@@ -6,11 +6,11 @@ from einops import rearrange
 
 import hydra
 
-from stream_blocksparse_attn_interface import stream_blocksparse_attn_func
-from stream_blocksparse_attn_interface import convert_blockmask
+from flash_blocksparse_attn_interface import flash_blocksparse_attn_func
+from flash_blocksparse_attn_interface import convert_blockmask
 from bert_padding import unpad_input, pad_input, index_first_axis
 
-class StreamingBlocksparseAttention(nn.Module):
+class FlashBlocksparseAttention(nn.Module):
     """Implement the scaled dot product attention with softmax.
     Arguments
     ---------
@@ -63,7 +63,7 @@ class StreamingBlocksparseAttention(nn.Module):
                 max_s = seqlen
                 cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32,
                                         device=qkv.device)
-                output = stream_blocksparse_attn_func(
+                output = flash_blocksparse_attn_func(
                     qkv, cu_seqlens, blockmask, self.dropout_p if self.training else 0.0,
                     max_s, softmax_scale=self.softmax_temp, causal=causal
                 )
@@ -74,7 +74,7 @@ class StreamingBlocksparseAttention(nn.Module):
                 x = rearrange(qkv, 'b s three h d -> b s (three h d)')
                 x_unpad, indices, cu_seqlens, max_s = unpad_input(x, key_padding_mask_bool)
                 x_unpad = rearrange(x_unpad, 'nnz (three h d) -> nnz three h d', three=3, h=nheads)
-                output_unpad = stream_blocksparse_attn_func(
+                output_unpad = flash_blocksparse_attn_func(
                     x_unpad, cu_seqlens, blockmask, self.dropout_p if self.training else 0.0,
                     max_s, softmax_scale=self.softmax_temp, causal=causal
                 )
@@ -89,12 +89,12 @@ class StreamingBlocksparseAttention(nn.Module):
             assert seqlen_rounded // 16 <= self.layout.shape[0], seqlen_rounded // 256 <= self.layout.shape[1]
             blockmask = self.layout[:seqlen_rounded // 16, :seqlen_rounded // 256]
             if convert_mask:
-                output = stream_blocksparse_attn_func(
+                output = flash_blocksparse_attn_func(
                     qkv, cu_seqlens, blockmask, self.dropout_p if self.training else 0.0,
                     max_s, softmax_scale=self.softmax_temp, causal=causal
                 )
             else:
-                output = stream_blocksparse_attn_func(
+                output = flash_blocksparse_attn_func(
                     qkv, cu_seqlens, self.blockmask_converted, self.dropout_p if self.training else 0.0,
                     max_s, softmax_scale=self.softmax_temp, causal=causal,
                     convert_mask=False,
@@ -103,7 +103,7 @@ class StreamingBlocksparseAttention(nn.Module):
         return output, None
 
 
-class StreamingBlocksparseMHA(nn.Module):
+class FlashBlocksparseMHA(nn.Module):
 
     def __init__(self, embed_dim, num_heads, sparsity_config, bias=True, batch_first=True,
                  attention_dropout=0.0, causal=False, max_seq_length=2048,
@@ -120,7 +120,7 @@ class StreamingBlocksparseMHA(nn.Module):
         assert self.head_dim in [16, 32, 64], "Only support head_dim == 16, 32, or 64"
 
         self.Wqkv = nn.Linear(embed_dim, 3 * embed_dim, bias=bias, **factory_kwargs)
-        self.inner_attn = StreamingBlocksparseAttention(
+        self.inner_attn = FlashBlocksparseAttention(
             sparsity_config, attention_dropout=attention_dropout,
             max_seq_length=max_seq_length, **factory_kwargs
         )

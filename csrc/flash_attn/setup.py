@@ -95,18 +95,18 @@ torch_dir = torch.__path__[0]
 if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
     generator_flag = ["-DOLD_GENERATOR_PATH"]
 
-raise_if_cuda_home_none("--streamattn")
+raise_if_cuda_home_none("--flashattn")
 # Check, if CUDA11 is installed for compute capability 8.0
 cc_flag = []
 _, bare_metal_major, _ = get_cuda_bare_metal_version(CUDA_HOME)
 if int(bare_metal_major) < 11:
-    raise RuntimeError("--streamattn only supported on SM80+")
+    raise RuntimeError("--flashattn only supported on SM80+")
 cc_flag.append("-gencode")
 cc_flag.append("arch=compute_80,code=sm_80")
 
 ext_modules.append(
     CUDAExtension(
-        name="stream_attn_cuda",
+        name="flash_attn_cuda",
         sources=[
             "fmha_api.cpp",
             "src/fmha_fprop_fp16_kernel.sm80.cu",
@@ -139,9 +139,9 @@ ext_modules.append(
 )
 
 setup(
-    name="stream_attn_cuda",
+    name="flash_attn_cuda",
     version="0.1",
-    description="Streaming attention",
+    description="Flash Attention",
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension} if ext_modules else {},
 )

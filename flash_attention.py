@@ -5,11 +5,11 @@ import torch.nn as nn
 from einops import rearrange
 
 from rotary import RotaryEmbedding, RotaryEmbedding2D
-from stream_attn_interface import stream_attn_func
+from flash_attn_interface import flash_attn_func
 from bert_padding import unpad_input, pad_input, index_first_axis
 
 
-class StreamingAttention(nn.Module):
+class FlashAttention(nn.Module):
     """Implement the scaled dot product attention with softmax.
     Arguments
     ---------
@@ -49,7 +49,7 @@ class StreamingAttention(nn.Module):
                 max_s = seqlen
                 cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32,
                                         device=qkv.device)
-                output = stream_attn_func(qkv, cu_seqlens, self.dropout_p if self.training else 0.0,
+                output = flash_attn_func(qkv, cu_seqlens, self.dropout_p if self.training else 0.0,
                                         max_s, softmax_scale=self.softmax_temp, causal=causal)
                 output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
             else:
@@ -58,7 +58,7 @@ class StreamingAttention(nn.Module):
                 x = rearrange(qkv, 'b s three h d -> b s (three h d)')
                 x_unpad, indices, cu_seqlens, max_s = unpad_input(x, key_padding_mask_bool)
                 x_unpad = rearrange(x_unpad, 'nnz (three h d) -> nnz three h d', three=3, h=nheads)
-                output_unpad = stream_attn_func(x_unpad, cu_seqlens,
+                output_unpad = flash_attn_func(x_unpad, cu_seqlens,
                                                 self.dropout_p if self.training else 0.0,
                                                 max_s, softmax_scale=self.softmax_temp, causal=causal)
                 output = rearrange(pad_input(rearrange(output_unpad, 'nnz h d -> nnz (h d)'),
@@ -66,14 +66,14 @@ class StreamingAttention(nn.Module):
                                 'b s (h d) -> b s h d', h=nheads)
         else:
             assert max_s is not None
-            output = stream_attn_func(qkv, cu_seqlens,
+            output = flash_attn_func(qkv, cu_seqlens,
                                       self.dropout_p if self.training else 0.0,
                                       max_s, softmax_scale=self.softmax_temp, causal=causal)
 
         return output, None
 
 
-class StreamingMHA(nn.Module):
+class FlashMHA(nn.Module):
 
     def __init__(self, embed_dim, num_heads, bias=True, batch_first=True, attention_dropout=0.0,
                  causal=False, use_rotary_emb=None, device=None, dtype=None, **kwargs) -> None:
@@ -96,7 +96,7 @@ class StreamingMHA(nn.Module):
             self.rotary_emb = RotaryEmbedding2D(self.head_dim)
 
         self.Wqkv = nn.Linear(embed_dim, 3 * embed_dim, bias=bias, **factory_kwargs)
-        self.inner_attn = StreamingAttention(attention_dropout=attention_dropout, **factory_kwargs)
+        self.inner_attn = FlashAttention(attention_dropout=attention_dropout, **factory_kwargs)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
 
     def forward(self, x, x_ignored_, x_ignored_1_, attn_mask=None, key_padding_mask=None,
