@@ -35,6 +35,7 @@ We display FlashAttention speedup using these parameters (similar to BERT-base):
 * Batch size 8
 * Head dimension 64
 * 12 attention heads
+
 Our graphs show sequence lengths between 128 and 4096 (when standard attention runs out of memory on an A100), but FlashAttention can scale up to sequence length 64K.
 
 #### Speedup
