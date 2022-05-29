@@ -4,7 +4,7 @@ following paper.
 
 **FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness***
 Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, Christopher Ré
-![FlashAttention](assets/flashattn_banner.pdf)
+![FlashAttention](assets/flashattn_banner.jpg)
 
 ## Alpha release (0.1).
 
