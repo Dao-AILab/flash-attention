@@ -6,9 +6,10 @@ from einops import rearrange
 
 import hydra
 
-from flash_blocksparse_attn_interface import flash_blocksparse_attn_func
-from flash_blocksparse_attn_interface import convert_blockmask
-from bert_padding import unpad_input, pad_input, index_first_axis
+from src.flash_blocksparse_attn_interface import flash_blocksparse_attn_func
+from src.flash_blocksparse_attn_interface import convert_blockmask
+from src.bert_padding import unpad_input, pad_input, index_first_axis
+
 
 class FlashBlocksparseAttention(nn.Module):
     """Implement the scaled dot product attention with softmax.

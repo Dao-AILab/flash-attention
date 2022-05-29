@@ -99,27 +99,7 @@ def pytorch_profiler(fn, *inputs, repeats=10):
             ) as p:
             # benchmark_forward(repeats, fn, *inputs)
             fn(*inputs)
-    print(p.key_averages().table(
-        sort_by="self_cuda_time_total", row_limit=-1))
-
-
-def convert_data(*tensors, device='cuda'):
-    tensors = tuple(t.to(device) for t in tensors)
-    for t in tensors:
-        if t.is_leaf: t.requires_grad = True
-        t.retain_grad()
-    return tensors
-
-
-def log_backward(output, *inputs):
-    """ Perform backward pass of output and print gradients of input tensors. """
-
-    #print(f"{output=}")
-    output.sum().backward(retain_graph=True)
-    print("Gradients:")
-    for t in inputs:
-        print(t.grad)
-        t.grad.zero_()
+    print(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
 
 def benchmark_memory(fn, *inputs, desc='', verbose=True, **kwinputs):

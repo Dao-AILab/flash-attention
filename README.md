@@ -1,4 +1,12 @@
-## FlashAttention - Alpha release (0.1).
+# FlashAttention
+This repository provides the official implementation of FlashAttention from the
+following paper.
+
+**FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness***
+Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, Christopher Ré
+![FlashAttention](assets/flashattn_banner.pdf)
+
+## Alpha release (0.1).
 
 To compile (requiring NVCC and an A100 GPU):
 ```
@@ -40,14 +48,14 @@ Our graphs show sequence lengths between 128 and 4096 (when standard attention r
 
 #### Speedup
 
-![FlashAttention speedup](images/flashattn_speedup.jpg)
+![FlashAttention speedup](assets/flashattn_speedup.jpg)
 
 We generally see 2-4X speedup at sequence lengths between 128 and 4K, and we see more speedup when using dropout and masking, since we fuse the kernels.
 At sequence lengths that are popular with language models like 512 and 1K, we see speedups up to 4X when using dropout and masking.
 
 #### Memory
 
-![FlashAttention memory](images/flashattn_memory.jpg)
+![FlashAttention memory](assets/flashattn_memory.jpg)
 
 We show memory savings in this graph (note that memory footprint is the same no matter if you use dropout or masking).
 Memory savings are proportional to sequence length -- since standard attention has memory quadratic in sequence length, whereas FlashAttention has memory linear in sequence length.
