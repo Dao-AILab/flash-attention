@@ -71,3 +71,14 @@ as a starting point.
 
 We thank [Young-Jun Ko](https://yjk21.github.io/) for the in-depth explanation of his FMHA implementation
 and for his thoughtful answers to our questions about CUDA.
+
+## Citation
+If you use this codebase, or otherwise found our work valuable, please cite:
+```
+@article{dao2022flashattention,
+  title={FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness},
+  author={Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
+  journal={arXiv preprint arXiv:2205.14135},
+  year={2022}
+}
+```
