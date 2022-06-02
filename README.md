@@ -9,7 +9,7 @@ Paper: https://arxiv.org/abs/2205.14135
 
 ## Alpha release (0.1).
 
-To compile (requiring NVCC and an A100 GPU):
+To compile (requiring CUDA 11, NVCC, and an Ampere GPU):
 ```
 cd csrc/flash_attn
 python setup.py install
@@ -23,13 +23,13 @@ PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
 ```
 
 FlashAttention currently supports:
-1. A100 GPUs.
+1. Ampere GPUs (e.g., A100, RTX 3090).
 2. fp16.
 3. Head dimensions 16, 32, 64.
 
 Our tentative roadmap:
 1. [Jun 2022] Make package pip-installable.
-2. [Jun 2022] Support SM86 GPUs (e.g., RTX 3080, 3090).
+2. ~~[Jun 2022] Support SM86 GPUs (e.g., RTX 3080, 3090)~~[Done].
 3. [Jun 2022] Refactor to use Cutlass.
 4. [Jun 2022] Support SM75 GPUs (e.g. T4).
 5. [Jun 2022] Support bf16.

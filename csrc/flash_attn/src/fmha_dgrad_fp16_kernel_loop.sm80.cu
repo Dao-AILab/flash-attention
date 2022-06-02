@@ -77,13 +77,18 @@ void run_fmha_dgrad_fp16_sm80(const Fused_multihead_attention_fprop_params &para
             using Kernel_traits = FMHA_kernel_traits<128, 64, 16, 1, 8, 0x08u>;
             run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream);
         } else if( params.s >= 256 ) {
-            // using Kernel_traits = FMHA_kernel_traits<256, 64, 16, 1, 8, 0x08u>;
-            // Don't share smem for K & V, and don't keep V in registers
-            // This speeds things up by 2-3% by avoiding register spills, but it
-            // uses more shared memory, which is fine on A100 but not other GPUs.
-            // For other GPUs, we should either use N=128 as the base, or keep V in registers.
-            using Kernel_traits = FMHA_kernel_traits<256, 64, 16, 1, 8, 0x100u>;
-            run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream);
+            auto dprops = at::cuda::getCurrentDeviceProperties();
+            if (dprops->major == 8 && dprops->minor == 0) {
+                // Don't share smem for K & V, and don't keep V in registers
+                // This speeds things up by 2-3% by avoiding register spills, but it
+                // uses more shared memory, which is fine on A100 but not other GPUs.
+                // For other GPUs, we keep V in registers.
+                using Kernel_traits = FMHA_kernel_traits<256, 64, 16, 1, 8, 0x100u>;
+                run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream);
+            } else if (dprops->major == 8 && dprops->minor > 0) {
+                using Kernel_traits = FMHA_kernel_traits<256, 64, 16, 1, 8, 0x08u>;
+                run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream);
+            }
         }
     } else if (params.d == 128) {
         using Kernel_traits = FMHA_kernel_traits<128, 128, 16, 1, 8, 0x100u>;
