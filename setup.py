@@ -107,7 +107,9 @@ raise_if_cuda_home_none("flash_attn")
 cc_flag = []
 _, bare_metal_major, _ = get_cuda_bare_metal_version(CUDA_HOME)
 if int(bare_metal_major) < 11:
-    raise RuntimeError("--flashattn only supported on SM80+")
+    raise RuntimeError("FlashAttention is only supported on CUDA 11")
+cc_flag.append("-gencode")
+cc_flag.append("arch=compute_75,code=sm_75")
 cc_flag.append("-gencode")
 cc_flag.append("arch=compute_80,code=sm_80")
 

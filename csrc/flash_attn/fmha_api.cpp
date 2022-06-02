@@ -117,7 +117,8 @@ mha_fwd(const at::Tensor &qkv,         // total x num_heads x 3 x head_size, tot
         c10::optional<at::Generator> gen_) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
-    TORCH_CHECK(dprops->major == 8 && dprops->minor >= 0);
+    bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
+    TORCH_CHECK((dprops->major == 8 && dprops->minor >= 0) || is_sm75);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     bool is_dropout = p_dropout > 0.0;
     Launch_params<Fused_multihead_attention_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
@@ -143,7 +144,7 @@ mha_fwd(const at::Tensor &qkv,         // total x num_heads x 3 x head_size, tot
     TORCH_CHECK(head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
 
     // int base_N = head_size == 16 ? 512 : (head_size == 128 ? 128 : 256);
-    int base_N = head_size == 128 ? 128 : 256;
+    int base_N = (head_size == 128 || (is_sm75 && head_size == 64)) ? 128 : 256;
     // int base_N = 256;
     int seq_len = 512;
     if( max_seq_len <= 128 ) {
@@ -236,7 +237,8 @@ mha_bwd(const at::Tensor &dout,  // total x num_heads, x head_size
         c10::optional<at::Generator> gen_
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
-    TORCH_CHECK(dprops->major == 8 && dprops->minor >= 0);
+    bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
+    TORCH_CHECK((dprops->major == 8 && dprops->minor >= 0) || is_sm75);
     auto launch = &run_fmha_dgrad_fp16_sm80;
 
     bool is_dropout = p_dropout > 0.0;
@@ -268,7 +270,7 @@ mha_bwd(const at::Tensor &dout,  // total x num_heads, x head_size
     TORCH_CHECK(head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
 
     // int base_N = head_size == 16 ? 512 : (head_size == 128 ? 128 : 256);
-    int base_N = head_size == 128 ? 128 : 256;
+    int base_N = (head_size == 128 || (is_sm75 && head_size == 64)) ? 128 : 256;
     int seq_len = 512;
     if( max_seq_len <= 128 ) {
         seq_len = 128;

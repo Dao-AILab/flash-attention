@@ -88,6 +88,9 @@ void run_fmha_dgrad_fp16_sm80(const Fused_multihead_attention_fprop_params &para
             } else if (dprops->major == 8 && dprops->minor > 0) {
                 using Kernel_traits = FMHA_kernel_traits<256, 64, 16, 1, 8, 0x08u>;
                 run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream);
+            } else if (dprops->major == 7 && dprops->minor == 5) {
+                using Kernel_traits = FMHA_kernel_traits<128, 64, 16, 1, 8, 0x08u>;
+                run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream);
             }
         }
     } else if (params.d == 128) {
