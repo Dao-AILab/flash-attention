@@ -39,7 +39,10 @@ Our tentative roadmap:
 
 ## Speedup and Memory Savings
 
-We present expected speedup (combined forward + backward pass) and memory savings from using FlashAttention against PyTorch standard attention, depending on sequence length.
+We present expected speedup (combined forward + backward pass) and memory savings from using FlashAttention against PyTorch standard attention, depending on sequence length, on different GPUs (speedup depends on memory bandwidth - we see more speedup on slower GPU memory).
+
+### A100
+
 We display FlashAttention speedup using these parameters (similar to BERT-base):
 * Batch size 8
 * Head dimension 64
@@ -47,14 +50,14 @@ We display FlashAttention speedup using these parameters (similar to BERT-base):
 
 Our graphs show sequence lengths between 128 and 4096 (when standard attention runs out of memory on an A100), but FlashAttention can scale up to sequence length 64K.
 
-### Speedup
+#### Speedup
 
 ![FlashAttention speedup](assets/flashattn_speedup.jpg)
 
 We generally see 2-4X speedup at sequence lengths between 128 and 4K, and we see more speedup when using dropout and masking, since we fuse the kernels.
 At sequence lengths that are popular with language models like 512 and 1K, we see speedups up to 4X when using dropout and masking.
 
-### Memory
+#### Memory
 
 ![FlashAttention memory](assets/flashattn_memory.jpg)
 
@@ -62,6 +65,15 @@ We show memory savings in this graph (note that memory footprint is the same no 
 Memory savings are proportional to sequence length -- since standard attention has memory quadratic in sequence length, whereas FlashAttention has memory linear in sequence length.
 We see 10X memory savings at sequence length 2K, and 20X at 4K.
 As a result, FlashAttention can scale to much longer sequence lengths.
+
+### RTX 3090
+
+For the RTX 3090, we use batch size 12 with 12 attention heads.
+Memory savings are the same as on an A100, so we'll only show speedup here.
+
+![FlashAttention speedup GTX 3090](assets/flashattn_speedup_3090.jpg)
+
+We see slightly higher speedups (between 2.5-4.5x) on the GTX 3090, since memory bandwidth on the GDDR6X is lower than A100 HBM (~900 GB/s vs. ~1.5 TB/s).
 
 ## Acknowledgments
 Our implementation uses Apex's
