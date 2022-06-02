@@ -4,9 +4,9 @@ import torch.nn as nn
 
 from einops import rearrange
 
-from src.rotary import RotaryEmbedding, RotaryEmbedding2D
-from src.flash_attn_interface import flash_attn_func
-from src.bert_padding import unpad_input, pad_input, index_first_axis
+from flash_attn.rotary import RotaryEmbedding, RotaryEmbedding2D
+from flash_attn.flash_attn_interface import flash_attn_func
+from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
 
 
 class FlashAttention(nn.Module):

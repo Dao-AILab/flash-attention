@@ -6,9 +6,9 @@ from einops import rearrange
 
 import hydra
 
-from src.flash_blocksparse_attn_interface import flash_blocksparse_attn_func
-from src.flash_blocksparse_attn_interface import convert_blockmask
-from src.bert_padding import unpad_input, pad_input, index_first_axis
+from flash_attn.flash_blocksparse_attn_interface import flash_blocksparse_attn_func
+from flash_attn.flash_blocksparse_attn_interface import convert_blockmask
+from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
 
 
 class FlashBlocksparseAttention(nn.Module):

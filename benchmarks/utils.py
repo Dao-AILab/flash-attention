@@ -86,20 +86,34 @@ def benchmark_all(fn, *inputs, grad=None, repeats=10, desc='', verbose=True, **k
     )
 
 
-def pytorch_profiler(fn, *inputs, repeats=10):
+def pytorch_profiler(fn, *inputs, trace_filename=None, backward=False, amp=False, verbose=True):
     """ Wrap benchmark functions in Pytorch profiler to see CUDA information. """
+    if backward:
+        g = torch.randn_like(fn(*inputs))
+    for _ in range(10):   # Warm up
+        with torch.autocast(device_type='cuda', enabled=amp):
+            if backward:
+                for x in inputs:
+                    if isinstance(x, torch.Tensor):
+                        x.grad = None
+            fn(*inputs) if not backward else fn(*inputs).backward(g)
     with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-                ],
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
-            ) as p:
-            # benchmark_forward(repeats, fn, *inputs)
-            fn(*inputs)
-    print(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
+        # activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA,],
+        activities=[torch.profiler.ProfilerActivity.CUDA,],
+        record_shapes=True,
+        # profile_memory=True,
+        with_stack=True,
+    ) as prof:
+        with torch.autocast(device_type='cuda', enabled=amp):
+            if backward:
+                for x in inputs:
+                    if isinstance(x, torch.Tensor):
+                        x.grad = None
+            fn(*inputs) if not backward else fn(*inputs).backward(g)
+    if verbose:
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
+    if trace_filename is not None:
+        prof.export_chrome_trace(trace_filename)
 
 
 def benchmark_memory(fn, *inputs, desc='', verbose=True, **kwinputs):

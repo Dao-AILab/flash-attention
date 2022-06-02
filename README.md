@@ -11,7 +11,6 @@ Paper: https://arxiv.org/abs/2205.14135
 
 To compile (requiring CUDA 11, NVCC, and an Ampere GPU):
 ```
-cd csrc/flash_attn
 python setup.py install
 ```
 
