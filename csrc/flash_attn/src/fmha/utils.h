@@ -1024,11 +1024,6 @@ struct MaxOp<float> {
 __device__ inline float operator()(float const &x, float const &y) { return max(x, y); }
 };
 
-template <>
-struct MaxOp<__half2> {
-__device__ inline __half2 operator()(__half2 const &x, __half2 const &y) { return __hmax2(x, y); }
-};
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename T>
