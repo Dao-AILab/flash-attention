@@ -29,6 +29,13 @@
 
 #include <fmha/utils.h>
 
+#include "cutlass/cutlass.h"
+#include "cutlass/gemm/warp/default_mma_tensor_op.h"
+#include "cutlass/layout/layout.h"
+#include <cutlass/arch/mma.h>
+#include <cutlass/array.h>
+#include <cutlass/numeric_types.h>
+
 namespace fmha {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -243,6 +250,49 @@ inline __device__ void gemm(Acc (&acc)[M][N], const A (&a)[M], const B (&b)[N]) 
             acc[mi][ni].mma(a[mi], b[ni]);
         }
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<typename Acc, typename A, typename B, int M, int N>
+inline __device__ void gemm_cl(Acc (&acc)[M][N], const A (&a)[M], const B (&b)[N]) {
+    using Shape = cutlass::gemm::GemmShape<16 * M, 16 * N, 16>;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+    using Element = cutlass::half_t;
+    using ElementC = float;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+
+    using WarpMma = typename cutlass::gemm::warp::DefaultMmaTensorOp<
+        Shape, InstructionShape, Element, LayoutA, Element, LayoutB, ElementC,
+        cutlass::layout::RowMajor, cutlass::arch::OpMultiplyAdd, 1, true>::Type;
+
+    using FragmentA = typename WarpMma::FragmentA;
+    using FragmentB = typename WarpMma::FragmentB;
+    using FragmentC = typename WarpMma::FragmentC;
+
+    static_assert(FragmentA::kStorageElements == M * a[0].NUM_REGS);
+    static_assert(FragmentB::kStorageElements == N * b[0].NUM_REGS);
+    static_assert(FragmentC::kStorageElements == M * N * acc[0][0].NUM_REGS);
+    const FragmentA a_cl = reinterpret_cast<const FragmentA (&)>(a);
+    const FragmentB b_cl = reinterpret_cast<const FragmentB (&)>(b);
+    FragmentC c_cl = reinterpret_cast<FragmentC (&)>(acc);
+
+    WarpMma mma_op;
+    mma_op(c_cl, a_cl, b_cl, c_cl);
+
+    // The modified c_cl is not copied back into acc, idk why
+    #pragma unroll
+    for (int mi = 0; mi < M; mi++) {
+        #pragma unroll
+        for (int ni = 0; ni < N; ni++) {
+            #pragma unroll
+            for (int i =0; i < 8; i++) {
+                acc[mi][ni].elt(i) = c_cl[mi * N * 8 + ni * 8 + i];
+            }
+        }
+    }
+
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

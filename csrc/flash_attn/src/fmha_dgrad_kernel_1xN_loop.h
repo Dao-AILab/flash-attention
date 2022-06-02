@@ -383,9 +383,9 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
             smem_do.load(frag_do[ki & 1], ki);
             if (!Kernel_traits::V_IN_REGS) {
                 smem_v.load(frag_v[ki & 1], ki);
-                fmha::gemm(acc_dp, frag_do[(ki - 1) & 1], frag_v[(ki - 1) & 1]);
+                fmha::gemm_cl(acc_dp, frag_do[(ki - 1) & 1], frag_v[(ki - 1) & 1]);
             } else {
-                fmha::gemm(acc_dp, frag_do[(ki - 1) & 1], frag_v[ki - 1]);
+                fmha::gemm_cl(acc_dp, frag_do[(ki - 1) & 1], frag_v[ki - 1]);
             }
             // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l < 4))  {
             //     float2 tmp = __half22float2(reinterpret_cast<__half2 &>(frag_do[(ki - 1) & 1]));
@@ -399,9 +399,9 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
         {
             int ki = Mma_tile_p::MMAS_K;
             if (!Kernel_traits::V_IN_REGS) {
-                fmha::gemm(acc_dp, frag_do[(ki - 1) & 1], frag_v[(ki - 1) & 1]);
+                fmha::gemm_cl(acc_dp, frag_do[(ki - 1) & 1], frag_v[(ki - 1) & 1]);
             } else {
-                fmha::gemm(acc_dp, frag_do[(ki - 1) & 1], frag_v[(ki - 1)]);
+                fmha::gemm_cl(acc_dp, frag_do[(ki - 1) & 1], frag_v[(ki - 1)]);
             }
         }
 
@@ -484,14 +484,14 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
             // Trigger the load from shared memory for the next series of Q values.
             smem_kt.load(frag_kt[ki & 1], ki);
             // Do the math for the values already in registers.
-            fmha::gemm(acc_dq, frag_p[ki - 1], frag_kt[(ki - 1) & 1]);
-            // fmha::gemm(acc_dq, frag_p[ki - 1], frag_kt[(ki - 1)]);
+            fmha::gemm_cl(acc_dq, frag_p[ki - 1], frag_kt[(ki - 1) & 1]);
+            // fmha::gemm_cl(acc_dq, frag_p[ki - 1], frag_kt[(ki - 1)]);
         }
         // Do the final stage of math.
         {
             int ki = Mma_tile_dq::MMAS_K;
-            fmha::gemm(acc_dq, frag_p[ki - 1], frag_kt[(ki - 1) & 1]);
-            // fmha::gemm(acc_dq, frag_p[ki - 1], frag_kt[(ki - 1)]);
+            fmha::gemm_cl(acc_dq, frag_p[ki - 1], frag_kt[(ki - 1) & 1]);
+            // fmha::gemm_cl(acc_dq, frag_p[ki - 1], frag_kt[(ki - 1)]);
         }
 
         static_assert(Gmem_tile_dq::LOOPS == 1);
@@ -524,13 +524,13 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
             // Trigger the load from shared memory for the next series of Q values.
             smem_dot.load(frag_dot[ki & 1], ki);
             // Do the math for the values already in registers.
-            fmha::gemm(acc_dv, frag_s[(ki - 1)], frag_dot[(ki - 1) & 1]);
+            fmha::gemm_cl(acc_dv, frag_s[(ki - 1)], frag_dot[(ki - 1) & 1]);
         }
 
         // Do the final stage of math.
         {
             int ki = Mma_tile_dkv::MMAS_K;
-            fmha::gemm(acc_dv, frag_s[(ki - 1)], frag_dot[(ki - 1) & 1]);
+            fmha::gemm_cl(acc_dv, frag_s[(ki - 1)], frag_dot[(ki - 1) & 1]);
         }
 
         // __syncthreads();
@@ -579,13 +579,13 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
             // Trigger the load from shared memory for the next series of Q values.
             smem_qt.load(frag_qt[ki & 1], ki);
             // Do the math for the values already in registers.
-            fmha::gemm(acc_dk, frag_dpt[(ki - 1)], frag_qt[(ki - 1) & 1]);
+            fmha::gemm_cl(acc_dk, frag_dpt[(ki - 1)], frag_qt[(ki - 1) & 1]);
         }
 
         // Do the final stage of math.
         {
             int ki = Mma_tile_dkv::MMAS_K;
-            fmha::gemm(acc_dk, frag_dpt[(ki - 1)], frag_qt[(ki - 1) & 1]);
+            fmha::gemm_cl(acc_dk, frag_dpt[(ki - 1)], frag_qt[(ki - 1) & 1]);
         }
 
         // Make sure dQ is in shared memory.
