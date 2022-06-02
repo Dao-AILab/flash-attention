@@ -111,6 +111,7 @@ if int(bare_metal_major) < 11:
 cc_flag.append("-gencode")
 cc_flag.append("arch=compute_80,code=sm_80")
 
+subprocess.run(["git", "submodule", "update", "--init", "csrc/flash_attn/cutlass"])
 ext_modules.append(
     CUDAExtension(
         name="flash_attn_cuda",
@@ -141,6 +142,7 @@ ext_modules.append(
         include_dirs=[
             Path(this_dir) / 'csrc' / 'flash_attn',
             Path(this_dir) / 'csrc' / 'flash_attn' / 'src',
+            Path(this_dir) / 'csrc' / 'flash_attn' / 'cutlass' / 'include',
         ],
     )
 )
