@@ -120,10 +120,25 @@ void run_fmha_fp16_sm80(Launch_params<Fused_multihead_attention_fprop_params> &l
         run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
     }
     // if (launch_params.params.d == 64) {
-        // using Kernel_traits = FMHA_kernel_traits<128, 64, 16, 1, 4, 0x08u>;
-        // using Kernel_traits = FMHA_kernel_traits<64, 64, 16, 1, 4, 0x08u>;
-        // using Kernel_traits = FMHA_kernel_traits<512, 64, 16, 1, 8, 0x08u>;
-        // using Kernel_traits = FMHA_kernel_traits<256, 64, 16, 1, 4, 0x08u>;
-        // run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
+    //     // using Kernel_traits = FMHA_kernel_traits<128, 64, 16, 1, 4, 0x08u>;
+    //     // using Kernel_traits = FMHA_kernel_traits<64, 64, 16, 1, 4, 0x08u>;
+    //     // using Kernel_traits = FMHA_kernel_traits<512, 64, 16, 1, 8, 0x08u>;
+    //     using Kernel_traits = FMHA_kernel_traits<128, 64, 16, 1, 4, 0x08u>;
+    //     run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
+    // }
+    // if (launch_params.params.d == 64) {
+    //     if( launch_params.params.s == 128 ) {
+    //         using Kernel_traits = FMHA_kernel_traits<128, 64, 16, 1, 4, 0x08u>;
+    //         run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
+    //     } else if( launch_params.params.s >= 256 ) {
+    //         auto dprops = at::cuda::getCurrentDeviceProperties();
+    //         if (dprops->major == 8 && dprops->minor >= 0) {
+    //             using Kernel_traits = FMHA_kernel_traits<256, 64, 16, 1, 4, 0x08u>;
+    //             run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
+    //         } else if (dprops->major == 7 && dprops->minor == 5) {
+    //             using Kernel_traits = FMHA_kernel_traits<128, 64, 16, 1, 4, 0x08u>;
+    //             run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
+    //         }
+    //     }
     // }
 }
