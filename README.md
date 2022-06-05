@@ -44,7 +44,7 @@ We present expected speedup (combined forward + backward pass) and memory saving
 We currently have benchmarks for these GPUs:
 * [A100](#a100)
 * [RTX 3090](#rtx-3090)
-* [T4](T4)
+* [T4](#t4)
 
 ### A100
 
