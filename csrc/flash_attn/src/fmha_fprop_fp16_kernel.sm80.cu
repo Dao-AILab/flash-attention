@@ -121,8 +121,21 @@ void run_fmha_fp16_sm80(Launch_params<Fused_multihead_attention_fprop_params> &l
             }
         }
     } else if (launch_params.params.d == 128) {
-        using Kernel_traits = FMHA_kernel_traits<128, 128, 16, 1, 4, 0x08u>;
-        run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
+        if( launch_params.params.s == 128 ) {
+            using Kernel_traits = FMHA_kernel_traits<128, 128, 16, 1, 4, 0x08u>;
+            run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
+        } else {
+            auto dprops = at::cuda::getCurrentDeviceProperties();
+            if (dprops->major == 8 && dprops->minor >= 0 && !is_dropout) {
+                // TD [2022-06-05] Keep K in registers to reduce register spilling
+                // Gives about 6% speedup compared to using block size 128.
+                using Kernel_traits = FMHA_kernel_traits<256, 128, 16, 1, 4, 0x18u>;
+                run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
+            } else {  // Need to use the same block size as backward
+                using Kernel_traits = FMHA_kernel_traits<128, 128, 16, 1, 4, 0x08u>;
+                run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
+            }
+        }
     }
     // if (launch_params.params.d == 64) {
     //     // using Kernel_traits = FMHA_kernel_traits<128, 64, 16, 1, 4, 0x08u>;
@@ -148,6 +161,23 @@ void run_fmha_fp16_sm80(Launch_params<Fused_multihead_attention_fprop_params> &l
     //                 using Kernel_traits = FMHA_kernel_traits<256, 64, 16, 1, 4, 0x08u>;
     //                 run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
     //             }
+    //         }
+    //     }
+    // }
+    // if (launch_params.params.d == 128) {
+    //     if( launch_params.params.s == 128 ) {
+    //         using Kernel_traits = FMHA_kernel_traits<128, 128, 16, 1, 4, 0x08u>;
+    //         run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
+    //     } else {
+    //         auto dprops = at::cuda::getCurrentDeviceProperties();
+    //         if (dprops->major == 8 && dprops->minor >= 0 && !is_dropout) {
+    //             // TD [2022-06-05] Keep K in registers to reduce register spilling
+    //             // Gives about 6% speedup compared to using block size 128.
+    //             using Kernel_traits = FMHA_kernel_traits<256, 128, 16, 1, 4, 0x18u>;
+    //             run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
+    //         } else {  // Need to use the same block size as backward
+    //             using Kernel_traits = FMHA_kernel_traits<128, 128, 16, 1, 4, 0x08u>;
+    //             run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
     //         }
     //     }
     // }

@@ -498,10 +498,19 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
         #pragma unroll
         for( int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki ) {
             fmha::gemm_cl(acc_o, frag_p[ki], frag_v[ki]);
+            // if ((threadIdx.x == 4) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
+            //     float2 tmp_p = __half22float2(reinterpret_cast<__half2 &>(frag_p[ki]));
+            //     float2 tmp_v = __half22float2(reinterpret_cast<__half2 &>(frag_v[ki]));
+            //     printf("Per warp, threadIdx.x = %d, frag_p = %.6f, %.6f, frag_v = %.6f, %.6f, acc_o=%.6f\n", threadIdx.x, tmp_p.x, tmp_p.y, tmp_v.x, tmp_v.y, acc_o[0][0].elt(0));
+            // }
         }
 
-        // The mapping from tidx to rows changes between the softmax and the O-reduction.
-        // So we recalculate the max.
+        // if ((threadIdx.x % 32 == 16) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
+        //     printf("Per warp, threadIdx.x = %d, acc_o=%.6f\n", threadIdx.x, acc_o[0][2].elt(0));
+        // }
+
+        // The mapping from tidx to rows changes between the softmax and the
+        // O-reduction. So we recalculate the max.
         float p_max_o[Gmem_tile_o::STGS_PER_LOOP][Mma_tile_o::MMAS_M];
         // TODO: not sure if this is right for seqlen 128 or 256
         int rows[Gmem_tile_o::STGS_PER_LOOP];

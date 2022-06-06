@@ -118,6 +118,7 @@ mha_fwd(const at::Tensor &qkv,         // total x num_heads x 3 x head_size, tot
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
+    bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
     TORCH_CHECK((dprops->major == 8 && dprops->minor >= 0) || is_sm75);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     bool is_dropout = p_dropout > 0.0;
@@ -144,7 +145,7 @@ mha_fwd(const at::Tensor &qkv,         // total x num_heads x 3 x head_size, tot
     TORCH_CHECK(head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
 
     // int base_N = head_size == 16 ? 512 : (head_size == 128 ? 128 : 256);
-    int base_N = (head_size == 128 || (is_sm75 && head_size == 64 && is_dropout)) ? 128 : 256;
+    int base_N = ((head_size == 128 && (is_dropout || !is_sm80)) || (is_sm75 && head_size == 64 && is_dropout)) ? 128 : 256;
     // int base_N = 256;
     int seq_len = 512;
     if( max_seq_len <= 128 ) {

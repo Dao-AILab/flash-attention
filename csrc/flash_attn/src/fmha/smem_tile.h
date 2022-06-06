@@ -1054,6 +1054,14 @@ struct Smem_tile_o {
         constexpr int STS_PER_WARP = 16 * Mma_tile::MMAS_N / ELEMENTS_PER_STS;
         int write_col = warp * STS_PER_WARP + lane % STS_PER_WARP;
 
+        // if ((threadIdx.x == 16) && (blockIdx.x == 0) && (blockIdx.y == 0)) {
+        //     printf("write_row = %d, write_col = %d\n", write_row, write_col);
+        // }
+
+        // if ((blockIdx.x == 0) && (blockIdx.y == 0) && (write_row == 0) && (write_col == 0)) {
+        //     printf("threadIdx.x = %d\n", threadIdx.x);
+        // }
+
         // Assemble the write pointer.
         smem_write_ = smem_ + write_row * BYTES_PER_ROW + write_col * BYTES_PER_STS;
 
@@ -1062,9 +1070,15 @@ struct Smem_tile_o {
         int read_col = tidx % THREADS_PER_ROW;
 
         // Take the XOR pattern into account for the column.
-        // read_col ^= 2 * (read_row % (Cta_tile::N == 16 ? 2 : (Cta_tile::N == 32 ? 4 : 8)));
-        read_col ^= 2 * (read_row % (Cta_tile::N == 16 ? 2 : (Cta_tile::N == 32 ? 4 : (Cta_tile::N == 128 ? 16 : 8))));
+        read_col ^= 2 * (read_row % (Cta_tile::N == 16 ? 2 : (Cta_tile::N == 32 ? 4 : 8)));
+        // read_col ^= 2 * (read_row % (Cta_tile::N == 16 ? 2 : (Cta_tile::N == 32 ? 4 : (Cta_tile::N == 128 ? 16 : 8))));
 
+        // if ((threadIdx.x == 8) && (blockIdx.x == 0) && (blockIdx.y == 0)) {
+        //     printf("read_row = %d, read_col = %d\n", read_row, read_col);
+        // }
+        // if ((blockIdx.x == 0) && (blockIdx.y == 0) && (read_row == 0) && (read_col == 0)) {
+        //     printf("threadIdx.x = %d\n", threadIdx.x);
+        // }
         // Assemble the read pointer.
         this->smem_read_ = smem_ + read_row * BYTES_PER_ROW + read_col * BYTES_PER_LDS;
 
@@ -1085,16 +1099,31 @@ struct Smem_tile_o {
             #pragma unroll
             for( int jj = 0; jj < Cta_tile::WARPS_K; ++jj ) {
                 int imm = ii * ROWS_PER_LDS * BYTES_PER_ROW + jj * Cta_tile::N * BYTES_PER_ELEMENT;
+                uint32_t smem_read = this->smem_read_ + imm;
+                // TD [2022-06-05] Ugly fix for d=128, maybe there's a better way.
+                if ((Cta_tile::N == 128) && (ii % 2 == 1)) {
+                    smem_read ^= 8 * BYTES_PER_LDS;
+                }
+                // if ((threadIdx.x == 8) && (blockIdx.x == 0) && (blockIdx.y == 0))  {
+                //     printf("imm diff = %d\n", smem_read - this->smem_read_);
+                // }
                 if( !HAS_INCOMPLETE_LDS || (ii < LDS_PER_LOOP - 1 || this->is_active_for_last_lds_) ) {
-                    fmha::lds(tmp[jj], this->smem_read_ + imm);
+                    // fmha::lds(tmp[jj], this->smem_read_ + imm);
+                    fmha::lds(tmp[jj], smem_read);
                 }
             }
 
             // Perform the reduction.
             out[ii] = zero_init ? tmp[0] : fmha::fadd4(out[ii], tmp[0]);
+            // if ((threadIdx.x == 8) && (blockIdx.x == 0) && (blockIdx.y == 0))  {
+            //     printf("out reduction: out = %.6f\n", reinterpret_cast<float (&)[4]>(out[ii])[0]);
+            // }
             #pragma unroll
             for( int jj = 1; jj < Cta_tile::WARPS_K; ++jj ) {
                 out[ii] = fmha::fadd4(out[ii], tmp[jj]);
+                // if ((threadIdx.x == 8) && (blockIdx.x == 0) && (blockIdx.y == 0))  {
+                //     printf("out reduction tmp = %.6f, out = %.6f\n", reinterpret_cast<float (&)[4]>(tmp[jj])[0], reinterpret_cast<float (&)[4]>(out[ii])[0]);
+                // }
             }
         }
     }
@@ -1102,6 +1131,7 @@ struct Smem_tile_o {
     // Store the accumulators.
     template <int M, int N>
     inline __device__ void store(const Accumulator (&acc)[M][N], int mi) {
+        // uint32_t smem_write_og = this->smem_write_;
         static constexpr int M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA;
         #pragma unroll
         for( int ni = 0; ni < Mma_tile::MMAS_N; ++ni ) {
@@ -1126,7 +1156,15 @@ struct Smem_tile_o {
                 fmha::sts(this->smem_write_ + row_0, tmp0);
                 fmha::sts(this->smem_write_ + row_1, tmp1);
             }
+            // if ((threadIdx.x == 16) && (blockIdx.x == 0) && (blockIdx.y == 0))  {
+            //     printf("smem_write diff = %d\n", this->smem_write_ - smem_write_og);
+            // }
 
+            // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0))  {
+            //     uint4 read_tmp;
+            //     fmha::lds(read_tmp, this->smem_read_);
+            //     printf("smem_o = %.6f\n", reinterpret_cast<float (&)[4]>(read_tmp)[0]);
+            // }
             // Swizzle the write pointer using a XOR of 16B.
             this->smem_write_ ^= 32;
 
@@ -1148,8 +1186,25 @@ struct Smem_tile_o {
                 fmha::sts(this->smem_write_ + row_1, tmp1);
             }
 
+            // if ((threadIdx.x == 16) && (blockIdx.x == 0) && (blockIdx.y == 0))  {
+            //     printf("smem_write diff = %d\n", this->smem_write_ - smem_write_og);
+            // }
+
             // Cancel the previous XOR of 1 + swizzle the write pointer using a XOR of 32B or 64B.
-            this->smem_write_ ^= (ni & 1) ? 7 * 32 : 3 * 32;
+            static_assert(Mma_tile::MMAS_N <= 8, "Not implemented");
+            if(        Mma_tile::MMAS_N >= 8 && ni % 4 == 3 ) {
+                this->smem_write_ ^= 15 * 32;
+            } else if( Mma_tile::MMAS_N >= 4 && ni % 2 == 1 ) {
+                this->smem_write_ ^= 7 * 32;
+            } else if( Mma_tile::MMAS_N >= 2 ) {
+                this->smem_write_ ^= 3 * 32;
+            }
+            // this->smem_write_ ^= (ni & 1) ? 7 * 32 : 3 * 32;
+            // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0))  {
+            //     uint4 read_tmp;
+            //     fmha::lds(read_tmp, this->smem_read_);
+            //     printf("smem_o = %.6f\n", reinterpret_cast<float (&)[4]>(read_tmp)[0]);
+            // }
         }
     }
 };
