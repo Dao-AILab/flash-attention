@@ -847,6 +847,7 @@ struct Smem_tile_row_b : public Smem_tile_without_skews<Cta_tile,
         // The size in bytes of the data needed to compute an MMA per CTA.
         const int BYTES_PER_MMA_PER_CTA = Mma_tile::N_PER_MMA_PER_CTA * BITS_PER_ELT / 8;
 
+        // uint32_t smem_read_og = this->smem_ + this->smem_read_offset_;
         #pragma unroll
         for( int ni = 0; ni < Mma_tile::MMAS_N; ++ni ) {
             // Prepare the offset.
@@ -872,6 +873,9 @@ struct Smem_tile_row_b : public Smem_tile_without_skews<Cta_tile,
                 lds(tmp.w, (ptr ^ 32) + 4*Base::BYTES_PER_ROW_BEFORE_PACKING);
             }
 
+            // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0)) {
+            //     printf("BYTES_PER_MMA_PER_CTA=%d, ni = %d, smem_read diff = %d\n", BYTES_PER_MMA_PER_CTA, ni, ptr - smem_read_og);
+            // }
             // Store those values in the fragment.
             b[ni].reg(0) = tmp.x;
             b[ni].reg(1) = tmp.y;
@@ -885,6 +889,8 @@ struct Smem_tile_row_b : public Smem_tile_without_skews<Cta_tile,
                 this->smem_read_offset_ ^= BYTES_PER_MMA_PER_CTA;
             } else if( BYTES_PER_MMA_PER_CTA == 64 ) {
                 // Nothing to do!
+            } else if( BYTES_PER_MMA_PER_CTA == 32 && Mma_tile::MMAS_N == 8 ) {
+                this->smem_read_offset_ ^= BYTES_PER_LDS * (ni % 4 == 3 ? 14 : (ni % 2 == 1 ? 6 : 2));
             } else if( BYTES_PER_MMA_PER_CTA == 32 && Mma_tile::MMAS_N == 4 ) {
                 this->smem_read_offset_ ^= BYTES_PER_LDS * (ni % 2 == 0 ? 2 : 6);
             } else if( BYTES_PER_MMA_PER_CTA == 32 && Mma_tile::MMAS_N == 2 ) {
@@ -1100,8 +1106,8 @@ struct Smem_tile_o {
             for( int jj = 0; jj < Cta_tile::WARPS_K; ++jj ) {
                 int imm = ii * ROWS_PER_LDS * BYTES_PER_ROW + jj * Cta_tile::N * BYTES_PER_ELEMENT;
                 uint32_t smem_read = this->smem_read_ + imm;
-                // TD [2022-06-05] Ugly fix for d=128, maybe there's a better way.
-                if ((Cta_tile::N == 128) && (ii % 2 == 1)) {
+                // TD [2022-06-05] Ugly fix for d=128 in the forward pass, maybe there's a better way.
+                if ((Cta_tile::N == 128) && (ROWS_PER_LDS == 4) && (ii % 2 == 1)) {
                     smem_read ^= 8 * BYTES_PER_LDS;
                 }
                 // if ((threadIdx.x == 8) && (blockIdx.x == 0) && (blockIdx.y == 0))  {
@@ -1232,16 +1238,17 @@ struct Smem_tile_mma {
         uint32_t smem_ = __nvvm_get_smem_pointer(smem);
 
         int write_col, write_row;
-        static_assert(WARPS_M == 1 && (WARPS_N == 4 || WARPS_N == 8) || (WARPS_M == 4 || WARPS_N == 8) || WARPS_N == 1);
+        static_assert(WARPS_M == 1 && (WARPS_N == 4 || WARPS_N == 8) || (WARPS_M == 4 || WARPS_M == 8) || WARPS_N == 1);
         if( WARPS_M == 1 && (WARPS_N == 4 || WARPS_N == 8) ) {
             write_row = (tidx & 0x1c) / 4;
             write_col = (tidx & 0xe0) / 4 + (tidx & 0x03);
+            write_col ^= (write_row & 0x07) * 4;
         } else {
             write_row = (tidx & 0xe0) / 2 + (tidx & 0x1c) / 4;
             write_col = (tidx & 0x03);
+            // write_col ^= (write_row & (BYTES_PER_ROW == 32 ? 0x01 : (BYTES_PER_ROW == 64 ? 0x03 : (BYTES_PER_ROW == 128 ? 0x07 : 0x0f)))) * 4;
+            write_col ^= (write_row & (BYTES_PER_ROW == 32 ? 0x01 : (BYTES_PER_ROW == 64 ? 0x03 : (BYTES_PER_ROW == 128 ? 0x07 : 0x07)))) * 4;
         }
-        // TODO [TD] Only works for, D=16, D=32 or D=64
-        write_col ^= (write_row & (BYTES_PER_ROW == 32 ? 0x01 : (BYTES_PER_ROW == 64 ? 0x03 : 0x07))) * 4;
 
         // write_offset_ = write_row * BYTES_PER_ROW + write_col * BYTES_PER_STS;
         smem_write_ = smem_ + write_row * BYTES_PER_ROW + write_col * BYTES_PER_STS;
@@ -1309,7 +1316,8 @@ struct Smem_tile_mma_transposed : public Base {
         read_row = (tidx & 0x0f);
         read_col = (tidx & 0xe0) / 16 + (tidx & 0x1c) / 16;
 
-        read_col ^= (read_row & (Base::BYTES_PER_ROW == 32 ? 0x01 : (Base::BYTES_PER_ROW == 64 ? 0x03 : 0x07)));
+        // read_col ^= (read_row & (Base::BYTES_PER_ROW == 32 ? 0x01 : (Base::BYTES_PER_ROW == 64 ? 0x03 : (Base::BYTES_PER_ROW == 128 ? 0x07 : 0x0f))));
+        read_col ^= (read_row & 0x07);
         // read_offset_ = read_row * BYTES_PER_ROW + read_col * BYTES_PER_LDS;
         smem_read_ = smem_ + read_row * BYTES_PER_ROW + read_col * BYTES_PER_LDS;
     }
@@ -1357,7 +1365,9 @@ struct Smem_tile_mma_epilogue : public Base {
         uint32_t smem_ = __nvvm_get_smem_pointer(smem);
         const int read_row = tidx / THREADS_PER_ROW;
         int read_col = tidx % THREADS_PER_ROW;
-        read_col ^= (read_row & (Base::BYTES_PER_ROW == 32 ? 0x01 : (Base::BYTES_PER_ROW == 64 ? 0x03 : 0x07)));
+        // read_col ^= (read_row & (Base::BYTES_PER_ROW == 32 ? 0x01 : (Base::BYTES_PER_ROW == 64 ? 0x03 : 0x07)));
+        static_assert(Base::BYTES_PER_ROW == 32 || Base::BYTES_PER_ROW == 64 || Base::BYTES_PER_ROW == 128 || Base::BYTES_PER_ROW == 256);
+        read_col ^= (read_row & (Base::BYTES_PER_ROW == 32 ? 0x01 : (Base::BYTES_PER_ROW == 64 ? 0x03 : (Base::BYTES_PER_ROW == 128 ? 0x07 : 0x07))));
         // read_offset_ = read_row * BYTES_PER_ROW + read_col * BYTES_PER_LDS;
         smem_read_ = smem_ + read_row * BYTES_PER_ROW + read_col * BYTES_PER_LDS;
     }
@@ -1402,6 +1412,9 @@ struct Smem_tile_mma_epilogue : public Base {
                 // fmha::sts(this->smem_ + offset + 8 * BYTES_PER_ROW, w);
                 // size_t offset = (this->smem_write_ ^ (ni * 32)) + mi * WARPS_M * 16 * BYTES_PER_ROW;
                 uint32_t offset = (this->smem_write_ ^ (ni * 32)) + mi * WARPS_M * 16 * BYTES_PER_ROW;
+                // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0)) {
+                //     printf("mi = %d, ni = %d, offset - smem_write_ = %d\n", mi, ni, offset - this->smem_write_);
+                // }
                 fmha::sts(offset + 0 * BYTES_PER_ROW, x);
                 fmha::sts(offset + 8 * BYTES_PER_ROW, z);
                 offset ^= 4 * Base::BYTES_PER_STS;

@@ -144,9 +144,7 @@ mha_fwd(const at::Tensor &qkv,         // total x num_heads x 3 x head_size, tot
     TORCH_CHECK(batch_size > 0);
     TORCH_CHECK(head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
 
-    // int base_N = head_size == 16 ? 512 : (head_size == 128 ? 128 : 256);
     int base_N = ((head_size == 128 && (is_dropout || !is_sm80)) || (is_sm75 && head_size == 64 && is_dropout)) ? 128 : 256;
-    // int base_N = 256;
     int seq_len = 512;
     if( max_seq_len <= 128 ) {
         seq_len = 128;
@@ -162,18 +160,13 @@ mha_fwd(const at::Tensor &qkv,         // total x num_heads x 3 x head_size, tot
     auto ctx = torch::empty({ total, num_heads, head_size }, opts);
 
     at::Tensor o_tmp;
-    if (loop) {
-        o_tmp = torch::empty({total, num_heads, head_size}, opts.dtype(at::kFloat));
-    }
+    if (loop) { o_tmp = torch::empty({total, num_heads, head_size}, opts.dtype(at::kFloat)); }
 
     auto softmax_lse = torch::empty({batch_size, num_heads, seq_len}, opts.dtype(at::kFloat));
     // auto softmax_lse = torch::full({batch_size, num_heads, seq_len}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
 
     at::Tensor s;
-    if (return_softmax) {
-        s = torch::empty({ batch_size, num_heads, seq_len, seq_len }, opts);
-        // s = torch::ones({ batch_size, num_heads, seq_len, seq_len }, opts) * 10000.0;
-    }
+    if (return_softmax) { s = torch::empty({ batch_size, num_heads, seq_len, seq_len }, opts); }
 
     if( zero_tensors ) {
         ctx.zero_();
@@ -228,7 +221,7 @@ mha_bwd(const at::Tensor &dout,  // total x num_heads, x head_size
         const at::Tensor &qkv,   // total x num_heads x 3 x head_size, total := \sum_{i=0}^{b} s_i
         const at::Tensor &out,   // total x num_heads x head_size
         at::Tensor &softmax,     // b x h x s x s softmax and dmask - will be overwritten with dP
-        const at::Tensor &softmax_lse,     // b x h x s softmax logsumexp
+        const at::Tensor &softmax_lse_,     // b x h x s softmax logsumexp
         const at::Tensor &cu_seqlens,  // b+1
         const float p_dropout,         // probability to drop
         const float softmax_scale,
@@ -239,6 +232,7 @@ mha_bwd(const at::Tensor &dout,  // total x num_heads, x head_size
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
+    bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
     TORCH_CHECK((dprops->major == 8 && dprops->minor >= 0) || is_sm75);
     auto launch = &run_fmha_dgrad_fp16_sm80;
 
@@ -269,8 +263,10 @@ mha_bwd(const at::Tensor &dout,  // total x num_heads, x head_size
     const int head_size = sizes[D_DIM];
     TORCH_CHECK(batch_size > 0);
     TORCH_CHECK(head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
+    if (head_size == 128) {  // TODO: eventually we should support SM86 and SM70 with d=128 as well
+        TORCH_CHECK(is_sm80);
+    }
 
-    // int base_N = head_size == 16 ? 512 : (head_size == 128 ? 128 : 256);
     int base_N = (head_size == 128 || (is_sm75 && head_size == 64)) ? 128 : 256;
     int seq_len = 512;
     if( max_seq_len <= 128 ) {
@@ -282,18 +278,14 @@ mha_bwd(const at::Tensor &dout,  // total x num_heads, x head_size
     }
     bool loop = seq_len > base_N;
 
+    // It's possible the softmax_lse_ from the fwd has a different length since base_N could be different.
+    auto softmax_lse = softmax_lse_.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, seq_len)}).contiguous();
+
     auto dqkv = torch::empty_like(qkv);
     auto opts = qkv.options();
-    // auto softmax_lse =
-    //     torch::empty({batch_size, num_heads, seq_len}, opts.dtype(at::kFloat));
     auto softmax_d = torch::empty({batch_size, num_heads, seq_len}, opts.dtype(at::kFloat));
-    // softmax.zero_();
-    // torch::nn::init::ones_(softmax);
-    // torch::nn::init::ones_(dqkv);
     at::Tensor dq_tmp;
-    if (loop) {
-        dq_tmp = torch::empty({total, num_heads, head_size}, opts.dtype(at::kFloat));
-    }
+    if (loop) { dq_tmp = torch::empty({total, num_heads, head_size}, opts.dtype(at::kFloat)); }
 
     if( zero_tensors ) {
         dqkv.zero_();
@@ -324,7 +316,7 @@ mha_bwd(const at::Tensor &dout,  // total x num_heads, x head_size
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
     // We're gonna reset the rng state in Python after this kernel, so the counter offset
-    // here doesn't matter at all. We just choose an arbitrary number;
+    // here doesn't matter at all. We just choose an arbitrary number.
     int64_t counter_offset = 4;
 
     if( is_dropout ) {

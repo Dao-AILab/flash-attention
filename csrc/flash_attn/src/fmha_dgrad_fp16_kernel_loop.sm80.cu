@@ -120,4 +120,8 @@ void run_fmha_dgrad_fp16_sm80(const Fused_multihead_attention_fprop_params &para
     //         }
     //     }
     // }
+    // if (params.d == 128) {
+    //     using Kernel_traits = FMHA_kernel_traits<128, 128, 16, 1, 8, 0x100u>;
+    //     run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream);
+    // }
 }

@@ -512,6 +512,17 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
             fmha::gemm_cl(acc_dv, frag_s[(ki - 1)], frag_dot[(ki - 1) & 1]);
         }
 
+        // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0))  {
+        //     float2 tmp0 = __half22float2(reinterpret_cast<__half2 &>(frag_dot[0][0]));
+        //     printf("frag_dot[0][0]=%.6f, %.6f\n", tmp0.x, tmp0.y);
+        //     float2 tmp1 = __half22float2(reinterpret_cast<__half2 &>(frag_dot[0][1]));
+        //     printf("frag_dot[0][1]=%.6f, %.6f\n", tmp1.x, tmp1.y);
+        // }
+
+        // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0))  {
+        //     printf("l = %d, acc_dv[0][0]=%.6f, %.6f\n", l, acc_dv[0][0].elt(2), acc_dv[0][0].elt(3));
+        //     printf("l = %d, acc_dv[0][1]=%.6f, %.6f\n", l, acc_dv[0][1].elt(2), acc_dv[0][1].elt(3));
+        // }
         // __syncthreads();
         // Commit the values for Q and dO into shared memory.
         if(l < steps - 1) {
@@ -577,7 +588,9 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
             // if (Is_dropout) {
             //     dq_out[0] = fmha::fmul4(dq_out[0], params.rp_dropout);
             // }
-            dq_out[0] = fmha::fmul4(dq_out[0], params.scale_bmm1f);
+            for (int jj = 0; jj < Gmem_tile_dq::STGS_PER_LOOP; ++jj) {
+                dq_out[jj] = fmha::fmul4(dq_out[jj], params.scale_bmm1f);
+            }
             // Output the values.
             gmem_dq.store(dq_out, 0);
             // Move to the next part of the output.
@@ -614,7 +627,8 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
         }
     }
     // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0))  {
-    //     printf("l final, acc_dk=%.6f, %.6f\n", acc_dk[0][0].elt(0), acc_dk[0][0].elt(1));
+    //     printf("l final, acc_dv[0][0]=%.6f, %.6f\n", acc_dv[0][0].elt(2), acc_dv[0][0].elt(3));
+    //     printf("l final, acc_dv[0][1]=%.6f, %.6f\n", acc_dv[0][1].elt(2), acc_dv[0][1].elt(3));
     // }
     for( int mi = 0; mi < Mma_tile_dkv::MMAS_M; mi++ ) {
         for( int ni = 0; ni < Mma_tile_dkv::MMAS_N; ni++ ) {

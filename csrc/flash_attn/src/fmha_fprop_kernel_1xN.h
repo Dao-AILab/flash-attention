@@ -382,8 +382,6 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
         // Apply the mask.
         softmax.apply_mask(mask);
 
-        // softmax.unpack_noscale_half_and_apply_mask(acc_p, mask);
-
         if( Kernel_traits::SHARE_SMEM_FOR_K_AND_V && l == 0 ) {
             // if we share K and V, it could be that V was not fully read yet but we write into smem for reduction
             __syncthreads();
@@ -408,7 +406,6 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
             }
         }
 
-        // __half2 p_max[Mma_tile_p::MMAS_M];
         softmax.template reduce_max</*zero_init=*/Is_first>(p_max);
 
         // if ((threadIdx.x == 0) && (l == 38)) {
