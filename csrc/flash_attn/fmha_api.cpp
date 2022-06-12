@@ -56,12 +56,18 @@ void set_params(Fused_multihead_attention_fprop_params &params,
     memset(&params, 0, sizeof(params));
 
     // Set the pointers and strides.
-    params.qkv_ptr = qkv_packed_d;
-    params.qkv_stride_in_elts = h * 3 * d;
-    params.qkv_stride_in_bytes = get_size_in_bytes(h * 3 * d, data_type);
+    params.q_ptr = qkv_packed_d;
+    params.k_ptr = qkv_packed_d + get_size_in_bytes(h * d, data_type);
+    params.v_ptr = qkv_packed_d + 2 * get_size_in_bytes(h * d, data_type);
+    params.q_row_stride_in_elts = 3 * h * d;
+    params.k_row_stride_in_elts = 3 * h * d;
+    params.v_row_stride_in_elts = 3 * h * d;
+    params.q_head_stride_in_elts = d;
+    params.k_head_stride_in_elts = d;
+    params.v_head_stride_in_elts = d;
     params.o_ptr = o_packed_d;
-    params.o_stride_in_elts = h * d;
-    params.o_stride_in_bytes = get_size_in_bytes(h * d, data_type);
+    params.o_row_stride_in_elts = h * d;
+    params.o_head_stride_in_elts = d;
     params.do_ptr = do_packed_d;
     params.o_tmp_ptr = o_tmp_d;
 

@@ -247,10 +247,10 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
 
     Gemm1 gemm_q_k(smem_, tidx);
     // Allocate the global memory tile loader for Q.
-    Gmem_tile_q gmem_q(params, 0, binfo, tidx);
+    Gmem_tile_q gmem_q(params.q_ptr, params.q_row_stride_in_elts, params.q_head_stride_in_elts, binfo, tidx);
     // Allocate the global memory tile loader for O.
-    Gmem_tile_o gmem_o(params, binfo, tidx);
-    Gmem_tile_o_tmp gmem_o_tmp(params.o_tmp_ptr, params.o_stride_in_elts, binfo, tidx);
+    Gmem_tile_o gmem_o(params.o_ptr, params.o_row_stride_in_elts, params.o_head_stride_in_elts, binfo, tidx);
+    Gmem_tile_o_tmp gmem_o_tmp(params.o_tmp_ptr, params.o_row_stride_in_elts, params.o_head_stride_in_elts, binfo, tidx);
     // Allocate the global memory tile loader for S.
     Gmem_tile_s gmem_s(params, binfo, tidx);
     Gmem_softmax_sum gmem_softmax_lse(params.softmax_lse_ptr, params, tidx);
@@ -273,9 +273,9 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
     fmha::Mask<Cta_tile_p, Is_causal> mask(binfo, tidx, loop_step_idx);
 
     // Allocate the global memory tile loader for K.
-    Gmem_tile_k gmem_k(params, 1, binfo, tidx);
+    Gmem_tile_k gmem_k(params.k_ptr, params.k_row_stride_in_elts, params.k_head_stride_in_elts, binfo, tidx);
     // Allocate the global memory tile loader for V.
-    Gmem_tile_v gmem_v(params, 2, binfo, tidx);
+    Gmem_tile_v gmem_v(params.v_ptr, params.v_row_stride_in_elts, params.v_head_stride_in_elts, binfo, tidx);
     // The base pointer of smem_v;
     char *smem_v_ = &smem_[Gemm1::SMEM_OFFSET_V];
     

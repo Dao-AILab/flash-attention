@@ -72,9 +72,7 @@ struct FMHA_kernel_traits {
     // The shared memory tile to transpose S.
     using Smem_tile_st = fmha::Smem_tile_mma_transposed<Cta_tile_p>;
 
-    using Gmem_tile_do = fmha::Gmem_tile_dout<Cta_tile_p>;
-
-    using Gmem_tile_dot = fmha::Gmem_tile_dout<Cta_tile_p, fmha::Gmem_tile_qkv<Cta_tile_p, fmha::BITS_PER_ELEMENT_B, S, D> >;
+    using Gmem_tile_do = fmha::Gmem_tile_qkv<Cta_tile_p, fmha::BITS_PER_ELEMENT_A, STEP, D>;
 
     // The global memory tile to store the softmax sum.
     using Gmem_softmax_sum = fmha::Gmem_summary_stats<Cta_tile_p>;

@@ -39,14 +39,13 @@ template<
     // The number of rows of Q, K or V loaded by this tile.
     int ROWS_,
     // The number of columns.
-    int COLS,
-    // The number of matrics.
-    int NUM_MATS = 3
+    int COLS
 >
 struct Gmem_tile_qkv {
 
     using Cta_tile = Cta_tile_;
 
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8;
     // The size of each LDG.
     static constexpr int BYTES_PER_LDG = 16;
     // The size of a row in bytes.
@@ -62,11 +61,12 @@ struct Gmem_tile_qkv {
     static constexpr int LDGS = DivUpConstexpr(ROWS, ROWS_PER_LDG);
 
     // Ctor.
-    template< typename Params, typename BInfo >
-    inline __device__ Gmem_tile_qkv(const Params &params, const int qkv_offset, const BInfo &binfo, const int tidx)
-        : params_qkv_stride_in_bytes_(params.qkv_stride_in_bytes)
+    template< typename BInfo >
+    inline __device__ Gmem_tile_qkv(void *ptr_, const uint32_t row_stride_in_elts,
+                                    const uint32_t head_stride_in_elts, const BInfo &binfo, const int tidx)
+        : row_stride_in_bytes(row_stride_in_elts * BYTES_PER_ELEMENT)
         , actual_seqlen(binfo.actual_seqlen)
-        , qkv_ptr_(reinterpret_cast<char *>(params.qkv_ptr))
+        , ptr(reinterpret_cast<char *>(ptr_))
         , tidx_(tidx) {
 
         // Compute the position in the sequence (within the CTA for the moment).
@@ -80,13 +80,13 @@ struct Gmem_tile_qkv {
 
         // The row offset in the batched GEMM. For each seq element, we store QKV in that order.
         // int64_t row_offset = (int64_t)row * params.qkv_stride_in_bytes;
-        uint32_t row_offset = (uint32_t)row * params.qkv_stride_in_bytes;
+        uint32_t row_offset = (uint32_t)((binfo.sum_s + row) * row_stride_in_bytes);
         // Add the block index.
         // row_offset += (int64_t)((binfo.sum_s * NUM_MATS + qkv_offset) * binfo.h + binfo.bidh) * BYTES_PER_ROW;
-        row_offset += (uint32_t)((binfo.sum_s * NUM_MATS + qkv_offset) * binfo.h + binfo.bidh) * BYTES_PER_ROW;
+        row_offset += (uint32_t)(binfo.bidh * head_stride_in_elts * BYTES_PER_ELEMENT);
 
         // Assemble the final pointer.
-        qkv_ptr_ += row_offset + col * BYTES_PER_LDG;
+        ptr += row_offset + col * BYTES_PER_LDG;
     }
 
     // Store data to shared memory.
@@ -101,8 +101,8 @@ struct Gmem_tile_qkv {
         uint32_t preds[LDGS];
         #pragma unroll
         for( int ii = 0; ii < LDGS; ++ii ) {
-            // ptrs[ii] = qkv_ptr_ + (int64_t)ii * ROWS_PER_LDG * params_qkv_stride_in_bytes_;
-            ptrs[ii] = qkv_ptr_ + (uint32_t)ii * ROWS_PER_LDG * params_qkv_stride_in_bytes_;
+            // ptrs[ii] = ptr + (int64_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
+            ptrs[ii] = ptr + (uint32_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
             preds[ii] = ((row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen));
             fetch_[ii] = make_uint4(0, 0, 0, 0);
         }
@@ -120,32 +120,25 @@ struct Gmem_tile_qkv {
         int row_ = tidx_ / THREADS_PER_ROW;
         #pragma unroll
         for( int ii = 0; ii < LDGS; ++ii ) {
-            // char *ptr = qkv_ptr_ + (int64_t)ii * ROWS_PER_LDG * params_qkv_stride_in_bytes_;
-            char *ptr = qkv_ptr_ + (uint32_t)ii * ROWS_PER_LDG * params_qkv_stride_in_bytes_;
+            // char *ptr_ = ptr + (int64_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
+            char *ptr_ = ptr + (uint32_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
             if( (row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen) ) {
-                fmha::stg(ptr, data[ii]);
+                fmha::stg(ptr_, data[ii]);
             }
         }
     }
 
-    // Move the pointer to the next location.
-    inline __device__ void move() {
-        // qkv_ptr_ += (int64_t)ROWS * params_qkv_stride_in_bytes_;
-        qkv_ptr_ += (uint32_t)ROWS * params_qkv_stride_in_bytes_;
-        actual_seqlen -= ROWS;
-    }
-
-    inline __device__ void move(int steps) {
-        // qkv_ptr_ += (int64_t)ROWS * params_qkv_stride_in_bytes_ * steps;
-        qkv_ptr_ += (uint32_t)ROWS * params_qkv_stride_in_bytes_ * steps;
+    inline __device__ void move(const int steps = 1) {
+        // ptr += (int64_t)ROWS * row_stride_in_bytes * steps;
+        ptr += (uint32_t)ROWS * row_stride_in_bytes * steps;
         actual_seqlen -= ROWS * steps;
     }
 
     // The stride between rows for the QKV matrice.
-    // int64_t params_qkv_stride_in_bytes_;
-    uint32_t params_qkv_stride_in_bytes_;
+    // int64_t row_stride_in_bytes;
+    const uint32_t row_stride_in_bytes;
     // The pointer.
-    char *qkv_ptr_;
+    char *ptr;
     // The fetch registers.
     uint4 fetch_[LDGS];
     // Keep track of the row the thread is processing as we move the tile.
@@ -196,10 +189,10 @@ struct Gmem_tile_o {
 
     // Ctor.
     template<typename BInfo>
-    // inline __device__ Gmem_tile_o(void *ptr, const size_t stride_in_elts, const BInfo &binfo, const int tidx)
-    inline __device__ Gmem_tile_o(void *ptr, const uint32_t stride_in_elts, const BInfo &binfo, const int tidx)
-        : stride_in_bytes_(stride_in_elts * BYTES_PER_ELEMENT)
-        , actual_seqlen_(binfo.actual_seqlen)
+    // inline __device__ Gmem_tile_o(void *ptr, const size_t row_stride_in_elts, const BInfo &binfo, const int tidx)
+    inline __device__ Gmem_tile_o(void *ptr, const uint32_t row_stride_in_elts,
+                                  const uint32_t head_stride_in_elts, const BInfo &binfo, const int tidx)
+        : row_stride_in_bytes(row_stride_in_elts * BYTES_PER_ELEMENT)
         , actual_seqlen(binfo.actual_seqlen)
         , ptr_(reinterpret_cast<char *>(ptr))
         , tidx_(tidx) {
@@ -213,8 +206,9 @@ struct Gmem_tile_o {
         // row_ = row;
 
         // The row offset in the batched GEMM.
-        // int64_t row_offset = (int64_t)row * stride_in_bytes_ + binfo.bidx * BYTES_PER_ROW;
-        uint32_t row_offset = (uint32_t)row * stride_in_bytes_ + binfo.bidx * BYTES_PER_ROW;
+        // int64_t row_offset = (int64_t)row * row_stride_in_bytes + binfo.bidx * BYTES_PER_ROW;
+        uint32_t row_offset = (uint32_t)((binfo.sum_s + row) * row_stride_in_bytes);
+        row_offset += (uint32_t)(binfo.bidh * head_stride_in_elts * BYTES_PER_ELEMENT);
         // Assemble the final pointer.
         ptr_ += row_offset + col * BYTES_PER_STG;
 
@@ -224,25 +218,19 @@ struct Gmem_tile_o {
         }
     }
 
-    template<typename Params, typename BInfo>
-    inline __device__ Gmem_tile_o(const Params &params, const BInfo &binfo, const int tidx)
-        : Gmem_tile_o(params.o_ptr, params.o_stride_in_elts, binfo, tidx) {}
-
     // Store data to global memory.
     inline __device__ void store(const uint4 (&src)[STGS_PER_LOOP], int mi) {
         int row_ = tidx_ / THREADS_PER_ROW;
         #pragma unroll
         for( int ii = 0; ii < STGS_PER_LOOP; ++ii ) {
             int jj = mi * STGS_PER_LOOP + ii;
-            // if( this->row_ + jj * ROWS_PER_STG >= this->actual_seqlen_ ) {
-            //     break;
             if( row_ + jj * ROWS_PER_STG >= this->actual_seqlen ) {
                 break;
             }
 
             if (BYTES_PER_ELEMENT == 4) {
                 if( !HAS_INCOMPLETE_STG || (jj < STGS - 1 || this->is_active_for_last_stg_) ) {
-                    fmha::stg(this->ptr_ + jj * ROWS_PER_STG * this->stride_in_bytes_, src[ii]);
+                    fmha::stg(this->ptr_ + jj * ROWS_PER_STG * this->row_stride_in_bytes, src[ii]);
                 }
             } else if (BYTES_PER_ELEMENT == 2) {
                 float x = reinterpret_cast<const float &>(src[ii].x);
@@ -251,7 +239,7 @@ struct Gmem_tile_o {
                 float w = reinterpret_cast<const float &>(src[ii].w);
                 uint2 out = float4_to_half4(x, y, z, w);
                 if( !HAS_INCOMPLETE_STG || (jj < STGS - 1 || this->is_active_for_last_stg_) ) {
-                    fmha::stg(this->ptr_ + jj * ROWS_PER_STG * this->stride_in_bytes_, out);
+                    fmha::stg(this->ptr_ + jj * ROWS_PER_STG * this->row_stride_in_bytes, out);
                 }
             }
         }
@@ -269,37 +257,26 @@ struct Gmem_tile_o {
             }
 
             if( !HAS_INCOMPLETE_STG || (jj < STGS - 1 || this->is_active_for_last_stg_) ) {
-                fmha::ldg(dst[ii], this->ptr_ + jj * ROWS_PER_STG * this->stride_in_bytes_);
+                fmha::ldg(dst[ii], this->ptr_ + jj * ROWS_PER_STG * this->row_stride_in_bytes);
             }
         }
     }
 
-    // Move the pointer to the next location.
-    inline __device__ void move() {
-        // row_ += ROWS;
-        // ptr_ += (int64_t)ROWS * stride_in_bytes_;
-        ptr_ += (uint32_t)ROWS * stride_in_bytes_;
-        actual_seqlen -= ROWS;
-    }
-
-    inline __device__ void move(const int steps) {
+    inline __device__ void move(const int steps = 1) {
         // row_ += ROWS * steps;
-        // ptr_ += (int64_t)ROWS * stride_in_bytes_ * steps;
-        ptr_ += (uint32_t)ROWS * stride_in_bytes_ * steps;
+        // ptr_ += (int64_t)ROWS * row_stride_in_bytes * steps;
+        ptr_ += (uint32_t)ROWS * row_stride_in_bytes * steps;
         actual_seqlen -= ROWS * steps;
     }
 
     // The stride between rows for the QKV matrice.
-    // int64_t stride_in_bytes_;
-    uint32_t stride_in_bytes_;
+    // int64_t row_stride_in_bytes;
+    const uint32_t row_stride_in_bytes;
     // The pointer.
     char *ptr_;
     // Is the thread active for the last STG?
     int is_active_for_last_stg_;
-    // Keep track of the row to disable loads.
-    // int row_;
     // The length of the sequence loaded by that memory tile.
-    const int actual_seqlen_;
     int actual_seqlen;
     const int tidx_;
 };
@@ -363,10 +340,7 @@ struct Gmem_tile_mma_sd {
     }
 
     // Move to the next tile.
-    inline __device__ void move() {
-        ptr_ += LOOP_STRIDE_BYTES;
-    }
-    inline __device__ void move(const int steps) {
+    inline __device__ void move(const int steps = 1) {
         ptr_ += LOOP_STRIDE_BYTES * steps;
     }
 
@@ -454,69 +428,6 @@ struct Gmem_tile_mma_s : public Base {
                 }
             }
         }
-    }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template<
-    // The dimensions of the tile computed by the CTA.
-    typename Cta_tile,
-    // The base class.
-    typename Base = fmha::Gmem_tile_qkv<Cta_tile, fmha::BITS_PER_ELEMENT_A, Cta_tile::M, Cta_tile::K>
->
-struct Gmem_tile_dout : public Base {
-
-    // Ctor.
-    template<typename Params, typename BInfo>
-    inline __device__ Gmem_tile_dout(void *ptr, const Params &params, const BInfo &binfo, int tidx)
-        : Base(params, 0, binfo, tidx) {
-
-        // this->qkv_ptr_ = reinterpret_cast<char *>(params.do_ptr);
-        this->qkv_ptr_ = static_cast<char *>(ptr);
-        this->params_qkv_stride_in_bytes_ = params.o_stride_in_bytes;  // needed for move
-
-        // Compute the position in the sequence (within the CTA for the moment).
-        int row = tidx / Base::THREADS_PER_ROW;
-        // Compute the position of the thread in the row.
-        int col = tidx % Base::THREADS_PER_ROW;
-
-        // The row offset in the batched GEMM. For each seq element, we store O in that order.
-        // int64_t row_offset = (int64_t)this->row_ * params.o_stride_in_bytes + binfo.bidx * Base::BYTES_PER_ROW;
-        // int64_t row_offset = (int64_t)row * params.o_stride_in_bytes + binfo.bidx * Base::BYTES_PER_ROW;
-        uint32_t row_offset = (uint32_t)row * params.o_stride_in_bytes + binfo.bidx * Base::BYTES_PER_ROW;
-
-        // Assemble the final pointer.
-        this->qkv_ptr_ += row_offset + col * Base::BYTES_PER_LDG;
-    }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template< typename Cta_tile, typename Base = fmha::Gmem_tile_o<Cta_tile> >
-struct Gmem_tile_dq : public Base {
-
-    // Ctor.
-    template<typename Params, typename BInfo>
-    inline __device__ Gmem_tile_dq(const Params &params, const int qkv_offset, const BInfo &binfo, int tidx)
-        : Base(params.dqkv_ptr, params.qkv_stride_in_elts, binfo, tidx) {
-        this->ptr_ = reinterpret_cast<char *>(params.dqkv_ptr);
-
-        // Compute the position in the sequence (within the CTA for the moment).
-        int row = tidx / Base::THREADS_PER_ROW;
-        // Compute the position of the thread in the row.
-        int col = tidx % Base::THREADS_PER_ROW;
-
-        // The row offset in the batched GEMM. For each seq element, we store O in that order.
-        // int64_t row_offset = (int64_t)this->row_ * params.qkv_stride_in_bytes +
-        //     ((binfo.sum_s * 3 + qkv_offset) * binfo.h + binfo.bidh) * Base::BYTES_PER_ROW;
-        // int64_t row_offset = (int64_t)row * this->stride_in_bytes_ +
-        //     ((binfo.sum_s * 3 + qkv_offset) * binfo.h + binfo.bidh) * Base::BYTES_PER_ROW;
-        uint32_t row_offset = (uint32_t)row * this->stride_in_bytes_ +
-            ((binfo.sum_s * 3 + qkv_offset) * binfo.h + binfo.bidh) * Base::BYTES_PER_ROW;
-
-        // Assemble the final pointer.
-        this->ptr_ += row_offset + col * Base::BYTES_PER_STG;
     }
 };
 

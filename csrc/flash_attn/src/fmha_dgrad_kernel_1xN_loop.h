@@ -80,8 +80,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
     using Gmem_tile_o = Gmem_tile_do;
 
     // The global memory tile to store dQ.
-    // using Gmem_tile_dq = typename Kernel_traits::Gmem_tile_dq;
-    using Gmem_tile_dq = fmha::Gmem_tile_dq<Cta_tile_dq>;
+    using Gmem_tile_dq = typename Kernel_traits::Gmem_tile_o;
     using Gmem_tile_dq_tmp = fmha::Gmem_tile_o<Cta_tile_dq, 4>;
     // The shared memory tile to swizzle dQ.
     using Smem_tile_dq = typename Kernel_traits::Smem_tile_o;
@@ -132,19 +131,19 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
 
     Gemm1 gemm_q_k(&smem_[Smem_tile_do::BYTES_PER_TILE], tidx);
     // Allocate the global memory tile loader for Q.
-    Gmem_tile_q gmem_q(params, 0, binfo, tidx);
+    Gmem_tile_q gmem_q(params.q_ptr, params.q_row_stride_in_elts, params.q_head_stride_in_elts, binfo, tidx);
     // Allocate the global memory tile loader for dQ.
-    Gmem_tile_dq gmem_dq(params, 0, binfo, tidx);
-    Gmem_tile_dq_tmp gmem_dq_tmp(params.o_tmp_ptr, params.o_stride_in_elts, binfo, tidx);
+    Gmem_tile_dq gmem_dq(params.dqkv_ptr, params.q_row_stride_in_elts, params.q_head_stride_in_elts, binfo, tidx);
+    Gmem_tile_dq_tmp gmem_dq_tmp(params.o_tmp_ptr, params.o_row_stride_in_elts, params.o_head_stride_in_elts, binfo, tidx);
     // Allocate the global memory tile loader for S.
     Gmem_tile_s gmem_s(params, binfo, tidx);
 
     fmha::Mask<Cta_tile_p, Is_causal> mask(binfo, tidx, loop_step_idx);
 
     // Allocate the global memory tile loader for K.
-    Gmem_tile_k gmem_k(params, 1, binfo, tidx);
+    Gmem_tile_k gmem_k(params.k_ptr, params.k_row_stride_in_elts, params.k_head_stride_in_elts, binfo, tidx);
     // Allocate the global memory tile loader for V.
-    Gmem_tile_v gmem_v(params, 2, binfo, tidx);
+    Gmem_tile_v gmem_v(params.v_ptr, params.v_row_stride_in_elts, params.v_head_stride_in_elts, binfo, tidx);
     // The base pointer of smem_v;
     char *smem_v_ = &smem_[Smem_tile_do::BYTES_PER_TILE + Gemm1::SMEM_OFFSET_V];
 
@@ -154,7 +153,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
     Smem_tile_kt smem_kt(&smem_[Smem_tile_do::BYTES_PER_TILE + Gemm1::Smem_tile_q::BYTES_PER_TILE], tidx);
 
     // Allocate the global memory tile loader for dO.
-    Gmem_tile_do gmem_do(params.do_ptr, params, binfo, tidx);
+    Gmem_tile_do gmem_do(params.do_ptr, params.o_row_stride_in_elts, params.o_head_stride_in_elts, binfo, tidx);
     // Allocate the shared memory tile loader for dO.
     Smem_tile_do smem_do(&smem_[0], tidx);
     Smem_tile_dot smem_dot(&smem_[0], tidx);
@@ -166,7 +165,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
     Smem_tile_st smem_dp(&smem_[Smem_tile_do::BYTES_PER_TILE + Gemm1::SMEM_OFFSET_O + Smem_tile_dq::BYTES_PER_TILE + Smem_tile_st::BYTES_PER_TILE], tidx);
 
     // Allocate the global memory tile loader for O.
-    Gmem_tile_o gmem_o(params.o_ptr, params, binfo, tidx);
+    Gmem_tile_o gmem_o(params.o_ptr, params.o_row_stride_in_elts, params.o_head_stride_in_elts, binfo, tidx);
 
     // Allocate the shared memory tile loader for O. We use the same as K so be careful!!!
     Smem_tile_dq smem_dq(&smem_[Smem_tile_do::BYTES_PER_TILE + Gemm1::SMEM_OFFSET_O], tidx);
@@ -654,11 +653,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
     __syncthreads();
     uint4 dv_out[Smem_tile_dv::NUM_LDS];
     smem_dv.load(dv_out);
-    Qkv_params dv_params;
-    dv_params.qkv_ptr = params.dqkv_ptr;
-    dv_params.qkv_stride_in_bytes = params.qkv_stride_in_bytes;
-    dv_params.h = params.h;
-    Gmem_tile_dv gmem_dv(dv_params, 2, binfo, tidx);
+    Gmem_tile_dv gmem_dv(params.dqkv_ptr + 2 * params.h * params.d * 2, params.v_row_stride_in_elts, params.v_head_stride_in_elts, binfo, tidx);
     if (!Is_first) {
         gmem_dv.move(loop_step_idx);
     }
@@ -669,11 +664,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
     // for (int ii = 0; ii < Smem_tile_dk::NUM_LDS; ++ii) {
     //     dk_out[ii] = fmha::fmul4(dk_out[ii], params.scale_bmm1f);
     // }
-    Qkv_params dk_params;
-    dk_params.qkv_ptr = params.dqkv_ptr;
-    dk_params.qkv_stride_in_bytes = params.qkv_stride_in_bytes;
-    dk_params.h = params.h;
-    Gmem_tile_dk gmem_dk(dk_params, 1, binfo, tidx);
+    Gmem_tile_dk gmem_dk(params.dqkv_ptr + params.h * params.d * 2, params.k_row_stride_in_elts, params.k_head_stride_in_elts, binfo, tidx);
     if (!Is_first) {
         gmem_dk.move(loop_step_idx);
     }

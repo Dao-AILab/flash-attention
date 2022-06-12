@@ -50,15 +50,21 @@ constexpr int D_DIM = 3;
 
 struct Qkv_params {
     // The QKV matrices.
-    void * __restrict__ qkv_ptr;
+    void *__restrict__ q_ptr;
+    void *__restrict__ k_ptr;
+    void *__restrict__ v_ptr;
 
     // The stride between rows of the Q, K and V matrices.
     // size_t qkv_stride_in_elts;
     // size_t qkv_stride_in_bytes;
     // TD [2022-04-16]: We're using 32-bit indexing to save registers.
     // The code probably won't work for arrays larger than 2GB.
-    uint32_t qkv_stride_in_elts;
-    uint32_t qkv_stride_in_bytes;
+    uint32_t q_row_stride_in_elts;
+    uint32_t k_row_stride_in_elts;
+    uint32_t v_row_stride_in_elts;
+    uint32_t q_head_stride_in_elts;
+    uint32_t k_head_stride_in_elts;
+    uint32_t v_head_stride_in_elts;
 
     // The number of heads.
     int h;
@@ -71,17 +77,14 @@ struct Fused_multihead_attention_fprop_params : public Qkv_params {
     // The dQKV matrices.
     void * __restrict__ dqkv_ptr;
 
-    // Temporary for dKV.
-    void * __restrict__ dkv_ptr;
-
     // The O matrix (output).
     void * __restrict__ o_ptr;
 
     // The stride between rows of O.
     // size_t o_stride_in_elts;
     // size_t o_stride_in_bytes;
-    uint32_t o_stride_in_elts;
-    uint32_t o_stride_in_bytes;
+    uint32_t o_row_stride_in_elts;
+    uint32_t o_head_stride_in_elts;
 
     // The pointer to the O_tmp matrix, which holds O intermediate value during
     // the loop;
