@@ -71,6 +71,14 @@ Memory savings are proportional to sequence length -- since standard attention h
 We see 10X memory savings at sequence length 2K, and 20X at 4K.
 As a result, FlashAttention can scale to much longer sequence lengths.
 
+#### Head Dimension 128
+
+![FlashAttention speedup, head dimension 128](assets/flashattn_speedup_a100_d128.jpg)
+
+We show speedup with head dimension 128.
+Here we show batch size 16 with 12 heads.
+Speedup is less than with the smaller head sizes, but speedup is still significant -- especially with a causal mask.
+
 ### RTX 3090
 
 For the RTX 3090, we use batch size 12 with 12 attention heads.
