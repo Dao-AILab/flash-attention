@@ -77,7 +77,8 @@ As a result, FlashAttention can scale to much longer sequence lengths.
 
 We show speedup with head dimension 128.
 Here we show batch size 16 with 12 heads.
-Speedup is less than with the smaller head sizes, but speedup is still significant -- especially with a causal mask.
+Speedup is less than with the smaller head sizes, since we have to make the block size smaller in the tiling.
+But speedup is still significant, especially with a causal mask.
 
 ### RTX 3090
 
