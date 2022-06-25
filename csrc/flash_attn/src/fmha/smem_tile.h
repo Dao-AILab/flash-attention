@@ -1204,6 +1204,8 @@ struct Smem_tile_o {
                 this->smem_write_ ^= 7 * 32;
             } else if( Mma_tile::MMAS_N >= 2 ) {
                 this->smem_write_ ^= 3 * 32;
+            } else {
+                this->smem_write_ ^= 3 * 32;
             }
             // this->smem_write_ ^= (ni & 1) ? 7 * 32 : 3 * 32;
             // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0))  {
