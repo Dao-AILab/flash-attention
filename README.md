@@ -104,6 +104,16 @@ T4 GPUs are commonly used for inference, so we also measure speedup on the forwa
 
 We see speedups between 2.5x-4.5x on the forward pass.
 
+## When you encounter issues
+
+This alpha release of FlashAttention contains code written for a research
+project to validate ideas on speeding up attention. 
+We have tested it on several models (BERT, GPT2, ViT). 
+However, there might still be bugs in the implementation that we hope to iron
+out in the next few months.
+
+If you encounter any of these bugs, please open a respective GitHub Issue!
+
 ## Acknowledgments
 Our implementation uses Apex's
 [FMHA](https://github.com/NVIDIA/apex/tree/master/apex/contrib/csrc/fmha) code
