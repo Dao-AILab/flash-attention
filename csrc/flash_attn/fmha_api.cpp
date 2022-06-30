@@ -107,6 +107,7 @@ void set_params_fprop(FMHA_fprop_params &params,
     params.p_dropout_in_uint = uint32_t(std::floor(params.p_dropout * 4294967295.0));
     params.p_dropout_in_uint16_t = uint16_t(std::floor(params.p_dropout * 65535.0));
     params.rp_dropout = 1.f / params.p_dropout;
+    params.scale_bmm1_rp_dropout = params.rp_dropout * params.scale_bmm1f;
     TORCH_CHECK(p_dropout < 1.f);
     set_alpha(params.scale_dropout, params.rp_dropout, data_type);
 

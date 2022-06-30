@@ -13,13 +13,13 @@ namespace fmha {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int ROWS, int THREADS_PER_ROW, int M, typename Gmem_softmax_sum>
-inline __device__ void dot_do_o(const uint4 (&do_)[M], const uint4 (&o)[M],
+inline __device__ void dot_do_o(const uint4 (&do_)[M], const uint4 (&o)[M], const float scale,
                                 Gmem_softmax_sum gmem_softmax_d, int tidx) {
     float sum[M];
     fmha::SumOp<float> sum_op;
     #pragma unroll
     for (int mi = 0; mi < M; ++mi) {
-        sum[mi] = fmha::Allreduce<THREADS_PER_ROW>::run(fmha::hmulsum8(do_[mi], o[mi]), sum_op);
+        sum[mi] = fmha::Allreduce<THREADS_PER_ROW>::run(fmha::hmulsum8(do_[mi], o[mi]), sum_op) * scale;
     }
     const int dp_sum_row = tidx / THREADS_PER_ROW;
     if ((dp_sum_row < ROWS) && (tidx % THREADS_PER_ROW == 0)) {
@@ -213,18 +213,18 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
     gmem_do.commit(smem_do);
     if (Is_first) {
         dot_do_o<Gmem_tile_do::ROWS, Gmem_tile_do::THREADS_PER_ROW>(
-            gmem_do.fetch_, gmem_o.fetch_, gmem_softmax_d, tidx
+            gmem_do.fetch_, gmem_o.fetch_, params.p_dropout, gmem_softmax_d, tidx
         );
     }
 
-    // Instead of scaling dP by rp_dropout, we scale V instead
-    if (Is_dropout) {
-        const uint32_t scale_dropout = params.scale_dropout;
-        #pragma unroll
-        for(int it=0; it < Gmem_tile_v::LDGS; it++){
-            gmem_v.fetch_[it] = fmha::hmul8(scale_dropout, gmem_v.fetch_[it]);
-        }
-    }
+    // // Instead of scaling dP by rp_dropout, we scale V instead
+    // if (Is_dropout) {
+    //     const uint32_t scale_dropout = params.scale_dropout;
+    //     #pragma unroll
+    //     for(int it=0; it < Gmem_tile_v::LDGS; it++){
+    //         gmem_v.fetch_[it] = fmha::hmul8(scale_dropout, gmem_v.fetch_[it]);
+    //     }
+    // }
 
     gmem_v.commit(smem_v);
 
@@ -518,7 +518,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
             gmem_do.commit(smem_do);
             if (Is_first) {
                 dot_do_o<Gmem_tile_do::ROWS, Gmem_tile_do::THREADS_PER_ROW>(
-                    gmem_do.fetch_, gmem_o.fetch_, gmem_softmax_d, tidx
+                    gmem_do.fetch_, gmem_o.fetch_, params.p_dropout, gmem_softmax_d, tidx
                 );
             }
             gmem_softmax_lse.load(reinterpret_cast<uint32_t(&)[Mma_tile_p::MMAS_M * 2]>(p_lse));
@@ -569,7 +569,8 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
             //     dq_out[0] = fmha::fmul4(dq_out[0], params.rp_dropout);
             // }
             for (int jj = 0; jj < Gmem_tile_dq::STGS_PER_LOOP; ++jj) {
-                dq_out[jj] = fmha::fmul4(dq_out[jj], params.scale_bmm1f);
+                // dq_out[jj] = fmha::fmul4(dq_out[jj], params.scale_bmm1f);
+                dq_out[jj] = fmha::fmul4(dq_out[jj], params.scale_bmm1_rp_dropout);
             }
             // Output the values.
             gmem_dq.store(dq_out, 0);
@@ -613,7 +614,8 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
     for( int mi = 0; mi < Mma_tile_dkv::MMAS_M; mi++ ) {
         for( int ni = 0; ni < Mma_tile_dkv::MMAS_N; ni++ ) {
             // acc_dk[mi][ni].mul_(Is_dropout ? params.rp_dropout * params.scale_bmm1f : params.scale_bmm1f);
-            acc_dk[mi][ni].mul_(params.scale_bmm1f);
+            // acc_dk[mi][ni].mul_(params.scale_bmm1f);
+            acc_dk[mi][ni].mul_(params.scale_bmm1_rp_dropout);
         }
     }
     // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0))  {

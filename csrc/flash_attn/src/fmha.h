@@ -115,6 +115,7 @@ struct FMHA_fprop_params : public Qkv_params {
 
     // Scale factor of 1 / (1 - p_dropout).
     float rp_dropout;
+    float scale_bmm1_rp_dropout;
 
     // Scale factor of 1 / (1 - p_dropout), in half2.
     uint32_t scale_dropout;
