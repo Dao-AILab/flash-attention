@@ -44,7 +44,7 @@ void run_fmha_dgrad_fp16_sm80_loop_(const Fused_multihead_attention_fprop_params
         FMHA_CHECK_CUDA(cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
     }
-    dim3 grid(params.h, params.b);
+    dim3 grid(params.b, params.h);
     kernel<<<grid, Kernel_traits::THREADS, smem_size_dq_dk_dv, stream>>>(params);
     FMHA_CHECK_CUDA(cudaPeekAtLastError());
 }

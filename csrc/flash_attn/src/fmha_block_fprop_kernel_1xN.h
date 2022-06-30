@@ -497,9 +497,9 @@ template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Return_so
 inline __device__ void device_block_1xN_loop(const Params &params) {
 
     // The block index for the batch.
-    const int bidb = blockIdx.y;
+    const int bidb = blockIdx.x;
     // The block index for the head.
-    const int bidh = blockIdx.x;
+    const int bidh = blockIdx.y;
     // The thread index.
     const int tidx = threadIdx.x;
 

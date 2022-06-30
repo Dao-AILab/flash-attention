@@ -119,9 +119,9 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
 
 
     // The block index for the batch.
-    const int bidb = blockIdx.y;
+    const int bidb = blockIdx.x;
     // The block index for the head.
-    const int bidh = blockIdx.x;
+    const int bidh = blockIdx.y;
     // The thread index.
     const int tidx = threadIdx.x;
 
@@ -683,9 +683,9 @@ inline __device__ void compute_dq_dk_dv_1xN(const Params &params) {
     constexpr int N_per_loop = Kernel_traits::Cta_tile_p::N;
 
     // The block index for the batch.
-    const int bidb = blockIdx.y;
+    const int bidb = blockIdx.x;
     // The block index for the head.
-    const int bidh = blockIdx.x;
+    const int bidh = blockIdx.y;
     // The thread index.
     const int tidx = threadIdx.x;
 

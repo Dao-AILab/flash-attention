@@ -68,7 +68,7 @@ void run_fmha_fp16_sm80_loop_(Launch_params<Fused_multihead_attention_fprop_para
         return;
     }
 
-    dim3 grid(launch_params.params.h, launch_params.params.b);
+    dim3 grid(launch_params.params.b, launch_params.params.h);
     kernel<<<grid, Kernel_traits::THREADS, smem_size, launch_params.stream>>>(
         launch_params.params);
 

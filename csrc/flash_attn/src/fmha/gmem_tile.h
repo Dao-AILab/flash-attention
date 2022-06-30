@@ -456,9 +456,9 @@ struct Gmem_summary_stats {
         : ptr_(reinterpret_cast<char *>(ptr)), tidx_(tidx) {
 
         // The block index for the batch.
-        const int bidb = blockIdx.y;
+        const int bidb = blockIdx.x;
         // The block index for the head.
-        const int bidh = blockIdx.x;
+        const int bidh = blockIdx.y;
         // The block index.
         // size_t bidx = bidb * params.h + bidh;
         uint32_t bidx = bidb * params.h + bidh;
