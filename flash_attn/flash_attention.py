@@ -5,7 +5,7 @@ import torch.nn as nn
 from einops import rearrange
 
 from flash_attn.rotary import RotaryEmbedding, RotaryEmbedding2D
-from flash_attn.flash_attn_interface import flash_attn_func
+from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
 from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
 
 
@@ -13,15 +13,15 @@ class FlashAttention(nn.Module):
     """Implement the scaled dot product attention with softmax.
     Arguments
     ---------
-        softmax_temp: The temperature to use for the softmax attention.
+        softmax_scale: The temperature to use for the softmax attention.
                       (default: 1/sqrt(d_keys) where d_keys is computed at
                       runtime)
         attention_dropout: The dropout rate to apply to the attention
                            (default: 0.1)
     """
-    def __init__(self, softmax_temp=None, attention_dropout=0.0, device=None, dtype=None):
+    def __init__(self, softmax_scale=None, attention_dropout=0.0, device=None, dtype=None):
         super().__init__()
-        self.softmax_temp = softmax_temp
+        self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
 
     def forward(self, qkv, attn_mask=None, key_padding_mask=None, causal=False, cu_seqlens=None,
@@ -49,8 +49,10 @@ class FlashAttention(nn.Module):
                 max_s = seqlen
                 cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32,
                                         device=qkv.device)
-                output = flash_attn_func(qkv, cu_seqlens, self.dropout_p if self.training else 0.0,
-                                        max_s, softmax_scale=self.softmax_temp, causal=causal)
+                output = flash_attn_unpadded_qkvpacked_func(
+                    qkv, cu_seqlens, max_s, self.dropout_p if self.training else 0.0,
+                    softmax_scale=self.softmax_scale, causal=causal
+                )
                 output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
             else:
                 key_padding_mask_bool = key_padding_mask.bool_matrix
@@ -58,17 +60,19 @@ class FlashAttention(nn.Module):
                 x = rearrange(qkv, 'b s three h d -> b s (three h d)')
                 x_unpad, indices, cu_seqlens, max_s = unpad_input(x, key_padding_mask_bool)
                 x_unpad = rearrange(x_unpad, 'nnz (three h d) -> nnz three h d', three=3, h=nheads)
-                output_unpad = flash_attn_func(x_unpad, cu_seqlens,
-                                                self.dropout_p if self.training else 0.0,
-                                                max_s, softmax_scale=self.softmax_temp, causal=causal)
+                output_unpad = flash_attn_unpadded_qkvpacked_func(
+                    x_unpad, cu_seqlens, max_s, self.dropout_p if self.training else 0.0,
+                    softmax_scale=self.softmax_scale, causal=causal
+                )
                 output = rearrange(pad_input(rearrange(output_unpad, 'nnz h d -> nnz (h d)'),
                                             indices, batch_size, seqlen),
                                 'b s (h d) -> b s h d', h=nheads)
         else:
             assert max_s is not None
-            output = flash_attn_func(qkv, cu_seqlens,
-                                      self.dropout_p if self.training else 0.0,
-                                      max_s, softmax_scale=self.softmax_temp, causal=causal)
+            output = flash_attn_unpadded_qkvpacked_func(
+                qkv, cu_seqlens, max_s, self.dropout_p if self.training else 0.0,
+                softmax_scale=self.softmax_scale, causal=causal
+            )
 
         return output, None
 

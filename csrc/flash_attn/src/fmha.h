@@ -42,9 +42,8 @@
 
 
 constexpr int TOTAL_DIM = 0;
-constexpr int THREE_DIM = 1;
-constexpr int H_DIM = 2;
-constexpr int D_DIM = 3;
+constexpr int H_DIM = 1;
+constexpr int D_DIM = 2;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -72,10 +71,7 @@ struct Qkv_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct Fused_multihead_attention_fprop_params : public Qkv_params {
-
-    // The dQKV matrices.
-    void * __restrict__ dqkv_ptr;
+struct FMHA_fprop_params : public Qkv_params {
 
     // The O matrix (output).
     void * __restrict__ o_ptr;
@@ -90,10 +86,7 @@ struct Fused_multihead_attention_fprop_params : public Qkv_params {
     // the loop;
     void *__restrict__ o_tmp_ptr;
 
-    // The dO matrix .
-    void * __restrict__ do_ptr;
-
-    // The pointer to the S matrix, overwritten by the dP matrix (bwd).
+    // The pointer to the S matrix.
     void * __restrict__ s_ptr;
     // The stride between rows of the S matrix.
     // int64_t s_stride_in_bytes;
@@ -102,18 +95,16 @@ struct Fused_multihead_attention_fprop_params : public Qkv_params {
     // The pointer to the softmax sum.
     void * __restrict__ softmax_lse_ptr;
 
-    // The pointer to the softmax d sum.
-    void * __restrict__ dsoftmax_sum;
-
     // The dimensions.
-    int b, s, d;
+    int b, seqlen_q, seqlen_k, d, seqlen_q_rounded;
 
     // The scaling factors for the kernel.
     float scale_bmm1f;
-    uint32_t scale_bmm1, scale_softmax, scale_bmm2;
+    uint32_t scale_bmm1;
 
     // array of length b+1 holding starting offset of each sequence.
-    int * __restrict__ cu_seqlens;
+    int * __restrict__ cu_seqlens_q;
+    int * __restrict__ cu_seqlens_k;
 
     int *__restrict__ blockmask;
 
@@ -136,7 +127,33 @@ struct Fused_multihead_attention_fprop_params : public Qkv_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_params> 
+struct FMHA_dgrad_params : public FMHA_fprop_params {
+
+    // The dQKV matrices.
+    void *__restrict__ dq_ptr;
+    void *__restrict__ dk_ptr;
+    void *__restrict__ dv_ptr;
+
+    // The stride between rows of the dQ, dK and dV matrices.
+    // TD [2022-04-16]: We're using 32-bit indexing to save registers.
+    // The code probably won't work for arrays larger than 2GB.
+    uint32_t dq_row_stride_in_elts;
+    uint32_t dk_row_stride_in_elts;
+    uint32_t dv_row_stride_in_elts;
+    uint32_t dq_head_stride_in_elts;
+    uint32_t dk_head_stride_in_elts;
+    uint32_t dv_head_stride_in_elts;
+
+    // The dO matrix. We assume it is contiguous.
+    void * __restrict__ do_ptr;
+
+    // The pointer to the softmax d sum.
+    void * __restrict__ dsoftmax_sum;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<typename Kernel_params>
 struct Launch_params{
     Launch_params(cudaDeviceProp * props_,
                   cudaStream_t stream_,
@@ -168,10 +185,10 @@ struct Launch_params{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void run_fmha_fp16_sm80(Launch_params<Fused_multihead_attention_fprop_params> &launch_params, const bool configure);
+void run_fmha_fp16_sm80(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
 
-void run_fmha_dgrad_fp16_sm80(const Fused_multihead_attention_fprop_params &params, cudaStream_t stream);
+void run_fmha_dgrad_fp16_sm80(const FMHA_dgrad_params &params, cudaStream_t stream);
 
-void run_fmha_block_fp16_sm80(Launch_params<Fused_multihead_attention_fprop_params> &launch_params, const bool configure);
+void run_fmha_block_fp16_sm80(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
 
-void run_fmha_block_dgrad_fp16_sm80(const Fused_multihead_attention_fprop_params &params, cudaStream_t stream);
+void run_fmha_block_dgrad_fp16_sm80(const FMHA_dgrad_params &params, cudaStream_t stream);

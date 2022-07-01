@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022, Tri Dao.
  * Copyright (c) 2011-2021, NVIDIA CORPORATION.  All rights reserved.
  * 
  * Redistribution and use in source and binary forms, with or without
@@ -30,24 +31,29 @@
 
 #include "fmha.h"
 
-void set_params(Fused_multihead_attention_fprop_params &params,
-                // sizes
-                const size_t b,
-                const size_t s,
-                const size_t h,
-                const size_t d,
-                // device pointers
-                void *qkv_packed_d,
-                void *cu_seqlens_d,
-                void *o_packed_d,
-                void *o_tmp_d,
-                void *do_packed_d,
-                void *s_d,
-                void *softmax_lse_d,
-                void *dsoftmax_sum_d,
-                float p_dropout,
-                float softmax_scale,
-                bool is_causal) {
+#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+
+
+void set_params_fprop(FMHA_fprop_params &params,
+                      // sizes
+                      const size_t b,
+                      const size_t seqlen_q,
+                      const size_t seqlen_k,
+                      const size_t h,
+                      const size_t d,
+                      // device pointers
+                      const at::Tensor q,
+                      const at::Tensor k,
+                      const at::Tensor v,
+                      void *cu_seqlens_q_d,
+                      void *cu_seqlens_k_d,
+                      void *o_packed_d,
+                      void *o_tmp_d,
+                      void *s_d,
+                      void *softmax_lse_d,
+                      float p_dropout,
+                      float softmax_scale,
+                      bool is_causal) {
 
     Data_type acc_type = DATA_TYPE_FP32;
     Data_type data_type = DATA_TYPE_FP16;
@@ -56,47 +62,43 @@ void set_params(Fused_multihead_attention_fprop_params &params,
     memset(&params, 0, sizeof(params));
 
     // Set the pointers and strides.
-    params.q_ptr = qkv_packed_d;
-    params.k_ptr = qkv_packed_d + get_size_in_bytes(h * d, data_type);
-    params.v_ptr = qkv_packed_d + 2 * get_size_in_bytes(h * d, data_type);
-    params.q_row_stride_in_elts = 3 * h * d;
-    params.k_row_stride_in_elts = 3 * h * d;
-    params.v_row_stride_in_elts = 3 * h * d;
-    params.q_head_stride_in_elts = d;
-    params.k_head_stride_in_elts = d;
-    params.v_head_stride_in_elts = d;
+    params.q_ptr = q.data_ptr();
+    params.k_ptr = k.data_ptr();
+    params.v_ptr = v.data_ptr();
+    params.q_row_stride_in_elts = q.stride(0);
+    params.k_row_stride_in_elts = k.stride(0);
+    params.v_row_stride_in_elts = v.stride(0);
+    params.q_head_stride_in_elts = q.stride(1);
+    params.k_head_stride_in_elts = k.stride(1);
+    params.v_head_stride_in_elts = v.stride(1);
     params.o_ptr = o_packed_d;
     params.o_row_stride_in_elts = h * d;
     params.o_head_stride_in_elts = d;
-    params.do_ptr = do_packed_d;
     params.o_tmp_ptr = o_tmp_d;
 
-    params.cu_seqlens = static_cast<int *>(cu_seqlens_d);
+    params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
+    params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
 
     // S = softmax(P)
     params.s_ptr = s_d;
-    params.s_stride_in_bytes = get_size_in_bytes(b * h * s, data_type);
+    params.s_stride_in_bytes = get_size_in_bytes(b * h * seqlen_k, data_type);
 
     // Softmax sum
     params.softmax_lse_ptr = softmax_lse_d;
-    params.dsoftmax_sum = dsoftmax_sum_d;
 
     // Set the dimensions.
     params.b = b;
     params.h = h;
-    params.s = s;
+    params.seqlen_q = seqlen_q;
+    params.seqlen_k = seqlen_k;
     params.d = d;
 
     // Set the different scale values.
     // const float scale_bmm1 = 1.f / sqrtf(d);
     const float scale_bmm1 = softmax_scale;
-    constexpr float scale_softmax = 1.f;
-    constexpr float scale_bmm2 = 1.f;
 
     params.scale_bmm1f = scale_bmm1;
     set_alpha(params.scale_bmm1, scale_bmm1, data_type);
-    set_alpha(params.scale_softmax, scale_softmax, acc_type);
-    set_alpha(params.scale_bmm2, scale_bmm2, data_type);
 
     // Set this to probability of keeping an element to simplify things.
     params.p_dropout = 1.f - p_dropout;
@@ -111,11 +113,69 @@ void set_params(Fused_multihead_attention_fprop_params &params,
     params.is_causal = is_causal;
 }
 
+void set_params_dgrad(FMHA_dgrad_params &params,
+                      // sizes
+                      const size_t b,
+                      const size_t seqlen_q,
+                      const size_t seqlen_k,
+                      const size_t h,
+                      const size_t d,
+                      // device pointers
+                      const at::Tensor q,
+                      const at::Tensor k,
+                      const at::Tensor v,
+                      at::Tensor dq,
+                      at::Tensor dk,
+                      at::Tensor dv,
+                      void *cu_seqlens_q_d,
+                      void *cu_seqlens_k_d,
+                      void *o_packed_d,
+                      void *dq_tmp_d,
+                      void *do_packed_d,
+                      void *softmax_lse_d,
+                      void *dsoftmax_sum_d,
+                      float p_dropout,
+                      float softmax_scale,
+                      bool is_causal) {
+
+    set_params_fprop(params,
+                     b, seqlen_q, seqlen_k, h, d,
+                     q, k, v,
+                     cu_seqlens_q_d,
+                     cu_seqlens_k_d,
+                     o_packed_d,
+                     dq_tmp_d,  // Reusing the o_tmp_ptr variable to store dq_tmp
+                     nullptr,
+                     softmax_lse_d,
+                     p_dropout,
+                     softmax_scale,
+                     is_causal);
+
+    // Set the pointers and strides.
+    params.dq_ptr = dq.data_ptr();
+    params.dk_ptr = dk.data_ptr();
+    params.dv_ptr = dv.data_ptr();
+    params.dq_row_stride_in_elts = dq.stride(0);
+    params.dk_row_stride_in_elts = dk.stride(0);
+    params.dv_row_stride_in_elts = dv.stride(0);
+    params.dq_head_stride_in_elts = dq.stride(1);
+    params.dk_head_stride_in_elts = dk.stride(1);
+    params.dv_head_stride_in_elts = dv.stride(1);
+    params.do_ptr = do_packed_d;
+
+    // Softmax sum
+    params.dsoftmax_sum = dsoftmax_sum_d;
+}
+
 std::vector<at::Tensor>
-mha_fwd(const at::Tensor &qkv,         // total x num_heads x 3 x head_size, total := \sum_{i=0}^{b} s_i
-        const at::Tensor &cu_seqlens,  // b+1
+mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+        const at::Tensor &k,         // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const at::Tensor &v,         // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const at::Tensor &cu_seqlens_q,  // b+1
+        const at::Tensor &cu_seqlens_k,  // b+1
+        const int max_seqlen_q_,
+        const int max_seqlen_k_,
         const float p_dropout,
-        const int max_seq_len,
         const float softmax_scale,
         const bool zero_tensors,
         const bool is_causal,
@@ -125,85 +185,95 @@ mha_fwd(const at::Tensor &qkv,         // total x num_heads x 3 x head_size, tot
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
-    TORCH_CHECK((dprops->major == 8 && dprops->minor >= 0) || is_sm75);
+    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    TORCH_CHECK(is_sm8x || is_sm75);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     bool is_dropout = p_dropout > 0.0;
-    Launch_params<Fused_multihead_attention_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
+    Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
 
-    TORCH_CHECK(qkv.dtype() == torch::kFloat16);
-    TORCH_CHECK(cu_seqlens.dtype() == torch::kInt32);
+    TORCH_CHECK(q.dtype() == torch::kFloat16);
+    TORCH_CHECK(k.dtype() == torch::kFloat16);
+    TORCH_CHECK(v.dtype() == torch::kFloat16);
+    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32);
+    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32);
 
-    TORCH_CHECK(qkv.is_cuda())
-    TORCH_CHECK(cu_seqlens.is_cuda())
+    TORCH_CHECK(q.is_cuda());
+    TORCH_CHECK(k.is_cuda());
+    TORCH_CHECK(v.is_cuda());
+    TORCH_CHECK(cu_seqlens_q.is_cuda());
+    TORCH_CHECK(cu_seqlens_k.is_cuda());
 
-    TORCH_CHECK(qkv.is_contiguous())
-    TORCH_CHECK(cu_seqlens.is_contiguous())
+    TORCH_CHECK(q.stride(-1) == 1);
+    TORCH_CHECK(k.stride(-1) == 1);
+    TORCH_CHECK(v.stride(-1) == 1);
+    TORCH_CHECK(cu_seqlens_k.is_contiguous());
+    TORCH_CHECK(cu_seqlens_k.is_contiguous());
 
-    TORCH_CHECK(cu_seqlens.dim() == 1);
-    TORCH_CHECK(qkv.dim() == 4);
+    const auto sizes = q.sizes();
 
-    const auto sizes = qkv.sizes();
-
-    TORCH_CHECK(sizes[THREE_DIM] == 3);
-
-    const int batch_size = cu_seqlens.numel() - 1;
-    const int total = sizes[TOTAL_DIM];
+    const int batch_size = cu_seqlens_q.numel() - 1;
+    const int total_q = sizes[TOTAL_DIM];
     const int num_heads = sizes[H_DIM];
     const int head_size = sizes[D_DIM];
+    const int total_k = k.size(TOTAL_DIM);
     TORCH_CHECK(batch_size > 0);
     TORCH_CHECK(head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
 
-    int base_N = ((head_size == 128 && (is_dropout || !is_sm80)) || (is_sm75 && head_size == 64 && is_dropout)) ? 128 : 256;
-    int seq_len = 512;
-    if( max_seq_len <= 128 ) {
-        seq_len = 128;
-    } else if( max_seq_len <= 256 ) {
-        seq_len = 256;
-    } else {
-        seq_len = ((max_seq_len + base_N - 1) / base_N) * base_N;
+    CHECK_SHAPE(q, total_q, num_heads, head_size);
+    CHECK_SHAPE(k, total_k, num_heads, head_size);
+    CHECK_SHAPE(v, total_k, num_heads, head_size);
+    CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+    CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+
+    int blocksize_c = ((head_size == 128 && (is_dropout || !is_sm80)) || (is_sm75 && head_size == 64 && is_dropout)) ? 128 : 256;
+    // Need to round max_seqlen_k to multiples of blocksize_c
+    int max_seqlen_k = ((max_seqlen_k_ + blocksize_c - 1) / blocksize_c) * blocksize_c;
+    if( max_seqlen_k_ <= 128 ) {
+        max_seqlen_k = 128;
+    } else if( max_seqlen_k_ <= 256 ) {
+        max_seqlen_k = 256;
     }
-    bool loop = seq_len > base_N;
+    int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
+    bool loop = max_seqlen_k > blocksize_c;
 
-    auto opts = qkv.options();
+    auto opts = q.options();
 
-    auto ctx = torch::empty({ total, num_heads, head_size }, opts);
+    auto o = torch::empty({ total_q, num_heads, head_size }, opts);
 
     at::Tensor o_tmp;
-    if (loop) { o_tmp = torch::empty({total, num_heads, head_size}, opts.dtype(at::kFloat)); }
+    if (loop) { o_tmp = torch::empty({total_q, num_heads, head_size}, opts.dtype(at::kFloat)); }
 
-    auto softmax_lse = torch::empty({batch_size, num_heads, seq_len}, opts.dtype(at::kFloat));
-    // auto softmax_lse = torch::full({batch_size, num_heads, seq_len}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
+    auto softmax_lse = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+    // auto softmax_lse = torch::full({batch_size, num_heads, max_seqlen_k}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
 
     at::Tensor s;
-    if (return_softmax) { s = torch::empty({ batch_size, num_heads, seq_len, seq_len }, opts); }
+    if (return_softmax) { s = torch::empty({ batch_size, num_heads, max_seqlen_q, max_seqlen_k }, opts); }
 
     if( zero_tensors ) {
-        ctx.zero_();
+        o.zero_();
         softmax_lse.fill_(-std::numeric_limits<float>::infinity());
-        if (loop) { o_tmp.zero_(); }
         if (return_softmax) {s.zero_();}
     }
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
-
-    set_params(launch_params.params,
-               batch_size,
-               seq_len,
-               num_heads,
-               head_size,
-               qkv.data_ptr(),
-               cu_seqlens.data_ptr(),
-               ctx.data_ptr(),
-               loop ? o_tmp.data_ptr() : nullptr,
-               nullptr,
-               return_softmax ? s.data_ptr() : nullptr,
-               softmax_lse.data_ptr(),
-               nullptr,
-               p_dropout,
-               softmax_scale,
-               is_causal);
+    set_params_fprop(launch_params.params,
+                     batch_size,
+                     max_seqlen_q,
+                     max_seqlen_k,
+                     num_heads,
+                     head_size,
+                     q, k, v,
+                     cu_seqlens_q.data_ptr(),
+                     cu_seqlens_k.data_ptr(),
+                     o.data_ptr(),
+                     loop ? o_tmp.data_ptr() : nullptr,
+                     return_softmax ? s.data_ptr() : nullptr,
+                     softmax_lse.data_ptr(),
+                     p_dropout,
+                     softmax_scale,
+                     is_causal);
 
     run_fmha_fp16_sm80(launch_params, /*configure=*/ true);
     // number of times random will be generated per thread, to offset philox counter in thc random
@@ -219,22 +289,28 @@ mha_fwd(const at::Tensor &qkv,         // total x num_heads x 3 x head_size, tot
 
     run_fmha_fp16_sm80(launch_params, /*configure=*/false);
 
-    std::vector<at::Tensor> result = {ctx, softmax_lse};
+    std::vector<at::Tensor> result = {o, softmax_lse};
     if (return_softmax) {result.push_back(s);}
     return result;
 }
 
 
 std::vector<at::Tensor>
-mha_bwd(const at::Tensor &dout,  // total x num_heads, x head_size
-        const at::Tensor &qkv,   // total x num_heads x 3 x head_size, total := \sum_{i=0}^{b} s_i
-        const at::Tensor &out,   // total x num_heads x head_size
-        at::Tensor &softmax,     // b x h x s x s softmax and dmask - will be overwritten with dP
+mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
+        const at::Tensor &q,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+        const at::Tensor &k,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const at::Tensor &v,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const at::Tensor &out,   // total_q x num_heads x head_size
         const at::Tensor &softmax_lse_,     // b x h x s softmax logsumexp
-        const at::Tensor &cu_seqlens,  // b+1
+        at::Tensor &dq,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+        at::Tensor &dk,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        at::Tensor &dv,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const at::Tensor &cu_seqlens_q,  // b+1
+        const at::Tensor &cu_seqlens_k,  // b+1
+        const int max_seqlen_q_,
+        const int max_seqlen_k_,          // max sequence length to choose the kernel
         const float p_dropout,         // probability to drop
         const float softmax_scale,
-        const int max_seq_len,          // max sequence length to choose the kernel
         const bool zero_tensors,
         const bool is_causal,
         c10::optional<at::Generator> gen_
@@ -242,84 +318,113 @@ mha_bwd(const at::Tensor &dout,  // total x num_heads, x head_size
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
-    TORCH_CHECK((dprops->major == 8 && dprops->minor >= 0) || is_sm75);
+    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    TORCH_CHECK(is_sm8x || is_sm75);
     auto launch = &run_fmha_dgrad_fp16_sm80;
 
     bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-    TORCH_CHECK(qkv.dtype() == torch::kFloat16);
+    TORCH_CHECK(q.dtype() == torch::kFloat16);
+    TORCH_CHECK(k.dtype() == torch::kFloat16);
+    TORCH_CHECK(v.dtype() == torch::kFloat16);
+    TORCH_CHECK(out.dtype() == torch::kFloat16);
     TORCH_CHECK(dout.dtype() == torch::kFloat16);
-    TORCH_CHECK(softmax.dtype() == torch::kFloat16);
-    TORCH_CHECK(cu_seqlens.dtype() == torch::kInt32);
+    TORCH_CHECK(dq.dtype() == torch::kFloat16);
+    TORCH_CHECK(dk.dtype() == torch::kFloat16);
+    TORCH_CHECK(dv.dtype() == torch::kFloat16);
+    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32);
+    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32);
 
-    TORCH_CHECK(qkv.is_cuda());
-    TORCH_CHECK(cu_seqlens.is_cuda());
+    TORCH_CHECK(q.is_cuda());
+    TORCH_CHECK(k.is_cuda());
+    TORCH_CHECK(v.is_cuda());
+    TORCH_CHECK(out.is_cuda());
+    TORCH_CHECK(dout.is_cuda());
+    TORCH_CHECK(softmax_lse_.is_cuda());
+    TORCH_CHECK(cu_seqlens_q.is_cuda());
+    TORCH_CHECK(cu_seqlens_k.is_cuda());
 
-    TORCH_CHECK(qkv.is_contiguous());
-    TORCH_CHECK(cu_seqlens.is_contiguous());
+    TORCH_CHECK(q.stride(-1) == 1);
+    TORCH_CHECK(k.stride(-1) == 1);
+    TORCH_CHECK(v.stride(-1) == 1);
+    TORCH_CHECK(out.is_contiguous());
+    TORCH_CHECK(dout.is_contiguous());
+    TORCH_CHECK(dq.stride(-1) == 1);
+    TORCH_CHECK(dk.stride(-1) == 1);
+    TORCH_CHECK(dv.stride(-1) == 1);
+    TORCH_CHECK(cu_seqlens_q.is_contiguous());
+    TORCH_CHECK(cu_seqlens_k.is_contiguous());
 
-    TORCH_CHECK(cu_seqlens.dim() == 1);
-    TORCH_CHECK(qkv.dim() == 4);
+    const auto sizes = q.sizes();
 
-    const auto sizes = qkv.sizes();
-
-    TORCH_CHECK(sizes[THREE_DIM] == 3);
-
-    const int batch_size = cu_seqlens.numel() - 1;
-    const int total = sizes[TOTAL_DIM];
+    const int batch_size = cu_seqlens_q.numel() - 1;
+    const int total_q = sizes[TOTAL_DIM];
     const int num_heads = sizes[H_DIM];
     const int head_size = sizes[D_DIM];
+    const int total_k = k.size(TOTAL_DIM);
     TORCH_CHECK(batch_size > 0);
     TORCH_CHECK(head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
     if (head_size == 128) {  // TODO: eventually we should support SM86 and SM70 with d=128 as well
         TORCH_CHECK(is_sm80);
     }
 
-    int base_N = (head_size == 128 || (is_sm75 && head_size == 64)) ? 128 : 256;
-    int seq_len = 512;
-    if( max_seq_len <= 128 ) {
-        seq_len = 128;
-    } else if( max_seq_len <= 256 ) {
-        seq_len = 256;
-    } else {
-        seq_len = ((max_seq_len + base_N - 1) / base_N) * base_N;
+    CHECK_SHAPE(q, total_q, num_heads, head_size);
+    CHECK_SHAPE(k, total_k, num_heads, head_size);
+    CHECK_SHAPE(v, total_k, num_heads, head_size);
+    CHECK_SHAPE(out, total_q, num_heads, head_size);
+    CHECK_SHAPE(dout, total_q, num_heads, head_size);
+    CHECK_SHAPE(dq, total_q, num_heads, head_size);
+    CHECK_SHAPE(dk, total_k, num_heads, head_size);
+    CHECK_SHAPE(dv, total_k, num_heads, head_size);
+    CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+    CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+
+    int blocksize_c = (head_size == 128 || (is_sm75 && head_size == 64)) ? 128 : 256;
+    int max_seqlen_k = ((max_seqlen_k_ + blocksize_c - 1) / blocksize_c) * blocksize_c;
+    if( max_seqlen_k_ <= 128 ) {
+        max_seqlen_k = 128;
+    } else if( max_seqlen_k_ <= 256 ) {
+        max_seqlen_k = 256;
     }
-    bool loop = seq_len > base_N;
+    int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
+    bool loop = max_seqlen_k > blocksize_c;
 
-    // It's possible the softmax_lse_ from the fwd has a different length since base_N could be different.
-    auto softmax_lse = softmax_lse_.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, seq_len)}).contiguous();
+    // It's possible the softmax_lse_ from the fwd has a different length since blocksize_c could be different.
+    auto softmax_lse = softmax_lse_.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, max_seqlen_q)}).contiguous();
 
-    auto dqkv = torch::empty_like(qkv);
-    auto opts = qkv.options();
-    auto softmax_d = torch::empty({batch_size, num_heads, seq_len}, opts.dtype(at::kFloat));
+    auto opts = q.options();
+    auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
     at::Tensor dq_tmp;
-    if (loop) { dq_tmp = torch::empty({total, num_heads, head_size}, opts.dtype(at::kFloat)); }
+    if (loop) { dq_tmp = torch::empty({total_q, num_heads, head_size}, opts.dtype(at::kFloat)); }
 
     if( zero_tensors ) {
-        dqkv.zero_();
+        dq.zero_();
+        dk.zero_();
+        dv.zero_();
         softmax_d.zero_();
-        if (loop) { dq_tmp.zero_(); }
     }
 
-    Fused_multihead_attention_fprop_params params;
+    FMHA_dgrad_params params;
 
-    set_params(params,
-               batch_size,
-               seq_len,
-               num_heads,
-               head_size,
-               qkv.data_ptr(),
-               cu_seqlens.data_ptr(),
-               out.data_ptr(),
-               loop ? dq_tmp.data_ptr() : nullptr,
-               dout.data_ptr(),
-               softmax.data_ptr(),  // softmax gets overwritten by dP!
-               softmax_lse.data_ptr(),
-               softmax_d.data_ptr(),
-               p_dropout,
-               softmax_scale,
-               is_causal);
+    set_params_dgrad(params,
+                     batch_size,
+                     max_seqlen_q,
+                     max_seqlen_k,
+                     num_heads,
+                     head_size,
+                     q, k, v,
+                     dq, dk, dv,
+                     cu_seqlens_q.data_ptr(),
+                     cu_seqlens_k.data_ptr(),
+                     out.data_ptr(),
+                     loop ? dq_tmp.data_ptr() : nullptr,
+                     dout.data_ptr(),
+                     softmax_lse.data_ptr(),
+                     softmax_d.data_ptr(),
+                     p_dropout,
+                     softmax_scale,
+                     is_causal);
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
@@ -334,24 +439,20 @@ mha_bwd(const at::Tensor &dout,  // total x num_heads, x head_size
         params.philox_args = gen->philox_cuda_state(counter_offset);
     }
 
-    Data_type acc_type = DATA_TYPE_FP32;
-    params.dqkv_ptr = dqkv.data_ptr();
-
     launch(params, stream);
-    return { dqkv, softmax, softmax_d };
-    // std::vector<at::Tensor> result = {dqkv, softmax, softmax_d};
-    // if (loop) {
-    //   result.push_back(dq_tmp);
-    // }
-    // return result;
+    return { dq, dk, dv, softmax_d };
 }
 
 std::vector<at::Tensor>
-mha_fwd_block(const at::Tensor &qkv,         // total x num_heads x 3 x head_size, total := \sum_{i=0}^{b} s_i
-              const at::Tensor &cu_seqlens,  // b+1
+mha_fwd_block(const at::Tensor &q,         // total_q x num_heads x head_size, total := \sum_{i=0}^{b} s_i
+              const at::Tensor &k,         // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+              const at::Tensor &v,         // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+              const at::Tensor &cu_seqlens_q,  // b+1
+              const at::Tensor &cu_seqlens_k,  // b+1
               const at::Tensor &blockmask,   // (seqlen / 256, seqlen / 16)
+              const int max_seqlen_q_,
+              const int max_seqlen_k_,
               const float p_dropout,
-              const int max_seq_len,
               const float softmax_scale,
               const bool is_causal,
               const bool return_softmax,
@@ -361,75 +462,90 @@ mha_fwd_block(const at::Tensor &qkv,         // total x num_heads x 3 x head_siz
     TORCH_CHECK(dprops->major == 8 && dprops->minor >= 0);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     bool is_dropout = p_dropout > 0.0;
-    Launch_params<Fused_multihead_attention_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
+    Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
 
-    bool loop = false;
-    int seq_len = 256;
-    if( max_seq_len > 256 ) {
-        seq_len = ((max_seq_len + 256 - 1) / 256) * 256;
-        loop = true;
-    }
+    TORCH_CHECK(q.dtype() == torch::kFloat16);
+    TORCH_CHECK(k.dtype() == torch::kFloat16);
+    TORCH_CHECK(v.dtype() == torch::kFloat16);
+    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32);
+    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32);
+    TORCH_CHECK(blockmask.dtype() == torch::kInt32);
 
-    TORCH_CHECK(qkv.is_cuda())
-    TORCH_CHECK(cu_seqlens.is_cuda())
+    TORCH_CHECK(q.is_cuda());
+    TORCH_CHECK(k.is_cuda());
+    TORCH_CHECK(v.is_cuda());
+    TORCH_CHECK(cu_seqlens_q.is_cuda());
+    TORCH_CHECK(cu_seqlens_k.is_cuda());
     TORCH_CHECK(blockmask.is_cuda())
 
-    TORCH_CHECK(qkv.is_contiguous())
-    TORCH_CHECK(cu_seqlens.is_contiguous())
+    TORCH_CHECK(q.stride(-1) == 1);
+    TORCH_CHECK(k.stride(-1) == 1);
+    TORCH_CHECK(v.stride(-1) == 1);
+    TORCH_CHECK(cu_seqlens_k.is_contiguous());
+    TORCH_CHECK(cu_seqlens_k.is_contiguous());
     TORCH_CHECK(blockmask.is_contiguous())
 
-    TORCH_CHECK(cu_seqlens.dim() == 1);
-    TORCH_CHECK(qkv.dim() == 4);
-    TORCH_CHECK(blockmask.dim() == 2);
+    const auto sizes = q.sizes();
 
-    const auto sizes = qkv.sizes();
-
-    TORCH_CHECK(sizes[THREE_DIM] == 3);
-
-    const int batch_size = cu_seqlens.numel() - 1;
-    const int total = sizes[TOTAL_DIM];
+    const int batch_size = cu_seqlens_q.numel() - 1;
+    const int total_q = sizes[TOTAL_DIM];
     const int num_heads = sizes[H_DIM];
     const int head_size = sizes[D_DIM];
+    const int total_k = k.size(TOTAL_DIM);
     TORCH_CHECK(batch_size > 0);
-    TORCH_CHECK(head_size == 16 || head_size == 32 || head_size == 64);
-    auto opts = qkv.options();
+    TORCH_CHECK(head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
 
-    auto ctx = torch::zeros({ total, num_heads, head_size }, opts);
+    CHECK_SHAPE(q, total_q, num_heads, head_size);
+    CHECK_SHAPE(k, total_k, num_heads, head_size);
+    CHECK_SHAPE(v, total_k, num_heads, head_size);
+    CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+    CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+
+    int max_seqlen_k = ((max_seqlen_k_ + 256 - 1) / 256) * 256;
+    if( max_seqlen_k <= 256 ) {
+        max_seqlen_k = 256;
+    }
+    int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
+    bool loop = max_seqlen_k > 256;
+    CHECK_SHAPE(blockmask, max_seqlen_k / 256, max_seqlen_q / 16);
+
+    auto opts = q.options();
+
+    auto o = torch::zeros({ total_q, num_heads, head_size }, opts);
 
     at::Tensor o_tmp;
     if (loop) {
         // o_tmp = torch::zeros({total, num_heads, head_size}, opts.dtype(at::kFloat));
-        o_tmp = torch::empty({total, num_heads, head_size}, opts.dtype(at::kFloat));
+        o_tmp = torch::empty({total_q, num_heads, head_size}, opts.dtype(at::kFloat));
     }
 
-    // auto softmax_lse = torch::full({batch_size, num_heads, seq_len}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
-    auto softmax_lse = torch::empty({batch_size, num_heads, seq_len}, opts.dtype(at::kFloat));
+    // auto softmax_lse = torch::full({batch_size, num_heads, max_seqlen_k}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
+    auto softmax_lse = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
 
     at::Tensor s;
     if (return_softmax) {
-        s = torch::zeros({ batch_size, num_heads, seq_len, seq_len }, opts);
+        s = torch::zeros({ batch_size, num_heads, max_seqlen_q, max_seqlen_k }, opts);
     }
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
-
-    set_params(launch_params.params,
-               batch_size,
-               seq_len,
-               num_heads,
-               head_size,
-               qkv.data_ptr(),
-               cu_seqlens.data_ptr(),
-               ctx.data_ptr(),
-               loop ? o_tmp.data_ptr() : nullptr,
-               nullptr,
-               return_softmax ? s.data_ptr() : nullptr,
-               softmax_lse.data_ptr(),
-               nullptr,
-               p_dropout,
-               softmax_scale,
-               is_causal);
+    set_params_fprop(launch_params.params,
+                     batch_size,
+                     max_seqlen_q,
+                     max_seqlen_k,
+                     num_heads,
+                     head_size,
+                     q, k, v,
+                     cu_seqlens_q.data_ptr(),
+                     cu_seqlens_k.data_ptr(),
+                     o.data_ptr(),
+                     loop ? o_tmp.data_ptr() : nullptr,
+                     return_softmax ? s.data_ptr() : nullptr,
+                     softmax_lse.data_ptr(),
+                     p_dropout,
+                     softmax_scale,
+                     is_causal);
     launch_params.params.blockmask = static_cast<int *>(blockmask.data_ptr());
 
     run_fmha_block_fp16_sm80(launch_params, /*configure=*/ true);
@@ -446,94 +562,137 @@ mha_fwd_block(const at::Tensor &qkv,         // total x num_heads x 3 x head_siz
 
     run_fmha_block_fp16_sm80(launch_params, /*configure=*/false);
 
-    std::vector<at::Tensor> result = {ctx, softmax_lse};
+    std::vector<at::Tensor> result = {o, softmax_lse};
     if (return_softmax) {result.push_back(s);}
     return result;
 }
 
 std::vector<at::Tensor>
 mha_bwd_block(const at::Tensor &dout,  // total x num_heads, x head_size
-              const at::Tensor &qkv,   // total x num_heads x 3 x head_size, total := \sum_{i=0}^{b} s_i
-              const at::Tensor &out,   // total x num_heads x head_size
-              at::Tensor &softmax,     // b x h x s x s softmax and dmask - will be overwritten with dP
-              const at::Tensor &softmax_lse,     // b x h x s softmax logsumexp
-              const at::Tensor &cu_seqlens,  // b+1
+              const at::Tensor &q,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+              const at::Tensor &k,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+              const at::Tensor &v,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+              const at::Tensor &out,   // total_q x num_heads x head_size
+              const at::Tensor &softmax_lse_,     // b x h x s softmax logsumexp
+              at::Tensor &dq,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+              at::Tensor &dk,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+              at::Tensor &dv,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+              const at::Tensor &cu_seqlens_q,  // b+1
+              const at::Tensor &cu_seqlens_k,  // b+1
               const at::Tensor &blockmask,   // (seqlen / 256, seqlen / 16)
+              const int max_seqlen_q_,
+              const int max_seqlen_k_,          // max sequence length to choose the kernel
               const float p_dropout,         // probability to drop
               const float softmax_scale,
-              const int max_seq_len,          // max sequence length to choose the kernel
               const bool is_causal,
               c10::optional<at::Generator> gen_
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
+    bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
+    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
     TORCH_CHECK(dprops->major == 8 && dprops->minor >= 0);
-    bool loop = false;
-    int seq_len = 256;
     auto launch = &run_fmha_block_dgrad_fp16_sm80;
-    if (max_seq_len > 256) {
-        seq_len = ((max_seq_len + 256 - 1) / 256) * 256;
-        loop = true;
-    }
 
     bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-    TORCH_CHECK(qkv.dtype() == torch::kFloat16);
+    TORCH_CHECK(q.dtype() == torch::kFloat16);
+    TORCH_CHECK(k.dtype() == torch::kFloat16);
+    TORCH_CHECK(v.dtype() == torch::kFloat16);
+    TORCH_CHECK(out.dtype() == torch::kFloat16);
     TORCH_CHECK(dout.dtype() == torch::kFloat16);
-    TORCH_CHECK(softmax.dtype() == torch::kFloat16);
-    TORCH_CHECK(cu_seqlens.dtype() == torch::kInt32);
+    TORCH_CHECK(dq.dtype() == torch::kFloat16);
+    TORCH_CHECK(dk.dtype() == torch::kFloat16);
+    TORCH_CHECK(dv.dtype() == torch::kFloat16);
+    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32);
+    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32);
     TORCH_CHECK(blockmask.dtype() == torch::kInt32);
 
-    TORCH_CHECK(qkv.is_cuda());
-    TORCH_CHECK(cu_seqlens.is_cuda());
+    TORCH_CHECK(q.is_cuda());
+    TORCH_CHECK(k.is_cuda());
+    TORCH_CHECK(v.is_cuda());
+    TORCH_CHECK(out.is_cuda());
+    TORCH_CHECK(dout.is_cuda());
+    TORCH_CHECK(softmax_lse_.is_cuda());
+    TORCH_CHECK(cu_seqlens_q.is_cuda());
+    TORCH_CHECK(cu_seqlens_k.is_cuda());
     TORCH_CHECK(blockmask.is_cuda());
 
-    TORCH_CHECK(qkv.is_contiguous());
-    TORCH_CHECK(cu_seqlens.is_contiguous());
+    TORCH_CHECK(q.stride(-1) == 1);
+    TORCH_CHECK(k.stride(-1) == 1);
+    TORCH_CHECK(v.stride(-1) == 1);
+    TORCH_CHECK(out.is_contiguous());
+    TORCH_CHECK(dout.is_contiguous());
+    TORCH_CHECK(dq.stride(-1) == 1);
+    TORCH_CHECK(dk.stride(-1) == 1);
+    TORCH_CHECK(dv.stride(-1) == 1);
+    TORCH_CHECK(cu_seqlens_q.is_contiguous());
+    TORCH_CHECK(cu_seqlens_k.is_contiguous());
     TORCH_CHECK(blockmask.is_contiguous());
 
-    TORCH_CHECK(cu_seqlens.dim() == 1);
-    TORCH_CHECK(qkv.dim() == 4);
-    TORCH_CHECK(blockmask.dim() == 2);
+    const auto sizes = q.sizes();
 
-    const auto sizes = qkv.sizes();
-
-    TORCH_CHECK(sizes[THREE_DIM] == 3);
-
-    const int batch_size = cu_seqlens.numel() - 1;
-    const int total = sizes[TOTAL_DIM];
+    const int batch_size = cu_seqlens_q.numel() - 1;
+    const int total_q = sizes[TOTAL_DIM];
     const int num_heads = sizes[H_DIM];
     const int head_size = sizes[D_DIM];
+    const int total_k = k.size(TOTAL_DIM);
     TORCH_CHECK(batch_size > 0);
-    TORCH_CHECK(head_size == 16 || head_size == 32 || head_size == 64);
+    TORCH_CHECK(head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
+    if (head_size == 128) {  // TODO: eventually we should support SM86 and SM70 with d=128 as well
+        TORCH_CHECK(is_sm80);
+    }
 
-    auto dqkv = torch::zeros_like(qkv);
-    auto opts = qkv.options();
-    auto softmax_d = torch::empty({batch_size, num_heads, seq_len}, opts.dtype(at::kFloat));
+    CHECK_SHAPE(q, total_q, num_heads, head_size);
+    CHECK_SHAPE(k, total_k, num_heads, head_size);
+    CHECK_SHAPE(v, total_k, num_heads, head_size);
+    CHECK_SHAPE(out, total_q, num_heads, head_size);
+    CHECK_SHAPE(dout, total_q, num_heads, head_size);
+    CHECK_SHAPE(dq, total_q, num_heads, head_size);
+    CHECK_SHAPE(dk, total_k, num_heads, head_size);
+    CHECK_SHAPE(dv, total_k, num_heads, head_size);
+    CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+    CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+
+    int max_seqlen_k = ((max_seqlen_k_ + 256 - 1) / 256) * 256;
+    if( max_seqlen_k <= 256 ) {
+        max_seqlen_k = 256;
+    }
+    int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
+    bool loop = max_seqlen_k > 256;
+    CHECK_SHAPE(blockmask, max_seqlen_k / 256, max_seqlen_q / 16);
+
+    // It's possible the softmax_lse_ from the fwd has a different length since blocksize_c could be different.
+    auto softmax_lse = softmax_lse_.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, max_seqlen_q)}).contiguous();
+
+    auto opts = q.options();
+    auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
     at::Tensor dq_tmp;
     if (loop) {
         // dq_tmp = torch::zeros({total, num_heads, head_size}, opts.dtype(at::kFloat));
-        dq_tmp = torch::empty({total, num_heads, head_size}, opts.dtype(at::kFloat));
+        dq_tmp = torch::empty({total_q, num_heads, head_size}, opts.dtype(at::kFloat));
     }
 
-    Fused_multihead_attention_fprop_params params;
+    FMHA_dgrad_params params;
 
-    set_params(params,
-               batch_size,
-               seq_len,
-               num_heads,
-               head_size,
-               qkv.data_ptr(),
-               cu_seqlens.data_ptr(),
-               out.data_ptr(),
-               loop ? dq_tmp.data_ptr() : nullptr,
-               dout.data_ptr(),
-               softmax.data_ptr(),  // softmax gets overwritten by dP!
-               softmax_lse.data_ptr(),
-               softmax_d.data_ptr(),
-               p_dropout,
-               softmax_scale,
-               is_causal);
+    set_params_dgrad(params,
+                     batch_size,
+                     max_seqlen_q,
+                     max_seqlen_k,
+                     num_heads,
+                     head_size,
+                     q, k, v,
+                     dq, dk, dv,
+                     cu_seqlens_q.data_ptr(),
+                     cu_seqlens_k.data_ptr(),
+                     out.data_ptr(),
+                     loop ? dq_tmp.data_ptr() : nullptr,
+                     dout.data_ptr(),
+                     softmax_lse.data_ptr(),
+                     softmax_d.data_ptr(),
+                     p_dropout,
+                     softmax_scale,
+                     is_causal);
     params.blockmask = static_cast<int *>(blockmask.data_ptr());
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
@@ -549,16 +708,8 @@ mha_bwd_block(const at::Tensor &dout,  // total x num_heads, x head_size
         params.philox_args = gen->philox_cuda_state(counter_offset);
     }
 
-    Data_type acc_type = DATA_TYPE_FP32;
-    params.dqkv_ptr = dqkv.data_ptr();
-
     launch(params, stream);
-    return { dqkv, softmax, softmax_d };
-    // std::vector<at::Tensor> result = {dqkv, softmax, softmax_d};
-    // if (loop) {
-    //   result.push_back(dq_tmp);
-    // }
-    // return result;
+    return { dq, dk, dv, softmax_d };
 }
 
 

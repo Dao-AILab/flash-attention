@@ -97,7 +97,7 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
 
     Gemm1 gemm_q_k(smem_, tidx);
     // Allocate the global memory tile loader for Q.
-    Gmem_tile_q gmem_q(params.q_ptr, params.q_row_stride_in_elts, params.q_head_stride_in_elts, binfo, tidx);
+    Gmem_tile_q gmem_q(params.q_ptr, params.q_row_stride_in_elts, params.q_head_stride_in_elts, binfo, tidx, true);
     // Allocate the global memory tile loader for O.
     Gmem_tile_o gmem_o(params.o_ptr, params.o_row_stride_in_elts, params.o_head_stride_in_elts, binfo, tidx);
     Gmem_tile_o_tmp gmem_o_tmp(params.o_tmp_ptr, params.o_row_stride_in_elts, params.o_head_stride_in_elts, binfo, tidx);
@@ -122,9 +122,9 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
     fmha::Mask<Cta_tile_p, Is_causal> mask(binfo, tidx, loop_step_idx);
 
     // Allocate the global memory tile loader for K.
-    Gmem_tile_k gmem_k(params.k_ptr, params.k_row_stride_in_elts, params.k_head_stride_in_elts, binfo, tidx);
+    Gmem_tile_k gmem_k(params.k_ptr, params.k_row_stride_in_elts, params.k_head_stride_in_elts, binfo, tidx, false);
     // Allocate the global memory tile loader for V.
-    Gmem_tile_v gmem_v(params.v_ptr, params.v_row_stride_in_elts, params.v_head_stride_in_elts, binfo, tidx);
+    Gmem_tile_v gmem_v(params.v_ptr, params.v_row_stride_in_elts, params.v_head_stride_in_elts, binfo, tidx, false);
     // The base pointer of smem_v;
     char *smem_v_ = &smem_[Gemm1::SMEM_OFFSET_V];
 
@@ -206,7 +206,7 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
         // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0)) {
         //     printf("block_row_idx = %d\n", block_row_idx);
         // }
-        if (block_row_idx * Cta_tile_p::M >= binfo.actual_seqlen) break;
+        if (block_row_idx * Cta_tile_p::M >= binfo.actual_seqlen_q) break;
 
         int mask_val_next = l < steps - 1 ? blockmask.mask_val(l + 1) : -1;
         // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0)) {
@@ -443,7 +443,7 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
 
         const bool is_final_write =
             Is_last
-            || ((loop_step_idx + 1) * Cta_tile_p::N >= binfo.actual_seqlen)
+            || ((loop_step_idx + 1) * Cta_tile_p::N >= binfo.actual_seqlen_k)
             || ((mask_val & 0x2) != 0)
             || ((Is_causal) && (block_row_idx * Cta_tile_p::M < (loop_step_idx + 1) * Cta_tile_p::N));
         // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0)) {
@@ -507,13 +507,14 @@ inline __device__ void device_block_1xN_loop(const Params &params) {
     auto seeds = at::cuda::philox::unpack(params.philox_args);
     Philox ph0(std::get<0>(seeds), tidx_global, std::get<1>(seeds));
     Philox ph1(std::get<0>(seeds), tidx_global + blockDim.x, std::get<1>(seeds));
-    const int STEPS = params.s / Kernel_traits::Cta_tile_p::M;
+    constexpr int M = Kernel_traits::Cta_tile_p::M;
+    const int STEPS = (params.seqlen_q + M - 1) / M;
 
-    constexpr int N_per_loop = Kernel_traits::Cta_tile_p::N;
-    if (params.s == N_per_loop) {
+    constexpr int blocksize_c = Kernel_traits::Cta_tile_p::N;
+    if (params.seqlen_k == blocksize_c) {
         fmha::device_block_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, true, true>(params, bidb, bidh, STEPS, ph0, ph1, 0);
     } else {
-        const int max_loop_steps = (params.s + N_per_loop - 1) / N_per_loop;
+        const int max_loop_steps = (params.seqlen_k + blocksize_c - 1) / blocksize_c;
         fmha::device_block_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, true, false>(params, bidb, bidh, STEPS, ph0, ph1, 0);
         for (int loop_step_idx = 1; loop_step_idx < max_loop_steps - 1; loop_step_idx++) {
             fmha::device_block_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, false, false>(params, bidb, bidh, STEPS, ph0, ph1, loop_step_idx);

@@ -42,7 +42,7 @@ struct Blockmask {
 
     template<typename Params>
     __device__ Blockmask(const Params &params, int loop_step_idx) :
-        blockmask_ptr(params.blockmask + loop_step_idx * params.s / 16) {
+        blockmask_ptr(params.blockmask + loop_step_idx * params.seqlen_q / 16) {
     }
 
     __device__ int mask_val(int block_row_idx) const {

@@ -29,12 +29,12 @@
 #include "fmha_block_fprop_kernel_1xN.h"
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Return_softmax>
-__global__ void fmha_block_fprop_fp16_sm80_loop_kernel(Fused_multihead_attention_fprop_params params) {
+__global__ void fmha_block_fprop_fp16_sm80_loop_kernel(FMHA_fprop_params params) {
     fmha::device_block_1xN_loop<Kernel_traits, Is_dropout, Is_causal, Return_softmax>(params);
 }
 
 template<typename Kernel_traits>
-void run_fmha_block_fp16_sm80_loop_(Launch_params<Fused_multihead_attention_fprop_params> &launch_params,
+void run_fmha_block_fp16_sm80_loop_(Launch_params<FMHA_fprop_params> &launch_params,
                             const bool configure) {
     bool is_causal = launch_params.params.is_causal;
     // TD [2022-04-27]: This case work is pretty ugly, maybe there's a better way?
@@ -46,8 +46,8 @@ void run_fmha_block_fp16_sm80_loop_(Launch_params<Fused_multihead_attention_fpro
            ? (launch_params.return_softmax ? &fmha_block_fprop_fp16_sm80_loop_kernel<Kernel_traits, false, true, true> : &fmha_block_fprop_fp16_sm80_loop_kernel<Kernel_traits, false, true, false>)
            : (launch_params.return_softmax ? &fmha_block_fprop_fp16_sm80_loop_kernel<Kernel_traits, false, false, true> : &fmha_block_fprop_fp16_sm80_loop_kernel<Kernel_traits, false, false, false>));
 
-    constexpr int N = Kernel_traits::Cta_tile_p::N;
-    const int loop_steps = (launch_params.params.s + N - 1) / N;
+    constexpr int blocksize_c = Kernel_traits::Cta_tile_p::N;
+    const int loop_steps = (launch_params.params.seqlen_k + blocksize_c - 1) / blocksize_c;
     constexpr int smem_size_softmax_lse = Kernel_traits::Smem_dp_sum::BYTES_PER_TILE;
     // Don't need smem_size_softmax_lse if we're not looping
     const int smem_size = fmha::get_dynamic_smem_size<Kernel_traits>()
@@ -60,7 +60,7 @@ void run_fmha_block_fp16_sm80_loop_(Launch_params<Fused_multihead_attention_fpro
     if (configure) {
         using Mma_tile_p = fmha::Hmma_tile<typename Kernel_traits::Cta_tile_p>;
         constexpr int M = Kernel_traits::Cta_tile_p::M;
-        size_t STEPS = (launch_params.params.s + M - 1) / M;
+        size_t STEPS = (launch_params.params.seqlen_q + M - 1) / M;
         constexpr size_t MMAS_M = Mma_tile_p::MMAS_M;
         constexpr size_t MMAS_N = Mma_tile_p::MMAS_N;
         size_t elts_per_head = STEPS * MMAS_M * MMAS_N * 8 * loop_steps;
@@ -75,7 +75,7 @@ void run_fmha_block_fp16_sm80_loop_(Launch_params<Fused_multihead_attention_fpro
     FMHA_CHECK_CUDA(cudaPeekAtLastError());
 }
 
-void run_fmha_block_fp16_sm80(Launch_params<Fused_multihead_attention_fprop_params> &launch_params,
+void run_fmha_block_fp16_sm80(Launch_params<FMHA_fprop_params> &launch_params,
                              const bool configure) {
     if (launch_params.params.d == 16) {
         using Kernel_traits = FMHA_kernel_traits<256, 16, 16, 1, 4, 0x08u>;

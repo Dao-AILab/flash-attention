@@ -63,9 +63,9 @@ struct Gmem_tile_qkv {
     // Ctor.
     template< typename BInfo >
     inline __device__ Gmem_tile_qkv(void *ptr_, const uint32_t row_stride_in_elts,
-                                    const uint32_t head_stride_in_elts, const BInfo &binfo, const int tidx)
+                                    const uint32_t head_stride_in_elts, const BInfo &binfo, const int tidx, bool use_seqlen_q)
         : row_stride_in_bytes(row_stride_in_elts * BYTES_PER_ELEMENT)
-        , actual_seqlen(binfo.actual_seqlen)
+        , actual_seqlen(use_seqlen_q ? binfo.actual_seqlen_q : binfo.actual_seqlen_k)
         , ptr(reinterpret_cast<char *>(ptr_))
         , tidx_(tidx) {
 
@@ -80,7 +80,7 @@ struct Gmem_tile_qkv {
 
         // The row offset in the batched GEMM. For each seq element, we store QKV in that order.
         // int64_t row_offset = (int64_t)row * params.qkv_stride_in_bytes;
-        uint32_t row_offset = (uint32_t)((binfo.sum_s + row) * row_stride_in_bytes);
+        uint32_t row_offset = (uint32_t)(((use_seqlen_q ? binfo.sum_s_q : binfo.sum_s_k) + row) * row_stride_in_bytes);
         // Add the block index.
         // row_offset += (int64_t)((binfo.sum_s * NUM_MATS + qkv_offset) * binfo.h + binfo.bidh) * BYTES_PER_ROW;
         row_offset += (uint32_t)(binfo.bidh * head_stride_in_elts * BYTES_PER_ELEMENT);
@@ -193,7 +193,7 @@ struct Gmem_tile_o {
     inline __device__ Gmem_tile_o(void *ptr, const uint32_t row_stride_in_elts,
                                   const uint32_t head_stride_in_elts, const BInfo &binfo, const int tidx)
         : row_stride_in_bytes(row_stride_in_elts * BYTES_PER_ELEMENT)
-        , actual_seqlen(binfo.actual_seqlen)
+        , actual_seqlen_q(binfo.actual_seqlen_q)
         , ptr_(reinterpret_cast<char *>(ptr))
         , tidx_(tidx) {
 
@@ -207,7 +207,7 @@ struct Gmem_tile_o {
 
         // The row offset in the batched GEMM.
         // int64_t row_offset = (int64_t)row * row_stride_in_bytes + binfo.bidx * BYTES_PER_ROW;
-        uint32_t row_offset = (uint32_t)((binfo.sum_s + row) * row_stride_in_bytes);
+        uint32_t row_offset = (uint32_t)((binfo.sum_s_q + row) * row_stride_in_bytes);
         row_offset += (uint32_t)(binfo.bidh * head_stride_in_elts * BYTES_PER_ELEMENT);
         // Assemble the final pointer.
         ptr_ += row_offset + col * BYTES_PER_STG;
@@ -224,7 +224,7 @@ struct Gmem_tile_o {
         #pragma unroll
         for( int ii = 0; ii < STGS_PER_LOOP; ++ii ) {
             int jj = mi * STGS_PER_LOOP + ii;
-            if( row_ + jj * ROWS_PER_STG >= this->actual_seqlen ) {
+            if( row_ + jj * ROWS_PER_STG >= this->actual_seqlen_q ) {
                 break;
             }
 
@@ -252,7 +252,7 @@ struct Gmem_tile_o {
         #pragma unroll
         for( int ii = 0; ii < STGS_PER_LOOP; ++ii ) {
             int jj = mi * STGS_PER_LOOP + ii;
-            if( row_ + jj * ROWS_PER_STG >= this->actual_seqlen ) {
+            if( row_ + jj * ROWS_PER_STG >= this->actual_seqlen_q ) {
                 break;
             }
 
@@ -266,7 +266,7 @@ struct Gmem_tile_o {
         // row_ += ROWS * steps;
         // ptr_ += (int64_t)ROWS * row_stride_in_bytes * steps;
         ptr_ += (uint32_t)ROWS * row_stride_in_bytes * steps;
-        actual_seqlen -= ROWS * steps;
+        actual_seqlen_q -= ROWS * steps;
     }
 
     // The stride between rows for the QKV matrice.
@@ -277,7 +277,7 @@ struct Gmem_tile_o {
     // Is the thread active for the last STG?
     int is_active_for_last_stg_;
     // The length of the sequence loaded by that memory tile.
-    int actual_seqlen;
+    int actual_seqlen_q;
     const int tidx_;
 };
 
@@ -319,8 +319,8 @@ struct Gmem_tile_mma_sd {
         uint32_t bidx = bidb * params.h + bidh;
 
         // The distance between two blocks (in bytes).
-        // const size_t block_stride_bytes = params.s * params.s * BYTES_PER_ELEMENT;
-        const uint32_t block_stride_bytes = params.s * params.s * BYTES_PER_ELEMENT;
+        // const size_t block_stride_bytes = params.seqlen_q * params.seqlen_k * BYTES_PER_ELEMENT;
+        const uint32_t block_stride_bytes = params.seqlen_q * params.seqlen_k * BYTES_PER_ELEMENT;
         // Set store location for each thread at the beginning of the loop
         ptr_ += bidx * block_stride_bytes + tidx * BYTES_PER_STG;
     }
@@ -468,8 +468,8 @@ struct Gmem_summary_stats {
         int lane = tidx % Cta_tile::THREADS_PER_WARP;
 
         // The distance between two blocks (in bytes).
-        // size_t block_stride_bytes = params.s * BYTES_PER_ELEMENT;
-        uint32_t block_stride_bytes = params.s * BYTES_PER_ELEMENT;
+        // size_t block_stride_bytes = params.seqlen_q * BYTES_PER_ELEMENT;
+        uint32_t block_stride_bytes = params.seqlen_q * BYTES_PER_ELEMENT;
 
         // Set store location for each thread at the beginning of the loop
         ptr_row_ = ptr_ + bidx * block_stride_bytes;
