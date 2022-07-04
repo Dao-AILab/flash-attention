@@ -96,7 +96,7 @@ struct FMHA_fprop_params : public Qkv_params {
     void * __restrict__ softmax_lse_ptr;
 
     // The dimensions.
-    int b, seqlen_q, seqlen_k, d, seqlen_q_rounded;
+    int b, seqlen_q, seqlen_k, d;
 
     // The scaling factors for the kernel.
     float scale_bmm1f;

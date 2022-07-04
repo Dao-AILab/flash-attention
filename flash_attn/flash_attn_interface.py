@@ -215,8 +215,8 @@ def flash_attn_unpadded_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
     """dropout_p should be set to 0.0 during evaluation
     Arguments:
         q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
-        k: (total_k, 2, nheads, headdim), where total_k = total number of key tokens in the batch.
-        v: (total_k, 2, nheads, headdim), where total_k = total number of key tokens in the batch.
+        k: (total_k, nheads, headdim), where total_k = total number of key tokens in the batch.
+        v: (total_k, nheads, headdim), where total_k = total number of key tokens in the batch.
         cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
            of the sequences in the batch, used to index into q.
         cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
