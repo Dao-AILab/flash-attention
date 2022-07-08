@@ -335,7 +335,7 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
         Frag_p frag_p[Mma_tile_o::MMAS_K][Mma_tile_o::MMAS_M];
         static_assert(Mma_tile_o::MMAS_M == Mma_tile_p::MMAS_M);
         static_assert(Mma_tile_o::MMAS_K == Mma_tile_p::MMAS_N);
-        softmax.pack(frag_p);
+        softmax.template pack<__half>(frag_p);
         if (Return_softmax) {
             gmem_s.store(frag_p, mask);
             if (not_last_iter) {
@@ -353,7 +353,7 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
             for( int ki = 0; ki < Mma_tile_o::MMAS_K; ki++ ) {
                 #pragma unroll
                 for( int mi = 0; mi < Mma_tile_o::MMAS_M; mi++ ) {
-                    frag_p[ki][mi].hrelu_();
+                    frag_p[ki][mi].template hrelu_<__half>();
                 }
             }
         }
@@ -371,7 +371,6 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
         // The mapping from tidx to rows changes between the softmax and the O-reduction.
         // So we recalculate the max.
         float p_max_o[Gmem_tile_o::STGS_PER_LOOP][Mma_tile_o::MMAS_M];
-        // TODO: not sure if this is right for seqlen 128 or 256
         int rows[Gmem_tile_o::STGS_PER_LOOP];
         for (int jj = 0; jj < Gmem_tile_o::STGS_PER_LOOP; jj++) {
             rows[jj] = tidx / Gmem_tile_o::THREADS_PER_ROW + jj * Gmem_tile_o::ROWS_PER_STG;
@@ -467,7 +466,7 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
 
         // Output the values.
         if (is_final_write) {
-            gmem_o.store(out, 0);
+            gmem_o.template store<__half>(out, 0);
         } else {
             gmem_o_tmp.store(out, 0);
         }

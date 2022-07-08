@@ -34,24 +34,6 @@ namespace fmha {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct Sum_ {
-    static constexpr bool IS_SUM = true;
-    static inline __device__ float apply(float x, float y) {
-        return x + y;
-    }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-struct Max_ {
-    static constexpr bool IS_SUM = false;
-    static inline __device__ float apply(float x, float y) {
-        return x > y ? x : y;
-    }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 inline __device__ float apply_exp_(float x, float max) {
     return __expf(x - max);
 }
@@ -508,7 +490,7 @@ struct Softmax : public Softmax_base<Cta_tile, Kernel_traits> {
     }
 
     // Pack the data to a fragment for the next GEMM.
-    template<int K, int M>
+    template<typename elem_type=__half, int K, int M>
     inline __device__ void pack(Fragment_a (&dst)[K][M]) const {
         #pragma unroll
         for( int mi = 0; mi < M; ++mi ) {
@@ -528,10 +510,10 @@ struct Softmax : public Softmax_base<Cta_tile, Kernel_traits> {
                 float tmp_13 = this->elt_[2 * mi + 1][4 * ki + 3];
 
                 // Pack to 4 registers.
-                dst[ki][mi].reg(0) = fmha::float2_to_half2(tmp_00, tmp_01);
-                dst[ki][mi].reg(1) = fmha::float2_to_half2(tmp_10, tmp_11);
-                dst[ki][mi].reg(2) = fmha::float2_to_half2(tmp_02, tmp_03);
-                dst[ki][mi].reg(3) = fmha::float2_to_half2(tmp_12, tmp_13);
+                dst[ki][mi].reg(0) = fmha::float2_pack<elem_type>(tmp_00, tmp_01);
+                dst[ki][mi].reg(1) = fmha::float2_pack<elem_type>(tmp_10, tmp_11);
+                dst[ki][mi].reg(2) = fmha::float2_pack<elem_type>(tmp_02, tmp_03);
+                dst[ki][mi].reg(3) = fmha::float2_pack<elem_type>(tmp_12, tmp_13);
             }
         }
     }

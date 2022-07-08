@@ -12,14 +12,16 @@ namespace fmha {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int ROWS, int THREADS_PER_ROW, int M, typename Gmem_softmax_sum>
+template <int ROWS, int THREADS_PER_ROW, typename elem_type=__half, int M, typename Gmem_softmax_sum>
 inline __device__ void dot_do_o(const uint4 (&do_)[M], const uint4 (&o)[M], const float scale,
                                 Gmem_softmax_sum gmem_softmax_d, int tidx) {
     float sum[M];
     fmha::SumOp<float> sum_op;
     #pragma unroll
     for (int mi = 0; mi < M; ++mi) {
-        sum[mi] = fmha::Allreduce<THREADS_PER_ROW>::run(fmha::hmulsum8(do_[mi], o[mi]), sum_op) * scale;
+        sum[mi] = fmha::Allreduce<THREADS_PER_ROW>::run(
+            fmha::hmulsum8<elem_type>(do_[mi], o[mi]), sum_op
+        ) * scale;
     }
     const int dp_sum_row = tidx / THREADS_PER_ROW;
     if ((dp_sum_row < ROWS) && (tidx % THREADS_PER_ROW == 0)) {
@@ -212,7 +214,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
     gmem_q.commit(gemm_q_k.smem_q);
     gmem_do.commit(smem_do);
     if (Is_first) {
-        dot_do_o<Gmem_tile_do::ROWS, Gmem_tile_do::THREADS_PER_ROW>(
+        dot_do_o<Gmem_tile_do::ROWS, Gmem_tile_do::THREADS_PER_ROW, __half>(
             gmem_do.fetch_, gmem_o.fetch_, params.p_dropout, gmem_softmax_d, tidx
         );
     }
@@ -331,7 +333,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
         Frag_p frag_p[Mma_tile_dq::MMAS_K][Mma_tile_dq::MMAS_M];
         static_assert(Mma_tile_dq::MMAS_M == Mma_tile_p::MMAS_M);
         static_assert(Mma_tile_dq::MMAS_K == Mma_tile_p::MMAS_N);
-        softmax.pack(frag_p);
+        softmax.template pack<__half>(frag_p);
 
         // Store s * dmask to smem for transpose
         smem_s.store(frag_p);
@@ -422,7 +424,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
             }
         }
 
-        softmax.pack(frag_p);
+        softmax.template pack<__half>(frag_p);
 
         // Store dp to smem for transpose
         smem_dp.store(frag_p);
@@ -473,7 +475,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
             for( int ki = 0; ki < Mma_tile_dkv::MMAS_K; ki++ ) {
                 #pragma unroll
                 for( int mi = 0; mi < Mma_tile_dkv::MMAS_M; mi++ ) {
-                    frag_s[ki][mi].hrelu_();
+                    frag_s[ki][mi].template hrelu_<__half>();
                 }
             }
         }
@@ -517,7 +519,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
         if(l < steps - 1) {
             gmem_do.commit(smem_do);
             if (Is_first) {
-                dot_do_o<Gmem_tile_do::ROWS, Gmem_tile_do::THREADS_PER_ROW>(
+                dot_do_o<Gmem_tile_do::ROWS, Gmem_tile_do::THREADS_PER_ROW, __half>(
                     gmem_do.fetch_, gmem_o.fetch_, params.p_dropout, gmem_softmax_d, tidx
                 );
             }
@@ -573,7 +575,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
                 dq_out[jj] = fmha::fmul4(dq_out[jj], params.scale_bmm1_rp_dropout);
             }
             // Output the values.
-            gmem_dq.store(dq_out, 0);
+            gmem_dq.template store<__half>(dq_out, 0);
             // Move to the next part of the output.
             gmem_dq.move();
         } else  {
@@ -627,11 +629,11 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
     // the total amount of shared mem?
     // Epilogue swizzle for dV
     Smem_tile_dv smem_dv(&smem_[0], tidx);
-    smem_dv.store(acc_dv);
+    smem_dv.template store<__half>(acc_dv);
 
     // Epilogue swizzle for dK
     Smem_tile_dk smem_dk(&smem_[Smem_tile_dv::BYTES_PER_TILE], tidx);
-    smem_dk.store(acc_dk);
+    smem_dk.template store<__half>(acc_dk);
 
     __syncthreads();
     uint4 dv_out[Smem_tile_dv::NUM_LDS];
@@ -644,9 +646,6 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
 
     uint4 dk_out[Smem_tile_dk::NUM_LDS];
     smem_dk.load(dk_out);
-    // for (int ii = 0; ii < Smem_tile_dk::NUM_LDS; ++ii) {
-    //     dk_out[ii] = fmha::fmul4(dk_out[ii], params.scale_bmm1f);
-    // }
     Gmem_tile_dk gmem_dk(params.dk_ptr, params.dk_row_stride_in_elts, params.dk_head_stride_in_elts, binfo, tidx, false);
     if (!Is_first) {
         gmem_dk.move(loop_step_idx);

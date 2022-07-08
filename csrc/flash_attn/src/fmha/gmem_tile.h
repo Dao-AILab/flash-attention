@@ -27,6 +27,8 @@
 
 #pragma once
 
+#include <cuda_fp16.h>
+
 namespace fmha {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -219,6 +221,7 @@ struct Gmem_tile_o {
     }
 
     // Store data to global memory.
+    template<typename elem_type=__half>
     inline __device__ void store(const uint4 (&src)[STGS_PER_LOOP], int mi) {
         int row_ = tidx_ / THREADS_PER_ROW;
         #pragma unroll
@@ -237,7 +240,7 @@ struct Gmem_tile_o {
                 float y = reinterpret_cast<const float &>(src[ii].y);
                 float z = reinterpret_cast<const float &>(src[ii].z);
                 float w = reinterpret_cast<const float &>(src[ii].w);
-                uint2 out = float4_to_half4(x, y, z, w);
+                uint2 out = fmha::float4_pack<elem_type>(x, y, z, w);
                 if( !HAS_INCOMPLETE_STG || (jj < STGS - 1 || this->is_active_for_last_stg_) ) {
                     fmha::stg(this->ptr_ + jj * ROWS_PER_STG * this->row_stride_in_bytes, out);
                 }
@@ -245,7 +248,7 @@ struct Gmem_tile_o {
         }
     }
 
-    // Store data to global memory.
+    // Load data from global memory.
     inline __device__ void load(uint4 (&dst)[STGS_PER_LOOP], int mi) {
         static_assert(BYTES_PER_ELEMENT == 4);
         int row_ = tidx_ / THREADS_PER_ROW;
@@ -364,36 +367,6 @@ struct Gmem_tile_mma_s : public Base {
     template< typename Params, typename Block_info >
     inline __device__ Gmem_tile_mma_s(const Params &params, const Block_info& binfo, const int tidx) 
         : Base(params.s_ptr, params, binfo.bidb, binfo.bidh, tidx) {
-    }
-
-    // Store to global memory.
-    template<typename Mask>
-    inline __device__ void store(const float (&softmax)[2 * M][4 * N], const Mask &mask) {
-        #pragma unroll
-        for( int mi = 0; mi < M; mi++ ) {
-            #pragma unroll
-            for( int ni = 0; ni < N; ni++ ) {
-
-                float tmp00 = softmax[2 * mi + 0][4 * ni + 0];
-                float tmp01 = softmax[2 * mi + 0][4 * ni + 1];
-                float tmp02 = softmax[2 * mi + 0][4 * ni + 2];
-                float tmp03 = softmax[2 * mi + 0][4 * ni + 3];
-
-                float tmp10 = softmax[2 * mi + 1][4 * ni + 0];
-                float tmp11 = softmax[2 * mi + 1][4 * ni + 1];
-                float tmp12 = softmax[2 * mi + 1][4 * ni + 2];
-                float tmp13 = softmax[2 * mi + 1][4 * ni + 3];
-
-                uint4 dst;
-                dst.x = fmha::float2_to_half2(tmp00, tmp01);
-                dst.y = fmha::float2_to_half2(tmp02, tmp03);
-                dst.z = fmha::float2_to_half2(tmp10, tmp11);
-                dst.w = fmha::float2_to_half2(tmp12, tmp13);
-                if( mask.is_valid(mi, ni, 0, 0) ) {
-                    Base::store(dst, mi, ni);
-                }
-            }
-        }
     }
 
     // Store to global memory.

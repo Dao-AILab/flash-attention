@@ -33,6 +33,10 @@
 
 #include <cuda_fp16.h>
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#include <cuda_bf16.h>
+#endif
+
 extern "C" __device__ uint32_t __nvvm_get_smem_pointer(void *ptr);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -310,12 +314,16 @@ static inline __device__ uint4 hmul8(uint32_t a, uint4 b) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static inline __device__ uint32_t hrelu2(uint32_t x, uint32_t lb = 0) {
+template<typename T>
+inline __device__ uint32_t hrelu2(uint32_t x);
+
+template<>
+inline __device__ uint32_t hrelu2<__half>(uint32_t x) {
     uint32_t res;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile( "max.f16x2 %0, %1, %2;\n" : "=r"(res) : "r"(x), "r"(lb));
-#else
     const uint32_t zero = 0u;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile( "max.f16x2 %0, %1, %2;\n" : "=r"(res) : "r"(x), "r"(zero));
+#else
     asm volatile( \
         "{\n" \
         "\t .reg .f16x2 sela;\n" \
@@ -325,6 +333,19 @@ static inline __device__ uint32_t hrelu2(uint32_t x, uint32_t lb = 0) {
 #endif
     return res;
 }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+template<>
+inline __device__ uint32_t hrelu2<__nv_bfloat16>(uint32_t x) {
+    uint32_t res;
+    const uint32_t zero = 0u;
+    asm volatile( "max.bf16x2 %0, %1, %2;\n" : "=r"(res) : "r"(x), "r"(zero));
+    return res;
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 static inline __device__ uint32_t habs2(uint32_t x) {
     uint32_t res;
     asm volatile( "abs.f16x2 %0, %1;\n" : "=r"(res) : "r"(x));
@@ -332,7 +353,7 @@ static inline __device__ uint32_t habs2(uint32_t x) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-//
+
 template< typename T >
 static inline __device__ T clamp(T x, T lb, T ub) {
     return x < lb ? lb : (x > ub ? ub : x);
@@ -370,6 +391,25 @@ static inline __device__ uint32_t float2_to_half2(float a, float b) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template<typename T>
+inline __device__ uint32_t float2_pack(float a, float b);
+
+template <>
+inline __device__ uint32_t float2_pack<__half>(float a, float b) {
+    __half2 result = __floats2half2_rn(a, b);
+    return reinterpret_cast<uint32_t(&)>(result);
+}
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+template <>
+inline __device__ uint32_t float2_pack<__nv_bfloat16>(float a, float b) {
+    __nv_bfloat162 result = __floats2bfloat162_rn(a, b);
+    return reinterpret_cast<uint32_t(&)>(result);
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 static inline __device__ uint32_t float_to_half2(float a) {
     return float2_to_half2(a,a);
 }
@@ -391,6 +431,16 @@ static inline __device__ uint2 float4_to_half4(float x, float y, float z, float 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template<typename T>
+inline __device__ uint2 float4_pack(float x, float y, float z, float w) {
+    uint2 d;
+    d.x = float2_pack<T>(x, y);
+    d.y = float2_pack<T>(z, w);
+    return d;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 static inline __device__ uint32_t hfma2(uint32_t a, uint32_t b, uint32_t c) {
     uint32_t d;
     asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(c));
@@ -404,7 +454,7 @@ static inline __device__ uint32_t hfma2_relu(uint32_t a, uint32_t b, uint32_t c)
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("fma.rn.f16x2.relu %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
 #else
-    d = hrelu2(hfma2(a, b, c));
+    d = hrelu2<__half>(hfma2(a, b, c));
 #endif
     return d;
 }
@@ -481,32 +531,41 @@ static inline __device__ uint4 hadd8(uint4 a, uint4 b) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Converted two half2's into float, then take their dot product.
-// inline __device__ void hfma2_to_float(float &sum, const __half2 a, const __half2 b) {
-static inline __device__ float hfma2_to_float(const __half2 a, const __half2 b) {
-    float2 af = __half22float2(a);
-    float2 bf = __half22float2(b);
+template<typename T>
+inline __device__ float2 half2_unpack(uint32_t a);
+
+template <>
+inline __device__ float2 half2_unpack<__half>(uint32_t a) {
+    return __half22float2(reinterpret_cast<__half2 (&)>(a));
+}
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+template <>
+inline __device__ float2 half2_unpack<__nv_bfloat16>(uint32_t a) {
+    return __bfloat1622float2(reinterpret_cast<__nv_bfloat162 (&)>(a));
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Converted two half2's or bf162's into float, then take their dot product.
+template <typename T>
+inline __device__ float hfma2_to_float(const uint32_t a, const uint32_t b) {
+    float2 af = fmha::half2_unpack<T>(a);
+    float2 bf = fmha::half2_unpack<T>(b);
     return af.x * bf.x + af.y * bf.y;
-    // sum += af.x * bf.x + af.y * bf.y;
-    // sum = __fmaf_rn(sum, af.x, bf.x);
-    // sum = __fmaf_rn(sum, af.y, bf.y);
-    // float2 prod = __half22float2(__hmul2(a, b));
-    // sum += prod.x + prod.y;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Converted two vectors of 8 half's into float, then take their dot product.
-static inline __device__ float hmulsum8(const uint4 a, const uint4 b) {
+// Converted two vectors of 8 half's or bf16's into float, then take their dot product.
+template<typename T>
+inline __device__ float hmulsum8(const uint4 a, const uint4 b) {
     float sum;
-    sum  = fmha::hfma2_to_float(reinterpret_cast<const __half2&>(a.x),
-                                reinterpret_cast<const __half2&>(b.x));
-    sum += fmha::hfma2_to_float(reinterpret_cast<const __half2&>(a.y),
-                                reinterpret_cast<const __half2&>(b.y));
-    sum += fmha::hfma2_to_float(reinterpret_cast<const __half2&>(a.z),
-                                reinterpret_cast<const __half2&>(b.z));
-    sum += fmha::hfma2_to_float(reinterpret_cast<const __half2&>(a.w),
-                                reinterpret_cast<const __half2&>(b.w));
+    sum  = fmha::hfma2_to_float<T>(a.x, b.x);
+    sum += fmha::hfma2_to_float<T>(a.y, b.y);
+    sum += fmha::hfma2_to_float<T>(a.z, b.z);
+    sum += fmha::hfma2_to_float<T>(a.w, b.w);
     return sum;
 }
 

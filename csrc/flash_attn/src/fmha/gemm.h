@@ -142,10 +142,11 @@ struct alignas(static_cast<int>(Base_::ALIGNMENT)) Fragment : public Base_ {
         }
     }
 
+    template <typename elem_type>
     inline __device__ void hrelu_() {
         #pragma unroll
         for( int ii = 0; ii < Base_::NUM_REGS; ++ii ) {
-            this->reg(ii) = fmha::hrelu2(this->reg(ii));
+            this->reg(ii) = fmha::hrelu2<elem_type>(this->reg(ii));
         }
     }
 };

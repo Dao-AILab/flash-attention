@@ -18,7 +18,7 @@ inline __device__ void dot_do_o(float (&sum)[M], const uint4 (&do_)[M], const ui
                                 Smem_dp_sum smem, const int buffer_idx) {
     #pragma unroll
     for (int mi = 0; mi < M; ++mi) {
-        sum[mi] = smem.reduce_warp(fmha::hmulsum8(do_[mi], o[mi]));
+        sum[mi] = smem.reduce_warp(fmha::hmulsum8<__half>(do_[mi], o[mi]));
     }
     static_assert(M == 1);
     smem.store(sum[0], buffer_idx);
@@ -358,7 +358,7 @@ inline __device__ void compute_block_dq_dk_dv_1xN_one_iter(const Params &params,
         Frag_p frag_p[Mma_tile_dq::MMAS_K][Mma_tile_dq::MMAS_M];
         static_assert(Mma_tile_dq::MMAS_M == Mma_tile_p::MMAS_M);
         static_assert(Mma_tile_dq::MMAS_K == Mma_tile_p::MMAS_N);
-        softmax.pack(frag_p);
+        softmax.template pack<__half>(frag_p);
 
         // Store s * dmask to smem for transpose
         smem_s.store(frag_p);
@@ -463,7 +463,7 @@ inline __device__ void compute_block_dq_dk_dv_1xN_one_iter(const Params &params,
         if (is_first_read) { softmax.subtract_dp_sum(dp_sum); }
 
         Frag_p frag_dp[Mma_tile_dq::MMAS_K][Mma_tile_dq::MMAS_M];
-        softmax.pack(frag_dp);
+        softmax.template pack<__half>(frag_dp);
 
         if (!Is_dropout) {
             #pragma unroll
@@ -544,7 +544,7 @@ inline __device__ void compute_block_dq_dk_dv_1xN_one_iter(const Params &params,
             for( int ki = 0; ki < Mma_tile_dkv::MMAS_K; ki++ ) {
                 #pragma unroll
                 for( int mi = 0; mi < Mma_tile_dkv::MMAS_M; mi++ ) {
-                    frag_s[ki][mi].hrelu_();
+                    frag_s[ki][mi].template hrelu_<__half>();
                 }
             }
         }
@@ -638,7 +638,7 @@ inline __device__ void compute_block_dq_dk_dv_1xN_one_iter(const Params &params,
             // }
             dq_out[0] = fmha::fmul4(dq_out[0], params.scale_bmm1f);
             // Output the values.
-            gmem_dq.store(dq_out, 0);
+            gmem_dq.template store<__half>(dq_out, 0);
         } else  {
             // Output the values.
             gmem_dq_tmp.store(dq_out, 0);
@@ -693,11 +693,11 @@ inline __device__ void compute_block_dq_dk_dv_1xN_one_iter(const Params &params,
     // the total amount of shared mem?
     // Epilogue swizzle for dV
     Smem_tile_dv smem_dv(&smem_[0], tidx);
-    smem_dv.store(acc_dv);
+    smem_dv.template store<__half>(acc_dv);
 
     // Epilogue swizzle for dK
     Smem_tile_dk smem_dk(&smem_[Smem_tile_dv::BYTES_PER_TILE], tidx);
-    smem_dk.store(acc_dk);
+    smem_dk.template store<__half>(acc_dk);
 
     __syncthreads();
     uint4 dv_out[Smem_tile_dv::NUM_LDS];
