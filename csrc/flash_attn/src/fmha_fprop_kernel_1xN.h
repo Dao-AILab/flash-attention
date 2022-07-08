@@ -115,12 +115,12 @@ struct Gemm_Q_K : public Gemm_Q_K_base<Kernel_traits> {
             // Trigger the load from shared memory for the next series of Q values.
             Base::smem_q.load(Base::frag_q[ki & 1], ki);
             // Do the math for the values already in registers.
-            fmha::gemm_cl(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1)]);
+            fmha::gemm_cl<__half>(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1)]);
         }
         // Do the final stage of math.
         {
             int ki = Mma_tile_p::MMAS_K;
-            fmha::gemm_cl(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1)]);
+            fmha::gemm_cl<__half>(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1)]);
         }
     }
 
@@ -175,12 +175,12 @@ struct Gemm_Q_K<Kernel_traits, false> : public Gemm_Q_K_base<Kernel_traits> {
             Base::smem_q.load(Base::frag_q[ki & 1], ki);
             Base::smem_k.load(frag_k[ki & 1], ki);
             // Do the math for the values already in registers.
-            fmha::gemm_cl(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1) & 1]);
+            fmha::gemm_cl<__half>(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1) & 1]);
         }
         // Do the final stage of math.
         {
             int ki = Mma_tile_p::MMAS_K;
-            fmha::gemm_cl(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1) & 1]);
+            fmha::gemm_cl<__half>(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1) & 1]);
         }
     }
 
@@ -494,7 +494,7 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
         // Do this part of O = P^T * V^T.
         #pragma unroll
         for( int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki ) {
-            fmha::gemm_cl(acc_o, frag_p[ki], frag_v[ki]);
+            fmha::gemm_cl<__half>(acc_o, frag_p[ki], frag_v[ki]);
             // if ((threadIdx.x == 4) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
             //     float2 tmp_p = __half22float2(reinterpret_cast<__half2 &>(frag_p[ki]));
             //     float2 tmp_v = __half22float2(reinterpret_cast<__half2 &>(frag_v[ki]));

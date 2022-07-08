@@ -253,9 +253,26 @@ inline __device__ void gemm(Acc (&acc)[M][N], const A (&a)[M], const B (&b)[N]) 
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////
+/// Statically maps half types => cutlass data types
+/////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename Type_>
+struct HalfTypeToCutlassType { using Type = Type_; };
+
+/// Statically maps __half => cutlass::half_t
+template <> struct HalfTypeToCutlassType<__half> {
+    using Type = cutlass::half_t;
+};
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+template <> struct HalfTypeToCutlassType<__nv_bfloat16> {
+    using Type = cutlass::bfloat16_t;
+};
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Acc, typename A, typename B, int M, int N>
+template<typename elem_type, typename Acc, typename A, typename B, int M, int N>
 inline __device__ void gemm_cl(Acc (&acc)[M][N], const A (&a)[M], const B (&b)[N]) {
     using Shape = cutlass::gemm::GemmShape<16 * M, 16 * N, 16>;
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
@@ -267,7 +284,7 @@ inline __device__ void gemm_cl(Acc (&acc)[M][N], const A (&a)[M], const B (&b)[N
     // TD [2022-06-02] We don't support Volta (SM70) yet.
     assert(0);
 #endif
-    using Element = cutlass::half_t;
+    using Element = typename HalfTypeToCutlassType<elem_type>::Type;
     using ElementC = float;
     using LayoutA = cutlass::layout::RowMajor;
     using LayoutB = cutlass::layout::ColumnMajor;

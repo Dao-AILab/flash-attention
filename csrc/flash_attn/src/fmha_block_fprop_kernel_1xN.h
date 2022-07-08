@@ -365,7 +365,7 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
         // Do this part of O = P^T * V^T.
         #pragma unroll
         for( int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki ) {
-            fmha::gemm_cl(acc_o, frag_p[ki], frag_v[ki]);
+            fmha::gemm_cl<__half>(acc_o, frag_p[ki], frag_v[ki]);
         }
 
         // The mapping from tidx to rows changes between the softmax and the O-reduction.
