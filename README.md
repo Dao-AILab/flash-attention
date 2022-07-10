@@ -23,8 +23,8 @@ PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
 
 FlashAttention currently supports:
 1. Turing or Ampere GPUs (e.g., A100, RTX 3090, T4, RTX 2080).
-2. fp16.
-3. Head dimensions 16, 32, 64, 128 (bwd requires A100).
+2. fp16 and bf16 (bf16 requires Ampere GPUs).
+3. Head dimensions 16, 32, 64, 128 (head dim 128 backward requires A100).
 
 Our tentative roadmap:
 1. [Jun 2022] Make package pip-installable.
