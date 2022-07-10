@@ -72,7 +72,7 @@ struct Gemm_Q_K_base {
     Smem_tile_k smem_k;
 };
 
-template<typename Kernel_traits, bool K_in_regs>
+template<typename Kernel_traits, bool K_in_regs, typename elem_type_=__half>
 struct Gemm_Q_K : public Gemm_Q_K_base<Kernel_traits> {
 
     using Base = Gemm_Q_K_base<Kernel_traits>;
@@ -81,6 +81,7 @@ struct Gemm_Q_K : public Gemm_Q_K_base<Kernel_traits> {
     using Smem_tile_k = typename Base::Smem_tile_k;
     using Fragment_k = typename Base::Fragment_k;
     using Mma_tile_p = typename Base::Mma_tile_p;
+    using elem_type = elem_type_;
 
     static constexpr bool SHARE_SMEM_FOR_K_AND_V = Kernel_traits::SHARE_SMEM_FOR_K_AND_V;
     // If V is stored in shared memory, we can't load K using the same shared memory.
@@ -115,12 +116,12 @@ struct Gemm_Q_K : public Gemm_Q_K_base<Kernel_traits> {
             // Trigger the load from shared memory for the next series of Q values.
             Base::smem_q.load(Base::frag_q[ki & 1], ki);
             // Do the math for the values already in registers.
-            fmha::gemm_cl<__half>(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1)]);
+            fmha::gemm_cl<elem_type>(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1)]);
         }
         // Do the final stage of math.
         {
             int ki = Mma_tile_p::MMAS_K;
-            fmha::gemm_cl<__half>(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1)]);
+            fmha::gemm_cl<elem_type>(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1)]);
         }
     }
 
@@ -132,8 +133,8 @@ struct Gemm_Q_K : public Gemm_Q_K_base<Kernel_traits> {
 };
 
 
-template<typename Kernel_traits>
-struct Gemm_Q_K<Kernel_traits, false> : public Gemm_Q_K_base<Kernel_traits> {
+template<typename Kernel_traits, typename elem_type_>
+struct Gemm_Q_K<Kernel_traits, false, elem_type_> : public Gemm_Q_K_base<Kernel_traits> {
     using Base = Gemm_Q_K_base<Kernel_traits>;
     using Smem_tile_o = typename Base::Smem_tile_o;
     using Smem_tile_q = typename Base::Smem_tile_q;
@@ -141,6 +142,7 @@ struct Gemm_Q_K<Kernel_traits, false> : public Gemm_Q_K_base<Kernel_traits> {
     using Smem_tile_v = typename Kernel_traits::Smem_tile_v;
     using Fragment_k = typename Base::Fragment_k;
     using Mma_tile_p = typename Base::Mma_tile_p;
+    using elem_type = elem_type_;
     Fragment_k frag_k[2][Mma_tile_p::MMAS_N];
 
     static constexpr bool SHARE_SMEM_FOR_K_AND_V = Kernel_traits::SHARE_SMEM_FOR_K_AND_V;
@@ -175,12 +177,12 @@ struct Gemm_Q_K<Kernel_traits, false> : public Gemm_Q_K_base<Kernel_traits> {
             Base::smem_q.load(Base::frag_q[ki & 1], ki);
             Base::smem_k.load(frag_k[ki & 1], ki);
             // Do the math for the values already in registers.
-            fmha::gemm_cl<__half>(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1) & 1]);
+            fmha::gemm_cl<elem_type>(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1) & 1]);
         }
         // Do the final stage of math.
         {
             int ki = Mma_tile_p::MMAS_K;
-            fmha::gemm_cl<__half>(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1) & 1]);
+            fmha::gemm_cl<elem_type>(acc_p, Base::frag_q[(ki - 1) & 1], frag_k[(ki - 1) & 1]);
         }
     }
 
@@ -197,6 +199,13 @@ constexpr size_t get_dynamic_smem_size(){
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Return_softmax, bool Is_first, bool Is_last, typename Params, typename Prng>
 inline __device__ void device_1xN_(const Params &params, const int bidb, const int bidh, int begin, int steps, Prng &ph0, Prng &ph1, const int loop_step_idx) {
 
+#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
+    using elem_type = typename Kernel_traits::elem_type;
+#else
+    constexpr bool is_fp16_type = std::is_same<typename Kernel_traits::elem_type, __half>::value;
+    assert(is_fp16_type);
+    using elem_type = __half;
+#endif
 
     // The description of the CTA tile for the 1st batched GEMM.
     using Cta_tile_p = typename Kernel_traits::Cta_tile_p;
@@ -231,7 +240,7 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
 
     using Smem_softmax_sum = typename Kernel_traits::Smem_dp_sum;
 
-    using Gemm1 = Gemm_Q_K<Kernel_traits, Kernel_traits::K_IN_REGS>;
+    using Gemm1 = Gemm_Q_K<Kernel_traits, Kernel_traits::K_IN_REGS, elem_type>;
 
     using Softmax = fmha::Softmax<Cta_tile_p, Kernel_traits>;
 
@@ -363,6 +372,10 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
         // Do this part of P = Q * K^T.
         gemm_q_k(acc_p);
 
+        // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
+        //     printf("acc_p=%.6f, %.6f\n", acc_p[0][0].elt(0), acc_p[0][0].elt(1));
+        // }
+
         uint4 out[Gmem_tile_o::STGS_PER_LOOP];
         if (!Is_first) { gmem_o_tmp.load(out, 0); }
 
@@ -466,7 +479,7 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
         Frag_p frag_p[Mma_tile_o::MMAS_K][Mma_tile_o::MMAS_M];
         static_assert(Mma_tile_o::MMAS_M == Mma_tile_p::MMAS_M);
         static_assert(Mma_tile_o::MMAS_K == Mma_tile_p::MMAS_N);
-        softmax.template pack<__half>(frag_p);
+        softmax.template pack<elem_type>(frag_p);
         if (Return_softmax) {
             gmem_s.store(frag_p, mask);
             gmem_s.move();
@@ -482,7 +495,7 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
             for( int ki = 0; ki < Mma_tile_o::MMAS_K; ki++ ) {
                 #pragma unroll
                 for( int mi = 0; mi < Mma_tile_o::MMAS_M; mi++ ) {
-                    frag_p[ki][mi].template hrelu_<__half>();
+                    frag_p[ki][mi].template hrelu_<elem_type>();
                 }
             }
         }
@@ -494,7 +507,7 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
         // Do this part of O = P^T * V^T.
         #pragma unroll
         for( int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki ) {
-            fmha::gemm_cl<__half>(acc_o, frag_p[ki], frag_v[ki]);
+            fmha::gemm_cl<elem_type>(acc_o, frag_p[ki], frag_v[ki]);
             // if ((threadIdx.x == 4) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
             //     float2 tmp_p = __half22float2(reinterpret_cast<__half2 &>(frag_p[ki]));
             //     float2 tmp_v = __half22float2(reinterpret_cast<__half2 &>(frag_v[ki]));
@@ -605,7 +618,7 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
 
         // Output the values.
         if (is_final_write) {
-            gmem_o.template store<__half>(out, 0);
+            gmem_o.template store<elem_type>(out, 0);
             gmem_o.move();
         } else {
             gmem_o_tmp.store(out, 0);

@@ -123,6 +123,7 @@ struct FMHA_fprop_params : public Qkv_params {
     // Random state.
     at::PhiloxCudaState philox_args;
 
+    bool is_bf16;
     bool is_causal;
 };
 

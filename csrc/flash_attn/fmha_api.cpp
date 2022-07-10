@@ -56,10 +56,12 @@ void set_params_fprop(FMHA_fprop_params &params,
                       bool is_causal) {
 
     Data_type acc_type = DATA_TYPE_FP32;
-    Data_type data_type = DATA_TYPE_FP16;
+    Data_type data_type = !(q.dtype() == torch::kBFloat16) ? DATA_TYPE_FP16 : DATA_TYPE_BF16;
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
+
+    params.is_bf16 = q.dtype() == torch::kBFloat16;
 
     // Set the pointers and strides.
     params.q_ptr = q.data_ptr();
@@ -192,9 +194,10 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     bool is_dropout = p_dropout > 0.0;
     Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
 
-    TORCH_CHECK(q.dtype() == torch::kFloat16);
-    TORCH_CHECK(k.dtype() == torch::kFloat16);
-    TORCH_CHECK(v.dtype() == torch::kFloat16);
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || (is_sm8x && q_dtype == torch::kBFloat16));
+    TORCH_CHECK(k.dtype() == q_dtype);
+    TORCH_CHECK(v.dtype() == q_dtype);
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32);
     TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32);
 
@@ -326,14 +329,15 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-    TORCH_CHECK(q.dtype() == torch::kFloat16);
-    TORCH_CHECK(k.dtype() == torch::kFloat16);
-    TORCH_CHECK(v.dtype() == torch::kFloat16);
-    TORCH_CHECK(out.dtype() == torch::kFloat16);
-    TORCH_CHECK(dout.dtype() == torch::kFloat16);
-    TORCH_CHECK(dq.dtype() == torch::kFloat16);
-    TORCH_CHECK(dk.dtype() == torch::kFloat16);
-    TORCH_CHECK(dv.dtype() == torch::kFloat16);
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || (is_sm8x && q_dtype == torch::kBFloat16));
+    TORCH_CHECK(k.dtype() == q_dtype);
+    TORCH_CHECK(v.dtype() == q_dtype);
+    TORCH_CHECK(out.dtype() == q_dtype);
+    TORCH_CHECK(dout.dtype() == q_dtype);
+    TORCH_CHECK(dq.dtype() == q_dtype);
+    TORCH_CHECK(dk.dtype() == q_dtype);
+    TORCH_CHECK(dv.dtype() == q_dtype);
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32);
     TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32);
 
