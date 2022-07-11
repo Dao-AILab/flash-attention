@@ -27,25 +27,27 @@ void run_fmha_dgrad_fp16_sm80_loop_(const FMHA_dgrad_params &params, cudaStream_
     // printf("blocksize_c = %d, WARPS_N = %d, Smem size = %d\n", blocksize_c, Kernel_traits::Cta_tile_p::WARPS_N, smem_size_dq_dk_dv);
 
     bool is_dropout = params.p_dropout < 1.f;  // params.p_dropout is the probability of "keeping"
+    // Work-around for gcc 7. It doesn't like nested BOOL_SWITCH.
     BOOL_SWITCH(is_dropout, IsDropoutConst, [&] {
-        BOOL_SWITCH(params.is_causal, IsCausalConst, [&] {
-            auto kernel = &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<
-                Kernel_traits, IsDropoutConst, IsCausalConst>;
-            if (params.seqlen_k == blocksize_c) {
-                kernel = &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<
-                    Kernel_traits, IsDropoutConst, IsCausalConst, /*loop_steps=*/1>;
-            } else if (params.seqlen_k == blocksize_c * 2) {
-                kernel = &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<
-                    Kernel_traits, IsDropoutConst, IsCausalConst, /*loop_steps=*/2>;
-            }
-            if( smem_size_dq_dk_dv >= 48 * 1024 ) {
-                FMHA_CHECK_CUDA(cudaFuncSetAttribute(
-                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
-            }
-            dim3 grid(params.b, params.h);
-            kernel<<<grid, Kernel_traits::THREADS, smem_size_dq_dk_dv, stream>>>(params);
-            FMHA_CHECK_CUDA(cudaPeekAtLastError());
-        });
+        auto kernel = params.is_causal
+            ? &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, true>
+            : &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, false>;
+        if (params.seqlen_k == blocksize_c) {
+            kernel = params.is_causal
+                ? &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, true, /*loop_steps=*/1>
+                : &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, false, /*loop_steps=*/1>;
+        } else if (params.seqlen_k == blocksize_c * 2) {
+            kernel = params.is_causal
+                ? &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, true, /*loop_steps=*/2>
+                : &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, false, /*loop_steps=*/2>;
+        }
+        if( smem_size_dq_dk_dv >= 48 * 1024 ) {
+            FMHA_CHECK_CUDA(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
+        }
+        dim3 grid(params.b, params.h);
+        kernel<<<grid, Kernel_traits::THREADS, smem_size_dq_dk_dv, stream>>>(params);
+        FMHA_CHECK_CUDA(cudaPeekAtLastError());
     });
 }
 

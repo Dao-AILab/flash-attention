@@ -59,21 +59,25 @@ void run_fmha_fp16_sm80_loop_(Launch_params<FMHA_fprop_params> &launch_params,
     const int smem_size = fmha::get_dynamic_smem_size<Kernel_traits>()
         + (loop_steps > 1 ? smem_size_softmax_lse : 0);
 
+    // Work-around for gcc 7. It doesn't like nested BOOL_SWITCH.
+    // https://github.com/kokkos/kokkos-kernels/issues/349
+    // https://github.com/HazyResearch/flash-attention/issues/21
     BOOL_SWITCH(launch_params.is_dropout, IsDropoutConst, [&] {
-        BOOL_SWITCH(launch_params.params.is_causal, IsCausalConst, [&] {
-            BOOL_SWITCH(launch_params.return_softmax, ReturnSoftmaxConst, [&] {
-                auto kernel = &fmha_fprop_fp16_sm80_loop_kernel<
-                    Kernel_traits, IsDropoutConst, IsCausalConst, ReturnSoftmaxConst>;
-                if( smem_size >= 48 * 1024 ) {
-                    FMHA_CHECK_CUDA(cudaFuncSetAttribute(
-                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-                }
-                dim3 grid(launch_params.params.b, launch_params.params.h);
-                kernel<<<grid, Kernel_traits::THREADS, smem_size, launch_params.stream>>>(
-                    launch_params.params);
-                FMHA_CHECK_CUDA(cudaPeekAtLastError());
-            });
-        });
+        auto kernel = launch_params.params.is_causal
+            ? (launch_params.return_softmax
+               ? &fmha_fprop_fp16_sm80_loop_kernel<Kernel_traits, IsDropoutConst, true, true>
+               : &fmha_fprop_fp16_sm80_loop_kernel<Kernel_traits, IsDropoutConst, true, false>)
+            : (launch_params.return_softmax
+               ? &fmha_fprop_fp16_sm80_loop_kernel<Kernel_traits, IsDropoutConst, false, true>
+               : &fmha_fprop_fp16_sm80_loop_kernel<Kernel_traits, IsDropoutConst, false, false>);
+        if( smem_size >= 48 * 1024 ) {
+            FMHA_CHECK_CUDA(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        }
+        dim3 grid(launch_params.params.b, launch_params.params.h);
+        kernel<<<grid, Kernel_traits::THREADS, smem_size, launch_params.stream>>>(
+            launch_params.params);
+        FMHA_CHECK_CUDA(cudaPeekAtLastError());
     });
 }
 
