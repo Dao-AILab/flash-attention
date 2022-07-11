@@ -8,6 +8,16 @@ Paper: https://arxiv.org/abs/2205.14135
 IEEE Spectrum [article](https://spectrum.ieee.org/mlperf-rankings-2022) about our submission to the MLPerf 2.0 benchmark using FlashAttention.
 ![FlashAttention](assets/flashattn_banner.jpg)
 
+#### Triton implementation of FlashAttention
+
+Phil Tillet (OpenAI) has an implementation of FlashAttention in Triton:
+https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention.py  
+
+As Triton is a higher-level language than CUDA, it might be easier to understand
+and experiment with. The notations in the Triton implementation are also closer
+to what's used in our paper.
+
+
 ## Alpha release (0.1).
 
 To compile (requiring CUDA 11, NVCC, and an Turing or Ampere GPU):
