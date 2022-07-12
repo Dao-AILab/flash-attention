@@ -10,7 +10,7 @@ IEEE Spectrum [article](https://spectrum.ieee.org/mlperf-rankings-2022) about ou
 
 #### Triton implementation of FlashAttention
 
-Phil Tillet (OpenAI) has an implementation of FlashAttention in Triton:
+Phil Tillet (OpenAI) has an experimental implementation of FlashAttention in Triton:
 https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention.py  
 
 As Triton is a higher-level language than CUDA, it might be easier to understand
