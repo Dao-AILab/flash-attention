@@ -116,6 +116,17 @@ T4 GPUs are commonly used for inference, so we also measure speedup on the forwa
 
 We see speedups between 2.5x-4.5x on the forward pass.
 
+## Tests
+We test that FlashAttention produces the same output and gradient as a reference
+implementation, up to some numerical tolerance. In particular, we check that the
+maximum numerical error of FlashAttention is at most twice the numerical error
+of a baseline implementation in Pytorch (for different head dimensions, input
+dtype, sequence length, causal / non-causal).
+
+To run the tests:
+```
+pytest -q -s tests/test_flash_attn.py
+```
 ## When you encounter issues
 
 This alpha release of FlashAttention contains code written for a research
