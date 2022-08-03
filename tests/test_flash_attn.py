@@ -333,7 +333,7 @@ def get_dropout_fraction(dropout_mask, query_padding_mask=None, key_padding_mask
 @pytest.mark.parametrize('causal', [False, True])
 @pytest.mark.parametrize('d', [128, 64, 32, 16])
 # @pytest.mark.parametrize('d', [64])
-@pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
+@pytest.mark.parametrize('seqlen', [49, 97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
 # @pytest.mark.parametrize('seqlen', [128])
 @pytest.mark.parametrize('dropout_p', [0.0, 0.17])
 # @pytest.mark.parametrize('dropout_p', [0.0])
