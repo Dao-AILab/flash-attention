@@ -98,7 +98,7 @@ class FlashMHA(nn.Module):
         self.inner_attn = FlashAttention(attention_dropout=attention_dropout, **factory_kwargs)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
 
-    def forward(self, x, key_padding_mask=None):
+    def forward(self, x, key_padding_mask=None, need_weights=False):
         """x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim)
         key_padding_mask: bool tensor of shape (batch, seqlen)
         """
