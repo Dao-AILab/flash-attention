@@ -107,7 +107,7 @@ class FlashMHA(nn.Module):
             query, key, value = rearrange(qkv, 'b s (three h d) -> b s three h d', three=3,
                                           h=self.num_heads).unbind(dim=2)
             query, key = self.rotary_emb(query, key, seq_dimension=-3)
-            qkv = torch.stack([query, key, value], dim=2)
+            qkv = torch.stack([query.type(x.dtype), key.type(x.dtype), value], dim=2)
         else:
             qkv = rearrange(qkv, 'b s (three h d) -> b s three h d', three=3, h=self.num_heads)
         context, attn_weights = self.inner_attn(qkv, key_padding_mask=key_padding_mask,
