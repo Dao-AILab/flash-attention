@@ -1,0 +1,130 @@
+# This workflow will upload a Python Package to Release asset
+# For more information see: https://help.github.com/en/actions/language-and-framework-guides/using-python-with-github-actions#publishing-to-package-registries
+
+
+name: Python Package
+
+on:
+  # create:
+  #   tags:
+  #     - '**'
+  push:
+    branch:
+      publish
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the tag version
+        id: extract_branch
+        run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
+        shell: bash
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.extract_branch.outputs.branch }}
+          release_name: ${{ steps.extract_branch.outputs.branch }}
+      
+  wheel:
+    name: Build Wheel
+    runs-on: ${{ matrix.os }}
+    needs: release
+    
+    strategy:
+      fail-fast: false
+      matrix:
+          # os: [ubuntu-20.04]
+          os: [ubuntu-18.04]
+          python-version: ['3.7', '3.8', '3.9', '3.10']
+          torch-version: [1.11.0, 1.12.0, 1.12.1]
+          cuda-version: ['113', '116']
+          exclude:
+            - torch-version: 1.11.0
+              cuda-version: '116'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Linux Env
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          bash .github/workflows/env.sh
+          echo ${{ needs.create_release.outputs.upload_url }} 
+          echo ${{ needs.steps.extract_branch.outputs.upload_url }} 
+        shell:
+          bash
+
+      - name: Install CUDA ${{ matrix.cuda-version }}
+        if: ${{ matrix.cuda-version != 'cpu' }}
+        run: |
+          bash .github/workflows/cuda/cu${{ matrix.cuda-version }}-${{ runner.os }}.sh
+        shell:
+          bash
+
+      - name: Check GPU Env
+        if: ${{ matrix.cuda-version != 'cpu' }}
+        run: |
+          source .github/workflows/cuda/cu${{ matrix.cuda-version }}-${{ runner.os }}-env.sh
+          nvcc --version
+        shell:
+          bash
+
+      - name: Install PyTorch ${{ matrix.torch-version }}+cu${{ matrix.cuda-version }}
+        run: |
+          pip install numpy pyyaml scipy ipython mkl mkl-include ninja cython typing pandas typing-extensions dataclasses && conda clean -ya
+          pip install --no-index --no-cache-dir torch==${{ matrix.torch-version }} -f https://download.pytorch.org/whl/cu${{ matrix.cuda-version }}/torch_stable.html
+          python --version
+          python -c "import torch; print('PyTorch:', torch.__version__)"
+          python -c "import torch; print('CUDA:', torch.version.cuda)"
+          python -c "from torch.utils import cpp_extension; print (cpp_extension.CUDA_HOME)"
+        shell:
+          bash
+      
+      - name: Get the tag version
+        id: extract_branch
+        run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
+
+      - name: Get Release with tag
+        id: get_current_release
+        uses: joutvhu/get-release@v1
+        with:
+          tag_name: ${{ steps.extract_branch.outputs.branch }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build wheel
+        run: |
+          export FORCE_CUDA="1"
+          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+          export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+          export CUDA_INSTALL_DIR=/usr/local/cuda-11.3$CUDA_INSTALL_DIR
+          pip install wheel
+          python setup.py bdist_wheel --dist-dir=dist
+          tmpname=cu${{ matrix.cuda-version }}torch${{ matrix.torch-version }}
+          wheel_name=$(ls dist/*whl | xargs -n 1 basename | sed "s/-/+$tmpname-/2")
+          ls dist/*whl |xargs -I {} mv {} ${wheel_name}
+          echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
+      
+      - name: Upload Release Asset
+        id: upload_release_asset 
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.get_current_release.outputs.upload_url }}
+          asset_path: ./${{env.wheel_name}}
+          asset_name: ${{env.wheel_name}}
+          asset_content_type: application/*
