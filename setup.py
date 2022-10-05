@@ -125,10 +125,11 @@ ext_modules.append(
             "csrc/flash_attn/src/fmha_block_dgrad_fp16_kernel_loop.sm80.cu",
         ],
         extra_compile_args={
-            "cxx": ["-O3"] + generator_flag,
+            "cxx": ["-O3", "-std=c++17"] + generator_flag,
             "nvcc": append_nvcc_threads(
                 [
                     "-O3",
+                    "-std=c++17",
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",
                     "--expt-relaxed-constexpr",

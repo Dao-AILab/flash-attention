@@ -2,6 +2,7 @@
  */
 
 #include "static_switch.h"
+#include "fp16_switch.h"
 #include "fmha.h"
 #include "fmha_dgrad_kernel_1xN_loop.h"
 
@@ -52,8 +53,8 @@ void run_fmha_dgrad_fp16_sm80_loop_(const FMHA_dgrad_params &params, cudaStream_
 }
 
 void run_fmha_dgrad_fp16_sm80(const FMHA_dgrad_params &params, cudaStream_t stream) {
-    BOOL_SWITCH(params.is_bf16, IsBf16Const, [&] {
-        using elem_type = std::conditional<IsBf16Const, __nv_bfloat16, __half>::type;
+    // work around for MSVC issue
+    FP16_SWITCH(params.is_bf16, [&] {
         auto dprops = at::cuda::getCurrentDeviceProperties();
         if (params.d == 16) {
             if( params.seqlen_k == 128 ) {
