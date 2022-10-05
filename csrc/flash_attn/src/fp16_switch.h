@@ -18,10 +18,10 @@
 #define FP16_SWITCH(COND, ...)                                           \
     [&] {                                                                            \
         if (COND) {                                                                  \
-            using elem_type = std::conditional<true, __nv_bfloat16, __half>::type;   \
+            using elem_type = __nv_bfloat16;   \
             return __VA_ARGS__();                                                    \
         } else {                                                                     \
-            using elem_type = std::conditional<true, __nv_bfloat16, __half>::type;   \
+            using elem_type = __half;   \
             return __VA_ARGS__();                                                    \
         }                                                                            \
     }()
