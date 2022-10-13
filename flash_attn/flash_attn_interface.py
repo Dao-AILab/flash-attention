@@ -14,26 +14,28 @@ def _get_block_size(device, head_dim, is_dropout):
         return 256 if (torch.cuda.get_device_capability(device) == (8, 0) and not is_dropout) else 128
 
 
-def _flash_attn_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p,
+def _flash_attn_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, attn_mask, attn_bias, dropout_p,
                         softmax_scale, causal, return_softmax):
+    # import pdb; pdb.set_trace()
     out, softmax_lse, *rest = flash_attn_cuda.fwd(
-        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale,
-        False, causal, return_softmax, None
-    )
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale,
+            False, causal, return_softmax, None, attn_mask, attn_bias
+        )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
     S_dmask = rest[0] if return_softmax else None
     return out, softmax_lse, S_dmask
 
 
-def _flash_attn_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k,
+def _flash_attn_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, attn_mask, attn_bias,
                          max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, causal):
-    softmax_d = flash_attn_cuda.bwd(
+    softmax_d, *rest = flash_attn_cuda.bwd(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k,
-        max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, False, causal, None)
+        max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, False, causal, None, attn_mask, attn_bias)
     # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
     #     breakpoint()
-    return dq, dk, dv, softmax_d
+    dbias = None if attn_bias is None else rest[0]
+    return dq, dk, dv, softmax_d, dbias
 
 
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
@@ -114,17 +116,17 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
 class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p,
-                softmax_scale, causal, return_softmax):
+    def forward(ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, attn_mask, attn_bias,
+                dropout_p, softmax_scale, causal, return_softmax):
         # Save rng_state because the backward pass will regenerate the dropout mask
         rng_state = torch.cuda.get_rng_state() if dropout_p > 0 else None
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         out, softmax_lse, S_dmask = _flash_attn_forward(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, attn_mask, attn_bias,
             dropout_p, softmax_scale, causal=causal, return_softmax=return_softmax
         )
-        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state, attn_mask, attn_bias)
         ctx.dropout_p = dropout_p
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
@@ -134,18 +136,20 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state, attn_mask, attn_bias = ctx.saved_tensors
         if rng_state is not None:
             cur_rng_state = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(rng_state)
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        _flash_attn_backward(
-            dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k,
+        # import pdb; pdb.set_trace()
+        dq, dk, dv, softmax_d, dbias = _flash_attn_backward(
+            dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, attn_mask, attn_bias,
             ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.dropout_p, ctx.softmax_scale, ctx.causal
         )
         if rng_state is not None:
             torch.cuda.set_rng_state(cur_rng_state)
-        return dq, dk, dv, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, dbias, None, None, None, None
+        # TODO: the last two is attn_mask, attn_bias, bias need gradient
 
 
 def flash_attn_unpadded_qkvpacked_func(qkv, cu_seqlens, max_seqlen, dropout_p, softmax_scale=None,
@@ -210,8 +214,8 @@ def flash_attn_unpadded_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_k, max_seq
                                        return_attn_probs)
 
 
-def flash_attn_unpadded_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                             dropout_p, softmax_scale=None, causal=False, return_attn_probs=False):
+def flash_attn_unpadded_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, attn_mask=None, attn_bias=None,
+                             dropout_p=0.0, softmax_scale=None, causal=False, return_attn_probs=False):
     """dropout_p should be set to 0.0 during evaluation
     Arguments:
         q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
@@ -239,7 +243,7 @@ def flash_attn_unpadded_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
-    return FlashAttnFunc.apply(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+    return FlashAttnFunc.apply(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, attn_mask, attn_bias,
                                dropout_p, softmax_scale, causal, return_attn_probs)
 
 

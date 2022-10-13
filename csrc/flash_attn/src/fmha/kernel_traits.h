@@ -71,6 +71,15 @@ struct FMHA_kernel_traits {
     // The global memory tile to load/store S.
     using Gmem_tile_s = fmha::Gmem_tile_mma_s<Cta_tile_p>;
 
+    // Gmem_tile_mma_mask
+    using Gmem_tile_mask = fmha::Gmem_tile_mma_mask<Cta_tile_p>;
+
+    // Gmem_tile_mma_bias
+    using Gmem_tile_bias = fmha::Gmem_tile_mma_bias<Cta_tile_p>;
+
+    // Gmem_tile_mma_ds
+    using Gmem_tile_ds = fmha::Gmem_tile_mma_ds<Cta_tile_p>;
+
     // The shared memory tile to transpose S.
     using Smem_tile_st = fmha::Smem_tile_mma_transposed<Cta_tile_p>;
 
