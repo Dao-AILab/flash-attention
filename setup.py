@@ -129,6 +129,7 @@ ext_modules.append(
             "nvcc": append_nvcc_threads(
                 [
                     "-O3",
+                    "-t4",
                     "-std=c++17",
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",

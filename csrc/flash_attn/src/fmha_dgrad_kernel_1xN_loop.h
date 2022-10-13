@@ -31,7 +31,7 @@ inline __device__ void dot_do_o(const uint4 (&do_)[M], const uint4 (&o)[M], cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_first, bool Is_last, typename Params, typename Prng>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool has_attn_mask, bool has_attn_bias, bool Is_first, bool Is_last, typename Params, typename Prng>
 inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng &ph,
                                                      const int loop_step_idx) {
 
@@ -148,6 +148,19 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
     // Allocate the global memory tile loader for S.
     Gmem_tile_s gmem_s(params, binfo, tidx);
 
+    // Allocate the global memory tile loader for mask.
+    using Gmem_tile_mask = typename Kernel_traits::Gmem_tile_mask;
+    // conctructor
+    Gmem_tile_mask gmem_mask(params, binfo, tidx, loop_step_idx);
+
+    // Allocate the global memory tile loader for bias.
+    using Gmem_tile_bias = typename Kernel_traits::Gmem_tile_bias;
+    using Gmem_tile_ds = typename Kernel_traits::Gmem_tile_ds;
+
+    // conctructor
+    Gmem_tile_bias gmem_bias(params, binfo, tidx, loop_step_idx);
+    Gmem_tile_ds gmem_ds(params, binfo, tidx, loop_step_idx);
+
     fmha::Mask<Cta_tile_p, Is_causal> mask(binfo, tidx, loop_step_idx);
 
     // Allocate the global memory tile loader for K.
@@ -197,6 +210,15 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
     gmem_softmax_lse.move(begin);
     gmem_softmax_d.move(begin);
 
+    if constexpr (has_attn_mask) {
+        gmem_mask.move(begin);
+    }
+
+    if constexpr (has_attn_bias) {
+        gmem_bias.move(begin);
+        gmem_ds.move(begin);
+    }
+
     if (!Is_first) {
         gmem_k.move(loop_step_idx);
         gmem_v.move(loop_step_idx);
@@ -221,6 +243,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
     // Commit the data for Q, dO, and V to shared memory.
     gmem_q.commit(gemm_q_k.smem_q);
     gmem_do.commit(smem_do);
+
     if (Is_first) {
         dot_do_o<Gmem_tile_do::ROWS, Gmem_tile_do::THREADS_PER_ROW, elem_type>(
             gmem_do.fetch_, gmem_o.fetch_, params.p_dropout, gmem_softmax_d, tidx
@@ -326,11 +349,33 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
 
         // Convert from the accumulator type to FP32 for Softmax.
         softmax.unpack_noscale(acc_p);
+        if constexpr (has_attn_mask) {
+            using Frag_mask = fmha::Fragment_c<fmha::Row, elem_type>;
+            Frag_mask frag_mask[Mma_tile_p::MMAS_M][Mma_tile_p::MMAS_N];
+            gmem_mask.template load<Frag_mask, elem_type>(frag_mask);
+            gmem_mask.move();
+
+            // Apply the attn mask.
+            softmax.apply_attn_mask(frag_mask);
+        }
+
+        if constexpr (has_attn_bias) {
+            using Frag_Bias = fmha::Fragment_c<fmha::Row, elem_type>;
+            Frag_Bias frag_bias[Mma_tile_p::MMAS_M][Mma_tile_p::MMAS_N];
+            gmem_bias.template load<Frag_Bias, elem_type>(frag_bias);
+            gmem_bias.move();
+
+            // Apply the attn mask.
+            softmax.apply_attn_bias(frag_bias, l);
+        }
+
         // Apply the mask.
         softmax.apply_mask(mask);
         // Scale by log-sum-exp of the softmax
         // softmax.apply_exp(p_lse);
+        // exp (x - (max+log(sum))) = exp(x - max) / sum
         softmax.template scale_apply_exp</*scale_max=*/false>(p_lse, params.scale_bmm1f);
+
         if (Is_dropout) {
             // softmax.apply_dropout(ph, params.p_dropout_in_uint);
             // softmax.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(ph, params.p_dropout_in_uint);
@@ -433,6 +478,11 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
         }
 
         softmax.template pack<elem_type>(frag_p);
+
+        if constexpr (has_attn_bias) {
+            gmem_ds.template store<elem_type>(softmax.elt_);
+            gmem_ds.move();
+        }
 
         // Store dp to smem for transpose
         smem_dp.store(frag_p);
@@ -636,6 +686,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
     // TODO [TD - 2022-05-04]: Are there cases where the shared mem for dV and dK are larger than
     // the total amount of shared mem?
     // Epilogue swizzle for dV
+    // data flow: fragment -> smem_dv -> global 
     Smem_tile_dv smem_dv(&smem_[0], tidx);
     smem_dv.template store<elem_type>(acc_dv);
 
@@ -665,7 +716,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
 
 // loop_steps = -1 means the number of steps will be params.seqlen_k / Kernel_traits::Cta_tile_p::N.
 // This template parameter is there so we can specialize with loop_steps == 1 and loop_steps == 2.
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, int loop_steps=-1, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Need_attn_mask, bool Need_attn_bias, int loop_steps=-1, typename Params>
 inline __device__ void compute_dq_dk_dv_1xN(const Params &params) {
     constexpr int blocksize_c = Kernel_traits::Cta_tile_p::N;
 
@@ -681,20 +732,20 @@ inline __device__ void compute_dq_dk_dv_1xN(const Params &params) {
     Philox ph(std::get<0>(seeds), tidx_global, std::get<1>(seeds));
 
     if (loop_steps == 1) {
-        compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, true, true>(params, ph, 0);
+        compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, Need_attn_mask, Need_attn_bias, true, true>(params, ph, 0);
     } else if (loop_steps == 2) {
-        compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, true, false>(params, ph, 0);
-        compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, false, true>(params, ph, 1);
+        compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, Need_attn_mask, Need_attn_bias, true, false>(params, ph, 0);
+        compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, Need_attn_mask, Need_attn_bias, false, true>(params, ph, 1);
     } else {
         if (params.seqlen_k == blocksize_c) {
-            compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, true, true>(params, ph, 0);
+            compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, Need_attn_mask, Need_attn_bias, true, true>(params, ph, 0);
         } else {
             const int max_loop_steps = (params.seqlen_k + blocksize_c - 1) / blocksize_c;
-            compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, true, false>(params, ph, 0);
+            compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, Need_attn_mask, Need_attn_bias, true, false>(params, ph, 0);
             for (int loop_step_idx = 1; loop_step_idx < max_loop_steps - 1; loop_step_idx++) {
-                compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, false, false>(params, ph, loop_step_idx);
+                compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, Need_attn_mask, Need_attn_bias, false, false>(params, ph, loop_step_idx);
             }
-            compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, false, true>(params, ph, max_loop_steps - 1);
+            compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, Need_attn_mask, Need_attn_bias, false, true>(params, ph, max_loop_steps - 1);
         }
     }
 }

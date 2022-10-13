@@ -112,7 +112,7 @@ jobs:
           export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
           export CUDA_INSTALL_DIR=/usr/local/cuda-11.3$CUDA_INSTALL_DIR
           pip install wheel
-          python setup.py bdist_wheel --dist-dir=dist
+          MAX_JOBS=1 python setup.py bdist_wheel --dist-dir=dist
           tmpname=cu${{ matrix.cuda-version }}torch${{ matrix.torch-version }}
           wheel_name=$(ls dist/*whl | xargs -n 1 basename | sed "s/-/+$tmpname-/2")
           ls dist/*whl |xargs -I {} mv {} ${wheel_name}
