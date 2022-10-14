@@ -81,6 +81,8 @@ struct FMHA_fprop_params : public Qkv_params {
     // size_t o_stride_in_bytes;
     uint32_t o_row_stride_in_elts;
     uint32_t o_head_stride_in_elts;
+    uint32_t o_tmp_row_stride_in_elts;
+    uint32_t o_tmp_head_stride_in_elts;
 
     // The pointer to the O_tmp matrix, which holds O intermediate value during
     // the loop;
