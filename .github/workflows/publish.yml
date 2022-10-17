@@ -5,12 +5,9 @@
 name: Python Package
 
 on:
-  # create:
-  #   tags:
-  #     - '**'
-  push:
-    branch:
-      publish
+  create:
+    tags:
+      - '**'
 
 jobs:
   release:
