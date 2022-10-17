@@ -28,6 +28,7 @@
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include "fmha.h"
 
@@ -45,9 +46,9 @@ void set_params_fprop(FMHA_fprop_params &params,
                       const at::Tensor q,
                       const at::Tensor k,
                       const at::Tensor v,
+                      at::Tensor out,
                       void *cu_seqlens_q_d,
                       void *cu_seqlens_k_d,
-                      void *o_packed_d,
                       void *o_tmp_d,
                       void *s_d,
                       void *softmax_lse_d,
@@ -73,10 +74,12 @@ void set_params_fprop(FMHA_fprop_params &params,
     params.q_head_stride_in_elts = q.stride(1);
     params.k_head_stride_in_elts = k.stride(1);
     params.v_head_stride_in_elts = v.stride(1);
-    params.o_ptr = o_packed_d;
-    params.o_row_stride_in_elts = h * d;
-    params.o_head_stride_in_elts = d;
+    params.o_ptr = out.data_ptr();
+    params.o_row_stride_in_elts = out.stride(0);
+    params.o_head_stride_in_elts = out.stride(1);
     params.o_tmp_ptr = o_tmp_d;
+    params.o_tmp_row_stride_in_elts = h * d;
+    params.o_tmp_head_stride_in_elts = d;
 
     params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
@@ -127,12 +130,12 @@ void set_params_dgrad(FMHA_dgrad_params &params,
                       const at::Tensor q,
                       const at::Tensor k,
                       const at::Tensor v,
+                      const at::Tensor out,
                       at::Tensor dq,
                       at::Tensor dk,
                       at::Tensor dv,
                       void *cu_seqlens_q_d,
                       void *cu_seqlens_k_d,
-                      void *o_packed_d,
                       void *dq_tmp_d,
                       void *do_packed_d,
                       void *softmax_lse_d,
@@ -143,10 +146,9 @@ void set_params_dgrad(FMHA_dgrad_params &params,
 
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, h, d,
-                     q, k, v,
+                     q, k, v, out,
                      cu_seqlens_q_d,
                      cu_seqlens_k_d,
-                     o_packed_d,
                      dq_tmp_d,  // Reusing the o_tmp_ptr variable to store dq_tmp
                      nullptr,
                      softmax_lse_d,
@@ -174,6 +176,7 @@ std::vector<at::Tensor>
 mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
         const at::Tensor &k,         // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const at::Tensor &v,         // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        at::Tensor &out,             // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const at::Tensor &cu_seqlens_q,  // b+1
         const at::Tensor &cu_seqlens_k,  // b+1
         const int max_seqlen_q_,
@@ -198,18 +201,21 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     TORCH_CHECK(q_dtype == torch::kFloat16 || (is_sm8x && q_dtype == torch::kBFloat16));
     TORCH_CHECK(k.dtype() == q_dtype);
     TORCH_CHECK(v.dtype() == q_dtype);
+    TORCH_CHECK(out.dtype() == q_dtype);
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32);
     TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32);
 
     TORCH_CHECK(q.is_cuda());
     TORCH_CHECK(k.is_cuda());
     TORCH_CHECK(v.is_cuda());
+    TORCH_CHECK(out.is_cuda());
     TORCH_CHECK(cu_seqlens_q.is_cuda());
     TORCH_CHECK(cu_seqlens_k.is_cuda());
 
     TORCH_CHECK(q.stride(-1) == 1);
     TORCH_CHECK(k.stride(-1) == 1);
     TORCH_CHECK(v.stride(-1) == 1);
+    TORCH_CHECK(out.stride(-1) == 1);
     TORCH_CHECK(cu_seqlens_k.is_contiguous());
     TORCH_CHECK(cu_seqlens_k.is_contiguous());
 
@@ -226,6 +232,7 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     CHECK_SHAPE(q, total_q, num_heads, head_size);
     CHECK_SHAPE(k, total_k, num_heads, head_size);
     CHECK_SHAPE(v, total_k, num_heads, head_size);
+    CHECK_SHAPE(out, total_q, num_heads, head_size);
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
 
@@ -240,9 +247,12 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
     bool loop = max_seqlen_k > blocksize_c;
 
+    // Otherwise the kernel will be launched from cuda:0 device
+    at::cuda::CUDAGuard device_guard{q.get_device()};
+
     auto opts = q.options();
 
-    auto o = torch::empty({ total_q, num_heads, head_size }, opts);
+    // auto o = torch::empty({ total_q, num_heads, head_size }, opts);
 
     at::Tensor o_tmp;
     if (loop) { o_tmp = torch::empty({total_q, num_heads, head_size}, opts.dtype(at::kFloat)); }
@@ -254,7 +264,7 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     if (return_softmax) { s = torch::empty({ batch_size, num_heads, max_seqlen_q, max_seqlen_k }, opts); }
 
     if( zero_tensors ) {
-        o.zero_();
+        out.zero_();
         softmax_lse.fill_(-std::numeric_limits<float>::infinity());
         if (return_softmax) {s.zero_();}
     }
@@ -268,10 +278,9 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
                      max_seqlen_k,
                      num_heads,
                      head_size,
-                     q, k, v,
+                     q, k, v, out,
                      cu_seqlens_q.data_ptr(),
                      cu_seqlens_k.data_ptr(),
-                     o.data_ptr(),
                      loop ? o_tmp.data_ptr() : nullptr,
                      return_softmax ? s.data_ptr() : nullptr,
                      softmax_lse.data_ptr(),
@@ -293,7 +302,7 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
 
     run_fmha_fp16_sm80(launch_params, /*configure=*/false);
 
-    std::vector<at::Tensor> result = {o, softmax_lse};
+    std::vector<at::Tensor> result = {softmax_lse};
     if (return_softmax) {result.push_back(s);}
     return result;
 }
@@ -395,6 +404,9 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
     bool loop = max_seqlen_k > blocksize_c;
 
+    // Otherwise the kernel will be launched from cuda:0 device
+    at::cuda::CUDAGuard device_guard{q.get_device()};
+
     // It's possible the softmax_lse_ from the fwd has a different length since blocksize_c could be different.
     auto softmax_lse = softmax_lse_.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, max_seqlen_q)}).contiguous();
 
@@ -418,11 +430,10 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      max_seqlen_k,
                      num_heads,
                      head_size,
-                     q, k, v,
+                     q, k, v, out,
                      dq, dk, dv,
                      cu_seqlens_q.data_ptr(),
                      cu_seqlens_k.data_ptr(),
-                     out.data_ptr(),
                      loop ? dq_tmp.data_ptr() : nullptr,
                      dout.data_ptr(),
                      softmax_lse.data_ptr(),
@@ -541,10 +552,9 @@ mha_fwd_block(const at::Tensor &q,         // total_q x num_heads x head_size, t
                      max_seqlen_k,
                      num_heads,
                      head_size,
-                     q, k, v,
+                     q, k, v, o,
                      cu_seqlens_q.data_ptr(),
                      cu_seqlens_k.data_ptr(),
-                     o.data_ptr(),
                      loop ? o_tmp.data_ptr() : nullptr,
                      return_softmax ? s.data_ptr() : nullptr,
                      softmax_lse.data_ptr(),
@@ -686,11 +696,10 @@ mha_bwd_block(const at::Tensor &dout,  // total x num_heads, x head_size
                      max_seqlen_k,
                      num_heads,
                      head_size,
-                     q, k, v,
+                     q, k, v, out,
                      dq, dk, dv,
                      cu_seqlens_q.data_ptr(),
                      cu_seqlens_k.data_ptr(),
-                     out.data_ptr(),
                      loop ? dq_tmp.data_ptr() : nullptr,
                      dout.data_ptr(),
                      softmax_lse.data_ptr(),

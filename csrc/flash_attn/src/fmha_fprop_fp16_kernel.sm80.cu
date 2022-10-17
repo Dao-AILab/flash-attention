@@ -29,6 +29,7 @@
 #include <cuda_bf16.h>
 
 #include "static_switch.h"
+#include "fp16_switch.h"
 #include "fmha.h"
 #include "fmha_fprop_kernel_1xN.h"
 
@@ -83,8 +84,7 @@ void run_fmha_fp16_sm80_loop_(Launch_params<FMHA_fprop_params> &launch_params,
 
 void run_fmha_fp16_sm80(Launch_params<FMHA_fprop_params> &launch_params,
                         const bool configure) {
-    BOOL_SWITCH(launch_params.params.is_bf16, IsBf16Const, [&] {
-        using elem_type = std::conditional<IsBf16Const, __nv_bfloat16, __half>::type;
+    FP16_SWITCH(launch_params.params.is_bf16, [&] {
         auto dprops = at::cuda::getCurrentDeviceProperties();
         if (launch_params.params.d == 16) {
             if( launch_params.params.seqlen_k == 128 ) {
