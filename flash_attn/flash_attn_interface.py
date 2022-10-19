@@ -7,12 +7,10 @@ import flash_attn_cuda
 
 def _get_block_size(device, head_dim, is_dropout):
     assert head_dim in [16, 32, 64, 128]
-    if head_dim in [16, 32]:
+    if head_dim in [16, 32, 64]:
         return 256
-    elif head_dim == 64:
-        return 128 if (torch.cuda.get_device_capability(device) == (7, 5) and is_dropout) else 256
     elif head_dim == 128:
-        return 256 if (torch.cuda.get_device_capability(device) == (8, 0) and not is_dropout) else 128
+        return 256 if (torch.cuda.get_device_capability(device) == (8, 0)) else 128
 
 
 def _flash_attn_forward(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,

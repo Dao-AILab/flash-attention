@@ -621,7 +621,7 @@ def test_flash_attn_unpadded(seqlen, d, dropout_p, causal, dtype):
 @pytest.mark.parametrize('seqlen', [512])
 @pytest.mark.parametrize('dropout_p', [0.0, 0.17])
 # @pytest.mark.parametrize('dropout_p', [0.0])
-def test_flash_attn_unpadded_qkvpacked_split(seqlen, d, dropout_p, causal, dtype):
+def test_flash_attn_split(seqlen, d, dropout_p, causal, dtype):
     if seqlen >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
     device = 'cuda'

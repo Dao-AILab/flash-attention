@@ -334,7 +334,12 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
         if (Is_dropout) {
             // softmax.apply_dropout(ph, params.p_dropout_in_uint);
             // softmax.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(ph, params.p_dropout_in_uint);
-            softmax.template apply_dropout_16bits</*encode_dropout_in_sign_bit=*/true>(ph, params.p_dropout_in_uint16_t);
+            // softmax.template apply_dropout_16bits</*encode_dropout_in_sign_bit=*/true>(ph, params.p_dropout_in_uint16_t);
+            unsigned int warp_idx = threadIdx.x / 32;
+            // TODO: this should change after we rearrange the warps (e.g. cutlass branch)
+            unsigned int block_col_idx = loop_step_idx * Cta_tile_p::N / 16 + warp_idx;
+            unsigned long long philox_subsequence = (begin + l) * (binfo.actual_seqlen_k / 16) + block_col_idx;
+            softmax.template apply_dropout_16bits</*encode_dropout_in_sign_bit=*/true>(ph, params.p_dropout_in_uint16_t, philox_subsequence);
         }
 
         using Frag_p = fmha::Fragment_a<fmha::Row>;
@@ -676,9 +681,8 @@ inline __device__ void compute_dq_dk_dv_1xN(const Params &params) {
     // The thread index.
     const int tidx = threadIdx.x;
 
-    const int tidx_global = (bidb * params.h + bidh) * blockDim.x + tidx;
     auto seeds = at::cuda::philox::unpack(params.philox_args);
-    Philox ph(std::get<0>(seeds), tidx_global, std::get<1>(seeds));
+    Philox ph(std::get<0>(seeds), 0, std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + tidx % 32);
 
     if (loop_steps == 1) {
         compute_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, true, true>(params, ph, 0);

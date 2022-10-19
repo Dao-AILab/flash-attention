@@ -1646,6 +1646,19 @@ struct Smem_tile_dp_sum {
         }
     }
 
+    inline __device__ void store_pair(const float (&sum)[MMAS_M * 2]) {
+        float *smem_write = smem_;
+        // Extract the position in the warp.
+        int warp = tidx_ / Cta_tile::THREADS_PER_WARP;
+        int lane = tidx_ % Cta_tile::THREADS_PER_WARP;
+        int row = lane / 4;
+        #pragma unroll
+        for (int mi = 0; mi < MMAS_M; ++mi) {
+            smem_write[mi * ROWS_PER_MMA + row + 0] = sum[mi * 2 + 0];
+            smem_write[mi * ROWS_PER_MMA + row + 8] = sum[mi * 2 + 1];
+        }
+    }
+
     inline __device__ void store_pair(const float (&sum)[MMAS_M * 2], const int buffer_idx) {
         float *smem_write = smem_ + buffer_idx * ROWS;
         // Extract the position in the warp.

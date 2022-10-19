@@ -197,7 +197,7 @@ constexpr size_t get_dynamic_smem_size(){
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Return_softmax, bool Is_first, bool Is_last, typename Params, typename Prng>
-inline __device__ void device_1xN_(const Params &params, const int bidb, const int bidh, int begin, int steps, Prng &ph0, Prng &ph1, const int loop_step_idx) {
+inline __device__ void device_1xN_(const Params &params, const int bidb, const int bidh, int begin, int steps, Prng &ph, const int loop_step_idx) {
 
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
     using elem_type = typename Kernel_traits::elem_type;
@@ -470,9 +470,17 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
 
         constexpr bool encode_dropout_in_sign_bit = Return_softmax;
         if (Is_dropout) {
-            // softmax.template apply_dropout<encode_dropout_in_sign_bit>(ph0, params.p_dropout_in_uint);
-            // softmax.template apply_dropout<encode_dropout_in_sign_bit>(ph0, ph1, params.p_dropout_in_uint);
-            softmax.template apply_dropout_16bits<encode_dropout_in_sign_bit>(ph0, ph1, params.p_dropout_in_uint16_t);
+            // softmax.template apply_dropout<encode_dropout_in_sign_bit>(ph, params.p_dropout_in_uint);
+            // softmax.template apply_dropout<encode_dropout_in_sign_bit>(ph, ph1, params.p_dropout_in_uint);
+            // softmax.template apply_dropout_16bits<encode_dropout_in_sign_bit>(ph, ph1, params.p_dropout_in_uint16_t);
+            unsigned int warp_idx = threadIdx.x / 32;
+            // TODO: this should change after we rearrange the warps (e.g. cutlass branch)
+            unsigned int block_col_idx = loop_step_idx * Cta_tile_p::N / 16 + warp_idx;
+            // We want to use actual_seqlen_k, not seqlen_k, since seqlen_k could be rounded
+            // differently in the fwd and bwd pass. E.g., for d=128 on A100, fwd rounds seqlen_k
+            // to multiples of 256 while bwd rounds seqlen_k to multiples of 128.
+            unsigned long long philox_subsequence = (begin + l) * (binfo.actual_seqlen_k / 16) + block_col_idx;
+            softmax.template apply_dropout_16bits<encode_dropout_in_sign_bit>(ph, params.p_dropout_in_uint16_t, philox_subsequence);
         }
 
         using Frag_p = fmha::Fragment_a<fmha::Row>;
@@ -650,23 +658,28 @@ inline __device__ void device_1xN_loop(const Params &params) {
     // The thread index.
     const int tidx = threadIdx.x;
 
-    const int tidx_global = (bidb * params.h + bidh) * blockDim.x * 2 + tidx;
+    // We want the fwd and bwd to generate the same dropout pattern (RNG), without restricting
+    // them to have the same number of threads or have to traverse the attention matrix
+    // in the same order.
+    // In the Philox RNG, we use the offset to store the batch, head, and the lane id
+    // (within a warp). We use the subsequence to store the location of the 16 x 16 blocks within
+    // the attention matrix. This way, as long as we have the batch, head, and the location of
+    // the 16 x 16 block within the attention matrix, we can generate the exact same dropout pattern.
     auto seeds = at::cuda::philox::unpack(params.philox_args);
-    Philox ph0(std::get<0>(seeds), tidx_global, std::get<1>(seeds));
-    Philox ph1(std::get<0>(seeds), tidx_global + blockDim.x, std::get<1>(seeds));
+    Philox ph(std::get<0>(seeds), 0, std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + tidx % 32);
     constexpr int M = Kernel_traits::Cta_tile_p::M;
     const int STEPS = (params.seqlen_q + M - 1) / M;
 
     constexpr int blocksize_c = Kernel_traits::Cta_tile_p::N;
     if (params.seqlen_k == blocksize_c) {
-        fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, true, true>(params, bidb, bidh, 0, STEPS, ph0, ph1, 0);
+        fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, true, true>(params, bidb, bidh, 0, STEPS, ph, 0);
     } else {
         const int max_loop_steps = (params.seqlen_k + blocksize_c - 1) / blocksize_c;
-        fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, true, false>(params, bidb, bidh, 0, STEPS, ph0, ph1, 0);
+        fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, true, false>(params, bidb, bidh, 0, STEPS, ph, 0);
         for (int loop_step_idx = 1; loop_step_idx < max_loop_steps - 1; loop_step_idx++) {
-            fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, false, false>(params, bidb, bidh, 0, STEPS, ph0, ph1, loop_step_idx);
+            fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, false, false>(params, bidb, bidh, 0, STEPS, ph, loop_step_idx);
         }
-        fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, false, true>(params, bidb, bidh, 0, STEPS, ph0, ph1, max_loop_steps - 1);
+        fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, false, true>(params, bidb, bidh, 0, STEPS, ph, max_loop_steps - 1);
     }
 }
 
