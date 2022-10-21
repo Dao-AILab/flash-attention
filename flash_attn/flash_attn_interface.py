@@ -14,10 +14,16 @@ def _get_block_size(device, head_dim, is_dropout):
 
 
 def _flash_attn_forward(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                        dropout_p, softmax_scale, causal, return_softmax, generator=None):
+                        dropout_p, softmax_scale, causal, return_softmax, num_splits=0,
+                        generator=None):
+    """
+    num_splits: how much to parallelize over the seqlen_q dimension. num_splits=0 means
+    it will be set by an internal heuristic. We're exposing num_splits mostly for benchmarking.
+    Don't change it unless you know what you're doing.
+    """
     softmax_lse, *rest = flash_attn_cuda.fwd(
         q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p,
-        softmax_scale, False, causal, return_softmax, generator
+        softmax_scale, False, causal, return_softmax, num_splits, generator
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()

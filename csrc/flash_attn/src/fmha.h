@@ -127,6 +127,8 @@ struct FMHA_fprop_params : public Qkv_params {
 
     bool is_bf16;
     bool is_causal;
+
+    int num_splits; // How many SMs per attention matrix.
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

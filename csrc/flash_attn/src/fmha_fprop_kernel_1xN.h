@@ -197,7 +197,7 @@ constexpr size_t get_dynamic_smem_size(){
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Return_softmax, bool Is_first, bool Is_last, typename Params, typename Prng>
-inline __device__ void device_1xN_(const Params &params, const int bidb, const int bidh, int begin, int steps, Prng &ph, const int loop_step_idx) {
+inline __device__ void device_1xN_(const Params &params, const int bidb, const int bidh, int steps, int step_stride, Prng &ph, const int loop_step_idx) {
 
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
     using elem_type = typename Kernel_traits::elem_type;
@@ -266,15 +266,23 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
 
     // Wind gmem tiles to the correct position.
     static_assert(Cta_tile_p::N % Cta_tile_p::M == 0);
-    const int begin_og = begin;
-    begin = Is_causal ? std::max(begin, loop_step_idx * Cta_tile_p::N / Cta_tile_p::M) : begin;
+    int begin = Is_causal ? loop_step_idx * Cta_tile_p::N / Cta_tile_p::M : 0;
+    // We want begin to be a multiple of gridDim.z
+    // This is because the row indices processed by each threadblock must align between the
+    // loop steps, otherwise we have a dependency between the blocks.
+    // For example, threadblock with blockIdx.z == 1 must process row indices that are
+    // k * gridDim.z + 1 for integer k.
+    const int begin_mod_z = begin % gridDim.z;
+    begin = begin_mod_z <= blockIdx.z ? begin - begin_mod_z : begin + gridDim.z - begin_mod_z;
     const int steps_og = steps;
-    steps -= begin - begin_og;
-    gmem_q.move(begin);
-    gmem_o.move(begin);
-    gmem_o_tmp.move(begin);
-    if (Return_softmax) { gmem_s.move(begin); }
-    gmem_softmax_lse.move(begin);
+    steps -= begin;
+    gmem_q.move(begin + blockIdx.z);
+    gmem_o.move(begin + blockIdx.z);
+    gmem_o_tmp.move(begin + blockIdx.z);
+    if (Return_softmax) {
+        gmem_s.move(begin + blockIdx.z);
+    }
+    gmem_softmax_lse.move(begin + blockIdx.z);
     // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0)) {
     //     printf("begin = %d, steps = %d\n", begin, steps);
     // }
@@ -362,8 +370,11 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
     Smem_softmax_sum smem_softmax_lse(reinterpret_cast<float *>(&smem_[Gemm1::SMEM_BYTES]), tidx);
 
     // Load over the entire sequence length.
-    for( int l = 0; l < steps; l++ ) {
-        if((begin + l) * Cta_tile_p::M >= binfo.actual_seqlen_q) break;
+    for (int l = blockIdx.z; l < steps; l += step_stride) {
+        // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0) && (blockIdx.z <= 1)) {
+        //     printf("l = %d\n", l);
+        // }
+        if ((begin + l) * Cta_tile_p::M >= binfo.actual_seqlen_q) break;
 
         // Declare the accumulators for the 1st gemm.
         fmha::Fragment_accumulator acc_p[Mma_tile_p::MMAS_M][Mma_tile_p::MMAS_N];
@@ -380,9 +391,9 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
         if (!Is_first) { gmem_o_tmp.load(out, 0); }
 
         // Trigger the load for the next Q values.
-        if( l < steps - 1) {
+        if (l + step_stride < steps) {
             gemm_q_k.smem_q.move_to_next_write_buffer();
-            gmem_q.move();
+            gmem_q.move(step_stride);
             gmem_q.load();
         }
 
@@ -395,27 +406,28 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
         // Apply the mask.
         softmax.apply_mask(mask);
 
-        if( Kernel_traits::SHARE_SMEM_FOR_K_AND_V && l == 0 ) {
+        if( Kernel_traits::SHARE_SMEM_FOR_K_AND_V && l < step_stride ) {
             // if we share K and V, it could be that V was not fully read yet but we write into smem for reduction
             __syncthreads();
         }
         // if (!Is_first) {
-        //     if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
+        //     if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l >= 0))  {
         //         printf("p_prev_lse=%.6f, %.6f\n", p_prev_lse[0], p_prev_lse[1]);
         //     }
         // }
         // Compute the max.
         float p_max[Mma_tile_p::MMAS_M * 2];
         if (!Is_first) {
-            smem_softmax_lse.store_pair(p_prev_lse, l % 2);
+            smem_softmax_lse.store_pair(p_prev_lse);
             // for (int mi = 0; mi < Mma_tile_p::MMAS_M * 2; mi++) { p_max[mi] = p_prev_lse[mi]; }
             for (int mi = 0; mi < Mma_tile_p::MMAS_M * 2; mi++) { p_max[mi] = p_prev_lse[mi] / params.scale_bmm1f; }
         }
 
         // Trigger the load for the next LSE values.
-        if( l < steps - 1) {
+        if (l + step_stride < steps) {
             if (!Is_first) {
-                gmem_softmax_lse.load_next(reinterpret_cast<uint32_t(&)[Mma_tile_p::MMAS_M * 2]>(p_prev_lse));
+                gmem_softmax_lse.load_next(reinterpret_cast<uint32_t(&)[Mma_tile_p::MMAS_M * 2]>(p_prev_lse),
+                                           step_stride);
             }
         }
 
@@ -490,11 +502,11 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
         softmax.template pack<elem_type>(frag_p);
         if (Return_softmax) {
             gmem_s.store(frag_p, mask);
-            gmem_s.move();
+            gmem_s.move(step_stride);
         }
 
         // Commit the values for Q into shared memory.
-        if(l < steps - 1) {
+        if (l + step_stride < steps) {
             gmem_q.commit(gemm_q_k.smem_q);
         }
 
@@ -548,7 +560,7 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
         }
         float p_prev_scale_o[Gmem_tile_o::STGS_PER_LOOP];
         if ((!Is_first) && o_rows_are_valid) {
-            smem_softmax_lse.load(p_prev_scale_o, rows, l % 2);
+            smem_softmax_lse.load(p_prev_scale_o, rows);
         }
         // if (!Is_first) {
         //     if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
@@ -594,7 +606,7 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
                     reinterpret_cast<uint32_t(&)[Mma_tile_p::MMAS_M]>(p_sum_log[jj]), rows[jj]);
             }
         }
-        gmem_softmax_lse.move();
+        gmem_softmax_lse.move(step_stride);
 
         // Load from shared memory.
         if (!Is_first) {
@@ -627,22 +639,21 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
         // Output the values.
         if (is_final_write) {
             gmem_o.template store<elem_type>(out, 0);
-            gmem_o.move();
+            gmem_o.move(step_stride);
         } else {
             gmem_o_tmp.store(out, 0);
         }
 
         // Move to the next part of the output.
-        if (!(Is_first && Is_last)) { gmem_o_tmp.move(); }
+        if (!(Is_first && Is_last)) { gmem_o_tmp.move(step_stride); }
         gemm_q_k.reload_k();
 
         // Make sure we are reading from the correct buffer.
         gemm_q_k.smem_q.move_to_next_read_buffer();
         // Trigger the load from shared memory for the next series of Q values.
-        if(l < steps - 1) {
+        if (l + step_stride < steps) {
             gemm_q_k.reload_q();
         }
-
     }  // Outer loop over the sequence length.
 }
 
@@ -672,14 +683,14 @@ inline __device__ void device_1xN_loop(const Params &params) {
 
     constexpr int blocksize_c = Kernel_traits::Cta_tile_p::N;
     if (params.seqlen_k == blocksize_c) {
-        fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, true, true>(params, bidb, bidh, 0, STEPS, ph, 0);
+        fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, true, true>(params, bidb, bidh, STEPS, gridDim.z, ph, 0);
     } else {
         const int max_loop_steps = (params.seqlen_k + blocksize_c - 1) / blocksize_c;
-        fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, true, false>(params, bidb, bidh, 0, STEPS, ph, 0);
+        fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, true, false>(params, bidb, bidh, STEPS, gridDim.z, ph, 0);
         for (int loop_step_idx = 1; loop_step_idx < max_loop_steps - 1; loop_step_idx++) {
-            fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, false, false>(params, bidb, bidh, 0, STEPS, ph, loop_step_idx);
+            fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, false, false>(params, bidb, bidh, STEPS, gridDim.z, ph, loop_step_idx);
         }
-        fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, false, true>(params, bidb, bidh, 0, STEPS, ph, max_loop_steps - 1);
+        fmha::device_1xN_<Kernel_traits, Is_dropout, Is_causal, Return_softmax, false, true>(params, bidb, bidh, STEPS, gridDim.z, ph, max_loop_steps - 1);
     }
 }
 
