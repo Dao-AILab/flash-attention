@@ -294,7 +294,6 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
                      is_causal,
                      num_splits);
 
-    run_fmha_fp16_sm80(launch_params, /*configure=*/ true);
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
@@ -307,7 +306,7 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
         launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
     }
 
-    run_fmha_fp16_sm80(launch_params, /*configure=*/false);
+    run_fmha_fp16_sm80(launch_params);
 
     std::vector<at::Tensor> result = {softmax_lse};
     if (return_softmax) {result.push_back(s);}
@@ -453,9 +452,8 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
-    // We're gonna reset the rng state in Python after this kernel, so the counter offset
-    // here doesn't matter at all. We just choose an arbitrary number.
-    int64_t counter_offset = 4;
+    // We use a custom RNG that increases the offset by batch_size * nheads * 32.
+    int64_t counter_offset = params.b * params.h * 32;
 
     if( is_dropout ) {
         // See Note [Acquire lock when using random generators]

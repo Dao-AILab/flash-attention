@@ -191,7 +191,7 @@ struct Launch_params{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void run_fmha_fp16_sm80(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
+void run_fmha_fp16_sm80(Launch_params<FMHA_fprop_params> &launch_params);
 
 void run_fmha_dgrad_fp16_sm80(const FMHA_dgrad_params &params, cudaStream_t stream);
 
