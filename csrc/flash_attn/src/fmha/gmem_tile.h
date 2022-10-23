@@ -28,6 +28,9 @@
 #pragma once
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+#include <fmha/utils.h>
 
 namespace fmha {
 
@@ -41,7 +44,8 @@ template<
     // The number of rows of Q, K or V loaded by this tile.
     int ROWS_,
     // The number of columns.
-    int COLS
+    int COLS,
+    int BYTES_PER_LDGS_ = 16
 >
 struct Gmem_tile_qkv {
 
@@ -49,7 +53,7 @@ struct Gmem_tile_qkv {
 
     static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8;
     // The size of each LDG.
-    static constexpr int BYTES_PER_LDG = 16;
+    static constexpr int BYTES_PER_LDG = BYTES_PER_LDGS_;
     // The size of a row in bytes.
     static constexpr int BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8;
 
@@ -126,6 +130,42 @@ struct Gmem_tile_qkv {
             char *ptr_ = ptr + (uint32_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
             if( (row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen) ) {
                 fmha::stg(ptr_, data[ii]);
+            }
+        }
+    }
+
+    template <typename elem_type>
+    inline __device__ void atomic_add(const uint4 (&data)[LDGS]) {
+        int row_ = tidx_ / THREADS_PER_ROW;
+        #pragma unroll
+        for( int ii = 0; ii < LDGS; ++ii ) {
+            using elem2_type = typename std::conditional<std::is_same<elem_type, __half>::value, __half2, __nv_bfloat162>::type;
+            // char *ptr_ = ptr + (int64_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
+            elem2_type *ptr_ = reinterpret_cast<elem2_type *>(ptr + (uint32_t)ii * ROWS_PER_LDG * row_stride_in_bytes);
+            if( (row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen) ) {
+                #pragma unroll
+                for (int jj = 0; jj < 4; ++jj) {
+                    atomicAdd(ptr_ + jj, reinterpret_cast<const elem2_type(&)[4]>(data[ii])[jj]);
+                }
+            }
+        }
+    }
+
+    // Not being used. This only supports converting from fp16 -> fp32 for now (not bf16 -> fp32).
+    inline __device__ void atomic_add_float(const uint4 (&data)[LDGS]) {
+        static_assert(BYTES_PER_ELEMENT == 4);  // Only support fp32
+        int row_ = tidx_ / THREADS_PER_ROW;
+        #pragma unroll
+        for( int ii = 0; ii < LDGS; ++ii ) {
+            // char *ptr_ = ptr + (int64_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
+            float *ptr_ = reinterpret_cast<float *>(ptr + (uint32_t)ii * ROWS_PER_LDG * row_stride_in_bytes);
+            if( (row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen) ) {
+                #pragma unroll
+                for (int jj = 0; jj < 4; ++jj) {
+                    const float2 data_f = fmha::half2_unpack<__half>(reinterpret_cast<const uint32_t(&)[4]>(data[ii])[jj]);
+                    atomicAdd(ptr_ + jj * 2, data_f.x);
+                    atomicAdd(ptr_ + jj * 2 + 1, data_f.y);
+                }
             }
         }
     }

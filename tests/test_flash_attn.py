@@ -356,7 +356,8 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     #     rtol, atol = (3e-3, 3e-3) if not causal else (1e-3, 1e-3)
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 32
+    # Set smaller batch size so it would trigger num_splits > 1
+    batch_size = 8
     nheads = 4
     x = torch.randn(batch_size, seqlen, nheads * d, device=device, dtype=dtype, requires_grad=True)
     Wqkv = torch.nn.Linear(nheads * d, 3 * nheads * d, device=device, dtype=dtype)
@@ -418,10 +419,11 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     if dropout_p == 0.0:
         assert dropout_mask.all()
     else:
-        assert 0.99 <= dropout_fraction / dropout_p <= 1.01
+        assert 0.98 <= dropout_fraction / dropout_p <= 1.02
 
     if is_sm80 or d < 128:  # Only run backward for d=128 on A100
-        assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
+        # Error for dK and dV could be a bit higher if we're splitting along seqlen_q dimension
+        assert (dqkv - dqkv_ref).abs().max().item() <= 4 * (dqkv_pt - dqkv_ref).abs().max().item()
         # assert torch.allclose(dqkv, dqkv_ref, rtol=rtol, atol=atol)
 
 

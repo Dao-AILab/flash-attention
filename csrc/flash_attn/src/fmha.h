@@ -140,6 +140,10 @@ struct FMHA_dgrad_params : public FMHA_fprop_params {
     void *__restrict__ dk_ptr;
     void *__restrict__ dv_ptr;
 
+    // // To accumulate dK and dV in case we're splitting the bwd along seqlen_q dimension
+    // void *__restrict__ dk_accum_ptr;
+    // void *__restrict__ dv_accum_ptr;
+
     // The stride between rows of the dQ, dK and dV matrices.
     // TD [2022-04-16]: We're using 32-bit indexing to save registers.
     // The code probably won't work for arrays larger than 2GB.
@@ -193,7 +197,7 @@ struct Launch_params{
 
 void run_fmha_fp16_sm80(Launch_params<FMHA_fprop_params> &launch_params);
 
-void run_fmha_dgrad_fp16_sm80(const FMHA_dgrad_params &params, cudaStream_t stream);
+void run_fmha_dgrad_fp16_sm80(FMHA_dgrad_params &params, cudaStream_t stream, const bool configure);
 
 void run_fmha_block_fp16_sm80(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
 

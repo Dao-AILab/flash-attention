@@ -76,6 +76,12 @@ struct FMHA_kernel_traits {
 
     using Gmem_tile_do = fmha::Gmem_tile_qkv<Cta_tile_p, fmha::BITS_PER_ELEMENT_A, STEP, D>;
 
+    // // The global memory tile to store the accumulated dK and dV
+    // // Hack: we set BYTES_PER_LDGS=32 to emulate the access pattern of dK and dV
+    // // where there are 16 bits per lements and 16 bytes per load. In reality we won't
+    // // be issue any load or store of size 32 bytes.
+    // using Gmem_tile_dkv_accum = fmha::Gmem_tile_qkv<Cta_tile_o, 32, S, D, 32>;
+
     // The global memory tile to store the softmax sum.
     using Gmem_softmax_sum = fmha::Gmem_summary_stats<Cta_tile_p>;
 

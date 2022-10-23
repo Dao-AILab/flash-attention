@@ -241,7 +241,7 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
 
-    int blocksize_c = (head_size == 128 && (!is_sm80)) ? 128 : 256;
+    int blocksize_c = head_size == 128 ? 128 : 256;
     // Need to round max_seqlen_k to multiples of blocksize_c
     int max_seqlen_k = ((max_seqlen_k_ + blocksize_c - 1) / blocksize_c) * blocksize_c;
     if( max_seqlen_k_ <= 128 ) {
@@ -332,6 +332,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         const float softmax_scale,
         const bool zero_tensors,
         const bool is_causal,
+        const int num_splits,
         c10::optional<at::Generator> gen_
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -447,7 +448,22 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      p_dropout,
                      softmax_scale,
                      is_causal,
-                     /*num_splits=*/1);
+                     num_splits);
+
+    launch(params, stream, /*configure=*/true);
+
+    at::Tensor dk_accum, dv_accum;
+    if (params.num_splits > 1) {
+        // dk_accum = torch::zeros({total_k, num_heads, head_size}, opts.dtype(at::kFloat));
+        // dv_accum = torch::zeros({total_k, num_heads, head_size}, opts.dtype(at::kFloat));
+        // params.dk_accum_ptr = dk_accum.data_ptr();
+        // params.dv_accum_ptr = dv_accum.data_ptr();
+        dk.zero_();
+        dv.zero_();
+    } else {
+        // params.dk_accum_ptr = nullptr;
+        // params.dv_accum_ptr = nullptr;
+    }
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
@@ -461,7 +477,12 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         params.philox_args = gen->philox_cuda_state(counter_offset);
     }
 
-    launch(params, stream);
+    launch(params, stream, /*configure=*/false);
+
+    // if (params.num_splits > 1) {
+    //     dk.copy_(dk_accum);
+    //     dv.copy_(dv_accum);
+    // }
     return { dq, dk, dv, softmax_d };
 }
 
