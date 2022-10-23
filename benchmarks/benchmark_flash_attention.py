@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from einops import rearrange, repeat
 
-from benchmarks.utils import benchmark_all, benchmark_forward, benchmark_backward, benchmark_combined
+from flash_attn.utils.benchmark import benchmark_all, benchmark_forward, benchmark_backward, benchmark_combined
 from flash_attn.bert_padding import unpad_input, pad_input
 from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
 
