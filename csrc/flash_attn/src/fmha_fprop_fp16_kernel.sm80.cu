@@ -114,36 +114,23 @@ void run_fmha_fp16_sm80_loop_(Launch_params<FMHA_fprop_params> &launch_params) {
 void run_fmha_fp16_sm80(Launch_params<FMHA_fprop_params> &launch_params) {
     FP16_SWITCH(launch_params.params.is_bf16, [&] {
         auto dprops = at::cuda::getCurrentDeviceProperties();
-        if (launch_params.params.d == 16) {
-            if( launch_params.params.seqlen_k == 128 ) {
-                using Kernel_traits = FMHA_kernel_traits<128, 16, 16, 1, 4, 0x08u, elem_type>;
-                run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params);
-            } else if( launch_params.params.seqlen_k == 256 ) {
-                using Kernel_traits = FMHA_kernel_traits<256, 16, 16, 1, 4, 0x08u, elem_type>;
-                run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params);
-            } else {
-                // TD [2022-05-15] 512 gives wrong results rn
-                // using Kernel_traits = FMHA_kernel_traits<512, 16, 16, 1, 4, 0x08u, elem_type>;
-                using Kernel_traits = FMHA_kernel_traits<256, 16, 16, 1, 4, 0x08u, elem_type>;
-                run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params);
-            }
-        } else if (launch_params.params.d == 32) {
-            if( launch_params.params.seqlen_k == 128 ) {
+        if (launch_params.params.d <= 32) {
+            if (launch_params.params.seqlen_k == 128) {
                 using Kernel_traits = FMHA_kernel_traits<128, 32, 16, 1, 4, 0x08u, elem_type>;
                 run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params);
-            } else if( launch_params.params.seqlen_k >= 256 ) {
+            } else if (launch_params.params.seqlen_k >= 256) {
                 using Kernel_traits = FMHA_kernel_traits<256, 32, 16, 1, 4, 0x08u, elem_type>;
                 run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params);
             }
-        } else if (launch_params.params.d == 64) {
-            if( launch_params.params.seqlen_k == 128 ) {
+        } else if (launch_params.params.d <= 64) {
+            if (launch_params.params.seqlen_k == 128) {
                 using Kernel_traits = FMHA_kernel_traits<128, 64, 16, 1, 4, 0x08u, elem_type>;
                 run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params);
-            } else if( launch_params.params.seqlen_k >= 256 ) {
+            } else if (launch_params.params.seqlen_k >= 256) {
                 using Kernel_traits = FMHA_kernel_traits<256, 64, 16, 1, 4, 0x08u, elem_type>;
                 run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params);
             }
-        } else if (launch_params.params.d == 128) {
+        } else if (launch_params.params.d <= 128) {
             // TD [2022-10-21]: Previously for SM80 we use block size 256 and keep K in shared memory
             // to reduce register spilling. However, that increases the smem usage from ~41KB to ~105KB,
             // reducing occupancy (only 1 kernel can be scheduled per SM instead of 2). This strategy gives

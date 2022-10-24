@@ -232,7 +232,7 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     const int head_size = sizes[D_DIM];
     const int total_k = k.size(TOTAL_DIM);
     TORCH_CHECK(batch_size > 0);
-    TORCH_CHECK(head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
+    TORCH_CHECK((head_size % 8 == 0) && (head_size <= 128));
 
     CHECK_SHAPE(q, total_q, num_heads, head_size);
     CHECK_SHAPE(k, total_k, num_heads, head_size);
@@ -241,7 +241,7 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
 
-    int blocksize_c = head_size == 128 ? 128 : 256;
+    int blocksize_c = head_size > 64 ? 128 : 256;
     // Need to round max_seqlen_k to multiples of blocksize_c
     int max_seqlen_k = ((max_seqlen_k_ + blocksize_c - 1) / blocksize_c) * blocksize_c;
     if( max_seqlen_k_ <= 128 ) {
@@ -386,8 +386,8 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     const int head_size = sizes[D_DIM];
     const int total_k = k.size(TOTAL_DIM);
     TORCH_CHECK(batch_size > 0);
-    TORCH_CHECK(head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
-    if (head_size == 128) {  // TODO: eventually we should support SM86 and SM70 with d=128 as well
+    TORCH_CHECK((head_size % 8 == 0) && (head_size <= 128));
+    if (head_size > 64) {  // TODO: eventually we should support SM86 and SM70 with d=128 as well
         TORCH_CHECK(is_sm80);
     }
 
@@ -402,7 +402,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
 
-    int blocksize_c = (head_size == 128 || (is_sm75 && head_size == 64)) ? 128 : 256;
+    int blocksize_c = (head_size > 64 || (is_sm75 && head_size > 32)) ? 128 : 256;
     int max_seqlen_k = ((max_seqlen_k_ + blocksize_c - 1) / blocksize_c) * blocksize_c;
     if( max_seqlen_k_ <= 128 ) {
         max_seqlen_k = 128;

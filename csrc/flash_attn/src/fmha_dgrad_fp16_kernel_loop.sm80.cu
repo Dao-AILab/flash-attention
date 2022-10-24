@@ -105,32 +105,19 @@ void run_fmha_dgrad_fp16_sm80(FMHA_dgrad_params &params, cudaStream_t stream, co
     // work around for MSVC issue
     FP16_SWITCH(params.is_bf16, [&] {
         auto dprops = at::cuda::getCurrentDeviceProperties();
-        if (params.d == 16) {
-            if( params.seqlen_k == 128 ) {
-                using Kernel_traits = FMHA_kernel_traits<128, 16, 16, 1, 8, 0x08u, elem_type>;
-                run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream, configure);
-            } else if( params.seqlen_k == 256 ) {
-                using Kernel_traits = FMHA_kernel_traits<256, 16, 16, 1, 8, 0x08u, elem_type>;
-                run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream, configure);
-            } else {
-                // TD [2022-05-15] 512 gives wrong results rn
-                // using Kernel_traits = FMHA_kernel_traits<512, 16, 16, 1, 8, 0x08u, elem_type>;
-                using Kernel_traits = FMHA_kernel_traits<256, 16, 16, 1, 8, 0x08u, elem_type>;
-                run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream, configure);
-            }
-        } else if (params.d == 32) {
-            if( params.seqlen_k == 128 ) {
+        if (params.d <= 32) {
+            if (params.seqlen_k == 128) {
                 using Kernel_traits = FMHA_kernel_traits<128, 32, 16, 1, 8, 0x08u, elem_type>;
                 run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream, configure);
-            } else if( params.seqlen_k >= 256 ) {
+            } else if (params.seqlen_k >= 256) {
                 using Kernel_traits = FMHA_kernel_traits<256, 32, 16, 1, 8, 0x08u, elem_type>;
                 run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream, configure);
             }
-        } else if (params.d == 64) {
-            if( params.seqlen_k == 128 ) {
+        } else if (params.d <= 64) {
+            if (params.seqlen_k == 128) {
                 using Kernel_traits = FMHA_kernel_traits<128, 64, 16, 1, 8, 0x08u, elem_type>;
                 run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream, configure);
-            } else if( params.seqlen_k >= 256 ) {
+            } else if (params.seqlen_k >= 256) {
                 if (dprops->major == 8 && dprops->minor == 0) {
                     // Don't share smem for K & V, and don't keep V in registers
                     // This speeds things up by 2-3% by avoiding register spills, but it
@@ -146,7 +133,7 @@ void run_fmha_dgrad_fp16_sm80(FMHA_dgrad_params &params, cudaStream_t stream, co
                     run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream, configure);
                 }
             }
-        } else if (params.d == 128) {
+        } else if (params.d <= 128) {
             using Kernel_traits = FMHA_kernel_traits<128, 128, 16, 1, 8, 0x100u, elem_type>;
             run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream, configure);
         }

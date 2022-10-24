@@ -340,7 +340,7 @@ def get_dropout_fraction(dropout_mask, query_padding_mask=None, key_padding_mask
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize('causal', [False, True])
 # @pytest.mark.parametrize('causal', [False])
-@pytest.mark.parametrize('d', [128, 64, 32, 16])
+@pytest.mark.parametrize('d', [128, 64, 80, 40, 32, 16])
 # @pytest.mark.parametrize('d', [64])
 @pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
 # @pytest.mark.parametrize('seqlen', [128])
@@ -362,8 +362,8 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     x = torch.randn(batch_size, seqlen, nheads * d, device=device, dtype=dtype, requires_grad=True)
     Wqkv = torch.nn.Linear(nheads * d, 3 * nheads * d, device=device, dtype=dtype)
 
-    key_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode='random')
-    # key_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode='full')
+    # key_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode='random')
+    key_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode='full')
 
     qkv_unpad, cu_seqlens, max_seqlen, qkv, output_pad_fn, dqkv_pad_fn = generate_qkv(
         x, Wqkv, nheads, key_padding_mask, key_padding_mask, qkvpacked=True
@@ -395,7 +395,7 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     print(f'Attention max diff: {(attn - attn_ref).abs().max().item()}')
     print(f'Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}')
 
-    if is_sm80 or d < 128:  # Only run backward for d=128 on A100
+    if is_sm80 or d <= 64:  # Only run backward for d=128 on A100
         g = torch.randn_like(output)
         dqkv_unpad, = torch.autograd.grad(output, qkv_unpad, g)
         dqkv = dqkv_pad_fn(dqkv_unpad)
@@ -421,7 +421,7 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     else:
         assert 0.98 <= dropout_fraction / dropout_p <= 1.02
 
-    if is_sm80 or d < 128:  # Only run backward for d=128 on A100
+    if is_sm80 or d <= 64:  # Only run backward for d=128 on A100
         # Error for dK and dV could be a bit higher if we're splitting along seqlen_q dimension
         assert (dqkv - dqkv_ref).abs().max().item() <= 4 * (dqkv_pt - dqkv_ref).abs().max().item()
         # assert torch.allclose(dqkv, dqkv_ref, rtol=rtol, atol=atol)
@@ -430,7 +430,7 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize('causal', [False, True])
-@pytest.mark.parametrize('d', [128, 64, 32, 16])
+@pytest.mark.parametrize('d', [128, 64, 80, 40, 32, 16])
 # @pytest.mark.parametrize('d', [64])
 @pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
 # @pytest.mark.parametrize('seqlen', [128])
@@ -487,7 +487,7 @@ def test_flash_attn_unpadded_kvpacked(seqlen, d, dropout_p, causal, dtype):
     print(f'Attention max diff: {(attn - attn_ref).abs().max().item()}')
     print(f'Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}')
 
-    if is_sm80 or d < 128:  # Only run backward for d=128 on A100
+    if is_sm80 or d <= 64:  # Only run backward for d=128 on A100
         g = torch.randn_like(output)
         dq_unpad, dkv_unpad, = torch.autograd.grad(output, (q_unpad, kv_unpad), g)
         dq = dq_pad_fn(dq_unpad)
@@ -512,7 +512,7 @@ def test_flash_attn_unpadded_kvpacked(seqlen, d, dropout_p, causal, dtype):
     else:
         assert 0.99 <= dropout_fraction / dropout_p <= 1.01
 
-    if is_sm80 or d < 128:  # Only run backward for d=128 on A100
+    if is_sm80 or d <= 64:  # Only run backward for d=128 on A100
         assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
         assert (dkv - dkv_ref).abs().max().item() <= 2 * (dkv_pt - dkv_ref).abs().max().item()
         # assert torch.allclose(dq, dq_ref, rtol=rtol, atol=atol)
@@ -522,7 +522,7 @@ def test_flash_attn_unpadded_kvpacked(seqlen, d, dropout_p, causal, dtype):
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize('causal', [False, True])
-@pytest.mark.parametrize('d', [128, 64, 32, 16])
+@pytest.mark.parametrize('d', [128, 64, 80, 40, 32, 16])
 # @pytest.mark.parametrize('d', [64])
 @pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
 # @pytest.mark.parametrize('seqlen', [128])
@@ -579,7 +579,7 @@ def test_flash_attn_unpadded(seqlen, d, dropout_p, causal, dtype):
     print(f'Attention max diff: {(attn - attn_ref).abs().max().item()}')
     print(f'Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}')
 
-    if is_sm80 or d < 128:  # Only run backward for d=128 on A100
+    if is_sm80 or d <= 64:  # Only run backward for d=128 on A100
         g = torch.randn_like(output)
         dq_unpad, dk_unpad, dv_unpad, = torch.autograd.grad(output, (q_unpad, k_unpad, v_unpad), g)
         dq = dq_pad_fn(dq_unpad)
@@ -605,7 +605,7 @@ def test_flash_attn_unpadded(seqlen, d, dropout_p, causal, dtype):
     else:
         assert 0.99 <= dropout_fraction / dropout_p <= 1.01
 
-    if is_sm80 or d < 128:  # Only run backward for d=128 on A100
+    if is_sm80 or d <= 64:  # Only run backward for d=128 on A100
         assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
@@ -618,7 +618,7 @@ def test_flash_attn_unpadded(seqlen, d, dropout_p, causal, dtype):
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize('causal', [False, True])
 # @pytest.mark.parametrize('causal', [False])
-@pytest.mark.parametrize('d', [128, 64, 32, 16])
+@pytest.mark.parametrize('d', [128, 64, 80, 40, 32, 16])
 # @pytest.mark.parametrize('d', [64])
 @pytest.mark.parametrize('seqlen', [512])
 @pytest.mark.parametrize('dropout_p', [0.0, 0.17])
@@ -681,7 +681,7 @@ def test_flash_attn_split(seqlen, d, dropout_p, causal, dtype):
     print(f'Attention max diff: {(attn - attn_ref).abs().max().item()}')
     print(f'Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}')
 
-    if is_sm80 or d < 128:  # Only run backward for d=128 on A100
+    if is_sm80 or d <= 64:  # Only run backward for d=128 on A100
         g = torch.randn_like(output)
         dqkv_unpad, = torch.autograd.grad(output, qkv_unpad, g)
         dqkv = dqkv_pad_fn(dqkv_unpad)
@@ -707,7 +707,7 @@ def test_flash_attn_split(seqlen, d, dropout_p, causal, dtype):
     else:
         assert 0.99 <= dropout_fraction / dropout_p <= 1.01
 
-    if is_sm80 or d < 128:  # Only run backward for d=128 on A100
+    if is_sm80 or d <= 64:  # Only run backward for d=128 on A100
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
         # assert torch.allclose(dqkv, dqkv_ref, rtol=rtol, atol=atol)
 
@@ -715,7 +715,7 @@ def test_flash_attn_split(seqlen, d, dropout_p, causal, dtype):
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize('causal', [False, True])
-@pytest.mark.parametrize('d', [128, 64, 32, 16])
+@pytest.mark.parametrize('d', [128, 64, 80, 40, 32, 16])
 # @pytest.mark.parametrize('d', [64])
 @pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
 # @pytest.mark.parametrize('seqlen', [128])
@@ -749,7 +749,7 @@ def test_flash_attn_race_condition(seqlen, d, dropout_p, causal, dtype):
         S_dmask_0, query_padding_mask, key_padding_mask, d, dropout_p > 0.0, causal=causal
     )
 
-    if is_sm80 or d < 128:  # Only run backward for d=128 on A100
+    if is_sm80 or d <= 64:  # Only run backward for d=128 on A100
         g = torch.randn_like(output_unpad_0)
         dq_unpad_0, dk_unpad_0, dv_unpad_0, = torch.autograd.grad(output_unpad_0,
                                                                   (q_unpad, k_unpad, v_unpad), g)
@@ -768,7 +768,7 @@ def test_flash_attn_race_condition(seqlen, d, dropout_p, causal, dtype):
         # assert torch.equal(sm_lse, sm_lse_0)
         assert torch.equal(S_dmask_converted, S_dmask_converted_0)
 
-        if is_sm80 or d < 128:  # Only run backward for d=128 on A100
+        if is_sm80 or d <= 64:  # Only run backward for d=128 on A100
             dq_unpad, dk_unpad, dv_unpad, = torch.autograd.grad(output_unpad,
                                                                 (q_unpad, k_unpad, v_unpad), g)
             assert torch.equal(dq_unpad, dq_unpad_0)

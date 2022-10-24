@@ -6,8 +6,8 @@ import flash_attn_cuda
 
 
 def _get_block_size(device, head_dim, is_dropout):
-    assert head_dim in [16, 32, 64, 128]
-    return 256 if head_dim in [16, 32, 64] else 128
+    assert head_dim % 8 == 0 and head_dim <= 128
+    return 256 if head_dim <= 64 else 128
 
 
 def _flash_attn_forward(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,

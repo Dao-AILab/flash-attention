@@ -81,11 +81,13 @@ struct Gmem_tile_qkv {
     // Ctor.
     template< typename BInfo >
     inline __device__ Gmem_tile_qkv(void *ptr_, const uint32_t row_stride_in_elts,
-                                    const uint32_t head_stride_in_elts, const BInfo &binfo, const int tidx, bool use_seqlen_q)
+                                    const uint32_t head_stride_in_elts, const int headdim,
+                                    const BInfo &binfo, const int tidx, bool use_seqlen_q)
         : row_stride_in_bytes(row_stride_in_elts * BYTES_PER_ELEMENT)
         , actual_seqlen(use_seqlen_q ? binfo.actual_seqlen_q : binfo.actual_seqlen_k)
         , ptr(reinterpret_cast<char *>(ptr_))
-        , tidx_(tidx) {
+        , tidx_(tidx)
+        , col_predicate((tidx % THREADS_PER_ROW) * (BYTES_PER_LDG / BYTES_PER_ELEMENT) < headdim) {
 
         // Compute the position in the sequence (within the CTA for the moment).
         int row = tidx / THREADS_PER_ROW;
@@ -121,7 +123,7 @@ struct Gmem_tile_qkv {
         for( int ii = 0; ii < LDGS; ++ii ) {
             // ptrs[ii] = ptr + (int64_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
             ptrs[ii] = ptr + (uint32_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
-            preds[ii] = ((row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen));
+            preds[ii] = col_predicate && ((row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen));
             fetch_[ii] = make_uint4(0, 0, 0, 0);
         }
 
@@ -140,7 +142,7 @@ struct Gmem_tile_qkv {
         for( int ii = 0; ii < LDGS; ++ii ) {
             // char *ptr_ = ptr + (int64_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
             char *ptr_ = ptr + (uint32_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
-            if( (row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen) ) {
+            if (col_predicate && (row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen)) {
                 fmha::stg(ptr_, data[ii]);
             }
         }
@@ -154,7 +156,7 @@ struct Gmem_tile_qkv {
             using elem2_type = typename std::conditional<std::is_same<elem_type, __half>::value, __half2, __nv_bfloat162>::type;
             // char *ptr_ = ptr + (int64_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
             elem2_type *ptr_ = reinterpret_cast<elem2_type *>(ptr + (uint32_t)ii * ROWS_PER_LDG * row_stride_in_bytes);
-            if( (row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen) ) {
+            if (col_predicate && (row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen)) {
                 #pragma unroll
                 for (int jj = 0; jj < 4; ++jj) {
                     atomicAdd(ptr_ + jj, reinterpret_cast<const elem2_type(&)[4]>(data[ii])[jj]);
@@ -172,7 +174,7 @@ struct Gmem_tile_qkv {
         for( int ii = 0; ii < LDGS; ++ii ) {
             // char *ptr_ = ptr + (int64_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
             float *ptr_ = reinterpret_cast<float *>(ptr + (uint32_t)ii * ROWS_PER_LDG * row_stride_in_bytes);
-            if( (row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen) ) {
+            if (col_predicate && (row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen)) {
                 #pragma unroll
                 for (int jj = 0; jj < 4; ++jj) {
                     const float2 data_f = fmha::half2_unpack<__half>(reinterpret_cast<const uint32_t(&)[4]>(data[ii])[jj]);
@@ -201,6 +203,7 @@ struct Gmem_tile_qkv {
     const int tidx_;
     // The length of the sequence loaded by that memory tile.
     int actual_seqlen;
+    const bool col_predicate;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -246,11 +249,13 @@ struct Gmem_tile_o {
     template<typename BInfo>
     // inline __device__ Gmem_tile_o(void *ptr, const size_t row_stride_in_elts, const BInfo &binfo, const int tidx)
     inline __device__ Gmem_tile_o(void *ptr, const uint32_t row_stride_in_elts,
-                                  const uint32_t head_stride_in_elts, const BInfo &binfo, const int tidx)
+                                  const uint32_t head_stride_in_elts, const int headdim,
+                                  const BInfo &binfo, const int tidx)
         : row_stride_in_bytes(row_stride_in_elts * BYTES_PER_ELEMENT)
         , actual_seqlen_q(binfo.actual_seqlen_q)
         , ptr_(reinterpret_cast<char *>(ptr))
-        , tidx_(tidx) {
+        , tidx_(tidx)
+        , col_predicate((tidx % THREADS_PER_ROW) * (BYTES_PER_STG / BYTES_PER_ELEMENT) < headdim) {
 
         // Compute the position in the sequence (within the CTA for the moment).
         int row = tidx / THREADS_PER_ROW;
@@ -280,7 +285,7 @@ struct Gmem_tile_o {
         #pragma unroll
         for( int ii = 0; ii < STGS_PER_LOOP; ++ii ) {
             int jj = mi * STGS_PER_LOOP + ii;
-            if( row_ + jj * ROWS_PER_STG >= this->actual_seqlen_q ) {
+            if ((!col_predicate) || (row_ + jj * ROWS_PER_STG >= this->actual_seqlen_q)) {
                 break;
             }
 
@@ -308,7 +313,7 @@ struct Gmem_tile_o {
         #pragma unroll
         for( int ii = 0; ii < STGS_PER_LOOP; ++ii ) {
             int jj = mi * STGS_PER_LOOP + ii;
-            if( row_ + jj * ROWS_PER_STG >= this->actual_seqlen_q ) {
+            if ((!col_predicate) || (row_ + jj * ROWS_PER_STG >= this->actual_seqlen_q)) {
                 break;
             }
 
@@ -335,6 +340,7 @@ struct Gmem_tile_o {
     // The length of the sequence loaded by that memory tile.
     int actual_seqlen_q;
     const int tidx_;
+    const bool col_predicate;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
