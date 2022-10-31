@@ -257,11 +257,9 @@ def _bwd_kernel_one_col_block(
         start_m = tl.multiple_of(start_m, BLOCK_M)
         offs_m_curr = start_m + offs_m
         # load q, k, v, do on-chip
-        if EVEN_M:
-            if EVEN_HEADDIM:
-                q = tl.load(q_ptrs)
-            else:
-                q = tl.load(q_ptrs, mask=(offs_d[None, :] < headdim))
+        # Same bug as below. Otherwise gives wrong result for headdim=40, seqlen=(128, 117)
+        if EVEN_M & EVEN_HEADDIM:
+            q = tl.load(q_ptrs)
         else:
             if EVEN_HEADDIM:
                 q = tl.load(q_ptrs, mask=offs_m_curr[:, None] < seqlen_q, other=0.0)
