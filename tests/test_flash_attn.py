@@ -160,6 +160,8 @@ def attention_ref(q, k, v, query_padding_mask=None, key_padding_mask=None, dropo
     # output = torch.einsum('bhts,bshd->bthd', attention_drop , v)
     if dropout_mask is not None:
         attention_drop = attention.masked_fill(~dropout_mask, 0.0)
+    else:
+        attention_drop = attention
     output = torch.einsum('bhts,bshd->bthd', attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, 'b s -> b s 1 1'), 0.0)
@@ -849,3 +851,56 @@ def test_flash_attn_multigpu():
         assert 0.99 <= dropout_fraction / dropout_p <= 1.01
 
     assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
+
+
+from flash_attn.flash_attn_triton import flash_attn_func
+
+@pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
+# @pytest.mark.parametrize('dtype', [torch.bfloat16])
+@pytest.mark.parametrize('causal', [False, True])
+# @pytest.mark.parametrize('causal', [True])
+@pytest.mark.parametrize('d', [64, 128])
+# @pytest.mark.parametrize('d', [64])
+# @pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
+@pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 512), (512, 256), (1024, 1024), (2048, 2048)])
+# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(512, 256)])
+def test_flash_attn_triton(seqlen_q, seqlen_k, d, causal, dtype):
+    if seqlen_q >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
+        pytest.skip()  # Reference implementation OOM
+    device = 'cuda'
+    # set seed
+    torch.random.manual_seed(0)
+    batch_size = 8
+    nheads = 4
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k, v = torch.randn(batch_size, seqlen_k, 2, nheads, d, device=device, dtype=dtype).unbind(dim=2)
+
+    q, k, v = [x.detach().requires_grad_() for x in [q, k, v]]
+    output = flash_attn_func(q, k, v, causal)
+
+    output_ref, attn_ref = attention_ref(q, k, v, causal=causal)
+    output_pt, attn_pt = attention_ref(q, k, v, causal=causal, upcast=False, reorder_ops=True)
+    print(f'Output max diff: {(output - output_ref).abs().max().item()}')
+    print(f'Output mean diff: {(output - output_ref).abs().mean().item()}')
+    print(f'Pytorch max diff: {(output_pt - output_ref).abs().max().item()}')
+    print(f'Pytorch mean diff: {(output_pt - output_ref).abs().mean().item()}')
+
+    g = torch.randn_like(output)
+    dq, dk, dv = torch.autograd.grad(output, (q, k, v), g)
+    dq_ref, dk_ref, dv_ref, = torch.autograd.grad(output_ref, (q, k, v), g)
+    dq_pt, dk_pt, dv_pt, = torch.autograd.grad(output_pt, (q, k, v), g)
+    print(f'dQ max diff: {(dq - dq_ref).abs().max().item()}')
+    print(f'dK max diff: {(dk - dk_ref).abs().max().item()}')
+    print(f'dV max diff: {(dv - dv_ref).abs().max().item()}')
+    print(f'dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}')
+    print(f'dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}')
+    print(f'dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}')
+
+    # Check that FlashAttention's numerical error is at most twice the numerical error
+    # of a Pytorch implementation.
+    assert (output - output_ref).abs().max().item() <= 2 * (output_pt - output_ref).abs().max().item()
+    # assert torch.allclose(output, output_ref, rtol=rtol, atol=atol)
+
+    assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
+    assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
+    assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()

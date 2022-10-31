@@ -6,9 +6,11 @@ import torch.nn.functional as F
 
 from einops import rearrange, repeat
 
-from flash_attn.utils.benchmark import benchmark_all, pytorch_profiler
+from flash_attn.utils.benchmark import benchmark_forward, benchmark_all, pytorch_profiler
 from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
-from flash_attn.triton.fused_attention import attention as attention
+# from flash_attn.triton.fused_attention import attention as attention
+from flash_attn.flash_attn_triton import flash_attn_qkvpacked_func
+from flash_attn.flash_attn_triton_og import attention as attention_og
 
 try:
     from flash_attn.fused_softmax import scaled_upper_triang_masked_softmax
@@ -45,19 +47,6 @@ def attention_pytorch(qkv, dropout_p=0.0, causal=True):
     return output.to(dtype=qkv.dtype)
 
 
-def attention_triton(q, k, v):
-    """
-    No dropout and only support causal=True.
-    Triton implementation seems to require q, k, v being contiguous?
-    Arguments:
-        q, k, v: (batch_size, nheads, seqlen, head_dim)
-    Output:
-        output: (batch_size, nheads, seqlen, head_dim)
-    """
-    softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-    return attention(q, k, v, softmax_scale)
-
-
 def attention_megatron(qkv):
     """
     Arguments:
@@ -85,6 +74,10 @@ batch_size = 2
 seqlen = 4096
 nheads = 12
 headdim = 128
+# batch_size = 64
+# seqlen = 512
+# nheads = 8
+# headdim = 128
 dropout_p = 0.0
 causal = True
 dtype = torch.bfloat16
@@ -100,9 +93,13 @@ benchmark_all(flash_attn_unpadded_qkvpacked_func, rearrange(qkv, 'b s ... -> (b 
 benchmark_all(attention_pytorch, qkv, dropout_p, causal=causal,
               repeats=repeats, desc='PyTorch Attention')
 
+benchmark_all(flash_attn_qkvpacked_func, qkv, causal, repeats=repeats, desc='FlashAttention Triton')
+pytorch_profiler(flash_attn_qkvpacked_func, qkv, causal, backward=True)
+
 q, k, v = [torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype,
                        requires_grad=True) for _ in range(3)]
-benchmark_all(attention_triton, q, k, v, repeats=repeats, desc='FlashAttention Triton')
+benchmark_all(attention_og, q, k, v, 1.0, repeats=repeats, desc='FlashAttention Triton OG')
+# pytorch_profiler(attention, q, k, v, 1.0, backward=True)
 
 if scaled_upper_triang_masked_softmax is not None:
     benchmark_all(attention_megatron, qkv, repeats=repeats, desc='Megatron Attention')
