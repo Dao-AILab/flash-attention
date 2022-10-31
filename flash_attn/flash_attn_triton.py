@@ -300,8 +300,8 @@ def _bwd_kernel_one_col_block(
         dv += tl.dot(p.to(do.dtype), do, trans_a=True)
         # compute dp = dot(v, do)
         # There seems to be a race condition when headdim=48/96, and dq, dk are wrong.
-        if not EVEN_HEADDIM:
-            tl.debug_barrier()
+        # Also wrong for headdim=128, seqlen=(108, 256), and ATOMIC_ADD=True
+        tl.debug_barrier()
         dp = tl.dot(do, v, trans_b=True)
         # compute ds = p * (dp - delta[:, None])
         # Putting the subtraction after the dp matmul (instead of before) is slightly faster

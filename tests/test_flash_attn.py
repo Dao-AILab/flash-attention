@@ -896,11 +896,13 @@ def test_flash_attn_triton(seqlen_q, seqlen_k, d, causal, dtype):
     print(f'dV max diff: {(dv - dv_ref).abs().max().item()}')
     print(f'dQ mean diff: {(dq - dq_ref).abs().mean().item()}')
     print(f'dK mean diff: {(dk - dk_ref).abs().mean().item()}')
+    print(f'dV mean diff: {(dv - dv_ref).abs().mean().item()}')
     print(f'dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}')
     print(f'dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}')
     print(f'dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}')
-    print(f'dQ Pytorch max diff: {(dq_pt - dq_ref).abs().mean().item()}')
-    print(f'dK Pytorch max diff: {(dk_pt - dk_ref).abs().mean().item()}')
+    print(f'dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}')
+    print(f'dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}')
+    print(f'dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}')
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
