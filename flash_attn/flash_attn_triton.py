@@ -5,10 +5,8 @@ https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention
 Changes:
 - Implement both causal and non-causal attention.
 - Implement cross-attention (not just self-attention).
-- Support arbitrary seqlens (not just multiples of 128) in the forward pass.
-- Support arbitrary seqlen_k (not just multiples of 128) in the backward pass. However, seqlen_q
-must still be a multiple of 128.
-- Speed up the forward pass a bit (and only store the LSE instead of m and l).
+- Support arbitrary seqlens (not just multiples of 128), for both forward and backward.
+- Speed up the forward pass a bit, and only store the LSE instead of m and l.
 - Make the backward for d=128 much faster by reducing register spilling.
 - Optionally parallelize the backward pass across seqlen_k, to deal with the case of
 small batch size * nheads.
@@ -17,8 +15,6 @@ small batch size * nheads.
 import math
 
 import torch
-
-from einops import rearrange
 
 import triton
 import triton.language as tl
@@ -213,7 +209,9 @@ def _bwd_kernel_one_col_block(
     dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
     dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
     # k and v stay in SRAM throughout
-    if EVEN_N:
+    # [2022-10-30] TD: Same bug as the fwd. In the case of EVEN_N=True and EVEN_N=False,
+    # if we just call # tl.load(k_ptrs), we get the wrong output!
+    if EVEN_N & EVEN_M:
         k = tl.load(k_ptrs)
         v = tl.load(v_ptrs)
     else:
@@ -225,7 +223,10 @@ def _bwd_kernel_one_col_block(
         start_m = tl.multiple_of(start_m, BLOCK_M)
         offs_m_curr = start_m + offs_m
         # load q, k, v, do on-chip
-        q = tl.load(q_ptrs)
+        if EVEN_M:
+            q = tl.load(q_ptrs)
+        else:
+            q = tl.load(q_ptrs, mask=offs_m_curr[:, None] < seqlen_q, other=0.0)
         # recompute p = softmax(qk, dim=-1).T
         qk = tl.dot(q, k, trans_b=True)
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
@@ -235,7 +236,10 @@ def _bwd_kernel_one_col_block(
         lse_i = tl.load(LSE + offs_m_curr)
         p = tl.exp(qk * softmax_scale - lse_i[:, None])
         # compute dv
-        do = tl.load(do_ptrs)
+        if EVEN_M:
+            do = tl.load(do_ptrs)
+        else:
+            do = tl.load(do_ptrs, mask=offs_m_curr[:, None] < seqlen_q, other=0.0)
         dv += tl.dot(p.to(do.dtype), do, trans_a=True)
         # compute dp = dot(v, do)
         dp = tl.dot(do, v, trans_b=True)
@@ -249,12 +253,22 @@ def _bwd_kernel_one_col_block(
         dk += tl.dot(ds, q, trans_a=True)
         # compute dq
         if not ATOMIC_ADD:
-            dq = tl.load(dq_ptrs, eviction_policy="evict_last")
-            dq += tl.dot(ds, k)
-            tl.store(dq_ptrs, dq, eviction_policy="evict_last")
+            if EVEN_M:
+                dq = tl.load(dq_ptrs, eviction_policy="evict_last")
+                dq += tl.dot(ds, k)
+                tl.store(dq_ptrs, dq, eviction_policy="evict_last")
+            else:
+                dq = tl.load(dq_ptrs, mask=offs_m_curr[:, None] < seqlen_q, other=0.0,
+                             eviction_policy="evict_last")
+                dq += tl.dot(ds, k)
+                tl.store(dq_ptrs, dq, mask=offs_m_curr[:, None] < seqlen_q,
+                         eviction_policy="evict_last")
         else:  # If we're parallelizing across the seqlen_k dimension
             dq = tl.dot(ds, k)
-            tl.atomic_add(dq_ptrs, dq)
+            if EVEN_M:
+                tl.atomic_add(dq_ptrs, dq)
+            else:
+                tl.atomic_add(dq_ptrs, dq, mask=offs_m_curr[:, None] < seqlen_q)
         # increment pointers
         dq_ptrs += BLOCK_M * stride_dqm
         q_ptrs += BLOCK_M * stride_qm
@@ -417,7 +431,6 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, causal=False, softmax_
         do = do.contiguous()
     batch, seqlen_q, nheads, d = q.shape
     _, seqlen_k, _, _ = k.shape
-    assert seqlen_q % 128 == 0, 'Backward pass currently only supports seqlens that are multiples of 128'
     seqlen_q_rounded = math.ceil(seqlen_q / 128) * 128
     assert lse.shape == (batch, nheads, seqlen_q_rounded)
     # dq_accum = torch.zeros_like(q, dtype=torch.float32)
