@@ -860,12 +860,12 @@ from flash_attn.flash_attn_triton import flash_attn_func
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize('causal', [False, True])
-# @pytest.mark.parametrize('causal', [False])
+# @pytest.mark.parametrize('causal', [True])
 @pytest.mark.parametrize('d', [64, 128])
 # @pytest.mark.parametrize('d', [64])
 # @pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
-@pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (256, 512), (512, 256), (1024, 1024), (2048, 2048)])
-# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(127, 256)])
+@pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (2048, 2048)])
+# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 211)])
 def test_flash_attn_triton(seqlen_q, seqlen_k, d, causal, dtype):
     if seqlen_q >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
@@ -887,7 +887,7 @@ def test_flash_attn_triton(seqlen_q, seqlen_k, d, causal, dtype):
     print(f'Pytorch max diff: {(output_pt - output_ref).abs().max().item()}')
     print(f'Pytorch mean diff: {(output_pt - output_ref).abs().mean().item()}')
 
-    run_bwd = (seqlen_q % 128 == 0) and (seqlen_k % 128 == 0)
+    run_bwd = seqlen_q % 128 == 0
     if run_bwd:
         g = torch.randn_like(output)
         dq, dk, dv = torch.autograd.grad(output, (q, k, v), g)
