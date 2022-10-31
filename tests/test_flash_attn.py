@@ -912,3 +912,44 @@ def test_flash_attn_triton(seqlen_q, seqlen_k, d, causal, dtype):
     assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
     assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
     assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
+
+
+@pytest.mark.skipif(not is_sm80, reason='Triton version is only tested on A100')
+@pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
+# @pytest.mark.parametrize('dtype', [torch.float16])
+@pytest.mark.parametrize('causal', [False, True])
+# @pytest.mark.parametrize('causal', [True])
+@pytest.mark.parametrize('d', [40, 48, 64, 128, 80, 88, 96])
+# @pytest.mark.parametrize('d', [64])
+# @pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
+@pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (1023, 1024), (2048, 2048)])
+# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(1023, 1024)])
+def test_flash_attn_triton_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
+    if seqlen_q >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
+        pytest.skip()  # Reference implementation OOM
+    device = 'cuda'
+    # set seed
+    torch.random.manual_seed(0)
+    batch_size = 32
+    nheads = 4
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k, v = torch.randn(batch_size, seqlen_k, 2, nheads, d, device=device, dtype=dtype).unbind(dim=2)
+
+    q, k, v = [x.detach().requires_grad_() for x in [q, k, v]]
+    output_0 = flash_attn_func(q, k, v, causal)
+
+    g = torch.randn_like(output_0)
+    dq_0, dk_0, dv_0 = torch.autograd.grad(output_0, (q, k, v), g)
+
+    # Disable the SEQUENCE_PARALLEL option for the bwd to make sure it's deterministic
+    for i in range(10000):
+        output = flash_attn_func(q, k, v, causal)
+        # print(f'Output max diff: {(output - output_0).abs().max().item()}')
+        # dq, dk, dv = torch.autograd.grad(output, (q, k, v), g)
+        # print(f'dQ max diff: {(dq - dq_0).abs().max().item()}')
+        # print(f'dK max diff: {(dk - dk_0).abs().max().item()}')
+        # print(f'dV max diff: {(dv - dv_0).abs().max().item()}')
+        assert torch.equal(output, output_0)
+        # assert torch.equal(dq, dq_0)
+        # assert torch.equal(dk, dk_0)
+        # assert torch.equal(dv, dv_0)
