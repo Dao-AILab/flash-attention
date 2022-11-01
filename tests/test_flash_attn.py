@@ -944,12 +944,18 @@ def test_flash_attn_triton_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
     # Disable the SEQUENCE_PARALLEL option for the bwd to make sure it's deterministic
     for i in range(10000):
         output = flash_attn_func(q, k, v, causal)
-        # print(f'Output max diff: {(output - output_0).abs().max().item()}')
-        # dq, dk, dv = torch.autograd.grad(output, (q, k, v), g)
-        # print(f'dQ max diff: {(dq - dq_0).abs().max().item()}')
-        # print(f'dK max diff: {(dk - dk_0).abs().max().item()}')
-        # print(f'dV max diff: {(dv - dv_0).abs().max().item()}')
+        output_equal = torch.equal(output, output_0)
+        if not output_equal:  # Printing / computing diff sometimes makes the race condition disappear
+            print(f'Output max diff: {(output - output_0).abs().max().item()}')
         assert torch.equal(output, output_0)
-        # assert torch.equal(dq, dq_0)
-        # assert torch.equal(dk, dk_0)
-        # assert torch.equal(dv, dv_0)
+        dq, dk, dv = torch.autograd.grad(output, (q, k, v), g)
+        dq_equal = torch.equal(dq, dq_0)
+        dk_equal = torch.equal(dk, dk_0)
+        dv_equal = torch.equal(dv, dv_0)
+        if not (dq_equal and dk_equal and dv_equal):
+            print(f'dQ max diff: {(dq - dq_0).abs().max().item()}')
+            print(f'dK max diff: {(dk - dk_0).abs().max().item()}')
+            print(f'dV max diff: {(dv - dv_0).abs().max().item()}')
+        assert torch.equal(dq, dq_0)
+        assert torch.equal(dk, dk_0)
+        assert torch.equal(dv, dv_0)
