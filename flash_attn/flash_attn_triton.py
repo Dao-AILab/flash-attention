@@ -7,7 +7,7 @@ Changes:
 - Implement cross-attention (not just self-attention).
 - Support arbitrary seqlens (not just multiples of 128), for both forward and backward.
 - [WIP] Support all head dimensions up to 128 (not just 16, 32, 64, 128), for both the forward pass
-and backward pass. For the backward pass, head dims that are not 16, 32, 64, 128 will require
+and backward pass. For the backward pass, head dims that are not 64, 128 will require
 more testing since there seems to be some race conditions due to the Triton compiler.
 - Speed up the forward pass a bit, and only store the LSE instead of m and l.
 - Make the backward for d=128 much faster by reducing register spilling.
@@ -17,9 +17,9 @@ small batch size * nheads.
 Differences between this Triton version and the CUDA version:
 - Triton version doesn't support dropout.
 - Triton forward is generally faster than CUDA forward.
-- Triton backward is faster than CUDA backward when batch * nheads is small, and might be slightly
-slower in other cases.
-- Triton version does yet not support different sequence lengths in a batch (i.e., RaggedTensor/NestedTensor).
+- Triton backward is faster than CUDA backward when batch * nheads is small, and when headdim=64. It is slightly
+slower when headdim=128 and batch * nheads is large.
+- Triton version doesn't yet support different sequence lengths in a batch (i.e., RaggedTensor/NestedTensor).
 """
 
 import math
@@ -282,7 +282,7 @@ def _bwd_kernel_one_col_block(
             qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float("-inf"))
         # There seems to be a race condition when headdim=48/96, and dq, dk, dv are wrong.
         # Also wrong for headdim=64.
-        if not EVEN_M:
+        if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
         lse_i = tl.load(LSE + offs_m_curr)
         p = tl.exp(qk * softmax_scale - lse_i[:, None])
@@ -316,6 +316,9 @@ def _bwd_kernel_one_col_block(
         if not EVEN_M:
             tl.debug_barrier()
         dp = tl.dot(do, v, trans_b=True)
+        # There's a race condition for headdim=48
+        if not EVEN_HEADDIM:
+            tl.debug_barrier()
         # compute ds = p * (dp - delta[:, None])
         # Putting the subtraction after the dp matmul (instead of before) is slightly faster
         Di = tl.load(D + offs_m_curr)
@@ -390,10 +393,6 @@ def _bwd_kernel_one_col_block(
 
 
 def init_to_zero(name):
-    # def fn(nargs):
-    #     with torch.no_grad():
-    #         nargs[name].zero_()
-    # return fn
     return lambda nargs: nargs[name].zero_()
 
 @triton.autotune(
@@ -406,15 +405,8 @@ def init_to_zero(name):
         # triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "SEQUENCE_PARALLEL": True}, num_warps=8, num_stages=1, pre_hook=init_to_zero('DQ')),
         # triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "SEQUENCE_PARALLEL": False}, num_warps=4, num_stages=1, pre_hook=init_to_zero('DQ')),
         # triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "SEQUENCE_PARALLEL": True}, num_warps=4, num_stages=1, pre_hook=init_to_zero('DQ')),
-        # triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "SEQUENCE_PARALLEL": False}, num_warps=8, num_stages=1),
-        # triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "SEQUENCE_PARALLEL": True}, num_warps=8, num_stages=1),
-        # triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "SEQUENCE_PARALLEL": False}, num_warps=4, num_stages=1),
-        # triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "SEQUENCE_PARALLEL": True}, num_warps=4, num_stages=1),
-        # triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "SEQUENCE_PARALLEL": False}, num_warps=4, num_stages=1),
-        # triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "SEQUENCE_PARALLEL": True}, num_warps=4, num_stages=1),
     ],
     key=['CACHE_KEY_SEQLEN_Q', 'CACHE_KEY_SEQLEN_K', 'IS_CAUSAL', 'BLOCK_HEADDIM'],
-    # reset_to_zero=['DQ']
 )
 @triton.heuristics(
     {

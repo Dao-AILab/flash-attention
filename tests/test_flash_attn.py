@@ -1,4 +1,5 @@
 import math
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -858,14 +859,14 @@ from flash_attn.flash_attn_triton import flash_attn_func
 
 @pytest.mark.skipif(not is_sm80, reason='Triton version is only tested on A100')
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
-# @pytest.mark.parametrize('dtype', [torch.float16])
+# @pytest.mark.parametrize('dtype', [torch.bfloat16])
 @pytest.mark.parametrize('causal', [False, True])
 # @pytest.mark.parametrize('causal', [False])
 @pytest.mark.parametrize('d', [40, 48, 64, 128, 80, 88, 96])
-# @pytest.mark.parametrize('d', [40])
+# @pytest.mark.parametrize('d', [48])
 # @pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
-@pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (2048, 2048)])
-# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(1024, 1024)])
+@pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (1023, 1024), (1024, 1023), (2048, 2048)])
+# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(1023, 1023)])
 def test_flash_attn_triton(seqlen_q, seqlen_k, d, causal, dtype):
     if seqlen_q >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
@@ -916,13 +917,13 @@ def test_flash_attn_triton(seqlen_q, seqlen_k, d, causal, dtype):
 
 @pytest.mark.skipif(not is_sm80, reason='Triton version is only tested on A100')
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
-# @pytest.mark.parametrize('dtype', [torch.float16])
+# @pytest.mark.parametrize('dtype', [torch.bfloat16])
 @pytest.mark.parametrize('causal', [False, True])
 # @pytest.mark.parametrize('causal', [True])
-@pytest.mark.parametrize('d', [40, 48, 64, 128, 80, 88, 96])
-# @pytest.mark.parametrize('d', [64])
+# @pytest.mark.parametrize('d', [40, 48, 64, 128, 80, 88, 96])
+@pytest.mark.parametrize('d', [64, 128])
 # @pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
-@pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (1023, 1024), (2048, 2048)])
+@pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (91, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (1023, 1024), (1024, 1023), (2048, 2048)])
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(1023, 1024)])
 def test_flash_attn_triton_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
     if seqlen_q >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
@@ -941,7 +942,10 @@ def test_flash_attn_triton_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
     g = torch.randn_like(output_0)
     dq_0, dk_0, dv_0 = torch.autograd.grad(output_0, (q, k, v), g)
 
-    # Disable the SEQUENCE_PARALLEL option for the bwd to make sure it's deterministic
+    # The SEQUENCE_PARALLEL option for the bwd to makes dq non-deterministic
+    deterministic_dq = False
+    equal_fn = (torch.equal if deterministic_dq
+                else partial(torch.allclose, atol=1e-3 if dtype == torch.bfloat16 else 1e-5))
     for i in range(10000):
         output = flash_attn_func(q, k, v, causal)
         output_equal = torch.equal(output, output_0)
@@ -949,13 +953,13 @@ def test_flash_attn_triton_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
             print(f'Output max diff: {(output - output_0).abs().max().item()}')
         assert torch.equal(output, output_0)
         dq, dk, dv = torch.autograd.grad(output, (q, k, v), g)
-        dq_equal = torch.equal(dq, dq_0)
+        dq_equal = equal_fn(dq, dq_0)
         dk_equal = torch.equal(dk, dk_0)
         dv_equal = torch.equal(dv, dv_0)
         if not (dq_equal and dk_equal and dv_equal):
             print(f'dQ max diff: {(dq - dq_0).abs().max().item()}')
             print(f'dK max diff: {(dk - dk_0).abs().max().item()}')
             print(f'dV max diff: {(dv - dv_0).abs().max().item()}')
-        assert torch.equal(dq, dq_0)
+        assert equal_fn(dq, dq_0)
         assert torch.equal(dk, dk_0)
         assert torch.equal(dv, dv_0)
