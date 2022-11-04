@@ -326,6 +326,7 @@ def _bwd_kernel_one_col_block(
         if IS_CAUSAL:
             qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float("-inf"))
         if BIAS_TYPE != 'none':
+            tl.debug_barrier()  # Race condition otherwise
             if BIAS_TYPE == 'vector':
                 if EVEN_N:
                     bias = tl.load(b_ptrs).to(tl.float32)
