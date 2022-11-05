@@ -454,17 +454,13 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     launch(params, stream, /*configure=*/true);
 
-    at::Tensor dk_accum, dv_accum;
     if (params.num_splits > 1) {
-        // dk_accum = torch::zeros({total_k, num_heads, head_size}, opts.dtype(at::kFloat));
-        // dv_accum = torch::zeros({total_k, num_heads, head_size}, opts.dtype(at::kFloat));
-        // params.dk_accum_ptr = dk_accum.data_ptr();
-        // params.dv_accum_ptr = dv_accum.data_ptr();
-        dk.zero_();
-        dv.zero_();
-    } else {
-        // params.dk_accum_ptr = nullptr;
-        // params.dv_accum_ptr = nullptr;
+        if (!dq_tmp.defined()) {
+            dq_tmp = torch::zeros({total_q, num_heads, head_size}, opts.dtype(at::kFloat));
+            params.o_tmp_ptr = dq_tmp.data_ptr();  // o_tmp stores dq_tmp in the backward pass
+        } else {
+            dq_tmp.zero_();
+        }
     }
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
@@ -481,10 +477,10 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     launch(params, stream, /*configure=*/false);
 
-    // if (params.num_splits > 1) {
-    //     dk.copy_(dk_accum);
-    //     dv.copy_(dv_accum);
-    // }
+    if (params.num_splits > 1) {
+        dq.copy_(dq_tmp);
+    }
+
     return { dq, dk, dv, softmax_d };
 }
 

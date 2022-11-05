@@ -368,8 +368,8 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     x = torch.randn(batch_size, seqlen, nheads * d, device=device, dtype=dtype, requires_grad=True)
     Wqkv = torch.nn.Linear(nheads * d, 3 * nheads * d, device=device, dtype=dtype)
 
-    # key_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode='random')
-    key_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode='full')
+    key_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode='random')
+    # key_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode='full')
 
     qkv_unpad, cu_seqlens, max_seqlen, qkv, output_pad_fn, dqkv_pad_fn = generate_qkv(
         x, Wqkv, nheads, key_padding_mask, key_padding_mask, qkvpacked=True

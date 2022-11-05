@@ -6,41 +6,41 @@
 #include "fmha.h"
 #include "fmha_dgrad_kernel_1xN_loop.h"
 
-// Find the number of splits that maximizes the occupancy. For example, if we have
-// batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
-// better than having 3 splits (efficiency = 0.67). However, we also don't want too many
-// splits as that would incur more HBM reads/writes.
-// Moreover, more than 1 split incurs extra cost of zeroing out dk/dv and doing atomic add
-// instead of just writing.
-// So for num_splits > 1, we divide the efficiency by some factor (e.g. 1.25, depending on seqlen)
-// to account for this. Moreover, more splits means atomic add will be slower.
-int num_splits_heuristic_bwd(int batch_nheads, int num_SMs, int ctas_per_sm, int max_splits,
-                             int seqlen, bool is_causal) {
-    float max_efficiency = 0.f;
-    int best_num_splits = 1;
-    std::vector<float> efficiency;
-    efficiency.reserve(max_splits);
-    float discount_factor = 1.f + 512.0 / seqlen;  // 1.25 for seqlen 2k, 1.125 for 4k.
-    discount_factor *= is_causal ? 1.1 : 1.f; // causal makes it even slower.
-    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        float n_waves = float(batch_nheads * num_splits) / (num_SMs * ctas_per_sm);
-        float eff_raw = n_waves / ceil(n_waves);
-        // Heuristic: each increase in num_splits results in 6% slowdown, up to maybe 8 splits.
-        float eff = num_splits == 1 ? eff_raw : (eff_raw  - 0.07 * std::min(num_splits - 2, 6)) / discount_factor;
-        // printf("num_splits = %d, eff_raw = %f, eff = %f\n", num_splits, eff_raw, eff);
-        if (eff > max_efficiency) {
-            max_efficiency = eff;
-            best_num_splits = num_splits;
-        }
-        efficiency.push_back(eff);
+// Pick whether we should parallelize across seqlen_k (num_splits > 1) or not (num_splits=1).
+// Parallelizing will have better occupancy, but has some overhead due to having to zero out dq
+// dq_tmp and having to copy dq_tmp to dq.
+int num_splits_heuristic_bwd(int batch_nheads, int num_SMs, int ctas_per_sm, int seqlen,
+                             int blocksize, bool is_causal) {
+    float n_waves_1 = float(batch_nheads) / (num_SMs * ctas_per_sm);
+    float eff_1 = n_waves_1 / ceil(n_waves_1);
+    int num_splits_parallel = seqlen / blocksize;
+    float n_waves_parallel = float(batch_nheads * num_splits_parallel) / (num_SMs * ctas_per_sm);
+    float eff_parallel_raw = n_waves_parallel / ceil(n_waves_parallel);
+    float discount_factor;
+    if (!is_causal) {
+        discount_factor = 1.f + float(blocksize) / seqlen;
+    } else {  // For causal, parallelizing seems to help with load-balancing as well
+        // For example, if headdim=128, seqlen >= 1280 always prefers parallel
+        if (seqlen / blocksize >= 10) return num_splits_parallel;
+        discount_factor = 1.f + 0.5 * float(blocksize) / seqlen;
     }
-    // printf("num_splits chosen = %d\n", best_num_splits);
-    return best_num_splits;
+    float eff_parallel = eff_parallel_raw / discount_factor;
+    return eff_1 >= eff_parallel ? 1 : num_splits_parallel;
+}
+
+template<typename Kernel_traits>
+__global__ void fmha_dgrad_dot_do_o_kernel(FMHA_dgrad_params params) {
+    fmha::compute_dot_do_o<Kernel_traits>(params);
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, int loop_steps=-1>
 __global__ void fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel(FMHA_dgrad_params params) {
     fmha::compute_dq_dk_dv_1xN<Kernel_traits, Is_dropout, Is_causal, loop_steps>(params);
+}
+
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
+__global__ void fmha_dgrad_fp16_sm80_dq_dk_dv_loop_seqparallel_kernel(FMHA_dgrad_params params) {
+    fmha::compute_dq_dk_dv_seqparallel<Kernel_traits, Is_dropout, Is_causal>(params);
 }
 
 template<typename Kernel_traits>
@@ -74,9 +74,14 @@ void run_fmha_dgrad_fp16_sm80_loop_(FMHA_dgrad_params &params, cudaStream_t stre
                 ? &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, true, /*loop_steps=*/2>
                 : &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, false, /*loop_steps=*/2>;
         }
+        auto kernel_seqparallel = params.is_causal
+            ? &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_seqparallel_kernel<Kernel_traits, IsDropoutConst, true>
+            : &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_seqparallel_kernel<Kernel_traits, IsDropoutConst, false>;
         if( smem_size_dq_dk_dv >= 48 * 1024 ) {
             FMHA_CHECK_CUDA(cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
+            FMHA_CHECK_CUDA(cudaFuncSetAttribute(
+                kernel_seqparallel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
         }
         // Automatically set num_splits to maximize occupancy
         if (params.num_splits <= 0) {
@@ -90,13 +95,20 @@ void run_fmha_dgrad_fp16_sm80_loop_(FMHA_dgrad_params &params, cudaStream_t stre
             // Numerical error on dk/dv scales as sqrt(num_splits).
             params.num_splits = num_splits_heuristic_bwd(
                 params.b * params.h, dprops->multiProcessorCount,
-                ctas_per_sm, /*max_splits=*/std::min(10, (params.seqlen_q + M - 1 / M)),
-                params.seqlen_k, params.is_causal
+                ctas_per_sm, params.seqlen_k, blocksize_c, params.is_causal
             );
         }
         if (configure) return;
-        dim3 grid(params.b, params.h, params.num_splits);
-        kernel<<<grid, Kernel_traits::THREADS, smem_size_dq_dk_dv, stream>>>(params);
+        if (params.num_splits == 1) {
+            dim3 grid(params.b, params.h, params.num_splits);
+            kernel<<<grid, Kernel_traits::THREADS, smem_size_dq_dk_dv, stream>>>(params);
+        } else {
+            dim3 grid_dot(params.b, params.h, (params.seqlen_q + 128 - 1) / 128);
+            fmha_dgrad_dot_do_o_kernel<Kernel_traits><<<grid_dot, Kernel_traits::THREADS, 0, stream>>>(params);
+            int num_splits = params.seqlen_k / blocksize_c;  // seqlen_k is divisible by blocksize_c
+            dim3 grid(params.b, params.h, num_splits);
+            kernel_seqparallel<<<grid, Kernel_traits::THREADS, smem_size_dq_dk_dv, stream>>>(params);
+        }
         FMHA_CHECK_CUDA(cudaPeekAtLastError());
     });
 }

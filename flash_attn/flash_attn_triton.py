@@ -26,10 +26,11 @@ that there are none left for other head dimensions.
 
 Differences between this Triton version and the CUDA version:
 - Triton version doesn't support dropout.
-- Triton forward is generally faster than CUDA forward.
-- Triton backward is faster than CUDA backward when batch * nheads is small, and when headdim=64.
-It is slightly slower when headdim=128 and batch * nheads is large.
-- Triton version doesn't yet support different sequence lengths in a batch (i.e., RaggedTensor/NestedTensor).
+- Triton forward is generally faster than CUDA forward, while Triton backward is
+generally slower than CUDA backward. Overall Triton forward + backward is slightly slower
+than CUDA forward + backward.
+- Triton version doesn't support different sequence lengths in a batch (i.e., RaggedTensor/NestedTensor).
+- Triton version supports attention bias, while CUDA version doesn't.
 """
 
 import math

@@ -32,12 +32,13 @@ def _flash_attn_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens
                          max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, causal, num_splits=0,
                          generator=None):
     """
-    num_splits: how much to parallelize over the seqlen_q dimension. num_splits=0 means
-    it will be set by an internal heuristic. Setting this too large (e.g. > 10) could make
-    numerical error of dK and dV larger (scaling as sqrt(num_splits)).
+    num_splits: whether to parallelize over the seqlen_k dimension (num_splits > 1) or
+    not (num_splits = 1). num_splits=0 means it will be set by an internal heuristic.
+    Any value above 1 will call the same kernel (i.e. num_splits=2 would call the same kernel
+    as num_splits=3), so effectively the choices are 0, 1, and 2.
     This hyperparameter can be tuned for performance, but default value (heuristic) should work fine.
     """
-    softmax_d = flash_attn_cuda.bwd(
+    _, _, _, softmax_d = flash_attn_cuda.bwd(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, False, causal, num_splits, generator)
     # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
