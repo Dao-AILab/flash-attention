@@ -18,6 +18,7 @@ small batch size * nheads.
 Caution:
 - This is an *experimental* implementation. The forward pass should be quite robust but
 I'm not 100% sure that the backward pass doesn't have race conditions (due to the Triton compiler).
+- This implementation has only been tested on A100.
 - If you plan to use headdim other than 64 and 128, you should test for race conditions
 (due to the Triton compiler), as done in tests/test_flash_attn.py
 "test_flash_attn_triton_race_condition". I've tested and fixed many race conditions
@@ -251,6 +252,29 @@ def _bwd_preprocess_do_o_dot(
 
 
 @triton.jit
+def _bwd_store_dk_dv(
+    dk_ptrs, dv_ptrs, dk, dv, offs_n, offs_d, seqlen_k, headdim,
+    EVEN_M: tl.constexpr, EVEN_N: tl.constexpr, EVEN_HEADDIM: tl.constexpr,
+):
+    # [2022-11-01] TD: Same bug. In the case of EVEN_N=True and EVEN_M=False,
+    # if we just call tl.store(dv_ptrs), there's a race condition
+    if EVEN_N & EVEN_M:
+        if EVEN_HEADDIM:
+            tl.store(dv_ptrs, dv)
+            tl.store(dk_ptrs, dk)
+        else:
+            tl.store(dv_ptrs, dv, mask=offs_d[None, :] < headdim)
+            tl.store(dk_ptrs, dk, mask=offs_d[None, :] < headdim)
+    else:
+        if EVEN_HEADDIM:
+            tl.store(dv_ptrs, dv, mask=offs_n[:, None] < seqlen_k)
+            tl.store(dk_ptrs, dk, mask=offs_n[:, None] < seqlen_k)
+        else:
+            tl.store(dv_ptrs, dv, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
+            tl.store(dk_ptrs, dk, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
+
+
+@triton.jit
 def _bwd_kernel_one_col_block(
     start_n,
     Q, K, V, Bias,
@@ -287,6 +311,16 @@ def _bwd_kernel_one_col_block(
     # initialize dv and dk
     dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
     dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
+    # There seems to be some problem with Triton pipelining that makes results wrong for
+    # headdim=64, seqlen=(113, 255), bias_type='matrix'. In this case the for loop
+    # may have zero step, and pipelining with the bias matrix could screw it up.
+    # So we just exit early.
+    if begin_m >= seqlen_q:
+        dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
+        dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
+        _bwd_store_dk_dv(dk_ptrs, dv_ptrs, dk, dv, offs_n, offs_d, seqlen_k, headdim,
+                         EVEN_M=EVEN_M, EVEN_N=EVEN_N, EVEN_HEADDIM=EVEN_HEADDIM)
+        return
     # k and v stay in SRAM throughout
     # [2022-10-30] TD: Same bug as the fwd. In the case of EVEN_N=True and EVEN_M=False,
     # if we just call tl.load(k_ptrs), we get the wrong output!
@@ -437,22 +471,8 @@ def _bwd_kernel_one_col_block(
     # write-back
     dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
     dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
-    # [2022-11-01] TD: Same bug. In the case of EVEN_N=True and EVEN_M=False,
-    # if we just call tl.store(dv_ptrs), there's a race condition
-    if EVEN_N & EVEN_M:
-        if EVEN_HEADDIM:
-            tl.store(dv_ptrs, dv)
-            tl.store(dk_ptrs, dk)
-        else:
-            tl.store(dv_ptrs, dv, mask=offs_d[None, :] < headdim)
-            tl.store(dk_ptrs, dk, mask=offs_d[None, :] < headdim)
-    else:
-        if EVEN_HEADDIM:
-            tl.store(dv_ptrs, dv, mask=offs_n[:, None] < seqlen_k)
-            tl.store(dk_ptrs, dk, mask=offs_n[:, None] < seqlen_k)
-        else:
-            tl.store(dv_ptrs, dv, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
-            tl.store(dk_ptrs, dk, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
+    _bwd_store_dk_dv(dk_ptrs, dv_ptrs, dk, dv, offs_n, offs_d, seqlen_k, headdim,
+                     EVEN_M=EVEN_M, EVEN_N=EVEN_N, EVEN_HEADDIM=EVEN_HEADDIM)
 
 
 def init_to_zero(name):
