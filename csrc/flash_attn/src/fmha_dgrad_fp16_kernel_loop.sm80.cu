@@ -7,7 +7,7 @@
 #include "fmha_dgrad_kernel_1xN_loop.h"
 
 // Pick whether we should parallelize across seqlen_k (num_splits > 1) or not (num_splits=1).
-// Parallelizing will have better occupancy, but has some overhead due to having to zero out dq
+// Parallelizing will have better occupancy, but has some overhead due to having to zero out
 // dq_tmp and having to copy dq_tmp to dq.
 int num_splits_heuristic_bwd(int batch_nheads, int num_SMs, int ctas_per_sm, int seqlen,
                              int blocksize, bool is_causal) {

@@ -271,6 +271,24 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
 
     static_assert(Cta_tile_p::N % Cta_tile_p::M == 0);
     int begin = Is_causal ? loop_step_idx * Cta_tile_p::N / Cta_tile_p::M : 0;
+    // Otherwise we'd be reading out-of-bound memory before the loop
+    if (begin * Cta_tile_p::M >= binfo.actual_seqlen_q) {
+        // Still need to zero out dk and dv before returning
+        static_assert(Smem_tile_dk::NUM_LDS == Smem_tile_dv::NUM_LDS);
+        uint4 dkv_out[Smem_tile_dk::NUM_LDS];
+        #pragma unroll
+        for (int i = 0; i < Smem_tile_dk::NUM_LDS; ++i) { dkv_out[i] = make_uint4(0u, 0u, 0u, 0u); }
+        Gmem_tile_dk gmem_dk(params.dk_ptr, params.dk_row_stride_in_elts, params.dk_head_stride_in_elts,
+                            params.d, binfo, tidx, false);
+        if (!Is_first) { gmem_dk.move(loop_step_idx); }
+        gmem_dk.store(dkv_out);
+        Gmem_tile_dv gmem_dv(params.dv_ptr, params.dv_row_stride_in_elts, params.dv_head_stride_in_elts,
+                            params.d, binfo, tidx, false);
+        if (!Is_first) { gmem_dv.move(loop_step_idx); }
+        gmem_dv.store(dkv_out);
+        return;
+    }
+
     const int steps = (params.seqlen_q + Cta_tile_p::M - 1) / Cta_tile_p::M - begin;
     // Wind gmem tiles to the correct position.
     gmem_q.move(begin);
