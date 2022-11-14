@@ -59,6 +59,11 @@ yields the fastest BERT training on cloud instances in MLPerf training 2.0 (June
   v0.7.0](https://github.com/huggingface/diffusers/releases/tag/v0.7.0).
   Up to 2x faster inference and lower memory usage.
   
+- Colossal-AI's
+  [implementation](https://github.com/hpcaitech/ColossalAI/tree/main/examples/images/diffusion)
+  of Stable Diffusion: with FlashAttention as one of its components, it speeds up
+  pretraining by up to 6.5x, and reduces the hardware cost of fine-tuning by 7x.
+  
 - Stable Diffusion inference from
   [Labml.ai](https://twitter.com/labmlai/status/1573634095732490240): 50% speedup.
   
