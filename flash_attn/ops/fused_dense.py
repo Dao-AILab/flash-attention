@@ -8,9 +8,7 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 
 # import fused_dense_cuda  # from apex
 import fused_dense_lib as fused_dense_cuda
-# from src.ops.triton.triton_matmul import matmul_dgelu
 from flash_attn.ops.gelu_activation import gelu_bwd
-# from src.ops.gelu_activation import gelu_bwd, bias_gelu, bias_gelu_back
 
 
 # implements fused GEMM+bias in forward pass using mlp_cuda from apex
