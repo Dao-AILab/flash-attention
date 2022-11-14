@@ -8,7 +8,13 @@ Paper: https://arxiv.org/abs/2205.14135
 IEEE Spectrum [article](https://spectrum.ieee.org/mlperf-rankings-2022) about our submission to the MLPerf 2.0 benchmark using FlashAttention.
 ![FlashAttention](assets/flashattn_banner.jpg)
 
-#### Triton implementation of FlashAttention
+## Usage
+
+We've been very happy to see FlashAttention being widely adopted in such a short
+time after its release. This [page](https://github.com/HazyResearch/flash-attention/blob/main/usage.md)
+contains a partial list of places where FlashAttention is being used.
+
+## Triton implementation of FlashAttention
 
 Phil Tillet (OpenAI) has an experimental implementation of FlashAttention in Triton:
 https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention.py  
