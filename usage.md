@@ -46,7 +46,7 @@ yields the fastest BERT training on cloud instances in MLPerf training 2.0 (June
   [AITemplate](https://ai.facebook.com/blog/gpu-inference-engine-nvidia-amd-open-source/)
   uses FlashAttention as part of their approach to speed up Transformer
   inference (up to 5.3x on BERT).
-  
+
 - [Kernl](https://github.com/ELS-RD/kernl) is a library for fast Transformer
   inference. They use FlashAttention as part of their
   [approach](https://twitter.com/pommedeterre33/status/1585284221014245377) to
@@ -58,18 +58,23 @@ yields the fastest BERT training on cloud instances in MLPerf training 2.0 (June
   for diffusion models. FlashAttention is integrated into [diffusers
   v0.7.0](https://github.com/huggingface/diffusers/releases/tag/v0.7.0).
   Up to 2x faster inference and lower memory usage.
-  
+
 - Colossal-AI's
   [implementation](https://github.com/hpcaitech/ColossalAI/tree/main/examples/images/diffusion)
   of Stable Diffusion: with FlashAttention as one of its components, it speeds up
   pretraining by up to 6.5x, and reduces the hardware cost of fine-tuning by 7x.
-  
+
+- Meta's
+  [AITemplate](https://ai.facebook.com/blog/gpu-inference-engine-nvidia-amd-open-source/)
+  with FlashAttention one of the components, is currently the [fastest](https://twitter.com/bing_xu_/status/1590447334055632897) Stable
+  Diffusion inference engine that we know of.
+
 - Stable Diffusion inference from
   [Labml.ai](https://twitter.com/labmlai/status/1573634095732490240): 50% speedup.
-  
+
 - Our own Stable Diffusion [fork](https://twitter.com/realDanFu/status/1580641495991754752) uses FlashAttention to get 3-4x speedup compared
   to the original version.
-  
+
 ## Other models
 
 - [Uni-Fold](https://github.com/dptech-corp/Uni-Fold): Uni-Fold is an
@@ -82,10 +87,12 @@ yields the fastest BERT training on cloud instances in MLPerf training 2.0 (June
 - [Triton](https://github.com/openai/triton): an [implementation](https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention.py) of
   FlashAttention in Triton by Phil Tillet from OpenAI. Triton is a Python-based
   language and compiler for parallel programming.
-  
+
 - [xformers](https://github.com/facebookresearch/xformers): The xformers team
-  has implemented [memory-efficient attention](https://twitter.com/fvsmassa/status/1580229170629849089) in a similar spirit to FlashAttention.
-  
+  has implemented [memory-efficient
+  attention](https://twitter.com/fvsmassa/status/1580229170629849089) in a
+  similar spirit to FlashAttention.
+  xformers dynamically dispatches to whichever implementation is available / faster.
+
 - [Jax](https://github.com/google/jax): an [implementation](https://github.com/lucidrains/flash-attention-jax)
   in Jax by [lucidrains](https://github.com/lucidrains/).
-  
