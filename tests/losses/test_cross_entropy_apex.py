@@ -6,7 +6,7 @@ import pytest
 
 from einops import rearrange
 
-from src.losses.cross_entropy_apex import CrossEntropyLossApex
+from flass_attn.losses.cross_entropy_apex import CrossEntropyLossApex
 
 is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
 
