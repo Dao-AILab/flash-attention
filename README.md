@@ -52,7 +52,7 @@ Our tentative roadmap:
 6. ~~[Jul 2022] Implement cross-attention~~[Done].
 7. ~~[Jul 2022] Support head dimension 128~~[Done].
 8. [Jul 2022] Support SM70 GPUs (V100).
-9. [Aug 2022] Fuse rotary embedding.
+9. ~~[Aug 2022] Fuse rotary embedding~~[Done].
 10. [Aug 2022] Support attention bias (e.g. ALiBi, relative positional encoding).
 
 ## Speedup and Memory Savings
@@ -154,10 +154,10 @@ and for his thoughtful answers to our questions about CUDA.
 ## Citation
 If you use this codebase, or otherwise found our work valuable, please cite:
 ```
-@article{dao2022flashattention,
+@inproceedings{dao2022flashattention,
   title={FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness},
   author={Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
-  journal={arXiv preprint arXiv:2205.14135},
+  booktitle={Advances in Neural Information Processing Systems},
   year={2022}
 }
 ```

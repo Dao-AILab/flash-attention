@@ -1,4 +1,4 @@
-This CUDA extensions implements fused matmul + bias (forward and backward), and fused matmul + bias + gelu
+This CUDA extension implements fused matmul + bias (forward and backward), and fused matmul + bias + gelu
 (forward and backward), adapted from Apex's
 [FusedDense](https://github.com/NVIDIA/apex/tree/master/apex/fused_dense).
 We make it work for bfloat16.
