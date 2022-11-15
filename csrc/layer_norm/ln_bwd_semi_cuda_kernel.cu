@@ -44,8 +44,8 @@ void launch_(LaunchParams<BwdParams> &launch_params, const bool configure_params
                     auto kernel = &ln_bwd_kernel<Kernel_traits, PrenormConst, IsDropoutConst, HasResidualConst, HasRowscaleConst>;
                     if( configure_params ) {
                         int ctas_per_sm;
-                        cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                            &ctas_per_sm, kernel, Kernel_traits::THREADS_PER_CTA, Kernel_traits::SMEM_BYTES);
+                        CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                            &ctas_per_sm, kernel, Kernel_traits::THREADS_PER_CTA, Kernel_traits::SMEM_BYTES));
                         launch_params.params.ctas_per_col = launch_params.props->multiProcessorCount * ctas_per_sm / Kernel_traits::CTAS_PER_ROW;
                         launch_params.barrier_size = 0;
                         launch_params.workspace_bytes = 0;
