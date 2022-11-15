@@ -152,7 +152,7 @@ ext_modules.append(
 
 setup(
     name="flash_attn",
-    version="0.1",
+    version="0.2",
     packages=find_packages(
         exclude=("build", "csrc", "include", "tests", "dist", "docs", "benchmarks", "flash_attn.egg-info",)
     ),
@@ -164,7 +164,7 @@ setup(
     url="https://github.com/HazyResearch/flash-attention",
     classifiers=[
         "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: Apache Software License",
+        "License :: OSI Approved :: BSD License",
         "Operating System :: Unix",
     ],
     ext_modules=ext_modules,

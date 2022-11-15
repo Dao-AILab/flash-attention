@@ -24,9 +24,14 @@ and experiment with. The notations in the Triton implementation are also closer
 to what's used in our paper.
 
 
-## Alpha release (0.1).
+## Beta release (0.2).
 
-To compile (requiring CUDA 11, NVCC, and an Turing or Ampere GPU):
+To install (requiring CUDA 11, NVCC, and an Turing or Ampere GPU):
+```sh
+pip install flash-attn
+```
+
+Alternatively you can compile from source:
 ```
 python setup.py install
 ```
@@ -44,7 +49,7 @@ FlashAttention currently supports:
 3. Head dimensions that are multiples of 8, up to 128 (e.g., 8, 16, 24, ..., 128). Head dim > 64 backward requires A100.
 
 Our tentative roadmap:
-1. [Jun 2022] Make package pip-installable.
+1. ~~[Jun 2022] Make package pip-installable~~[Done, thanks to lucidrains].
 2. ~~[Jun 2022] Support SM86 GPUs (e.g., RTX 3080, 3090)~~[Done].
 3. [Jun 2022] Refactor to use Cutlass.
 4. ~~[Jun 2022] Support SM75 GPUs (e.g. T4)~~[Done].
