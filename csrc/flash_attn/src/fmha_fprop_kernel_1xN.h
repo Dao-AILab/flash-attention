@@ -280,6 +280,8 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
     // k * gridDim.z + 1 for integer k.
     const int begin_mod_z = begin % gridDim.z;
     begin = begin_mod_z <= blockIdx.z ? begin - begin_mod_z : begin + gridDim.z - begin_mod_z;
+    // Otherwise we'd be reading out-of-bound memory before the loop
+    if ((begin + blockIdx.z) * Cta_tile_p::M >= binfo.actual_seqlen_q) return;
     const int steps_og = steps;
     steps -= begin;
     gmem_q.move(begin + blockIdx.z);

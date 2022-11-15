@@ -6,7 +6,7 @@ import pytest
 
 from einops import rearrange
 
-from flash_attn.rotary import apply_rotary_emb_func, apply_rotary_emb_torch
+from flash_attn.layers.rotary import apply_rotary_emb_func, apply_rotary_emb_torch
 
 
 is_sm8x = torch.cuda.get_device_capability('cuda') >= (8, 0)
