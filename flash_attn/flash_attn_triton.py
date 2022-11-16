@@ -25,7 +25,7 @@ I'm not 100% sure that the backward pass doesn't have race conditions (due to th
 for different head dimensions (40, 48, 64, 128, 80, 88, 96), but I'm still not 100% confident
 that there are none left for other head dimensions.
 
-Differences between this Triton version and the CUDA version:xr
+Differences between this Triton version and the CUDA version:
 - Triton version doesn't support dropout.
 - Triton forward is generally faster than CUDA forward, while Triton backward is
 generally slower than CUDA backward. Overall Triton forward + backward is slightly slower
