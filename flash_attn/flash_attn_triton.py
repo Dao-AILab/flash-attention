@@ -173,13 +173,13 @@ def _fwd_kernel(
             # can then fuse the mult and add into an fma instruction. But if we have bias we need to
             # to multiply with softmax_scale here.
             qk = qk * softmax_scale + bias
-            m_ij = tl.maximum(tl.maximum(tl.max(qk, 1), lse_i),1e-16)
+            m_ij = tl.maximum(tl.maximum(tl.max(qk, 1) , m_i), -1e16)
             p = tl.exp(qk - m_ij[:, None])
         else:
-            m_ij = tl.maximum(tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i),1e-16)
+            m_ij = tl.maximum(tl.maximum(tl.max(qk, 1) * softmax_scale, m_i), -1e16)
             p = tl.exp(qk * softmax_scale - m_ij[:, None])
         p = tl.where(m, p, 0)
-        l_ij = tl.maximum(tl.sum(p, 1),1e-16)
+        l_ij = tl.maximum(tl.sum(p, 1),-1e16)
         # scale acc_o
         acc_o_scale = tl.exp(m_i - m_ij)
         # # -- update output accumulator --
