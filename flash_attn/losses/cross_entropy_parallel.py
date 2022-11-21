@@ -14,7 +14,7 @@ from apex.transformer.tensor_parallel.utils import VocabUtility
 
 # `all_gather_into_tensor` and `reduce_scatter_tensor` are new placeholders for
 # `_all_gather_base` and `_reduce_scatter_base`. They require the most recent
-# version of PyTorch. The following 4 lines are for backward comparability with
+# version of PyTorch. The following 4 lines are for backward compatibility with
 # older PyTorch.
 if "all_gather_into_tensor" not in dir(torch.distributed):
     torch.distributed.all_gather_into_tensor = torch.distributed._all_gather_base
