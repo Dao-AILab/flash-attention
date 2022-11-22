@@ -160,7 +160,7 @@ and for his thoughtful answers to our questions about CUDA.
 If you use this codebase, or otherwise found our work valuable, please cite:
 ```
 @inproceedings{dao2022flashattention,
-  title={FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness},
+  title={Flash{A}ttention: Fast and Memory-Efficient Exact Attention with {IO}-Awareness},
   author={Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
   booktitle={Advances in Neural Information Processing Systems},
   year={2022}
