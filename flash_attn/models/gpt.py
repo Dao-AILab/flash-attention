@@ -104,14 +104,14 @@ def _init_weights(module, n_layer, initializer_range=0.02, rescale_prenorm_resid
                 nn.init.normal_(p, mean=0.0, std=initializer_range / math.sqrt(2 * n_layer))
 
 
-class GPT2Model(nn.Module):
+class GPTModel(nn.Module):
 
     def __init__(self, config: GPT2Config):
         super().__init__()
-        self.pad_vocab_size_multiple_8 = getattr(config, 'pad_vocab_size_multiple_8', False)
-        if self.pad_vocab_size_multiple_8:
-            if config.vocab_size % 8 != 0:
-                config.vocab_size += 8 - (config.vocab_size % 8)
+        self.pad_vocab_size_multiple = getattr(config, 'pad_vocab_size_multiple', 1)
+        if config.vocab_size % self.pad_vocab_size_multiple != 0:
+            config.vocab_size += (self.pad_vocab_size_multiple
+                                  - (config.vocab_size % self.pad_vocab_size_multiple))
 
         self.embeddings = GPT2Embeddings(config.hidden_size, config.vocab_size,
                                          config.max_position_embeddings)
@@ -153,11 +153,11 @@ class GPT2Model(nn.Module):
         return hidden_states
 
 
-class GPT2LMHeadModel(nn.Module):
+class GPTLMHeadModel(nn.Module):
 
     def __init__(self, config: GPT2Config):
         super().__init__()
-        self.transformer = GPT2Model(config)
+        self.transformer = GPTModel(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # Initialize weights and apply final processing
         self.apply(partial(_init_weights, n_layer=config.num_hidden_layers,

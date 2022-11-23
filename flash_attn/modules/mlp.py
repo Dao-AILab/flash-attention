@@ -64,7 +64,6 @@ class FusedDenseGeluDense(nn.Module):
         self.fc2 = nn.Linear(hidden_features, out_features, bias=bias, **factory_kwargs)
 
     def forward(self, x):
-        assert x.dtype in [torch.float16, torch.bfloat16]
         assert x.is_cuda
         fn = (fused_dense_gelu_dense_function_td if not self.return_residual
               else fused_dense_res_gelu_dense_function_td)
