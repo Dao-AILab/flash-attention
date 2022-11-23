@@ -85,6 +85,12 @@ yields the fastest BERT training on cloud instances in MLPerf training 2.0 (June
   FlashAttention, Uni-Fold is 2.6x
   [faster](https://twitter.com/guolin_ke/status/1580532071901995008) than AlphaFold.
 
+- [OpenFold](https://github.com/aqlaboratory/openfold): a trainable,
+  memory-efficient, and GPU-friendly PyTorch reproduction of AlphaFold 2. With
+  FlashAttention as one of its
+  [components](https://twitter.com/gahdritz/status/1595420944880779266), it is
+  up to 3x faster than AlphaFold2, and can predict 2x longer structures.
+
 ## Different implementations
 
 - [Triton](https://github.com/openai/triton): an [implementation](https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention.py) of
