@@ -89,7 +89,8 @@ yields the fastest BERT training on cloud instances in MLPerf training 2.0 (June
   memory-efficient, and GPU-friendly PyTorch reproduction of AlphaFold 2. With
   FlashAttention as one of its
   [components](https://twitter.com/gahdritz/status/1595420944880779266), it is
-  up to 3x faster than AlphaFold2, and can predict 2x longer structures.
+  up to 3x faster than AlphaFold2 to run inference on short sequences, and can
+  predict 2x longer structures.
 
 ## Different implementations
 
