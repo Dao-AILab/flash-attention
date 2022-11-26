@@ -119,8 +119,12 @@ ext_modules.append(
         name="flash_attn_cuda",
         sources=[
             "csrc/flash_attn/fmha_api.cpp",
-            "csrc/flash_attn/src/fmha_fprop_fp16_kernel.sm80.cu",
-            "csrc/flash_attn/src/fmha_dgrad_fp16_kernel_loop.sm80.cu",
+            "csrc/flash_attn/src/fmha_fwd_hdim32.cu",
+            "csrc/flash_attn/src/fmha_fwd_hdim64.cu",
+            "csrc/flash_attn/src/fmha_fwd_hdim128.cu",
+            "csrc/flash_attn/src/fmha_bwd_hdim32.cu",
+            "csrc/flash_attn/src/fmha_bwd_hdim64.cu",
+            "csrc/flash_attn/src/fmha_bwd_hdim128.cu",
             "csrc/flash_attn/src/fmha_block_fprop_fp16_kernel.sm80.cu",
             "csrc/flash_attn/src/fmha_block_dgrad_fp16_kernel_loop.sm80.cu",
         ],
@@ -152,7 +156,7 @@ ext_modules.append(
 
 setup(
     name="flash_attn",
-    version="0.2.1",
+    version="0.2.2",
     packages=find_packages(
         exclude=("build", "csrc", "include", "tests", "dist", "docs", "benchmarks", "flash_attn.egg-info",)
     ),

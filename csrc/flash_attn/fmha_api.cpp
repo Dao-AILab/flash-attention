@@ -176,6 +176,16 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     params.dsoftmax_sum = dsoftmax_sum_d;
 }
 
+void run_fmha_fwd(Launch_params<FMHA_fprop_params> &launch_params) {
+    if (launch_params.params.d <= 32) {
+        run_fmha_fwd_hdim32(launch_params);
+    } else if (launch_params.params.d <= 64) {
+        run_fmha_fwd_hdim64(launch_params);
+    } else if (launch_params.params.d <= 128) {
+        run_fmha_fwd_hdim128(launch_params);
+    }
+}
+
 std::vector<at::Tensor>
 mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
         const at::Tensor &k,         // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
@@ -307,13 +317,22 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
         launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
     }
 
-    run_fmha_fp16_sm80(launch_params);
+    run_fmha_fwd(launch_params);
 
     std::vector<at::Tensor> result = {softmax_lse};
     if (return_softmax) {result.push_back(s);}
     return result;
 }
 
+void run_fmha_bwd(FMHA_dgrad_params &params, cudaStream_t stream, const bool configure) {
+  if (params.d <= 32) {
+      run_fmha_bwd_hdim32(params, stream, configure);
+  } else if (params.d <= 64) {
+      run_fmha_bwd_hdim64(params, stream, configure);
+  } else if (params.d <= 128) {
+      run_fmha_bwd_hdim128(params, stream, configure);
+  }
+}
 
 std::vector<at::Tensor>
 mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
@@ -341,7 +360,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
     TORCH_CHECK(is_sm8x || is_sm75);
-    auto launch = &run_fmha_dgrad_fp16_sm80;
+    auto launch = &run_fmha_bwd;
 
     bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
