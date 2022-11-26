@@ -1,6 +1,6 @@
 // Copyright (c) 2022, Tri Dao.
 
-// Splitting the different head dimentions to different files to speed up compilation.
+// Splitting the different head dimensions to different files to speed up compilation.
 
 #include "fmha_fwd_launch_template.h"
 
