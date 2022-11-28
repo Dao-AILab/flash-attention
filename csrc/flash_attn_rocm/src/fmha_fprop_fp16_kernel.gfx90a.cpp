@@ -7,42 +7,6 @@
 template <ck::index_t... Is>
 using S = ck::Sequence<Is...>;
 
-using F16 = ck::half_t;
-using F32 = float;
-
-using PassThrough = ck::tensor_operation::element_wise::PassThrough;
-
-using ADataType        = F16;
-using B0DataType       = F16;
-using B1DataType       = F16;
-using AccDataType      = F32;
-using CShuffleDataType = F32;
-using CDataType        = F16;
-using Acc0BiasDataType = ck::Tuple<>;
-using Acc1BiasDataType = ck::Tuple<>;
-
-static constexpr ck::index_t NumDimG = 2;
-static constexpr ck::index_t NumDimM = 1;
-static constexpr ck::index_t NumDimN = 1;
-static constexpr ck::index_t NumDimK = 1;
-static constexpr ck::index_t NumDimO = 1;
-
-using AElementOp    = PassThrough;
-using B0ElementOp   = PassThrough;
-using Acc0ElementOp = ck::tensor_operation::element_wise::Scale;
-using B1ElementOp   = PassThrough;
-using CElementOp    = PassThrough;
-
-static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::MNKOPadding;
-static constexpr auto MaskingSpec =
-    ck::tensor_operation::device::MaskingSpecialization::MaskDisabled;
-
-static constexpr auto TensorSpecA  = ck::tensor_operation::device::TensorSpecialization::Default;
-static constexpr auto TensorSpecB0 = ck::tensor_operation::device::TensorSpecialization::Default;
-static constexpr auto TensorSpecB1 = ck::tensor_operation::device::TensorSpecialization::Default;
-static constexpr auto TensorSpecC  = ck::tensor_operation::device::TensorSpecialization::Default;
-
-
 struct SimpleDeviceMem
 {
     SimpleDeviceMem() = delete;
@@ -60,7 +24,45 @@ struct SimpleDeviceMem
 };
 
 void run_fmha_fp16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) {
+
+    //TODO : Find out and choose proper instances parameters for different problem sizes
+
+    using F16 = ck::half_t;
+    using F32 = float;
+
+    using PassThrough = ck::tensor_operation::element_wise::PassThrough;
+
+    using ADataType        = F16;
+    using B0DataType       = F16;
+    using B1DataType       = F16;
+    using AccDataType      = F32;
+    using CShuffleDataType = F32;
+    using CDataType        = F16;
+    using Acc0BiasDataType = ck::Tuple<>;
+    using Acc1BiasDataType = ck::Tuple<>;
+
+    static constexpr ck::index_t NumDimG = 2;
+    static constexpr ck::index_t NumDimM = 1;
+    static constexpr ck::index_t NumDimN = 1;
+    static constexpr ck::index_t NumDimK = 1;
+    static constexpr ck::index_t NumDimO = 1;
+
+    using AElementOp    = PassThrough;
+    using B0ElementOp   = PassThrough;
+    using Acc0ElementOp = ck::tensor_operation::element_wise::Scale;
+    using B1ElementOp   = PassThrough;
+    using CElementOp    = PassThrough;
+
+    static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::MNKOPadding;
+    static constexpr auto MaskingSpec =
+        ck::tensor_operation::device::MaskingSpecialization::MaskDisabled;
+
+    static constexpr auto TensorSpecA  = ck::tensor_operation::device::TensorSpecialization::Default;
+    static constexpr auto TensorSpecB0 = ck::tensor_operation::device::TensorSpecialization::Default;
+    static constexpr auto TensorSpecB1 = ck::tensor_operation::device::TensorSpecialization::Default;
+    static constexpr auto TensorSpecC  = ck::tensor_operation::device::TensorSpecialization::Default;
     
+    //init the instance with parameters
     using DeviceGemmInstance =
         ck::tensor_operation::device::DeviceGroupedGemmSoftmaxGemmPermute_Xdl_CShuffle<
             NumDimG,

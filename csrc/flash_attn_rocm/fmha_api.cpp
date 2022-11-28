@@ -1,8 +1,7 @@
 
 #include <torch/extension.h>
-//#include <ATen/cuda/CUDAContext.h>
-//#include <c10/cuda/CUDAGuard.h>
-#include <c10/hip/HIPStream.h>
+#include <ATen/hip/HIPContext.h>
+#include <c10/hip/HIPGuard.h>
 #include "fmha.h"
 
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
@@ -112,7 +111,7 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
         c10::optional<at::Generator> gen_) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    auto stream = at::cuda::getCurrentHIPStream().stream();
     bool is_dropout = p_dropout > 0.0;
     Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
 
