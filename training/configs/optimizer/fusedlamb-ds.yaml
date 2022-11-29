@@ -1,0 +1,2 @@
+# @package train.optimizer
+_target_: deepspeed.ops.lamb.FusedLamb

@@ -1,0 +1,21 @@
+defaults:
+  - default.yaml
+
+gpus: 0
+
+min_epochs: 1
+max_epochs: 2
+
+# prints
+weights_summary: "full"
+profiler: null
+
+# debugs
+fast_dev_run: true
+num_sanity_val_steps: 2
+overfit_batches: 0
+limit_train_batches: 1.0
+limit_val_batches: 1.0
+limit_test_batches: 1.0
+track_grad_norm: -1
+terminate_on_nan: true

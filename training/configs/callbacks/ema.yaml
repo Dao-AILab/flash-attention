@@ -1,0 +1,4 @@
+ema:
+  _target_: src.callbacks.ema.EMACallback
+  decay: ???
+  use_num_updates: False

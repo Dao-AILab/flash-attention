@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - /experiment/pile/gpt3s-flash-8k.yaml
+
+model:
+  config:
+    max_position_embeddings: 0  # Disable absolute position embedding
+    rotary_emb_fraction: 0.5

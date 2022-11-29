@@ -1,0 +1,7 @@
+# @package train.optimizer
+_target_: torch.distributed.optim.ZeroRedundancyOptimizer
+_recursive_: True
+optimizer_class:
+  _target_: apex.optimizers.FusedAdam
+  _partial_: True
+  adam_w_mode: True

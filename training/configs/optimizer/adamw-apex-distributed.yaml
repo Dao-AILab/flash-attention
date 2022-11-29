@@ -1,0 +1,3 @@
+# @package train.optimizer
+_target_: apex.contrib.optimizers.distributed_fused_adam.DistributedFusedAdam
+adam_w_mode: True

@@ -1,0 +1,13 @@
+defaults:
+  - _self_
+  - gpt2model: gpt2-small
+
+_target_: flash_attn.models.gpt.GPTLMHeadModel
+_recursive_: True
+config:
+  _target_: transformers.GPT2Config
+  # Mistral's config: # https://github.com/stanford-crfm/mistral/blob/main/conf/models/mistral-small.yaml
+  # However, reorder_and_upcast_attn slows things down
+  reorder_and_upcast_attn: false
+  scale_attn_by_inverse_layer_idx: true
+  n_positions: ${datamodule.max_length}

@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - /experiment/pile/gpt3l-flash.yaml
+
+datamodule:
+  max_length: 8192
+  batch_size: ${eval:"1 if ${train.gpu_mem} < 40 else (2 if ${train.gpu_mem} < 80 else 4)"}
+
+train:
+  global_batch_size: 64
