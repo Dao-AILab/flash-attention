@@ -65,14 +65,6 @@ ENV PIP_NO_CACHE_DIR=1
 # # apex and pytorch-fast-transformers take a while to compile so we install them first
 # TD [2022-04-28] apex is already installed. In case we need a newer commit:
 # RUN pip install --upgrade --force-reinstall --global-option="--cpp_ext" --global-option="--cuda_ext" --global-option="--fast_multihead_attn" --global-option="--fmha" --global-option="--fast_layer_norm" --global-option="--xentropy" git+https://github.com/NVIDIA/apex.git#egg=apex
-# TD [2021-10-28] pytorch-fast-transformers doesn't have a wheel compatible with CUDA 11.3 and Pytorch 1.10
-# So we install from source, and change compiler flag -arch=compute_60 -> -arch=compute_70 for V100
-# RUN pip install pytorch-fast-transformers==0.4.0
-# RUN pip install git+git://github.com/idiap/fast-transformers.git@v0.4.0  # doesn't work on V100
-RUN git clone https://github.com/idiap/fast-transformers \
-    && sed -i 's/\["-arch=compute_60"\]/\["-arch=compute_70"\]/' fast-transformers/setup.py \
-    && pip install fast-transformers/ \
-    && rm -rf fast-transformers
 
 # xgboost conflicts with deepspeed
 RUN pip uninstall -y xgboost && DS_BUILD_UTILS=1 DS_BUILD_FUSED_LAMB=1 pip install deepspeed==0.7.5

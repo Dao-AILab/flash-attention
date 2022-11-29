@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - /experiment/pile/gpt2xl-flash-rotary-8k.yaml
+  - /experiment/pile/gpt3xl-flash-rotary-8k.yaml
 
 model:
   config:

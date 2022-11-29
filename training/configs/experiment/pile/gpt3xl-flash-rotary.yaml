@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - /experiment/pile/gpt2xl-flash.yaml
+  - /experiment/pile/gpt3xl-flash.yaml
 
 model:
   config:

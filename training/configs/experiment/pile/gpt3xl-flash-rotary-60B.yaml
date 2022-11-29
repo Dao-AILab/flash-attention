@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - /experiment/pile/gpt2xl-flash-rotary.yaml
+  - /experiment/pile/gpt3xl-flash-rotary.yaml
 
 trainer:
   max_steps: 60000

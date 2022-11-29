@@ -1,0 +1,17 @@
+# @package _global_
+defaults:
+  - /experiment/pile/gpt3xl-hf.yaml
+
+model:
+  config:
+    n_embd: 2560
+    n_head: 128
+    n_layer: 32
+
+# OOM on A100 80GB even with batch_size = 1
+datamodule:
+  batch_size: 1
+
+train:
+  optimizer:
+    lr: 1.6e-4

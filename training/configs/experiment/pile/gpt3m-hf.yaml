@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - /experiment/pile/gpt3s-hf.yaml
+  - override /model/gpt2model: gpt2-medium
+
+datamodule:
+  batch_size: 4
+
+train:
+  optimizer:
+    lr: 3.0e-4

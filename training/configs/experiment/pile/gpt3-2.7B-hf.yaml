@@ -1,0 +1,16 @@
+# @package _global_
+defaults:
+  - /experiment/pile/gpt3xl-hf.yaml
+
+model:
+  config:
+    n_embd: 2560
+    n_head: 32
+    n_layer: 32
+
+datamodule:
+  batch_size: 1
+
+train:
+  optimizer:
+    lr: 1.6e-4

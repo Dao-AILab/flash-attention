@@ -14,6 +14,20 @@ We've been very happy to see FlashAttention being widely adopted in such a short
 time after its release. This [page](https://github.com/HazyResearch/flash-attention/blob/main/usage.md)
 contains a partial list of places where FlashAttention is being used.
 
+## Full model code and training script
+
+We have released the full GPT model
+[implementation](https://github.com/HazyResearch/flash-attention/blob/main/flash_attn/models/gpt.py).
+We also provide optimized implementations of other layers (e.g., MLP, LayerNorm,
+cross-entropy loss, rotary embedding). Overall this speeds up training by 3-5x
+compared to the baseline implementation from Huggingface, reaching up to 189
+TFLOPs/sec per A100, equivalent to 60.6\% model FLOPs utilization (we don't need
+any activation checkpointing). 
+
+We also include a training
+[script](https://github.com/HazyResearch/flash-attention/tree/main/training) to
+train GPT2 on Openwebtext and GPT3 on The Pile.
+
 ## Triton implementation of FlashAttention
 
 Phil Tillet (OpenAI) has an experimental implementation of FlashAttention in Triton:
