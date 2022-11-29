@@ -220,7 +220,7 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
         launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
     }
 
-    run_fmha_fp16_gfx90a(launch_params);
+    run_fmha_fp16_bf16_gfx90a(launch_params);
 
     std::vector<at::Tensor> result = {softmax_lse};
     if (return_softmax) {result.push_back(s);}
