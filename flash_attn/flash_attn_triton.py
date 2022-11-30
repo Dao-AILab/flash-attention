@@ -82,14 +82,13 @@ def _fwd_kernel(
 # m = Q seqlen , n = K seqlen
 # cuda grid dim <num_m_block, B*H>  block dim <block_M, block_N>
     start_m = tl.program_id(0)
-
-    off_hb = tl.program_id(1)
-    off_b = off_hb // nheads
-    off_h = off_hb % nheads
+    # off_hb = tl.program_id(1)
+    # off_b = off_hb // nheads
+    # off_h = off_hb % nheads
     # TODO
-    # off_b = tl.program_id(1)
-    # off_h = tl.program_id(2)
-    # off_hb = off_b * nheads + off_h
+    off_b = tl.program_id(1)
+    off_h = tl.program_id(2)
+    off_hb = off_b * nheads + off_h
 
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M) # 图中小块的纵向
@@ -245,9 +244,9 @@ def _bwd_preprocess_do_o_dot(
     BLOCK_M: tl.constexpr, BLOCK_HEADDIM: tl.constexpr,
 ):
     start_m = tl.program_id(0)
-    off_hb = tl.program_id(1)
-    off_b = off_hb // nheads
-    off_h = off_hb % nheads
+    off_b = tl.program_id(1)
+
+    off_h = tl.program_id(2)
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
@@ -258,6 +257,7 @@ def _bwd_preprocess_do_o_dot(
                  mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
     # write-back
+    off_hb = off_b * nheads + off_h
     tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta)
 
 
@@ -538,9 +538,9 @@ def _bwd_kernel(
     EVEN_M: tl.constexpr, EVEN_N: tl.constexpr, EVEN_HEADDIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    off_hb = tl.program_id(1)
-    off_b = off_hb // nheads
-    off_h = off_hb % nheads
+    off_b = tl.program_id(1)
+    off_h = tl.program_id(2)
+    off_hb = off_b * nheads + off_h
     # offset pointers for batch/head
     Q += off_b * stride_qb + off_h * stride_qh
     K += off_b * stride_kb + off_h * stride_kh
@@ -649,7 +649,7 @@ def  _flash_attn_forward(q, k, v, m, bias=None, causal=False, softmax_scale=None
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
     BLOCK = 128
     num_warps = 4 if d <= 64 else 8
-    grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
+    grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch , nheads)
     _fwd_kernel[grid](
         q, k, v, bias, m, o,
         lse, tmp,
@@ -704,7 +704,7 @@ def _flash_attn_backward(do, q, k, v, m, o, lse, dq, dk, dv, bias=None, causal=F
     # delta = torch.zeros_like(lse)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
-    grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
+    grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch , nheads)
     _bwd_preprocess_do_o_dot[grid](
         o, do, delta,
         o.stride(0), o.stride(2), o.stride(1),
@@ -738,7 +738,7 @@ def _flash_attn_backward(do, q, k, v, m, o, lse, dq, dk, dv, bias=None, causal=F
     # BLOCK_N = 64
     # num_warps = 4
     grid = lambda META: (triton.cdiv(seqlen_k, META["BLOCK_N"]) if META["SEQUENCE_PARALLEL"] else 1,
-                    batch * nheads)
+                    batch , nheads)
     _bwd_kernel[grid](
         q, k, v, m, bias,
         do, dq_accum, dk, dv,

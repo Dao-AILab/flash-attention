@@ -91,9 +91,9 @@ def attn_ref(q,k,v,bias,mask,num_heads):
 # @pytest.mark.parametrize('causal', [False, True])
 @pytest.mark.parametrize('causal', [True])
 # @pytest.mark.parametrize('d', [128, 64, 80, 40, 32, 16])
-@pytest.mark.parametrize('d', [63])
+@pytest.mark.parametrize('d', [2])
 # @pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
-@pytest.mark.parametrize('seqlen', [127])
+@pytest.mark.parametrize('seqlen', [5])
 # @pytest.mark.parametrize('dropout_p', [0.0, 0.17])
 @pytest.mark.parametrize('dropout_p', [0.0])
 def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
@@ -101,11 +101,11 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
         pytest.skip()  # Reference implementation OOM
     device = 'cuda'
     torch.random.manual_seed(1)
-    batch_size = 15
-    nheads = 5
+    batch_size = 512
+    nheads = 127
 
 
-    data = torch.randn(batch_size, seqlen, 3 * nheads * d, device=device, dtype=dtype)
+    data = torch.randn(batch_size, seqlen, 3 * nheads * d, device=device, dtype=dtype).abs()
     qkv = rearrange(data, "b s (t h) -> b s t h",t=3)
     q = qkv[:, :, 0].detach().clone().requires_grad_(True)
     k = qkv[:, :, 1].detach().clone().requires_grad_(True)
@@ -115,24 +115,32 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     k_f = rearrange(k, "b s (n h) -> b s n h", n=nheads).detach().clone().requires_grad_(True)
     v_f = rearrange(v, "b s (n h) -> b s n h", n=nheads).detach().clone().requires_grad_(True)
     mask = torch.arange(seqlen, device=device, dtype=torch.long).view(1, 1, 1, seqlen) >= torch.arange(seqlen, device=device, dtype=torch.long).view(1, 1, seqlen, 1)
-    print(mask[0].dtype)
+    mask_ = mask.clone().detach().requires_grad_(False)
+    bias_ = bias.masked_fill(mask==False, float('-inf'))
     mask = repeat(mask,"1 ... -> b ...",b=batch_size)
     # mask = torch.randint(0,2,(batch_size,seqlen,seqlen),dtype=torch.bool, device=device).view(batch_size,1,seqlen,seqlen)
-    # mask[0,0,:,1] = True
-    # mask[:] = True
+    mask[:] = True
+    import time
+    start = time.time()
     output = flash_attn_func(
-        q_f,k_f,v_f,mask, bias,causal
+        q_f,k_f,v_f,mask, bias_,causal
     )
-    output = rearrange(output, "b s n d -> b s (n d)")
-    # output_ref = attn_ref(q,k,v,bias,mask,num_heads=nheads)
-    output_ref = attention_ref(q,k,v,bias,mask,num_heads=nheads).flatten(-2)
+    end = time.time()
+    print("flash time",end-start)
+    start = time.time()
+    # output = rearrange(output, "b s n d -> b s (n d)")
+    # output_ref = attn_ref(q,k,v,bias,mask,nheads)
+    output_ref = attention_ref(q,k,v,bias,mask_,num_heads=nheads)
+    print(output_ref.shape)
+    end = time.time()
+    print("ref time",end-start)
     print(f'Output max diff: {(output - output_ref).abs().max().item()}')
-    print(f'Output mean diff: {(output - output_ref).abs().mean().item()}')
+    print(f'Output sum diff: {(output - output_ref).abs().mean().item()}')
     g = torch.randn_like(output)
     dq_f,dk_f,dv_f =  torch.autograd.grad(output, [q_f, k_f, v_f], g, retain_graph=True)
     dq,dk,dv  = torch.autograd.grad(output_ref, [q, k, v], g, retain_graph=True)
     # print(q.grad[0][5])
     # print(q_f.grad[0][5].flatten())
-    print(f'Q max diff in a seq: {(dv[5][-5] - dv_f[5][-5].flatten()).abs().max().item()}')
+    print(f'Q max diff in a seq: {(dv[0][0] - dv_f[0][0].flatten()).abs().max().item()}')
     print(f'Q max diff in a batch: {(dq[1].flatten() - dq_f[1].flatten()).abs().max().item()}')
     print(f"q grad mean diff: {(dq.flatten() - dq_f.flatten()).abs().mean().item()}")
