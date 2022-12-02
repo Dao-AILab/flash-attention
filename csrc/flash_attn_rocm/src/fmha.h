@@ -127,7 +127,7 @@ struct FMHA_fprop_params : public Qkv_params {
 
 template<typename Kernel_params>
 struct Launch_params{
-    Launch_params(hipDeviceProp * props_,
+    Launch_params(hipDeviceProp_t * props_,
                   hipStream_t stream_,
                   bool is_dropout_,
                   bool return_softmax_)
