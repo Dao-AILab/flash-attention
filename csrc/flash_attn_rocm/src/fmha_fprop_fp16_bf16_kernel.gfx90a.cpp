@@ -29,12 +29,12 @@ void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) 
     using FP16 = ck::half_t;
     using BF16 = ck::bhalf_t;
 
-    if(params.is_bf16){
+    //constexpr if(launch_params.params.is_bf16){
         using InputDataType = BF16;
-    }
-    else{
-        using InputDataType = FP16;
-    }
+    //}
+    //else{
+    //    using InputDataType = FP16;
+    //}
 
     using F32 = float;
 
@@ -144,16 +144,18 @@ void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) 
     bool input_permute  = true;
     bool output_permute = true;
 
+    float alpha = launch_params.params.scale_bmm1f;
+
     auto a_element_op    = AElementOp{};
     auto b0_element_op   = B0ElementOp{};
     auto acc0_element_op = Acc0ElementOp{alpha};
     auto b1_element_op   = B1ElementOp{};
     auto c_element_op    = CElementOp{};
 
-    void* p_a = launch_params.params.q_ptr;
-    void* p_b0 = launch_params.params.k_ptr;
-    void* p_b1 = launch_params.params.v_ptr;
-    void* p_c = launch_params.params.o_ptr;
+    auto p_a = launch_params.params.q_ptr;
+    auto p_b0 = launch_params.params.k_ptr;
+    auto p_b1 = launch_params.params.v_ptr;
+    auto p_c = launch_params.params.o_ptr;
 
     std::vector<DeviceGemmInstance::ProblemDesc> problem_descs;
 
@@ -163,12 +165,12 @@ void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) 
 
     int* host_seqlens_q;
     int* host_seqlens_k;
-    host_seqlens_q = (int*)malloc((params.b+1)*sizeof(int));
-    host_seqlens_k = (int*)malloc((params.b+1)*sizeof(int));
-    hipMemcpy(host_seqlens_q, params.cu_seqlens_q, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost);
-    hipMemcpy(host_seqlens_k, params.cu_seqlens_k, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost);
+    host_seqlens_q = (int*)malloc((launch_params.params.b+1)*sizeof(int));
+    host_seqlens_k = (int*)malloc((launch_params.params.b+1)*sizeof(int));
+    hipMemcpy(host_seqlens_q, launch_params.params.cu_seqlens_q, (launch_params.params.b+1)*sizeof(int), hipMemcpyDeviceToHost);
+    hipMemcpy(host_seqlens_k, launch_params.params.cu_seqlens_k, (launch_params.params.b+1)*sizeof(int), hipMemcpyDeviceToHost);
 
-    for(size_t i = 0; i < (batch_size + 1); i++){
+    for(size_t i = 0; i < batch_size ; i++){
         int M     = host_seqlens_q[i + 1] - host_seqlens_q[i]; //seqlen Q
         int N     = host_seqlens_k[i + 1] - host_seqlens_k[i]; //seqlen K
         int K     = head_dim;
@@ -240,7 +242,7 @@ void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) 
     {
         std::cout << gemm.GetTypeString() << " does not support this problem" << std::endl;
 
-        return 0;
+        return;
     }
 
     float ave_time = invoker.Run(argument, StreamConfig{nullptr, time_kernel});

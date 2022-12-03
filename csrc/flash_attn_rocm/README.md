@@ -8,4 +8,7 @@ Below is the introduction to the files.
 
 "src/fmha_fprop_fp16_kernel.gfx90a.cpp" is the interface that link API in fmha_api.cpp and the CK backend, which defined function "run_fmha_fp16_gfx90a". In this function, it will use parameters conveyed from "mha_fwd" to initialize instance in CK and call CK function. Things still need to be done in this file is to find out and choose proper instance parameters according to the parameters from "mha_fwd".
 
-"compile.sh" is a compile script to compile the example above.
+"build.sh" is a compile script to compile the example above, need to be improved.
+
+"CMakeList.txt" is a cmake file to compile the example above, need to be improved.
+

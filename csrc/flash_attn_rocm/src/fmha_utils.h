@@ -12,7 +12,7 @@
 #define FMHA_CHECK_HIP( call )                                                                     \
     do {                                                                                           \
         hipError_t status_ = call;                                                                 \
-        if( status_ != cudaSuccess ) {                                                             \
+        if( status_ != hipSuccess ) {                                                             \
             fprintf( stderr,                                                                       \
                      "HIP error (%s:%d): %s\n",                                                    \
                      __FILE__,                                                                     \

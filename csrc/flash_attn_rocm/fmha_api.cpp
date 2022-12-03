@@ -38,16 +38,23 @@ void set_params_fprop(FMHA_fprop_params &params,
     params.is_bf16 = q.dtype() == torch::kBFloat16;
 
     // Set the pointers and strides.
-    params.q_ptr = q.data_ptr();
-    params.k_ptr = k.data_ptr();
-    params.v_ptr = v.data_ptr();
+    // params.q_ptr = q.data_ptr();
+    // params.k_ptr = k.data_ptr();
+    // params.v_ptr = v.data_ptr();
+
+    for (int i = 0; i < b; i++){
+        params.q_ptr.push_back(q[i].data_ptr());
+        params.k_ptr.push_back(k[i].data_ptr());
+        params.v_ptr.push_back(v[i].data_ptr());
+        params.o_ptr.push_back(out[i].data_ptr());
+    }
     params.q_row_stride_in_elts = q.stride(0);
     params.k_row_stride_in_elts = k.stride(0);
     params.v_row_stride_in_elts = v.stride(0);
     params.q_head_stride_in_elts = q.stride(1);
     params.k_head_stride_in_elts = k.stride(1);
     params.v_head_stride_in_elts = v.stride(1);
-    params.o_ptr = out.data_ptr();
+    //params.o_ptr = out.data_ptr();
     params.o_row_stride_in_elts = out.stride(0);
     params.o_head_stride_in_elts = out.stride(1);
     params.o_tmp_ptr = o_tmp_d;
@@ -107,8 +114,8 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
         const bool zero_tensors,
         const bool is_causal,
         const bool return_softmax,
-        const int num_splits,
-        c10::optional<at::Generator> gen_) {
+        const int num_splits/*,
+        c10::optional<at::Generator> gen_*/) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentHIPStream().stream();
@@ -167,7 +174,7 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    //at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
 
@@ -188,8 +195,8 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
         if (return_softmax) {s.zero_();}
     }
 
-    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-        gen_, at::cuda::detail::getDefaultCUDAGenerator());
+    //auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+    //    gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
     set_params_fprop(launch_params.params,
                      batch_size,
@@ -212,13 +219,13 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = launch_params.params.b * launch_params.params.h * 32;
-    at::PhiloxCudaState rng_engine_inputs;
+    // at::PhiloxCudaState rng_engine_inputs;
 
-    if( is_dropout ) {
-        // See Note [Acquire lock when using random generators]
-        std::lock_guard<std::mutex> lock(gen->mutex_);
-        launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
-    }
+    //if( is_dropout ) {
+    //    // See Note [Acquire lock when using random generators]
+    //    std::lock_guard<std::mutex> lock(gen->mutex_);
+    //    launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
+    //}
 
     run_fmha_fp16_bf16_gfx90a(launch_params);
 
@@ -294,8 +301,8 @@ int main(){
             zero_tensors,
             is_causal,
             return_softmax,
-            num_splits,
-            c10::optional<at::Generator> gen_);
+            num_splits/*,
+            c10::optional<at::Generator> gen_*/);
 
     return 0;
 }

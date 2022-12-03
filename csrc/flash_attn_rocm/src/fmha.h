@@ -42,9 +42,12 @@ constexpr int D_DIM = 2;
 
 struct Qkv_params {
     // The QKV matrices.
-    void *__restrict__ q_ptr;
-    void *__restrict__ k_ptr;
-    void *__restrict__ v_ptr;
+    // void *__restrict__ q_ptr;
+    // void *__restrict__ k_ptr;
+    // void *__restrict__ v_ptr;
+    std::vector<const void*> q_ptr; //changed to ck input type
+    std::vector<const void*> k_ptr;
+    std::vector<const void*> v_ptr;
 
     // The stride between rows of the Q, K and V matrices.
     // size_t qkv_stride_in_elts;
@@ -67,7 +70,8 @@ struct Qkv_params {
 struct FMHA_fprop_params : public Qkv_params {
 
     // The O matrix (output).
-    void * __restrict__ o_ptr;
+    // void * __restrict__ o_ptr;
+    std::vector<void*> o_ptr;
 
     // The stride between rows of O.
     // size_t o_stride_in_elts;
@@ -140,7 +144,7 @@ struct Launch_params{
 
     size_t elts_per_thread;
 
-    hipDeviceProp * props;
+    hipDeviceProp_t * props;
 
     hipStream_t stream;
 
@@ -157,7 +161,7 @@ struct Launch_params{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void run_fmha_fp16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params);
+void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params);
 
 //void run_fmha_dgrad_fp16_gfx90a(FMHA_dgrad_params &params, hipStream_t stream, const bool configure);
 
