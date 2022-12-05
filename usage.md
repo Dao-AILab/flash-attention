@@ -50,6 +50,11 @@ yields the fastest BERT training on cloud instances in MLPerf training 2.0 (June
   uses FlashAttention as part of their approach to speed up Transformer
   inference (up to 5.3x on BERT).
 
+- Nvidia's [FasterTransformer](https://github.com/NVIDIA/FasterTransformer) is a
+  state-of-the-art Transformer inference library. As of version
+  [5.2](https://github.com/NVIDIA/FasterTransformer/commit/b672f49e256ba7a2d4fc9691d270b60b7fc1a2ff),
+  FlashAttention is used as a component of FasterTransformer to speed up GPT inference.
+
 - [Kernl](https://github.com/ELS-RD/kernl) is a library for fast Transformer
   inference. They use FlashAttention as part of their
   [approach](https://twitter.com/pommedeterre33/status/1585284221014245377) to
