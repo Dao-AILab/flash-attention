@@ -30,12 +30,12 @@ void set_params_fprop(FMHA_fprop_params &params,
                       int num_splits) {
 
     Data_type acc_type = DATA_TYPE_FP32;
-    Data_type data_type = !(q.dtype() == torch::kBFloat16) ? DATA_TYPE_FP16 : DATA_TYPE_BF16;
+    Data_type data_type = !(q.dtype() == at::kBFloat16) ? DATA_TYPE_FP16 : DATA_TYPE_BF16;
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
 
-    params.is_bf16 = q.dtype() == torch::kBFloat16;
+    params.is_bf16 = q.dtype() == at::kBFloat16;
 
     // Set the pointers and strides.
     // params.q_ptr = q.data_ptr();
@@ -83,7 +83,7 @@ void set_params_fprop(FMHA_fprop_params &params,
     const float scale_bmm1 = softmax_scale;
 
     params.scale_bmm1f = scale_bmm1;
-    set_alpha(params.scale_bmm1, scale_bmm1, data_type);
+    //set_alpha(params.scale_bmm1, scale_bmm1, data_type);
 
     // Set this to probability of keeping an element to simplify things.
     params.p_dropout = 1.f - p_dropout;
@@ -93,8 +93,8 @@ void set_params_fprop(FMHA_fprop_params &params,
     params.p_dropout_in_uint16_t = uint16_t(std::floor(params.p_dropout * 65535.0));
     params.rp_dropout = 1.f / params.p_dropout;
     params.scale_bmm1_rp_dropout = params.rp_dropout * params.scale_bmm1f;
-    TORCH_CHECK(p_dropout < 1.f);
-    set_alpha(params.scale_dropout, params.rp_dropout, data_type);
+    //TORCH_CHECK(p_dropout < 1.f);
+    //set_alpha(params.scale_dropout, params.rp_dropout, data_type);
 
     params.is_causal = is_causal;
     params.num_splits = num_splits;
@@ -117,18 +117,22 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
         const int num_splits/*,
         c10::optional<at::Generator> gen_*/) {
 
+    std::cout<<"run here-5"<<std::endl;
+
     auto dprops = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentHIPStream().stream();
     bool is_dropout = p_dropout > 0.0;
     Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
 
+    std::cout<<"run here-4"<<std::endl;
+
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16);
+    //TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16);
     TORCH_CHECK(k.dtype() == q_dtype);
     TORCH_CHECK(v.dtype() == q_dtype);
     TORCH_CHECK(out.dtype() == q_dtype);
-    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32);
-    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32);
+    //TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32);//////==>kInt32 not supported now
+    //TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32);//////==>kInt32 not supported now
 
     TORCH_CHECK(q.is_cuda());
     TORCH_CHECK(k.is_cuda());
@@ -170,24 +174,26 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
         max_seqlen_k = 256;
     }
     int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
-    bool loop = max_seqlen_k > blocksize_c;
+    bool loop = false;
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    //at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    // at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+
+    std::cout<<"run here0"<<std::endl;
 
     auto opts = q.options();
 
     // auto o = torch::empty({ total_q, num_heads, head_size }, opts);
 
-    at::Tensor o_tmp;
-    if (loop) { o_tmp = torch::empty({total_q, num_heads, head_size}, opts.dtype(at::kFloat)); }
+    //at::Tensor o_tmp;
+    //if (loop) { o_tmp = torch::empty({total_q, num_heads, head_size}, opts.dtype(at::kFloat)); }
 
-    auto softmax_lse = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+    auto softmax_lse = at::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
     // auto softmax_lse = torch::full({batch_size, num_heads, max_seqlen_k}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
 
     at::Tensor s;
-    if (return_softmax) { s = torch::empty({ batch_size, num_heads, max_seqlen_q, max_seqlen_k }, opts); }
+    if (return_softmax) { s = at::empty({ batch_size, num_heads, max_seqlen_q, max_seqlen_k }, opts); }
 
     if( zero_tensors ) {
         out.zero_();
@@ -198,6 +204,8 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     //auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
     //    gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
+    std::cout<<"run here1"<<std::endl;
+
     set_params_fprop(launch_params.params,
                      batch_size,
                      max_seqlen_q,
@@ -207,7 +215,7 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
                      q, k, v, out,
                      cu_seqlens_q.data_ptr(),
                      cu_seqlens_k.data_ptr(),
-                     loop ? o_tmp.data_ptr() : nullptr,
+                     nullptr,
                      return_softmax ? s.data_ptr() : nullptr,
                      softmax_lse.data_ptr(),
                      p_dropout,
@@ -226,8 +234,11 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     //    std::lock_guard<std::mutex> lock(gen->mutex_);
     //    launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
     //}
+    std::cout<<"run here2"<<std::endl;
 
     run_fmha_fp16_bf16_gfx90a(launch_params);
+
+    std::cout<<"run here3"<<std::endl;
 
     std::vector<at::Tensor> result = {softmax_lse};
     if (return_softmax) {result.push_back(s);}
@@ -272,8 +283,10 @@ int main(){
 
     at::TensorOptions opts=at::TensorOptions().dtype(at::kInt);
     c10::IntArrayRef s={batch_size + 1};
+    std::cout<<"main run here 0 "<<std::endl;
     at::Tensor cu_seqlens_q=at::from_blob(cu_seqlens_q_vec.data(),s,opts).clone().to(at::kCUDA);
     at::Tensor cu_seqlens_k=at::from_blob(cu_seqlens_k_vec.data(),s,opts).clone().to(at::kCUDA);
+    std::cout<<"main run here 1 "<<std::endl;
 
     int max_seqlen_q_ = 256;
     int max_seqlen_k_ = 256;
@@ -285,6 +298,8 @@ int main(){
     bool is_causal = false;       //if do uptriangle mask
     bool return_softmax = false;  //if return the Intermediate results of softmax
     int num_splits = 0;           //parameter used in CUDA flash-attention, useless in ck
+
+    std::cout<<"main run here 2 "<<std::endl;
 
     //call the API and return results
     auto result = 

@@ -1,7 +1,5 @@
-
 #pragma once
 
-//#include <cuda.h>
 #include <vector>
 #include <iostream>
 
@@ -13,26 +11,7 @@
 //
 //#include <ATen/cuda/CUDAGraphsUtils.cuh>
 
-#include <fmha_utils.h>
-
-#include <iostream>
-#include <numeric>
-#include <initializer_list>
-#include <cstdlib>
-
-#include "ck/ck.hpp"
-#include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
-#include "ck/tensor_operation/gpu/device/tensor_specialization.hpp"
-#include "ck/tensor_operation/gpu/device/device_grouped_gemm_softmax_gemm_permute_xdl_cshuffle.hpp"
-#include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
-
-#include "ck/library/utility/check_err.hpp"
-#include "ck/library/utility/device_memory.hpp"
-#include "ck/library/utility/host_tensor.hpp"
-#include "ck/library/utility/host_tensor_generator.hpp"
-#include "ck/library/reference_tensor_operation/cpu/reference_batched_gemm.hpp"
-#include "ck/library/reference_tensor_operation/cpu/reference_softmax.hpp"
-
+#include "fmha_utils.h"
 
 constexpr int TOTAL_DIM = 0;
 constexpr int H_DIM = 1;
