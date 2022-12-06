@@ -36,7 +36,8 @@
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #endif
 
-#include <ATen/cuda/CUDAGraphsUtils.cuh>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/detail/UnpackRaw.cuh>
 
 #include <fmha_utils.h>
 

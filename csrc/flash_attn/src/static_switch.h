@@ -9,17 +9,27 @@
 ///
 /// Usage:
 /// ```
-/// BOOL_SWITCH(flag, BoolConst, [&] {
+/// BOOL_SWITCH(flag, BoolConst, ({
 ///     some_function<BoolConst>(...);
-/// });
+/// }));
 /// ```
-#define BOOL_SWITCH(COND, CONST_NAME, ...)                                           \
-    [&] {                                                                            \
-        if (COND) {                                                                  \
-            constexpr bool CONST_NAME = true;                                        \
-            return __VA_ARGS__();                                                    \
-        } else {                                                                     \
-            constexpr bool CONST_NAME = false;                                       \
-            return __VA_ARGS__();                                                    \
-        }                                                                            \
-    }()
+/// We need "({" and "})" to make sure that the code is a single argument being passed to the macro.
+#define BOOL_SWITCH(COND, CONST_NAME, CODE) \
+    if (COND) {                             \
+        constexpr bool CONST_NAME = true;   \
+        CODE;                               \
+    } else {                                \
+        constexpr bool CONST_NAME = false;  \
+        CODE;                               \
+    }
+
+// modified from BOOL_SWITCH
+// because MSVC cannot handle std::conditional with constexpr variable
+#define FP16_SWITCH(COND, CODE)        \
+    if (COND) {                        \
+      using elem_type = __nv_bfloat16; \
+      CODE;                            \
+    } else {                           \
+      using elem_type = __half;        \
+      CODE;                            \
+    }                                  \

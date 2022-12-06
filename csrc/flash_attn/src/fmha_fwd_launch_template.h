@@ -8,7 +8,6 @@
 #include <cuda_bf16.h>
 
 #include "static_switch.h"
-#include "fp16_switch.h"
 #include "fmha.h"
 #include "fmha_fprop_kernel_1xN.h"
 
@@ -57,7 +56,7 @@ void run_fmha_fwd_loop(Launch_params<FMHA_fprop_params> &launch_params) {
     // Work-around for gcc 7. It doesn't like nested BOOL_SWITCH.
     // https://github.com/kokkos/kokkos-kernels/issues/349
     // https://github.com/HazyResearch/flash-attention/issues/21
-    BOOL_SWITCH(launch_params.is_dropout, IsDropoutConst, [&] {
+    BOOL_SWITCH(launch_params.is_dropout, IsDropoutConst, ({
         auto kernel = launch_params.params.is_causal
             ? (launch_params.return_softmax
                ? &fmha_fwd_loop_kernel<Kernel_traits, IsDropoutConst, true, true>
@@ -88,5 +87,5 @@ void run_fmha_fwd_loop(Launch_params<FMHA_fprop_params> &launch_params) {
         kernel<<<grid, Kernel_traits::THREADS, smem_size, launch_params.stream>>>(
             launch_params.params);
         FMHA_CHECK_CUDA(cudaPeekAtLastError());
-    });
+    }));
 }
