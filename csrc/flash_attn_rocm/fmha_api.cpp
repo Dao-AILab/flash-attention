@@ -117,22 +117,18 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
         const int num_splits/*,
         c10::optional<at::Generator> gen_*/) {
 
-    std::cout<<"run here-5"<<std::endl;
-
     auto dprops = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentHIPStream().stream();
     bool is_dropout = p_dropout > 0.0;
     Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
 
-    std::cout<<"run here-4"<<std::endl;
-
     auto q_dtype = q.dtype();
-    //TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16);
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16);
     TORCH_CHECK(k.dtype() == q_dtype);
     TORCH_CHECK(v.dtype() == q_dtype);
     TORCH_CHECK(out.dtype() == q_dtype);
-    //TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32);//////==>kInt32 not supported now
-    //TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32);//////==>kInt32 not supported now
+    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32);
+    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32);
 
     TORCH_CHECK(q.is_cuda());
     TORCH_CHECK(k.is_cuda());
@@ -180,8 +176,6 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     // Cast to char to avoid compiler warning about narrowing
     // at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
-    std::cout<<"run here0"<<std::endl;
-
     auto opts = q.options();
 
     // auto o = torch::empty({ total_q, num_heads, head_size }, opts);
@@ -203,8 +197,6 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
 
     //auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
     //    gen_, at::cuda::detail::getDefaultCUDAGenerator());
-
-    std::cout<<"run here1"<<std::endl;
 
     set_params_fprop(launch_params.params,
                      batch_size,
@@ -234,11 +226,8 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     //    std::lock_guard<std::mutex> lock(gen->mutex_);
     //    launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
     //}
-    std::cout<<"run here2"<<std::endl;
 
     run_fmha_fp16_bf16_gfx90a(launch_params);
-
-    std::cout<<"run here3"<<std::endl;
 
     std::vector<at::Tensor> result = {softmax_lse};
     if (return_softmax) {result.push_back(s);}
@@ -282,11 +271,8 @@ int main(){
     }
 
     at::TensorOptions opts=at::TensorOptions().dtype(at::kInt);
-    c10::IntArrayRef s={batch_size + 1};
-    std::cout<<"main run here 0 "<<std::endl;
-    at::Tensor cu_seqlens_q=at::from_blob(cu_seqlens_q_vec.data(),s,opts).clone().to(at::kCUDA);
-    at::Tensor cu_seqlens_k=at::from_blob(cu_seqlens_k_vec.data(),s,opts).clone().to(at::kCUDA);
-    std::cout<<"main run here 1 "<<std::endl;
+    at::Tensor cu_seqlens_q=at::from_blob(cu_seqlens_q_vec.data(),{batch_size + 1},opts).clone().to(at::kCUDA);
+    at::Tensor cu_seqlens_k=at::from_blob(cu_seqlens_k_vec.data(),{batch_size + 1},opts).clone().to(at::kCUDA);
 
     int max_seqlen_q_ = 256;
     int max_seqlen_k_ = 256;
@@ -298,8 +284,6 @@ int main(){
     bool is_causal = false;       //if do uptriangle mask
     bool return_softmax = false;  //if return the Intermediate results of softmax
     int num_splits = 0;           //parameter used in CUDA flash-attention, useless in ck
-
-    std::cout<<"main run here 2 "<<std::endl;
 
     //call the API and return results
     auto result = 
