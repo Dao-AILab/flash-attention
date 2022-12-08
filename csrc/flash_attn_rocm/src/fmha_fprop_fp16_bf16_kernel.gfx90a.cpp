@@ -5,19 +5,6 @@
 #include <initializer_list>
 #include <cstdlib>
 
-#include "ck/ck.hpp"
-#include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
-#include "ck/tensor_operation/gpu/device/tensor_specialization.hpp"
-#include "ck/tensor_operation/gpu/device/device_grouped_gemm_softmax_gemm_permute_xdl_cshuffle.hpp"
-#include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
-
-#include "ck/library/utility/check_err.hpp"
-#include "ck/library/utility/device_memory.hpp"
-#include "ck/library/utility/host_tensor.hpp"
-#include "ck/library/utility/host_tensor_generator.hpp"
-#include "ck/library/reference_tensor_operation/cpu/reference_batched_gemm.hpp"
-#include "ck/library/reference_tensor_operation/cpu/reference_softmax.hpp"
-
 template <ck::index_t... Is>
 using S = ck::Sequence<Is...>;
 
@@ -151,7 +138,7 @@ void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) 
             MaskingSpec>;   // MaskingSpecialization
         
     bool do_verification = false;
-    bool time_kernel     = true;
+    bool time_kernel     = false;
 
     bool input_permute  = true;
     bool output_permute = true;
@@ -189,6 +176,7 @@ void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) 
         int O     = head_dim;
         int G0 = 1; // G0 = batch_size
         int G1 = num_heads;
+        
 
         std::vector<ck::index_t> a_gs_ms_ks_lengths{G0, G1, M, K};
         std::vector<ck::index_t> a_gs_ms_ks_strides =
@@ -258,5 +246,9 @@ void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) 
     }
 
     float ave_time = invoker.Run(argument, StreamConfig{nullptr, time_kernel});
+
+    if(time_kernel){
+        std::cout << "time elpase is " << ave_time <<" ms" << std::endl;
+    }
 
 }

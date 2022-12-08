@@ -37,30 +37,6 @@ void set_params_fprop(FMHA_fprop_params &params,
 
     params.is_bf16 = q.dtype() == at::kBFloat16;
 
-    // Set the pointers and strides.
-    // params.q_ptr = q.data_ptr();
-    // params.k_ptr = k.data_ptr();
-    // params.v_ptr = v.data_ptr();
-
-    for (int i = 0; i < b; i++){
-        params.q_ptr.push_back(q[i].data_ptr());
-        params.k_ptr.push_back(k[i].data_ptr());
-        params.v_ptr.push_back(v[i].data_ptr());
-        params.o_ptr.push_back(out[i].data_ptr());
-    }
-    params.q_row_stride_in_elts = q.stride(0);
-    params.k_row_stride_in_elts = k.stride(0);
-    params.v_row_stride_in_elts = v.stride(0);
-    params.q_head_stride_in_elts = q.stride(1);
-    params.k_head_stride_in_elts = k.stride(1);
-    params.v_head_stride_in_elts = v.stride(1);
-    //params.o_ptr = out.data_ptr();
-    params.o_row_stride_in_elts = out.stride(0);
-    params.o_head_stride_in_elts = out.stride(1);
-    params.o_tmp_ptr = o_tmp_d;
-    params.o_tmp_row_stride_in_elts = h * d;
-    params.o_tmp_head_stride_in_elts = d;
-
     params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
 
@@ -77,6 +53,18 @@ void set_params_fprop(FMHA_fprop_params &params,
     params.seqlen_q = seqlen_q;
     params.seqlen_k = seqlen_k;
     params.d = d;
+
+    at::Tensor q_ = q.view({params.b, params.seqlen_q , params.h , params.d});
+    at::Tensor k_ = k.view({params.b, params.seqlen_k , params.h , params.d});
+    at::Tensor v_ = v.view({params.b, params.seqlen_q , params.h , params.d});
+    out = out.view({params.b, params.seqlen_q , params.h , params.d});
+
+    for (int i = 0; i < b; i++){
+        params.q_ptr.push_back(q_[i].data_ptr());
+        params.k_ptr.push_back(k_[i].data_ptr());
+        params.v_ptr.push_back(v_[i].data_ptr());
+        params.o_ptr.push_back(out[i].data_ptr());
+    }
 
     // Set the different scale values.
     // const float scale_bmm1 = 1.f / sqrtf(d);
@@ -101,12 +89,12 @@ void set_params_fprop(FMHA_fprop_params &params,
 }
 
 std::vector<at::Tensor>
-mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
-        const at::Tensor &k,         // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-        const at::Tensor &v,         // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-        at::Tensor &out,             // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-        const at::Tensor &cu_seqlens_q,  // b+1
-        const at::Tensor &cu_seqlens_k,  // b+1
+mha_fwd(const at::Tensor &q,        
+        const at::Tensor &k,        
+        const at::Tensor &v,        
+        at::Tensor &out,            
+        const at::Tensor &cu_seqlens_q,  
+        const at::Tensor &cu_seqlens_k,  
         const int max_seqlen_q_,
         const int max_seqlen_k_,
         const float p_dropout,
@@ -151,6 +139,7 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     const int num_heads = sizes[H_DIM];
     const int head_size = sizes[D_DIM];
     const int total_k = k.size(TOTAL_DIM);
+    
     TORCH_CHECK(batch_size > 0);
     TORCH_CHECK((head_size % 8 == 0) && (head_size <= 128));
 
@@ -177,11 +166,6 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     // at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
-
-    // auto o = torch::empty({ total_q, num_heads, head_size }, opts);
-
-    //at::Tensor o_tmp;
-    //if (loop) { o_tmp = torch::empty({total_q, num_heads, head_size}, opts.dtype(at::kFloat)); }
 
     auto softmax_lse = at::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
     // auto softmax_lse = torch::full({batch_size, num_heads, max_seqlen_k}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
@@ -234,7 +218,6 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     return result;
 }
 
-
 /*
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "Fused Multi-head Self-attention";
@@ -244,64 +227,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bwd_block", &mha_bwd_block, "Backward pass (blocksparse)");
 }
 */
-
-//main function to test with the API
-int main(){
-
-    int batch_size = 64;
-    int nheads = 16;
-    int seqlen = 256;
-    int n = 1024;
-    int d = n / nheads; //head_size
-
-    //initialize the tensors
-    at::Tensor q = at::rand({batch_size*seqlen, nheads, d},at::kHalf).to(at::kCUDA);
-    at::Tensor k = at::rand({batch_size*seqlen, nheads, d},at::kHalf).to(at::kCUDA);
-    at::Tensor v = at::rand({batch_size*seqlen, nheads, d},at::kHalf).to(at::kCUDA);
-    //initialize the output tensor
-    at::Tensor out = at::zeros({batch_size*seqlen, nheads, d},at::kHalf).to(at::kCUDA);
-
-    //initialize seqlens vector (size is b+1)
-    std::vector<int> cu_seqlens_q_vec;
-    std::vector<int> cu_seqlens_k_vec;
-
-    for (int i = 0 ; i < batch_size + 1; i++){
-      cu_seqlens_q_vec.push_back(i * seqlen);
-      cu_seqlens_k_vec.push_back(i * seqlen);
-    }
-
-    at::TensorOptions opts=at::TensorOptions().dtype(at::kInt);
-    at::Tensor cu_seqlens_q=at::from_blob(cu_seqlens_q_vec.data(),{batch_size + 1},opts).clone().to(at::kCUDA);
-    at::Tensor cu_seqlens_k=at::from_blob(cu_seqlens_k_vec.data(),{batch_size + 1},opts).clone().to(at::kCUDA);
-
-    int max_seqlen_q_ = 256;
-    int max_seqlen_k_ = 256;
-    
-    //option parameters
-    float p_dropout = 0;          //dropout pecentage 
-    float softmax_scale = 0.125;  //scale parameter
-    bool zero_tensors = false;    //if init the out tensor into zeros
-    bool is_causal = false;       //if do uptriangle mask
-    bool return_softmax = false;  //if return the Intermediate results of softmax
-    int num_splits = 0;           //parameter used in CUDA flash-attention, useless in ck
-
-    //call the API and return results
-    auto result = 
-    mha_fwd(q,   
-            k,   
-            v,   
-            out, 
-            cu_seqlens_q, 
-            cu_seqlens_k, 
-            max_seqlen_q_,
-            max_seqlen_k_,
-            p_dropout,
-            softmax_scale,
-            zero_tensors,
-            is_causal,
-            return_softmax,
-            num_splits/*,
-            c10::optional<at::Generator> gen_*/);
-
-    return 0;
-}

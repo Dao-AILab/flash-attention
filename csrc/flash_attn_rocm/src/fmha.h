@@ -13,9 +13,6 @@ constexpr int D_DIM = 2;
 
 struct Qkv_params {
     // The QKV matrices.
-    // void *__restrict__ q_ptr;
-    // void *__restrict__ k_ptr;
-    // void *__restrict__ v_ptr;
     std::vector<const void*> q_ptr; //changed to ck input type
     std::vector<const void*> k_ptr;
     std::vector<const void*> v_ptr;
