@@ -24,8 +24,7 @@ is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
                           (torch.float32, torch.float32)]
                          + ([(torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32)] if is_sm8x else []))
 # @pytest.mark.parametrize('input_dtype,residual_dtype', [(torch.float16, torch.float32)])
-@pytest.mark.parametrize('hidden_size', [768, 1024, 1280, 1536, 1600, 2048, 2560, 3072, 4096, 5120])
-# @pytest.mark.parametrize('hidden_size', [768])
+@pytest.mark.parametrize('hidden_size', [192, 256, 384, 768, 1024, 1280, 1536, 1600, 2048, 2560, 3000, 3072, 4096, 5120, 6144])
 def test_dropout_layer_norm_training(hidden_size, input_dtype, residual_dtype, weight_dtype,
                                      dropout_p, has_residual, has_rowscale):
     if weight_dtype == torch.float16 and input_dtype == torch.bfloat16:
@@ -148,7 +147,13 @@ def test_dropout_layer_norm_eval(hidden_size, input_dtype, residual_dtype, weigh
                          [(torch.float16, torch.float16), (torch.float16, torch.float32),
                           (torch.float32, torch.float32)]
                          + ([(torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32)] if is_sm8x else []))
-@pytest.mark.parametrize('hidden_size', [768, 1024, 1280, 1536, 1600, 2048, 2560, 3072, 4096, 5120])
+# @pytest.mark.parametrize('has_rowscale', [False])
+# @pytest.mark.parametrize('has_residual', [True])
+# @pytest.mark.parametrize('dropout_p', [0.0])
+# @pytest.mark.parametrize('weight_dtype', [torch.float32])
+# @pytest.mark.parametrize('input_dtype,residual_dtype', [(torch.float32, torch.float32)])
+# @pytest.mark.parametrize('hidden_size', [768, 1024, 1280, 1536, 1600, 2048, 2560, 3072, 4096, 5120])
+@pytest.mark.parametrize('hidden_size', [192, 256, 384, 768, 1024, 1280, 1536, 1600, 2048, 2560, 3000, 3072, 4096, 5120, 6144])
 def test_dropout_layer_norm_prenorm_training(hidden_size, input_dtype, residual_dtype, weight_dtype,
                                              dropout_p, has_residual, has_rowscale):
     if weight_dtype == torch.float16 and input_dtype == torch.bfloat16:

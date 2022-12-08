@@ -129,6 +129,7 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
 
     TORCH_CHECK(gamma.sizes() == beta.sizes());
     TORCH_CHECK(hidden_size == cols);
+    TORCH_CHECK((hidden_size % 8 == 0) && (hidden_size <= 6144));
 
     TORCH_CHECK(epsilon >= 0.f);
 
@@ -156,8 +157,10 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int multiple = hidden_size <= 1536 ? 256 : (hidden_size <= 3072 ? 512 : 1024);
     // Request the kernel launcher.
-    auto launcher = get_fwd_launcher(wtype, itype, rtype, otype, ctype, hidden_size);
+    auto launcher = get_fwd_launcher(wtype, itype, rtype, otype, ctype, round_multiple(hidden_size, multiple));
 
     // Query the kernel-specific launch parameters.
     launcher(launch_params, true);
@@ -178,6 +181,7 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
     params.z = z.data_ptr();
     params.epsilon = epsilon;
     params.dropout_scale = 1.f / (1.f - dropout_p);
+    params.inverse_cols = 1.f / float(params.cols);
 
     if (dropout_p > 0.f) {
         // number of times random will be generated per thread, to offset philox counter in thc random
@@ -263,6 +267,8 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
     }
 
     auto hidden_size = gamma.numel();
+    TORCH_CHECK(hidden_size == cols);
+    TORCH_CHECK((hidden_size % 8 == 0) && (hidden_size <= 6144));
 
     TORCH_CHECK(mu.numel() == rows);
     TORCH_CHECK(mu.sizes() == rsigma.sizes());
@@ -285,7 +291,9 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
     launch_params.params.dx1 = has_residual ? dx1.data_ptr() : nullptr;
     launch_params.params.rowscale = rowscale_.has_value() ? rowscale_.value().data_ptr() : nullptr;
 
-    auto launcher = get_bwd_launcher(wtype, itype, rtype, otype, ctype, hidden_size);
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int multiple = hidden_size <= 1536 ? 256 : (hidden_size <= 3072 ? 512 : 1024);
+    auto launcher = get_bwd_launcher(wtype, itype, rtype, otype, ctype, round_multiple(hidden_size, multiple));
 
     launcher(launch_params, true, /*prenorm=*/false);
 
@@ -308,6 +316,7 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
     params.dbeta_part = dbeta_part.data_ptr();
     params.dgamma_part = dgamma_part.data_ptr();
     params.dropout_scale = 1.f / (1.f - dropout_p);
+    params.inverse_cols = 1.f / float(params.cols);
 
     if( launch_params.barrier_size > 0 ) {
         // TODO Any way to avoid this?
@@ -385,6 +394,8 @@ std::vector<at::Tensor> dropout_add_ln_prenorm_bwd(const at::Tensor &dz,     // 
     }
 
     auto hidden_size = gamma.numel();
+    TORCH_CHECK(hidden_size == cols);
+    TORCH_CHECK((hidden_size % 8 == 0) && (hidden_size <= 6144));
 
     TORCH_CHECK(mu.numel() == rows);
     TORCH_CHECK(mu.sizes() == rsigma.sizes());
@@ -407,8 +418,9 @@ std::vector<at::Tensor> dropout_add_ln_prenorm_bwd(const at::Tensor &dz,     // 
     launch_params.params.dx1 = has_residual ? dx1.data_ptr() : nullptr;
     launch_params.params.rowscale = rowscale_.has_value() ? rowscale_.value().data_ptr() : nullptr;
 
-    // TODO: how to set template param for launcher
-    auto launcher = get_bwd_launcher(wtype, itype, rtype, otype, ctype, hidden_size);
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int multiple = hidden_size <= 1536 ? 256 : (hidden_size <= 3072 ? 512 : 1024);
+    auto launcher = get_bwd_launcher(wtype, itype, rtype, otype, ctype, round_multiple(hidden_size, multiple));
 
     launcher(launch_params, true, /*prenorm=*/true);
 
@@ -432,6 +444,7 @@ std::vector<at::Tensor> dropout_add_ln_prenorm_bwd(const at::Tensor &dz,     // 
     params.dbeta_part = dbeta_part.data_ptr();
     params.dgamma_part = dgamma_part.data_ptr();
     params.dropout_scale = 1.f / (1.f - dropout_p);
+    params.inverse_cols = 1.f / float(params.cols);
 
     if( launch_params.barrier_size > 0 ) {
         // TODO Any way to avoid this?

@@ -2,7 +2,6 @@
 import torch
 from torch.nn import init
 
-# from apex._autocast_utils import _cast_if_autocast_enabled
 import dropout_layer_norm
 
 
@@ -145,7 +144,7 @@ def dropout_add_layer_norm(x0, x1, weight, bias, dropout_p, epsilon, rowscale=No
 
 
 class DropoutAddLayerNorm(torch.nn.Module):
-    def __init__(self, hidden_size, prenorm=False, p=0.5, eps=1e-5, residual_in_fp32=False,
+    def __init__(self, hidden_size, prenorm=False, p=0.0, eps=1e-5, residual_in_fp32=False,
                  device=None, dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()

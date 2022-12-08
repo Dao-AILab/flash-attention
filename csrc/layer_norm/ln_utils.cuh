@@ -530,20 +530,20 @@ struct Reducer<T, 1, WARPS_M, WARPS_N> : public Reducer<T, 1, WARPS_M, 1> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
  
-template<typename T>
-inline __device__ void warp_chan_upd_dynamic(T &m_a, T &m2_a, T &n_a, int num_active){
+template<typename T, typename int_t>
+inline __device__ void warp_chan_upd_dynamic(T &m_a, T &m2_a, int_t &n_a, int num_active){
     //Assume at least leftmost is valid and init: step = next_pow2(num_active) / 2 (might get NaN otherwise)
-    int highest_bit_set = (8 * sizeof(num_active)) - __clz(num_active - 1);
+    const int highest_bit_set = (8 * sizeof(num_active)) - __clz(num_active - 1);
     
     #pragma unroll
     for( int step = (1 << (highest_bit_set - 1)); step > 0; step /= 2 ) {
         // Exchange
-        T n_b = warp_shuffle_down(n_a, step);
+        int_t n_b = warp_shuffle_down(n_a, step);
         T m_b = warp_shuffle_down(m_a, step);
         T m2_b = warp_shuffle_down(m2_a, step);
 
         // Update
-        const T n_ab = n_a + n_b; // We can handle one of them being 0, not both.
+        const int_t n_ab = n_a + n_b; // We can handle one of them being 0, not both.
         const T rn_ab = 1.f / n_ab; // Might have different n per thread, otherwise this would simplify :(
         const T delta = m_a - m_b;
         const float m2_ab = m2_a + m2_b + delta * delta * n_a * n_b * rn_ab;
@@ -647,23 +647,26 @@ struct Stats<T, 1, WARPS_M, WARPS_N> {
         smem1_ = smem0_ + WARPS_M * WARPS_N;
     }
 
-    template<uint32_t N>
-    inline __device__ stats_t compute(const T (&elts)[N], const T rn) {
+    template<bool Is_even_cols, uint32_t N, typename function_t>
+    inline __device__ stats_t compute(const T (&elts)[N], const T row_norm_factor,
+                                      function_t valid_elts_in_warp_fn, const int num_valid_elts = N) {
         stats_t * smem = use0_ ? smem0_ : smem1_;
         use0_ = !use0_;
         // Compute warp local for all WARPS_N
-        constexpr T warp_rn = 1.f / T(N * THREADS_PER_WARP);
-        stats_t warp_stats = warp_stats_.compute(elts, warp_rn);
+        const auto warp_n = warp_stats_.reducer_.warp_n_;
+        const T warp_norm_factor = 1.f / T(Is_even_cols ? N * THREADS_PER_WARP : valid_elts_in_warp_fn(warp_n));
+        stats_t warp_stats = warp_stats_.template compute<Is_even_cols>(
+            elts, warp_norm_factor, valid_elts_in_warp_fn, num_valid_elts
+        );
 
         //Each warp warp leader stores its stats
-        const auto warp_n = warp_stats_.reducer_.warp_n_;
         const auto lane = warp_stats_.reducer_.lane_;
         if( lane == 0 ) {
             smem[warp_n] = warp_stats;
         }
         __syncthreads();
 
-        T n = Zeros<T>::get();
+        int n = 0;;
         T m = Zeros<T>::get();
         T m2 = Zeros<T>::get();
 
@@ -671,7 +674,7 @@ struct Stats<T, 1, WARPS_M, WARPS_N> {
         static_assert(WARPS_N <= 32);
         if(lane < WARPS_N){
             stats_t result = smem[lane];
-            n = N * THREADS_PER_WARP;
+            n = Is_even_cols ? N * THREADS_PER_WARP : valid_elts_in_warp_fn(lane);
             m = layer_norm::Get<0>::of<stats_t, T>(result);
             m2 = layer_norm::Get<1>::of<stats_t, T>(result);
         }
@@ -703,23 +706,29 @@ struct Stats<T, 1, WARPS_M, 1> {
     {
     }
 
-    template<uint32_t N>
-    inline __device__ stats_t compute(const T (&elts)[N], const T rn) {
+    template<bool Is_even_cols, uint32_t N, typename function_t>
+    inline __device__ stats_t compute(const T (&elts)[N], const T row_norm_factor,
+                                      // const int valid_elts_in_warp_ignored_, const int num_valid_elts = N) {
+                                      function_t valid_elts_in_warp_fn, const int num_valid_elts = N) {
 
         auto sum = Sum<T>();
 
         T m = Zeros<T>::get();
         #pragma unroll
         for( int it = 0; it < N; it++ ) {
-            m += elts[it];
+            if (Is_even_cols || (it < num_valid_elts)) {
+                m += elts[it];
+            }
         }
-        m = reducer_.allreduce(m, sum) * rn;
+        m = reducer_.allreduce(m, sum) * row_norm_factor;
 
         T m2 = Zeros<T>::get();
         #pragma unroll
         for( int it = 0; it < N; it++ ) {
-            T diff = (elts[it] - m);
-            m2 += diff * diff;
+            if (Is_even_cols || (it < num_valid_elts)) {
+                T diff = (elts[it] - m);
+                m2 += diff * diff;
+            }
         }
         m2 = reducer_.allreduce(m2, sum);
 

@@ -64,6 +64,8 @@ struct ParamsBase {
     void *gamma;
     void *rowscale;
 
+    float inverse_cols;
+
     float dropout_keep_p;
     float dropout_scale;
 
