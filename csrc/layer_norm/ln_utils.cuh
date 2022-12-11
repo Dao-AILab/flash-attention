@@ -45,7 +45,7 @@ inline void check_cuda_(cudaError_t status, const char *file, int line) {
 #define REGISTER_BWD_LAUNCHER(                                                                                                                  \
     HIDDEN_SIZE, WTYPE, ITYPE, RTYPE, OTYPE, CTYPE, CTAS_PER_ROW, WARPS_M, WARPS_N, BYTES_PER_LDG, BYTES_PER_LDG_FINALIZE)                      \
     void ln_bwd_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##RTYPE##_##OTYPE##_##CTYPE(LaunchParams<BwdParams> &launch_params,                         \
-                                                                                const bool configure_params, const bool prenorm) {              \
+                                                                                const bool configure_params) {                                  \
         launch_<WTYPE,                                                                                                                          \
                 ITYPE,                                                                                                                          \
                 RTYPE,                                                                                                                          \
@@ -57,7 +57,7 @@ inline void check_cuda_(cudaError_t status, const char *file, int line) {
                 WARPS_M,                                                                                                                        \
                 WARPS_N,                                                                                                                        \
                 BYTES_PER_LDG,                                                                                                                  \
-                BYTES_PER_LDG_FINALIZE>(launch_params, configure_params, prenorm);                                                              \
+                BYTES_PER_LDG_FINALIZE>(launch_params, configure_params);                                                                       \
     }                                                                                                                                           \
     static BwdRegistrar<WTYPE, ITYPE, RTYPE, OTYPE, CTYPE, HIDDEN_SIZE> reg_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##RTYPE##_##OTYPE##_##CTYPE(    \
         ln_bwd_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##RTYPE##_##OTYPE##_##CTYPE)

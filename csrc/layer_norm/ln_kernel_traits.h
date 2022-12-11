@@ -38,6 +38,7 @@ template<
     typename output_t_,
     typename compute_t_,
     typename index_t_,
+    bool Has_colscale,
     uint32_t THREADS_PER_CTA_,
     uint32_t BYTES_PER_LDG_,
     typename Base = Kernel_traits_base<HIDDEN_SIZE_,
@@ -69,7 +70,8 @@ struct Kernel_traits_finalize : public Base {
     // Shared memory size to coalsece the CTA result.
     enum { SMEM_BYTES_OUTPUT = Base::THREADS_PER_WARP * BYTES_PER_LDG };
     // Shared memory requirement per CTA. 
-    enum { SMEM_BYTES_PER_CTA = 2 * SMEM_BYTES_TRANSPOSE + 2 * SMEM_BYTES_OUTPUT };
+    static constexpr int NUM_FACTORS = Has_colscale ? 3 : 2;
+    enum { SMEM_BYTES_PER_CTA = NUM_FACTORS * SMEM_BYTES_TRANSPOSE + NUM_FACTORS * SMEM_BYTES_OUTPUT };
 
     // The type of the reducer.
     using Reducer = layer_norm::Reducer<compute_t_, 1, 1, 1>;

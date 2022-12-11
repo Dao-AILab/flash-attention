@@ -16,7 +16,7 @@
 
 namespace layer_norm {
 
-template<typename Ktraits, bool Is_dropout, bool Has_residual, bool Is_even_cols>
+template<typename Ktraits, bool Is_dropout, bool Has_residual, bool Has_colscale, bool Is_even_cols>
 __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) 
 void ln_fwd_kernel(FwdParams params) {
 
@@ -46,7 +46,7 @@ void ln_fwd_kernel(FwdParams params) {
     using Stats = typename Ktraits::Stats;
     using stats_t = typename Stats::stats_t;
 
-    constexpr bool save_x = Has_residual || Is_dropout || !(std::is_same<input_t, residual_t>::value);
+    const bool save_x = Has_residual || Is_dropout || Has_colscale || (params.rowscale != nullptr) || !(std::is_same<input_t, residual_t>::value);
 
     extern __shared__ char smem_[];
 
@@ -80,12 +80,14 @@ void ln_fwd_kernel(FwdParams params) {
 
     Wvec gamma[LDGS];
     Wvec beta[LDGS];
+    Wvec colscale[LDGS];
     index_t idx = c;
     #pragma unroll
     for( int it = 0; it < LDGS; it++ ) {
         if (Is_even_cols || (it < num_valid_ldgs)) {
             gamma[it].load_from(params.gamma, idx);
             beta[it].load_from(params.beta, idx);
+            if (Has_colscale) { colscale[it].load_from(params.colscale, idx); }
             idx += VEC_COLS_PER_LDG;
         }
     }
@@ -109,13 +111,9 @@ void ln_fwd_kernel(FwdParams params) {
                     // the more efficient curand_uniform4.
                     mask_t keep = !Is_dropout ? true : curand_uniform(&state) <= params.dropout_keep_p;
                     compute_t x0_ij = compute_t(x0.data.elt[jt]) * rowscale_val;
-                    compute_t x_ij;
-                    if (Has_residual) {
-                        compute_t x1_ij = compute_t(x1.data.elt[jt]);
-                        x_ij = keep ? (Is_dropout ? x0_ij * params.dropout_scale : x0_ij) + x1_ij : x1_ij;
-                    } else  {
-                        x_ij = keep ? (Is_dropout ? x0_ij * params.dropout_scale : x0_ij) : 0.f;
-                    }
+                    x0_ij = keep ? (Is_dropout ? x0_ij * params.dropout_scale : x0_ij) : 0.0f;
+                    if (Has_colscale) { x0_ij *= compute_t(colscale[it].data.elt[jt]); }
+                    compute_t x_ij = Has_residual ? x0_ij + compute_t(x1.data.elt[jt]) : x0_ij;
                     if (save_x) { x.data.elt[jt] = x_ij; }
                     xf[it * NUM_ELTS + jt] = x_ij;
                     if (Is_dropout) { dmask.data.elt[jt] = keep; }
@@ -130,8 +128,8 @@ void ln_fwd_kernel(FwdParams params) {
         const index_t num_vecs = params.cols / Ktraits::ELTS_PER_LDG;
         const index_t num_full_ldgs = num_vecs / Ktraits::VEC_COLS_PER_LDG;
         const index_t remaining_vecs = num_vecs % Ktraits::VEC_COLS_PER_LDG;
-        // Need to convert to int, otherwise the subtraction will wrap around.
         auto valid_elts_in_warp_fn = [num_full_ldgs, remaining_vecs] (int warp_n) -> int {
+            // Need to convert to int, otherwise the subtraction will wrap around.
             const index_t valid_partial_vecs_in_warp =
                 std::min(std::max(int(remaining_vecs) - int(warp_n * THREADS_PER_WARP), int(0)),
                         int(THREADS_PER_WARP));
@@ -206,45 +204,48 @@ void launch_(LaunchParams<FwdParams> &launch_params, const bool configure_params
                                         BYTES_PER_LDG
                                         >;
     bool has_residual = launch_params.params.x1 != nullptr;
+    bool has_colscale = launch_params.params.colscale != nullptr;
     bool is_even_cols = launch_params.params.cols == HIDDEN_SIZE;
     BOOL_SWITCH(launch_params.params.dropout_keep_p < 1.f, IsDropoutConst, [&] {
         BOOL_SWITCH(has_residual, HasResidualConst, [&] {
-            BOOL_SWITCH(is_even_cols, IsEvenColsConst, [&] {
-                auto kernel = &ln_fwd_kernel<Kernel_traits, IsDropoutConst, HasResidualConst, IsEvenColsConst>;
-                if( configure_params ) {
-                    int ctas_per_sm;
-                    CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                        &ctas_per_sm, kernel, Kernel_traits::THREADS_PER_CTA, Kernel_traits::SMEM_BYTES_FWD));
-                    launch_params.params.ctas_per_col = launch_params.props->multiProcessorCount * ctas_per_sm / Kernel_traits::CTAS_PER_ROW;
-                    const size_t rows_per_loop = launch_params.params.ctas_per_col * Kernel_traits::ROWS_PER_CTA;
-                    launch_params.elts_per_thread = (launch_params.params.rows + rows_per_loop - 1) / rows_per_loop * Kernel_traits::LDGS * Kernel_traits::NUM_ELTS;
-                    launch_params.barrier_size = 0;
-                    launch_params.workspace_bytes = 0;
-                    if(Kernel_traits::CTAS_PER_ROW > 1) {
-                        launch_params.barrier_size = 2 * launch_params.params.ctas_per_col;
-                        launch_params.workspace_bytes = launch_params.params.ctas_per_col
-                                                      * Kernel_traits::WARPS_M
-                                                      * Kernel_traits::CTAS_PER_ROW
-                                                      * sizeof(typename Kernel_traits::Stats::stats_t)
-                                                      * 2;
+            BOOL_SWITCH(has_colscale, HasColscaleConst, [&] {
+                BOOL_SWITCH(is_even_cols, IsEvenColsConst, [&] {
+                    auto kernel = &ln_fwd_kernel<Kernel_traits, IsDropoutConst, HasResidualConst, HasColscaleConst, IsEvenColsConst>;
+                    if( configure_params ) {
+                        int ctas_per_sm;
+                        CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                            &ctas_per_sm, kernel, Kernel_traits::THREADS_PER_CTA, Kernel_traits::SMEM_BYTES_FWD));
+                        launch_params.params.ctas_per_col = launch_params.props->multiProcessorCount * ctas_per_sm / Kernel_traits::CTAS_PER_ROW;
+                        const size_t rows_per_loop = launch_params.params.ctas_per_col * Kernel_traits::ROWS_PER_CTA;
+                        launch_params.elts_per_thread = (launch_params.params.rows + rows_per_loop - 1) / rows_per_loop * Kernel_traits::LDGS * Kernel_traits::NUM_ELTS;
+                        launch_params.barrier_size = 0;
+                        launch_params.workspace_bytes = 0;
+                        if(Kernel_traits::CTAS_PER_ROW > 1) {
+                            launch_params.barrier_size = 2 * launch_params.params.ctas_per_col;
+                            launch_params.workspace_bytes = launch_params.params.ctas_per_col
+                                                          * Kernel_traits::WARPS_M
+                                                          * Kernel_traits::CTAS_PER_ROW
+                                                          * sizeof(typename Kernel_traits::Stats::stats_t)
+                                                          * 2;
+                        }
+                        return;
                     }
-                    return;
-                }
 
-                if( Kernel_traits::SMEM_BYTES_FWD >= 48 * 1024 ) {
-                    CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel_traits::SMEM_BYTES_FWD));
-                }
-                auto stream = launch_params.stream;
-                auto ctas_per_col = launch_params.params.ctas_per_col;
+                    if( Kernel_traits::SMEM_BYTES_FWD >= 48 * 1024 ) {
+                        CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel_traits::SMEM_BYTES_FWD));
+                    }
+                    auto stream = launch_params.stream;
+                    auto ctas_per_col = launch_params.params.ctas_per_col;
 
-                if( Kernel_traits::CTAS_PER_ROW == 1 ) {
-                    kernel<<<ctas_per_col, Kernel_traits::THREADS_PER_CTA, Kernel_traits::SMEM_BYTES_FWD, stream>>>(launch_params.params);
-                } else {
-                    dim3 grid(Kernel_traits::CTAS_PER_ROW * ctas_per_col);
-                    dim3 block(Kernel_traits::THREADS_PER_CTA);
-                    void *params_ = (void *)&launch_params.params;
-                    cudaLaunchCooperativeKernel((void *)kernel, grid, block, (void **)&params_, Kernel_traits::SMEM_BYTES_FWD, stream);
-                }
+                    if( Kernel_traits::CTAS_PER_ROW == 1 ) {
+                        kernel<<<ctas_per_col, Kernel_traits::THREADS_PER_CTA, Kernel_traits::SMEM_BYTES_FWD, stream>>>(launch_params.params);
+                    } else {
+                        dim3 grid(Kernel_traits::CTAS_PER_ROW * ctas_per_col);
+                        dim3 block(Kernel_traits::THREADS_PER_CTA);
+                        void *params_ = (void *)&launch_params.params;
+                        cudaLaunchCooperativeKernel((void *)kernel, grid, block, (void **)&params_, Kernel_traits::SMEM_BYTES_FWD, stream);
+                    }
+                });
             });
         });
     });

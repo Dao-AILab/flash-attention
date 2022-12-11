@@ -40,6 +40,8 @@ struct ParamsBase {
         , mu(nullptr)
         , rs(nullptr)
         , gamma(nullptr)
+        , rowscale(nullptr)
+        , colscale(nullptr)
         , dropout_keep_p(1.f)
         , dropout_scale(1.f)
         , workspace(nullptr)
@@ -63,6 +65,7 @@ struct ParamsBase {
     void *rs;
     void *gamma;
     void *rowscale;
+    void *colscale;
 
     float inverse_cols;
 
@@ -106,10 +109,12 @@ struct BwdParams : public ParamsBase {
         , dx(nullptr)
         , dbeta_part(nullptr)
         , dgamma_part(nullptr)
+        , dcolscale_part(nullptr)
         , dx0(nullptr)
         , dx1(nullptr)
         , dbeta(nullptr)
         , dgamma(nullptr)
+        , dcolscale(nullptr)
     {
     }
 
@@ -121,6 +126,7 @@ struct BwdParams : public ParamsBase {
     // Workspace for Wgrad pre-reduction.
     void *dbeta_part;
     void *dgamma_part;
+    void *dcolscale_part;
 
     // Output: Dgrad.
     void *dx0;
@@ -128,13 +134,14 @@ struct BwdParams : public ParamsBase {
     // Output: Wgrad.
     void *dbeta;
     void *dgamma;
+    void *dcolscale;
 
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 using FwdFunction = std::function<void(LaunchParams<FwdParams>&, const bool)>;
-using BwdFunction = std::function<void(LaunchParams<BwdParams>&, const bool, const bool)>;
+using BwdFunction = std::function<void(LaunchParams<BwdParams>&, const bool)>;
 using FunctionKey = uint64_t;
 using FwdRegistry = std::unordered_map<FunctionKey, FwdFunction>;
 using BwdRegistry = std::unordered_map<FunctionKey, BwdFunction>;
