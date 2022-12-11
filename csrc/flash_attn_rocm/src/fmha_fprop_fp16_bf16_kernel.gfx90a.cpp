@@ -24,16 +24,27 @@ struct SimpleDeviceMem
     void* p_mem_;
 };
 
+
 void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) {
 
     //TODO : Find out and choose proper instances parameters for different problem sizes
     using FP16 = ck::half_t;
     using BF16 = ck::bhalf_t;
 
-    using InputDataType = FP16;
+    using InputDataType = BF16;
 
-    //if(launch_params.params.is_bf16)
-    //    using InputDataType = BF16;
+    //std::cout << "launch_params.params.is_bf16 " << launch_params.params.is_bf16 <<std::endl;
+
+    if(launch_params.params.is_bf16)
+        using InputDataType = BF16;
+
+    //if (std::is_same_v<InputDataType, ck::bhalf_t>) {
+	//	std::cout << "bf16 type" << std::endl;
+    //}
+    //else{
+    //    std::cout << "fp16 type" << std::endl;
+    //}
+
 
     using F32 = float;
 

@@ -41,11 +41,11 @@ void set_params_fprop(FMHA_fprop_params &params,
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
 
     // S = softmax(P)
-    params.s_ptr = s_d;
-    params.s_stride_in_bytes = get_size_in_bytes(b * h * seqlen_k, data_type);
+    // params.s_ptr = s_d;
+    // params.s_stride_in_bytes = get_size_in_bytes(b * h * seqlen_k, data_type);
 
     // Softmax sum
-    params.softmax_lse_ptr = softmax_lse_d;
+    // params.softmax_lse_ptr = softmax_lse_d;
 
     // Set the dimensions.
     params.b = b;
@@ -85,10 +85,12 @@ void set_params_fprop(FMHA_fprop_params &params,
     for (int i = 0; i < b; i++){
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
-        params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr   + i*temp_seqlen_q * params.h * params.d * 2));
-        params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr   + i*temp_seqlen_k * params.h * params.d * 2));
-        params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr   + i*temp_seqlen_q * params.h * params.d * 2));
-        params.o_ptr.push_back(reinterpret_cast<void*>(out_ptr + i*temp_seqlen_q * params.h * params.d * 2));
+        int temp_q_stride = get_size_in_bytes(i * d * h * temp_seqlen_q, data_type);
+        int temp_k_stride = get_size_in_bytes(i * d * h * temp_seqlen_k, data_type);
+        params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr   + temp_q_stride));
+        params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr   + temp_k_stride));
+        params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr   + temp_q_stride));
+        params.o_ptr.push_back(reinterpret_cast<void*>(out_ptr + temp_q_stride));
     }
 
     // Set the different scale values.
@@ -267,16 +269,16 @@ int main(){
     int d = n / nheads; //head_size//64
 
     //initialize the tensors
-    at::Tensor q_host = at::rand({batch_size*seqlen, nheads, d}, at::kHalf);
-    at::Tensor k_host = at::rand({batch_size*seqlen, nheads, d}, at::kHalf);
-    at::Tensor v_host = at::rand({batch_size*seqlen, nheads, d}, at::kHalf);
+    at::Tensor q_host = at::rand({batch_size*seqlen, nheads, d}, torch::kBFloat16);//torch::kBFloat16
+    at::Tensor k_host = at::rand({batch_size*seqlen, nheads, d}, torch::kBFloat16);
+    at::Tensor v_host = at::rand({batch_size*seqlen, nheads, d}, torch::kBFloat16);
 
     at::Tensor q = q_host.to(at::kCUDA);
     at::Tensor k = k_host.to(at::kCUDA);
     at::Tensor v = v_host.to(at::kCUDA);
 
     //initialize the output tensor
-    at::Tensor out_host = at::zeros({batch_size*seqlen, nheads, d},at::kHalf);
+    at::Tensor out_host = at::zeros({batch_size*seqlen, nheads, d},torch::kBFloat16);
     at::Tensor out = out_host.to(at::kCUDA);
 
     //initialize seqlens vector (size is b+1)
@@ -321,17 +323,18 @@ int main(){
             c10::optional<at::Generator> gen_*/);
 
 
-    using F16 = ck::half_t;
+    using FP16 = ck::half_t;
+    using BF16 = ck::bhalf_t;
     using F32 = float;
 
     using PassThrough = ck::tensor_operation::element_wise::PassThrough;
 
-    using ADataType        = F16;
-    using B0DataType       = F16;
-    using B1DataType       = F16;
+    using ADataType        = BF16;
+    using B0DataType       = BF16;
+    using B1DataType       = BF16;
     using AccDataType      = F32;
     using CShuffleDataType = F32;
-    using CDataType        = F16;
+    using CDataType        = BF16;
     using Acc0BiasDataType = ck::Tuple<>;
     using Acc1BiasDataType = ck::Tuple<>;
 
