@@ -54,16 +54,41 @@ void set_params_fprop(FMHA_fprop_params &params,
     params.seqlen_k = seqlen_k;
     params.d = d;
 
+    params.host_seqlens_q = (int*)malloc((params.b+1)*sizeof(int));
+    params.host_seqlens_k = (int*)malloc((params.b+1)*sizeof(int));
+    FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_q, params.cu_seqlens_q, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
+    FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_k, params.cu_seqlens_k, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
+
     at::Tensor q_ = q.view({params.b, params.seqlen_q , params.h , params.d});
     at::Tensor k_ = k.view({params.b, params.seqlen_k , params.h , params.d});
     at::Tensor v_ = v.view({params.b, params.seqlen_q , params.h , params.d});
     out = out.view({params.b, params.seqlen_q , params.h , params.d});
 
+    char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
+    char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
+    char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
+    char* out_ptr = reinterpret_cast<char*>(out.data_ptr());
+
+    //std::cout << "multiply" << params.seqlen_q * params.h * params.d<< std::endl;
+
+    //std::cout << " q.data_ptr() " << q.data_ptr() << std::endl;
+    //std::cout << " q_.data_ptr() " << q_.data_ptr() << std::endl;
+    //std::cout << " q_[0].data_ptr() " << q_[0].data_ptr() << std::endl;
+    //std::cout << " q_[1].data_ptr() " << q_[1].data_ptr() << std::endl;
+    //std::cout << " new q[1] " << reinterpret_cast<void*>(q_ptr + params.seqlen_q * params.h * params.d * 2) << std::endl;
+    //std::cout << " q_[0][0][0][0].data_ptr() " << q_[0][0][0][0].data_ptr() << std::endl;
+    //std::cout << " q_[0][0][0][1].data_ptr() " << q_[0][0][0][1].data_ptr() << std::endl;
+    //std::cout << " q_[0][0][1][0].data_ptr() " << q_[0][0][1][0].data_ptr() << std::endl;
+    //std::cout << " q_[0][1][0][0].data_ptr() " << q_[0][1][0][0].data_ptr() << std::endl;
+    //std::cout << " q_[1][0][0][0].data_ptr() " << q_[1][0][0][0].data_ptr() << std::endl;
+
     for (int i = 0; i < b; i++){
-        params.q_ptr.push_back(q_[i].data_ptr());
-        params.k_ptr.push_back(k_[i].data_ptr());
-        params.v_ptr.push_back(v_[i].data_ptr());
-        params.o_ptr.push_back(out[i].data_ptr());
+        int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
+        int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
+        params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr   + i*temp_seqlen_q * params.h * params.d * 2));
+        params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr   + i*temp_seqlen_k * params.h * params.d * 2));
+        params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr   + i*temp_seqlen_q * params.h * params.d * 2));
+        params.o_ptr.push_back(reinterpret_cast<void*>(out_ptr + i*temp_seqlen_q * params.h * params.d * 2));
     }
 
     // Set the different scale values.
@@ -218,6 +243,7 @@ mha_fwd(const at::Tensor &q,
     return result;
 }
 
+
 /*
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "Fused Multi-head Self-attention";
@@ -227,3 +253,299 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bwd_block", &mha_bwd_block, "Backward pass (blocksparse)");
 }
 */
+
+
+//main function to test with the API
+int main(){
+
+    bool do_verification = true; // whether do verification
+
+    int batch_size = 64;
+    int nheads = 16;
+    int seqlen = 256;
+    int n = 1024;
+    int d = n / nheads; //head_size//64
+
+    //initialize the tensors
+    at::Tensor q_host = at::rand({batch_size*seqlen, nheads, d}, at::kHalf);
+    at::Tensor k_host = at::rand({batch_size*seqlen, nheads, d}, at::kHalf);
+    at::Tensor v_host = at::rand({batch_size*seqlen, nheads, d}, at::kHalf);
+
+    at::Tensor q = q_host.to(at::kCUDA);
+    at::Tensor k = k_host.to(at::kCUDA);
+    at::Tensor v = v_host.to(at::kCUDA);
+
+    //initialize the output tensor
+    at::Tensor out_host = at::zeros({batch_size*seqlen, nheads, d},at::kHalf);
+    at::Tensor out = out_host.to(at::kCUDA);
+
+    //initialize seqlens vector (size is b+1)
+    std::vector<int> cu_seqlens_q_vec;
+    std::vector<int> cu_seqlens_k_vec;
+
+    for (int i = 0 ; i < batch_size + 1; i++){
+      cu_seqlens_q_vec.push_back(i * seqlen);
+      cu_seqlens_k_vec.push_back(i * seqlen);
+    }
+
+    at::TensorOptions opts=at::TensorOptions().dtype(at::kInt);
+    at::Tensor cu_seqlens_q=at::from_blob(cu_seqlens_q_vec.data(),{batch_size + 1},opts).clone().to(at::kCUDA);
+    at::Tensor cu_seqlens_k=at::from_blob(cu_seqlens_k_vec.data(),{batch_size + 1},opts).clone().to(at::kCUDA);
+
+    int max_seqlen_q_ = 256;
+    int max_seqlen_k_ = 256;
+    
+    //other parameters
+    float p_dropout = 0;           
+    float softmax_scale = 0.125;  
+    bool zero_tensors = false;    
+    bool is_causal = false;       
+    bool return_softmax = false;  
+    int num_splits = 0;           
+
+    auto result = 
+    mha_fwd(q,   
+            k,   
+            v,   
+            out, 
+            cu_seqlens_q, 
+            cu_seqlens_k, 
+            max_seqlen_q_,
+            max_seqlen_k_,
+            p_dropout,
+            softmax_scale,
+            zero_tensors,
+            is_causal,
+            return_softmax,
+            num_splits/*,
+            c10::optional<at::Generator> gen_*/);
+
+
+    using F16 = ck::half_t;
+    using F32 = float;
+
+    using PassThrough = ck::tensor_operation::element_wise::PassThrough;
+
+    using ADataType        = F16;
+    using B0DataType       = F16;
+    using B1DataType       = F16;
+    using AccDataType      = F32;
+    using CShuffleDataType = F32;
+    using CDataType        = F16;
+    using Acc0BiasDataType = ck::Tuple<>;
+    using Acc1BiasDataType = ck::Tuple<>;
+
+    static constexpr ck::index_t NumDimG = 2;
+    static constexpr ck::index_t NumDimM = 1;
+    static constexpr ck::index_t NumDimN = 1;
+    static constexpr ck::index_t NumDimK = 1;
+    static constexpr ck::index_t NumDimO = 1;
+
+    using AElementOp    = PassThrough;
+    using B0ElementOp   = PassThrough;
+    using Acc0ElementOp = ck::tensor_operation::element_wise::Scale;
+    using B1ElementOp   = PassThrough;
+    using CElementOp    = PassThrough;
+
+    // Ref Gemm0: fp16 in, fp32 out
+    using ReferenceGemm0Instance = ck::tensor_operation::host::ReferenceBatchedGemm<ADataType,
+                                                                                    B0DataType,
+                                                                                    AccDataType,
+                                                                                    AccDataType,
+                                                                                    AElementOp,
+                                                                                    B0ElementOp,
+                                                                                    Acc0ElementOp>;
+
+    // Ref Softmax: fp32 in, fp16 out
+    using ReferenceSoftmaxInstance =
+        ck::tensor_operation::host::ReferenceSoftmax<AccDataType, ADataType, AccDataType>;
+
+    // Ref Gemm1: fp16 in, fp16 out
+    using ReferenceGemm1Instance = ck::tensor_operation::host::ReferenceBatchedGemm<ADataType,
+                                                                                    B1DataType,
+                                                                                    CDataType,
+                                                                                    AccDataType,
+                                                                                    AElementOp,
+                                                                                    B1ElementOp,
+                                                                                    CElementOp>;
+
+    
+
+    bool pass = true;
+    if(do_verification)
+    {
+        q_host = q_host.view({ batch_size, seqlen, nheads, d }); //64 256 16 64
+        k_host = k_host.view({ batch_size, seqlen, nheads, d });
+        v_host = v_host.view({ batch_size, seqlen, nheads, d });
+
+        const int M   = seqlen;   //seqlen Q
+        const int N   = seqlen;   //seqlen K
+        const int K   = d;        //head_dim
+        const int O   = d;        //head_dim
+        const int G0  = 1;        // G0 = batch_size
+        const int G1  = nheads;   // num_heads
+
+        std::vector<Tensor<ADataType>>  a_tensors;
+        std::vector<Tensor<B0DataType>> b0_tensors;
+        std::vector<Tensor<B1DataType>> b1_tensors;
+        std::vector<Tensor<CDataType>>  c_tensors;
+
+        auto a_element_op    = AElementOp{};
+        auto b0_element_op   = B0ElementOp{};
+        auto acc0_element_op = Acc0ElementOp{softmax_scale};
+        auto b1_element_op   = B1ElementOp{};
+        auto c_element_op    = CElementOp{};
+
+        for(std::size_t i = 0; i < batch_size; i++)
+        {
+
+            std::vector<ck::index_t> a_gs_ms_ks_lengths{G0, G1, M, K};
+            std::vector<ck::index_t> a_gs_ms_ks_strides ={M * G1 * K, K, G1 * K, 1};
+
+            std::vector<ck::index_t> b0_gs_ns_ks_lengths{G0, G1, N, K};
+            std::vector<ck::index_t> b0_gs_ns_ks_strides ={N * G1 * K, K, G1 * K, 1};
+
+            std::vector<ck::index_t> b1_gs_os_ns_lengths{G0, G1, O, N};
+            std::vector<ck::index_t> b1_gs_os_ns_strides ={N * G1 * O, O, 1, G1 * O};
+
+            std::vector<ck::index_t> c_gs_ms_os_lengths{G0, G1, M, O};
+            std::vector<ck::index_t> c_gs_ms_os_strides ={M * G1 * O, O, G1 * O, 1};
+
+            // C_m_o = A_m_k * B0_k_n * B1_n_o
+            Tensor<ADataType> a_gs_ms_ks(a_gs_ms_ks_lengths, a_gs_ms_ks_strides);
+            Tensor<B0DataType> b0_gs_ns_ks(b0_gs_ns_ks_lengths, b0_gs_ns_ks_strides);
+            Tensor<B1DataType> b1_gs_os_ns(b1_gs_os_ns_lengths, b1_gs_os_ns_strides);
+            Tensor<CDataType> c_gs_ms_os_device_result(c_gs_ms_os_lengths, c_gs_ms_os_strides);
+
+            void* q_h_ptr_f = q_host[i].data_ptr();
+            void* k_h_ptr_f = k_host[i].data_ptr();
+            void* v_h_ptr_f = v_host[i].data_ptr();
+
+            ck::half_t* q_h_ptr = reinterpret_cast<ck::half_t*>(q_h_ptr_f);
+            ck::half_t* k_h_ptr = reinterpret_cast<ck::half_t*>(k_h_ptr_f);
+            ck::half_t* v_h_ptr = reinterpret_cast<ck::half_t*>(v_h_ptr_f);
+
+            //std::cout << "q_host[i].numel() " << q_host[i].numel() << std::endl;
+
+            std::vector<ck::half_t> a_vector(q_h_ptr, q_h_ptr + q_host[i].numel()); //transfer tensor into vector
+            a_gs_ms_ks.mData.assign(a_vector.begin(), a_vector.end());
+
+            std::vector<ck::half_t> b0_vector(k_h_ptr, k_h_ptr + k_host[i].numel()); //transfer tensor into vector
+            b0_gs_ns_ks.mData.assign(b0_vector.begin(), b0_vector.end());
+            
+            std::vector<ck::half_t> b1_vector(v_h_ptr, v_h_ptr + v_host[i].numel()); //transfer tensor into vector
+            b1_gs_os_ns.mData.assign(b1_vector.begin(), b1_vector.end());
+
+            a_tensors.push_back(a_gs_ms_ks);
+            b0_tensors.push_back(b0_gs_ns_ks);
+            b1_tensors.push_back(b1_gs_os_ns);
+            c_tensors.push_back(c_gs_ms_os_device_result);
+
+        }
+
+        for(std::size_t i = 0; i < batch_size; i++)
+        {
+            const auto& a_gs_ms_ks         = a_tensors[i];
+            const auto& b0_gs_ns_ks        = b0_tensors[i];
+            const auto& b1_gs_os_ns        = b1_tensors[i];
+            auto& c_gs_ms_os_device_result = c_tensors[i];
+            //auto& c_gs_ms_os_device_buf    = *c_tensors_device[i];
+
+            at::Tensor out_host_result = out.to(torch::kCPU).view({batch_size, seqlen, nheads, d});
+            void* out_host_ptr_f = out_host_result[i].data_ptr();
+            ck::half_t* out_host_ptr = reinterpret_cast<ck::half_t*>(out_host_ptr_f);
+            std::vector<ck::half_t> result_vector(out_host_ptr, out_host_ptr + out_host_result[i].numel()); //transfer tensor into vector
+            c_gs_ms_os_device_result.mData.assign(result_vector.begin(), result_vector.end());
+
+            //c_gs_ms_os_device_buf.FromDevice(c_gs_ms_os_device_result.mData.data());//
+
+            Tensor<ADataType> a_g_m_k({G0 * G1, M, K});
+            Tensor<B0DataType> b0_g_k_n({G0 * G1, K, N});
+            Tensor<B1DataType> b1_g_n_o({G0 * G1, N, O});
+            Tensor<AccDataType> acc0_g_m_n({G0 * G1, M, N});        // scratch object after gemm0
+            Tensor<ADataType> a1_g_m_n({G0 * G1, M, N});            // scratch object after softmax
+            Tensor<CDataType> c_g_m_o_host_result({G0 * G1, M, O}); // scratch object after gemm1
+
+            std::vector<ck::index_t> c_gs_ms_os_lengths{G0, G1, M, O};
+            std::vector<ck::index_t> c_gs_ms_os_strides{M * G1 * O, O, G1 * O, 1};
+            //    output_permute
+            //        ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1} // C layout [G0, M, G1, O]
+            //        : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // C layout [G0, G1, M, O]
+
+            Tensor<CDataType> c_gs_ms_os_host_result(c_gs_ms_os_lengths, c_gs_ms_os_strides);
+
+            // permute
+            a_gs_ms_ks.ForEach([&](auto& self, auto idx) {
+                a_g_m_k(idx[0] * G1 + idx[1], idx[2], idx[3]) = self(idx);
+            });
+            b0_gs_ns_ks.ForEach([&](auto& self, auto idx) {
+                b0_g_k_n(idx[0] * G1 + idx[1], idx[3], idx[2]) = self(idx);
+            });
+            b1_gs_os_ns.ForEach([&](auto& self, auto idx) {
+                b1_g_n_o(idx[0] * G1 + idx[1], idx[3], idx[2]) = self(idx);
+            });
+
+            // gemm 0
+            auto ref_gemm0          = ReferenceGemm0Instance{};
+            auto ref_gemm0_invoker  = ref_gemm0.MakeInvoker();
+            auto ref_gemm0_argument = ref_gemm0.MakeArgument(
+                a_g_m_k, b0_g_k_n, acc0_g_m_n, a_element_op, b0_element_op, acc0_element_op);
+
+            ref_gemm0_invoker.Run(ref_gemm0_argument);
+
+            //// masking
+            //const auto mask = DeviceGemmInstance::C0MatrixMask(N);
+            //acc0_g_m_n.ForEach([&](auto& self, auto idx) {
+            //    if(mask.IsMaskedElement(idx[1], idx[2]))
+            //        self(idx) = -ck::NumericLimits<float>::Infinity();
+            //});
+
+            // softmax
+            auto ref_softmax          = ReferenceSoftmaxInstance{};
+            auto ref_softmax_invoker  = ref_softmax.MakeInvoker();
+            auto ref_softmax_argument = ref_softmax.MakeArgument(acc0_g_m_n, a1_g_m_n, 1, 0, {2});
+
+            ref_softmax_invoker.Run(ref_softmax_argument);
+
+            // gemm 1
+            auto ref_gemm1          = ReferenceGemm1Instance{};
+            auto ref_gemm1_invoker  = ref_gemm1.MakeInvoker();
+            auto ref_gemm1_argument = ref_gemm1.MakeArgument(a1_g_m_n,
+                                                             b1_g_n_o,
+                                                             c_g_m_o_host_result,
+                                                             PassThrough{},
+                                                             b1_element_op,
+                                                             c_element_op);
+
+            ref_gemm1_invoker.Run(ref_gemm1_argument);
+
+            // permute
+            c_gs_ms_os_host_result.ForEach([&](auto& self, auto idx) {
+                const size_t& g0 = idx[0];
+                const size_t& g1 = idx[1];
+
+                const size_t g = g0 * G1 + g1;
+
+                self(idx) = c_g_m_o_host_result(g, idx[2], idx[3]);
+            });
+
+            double rtol = 1e-2;
+            double atol = 1e-2;
+
+            bool pass_ =
+                ck::utils::check_err(c_gs_ms_os_device_result.mData, c_gs_ms_os_host_result.mData, "Error: Incorrect results!",
+                                    rtol,
+                                    atol);
+            pass &= pass_;
+        }
+
+        if(pass)
+        std::cout << "Verification passed!" <<std::endl;
+        else
+        std::cout << "Verification failed!" <<std::endl;
+    }
+
+    return pass ? 0 : 1;
+
+
+}

@@ -162,16 +162,16 @@ void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) 
     int num_heads = launch_params.params.h;
     int head_dim = launch_params.params.d;
 
-    int* host_seqlens_q;
-    int* host_seqlens_k;
-    host_seqlens_q = (int*)malloc((launch_params.params.b+1)*sizeof(int));
-    host_seqlens_k = (int*)malloc((launch_params.params.b+1)*sizeof(int));
-    FMHA_CHECK_HIP(hipMemcpy(host_seqlens_q, launch_params.params.cu_seqlens_q, (launch_params.params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
-    FMHA_CHECK_HIP(hipMemcpy(host_seqlens_k, launch_params.params.cu_seqlens_k, (launch_params.params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
+    //int* host_seqlens_q;
+    //int* host_seqlens_k;
+    //host_seqlens_q = (int*)malloc((launch_params.params.b+1)*sizeof(int));
+    //host_seqlens_k = (int*)malloc((launch_params.params.b+1)*sizeof(int));
+    //FMHA_CHECK_HIP(hipMemcpy(host_seqlens_q, launch_params.params.cu_seqlens_q, (launch_params.params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
+    //FMHA_CHECK_HIP(hipMemcpy(host_seqlens_k, launch_params.params.cu_seqlens_k, (launch_params.params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
 
     for(size_t i = 0; i < batch_size ; i++){
-        int M     = host_seqlens_q[i + 1] - host_seqlens_q[i]; //seqlen Q
-        int N     = host_seqlens_k[i + 1] - host_seqlens_k[i]; //seqlen K
+        int M     = launch_params.params.host_seqlens_q[i + 1] - launch_params.params.host_seqlens_q[i]; //seqlen Q
+        int N     = launch_params.params.host_seqlens_k[i + 1] - launch_params.params.host_seqlens_k[i]; //seqlen K
         int K     = head_dim;
         int O     = head_dim;
         int G0 = 1; // G0 = batch_size
