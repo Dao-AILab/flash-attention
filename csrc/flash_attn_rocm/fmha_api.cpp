@@ -97,7 +97,7 @@ void set_params_fprop(FMHA_fprop_params &params,
         int temp_k_stride = get_size_in_bytes(i * d * h * temp_seqlen_k, data_type);
         params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr   + temp_q_stride));
         params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr   + temp_k_stride));
-        params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr   + temp_q_stride));
+        params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr   + temp_k_stride));
         params.o_ptr.push_back(reinterpret_cast<void*>(out_ptr + temp_q_stride));
     }
 

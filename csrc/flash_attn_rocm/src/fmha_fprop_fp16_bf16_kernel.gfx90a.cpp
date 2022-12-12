@@ -9,10 +9,6 @@
 template <ck::index_t... Is>
 using S = ck::Sequence<Is...>;
 
-using FP16 = ck::half_t;
-using BF16 = ck::bhalf_t;
-
-
 struct SimpleDeviceMem
 {
     SimpleDeviceMem() = delete;
@@ -29,7 +25,9 @@ struct SimpleDeviceMem
     void* p_mem_;
 };
 
-template<typename InputType>
+template<typename InputType, 
+         ck::index_t MPerBlock, ck::index_t NPerBlock, ck::index_t KPerBlock, ck::index_t Gemm1NPerBlock,
+         ck::index_t MPerXDL, ck::index_t NPerXDL, ck::index_t NXdlPerWave, ck::index_t Gemm1NXdlPerWave>
 void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_params){
     
     using F32 = float;
@@ -94,20 +92,20 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
             TensorSpecC,
             1,
             256,
-            128,         // MPerBlock
-            128,         // NPerBlock
-            32,          // KPerBlock
-            64,          // Gemm1NPerBlock
-            32,          // Gemm1KPerBlock
-            8,           // AK1
-            8,           // BK1
-            2,           // B1K1
-            32,          // MPerXDL
-            32,          // NPerXDL
-            1,           // MXdlPerWave
-            4,           // NXdlPerWave
-            2,           // Gemm1NXdlPerWave
-            S<4, 64, 1>, // ABlockTransfer
+            MPerBlock,         // MPerBlock
+            NPerBlock,         // NPerBlock
+            KPerBlock,         // KPerBlock
+            Gemm1NPerBlock,    // Gemm1NPerBlock
+            32,                // Gemm1KPerBlock
+            8,                 // AK1
+            8,                 // BK1
+            2,                 // B1K1
+            MPerXDL,           // MPerXDL
+            NPerXDL,           // NPerXDL
+            1,                 // MXdlPerWave
+            NXdlPerWave,       // NXdlPerWave
+            Gemm1NXdlPerWave,  // Gemm1NXdlPerWave
+            S<4, 64, 1>,       // ABlockTransfer
             S<1, 0, 2>,
             S<1, 0, 2>,
             2,
@@ -253,245 +251,24 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
 void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) {
 
     //TODO : Find out and choose proper instances parameters for different problem sizes
-    
+    //MPerBlock, NPerBlock, KPerBlock, Gemm1NPerBlock
     FP16_SWITCH(launch_params.params.is_bf16, [&] {
-        run_fmha_fp16_bf16_gfx90a_loop_<elem_type>(launch_params);
+        //if(launch_params.params.d <= 32){
+        //    if(launch_params.params.seqlen_k <= 128){
+        //        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 64, 32, 128, 32, 32, 2, 4>(launch_params);
+        //    }
+        //    else if(launch_params.params.seqlen_k <= 256){
+        //        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 64, 128, 32, 32, 4, 4>(launch_params);
+        //    }
+        //}
+        //else if(launch_params.params.d <= 128){
+        //    if(launch_params.params.seqlen_k <= 128){
+                run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 32, 64, 32, 32, 4, 2>(launch_params);
+        //    }
+        //    else if(launch_params.params.seqlen_k <= 256){
+        //        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 64, 256, 32, 64, 16, 16, 16, 4>(launch_params);
+        //    }
+        //}
     });
 
-
-/*
-    using FP16 = ck::half_t;
-    using BF16 = ck::bhalf_t;
-
-    using InputDataType = BF16;
-
-    //std::cout << "launch_params.params.is_bf16 " << launch_params.params.is_bf16 <<std::endl;
-
-    //if(launch_params.params.is_bf16)
-    //    using InputDataType = BF16;
-
-    //if (std::is_same_v<InputDataType, ck::bhalf_t>) {
-	//	std::cout << "bf16 type" << std::endl;
-    //}
-    //else{
-    //    std::cout << "fp16 type" << std::endl;
-    //}
-
-
-    using F32 = float;
-
-    using PassThrough = ck::tensor_operation::element_wise::PassThrough;
-
-    using ADataType        = InputDataType;
-    using B0DataType       = InputDataType;
-    using B1DataType       = InputDataType;
-    using AccDataType      = F32;
-    using CShuffleDataType = F32;
-    using CDataType        = InputDataType;
-    using Acc0BiasDataType = ck::Tuple<>;
-    using Acc1BiasDataType = ck::Tuple<>;
-
-    static constexpr ck::index_t NumDimG = 2;
-    static constexpr ck::index_t NumDimM = 1;
-    static constexpr ck::index_t NumDimN = 1;
-    static constexpr ck::index_t NumDimK = 1;
-    static constexpr ck::index_t NumDimO = 1;
-
-    using AElementOp    = PassThrough;
-    using B0ElementOp   = PassThrough;
-    using Acc0ElementOp = ck::tensor_operation::element_wise::Scale;
-    using B1ElementOp   = PassThrough;
-    using CElementOp    = PassThrough;
-
-    static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::MNKOPadding;
-    static constexpr auto MaskingSpec =
-        ck::tensor_operation::device::MaskingSpecialization::MaskDisabled;
-
-    static constexpr auto TensorSpecA  = ck::tensor_operation::device::TensorSpecialization::Default;
-    static constexpr auto TensorSpecB0 = ck::tensor_operation::device::TensorSpecialization::Default;
-    static constexpr auto TensorSpecB1 = ck::tensor_operation::device::TensorSpecialization::Default;
-    static constexpr auto TensorSpecC  = ck::tensor_operation::device::TensorSpecialization::Default;
-    
-    //init the instance with parameters
-    using DeviceGemmInstance =
-        ck::tensor_operation::device::DeviceGroupedGemmSoftmaxGemmPermute_Xdl_CShuffle<
-            NumDimG,
-            NumDimM,
-            NumDimN,
-            NumDimK,
-            NumDimO,
-            ADataType,
-            B0DataType,
-            B1DataType,
-            CDataType,
-            Acc0BiasDataType,
-            Acc1BiasDataType,
-            AccDataType,
-            CShuffleDataType,
-            AElementOp,
-            B0ElementOp,
-            Acc0ElementOp,
-            B1ElementOp,
-            CElementOp,
-            GemmSpec,
-            TensorSpecA,
-            TensorSpecB0,
-            TensorSpecB1,
-            TensorSpecC,
-            1,
-            256,
-            128,         // MPerBlock
-            128,         // NPerBlock
-            32,          // KPerBlock
-            64,          // Gemm1NPerBlock
-            32,          // Gemm1KPerBlock
-            8,           // AK1
-            8,           // BK1
-            2,           // B1K1
-            32,          // MPerXDL
-            32,          // NPerXDL
-            1,           // MXdlPerWave
-            4,           // NXdlPerWave
-            2,           // Gemm1NXdlPerWave
-            S<4, 64, 1>, // ABlockTransfer
-            S<1, 0, 2>,
-            S<1, 0, 2>,
-            2,
-            8,
-            8,
-            true,
-            S<4, 64, 1>, // BBlockTransfer
-            S<1, 0, 2>,
-            S<1, 0, 2>,
-            2,
-            8,
-            8,
-            true,
-            S<16, 16, 1>, // B1BlockTransfer
-            S<0, 2, 1>,
-            S<0, 2, 1>,
-            1,
-            4,
-            2,
-            false,
-            1,              // CShuffleMXdlPerWavePerShuffle
-            2,              // CShuffleNXdlPerWavePerShuffle
-            S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-            8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
-            MaskingSpec>;   // MaskingSpecialization
-        
-    bool do_verification = false;
-    bool time_kernel     = false;
-
-    bool input_permute  = true;
-    bool output_permute = true;
-
-    float alpha = launch_params.params.scale_bmm1f;
-
-    auto a_element_op    = AElementOp{};
-    auto b0_element_op   = B0ElementOp{};
-    auto acc0_element_op = Acc0ElementOp{alpha};
-    auto b1_element_op   = B1ElementOp{};
-    auto c_element_op    = CElementOp{};
-
-    auto p_a = launch_params.params.q_ptr;
-    auto p_b0 = launch_params.params.k_ptr;
-    auto p_b1 = launch_params.params.v_ptr;
-    auto p_c = launch_params.params.o_ptr;
-
-    std::vector<DeviceGemmInstance::ProblemDesc> problem_descs;
-
-    int batch_size = launch_params.params.b;
-    int num_heads = launch_params.params.h;
-    int head_dim = launch_params.params.d;
-
-    //int* host_seqlens_q;
-    //int* host_seqlens_k;
-    //host_seqlens_q = (int*)malloc((launch_params.params.b+1)*sizeof(int));
-    //host_seqlens_k = (int*)malloc((launch_params.params.b+1)*sizeof(int));
-    //FMHA_CHECK_HIP(hipMemcpy(host_seqlens_q, launch_params.params.cu_seqlens_q, (launch_params.params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
-    //FMHA_CHECK_HIP(hipMemcpy(host_seqlens_k, launch_params.params.cu_seqlens_k, (launch_params.params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
-
-    for(size_t i = 0; i < batch_size ; i++){
-        int M     = launch_params.params.host_seqlens_q[i + 1] - launch_params.params.host_seqlens_q[i]; //seqlen Q
-        int N     = launch_params.params.host_seqlens_k[i + 1] - launch_params.params.host_seqlens_k[i]; //seqlen K
-        int K     = head_dim;
-        int O     = head_dim;
-        int G0 = 1; // G0 = batch_size
-        int G1 = num_heads;
-        
-
-        std::vector<ck::index_t> a_gs_ms_ks_lengths{G0, G1, M, K};
-        std::vector<ck::index_t> a_gs_ms_ks_strides =
-            input_permute
-                ? std::vector<ck::index_t>{M * G1 * K, K, G1 * K, 1} // A layout [G0, M, G1, K]
-                : std::vector<ck::index_t>{G1 * M * K, M * K, K, 1}; // A layout [G0, G1, M, K]
-
-        std::vector<ck::index_t> b0_gs_ns_ks_lengths{G0, G1, N, K};
-        std::vector<ck::index_t> b0_gs_ns_ks_strides =
-            input_permute
-                ? std::vector<ck::index_t>{N * G1 * K, K, G1 * K, 1} // B0 layout [G0, N, G1, K]
-                : std::vector<ck::index_t>{G1 * N * K, N * K, K, 1}; // B0 layout [G0, G1, N, K]
-
-        std::vector<ck::index_t> b1_gs_os_ns_lengths{G0, G1, O, N};
-        std::vector<ck::index_t> b1_gs_os_ns_strides =
-            input_permute
-                ? std::vector<ck::index_t>{N * G1 * O, O, 1, G1 * O} // B1 layout [G0, N, G1, O]
-                : std::vector<ck::index_t>{G1 * N * O, N * O, 1, O}; // B1 layout [G0, G1, N, O]
-
-        std::vector<ck::index_t> c_gs_ms_os_lengths{G0, G1, M, O};
-        std::vector<ck::index_t> c_gs_ms_os_strides =
-            output_permute
-                ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1} // C layout [G0, M, G1, O]
-                : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // C layout [G0, G1, M, O]
-
-        problem_descs.push_back({a_gs_ms_ks_lengths,
-                                 a_gs_ms_ks_strides,
-                                 b0_gs_ns_ks_lengths,
-                                 b0_gs_ns_ks_strides,
-                                 b1_gs_os_ns_lengths,
-                                 b1_gs_os_ns_strides,
-                                 c_gs_ms_os_lengths,
-                                 c_gs_ms_os_strides,
-                                 {},   // acc0_biases_gs_ms_ns_lengths
-                                 {},   // acc0_biases_gs_ms_ns_strides
-                                 {},   // acc1_biases_gs_ms_os_lengths
-                                 {}}); // acc1_biases_gs_ms_os_strides
-                                 
-    }
-
-    // do GEMM
-    auto gemm     = DeviceGemmInstance{};
-    auto invoker  = gemm.MakeInvoker();
-    auto argument = gemm.MakeArgument(p_a,
-                                      p_b0,
-                                      p_b1,
-                                      p_c,
-                                      {},
-                                      {},
-                                      problem_descs,
-                                      a_element_op,
-                                      b0_element_op,
-                                      acc0_element_op,
-                                      b1_element_op,
-                                      c_element_op);
-
-    // specify workspace for problem_desc
-    SimpleDeviceMem problem_desc_workspace(gemm.GetWorkSpaceSize(&argument));
-
-    gemm.SetWorkSpacePointer(&argument, problem_desc_workspace.GetDeviceBuffer());
-
-    if(!gemm.IsSupportedArgument(argument))
-    {
-        std::cout << gemm.GetTypeString() << " does not support this problem" << std::endl;
-
-        return;
-    }
-
-    float ave_time = invoker.Run(argument, StreamConfig{nullptr, time_kernel});
-
-    if(time_kernel){
-        std::cout << "time elpase is " << ave_time <<" ms" << std::endl;
-    }
-*/
 }
