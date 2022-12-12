@@ -59,10 +59,10 @@ void set_params_fprop(FMHA_fprop_params &params,
     FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_q, params.cu_seqlens_q, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
     FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_k, params.cu_seqlens_k, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
 
-    at::Tensor q_ = q.view({params.b, params.seqlen_q , params.h , params.d});
-    at::Tensor k_ = k.view({params.b, params.seqlen_k , params.h , params.d});
-    at::Tensor v_ = v.view({params.b, params.seqlen_q , params.h , params.d});
-    out = out.view({params.b, params.seqlen_q , params.h , params.d});
+    //at::Tensor q_ = q.view({params.b, params.seqlen_q , params.h , params.d});
+    //at::Tensor k_ = k.view({params.b, params.seqlen_k , params.h , params.d});
+    //at::Tensor v_ = v.view({params.b, params.seqlen_q , params.h , params.d});
+    //out = out.view({params.b, params.seqlen_q , params.h , params.d});
 
     char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
     char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
@@ -81,6 +81,14 @@ void set_params_fprop(FMHA_fprop_params &params,
     //std::cout << " q_[0][0][1][0].data_ptr() " << q_[0][0][1][0].data_ptr() << std::endl;
     //std::cout << " q_[0][1][0][0].data_ptr() " << q_[0][1][0][0].data_ptr() << std::endl;
     //std::cout << " q_[1][0][0][0].data_ptr() " << q_[1][0][0][0].data_ptr() << std::endl;
+/*
+    for (int i = 0; i < b; i++){
+        params.q_ptr.push_back(q_[i].data_ptr());
+        params.k_ptr.push_back(k_[i].data_ptr());
+        params.v_ptr.push_back(v_[i].data_ptr());
+        params.o_ptr.push_back(out[i].data_ptr());
+    }
+*/
 
     for (int i = 0; i < b; i++){
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
@@ -269,7 +277,7 @@ int main(){
     int d = n / nheads; //head_size//64
 
     //initialize the tensors
-    at::Tensor q_host = at::rand({batch_size*seqlen, nheads, d}, torch::kBFloat16);//torch::kBFloat16
+    at::Tensor q_host = at::rand({batch_size*seqlen, nheads, d}, torch::kBFloat16);//torch::kBFloat16;at::kHalf
     at::Tensor k_host = at::rand({batch_size*seqlen, nheads, d}, torch::kBFloat16);
     at::Tensor v_host = at::rand({batch_size*seqlen, nheads, d}, torch::kBFloat16);
 
@@ -278,7 +286,7 @@ int main(){
     at::Tensor v = v_host.to(at::kCUDA);
 
     //initialize the output tensor
-    at::Tensor out_host = at::zeros({batch_size*seqlen, nheads, d},torch::kBFloat16);
+    at::Tensor out_host = at::empty({batch_size*seqlen, nheads, d},torch::kBFloat16);
     at::Tensor out = out_host.to(at::kCUDA);
 
     //initialize seqlens vector (size is b+1)
@@ -373,7 +381,6 @@ int main(){
                                                                                     CElementOp>;
 
     
-
     bool pass = true;
     if(do_verification)
     {
@@ -424,19 +431,19 @@ int main(){
             void* k_h_ptr_f = k_host[i].data_ptr();
             void* v_h_ptr_f = v_host[i].data_ptr();
 
-            ck::half_t* q_h_ptr = reinterpret_cast<ck::half_t*>(q_h_ptr_f);
-            ck::half_t* k_h_ptr = reinterpret_cast<ck::half_t*>(k_h_ptr_f);
-            ck::half_t* v_h_ptr = reinterpret_cast<ck::half_t*>(v_h_ptr_f);
+            ADataType* q_h_ptr = reinterpret_cast<ADataType*>(q_h_ptr_f);
+            B0DataType* k_h_ptr = reinterpret_cast<B0DataType*>(k_h_ptr_f);
+            B1DataType* v_h_ptr = reinterpret_cast<B1DataType*>(v_h_ptr_f);
 
             //std::cout << "q_host[i].numel() " << q_host[i].numel() << std::endl;
 
-            std::vector<ck::half_t> a_vector(q_h_ptr, q_h_ptr + q_host[i].numel()); //transfer tensor into vector
+            std::vector<ADataType> a_vector(q_h_ptr, q_h_ptr + q_host[i].numel()); //transfer tensor into vector
             a_gs_ms_ks.mData.assign(a_vector.begin(), a_vector.end());
 
-            std::vector<ck::half_t> b0_vector(k_h_ptr, k_h_ptr + k_host[i].numel()); //transfer tensor into vector
+            std::vector<B0DataType> b0_vector(k_h_ptr, k_h_ptr + k_host[i].numel()); //transfer tensor into vector
             b0_gs_ns_ks.mData.assign(b0_vector.begin(), b0_vector.end());
             
-            std::vector<ck::half_t> b1_vector(v_h_ptr, v_h_ptr + v_host[i].numel()); //transfer tensor into vector
+            std::vector<B1DataType> b1_vector(v_h_ptr, v_h_ptr + v_host[i].numel()); //transfer tensor into vector
             b1_gs_os_ns.mData.assign(b1_vector.begin(), b1_vector.end());
 
             a_tensors.push_back(a_gs_ms_ks);
@@ -446,6 +453,8 @@ int main(){
 
         }
 
+        at::Tensor out_device_result = out.to(torch::kCPU).view({batch_size, seqlen, nheads, d});
+
         for(std::size_t i = 0; i < batch_size; i++)
         {
             const auto& a_gs_ms_ks         = a_tensors[i];
@@ -454,10 +463,10 @@ int main(){
             auto& c_gs_ms_os_device_result = c_tensors[i];
             //auto& c_gs_ms_os_device_buf    = *c_tensors_device[i];
 
-            at::Tensor out_host_result = out.to(torch::kCPU).view({batch_size, seqlen, nheads, d});
-            void* out_host_ptr_f = out_host_result[i].data_ptr();
-            ck::half_t* out_host_ptr = reinterpret_cast<ck::half_t*>(out_host_ptr_f);
-            std::vector<ck::half_t> result_vector(out_host_ptr, out_host_ptr + out_host_result[i].numel()); //transfer tensor into vector
+            //at::Tensor out_device_result = out.to(torch::kCPU).view({batch_size, seqlen, nheads, d});
+            void* out_host_ptr_f = out_device_result[i].data_ptr();
+            CDataType* out_host_ptr = reinterpret_cast<CDataType*>(out_host_ptr_f);
+            std::vector<CDataType> result_vector(out_host_ptr, out_host_ptr + out_device_result[i].numel()); //transfer tensor into vector
             c_gs_ms_os_device_result.mData.assign(result_vector.begin(), result_vector.end());
 
             //c_gs_ms_os_device_buf.FromDevice(c_gs_ms_os_device_result.mData.data());//
@@ -540,6 +549,15 @@ int main(){
                                     rtol,
                                     atol);
             pass &= pass_;
+
+            //for (int j = 0; j < 4 ; j++){
+            //    std::cout << "data at j is " 
+            //    << ck::type_convert<float>(c_gs_ms_os_device_result.mData[j]) 
+            //    << " , " 
+            //    << ck::type_convert<float>(c_gs_ms_os_host_result.mData[j]) 
+            //    <<std::endl;
+            //}
+
         }
 
         if(pass)
