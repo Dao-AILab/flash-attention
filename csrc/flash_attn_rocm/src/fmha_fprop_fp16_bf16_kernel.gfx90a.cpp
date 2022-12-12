@@ -9,6 +9,10 @@
 template <ck::index_t... Is>
 using S = ck::Sequence<Is...>;
 
+using FP16 = ck::half_t;
+using BF16 = ck::bhalf_t;
+
+
 struct SimpleDeviceMem
 {
     SimpleDeviceMem() = delete;
@@ -24,7 +28,7 @@ struct SimpleDeviceMem
 
     void* p_mem_;
 };
-/*
+
 template<typename InputType>
 void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_params){
     
@@ -244,17 +248,18 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     }
 
 }
-*/
+
 
 void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) {
 
     //TODO : Find out and choose proper instances parameters for different problem sizes
-    /*
+    
     FP16_SWITCH(launch_params.params.is_bf16, [&] {
         run_fmha_fp16_bf16_gfx90a_loop_<elem_type>(launch_params);
     });
-    */
 
+
+/*
     using FP16 = ck::half_t;
     using BF16 = ck::bhalf_t;
 
@@ -488,5 +493,5 @@ void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) 
     if(time_kernel){
         std::cout << "time elpase is " << ave_time <<" ms" << std::endl;
     }
-
+*/
 }
