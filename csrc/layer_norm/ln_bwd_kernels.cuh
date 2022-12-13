@@ -7,7 +7,7 @@
 
 namespace layer_norm {
 
-template<typename Ktraits, bool Prenorm, bool Is_dropout, bool Has_residual, bool Has_colscale, bool Is_even_cols>
+template<typename Ktraits, bool Is_dropout, bool Has_colscale, bool Has_subset, bool Is_even_cols>
 __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) 
 void ln_bwd_kernel(layer_norm::BwdParams params) {
 
@@ -37,6 +37,9 @@ void ln_bwd_kernel(layer_norm::BwdParams params) {
 
     extern __shared__ char smem_[];
 
+    const bool has_residual = params.dx1 != nullptr;
+    const bool prenorm = params.dx != nullptr;
+
     const index_t tidx = threadIdx.x;
     const index_t bidn = blockIdx.x % CTAS_PER_ROW;
     const index_t bidm = blockIdx.x / CTAS_PER_ROW;
@@ -50,6 +53,10 @@ void ln_bwd_kernel(layer_norm::BwdParams params) {
     const index_t c = bidn * THREADS_PER_ROW + warp_n * THREADS_PER_WARP + lane;
 
     static_assert(COLS == THREADS_PER_ROW * LDGS * NUM_ELTS * CTAS_PER_ROW);
+
+    const input_t *rowscale = static_cast<input_t *>(params.rowscale);
+    const index_t *x0_subset = static_cast<index_t *>(params.x0_subset);
+    const index_t *z_subset = static_cast<index_t *>(params.z_subset);
 
     Cvec dzy_sum[LDGS];
     Cvec dz_sum[LDGS];
@@ -87,40 +94,62 @@ void ln_bwd_kernel(layer_norm::BwdParams params) {
     for( int row = r; row < params.rows; row += params.ctas_per_col * ROWS_PER_CTA ) {
         const compute_t mu_r = static_cast<const compute_t *>(params.mu)[row];
         const compute_t rs_r = static_cast<const compute_t *>(params.rs)[row];
-        const compute_t rowscale_val =
-            params.rowscale == nullptr ? 1.0f : compute_t(static_cast<const input_t *>(params.rowscale)[row]);
+        const compute_t rowscale_val = !Has_subset ? (params.rowscale == nullptr ? 1.0f : compute_t(rowscale[row])) : params.rowscale_const;
+        const int row_z = !Has_subset ? row + 1 : z_subset[row];
+        const int row_x0 = !Has_subset ? row + 1 : x0_subset[row];
+        const bool load_dz = !Has_subset || row_z > 0;
+        const bool save_dx0 = !Has_subset || row_x0 > 0;
         Mvec dmask[LDGS];
         Rvec dx[LDGS];
         compute_t dy[LDGS * NUM_ELTS];
         compute_t y[LDGS * NUM_ELTS];
         compute_t mdy_local = 0.f;
         compute_t mdyy_local = 0.f;
-        index_t idx = row * params.cols / Ktraits::ELTS_PER_LDG + c;
-        #pragma unroll
-        for( int it = 0; it < LDGS; it++ ) {
-            if (Is_even_cols || (it < num_valid_ldgs)) {
-                Rvec x;
-                Ovec dz;
-                dz.load_from(params.dz, idx);
-                if (Prenorm) { dx[it].load_from(params.dx, idx); }
-                x.load_from(params.x, idx);
-                if (Is_dropout) { dmask[it].load_from(params.dmask, idx); }
-                idx += Ktraits::VEC_COLS_PER_LDG;
-                #pragma unroll
-                for( int jt = 0; jt < NUM_ELTS; jt++ ) {
-                    compute_t x_tmp = x.data.elt[jt];
-                    compute_t y_tmp = rs_r * (x_tmp - mu_r);
-                    compute_t dy_tmp = compute_t(gamma[it].data.elt[jt]) * compute_t(dz.data.elt[jt]);
-                    compute_t dz_tmp = dz.data.elt[jt];
+        // If dz is not loaded, then dy should be 0 and we don't care about the value of y.
+        if (load_dz) {
+            index_t idx_x = row * params.cols / Ktraits::ELTS_PER_LDG + c;
+            index_t idx_z = !Has_subset ? idx_x : (load_dz ? (row_z - 1) * params.cols / Ktraits::ELTS_PER_LDG + c : 0);
+            index_t idx_x0 = !Has_subset ? idx_x : (save_dx0 ? (row_x0 - 1) * params.cols / Ktraits::ELTS_PER_LDG + c : 0);
+            #pragma unroll
+            for( int it = 0; it < LDGS; it++ ) {
+                if (Is_even_cols || (it < num_valid_ldgs)) {
+                    Rvec x;
+                    Ovec dz;
+                    dz.load_from(params.dz, !Has_subset ? idx_x : idx_z);
+                    if (prenorm) { dx[it].load_from(params.dx, idx_x); }
+                    x.load_from(params.x, idx_x);
+                    if (Is_dropout) { dmask[it].load_from(params.dmask, !Has_subset ? idx_x : idx_x0); }
+                    idx_x += Ktraits::VEC_COLS_PER_LDG;
+                    idx_z += Ktraits::VEC_COLS_PER_LDG;
+                    idx_x0 += Ktraits::VEC_COLS_PER_LDG;
+                    #pragma unroll
+                    for( int jt = 0; jt < NUM_ELTS; jt++ ) {
+                        compute_t x_tmp = x.data.elt[jt];
+                        compute_t y_tmp = rs_r * (x_tmp - mu_r);
+                        compute_t dy_tmp = compute_t(gamma[it].data.elt[jt]) * compute_t(dz.data.elt[jt]);
+                        compute_t dz_tmp = dz.data.elt[jt];
 
-                    mdy_local += dy_tmp;
-                    mdyy_local += dy_tmp * y_tmp;
+                        mdy_local += dy_tmp;
+                        mdyy_local += dy_tmp * y_tmp;
 
-                    dy[it * NUM_ELTS + jt] = dy_tmp;
-                    y[it * NUM_ELTS + jt] = y_tmp;
+                        dy[it * NUM_ELTS + jt] = dy_tmp;
+                        y[it * NUM_ELTS + jt] = y_tmp;
 
-                    dzy_sum[it].data.elt[jt] += dz_tmp * y_tmp;
-                    dz_sum[it].data.elt[jt] += dz_tmp;
+                        dzy_sum[it].data.elt[jt] += dz_tmp * y_tmp;
+                        dz_sum[it].data.elt[jt] += dz_tmp;
+                    }
+                }
+            }
+        } else {
+            index_t idx_x = row * params.cols / Ktraits::ELTS_PER_LDG + c;
+            index_t idx_x0 = !Has_subset ? idx_x : (save_dx0 ? (row_x0 - 1) * params.cols / Ktraits::ELTS_PER_LDG + c : 0);
+            #pragma unroll
+            for( int it = 0; it < LDGS; it++ ) {
+                if (Is_even_cols || (it < num_valid_ldgs)) {
+                    if (prenorm) { dx[it].load_from(params.dx, idx_x); }
+                    if (Is_dropout) { dmask[it].load_from(params.dmask, !Has_subset ? idx_x : idx_x0); }
+                    idx_x += Ktraits::VEC_COLS_PER_LDG;
+                    idx_x0 += Ktraits::VEC_COLS_PER_LDG;
                 }
             }
         }
@@ -129,42 +158,51 @@ void ln_bwd_kernel(layer_norm::BwdParams params) {
         mdy_local = layer_norm::Get<0>::of<reduce_t, compute_t>(result) * params.inverse_cols;
         mdyy_local = layer_norm::Get<1>::of<reduce_t, compute_t>(result) * params.inverse_cols;
 
-        idx = row * params.cols / Ktraits::ELTS_PER_LDG + c;
+        index_t idx_x = row * params.cols / Ktraits::ELTS_PER_LDG + c;
+        index_t idx_x0 = !Has_subset ? idx_x : (save_dx0 ? (row_x0 - 1) * params.cols / Ktraits::ELTS_PER_LDG + c : 0);
         #pragma unroll
         for( int it = 0; it < LDGS; it++ ) {
             if (Is_even_cols || (it < num_valid_ldgs)) {
                 Ivec dx0;
                 Rvec dx1;
                 Ivec x0;
-                if (Has_colscale) { x0.load_from(params.x0, idx); }
+                if (Has_colscale && save_dx0) { x0.load_from(params.x0, !Has_subset ? idx_x : idx_x0); }
                 #pragma unroll
                 for( int jt = 0; jt < NUM_ELTS; jt++ ) {
-                    compute_t dy_tmp = dy[it * NUM_ELTS + jt];
-                    compute_t y_tmp = y[it * NUM_ELTS + jt];
-                    compute_t dx_tmp = rs_r * (dy_tmp - (mdyy_local * y_tmp + mdy_local));
-                    compute_t dx_tmp_res = Prenorm ? dx_tmp + compute_t(dx[it].data.elt[jt]) : dx_tmp;
-                    if (Has_residual) { dx1.data.elt[jt] = dx_tmp_res; }
-                    compute_t dx0_tmp_res = dx_tmp_res * rowscale_val;
-                    if (Is_dropout) {
-                        dx0_tmp_res *= params.dropout_scale;
-                        if (Has_colscale) {
-                            dcolscale_sum[it].data.elt[jt] += dmask[it].data.elt[jt] ? dx0_tmp_res * compute_t(x0.data.elt[jt]) : 0.f;
-                            dx0.data.elt[jt] = dmask[it].data.elt[jt] ? dx0_tmp_res * compute_t(colscale[it].data.elt[jt]) : 0.f;
-                        } else {
-                            dx0.data.elt[jt] = dmask[it].data.elt[jt] ? dx0_tmp_res : 0.f;
-                        }
+                    compute_t dx_tmp_res;
+                    if (load_dz) {
+                        compute_t dy_tmp = dy[it * NUM_ELTS + jt];
+                        compute_t y_tmp = y[it * NUM_ELTS + jt];
+                        compute_t dx_tmp = rs_r * (dy_tmp - (mdyy_local * y_tmp + mdy_local));
+                        dx_tmp_res = prenorm ? dx_tmp + compute_t(dx[it].data.elt[jt]) : dx_tmp;
                     } else {
-                        if (Has_colscale) {
-                            dcolscale_sum[it].data.elt[jt] += dx0_tmp_res * compute_t(x0.data.elt[jt]);
-                            dx0.data.elt[jt] = dx0_tmp_res * compute_t(colscale[it].data.elt[jt]);
+                        dx_tmp_res = prenorm ? compute_t(dx[it].data.elt[jt]) : 0.f;
+                    }
+                    if (has_residual) { dx1.data.elt[jt] = dx_tmp_res; }
+                    if (save_dx0) {
+                        compute_t dx0_tmp_res = dx_tmp_res * rowscale_val;
+                        if (Is_dropout) {
+                            dx0_tmp_res *= params.dropout_scale;
+                            if (Has_colscale) {
+                                dcolscale_sum[it].data.elt[jt] += dmask[it].data.elt[jt] ? dx0_tmp_res * compute_t(x0.data.elt[jt]) : 0.f;
+                                dx0.data.elt[jt] = dmask[it].data.elt[jt] ? dx0_tmp_res * compute_t(colscale[it].data.elt[jt]) : 0.f;
+                            } else {
+                                dx0.data.elt[jt] = dmask[it].data.elt[jt] ? dx0_tmp_res : 0.f;
+                            }
                         } else {
-                            dx0.data.elt[jt] = dx0_tmp_res;
+                            if (Has_colscale) {
+                                dcolscale_sum[it].data.elt[jt] += dx0_tmp_res * compute_t(x0.data.elt[jt]);
+                                dx0.data.elt[jt] = dx0_tmp_res * compute_t(colscale[it].data.elt[jt]);
+                            } else {
+                                dx0.data.elt[jt] = dx0_tmp_res;
+                            }
                         }
                     }
                 }
-                if (Has_residual) { dx1.store_to(params.dx1, idx); }
-                dx0.store_to(params.dx0, idx);
-                idx += Ktraits::VEC_COLS_PER_LDG;
+                if (has_residual) { dx1.store_to(params.dx1, idx_x); }
+                if (save_dx0) { dx0.store_to(params.dx0, !Has_subset ? idx_x : idx_x0); }
+                idx_x += Ktraits::VEC_COLS_PER_LDG;
+                idx_x0 += Ktraits::VEC_COLS_PER_LDG;
             }
         }
 
@@ -434,64 +472,61 @@ void launch_(LaunchParams<BwdParams> &launch_params, const bool configure_params
                                         WARPS_N,
                                         BYTES_PER_LDG_MAIN
                                         >;
-    bool prenorm = launch_params.params.dx != nullptr;
     bool is_dropout = launch_params.params.dropout_keep_p < 1.f;
-    bool has_residual = launch_params.params.dx1 != nullptr;
     bool has_colscale = launch_params.params.colscale != nullptr;
+    bool has_subset = launch_params.params.x0_subset != nullptr;
     bool is_even_cols = launch_params.params.cols == HIDDEN_SIZE;
-    BOOL_SWITCH(prenorm, PrenormConst, [&] {
-        BOOL_SWITCH(is_dropout, IsDropoutConst, [&] {
-            BOOL_SWITCH(has_residual, HasResidualConst, [&] {
-                BOOL_SWITCH(has_colscale, HasColscaleConst, [&] {
-                    BOOL_SWITCH(is_even_cols, IsEvenColsConst, [&] {
-                        auto kernel = &ln_bwd_kernel<Kernel_traits, PrenormConst, IsDropoutConst, HasResidualConst, HasColscaleConst, IsEvenColsConst>;
-                        if( configure_params ) {
-                            int ctas_per_sm;
-                            CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                                &ctas_per_sm, kernel, Kernel_traits::THREADS_PER_CTA, Kernel_traits::SMEM_BYTES));
-                            launch_params.params.ctas_per_col = launch_params.props->multiProcessorCount * ctas_per_sm / Kernel_traits::CTAS_PER_ROW;
-                            launch_params.barrier_size = 0;
-                            launch_params.workspace_bytes = 0;
-                            if(Kernel_traits::CTAS_PER_ROW > 1) {
-                                launch_params.barrier_size = 2 * launch_params.params.ctas_per_col;
-                                launch_params.workspace_bytes = launch_params.params.ctas_per_col
-                                                              * Kernel_traits::WARPS_M
-                                                              * Kernel_traits::CTAS_PER_ROW
-                                                              * sizeof(typename Kernel_traits::reduce_t)
-                                                              * 2;
-                            }
-                            return;
+    BOOL_SWITCH(is_dropout, IsDropoutConst, [&] {
+        BOOL_SWITCH(has_colscale, HasColscaleConst, [&] {
+            BOOL_SWITCH(has_subset, HasSubsetConst, [&] {
+                BOOL_SWITCH(is_even_cols, IsEvenColsConst, [&] {
+                    auto kernel = &ln_bwd_kernel<Kernel_traits, IsDropoutConst, HasColscaleConst, HasSubsetConst, IsEvenColsConst>;
+                    if( configure_params ) {
+                        int ctas_per_sm;
+                        CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                            &ctas_per_sm, kernel, Kernel_traits::THREADS_PER_CTA, Kernel_traits::SMEM_BYTES));
+                        launch_params.params.ctas_per_col = launch_params.props->multiProcessorCount * ctas_per_sm / Kernel_traits::CTAS_PER_ROW;
+                        launch_params.barrier_size = 0;
+                        launch_params.workspace_bytes = 0;
+                        if(Kernel_traits::CTAS_PER_ROW > 1) {
+                            launch_params.barrier_size = 2 * launch_params.params.ctas_per_col;
+                            launch_params.workspace_bytes = launch_params.params.ctas_per_col
+                                                          * Kernel_traits::WARPS_M
+                                                          * Kernel_traits::CTAS_PER_ROW
+                                                          * sizeof(typename Kernel_traits::reduce_t)
+                                                          * 2;
                         }
+                        return;
+                    }
 
-                        if( Kernel_traits::SMEM_BYTES >= 48 * 1024 ) {
-                            CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel_traits::SMEM_BYTES));
-                        }
-                        auto stream = launch_params.stream;
-                        auto ctas_per_col = launch_params.params.ctas_per_col;
+                    if( Kernel_traits::SMEM_BYTES >= 48 * 1024 ) {
+                        CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel_traits::SMEM_BYTES));
+                    }
+                    auto stream = launch_params.stream;
+                    auto ctas_per_col = launch_params.params.ctas_per_col;
 
-                        if( Kernel_traits::CTAS_PER_ROW == 1 ) {
-                            kernel<<<ctas_per_col, Kernel_traits::THREADS_PER_CTA, Kernel_traits::SMEM_BYTES, stream>>>(launch_params.params);
-                        } else {
-                            dim3 grid(Kernel_traits::CTAS_PER_ROW * ctas_per_col);
-                            dim3 block(Kernel_traits::THREADS_PER_CTA);
-                            void *params_ = (void *)&launch_params.params;
-                            cudaLaunchCooperativeKernel((void *)kernel, grid, block, (void **)&params_, Kernel_traits::SMEM_BYTES, stream);
-                        }
+                    if( Kernel_traits::CTAS_PER_ROW == 1 ) {
+                        kernel<<<ctas_per_col, Kernel_traits::THREADS_PER_CTA, Kernel_traits::SMEM_BYTES, stream>>>(launch_params.params);
+                    } else {
+                        dim3 grid(Kernel_traits::CTAS_PER_ROW * ctas_per_col);
+                        dim3 block(Kernel_traits::THREADS_PER_CTA);
+                        void *params_ = (void *)&launch_params.params;
+                        cudaLaunchCooperativeKernel((void *)kernel, grid, block, (void **)&params_, Kernel_traits::SMEM_BYTES, stream);
+                    }
 
-                        using Kernel_traits_f = layer_norm::Kernel_traits_finalize<HIDDEN_SIZE,
-                                                                                  weight_t,
-                                                                                  input_t,
-                                                                                  residual_t,
-                                                                                  output_t,
-                                                                                  compute_t,
-                                                                                  index_t,
-                                                                                  HasColscaleConst,
-                                                                                  32 * 32,  // THREADS_PER_CTA
-                                                                                  BYTES_PER_LDG_FINAL>;
+                    using Kernel_traits_f = layer_norm::Kernel_traits_finalize<HIDDEN_SIZE,
+                                                                              weight_t,
+                                                                              input_t,
+                                                                              residual_t,
+                                                                              output_t,
+                                                                              compute_t,
+                                                                              index_t,
+                                                                              HasColscaleConst,
+                                                                              32 * 32,  // THREADS_PER_CTA
+                                                                              BYTES_PER_LDG_FINAL>;
 
-                        auto kernel_f = &layer_norm::ln_bwd_finalize_kernel<Kernel_traits_f, HasColscaleConst, IsEvenColsConst>;
-                        kernel_f<<<Kernel_traits_f::CTAS, Kernel_traits_f::THREADS_PER_CTA, 0, stream>>>(launch_params.params);
-                    });
+                    auto kernel_f = &layer_norm::ln_bwd_finalize_kernel<Kernel_traits_f, HasColscaleConst, IsEvenColsConst>;
+                    kernel_f<<<Kernel_traits_f::CTAS, Kernel_traits_f::THREADS_PER_CTA, 0, stream>>>(launch_params.params);
                 });
             });
         });

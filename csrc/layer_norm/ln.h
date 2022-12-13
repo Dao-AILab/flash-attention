@@ -66,11 +66,14 @@ struct ParamsBase {
     void *gamma;
     void *rowscale;
     void *colscale;
+    void *x0_subset;
+    void *z_subset;
 
     float inverse_cols;
 
     float dropout_keep_p;
     float dropout_scale;
+    float rowscale_const;
 
     // Multi-CTA workspace in gmem.
     void *workspace;

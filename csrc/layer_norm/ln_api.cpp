@@ -84,9 +84,13 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
                                            const at::Tensor &gamma,   // hidden_size
                                            const at::Tensor &beta,   // hidden_size
                                            c10::optional<const at::Tensor> &rowscale_,      // BxS
-                                           c10::optional<const at::Tensor> &colscale_,      // BxS
+                                           c10::optional<const at::Tensor> &colscale_,      // hidden_size
+                                           c10::optional<const at::Tensor> &x0_subset_,      // BxS
+                                           c10::optional<const at::Tensor> &z_subset_,      // BxS
                                            const float dropout_p,
                                            const float epsilon,
+                                           const float rowscale_const,
+                                           const int64_t z_numrows,
                                            c10::optional<at::Generator> gen_,
                                            bool residual_in_fp32
 ) {
@@ -99,14 +103,19 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
     auto ctype = torch::kFloat32;
     auto mtype = torch::kUInt8;
 
-    TORCH_CHECK(beta.scalar_type() == wtype);
+    TORCH_CHECK(beta.dtype() == wtype);
 
     TORCH_CHECK(x0.is_cuda())
     TORCH_CHECK(gamma.is_cuda())
     TORCH_CHECK(beta.is_cuda())
 
     TORCH_CHECK(x0.is_contiguous());
-    auto sizes = x0.sizes();
+    // c10::IntArrayRef does not own the storage, so we need to construct a vector.
+    // Otherwise just constructing IntArrayRef({blah}) will cause unintialized memory because
+    // blah is then deallocated.
+    std::vector<int64_t> sizes_vec {!x0_subset_.has_value() ? x0.size(0) : x0_subset_.value().size(0), x0.size(1)};
+    auto sizes = c10::IntArrayRef(sizes_vec);
+    TORCH_CHECK(x0.dim() == 2);
     TORCH_CHECK(sizes.size() == 2);
 
     const int rows = sizes[0];
@@ -124,7 +133,7 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
         auto rowscale = rowscale_.value();
         TORCH_CHECK(rowscale.is_cuda())
         TORCH_CHECK(rowscale.is_contiguous());
-        TORCH_CHECK(rowscale.sizes() == std::vector<int64_t>{rows});
+        TORCH_CHECK(rowscale.sizes() == c10::IntArrayRef{rows});
         TORCH_CHECK(rowscale.dtype() == itype);
     }
 
@@ -132,8 +141,23 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
         auto colscale = colscale_.value();
         TORCH_CHECK(colscale.is_cuda())
         TORCH_CHECK(colscale.is_contiguous());
-        TORCH_CHECK(colscale.sizes() == std::vector<int64_t>{cols});
+        TORCH_CHECK(colscale.sizes() == c10::IntArrayRef{cols});
         TORCH_CHECK(colscale.dtype() == wtype);
+    }
+
+    if (x0_subset_.has_value()) {
+        auto x0_subset = x0_subset_.value();
+        TORCH_CHECK(x0_subset.is_cuda())
+        TORCH_CHECK(x0_subset.is_contiguous());
+        TORCH_CHECK(x0_subset.sizes() == c10::IntArrayRef{rows});
+        TORCH_CHECK(x0_subset.dtype() == torch::kInt32);
+
+        TORCH_CHECK(z_subset_.has_value());
+        auto z_subset = z_subset_.value();
+        TORCH_CHECK(z_subset.is_cuda());
+        TORCH_CHECK(z_subset.is_contiguous());
+        TORCH_CHECK(z_subset.sizes() == c10::IntArrayRef{rows});
+        TORCH_CHECK(z_subset.dtype() == torch::kInt32);
     }
 
     TORCH_CHECK(gamma.sizes() == beta.sizes());
@@ -144,12 +168,12 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
 
     auto opts = x0.options();
 
-    bool save_x = x1_.has_value() || (dropout_p > 0.f) || rowscale_.has_value() || colscale_.has_value() || (itype != rtype);
+    bool save_x = x1_.has_value() || (dropout_p > 0.f) || rowscale_.has_value() || colscale_.has_value() || x0_subset_.has_value() || (itype != rtype);
     at::Tensor x;
     if (save_x) { x = torch::empty(sizes, opts.dtype(rtype)); }
     at::Tensor dmask;
-    if (dropout_p > 0.f) { dmask = torch::empty(sizes, opts.dtype(mtype)); };
-    auto z = torch::empty(sizes, opts.dtype(otype));
+    if (dropout_p > 0.f) { dmask = torch::empty(x0.sizes(), opts.dtype(mtype)); };
+    auto z = torch::empty(z_subset_.has_value() ? c10::IntArrayRef{z_numrows, cols} : sizes, opts.dtype(otype));
 
     auto mu = torch::empty({ rows }, opts.dtype(ctype));
     auto rsigma = torch::empty({ rows }, opts.dtype(ctype));
@@ -163,6 +187,8 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
     launch_params.params.x1 = x1_.has_value() ? x1_.value().data_ptr() : nullptr;
     launch_params.params.rowscale = rowscale_.has_value() ? rowscale_.value().data_ptr() : nullptr;
     launch_params.params.colscale = colscale_.has_value() ? colscale_.value().data_ptr() : nullptr;
+    launch_params.params.x0_subset = x0_subset_.has_value() ? x0_subset_.value().data_ptr() : nullptr;
+    launch_params.params.z_subset = z_subset_.has_value() ? z_subset_.value().data_ptr() : nullptr;
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
@@ -192,6 +218,7 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
     params.epsilon = epsilon;
     params.dropout_scale = 1.f / (1.f - dropout_p);
     params.inverse_cols = 1.f / float(params.cols);
+    params.rowscale_const = rowscale_const;
 
     if (dropout_p > 0.f) {
         // number of times random will be generated per thread, to offset philox counter in thc random
@@ -230,8 +257,12 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
                                            const at::Tensor &rsigma, // BxS, FP32!
                                            const at::Tensor &gamma,   // hidden_size
                                            c10::optional<const at::Tensor> &rowscale_,      // BxS
-                                           c10::optional<const at::Tensor> &colscale_,      // BxS
+                                           c10::optional<const at::Tensor> &colscale_,      // hidden_size
+                                           c10::optional<const at::Tensor> &x0_subset_,      // BxS
+                                           c10::optional<const at::Tensor> &z_subset_,      // BxS
                                            const float dropout_p,
+                                           const float rowscale_const,
+                                           const int64_t x0_numrows,
                                            const bool has_residual
 ) {
 
@@ -259,9 +290,16 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
 
     auto sizes = x.sizes();
     TORCH_CHECK(sizes.size() == 2);
-    TORCH_CHECK(dz.sizes() == sizes);
     auto rows = sizes[0];
     auto cols = sizes[1];
+    TORCH_CHECK(dz.dim() == 2);
+    TORCH_CHECK(dz.size(1) == cols);
+
+    // c10::IntArrayRef does not own the storage, so we need to construct a vector.
+    // Otherwise just constructing IntArrayRef({blah}) will cause unintialized memory because
+    // blah is then deallocated.
+    std::vector<int64_t> x0_sizes_vec {!x0_subset_.has_value() ? rows : x0_numrows, cols};
+    auto x0_sizes = c10::IntArrayRef(x0_sizes_vec);
 
     if (dx_.has_value()) {
         auto dx = dx_.value();
@@ -276,14 +314,14 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
         TORCH_CHECK(dmask.dtype() == mtype);
         TORCH_CHECK(dmask.is_cuda());
         TORCH_CHECK(dmask.is_contiguous());
-        TORCH_CHECK(dmask.sizes() == sizes);
+        TORCH_CHECK(dmask.sizes() == x0_sizes);
     }
 
     if (rowscale_.has_value()) {
         auto rowscale = rowscale_.value();
         TORCH_CHECK(rowscale.is_cuda())
         TORCH_CHECK(rowscale.is_contiguous());
-        TORCH_CHECK(rowscale.sizes() == std::vector<int64_t>{rows});
+        TORCH_CHECK(rowscale.sizes() == c10::IntArrayRef{rows});
         TORCH_CHECK(rowscale.dtype() == itype);
     }
 
@@ -291,15 +329,30 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
         auto colscale = colscale_.value();
         TORCH_CHECK(colscale.is_cuda())
         TORCH_CHECK(colscale.is_contiguous());
-        TORCH_CHECK(colscale.sizes() == std::vector<int64_t>{cols});
+        TORCH_CHECK(colscale.sizes() == c10::IntArrayRef{cols});
         TORCH_CHECK(colscale.dtype() == wtype);
 
         TORCH_CHECK(x0_.has_value());
         auto x0 = x0_.value();
         TORCH_CHECK(x0.is_cuda())
         TORCH_CHECK(x0.is_contiguous());
-        TORCH_CHECK(x0.sizes() == sizes);
+        TORCH_CHECK(x0.sizes() == x0_sizes);
         TORCH_CHECK(x0.dtype() == itype);
+    }
+
+    if (x0_subset_.has_value()) {
+        auto x0_subset = x0_subset_.value();
+        TORCH_CHECK(x0_subset.is_cuda())
+        TORCH_CHECK(x0_subset.is_contiguous());
+        TORCH_CHECK(x0_subset.sizes() == c10::IntArrayRef{rows});
+        TORCH_CHECK(x0_subset.dtype() == torch::kInt32);
+
+        TORCH_CHECK(z_subset_.has_value());
+        auto z_subset = z_subset_.value();
+        TORCH_CHECK(z_subset.is_cuda());
+        TORCH_CHECK(z_subset.is_contiguous());
+        TORCH_CHECK(z_subset.sizes() == c10::IntArrayRef{rows});
+        TORCH_CHECK(z_subset.dtype() == torch::kInt32);
     }
 
     auto hidden_size = gamma.numel();
@@ -313,7 +366,7 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
 
     auto opts = x.options();
 
-    auto dx0 = torch::empty_like(x, opts.dtype(itype));
+    auto dx0 = torch::empty(x0_sizes, opts.dtype(itype));
     at::Tensor dx1;
     if (has_residual) { dx1 = torch::empty_like(x, opts.dtype(rtype)); }
     auto dgamma = torch::empty_like(gamma);
@@ -331,6 +384,8 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
     launch_params.params.dx1 = has_residual ? dx1.data_ptr() : nullptr;
     launch_params.params.rowscale = rowscale_.has_value() ? rowscale_.value().data_ptr() : nullptr;
     launch_params.params.colscale = colscale_.has_value() ? colscale_.value().data_ptr() : nullptr;
+    launch_params.params.x0_subset = x0_subset_.has_value() ? x0_subset_.value().data_ptr() : nullptr;
+    launch_params.params.z_subset = z_subset_.has_value() ? z_subset_.value().data_ptr() : nullptr;
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int multiple = hidden_size <= 1536 ? 256 : (hidden_size <= 3072 ? 512 : 1024);
@@ -366,6 +421,7 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
     params.dcolscale_part = colscale_.has_value() ? dcolscale_part.data_ptr() : nullptr;
     params.dropout_scale = 1.f / (1.f - dropout_p);
     params.inverse_cols = 1.f / float(params.cols);
+    params.rowscale_const = rowscale_const;
 
     if( launch_params.barrier_size > 0 ) {
         // TODO Any way to avoid this?

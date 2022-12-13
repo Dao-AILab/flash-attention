@@ -16,7 +16,7 @@
 
 namespace layer_norm {
 
-template<typename Ktraits, bool Is_dropout, bool Has_residual, bool Has_colscale, bool Is_even_cols>
+template<typename Ktraits, bool Is_dropout, bool Has_colscale, bool Has_subset, bool Is_even_cols>
 __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) 
 void ln_fwd_kernel(FwdParams params) {
 
@@ -46,7 +46,8 @@ void ln_fwd_kernel(FwdParams params) {
     using Stats = typename Ktraits::Stats;
     using stats_t = typename Stats::stats_t;
 
-    const bool save_x = Has_residual || Is_dropout || Has_colscale || (params.rowscale != nullptr) || !(std::is_same<input_t, residual_t>::value);
+    const bool has_residual = params.x1 != nullptr;
+    const bool save_x = has_residual || Is_dropout || Has_colscale || (params.rowscale != nullptr) || Has_subset || !(std::is_same<input_t, residual_t>::value);
 
     extern __shared__ char smem_[];
 
@@ -67,6 +68,8 @@ void ln_fwd_kernel(FwdParams params) {
     compute_t *rs_ptr = static_cast<compute_t *>(params.rs);
 
     const input_t *rowscale = static_cast<input_t *>(params.rowscale);
+    const index_t *x0_subset = static_cast<index_t *>(params.x0_subset);
+    const index_t *z_subset = static_cast<index_t *>(params.z_subset);
 
     // https://github.com/pytorch/pytorch/blob/master/aten/src/ATen/native/cuda/Dropout.cu
     curandStatePhilox4_32_10_t state;
@@ -93,8 +96,12 @@ void ln_fwd_kernel(FwdParams params) {
     }
 
     for( int row = r; row < params.rows; row += params.ctas_per_col * ROWS_PER_CTA ) {
-        const compute_t rowscale_val = params.rowscale == nullptr ? 1.0f : compute_t(rowscale[row]);
-        index_t idx = row * params.cols / Ktraits::ELTS_PER_LDG + c;
+        const compute_t rowscale_val = !Has_subset ? (params.rowscale == nullptr ? 1.0f : compute_t(rowscale[row])) : params.rowscale_const;
+        const int row_x0 = !Has_subset ? row + 1 : x0_subset[row];
+        const int row_z = !Has_subset ? row + 1 : z_subset[row];
+        const bool load_x0 = !Has_subset || row_x0 > 0;
+        index_t idx_x = row * params.cols / Ktraits::ELTS_PER_LDG + c;
+        index_t idx_x0 = !Has_subset ? idx_x : (load_x0 ? (row_x0 - 1) * params.cols / Ktraits::ELTS_PER_LDG + c : 0);
         compute_t xf[LDGS * NUM_ELTS];
         #pragma unroll
         for( int it = 0; it < LDGS; it++ ) {
@@ -103,24 +110,30 @@ void ln_fwd_kernel(FwdParams params) {
                 Rvec x1;
                 Rvec x;
                 Mvec dmask;
-                x0.load_from(params.x0, idx);
-                if (Has_residual) { x1.load_from(params.x1, idx); }
+                if (load_x0) { x0.load_from(params.x0, !Has_subset ? idx_x : idx_x0); }
+                if (has_residual) { x1.load_from(params.x1, idx_x); }
                 #pragma unroll
                 for( int jt = 0; jt < NUM_ELTS; jt++ ) {
                     // TD [2022-04-22]: We're memory bound, not compute bound, so we don't need to use
                     // the more efficient curand_uniform4.
-                    mask_t keep = !Is_dropout ? true : curand_uniform(&state) <= params.dropout_keep_p;
-                    compute_t x0_ij = compute_t(x0.data.elt[jt]) * rowscale_val;
-                    x0_ij = keep ? (Is_dropout ? x0_ij * params.dropout_scale : x0_ij) : 0.0f;
-                    if (Has_colscale) { x0_ij *= compute_t(colscale[it].data.elt[jt]); }
-                    compute_t x_ij = Has_residual ? x0_ij + compute_t(x1.data.elt[jt]) : x0_ij;
+                    compute_t x_ij;
+                    if (load_x0) {
+                        mask_t keep = !Is_dropout ? true : curand_uniform(&state) <= params.dropout_keep_p;
+                        if (Is_dropout) { dmask.data.elt[jt] = keep; }
+                        compute_t x0_ij = compute_t(x0.data.elt[jt]) * rowscale_val;
+                        x0_ij = keep ? (Is_dropout ? x0_ij * params.dropout_scale : x0_ij) : 0.0f;
+                        if (Has_colscale) { x0_ij *= compute_t(colscale[it].data.elt[jt]); }
+                        x_ij = has_residual ? x0_ij + compute_t(x1.data.elt[jt]) : x0_ij;
+                    } else {
+                        x_ij = has_residual ? compute_t(x1.data.elt[jt]) : 0.f;
+                    }
                     if (save_x) { x.data.elt[jt] = x_ij; }
                     xf[it * NUM_ELTS + jt] = x_ij;
-                    if (Is_dropout) { dmask.data.elt[jt] = keep; }
                 }
-                if (save_x) { x.store_to(params.x, idx); }
-                if (Is_dropout) { dmask.store_to(params.dmask, idx); }
-                idx += VEC_COLS_PER_LDG;
+                if (save_x) { x.store_to(params.x, idx_x); }
+                if (Is_dropout && load_x0) { dmask.store_to(params.dmask, !Has_subset ? idx_x : idx_x0); }
+                idx_x += VEC_COLS_PER_LDG;
+                idx_x0 += VEC_COLS_PER_LDG;
             }
         }
 
@@ -152,20 +165,23 @@ void ln_fwd_kernel(FwdParams params) {
             rs_ptr[row] = rs;
         }
 
-        idx = row * params.cols / Ktraits::ELTS_PER_LDG + c;
-        #pragma unroll
-        for( int it = 0; it < LDGS; it++ ) {
-            if (Is_even_cols || (it < num_valid_ldgs)) {
-                Ovec z;
-                #pragma unroll
-                for( int jt = 0; jt < NUM_ELTS; jt++ ) {
-                    compute_t y_ij = compute_t(rs * (xf[it * NUM_ELTS + jt] - mu));
-                    compute_t g_ij = gamma[it].data.elt[jt];
-                    compute_t b_ij = beta[it].data.elt[jt];
-                    z.data.elt[jt] = output_t(g_ij * y_ij + b_ij);
+        const bool save_z = !Has_subset || row_z > 0;
+        if (save_z) {
+            index_t idx_z = (!Has_subset ? row : (row_z - 1)) * params.cols / Ktraits::ELTS_PER_LDG + c;
+            #pragma unroll
+            for( int it = 0; it < LDGS; it++ ) {
+                if (Is_even_cols || (it < num_valid_ldgs)) {
+                    Ovec z;
+                    #pragma unroll
+                    for( int jt = 0; jt < NUM_ELTS; jt++ ) {
+                        compute_t y_ij = compute_t(rs * (xf[it * NUM_ELTS + jt] - mu));
+                        compute_t g_ij = gamma[it].data.elt[jt];
+                        compute_t b_ij = beta[it].data.elt[jt];
+                        z.data.elt[jt] = output_t(g_ij * y_ij + b_ij);
+                    }
+                    z.store_to(params.z, idx_z);
+                    idx_z += VEC_COLS_PER_LDG;
                 }
-                z.store_to(params.z, idx);
-                idx += VEC_COLS_PER_LDG;
             }
         }
 
@@ -203,14 +219,14 @@ void launch_(LaunchParams<FwdParams> &launch_params, const bool configure_params
                                         WARPS_N,
                                         BYTES_PER_LDG
                                         >;
-    bool has_residual = launch_params.params.x1 != nullptr;
     bool has_colscale = launch_params.params.colscale != nullptr;
+    bool has_subset = launch_params.params.x0_subset != nullptr;
     bool is_even_cols = launch_params.params.cols == HIDDEN_SIZE;
     BOOL_SWITCH(launch_params.params.dropout_keep_p < 1.f, IsDropoutConst, [&] {
-        BOOL_SWITCH(has_residual, HasResidualConst, [&] {
-            BOOL_SWITCH(has_colscale, HasColscaleConst, [&] {
-                BOOL_SWITCH(is_even_cols, IsEvenColsConst, [&] {
-                    auto kernel = &ln_fwd_kernel<Kernel_traits, IsDropoutConst, HasResidualConst, HasColscaleConst, IsEvenColsConst>;
+        BOOL_SWITCH(has_colscale, HasColscaleConst, [&] {
+            BOOL_SWITCH(has_subset, HasSubsetConst, [&] {
+                    BOOL_SWITCH(is_even_cols, IsEvenColsConst, [&] {
+                        auto kernel = &ln_fwd_kernel<Kernel_traits, IsDropoutConst, HasColscaleConst, HasSubsetConst, IsEvenColsConst>;
                     if( configure_params ) {
                         int ctas_per_sm;
                         CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
