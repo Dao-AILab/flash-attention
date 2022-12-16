@@ -18,6 +18,9 @@ PR or email us. We'd very much like to hear from you!
 - Microsoft's [DeepSpeed](https://github.com/microsoft/DeepSpeed):
   FlashAttention is [integrated](https://github.com/microsoft/DeepSpeed/blob/ec13da6ba7cabc44bb4745a64a208b8580792954/deepspeed/ops/transformer/inference/triton_ops.py) into DeepSpeed's inference engine.
 
+- Nvidia's [Megatron-LM](https://github.com/NVIDIA/Megatron-LM/pull/267). This
+  library is a popular framework on training large transformer language models at scale.
+
 - MosaicML [Composer](https://github.com/mosaicml/composer)
   [library](https://www.mosaicml.com/blog/gpt-3-quality-for-500k). Composer is a
   library for efficient neural network training.
