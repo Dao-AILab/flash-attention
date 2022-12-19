@@ -200,6 +200,10 @@ class DropoutAddLayerNormSubsetFn(torch.autograd.Function):
                 None, None)
 
 
+def layer_norm(x, weight, bias, epsilon):
+    return DropoutAddLayerNormFn.apply(x, None, weight, bias, None, None, 0.0, epsilon, False)
+
+
 def dropout_add_layer_norm(x0, x1, weight, bias, dropout_p, epsilon, rowscale=None, layerscale=None,
                            prenorm=False, residual_in_fp32=False,
                            return_dropout_mask=False):

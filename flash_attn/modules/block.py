@@ -23,10 +23,16 @@ class Block(nn.Module):
 
     def __init__(self, dim, mixer_cls=None, mlp_cls=None, norm_cls=nn.LayerNorm,
                  dropout_cls=nn.Dropout, prenorm=True, resid_dropout=0., drop_path=0.,
-                 fused_dropout_add_ln=False):
+                 fused_dropout_add_ln=False, return_residual=False):
+        """
+        return_residual: whether each of the sub-layers (mixer and mlp) will return the residual.
+        This is for performance reason: for post-norm architecture, returning the input allows us
+        to fuse the backward of nn.Linear with the residual connection.
+        """
         super().__init__()
         self.prenorm = prenorm
         self.fused_dropout_add_ln = fused_dropout_add_ln
+        self.return_residual = return_residual
         if mixer_cls is None:
             mixer_cls = partial(MHA, num_heads=dim // 64)
         if mlp_cls is None:
@@ -92,8 +98,11 @@ class Block(nn.Module):
             return hidden_states, residual
         else:
             assert residual is None
-            mixer_out = self.mixer(hidden_states,
-                                   **(mixer_kwargs if mixer_kwargs is not None else {}))
+            mixer_out = self.mixer(
+                hidden_states, **(mixer_kwargs if mixer_kwargs is not None else {})
+            )
+            if self.return_residual:  # mixer out is actually a pair here
+                mixer_out, hidden_states = mixer_out
             if not self.fused_dropout_add_ln:
                 hidden_states = self.norm1((self.drop_path1(self.dropout1(mixer_out))
                                             + hidden_states).to(dtype=self.norm1.weight.dtype))
@@ -111,6 +120,8 @@ class Block(nn.Module):
                 )
             if not isinstance(self.mlp, nn.Identity):
                 mlp_out = self.mlp(hidden_states)
+                if self.return_residual:  # mlp out is actually a pair here
+                    mlp_out, hidden_states = mlp_out
                 if not self.fused_dropout_add_ln:
                     hidden_states = self.norm2((self.drop_path2(self.dropout2(mlp_out))
                                                 + hidden_states).to(dtype=self.norm2.weight.dtype))

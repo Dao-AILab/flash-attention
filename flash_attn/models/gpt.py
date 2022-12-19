@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers.models.gpt2.configuration_gpt2 import GPT2Config
+from transformers import GPT2Config
 
 from flash_attn.modules.mha import MHA
 from flash_attn.modules.mlp import Mlp, FusedDenseGeluDense

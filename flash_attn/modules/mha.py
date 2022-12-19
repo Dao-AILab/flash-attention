@@ -53,28 +53,49 @@ class FlashSelfAttention(nn.Module):
         self.dropout_p = attention_dropout
         self.triton = triton
 
-    def forward(self, qkv):
+    def forward(self, qkv, cu_seqlens=None, max_seqlen=None):
         """Implements the multihead softmax attention.
         Arguments
         ---------
-            qkv: The tensor containing the query, key, and value. (B, S, 3, H, D)
+            qkv: The tensor containing the query, key, and value.
+                If cu_seqlens is None and max_seqlen is None, then qkv has shape (B, S, 3, H, D).
+                If cu_seqlens is not None and max_seqlen is not None, then qkv has shape
+                (total, 3, H, D), where total is the sum of the sequence lengths in the batch.
+            cu_seqlens: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+                of the sequences in the batch, used to index into qkv.
+            max_seqlen: int. Maximum sequence length in the batch.
+        Returns:
+        --------
+            out: (total, H, D) if cu_seqlens is not None and max_seqlen is not None,
+                else (B, S, H, D).
         """
         assert qkv.dtype in [torch.float16, torch.bfloat16]
         assert qkv.is_cuda
-        batch_size, seqlen = qkv.shape[0], qkv.shape[1]
-        if self.triton and (self.dropout_p == 0 or not self.training):  # Triton version doesn't support dropout
-            output = flash_attn_qkvpacked_func(qkv, None, self.causal, self.softmax_scale)
-        else:
-            qkv = rearrange(qkv, 'b s ... -> (b s) ...')
-            max_s = seqlen
-            cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32,
-                                    device=qkv.device)
-            output = flash_attn_unpadded_qkvpacked_func(
-                qkv, cu_seqlens, max_s, self.dropout_p if self.training else 0.0,
+        unpadded = cu_seqlens is not None
+        if unpadded:
+            assert cu_seqlens.dtype == torch.int32
+            assert max_seqlen is not None
+            assert isinstance(max_seqlen, int)
+            return flash_attn_unpadded_qkvpacked_func(
+                qkv, cu_seqlens, max_seqlen, self.dropout_p if self.training else 0.0,
                 softmax_scale=self.softmax_scale, causal=self.causal
             )
-            output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
-        return output
+        else:
+            batch_size, seqlen = qkv.shape[0], qkv.shape[1]
+            # Triton version doesn't support dropout
+            if self.triton and (self.dropout_p == 0 or not self.training):
+                output = flash_attn_qkvpacked_func(qkv, None, self.causal, self.softmax_scale)
+            else:
+                qkv = rearrange(qkv, 'b s ... -> (b s) ...')
+                max_seqlen = seqlen
+                cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32,
+                                        device=qkv.device)
+                output = flash_attn_unpadded_qkvpacked_func(
+                    qkv, cu_seqlens, max_seqlen, self.dropout_p if self.training else 0.0,
+                    softmax_scale=self.softmax_scale, causal=self.causal
+                )
+                output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
+            return output
 
 
 class FlashCrossAttention(nn.Module):
@@ -146,16 +167,24 @@ class SelfAttention(nn.Module):
         self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
 
-    def forward(self, qkv):
+    def forward(self, qkv, key_padding_mask=None):
         """Implements the multihead softmax attention.
         Arguments
         ---------
             qkv: The tensor containing the query, key, and value. (B, S, 3, H, D)
+            key_padding_mask: boolean mask to apply to the attention weights. True means to keep,
+                False means to mask out. (B, S)
         """
         batch_size, seqlen = qkv.shape[0], qkv.shape[1]
         q, k, v = qkv.unbind(dim=2)
         softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
         scores = torch.einsum('bthd,bshd->bhts', q, k * softmax_scale)
+        if key_padding_mask is not None:
+            padding_mask = torch.full((batch_size, seqlen), -10000.0, dtype=scores.dtype,
+                                      device=scores.device)
+            padding_mask.masked_fill_(key_padding_mask, 0.0)
+            # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
+            scores = scores + rearrange(padding_mask, 'b s -> b 1 1 s')
         if self.causal:
             # "triu_tril_cuda_template" not implemented for 'BFloat16'
             # So we have to construct the mask in float
@@ -239,6 +268,7 @@ class MHA(nn.Module):
         self.causal = causal
         self.dwconv = dwconv
         self.rotary_emb_dim = rotary_emb_dim
+        self.use_flash_attn = use_flash_attn
         self.return_residual = return_residual
         self.checkpointing = checkpointing
 
@@ -279,12 +309,35 @@ class MHA(nn.Module):
         # output projection always have the bias (for now)
         self.out_proj = linear_cls(embed_dim, embed_dim, **factory_kwargs)
 
-    def forward(self, x, x_kv=None):
+    def forward(self, x, x_kv=None, cu_seqlens=None, max_seqlen=None, key_padding_mask=None):
         """
         Arguments:
-            x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim)
+            x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim) if
+                cu_seqlens is None and max_seqlen is None, else (total, hidden_dim) where total
+                is the is the sum of the sequence lengths in the batch.
             x_kv: (batch, seqlen, hidden_dim), only applicable for cross-attention. If None, use x.
+            cu_seqlens: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+                of the sequences in the batch, used to index into x. Only applicable when using
+                FlashAttention.
+            max_seqlen: int. Maximum sequence length in the batch.
+            key_padding_mask: boolean mask, True means to keep, False means to mask out.
+                (batch, seqlen). Only applicable when not using FlashAttention.
         """
+        if cu_seqlens is not None:
+            assert max_seqlen is not None
+            assert key_padding_mask is None
+            assert self.use_flash_attn
+            assert not self.cross_attn, ('Unpadded FlashAttention code path for cross-attention'
+                                         'is not implemented yet')
+            assert not self.dwconv
+            assert self.rotary_emb_dim == 0
+        if key_padding_mask is not None:
+            assert cu_seqlens is None
+            assert max_seqlen is None
+            assert not self.use_flash_attn
+            assert not self.cross_attn, ('Key padding mask code path for cross-attention'
+                                         'is not implemented yet')
+
         if not self.cross_attn:
             if not self.return_residual:
                 qkv = self.Wqkv(x)
@@ -293,14 +346,15 @@ class MHA(nn.Module):
             if self.dwconv:
                 qkv = rearrange(self.dwconv_qkv(rearrange(qkv, 'b s d -> b d s'))[..., :-2],
                                 'b d s -> b s d').contiguous()
-            qkv = rearrange(qkv, 'b s (three h d) -> b s three h d', three=3, h=self.num_heads)
+            qkv = rearrange(qkv, '... (three h d) -> ... three h d', three=3, h=self.num_heads)
             if self.rotary_emb_dim > 0:
                 qkv = self.rotary_emb(qkv)
+            extra_kwargs = ({'cu_seqlens': cu_seqlens, 'max_seqlen': max_seqlen}
+                            if self.use_flash_attn else {'key_padding_mask': key_padding_mask})
             if not self.checkpointing:
-                context = self.inner_attn(qkv)
+                context = self.inner_attn(qkv, **extra_kwargs)
             else:
-                # context = torch.utils.checkpoint.checkpoint(self._inner_attention, qkv)
-                context = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv)
+                context = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv, **extra_kwargs)
         else:
             q = rearrange(self.Wq(x), 'b s (h d) -> b s h d', h=self.num_heads)
             kv = rearrange(self.Wkv(x if x_kv is None else x_kv), 'b s (two h d) -> b s two h d',
@@ -313,7 +367,6 @@ class MHA(nn.Module):
             if not self.checkpointing:
                 context = self.inner_attn(q, kv)
             else:
-                # context = torch.utils.checkpoint.checkpoint(self._inner_attention, qkv)
                 context = torch.utils.checkpoint.checkpoint(self.inner_attn, q, kv)
-        out = self.out_proj(rearrange(context, 'b s h d -> b s (h d)'))
+        out = self.out_proj(rearrange(context, '... h d -> ... (h d)'))
         return out if not self.return_residual else (out, x)
