@@ -30,5 +30,4 @@ python -c 'import torch;print(torch.utils.cmake_prefix_path)'
 ```
 to find your path.
 
-"build.sh" is a compile script to compile the example above, cannot be used now, need to be improved.
 
