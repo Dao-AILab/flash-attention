@@ -53,15 +53,12 @@ def test_bert_non_optimized(model_name):
     """
     dtype = torch.float16
     config = BertConfig.from_pretrained(model_name)
-    # Our implementation assumes the activation is nn.GELU(approximate='tanh')
-    # Huggingface calls it "gelu_new" or "gelu_fast".
-    config.hidden_act = "gelu_new"
 
     model = BertForPreTraining.from_pretrained(model_name, config)
     model = model.cuda().to(dtype=dtype)
 
     model_ref = get_hf_models(model_name, config, torch.float32)
-    model_hf = get_hf_models(model_name, config, torch.float16)
+    model_hf = get_hf_models(model_name, config, dtype)
 
     model.eval()
     model_ref.eval()
@@ -74,7 +71,8 @@ def test_bert_non_optimized(model_name):
     attention_mask = torch.arange(max_seqlen, device='cuda')[None, :] < seqlens[:, None]
     input_ids = torch.randint(0, config.vocab_size, (batch_size, max_seqlen), dtype=torch.long,
                               device='cuda')
-    sequence_output, pooled_output = model.bert(input_ids, attention_mask=attention_mask)
+    out = model.bert(input_ids, attention_mask=attention_mask)
+    sequence_output, pooled_output = out.last_hidden_state, out.pooler_output
     out_hf = model_hf.bert(input_ids, attention_mask=attention_mask)
     sequence_output_hf, pooled_output_hf = out_hf.last_hidden_state, out_hf.pooler_output
     out_ref = model_ref.bert(input_ids, attention_mask=attention_mask)
@@ -84,8 +82,8 @@ def test_bert_non_optimized(model_name):
     print(f'Output mean diff: {(sequence_output - sequence_output_ref).abs().mean().item()}')
     print(f'HF fp16 max diff: {(sequence_output_hf - sequence_output_ref).abs().max().item()}')
     print(f'HF fp16 mean diff: {(sequence_output_hf - sequence_output_ref).abs().mean().item()}')
-    assert (sequence_output - sequence_output_ref).abs().max().item() < 2 * (sequence_output_hf - sequence_output_ref).abs().max().item()
-    assert (pooled_output - pooled_output_ref).abs().max().item() < 2 * (pooled_output_hf - pooled_output_ref).abs().max().item()
+    assert (sequence_output - sequence_output_ref).abs().max().item() < 3 * (sequence_output_hf - sequence_output_ref).abs().max().item()
+    assert (pooled_output - pooled_output_ref).abs().max().item() < 3 * (pooled_output_hf - pooled_output_ref).abs().max().item()
 
 
 @pytest.mark.parametrize('model_name', ["bert-base-uncased", "bert-large-uncased"])
@@ -97,8 +95,9 @@ def test_bert_optimized(model_name):
     """
     dtype = torch.float16
     config = BertConfig.from_pretrained(model_name)
-    # Our implementation assumes the activation is nn.GELU(approximate='tanh')
-    # Huggingface calls it "gelu_new" or "gelu_fast".
+    # Our implementation of fused_dense_gelu_dense assumes the activation is
+    # nn.GELU(approximate='tanh'). Huggingface calls it "gelu_new" or "gelu_fast".
+    # If you just want "gelu", disable fused_dense_gelu_dense.
     config.hidden_act = "gelu_new"
     config.use_flash_attn = True
     config.fused_bias_fc = True
@@ -109,7 +108,7 @@ def test_bert_optimized(model_name):
     model = model.cuda().to(dtype=dtype)
 
     model_ref = get_hf_models(model_name, config, torch.float32)
-    model_hf = get_hf_models(model_name, config, torch.float16)
+    model_hf = get_hf_models(model_name, config, dtype)
 
     model.eval()
     model_ref.eval()
@@ -122,7 +121,8 @@ def test_bert_optimized(model_name):
     attention_mask = torch.arange(max_seqlen, device='cuda')[None, :] < seqlens[:, None]
     input_ids = torch.randint(0, config.vocab_size, (batch_size, max_seqlen), dtype=torch.long,
                               device='cuda')
-    sequence_output, pooled_output = model.bert(input_ids, attention_mask=attention_mask)
+    out = model.bert(input_ids, attention_mask=attention_mask)
+    sequence_output, pooled_output = out.last_hidden_state, out.pooler_output
     out_hf = model_hf.bert(input_ids, attention_mask=attention_mask)
     sequence_output_hf, pooled_output_hf = out_hf.last_hidden_state, out_hf.pooler_output
     # Need to zero out the padded tokens in the sequence before comparison.
@@ -138,7 +138,8 @@ def test_bert_optimized(model_name):
     assert (sequence_output - sequence_output_ref).abs().max().item() < 4 * (sequence_output_hf - sequence_output_ref).abs().max().item()
     assert (pooled_output - pooled_output_ref).abs().max().item() < 4 * (pooled_output_hf - pooled_output_ref).abs().max().item()
 
-    prediction_scores, seq_relationship_scores = model(input_ids, attention_mask=attention_mask)
+    out = model(input_ids, attention_mask=attention_mask)
+    prediction_scores, seq_relationship_scores = out.prediction_logits, out.seq_relationship_logits
     # Need to zero out the padded tokens in the sequence before comparison.
     prediction_scores = prediction_scores.clone()
     prediction_scores[~attention_mask, :] = 0.0
@@ -157,30 +158,36 @@ def test_bert_optimized(model_name):
     assert (seq_relationship_scores - seq_relationship_scores_ref).abs().max().item() < 2 * (seq_relationship_scores_hf - seq_relationship_scores_ref).abs().max().item()
 
 
+@pytest.mark.parametrize('last_layer_subset', [False, True])
+# @pytest.mark.parametrize('last_layer_subset', [True])
+@pytest.mark.parametrize('has_key_padding_mask', [True, False])
+# @pytest.mark.parametrize('has_key_padding_mask', [True])
 @pytest.mark.parametrize('model_name', ["bert-base-uncased", "bert-large-uncased"])
 # @pytest.mark.parametrize('model_name', ["bert-base-uncased"])
-def test_bert_dense_seq_output(model_name):
+def test_bert_dense_seq_output(model_name, has_key_padding_mask, last_layer_subset):
     """Check that our implementation of BERT (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
     forward pass in fp16, when compared to the HF forward pass in fp32.
     """
     dtype = torch.float16
     config = BertConfig.from_pretrained(model_name)
-    # Our implementation assumes the activation is nn.GELU(approximate='tanh')
-    # Huggingface calls it "gelu_new" or "gelu_fast".
+    # Our implementation of fused_dense_gelu_dense assumes the activation is
+    # nn.GELU(approximate='tanh'). Huggingface calls it "gelu_new" or "gelu_fast".
+    # If you just want "gelu", disable fused_dense_gelu_dense.
     config.hidden_act = "gelu_new"
     config.use_flash_attn = True
     config.fused_bias_fc = True
     config.fused_dense_gelu_dense = True
     config.fused_dropout_add_ln = True
     config.dense_seq_output = True
+    config.last_layer_subset = last_layer_subset
     config.use_xentropy = True
 
     model = BertForPreTraining.from_pretrained(model_name, config)
     model = model.cuda().to(dtype=dtype)
 
     model_ref = get_hf_models(model_name, config, torch.float32)
-    model_hf = get_hf_models(model_name, config, torch.float16)
+    model_hf = get_hf_models(model_name, config, dtype)
 
     model.eval()
     model_ref.eval()
@@ -190,19 +197,25 @@ def test_bert_dense_seq_output(model_name):
     batch_size = 4
     max_seqlen = 512
     seqlens = torch.randint(max_seqlen // 2, max_seqlen + 1, (batch_size,), device='cuda')
-    attention_mask = torch.arange(max_seqlen, device='cuda')[None, :] < seqlens[:, None]
+    if has_key_padding_mask:
+        attention_mask = torch.arange(max_seqlen, device='cuda')[None, :] < seqlens[:, None]
+    else:
+        attention_mask = None
     input_ids = torch.randint(0, config.vocab_size, (batch_size, max_seqlen), dtype=torch.long,
                               device='cuda')
     labels = torch.randint(0, config.vocab_size, (batch_size, max_seqlen), dtype=torch.long,
                            device='cuda')
-    labels[(torch.rand(batch_size, max_seqlen, device='cuda') < 0.15) | ~attention_mask] = 0
+    if attention_mask is not None:
+        labels[~attention_mask] = 0
+    labels[(torch.rand(batch_size, max_seqlen, device='cuda') > 0.15)] = 0
     masked_tokens_mask = labels.flatten() > 0
     next_sequence_label = torch.randint(0, 2, (batch_size,), device='cuda')
 
-    total_loss, prediction_scores, seq_relationship_scores, _, _ = model(
+    out = model(
         input_ids, attention_mask=attention_mask,
         labels=labels, next_sentence_label=next_sequence_label
     )
+    prediction_scores, seq_relationship_scores = out.prediction_logits, out.seq_relationship_logits
     out_hf = model_hf(input_ids, attention_mask=attention_mask,
                       labels=labels, next_sentence_label=next_sequence_label)
     prediction_scores_hf, seq_relationship_scores_hf = out_hf.prediction_logits, out_hf.seq_relationship_logits
@@ -217,3 +230,6 @@ def test_bert_dense_seq_output(model_name):
     print(f'HF fp16 prediction_scoresff: {(prediction_scores_hf - prediction_scores_ref).abs().max().item()}')
     print(f'HF fp16 prediction_scoresiff: {(prediction_scores_hf - prediction_scores_ref).abs().mean().item()}')
     assert (prediction_scores - prediction_scores_ref).abs().max().item() < 2 * (prediction_scores_hf - prediction_scores_ref).abs().max().item()
+    assert (seq_relationship_scores - seq_relationship_scores_ref).abs().max().item() < 2 * (seq_relationship_scores_hf - seq_relationship_scores_ref).abs().max().item()
+    # The loss calculation from HF is wrong: it doesn't ignore the labels that are 0.
+    # assert (out.loss - out_ref.loss).abs().max().item() < 2 * (out_hf.loss - out_ref.loss).abs().max().item()
