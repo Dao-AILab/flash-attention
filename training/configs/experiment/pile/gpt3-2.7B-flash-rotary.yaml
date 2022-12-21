@@ -11,7 +11,7 @@ model:
     mlp_checkpoint_lvl: 0
 
 datamodule:
-  batch_size: ${eval:"4 if ${train.gpu_mem} < 24 else (8 if ${train.gpu_mem} < 40 else (16 if ${train.gpu} < 80 else 32))"}
+  batch_size: ${eval:"4 if ${train.gpu_mem} < 24 else (8 if ${train.gpu_mem} < 40 else (16 if ${train.gpu_mem} < 80 else 32))"}
 
 train:
   optimizer:
