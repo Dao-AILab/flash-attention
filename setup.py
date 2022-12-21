@@ -8,7 +8,7 @@ from setuptools import setup, find_packages
 import subprocess
 
 import torch
-from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
+from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, ROCM_HOME, CUDA_HOME
 
 
 with open("README.md", "r", encoding="utf-8") as fh:
@@ -18,6 +18,15 @@ with open("README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
+# ##JCG update check from apex
+# def check_if_rocm_pytorch():
+#     is_rocm_pytorch = False
+#     if TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 5):
+#         from torch.utils.cpp_extension import ROCM_HOME
+#         is_rocm_pytorch = True if ((torch.version.hip is not None) and (ROCM_HOME is not None)) else False
+#     return is_rocm_pytorch
+
+# IS_ROCM_PYTORCH = check_if_rocm_pytorch()
 
 def get_cuda_bare_metal_version(cuda_dir):
     raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
@@ -60,37 +69,47 @@ def raise_if_cuda_home_none(global_option: str) -> None:
 
 
 def append_nvcc_threads(nvcc_extra_args):
-    _, bare_metal_major, bare_metal_minor = get_cuda_bare_metal_version(CUDA_HOME)
-    if int(bare_metal_major) >= 11 and int(bare_metal_minor) >= 2:
-        return nvcc_extra_args + ["--threads", "4"]
+    # _, bare_metal_major, bare_metal_minor = get_cuda_bare_metal_version(CUDA_HOME)
+    # if int(bare_metal_major) >= 11 and int(bare_metal_minor) >= 2:
+    #     return nvcc_extra_args + ["--threads", "4"]
     return nvcc_extra_args
 
 
-if not torch.cuda.is_available():
-    # https://github.com/NVIDIA/apex/issues/486
-    # Extension builds after https://github.com/pytorch/pytorch/pull/23408 attempt to query torch.cuda.get_device_capability(),
-    # which will fail if you are compiling in an environment without visible GPUs (e.g. during an nvidia-docker build command).
-    print(
-        "\nWarning: Torch did not find available GPUs on this system.\n",
-        "If your intention is to cross-compile, this is not an error.\n"
-        "By default, We cross-compile for Volta (compute capability 7.0), "
-        "Turing (compute capability 7.5),\n"
-        "and, if the CUDA version is >= 11.0, Ampere (compute capability 8.0).\n"
-        "If you wish to cross-compile for a single specific architecture,\n"
-        'export TORCH_CUDA_ARCH_LIST="compute capability" before running setup.py.\n',
-    )
-    if os.environ.get("TORCH_CUDA_ARCH_LIST", None) is None:
-        _, bare_metal_major, bare_metal_minor = get_cuda_bare_metal_version(CUDA_HOME)
-        if int(bare_metal_major) == 11:
-            os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0"
-            if int(bare_metal_minor) > 0:
-                os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0;8.6"
-        else:
-            os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5"
+# if not torch.cuda.is_available():
+#     # https://github.com/NVIDIA/apex/issues/486
+#     # Extension builds after https://github.com/pytorch/pytorch/pull/23408 attempt to query torch.cuda.get_device_capability(),
+#     # which will fail if you are compiling in an environment without visible GPUs (e.g. during an nvidia-docker build command).
+#     print(
+#         "\nWarning: Torch did not find available GPUs on this system.\n",
+#         "If your intention is to cross-compile, this is not an error.\n"
+#         "By default, We cross-compile for Volta (compute capability 7.0), "
+#         "Turing (compute capability 7.5),\n"
+#         "and, if the CUDA version is >= 11.0, Ampere (compute capability 8.0).\n"
+#         "If you wish to cross-compile for a single specific architecture,\n"
+#         'export TORCH_CUDA_ARCH_LIST="compute capability" before running setup.py.\n',
+#     )
+#     if os.environ.get("TORCH_CUDA_ARCH_LIST", None) is None:
+#         _, bare_metal_major, bare_metal_minor = get_cuda_bare_metal_version(CUDA_HOME)
+#         if int(bare_metal_major) == 11:
+#             os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0"
+#             if int(bare_metal_minor) > 0:
+#                 os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0;8.6"
+#         else:
+#             os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5"
 
 print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
 TORCH_MAJOR = int(torch.__version__.split(".")[0])
 TORCH_MINOR = int(torch.__version__.split(".")[1])
+
+##JCG update check from apex
+def check_if_rocm_pytorch():
+    is_rocm_pytorch = False
+    if TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 5):
+        from torch.utils.cpp_extension import ROCM_HOME
+        is_rocm_pytorch = True if ((torch.version.hip is not None) and (ROCM_HOME is not None)) else False
+    return is_rocm_pytorch
+
+IS_ROCM_PYTORCH = check_if_rocm_pytorch()
 
 cmdclass = {}
 ext_modules = []
@@ -102,50 +121,50 @@ torch_dir = torch.__path__[0]
 if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
     generator_flag = ["-DOLD_GENERATOR_PATH"]
 
-raise_if_cuda_home_none("flash_attn")
-# Check, if CUDA11 is installed for compute capability 8.0
+# raise_if_cuda_home_none("flash_attn")
+# # Check, if CUDA11 is installed for compute capability 8.0
 cc_flag = []
-_, bare_metal_major, _ = get_cuda_bare_metal_version(CUDA_HOME)
-if int(bare_metal_major) < 11:
-    raise RuntimeError("FlashAttention is only supported on CUDA 11")
+# _, bare_metal_major, _ = get_cuda_bare_metal_version(CUDA_HOME)
+# if int(bare_metal_major) < 11:
+#     raise RuntimeError("FlashAttention is only supported on CUDA 11")
 cc_flag.append("-gencode")
 cc_flag.append("arch=compute_75,code=sm_75")
 cc_flag.append("-gencode")
 cc_flag.append("arch=compute_80,code=sm_80")
 
-subprocess.run(["git", "submodule", "update", "--init", "csrc/flash_attn/cutlass"])
+subprocess.run(["git", "submodule", "update", "--init", "csrc/flash_attn_rocm/composable_kernel"])
 ext_modules.append(
     CUDAExtension(
         name="flash_attn_cuda",
         sources=[
-            "csrc/flash_attn/fmha_api.cpp",
-            "csrc/flash_attn/src/fmha_fprop_fp16_kernel.sm80.cu",
-            "csrc/flash_attn/src/fmha_dgrad_fp16_kernel_loop.sm80.cu",
-            "csrc/flash_attn/src/fmha_block_fprop_fp16_kernel.sm80.cu",
-            "csrc/flash_attn/src/fmha_block_dgrad_fp16_kernel_loop.sm80.cu",
+            "csrc/flash_attn_rocm/fmha_api.cpp",
+            "csrc/flash_attn_rocm/src/fmha_fprop_fp16_bf16_kernel.gfx90a.cpp",
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"] + generator_flag,
-            "nvcc": append_nvcc_threads(
+            "nvcc":
                 [
                     "-O3",
                     "-std=c++17",
-                    "-U__CUDA_NO_HALF_OPERATORS__",
-                    "-U__CUDA_NO_HALF_CONVERSIONS__",
+                    "-U__HIP_NO_HALF_OPERATORS__",
+                    "-U__HIP_NO_HALF_CONVERSIONS__",
                     "--expt-relaxed-constexpr",
                     "--expt-extended-lambda",
-                    "--use_fast_math",
-                    "--ptxas-options=-v",
-                    "-lineinfo"
+                    "--use_fast_math"
                 ]
                 + generator_flag
                 + cc_flag
-            ),
+            ,
         },
         include_dirs=[
-            Path(this_dir) / 'csrc' / 'flash_attn',
-            Path(this_dir) / 'csrc' / 'flash_attn' / 'src',
-            Path(this_dir) / 'csrc' / 'flash_attn' / 'cutlass' / 'include',
+            Path(this_dir) / 'csrc' / 'flash_attn_rocm',
+            Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'src',
+            Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' ,
+            # Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' ,
+            # Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'tensor_operation' / 'gpu' / 'device',
+            # Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'tensor_operation' / 'gpu' /' element',
+            # Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'library' / 'utility',
+            # Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'library' / 'reference_tensor_operation',
         ],
     )
 )
