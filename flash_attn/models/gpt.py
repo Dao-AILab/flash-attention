@@ -36,11 +36,12 @@ def create_mixer_cls(config, layer_idx=None):
         softmax_scale /= float(layer_idx + 1)
     dwconv = getattr(config, 'attn_dwconv', False)
     rotary_emb_dim = int(getattr(config, 'rotary_emb_fraction', 0.0) * head_dim)
+    rotary_emb_scale_base = getattr(config, 'rotary_emb_scale_base', 0)
     use_flash_attn = getattr(config, 'use_flash_attn', False)
     fused_bias_fc = getattr(config, 'fused_bias_fc', False)
     mixer_cls = partial(MHA, num_heads=config.num_attention_heads, dropout=config.attn_pdrop,
                         softmax_scale=softmax_scale, causal=True, dwconv=dwconv,
-                        rotary_emb_dim=rotary_emb_dim,
+                        rotary_emb_dim=rotary_emb_dim, rotary_emb_scale_base=rotary_emb_scale_base,
                         fused_bias_fc=fused_bias_fc, use_flash_attn=use_flash_attn)
     return mixer_cls
 

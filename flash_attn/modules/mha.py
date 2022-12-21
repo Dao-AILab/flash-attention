@@ -283,6 +283,7 @@ class MHA(nn.Module):
 
     def __init__(self, embed_dim, num_heads, cross_attn=False, bias=True, dropout=0.0,
                  softmax_scale=None, causal=False, dwconv=False, rotary_emb_dim=0,
+                 rotary_emb_scale_base=0,
                  fused_bias_fc=False, use_flash_attn=False, return_residual=False,
                  checkpointing=False, device=None, dtype=None) -> None:
         """
@@ -308,7 +309,7 @@ class MHA(nn.Module):
         if self.rotary_emb_dim > 0:
             assert not cross_attn, 'MHA with rotary embedding does not support cross-attention yet'
             assert RotaryEmbedding is not None, 'rotary_emb is not installed'
-            self.rotary_emb = RotaryEmbedding(self.rotary_emb_dim)
+            self.rotary_emb = RotaryEmbedding(self.rotary_emb_dim, scale_base=rotary_emb_scale_base)
 
         if fused_bias_fc and FusedDenseTD is None:
             raise ImportError('fused_dense is not installed')
