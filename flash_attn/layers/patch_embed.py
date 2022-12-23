@@ -10,9 +10,9 @@ from torch.nn.modules.utils import _pair
 from einops import rearrange
 
 try:
-    from flash_attn.ops.fused_dense import FusedDenseTD
+    from flash_attn.ops.fused_dense import FusedDense
 except ImportError:
-    FusedDenseTD = None
+    FusedDense = None
 
 
 class PatchEmbed(nn.Module):
@@ -37,10 +37,10 @@ class PatchEmbed(nn.Module):
         self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.flatten = flatten
-        if fused_bias_fc and FusedDenseTD is None:
+        if fused_bias_fc and FusedDense is None:
             raise ImportError('fused_dense is not installed')
 
-        linear_cls = nn.Linear if not fused_bias_fc or not bias else FusedDenseTD
+        linear_cls = nn.Linear if not fused_bias_fc or not bias else FusedDense
         self.proj = linear_cls(in_chans * patch_size[0] * patch_size[1], embed_dim, bias=bias)
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 

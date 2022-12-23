@@ -30,9 +30,9 @@ from flash_attn.bert_padding import unpad_input, pad_input
 from flash_attn.bert_padding import index_first_axis, index_first_axis_residual
 
 try:
-    from flash_attn.ops.fused_dense import FusedDenseTD
+    from flash_attn.ops.fused_dense import FusedDense
 except ImportError:
-    FusedDenseTD = None
+    FusedDense = None
 
 try:
     from flash_attn.ops.layer_norm import dropout_add_layer_norm, layer_norm
@@ -70,6 +70,8 @@ def create_mlp_cls(config, layer_idx=None, return_residual=False):
                           activation=partial(F.gelu, approximate=approximate),
                           return_residual=return_residual)
     else:
+        if FusedDenseGeluDense is None:
+            raise ImportError('fused_dense is not installed')
         mlp_checkpoint_lvl = getattr(config, 'mlp_checkpoint_lvl', 0)
         # mlp_checkpoint_lvl could be a list, which contains the checkpoint_lvl for each layer
         if isinstance(mlp_checkpoint_lvl, Sequence):
@@ -168,9 +170,9 @@ class BertPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
         fused_bias_fc = getattr(config, 'fused_bias_fc', False)
-        if fused_bias_fc and FusedDenseTD is None:
+        if fused_bias_fc and FusedDense is None:
             raise ImportError('fused_dense is not installed')
-        linear_cls = nn.Linear if not fused_bias_fc else FusedDenseTD
+        linear_cls = nn.Linear if not fused_bias_fc else FusedDense
         self.dense = linear_cls(config.hidden_size, config.hidden_size)
         self.activation = nn.Tanh()
 
@@ -188,12 +190,12 @@ class BertPredictionHeadTransform(nn.Module):
     def __init__(self, config):
         super().__init__()
         fused_bias_fc = getattr(config, 'fused_bias_fc', False)
-        if fused_bias_fc and FusedDenseTD is None:
+        if fused_bias_fc and FusedDense is None:
             raise ImportError('fused_dense is not installed')
         self.fused_dropout_add_ln = getattr(config, 'fused_dropout_add_ln', False)
         if self.fused_dropout_add_ln and layer_norm is None:
             raise ImportError('dropout_add_layer_norm is not installed')
-        linear_cls = nn.Linear if not fused_bias_fc else FusedDenseTD
+        linear_cls = nn.Linear if not fused_bias_fc else FusedDense
         self.dense = linear_cls(config.hidden_size, config.hidden_size)
         approximate = 'tanh' if config.hidden_act in ['gelu_new', 'gelu_fast'] else 'none'
         self.transform_act_fn = nn.GELU(approximate=approximate)
@@ -215,9 +217,9 @@ class BertLMPredictionHead(nn.Module):
     def __init__(self, config):
         super().__init__()
         fused_bias_fc = getattr(config, 'fused_bias_fc', False)
-        if fused_bias_fc and FusedDenseTD is None:
+        if fused_bias_fc and FusedDense is None:
             raise ImportError('fused_dense is not installed')
-        linear_cls = nn.Linear if not fused_bias_fc else FusedDenseTD
+        linear_cls = nn.Linear if not fused_bias_fc else FusedDense
 
         self.transform = BertPredictionHeadTransform(config)
 

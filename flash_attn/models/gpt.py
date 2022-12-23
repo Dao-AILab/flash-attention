@@ -61,6 +61,8 @@ def create_mlp_cls(config, layer_idx=None):
             assert layer_idx is not None
             mlp_checkpoint_lvl = mlp_checkpoint_lvl[layer_idx]
         if fused_dense_gelu_dense:
+            if FusedDenseGeluDense is None:
+                raise ImportError('fused_dense is not installed')
             mlp_cls = partial(FusedDenseGeluDense, hidden_features=inner_dim,
                               checkpoint_lvl=mlp_checkpoint_lvl)
         elif fused_dense_sqrelu_dense:

@@ -21,9 +21,9 @@ except ImportError:
     flash_attn_qkvpacked_func, flash_attn_kvpacked_func = None, None
 
 try:
-    from flash_attn.ops.fused_dense import FusedDenseTD, FusedDenseResidual
+    from flash_attn.ops.fused_dense import FusedDense
 except ImportError:
-    FusedDenseTD, FusedDenseResidual = None, None
+    FusedDense = None
 
 try:
     from flash_attn.layers.rotary import RotaryEmbedding
@@ -270,7 +270,7 @@ class CrossAttention(nn.Module):
 
 
 class LinearResidual(nn.Linear):
-    """Wrap nn.Linear to return the residual as well. For compatibility with FusedDenseResidual.
+    """Wrap nn.Linear to return the residual as well. For compatibility with FusedDense.
     """
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -311,10 +311,11 @@ class MHA(nn.Module):
             assert RotaryEmbedding is not None, 'rotary_emb is not installed'
             self.rotary_emb = RotaryEmbedding(self.rotary_emb_dim, scale_base=rotary_emb_scale_base)
 
-        if fused_bias_fc and FusedDenseTD is None:
+        if fused_bias_fc and FusedDense is None:
             raise ImportError('fused_dense is not installed')
-        linear_cls = nn.Linear if not fused_bias_fc else FusedDenseTD
-        linear_resid_cls = LinearResidual if not fused_bias_fc else FusedDenseResidual
+        linear_cls = nn.Linear if not fused_bias_fc else FusedDense
+        linear_resid_cls = (LinearResidual if not fused_bias_fc
+                            else partial(FusedDense, return_residual=True))
         if not self.cross_attn:
             if not self.return_residual:
                 self.Wqkv = linear_cls(embed_dim, 3 * embed_dim, bias=bias, **factory_kwargs)
