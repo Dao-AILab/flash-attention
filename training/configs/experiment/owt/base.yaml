@@ -54,7 +54,7 @@ train:
   loss_fn:
     # This is faster and uses less memory than torch.nn.CrossEntropyLoss.
     # It's also more numerically stable if we're using DeepSpeed 16 bits.
-    _target_: src.losses.cross_entropy_apex.CrossEntropyLossApex
+    _target_: src.losses.cross_entropy.CrossEntropyLoss
     inplace_backward: True  # to save memory
 
 eval:

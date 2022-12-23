@@ -40,9 +40,9 @@ except ImportError:
     dropout_add_layer_norm, layer_norm = None, None
 
 try:
-    from flash_attn.losses.cross_entropy_apex import CrossEntropyLossApex
+    from flash_attn.losses.cross_entropy import CrossEntropyLoss
 except ImportError:
-    CrossEntropyLossApex = None
+    CrossEntropyLoss = None
 
 
 logger = logging.getLogger(__name__)
@@ -374,10 +374,10 @@ class BertForPreTraining(BertPreTrainedModel):
         if self.last_layer_subset:
             assert self.dense_seq_output, 'last_layer_subset requires dense_seq_output'
         use_xentropy = getattr(config, 'use_xentropy', False)
-        if use_xentropy and CrossEntropyLossApex is None:
+        if use_xentropy and CrossEntropyLoss is None:
             raise ImportError('xentropy_cuda is not installed')
         loss_cls = (nn.CrossEntropyLoss if not use_xentropy
-                    else partial(CrossEntropyLossApex, inplace_backward=True))
+                    else partial(CrossEntropyLoss, inplace_backward=True))
 
         self.bert = BertModel(config)
         self.cls = BertPreTrainingHeads(config)
