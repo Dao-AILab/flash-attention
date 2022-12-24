@@ -2,6 +2,7 @@
 // We make it work for bfloat16
 #include <torch/extension.h>
 #include <torch/torch.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <vector>
 
 #include <stdio.h>
@@ -49,6 +50,10 @@ std::vector<at::Tensor> linear_bias_wgrad(at::Tensor input, at::Tensor d_output,
   TORCH_CHECK(d_output.is_contiguous());
   CHECK_SHAPE(input, batch_size, in_features);
   CHECK_SHAPE(d_output, batch_size, out_features);
+
+  // Otherwise the kernel will be launched from cuda:0 device
+  // Cast to char to avoid compiler warning about narrowing
+  at::cuda::CUDAGuard device_guard{(char)input.get_device()};
 
   // create output/workspace tensor
   auto opts = input.options();
@@ -104,6 +109,10 @@ std::vector<at::Tensor> linear_gelu_forward(at::Tensor input, at::Tensor weight,
     CHECK_SHAPE(bias, out_features);
   }
 
+  // Otherwise the kernel will be launched from cuda:0 device
+  // Cast to char to avoid compiler warning about narrowing
+  at::cuda::CUDAGuard device_guard{(char)input.get_device()};
+
   // create output/workspace tensor
   auto opts = input.options();
   auto output = at::empty({batch_size, out_features}, opts);
@@ -152,6 +161,10 @@ std::vector<at::Tensor> bias_gelu_linear_dgrad_bgrad(
   CHECK_SHAPE(weight, out_features, in_features);
   CHECK_SHAPE(d_output, batch_size, out_features);
   CHECK_SHAPE(gelu_in, batch_size, in_features);
+
+  // Otherwise the kernel will be launched from cuda:0 device
+  // Cast to char to avoid compiler warning about narrowing
+  at::cuda::CUDAGuard device_guard{(char)weight.get_device()};
 
   // create output/workspace tensor
   auto opts = weight.options();

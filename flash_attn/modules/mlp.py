@@ -5,9 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from flash_attn.ops.fused_dense import FusedDenseGeluDense
+    from flash_attn.ops.fused_dense import FusedDenseGeluDense, ParallelFusedDenseGeluDense
 except ImportError:
-    FusedDenseGeluDense = None
+    FusedDenseGeluDense, ParallelFusedDenseGeluDense = None, None
 
 
 class Mlp(nn.Module):
