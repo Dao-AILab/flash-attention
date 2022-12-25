@@ -21,9 +21,9 @@ except ImportError:
     flash_attn_qkvpacked_func, flash_attn_kvpacked_func = None, None
 
 try:
-    from flash_attn.ops.fused_dense import FusedDense
+    from flash_attn.ops.fused_dense import FusedDense, ColumnParallelLinear, RowParallelLinear
 except ImportError:
-    FusedDense = None
+    FusedDense, ColumnParallelLinear, RowParallelLinear = None, None, None
 
 try:
     from flash_attn.layers.rotary import RotaryEmbedding
@@ -42,7 +42,7 @@ class FlashSelfAttention(nn.Module):
                            (default: 0.0)
     """
     def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
-                 triton=False, device=None, dtype=None):
+                 triton=False):
         super().__init__()
         if attention_dropout != 0.0 or not triton:
             assert flash_attn_unpadded_qkvpacked_func is not None, 'FlashAttention is not installed'
@@ -109,7 +109,7 @@ class FlashCrossAttention(nn.Module):
                            (default: 0.0)
     """
     def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
-                 triton=False, device=None, dtype=None):
+                 triton=False):
         super().__init__()
         if attention_dropout != 0.0 or not triton:
             assert flash_attn_unpadded_kvpacked_func is not None, 'FlashAttention is not installed'
@@ -181,8 +181,7 @@ class SelfAttention(nn.Module):
         attention_dropout: The dropout rate to apply to the attention
                            (default: 0.0)
     """
-    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
-                 device=None, dtype=None):
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
         super().__init__()
         self.causal = causal
         self.softmax_scale = softmax_scale
@@ -228,8 +227,7 @@ class CrossAttention(nn.Module):
         attention_dropout: The dropout rate to apply to the attention
                            (default: 0.0)
     """
-    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
-                 device=None, dtype=None):
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
         super().__init__()
         self.causal = causal
         self.softmax_scale = softmax_scale
@@ -309,7 +307,8 @@ class MHA(nn.Module):
         if self.rotary_emb_dim > 0:
             assert not cross_attn, 'MHA with rotary embedding does not support cross-attention yet'
             assert RotaryEmbedding is not None, 'rotary_emb is not installed'
-            self.rotary_emb = RotaryEmbedding(self.rotary_emb_dim, scale_base=rotary_emb_scale_base)
+            self.rotary_emb = RotaryEmbedding(self.rotary_emb_dim, scale_base=rotary_emb_scale_base,
+                                              device=device)
 
         if fused_bias_fc and FusedDense is None:
             raise ImportError('fused_dense is not installed')
@@ -338,7 +337,7 @@ class MHA(nn.Module):
                                         groups=2 * embed_dim)
             inner_attn_cls = FlashCrossAttention if use_flash_attn else CrossAttention
         self.inner_attn = inner_attn_cls(causal=causal, softmax_scale=softmax_scale,
-                                         attention_dropout=dropout, **factory_kwargs)
+                                         attention_dropout=dropout)
         # output projection always have the bias (for now)
         self.out_proj = linear_cls(embed_dim, embed_dim, **factory_kwargs)
 
@@ -378,7 +377,7 @@ class MHA(nn.Module):
             if self.dwconv:
                 qkv = rearrange(self.dwconv_qkv(rearrange(qkv, 'b s d -> b d s'))[..., :-2],
                                 'b d s -> b s d').contiguous()
-            qkv = rearrange(qkv, '... (three h d) -> ... three h d', three=3, h=self.num_heads)
+            qkv = rearrange(qkv, '... (three h d) -> ... three h d', three=3, d=self.head_dim)
             if self.rotary_emb_dim > 0:
                 qkv = self.rotary_emb(qkv)
             if not self.checkpointing:
@@ -395,8 +394,8 @@ class MHA(nn.Module):
                 else:
                     kv, x = self.Wkv(x)
                 q = self.Wq(x)
-            q = rearrange(q, '... (h d) -> ... h d', h=self.num_heads)
-            kv = rearrange(kv, '... (two h d) -> ... two h d', two=2, h=self.num_heads)
+            q = rearrange(q, '... (h d) -> ... h d', d=self.head_dim)
+            kv = rearrange(kv, '... (two h d) -> ... two h d', two=2, d=self.head_dim)
             if self.dwconv:
                 q = rearrange(self.dwconv_q(rearrange(q, 'b s d -> b d s'))[..., :-2],
                               'b d s -> b s d').contiguous()
@@ -408,3 +407,66 @@ class MHA(nn.Module):
                 context = torch.utils.checkpoint.checkpoint(self.inner_attn, q, kv, **kwargs)
         out = self.out_proj(rearrange(context, '... h d -> ... (h d)'))
         return out if not self.return_residual else (out, x)
+
+
+class ParallelMHA(nn.Module):
+    """Multi-head self-attention and cross-attention
+    """
+
+    def __init__(self, embed_dim, num_heads, process_group, bias=True, dropout=0.0,
+                 softmax_scale=None, causal=False, rotary_emb_dim=0, rotary_emb_scale_base=0,
+                 use_flash_attn=False, checkpointing=False, device=None, dtype=None) -> None:
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.process_group = process_group
+        self.embed_dim = embed_dim
+        self.causal = causal
+        self.rotary_emb_dim = rotary_emb_dim
+        self.use_flash_attn = use_flash_attn
+        self.checkpointing = checkpointing
+
+        self.num_heads = num_heads
+        assert self.embed_dim % num_heads == 0, "self.kdim must be divisible by num_heads"
+        self.head_dim = self.embed_dim // num_heads
+
+        if self.rotary_emb_dim > 0:
+            assert RotaryEmbedding is not None, 'rotary_emb is not installed'
+            self.rotary_emb = RotaryEmbedding(self.rotary_emb_dim, scale_base=rotary_emb_scale_base,
+                                              device=device)
+
+        if ColumnParallelLinear is None or RowParallelLinear is None:
+            raise ImportError('fused_dense is not installed')
+        self.Wqkv = ColumnParallelLinear(embed_dim, 3 * embed_dim, process_group, bias=bias,
+                                         **factory_kwargs)
+        inner_attn_cls = FlashSelfAttention if use_flash_attn else SelfAttention
+        self.inner_attn = inner_attn_cls(causal=causal, softmax_scale=softmax_scale,
+                                         attention_dropout=dropout)
+        # output projection always have the bias (for now)
+        self.out_proj = RowParallelLinear(embed_dim, embed_dim, process_group, **factory_kwargs)
+
+    def forward(self, x, seqlen=None, **kwargs):
+        """
+        Arguments:
+            x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim) if seqlen=None.
+                If seqlen is not None, x is (batch * seqlen, hidden_dim). This is so that when we
+                split x during sequence parallel, we split the batch * seqlen dimension
+                (in case batch is small).
+        """
+        qkv = self.Wqkv(x)
+        if seqlen is None:
+            qkv = rearrange(qkv, 'b s (three h d) -> b s three h d', three=3, d=self.head_dim)
+        else:
+            qkv = rearrange(qkv, '(b s) (three h d) -> b s three h d', s=seqlen, three=3,
+                            d=self.head_dim)
+        if self.rotary_emb_dim > 0:
+            qkv = self.rotary_emb(qkv)
+        if not self.checkpointing:
+            context = self.inner_attn(qkv, **kwargs)
+        else:
+            context = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv, **kwargs)
+        if seqlen is None:
+            context = rearrange(context, 'b s h d -> b s (h d)')
+        else:
+            context = rearrange(context, 'b s h d -> (b s) (h d)')
+        out = self.out_proj(context)
+        return out

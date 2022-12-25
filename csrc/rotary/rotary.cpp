@@ -1,10 +1,8 @@
 #include <torch/extension.h>
+#include <c10/cuda/CUDAGuard.h>
 
-#define CHECK_DEVICE(x)                                                        \
-  TORCH_CHECK(x.device().type() == torch::kCUDA, #x " must be on CUDA")
-#define CHECK_SHAPE(x, ...)                                                    \
-  TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}),                  \
-              #x " must have shape (" #__VA_ARGS__ ")")
+#define CHECK_DEVICE(x) TORCH_CHECK(x.device().type() == torch::kCUDA, #x " must be on CUDA")
+#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 
 void apply_rotary_cuda(const torch::Tensor x1, const torch::Tensor x2,
                        const torch::Tensor cos, const torch::Tensor sin,
@@ -26,6 +24,11 @@ void apply_rotary(const torch::Tensor x1, const torch::Tensor x2,
     TORCH_CHECK(x1.sizes() == x2.sizes());
     TORCH_CHECK(cos.sizes() == sin.sizes());
     TORCH_CHECK(out1.sizes() == out2.sizes());
+
+    // Otherwise the kernel will be launched from cuda:0 device
+    // Cast to char to avoid compiler warning about narrowing
+    at::cuda::CUDAGuard device_guard{(char)x1.get_device()};
+
     apply_rotary_cuda(x1, x2, cos, sin, out1, out2, conj);
 }
 

@@ -137,17 +137,19 @@ class RotaryEmbedding(torch.nn.Module):
 
     """
 
-    def __init__(self, dim: int, base=10000, scale_base=0, *_, **__):
+    def __init__(self, dim: int, base=10000, scale_base=0, device=None):
         """
         If scale_base > 0, this implements XPos (Sun et al., https://arxiv.org/abs/2212.10554).
         Reference: https://github.com/sunyt32/torchscale/blob/main/torchscale/component/xpos_relative_position.py
         """
         super().__init__()
         # Generate and save the inverse frequency buffer (non trainable)
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device,
+                                                dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq)
         self.scale_base = scale_base
-        scale = (torch.arange(0, dim, 2) + 0.4 * dim) / (1.4 * dim) if scale_base > 0 else None
+        scale = ((torch.arange(0, dim, 2, device=device, dtype=torch.float32) + 0.4 * dim)
+                 / (1.4 * dim) if scale_base > 0 else None)
         self.register_buffer("scale", scale)
 
         self._seq_len_cached = 0
@@ -168,14 +170,14 @@ class RotaryEmbedding(torch.nn.Module):
             t = torch.arange(seqlen, device=x.device, dtype=self.inv_freq.dtype)
             # Don't do einsum, it converts fp32 to fp16
             # freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-            freqs = torch.outer(t, self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq.to(device=t.device))
             if self.scale is None:
                 self._cos_cached = torch.cos(freqs).to(x.dtype)
                 self._sin_cached = torch.sin(freqs).to(x.dtype)
             else:
                 power = ((torch.arange(seqlen, dtype=self.scale.dtype, device=self.scale.device)
                           - seqlen // 2) / self.scale_base)
-                scale = self.scale ** rearrange(power, 's -> s 1')
+                scale = self.scale.to(device=power.device) ** rearrange(power, 's -> s 1')
                 # We want the multiplication by scale to happen in fp32
                 self._cos_cached = (torch.cos(freqs) * scale).to(x.dtype)
                 self._sin_cached = (torch.sin(freqs) * scale).to(x.dtype)
