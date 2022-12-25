@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include "ATen/cuda/CUDAContext.h"
+#include <c10/cuda/CUDAGuard.h>
 
 #include "ln.h"
 
@@ -165,6 +166,10 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
     TORCH_CHECK((hidden_size % 8 == 0) && (hidden_size <= 6144));
 
     TORCH_CHECK(epsilon >= 0.f);
+
+    // Otherwise the kernel will be launched from cuda:0 device
+    // Cast to char to avoid compiler warning about narrowing
+    at::cuda::CUDAGuard device_guard{(char)x0.get_device()};
 
     auto opts = x0.options();
 
@@ -363,6 +368,10 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
     TORCH_CHECK(mu.sizes() == rsigma.sizes());
 
     TORCH_CHECK(gamma.numel() == cols);
+
+    // Otherwise the kernel will be launched from cuda:0 device
+    // Cast to char to avoid compiler warning about narrowing
+    at::cuda::CUDAGuard device_guard{(char)dz.get_device()};
 
     auto opts = x.options();
 

@@ -27,14 +27,14 @@ class FusedDenseFunc(torch.autograd.Function):
         If process_group is not None, we're doing Tensor Parallel with sequence parallelism:
         we do an all_gather_raw of x before doing the matmul.
         """
+        ctx.compute_weight_gradient = weight.requires_grad
+        ctx.return_residual = return_residual
+        ctx.process_group = process_group
+
         if torch.is_autocast_enabled():
             dtype = torch.get_autocast_gpu_dtype()
             x, weight = [a.to(dtype=dtype) for a in [x, weight]]
             bias = bias.to(dtype=dtype) if bias is not None else None
-
-        ctx.return_residual = return_residual
-        ctx.process_group = process_group
-        ctx.compute_weight_gradient = weight.requires_grad
 
         x = x.contiguous()
         weight = weight.contiguous()

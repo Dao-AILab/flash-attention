@@ -23,7 +23,7 @@ class Block(nn.Module):
 
     def __init__(self, dim, mixer_cls=None, mlp_cls=None, norm_cls=nn.LayerNorm,
                  dropout_cls=nn.Dropout, prenorm=True, resid_dropout=0., drop_path=0.,
-                 fused_dropout_add_ln=False, return_residual=False):
+                 fused_dropout_add_ln=False, return_residual=False, sequence_parallel=False):
         """
         return_residual: whether each of the sub-layers (mixer and mlp) will return the residual.
         This is for performance reason: for post-norm architecture, returning the input allows us
@@ -50,6 +50,14 @@ class Block(nn.Module):
         if self.fused_dropout_add_ln:
             assert dropout_add_layer_norm is not None, 'dropout_add_ln is not installed'
             assert isinstance(self.norm1, nn.LayerNorm) and isinstance(self.dropout1, nn.Dropout)
+
+        # Mark the norm parameters as "sequence_parallel" so that we run all-reduce on their grads.
+        if sequence_parallel:
+            for p in self.norm1.parameters():
+                p._sequence_parallel = True
+            if hasattr(self, 'norm2'):
+                for p in self.norm2.parameters():
+                    p._sequence_parallel = True
 
     def forward(self, hidden_states: Tensor, residual: Optional[Tensor] = None,
                 mixer_kwargs=None):
