@@ -17,6 +17,7 @@ from apex.transformer import tensor_parallel
 from flash_attn.modules.mha import MHA, ParallelMHA
 from flash_attn.modules.mlp import FusedDenseGeluDense, ParallelFusedDenseGeluDense
 from flash_attn.modules.block import Block
+from flash_attn.utils.distributed import allreduce_sequence_parallel_grad
 
 is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
 
@@ -124,13 +125,7 @@ def test_block_parallel(dim, world_size, dtype):
 
     out_pt.backward(g)
     out.backward(g[rank * partition_batch_dim:(rank + 1) * partition_batch_dim])
-    # We want to iterate over parameters with _sequence_parallel=True in the same order,
-    # as different ranks might have different number of parameters (e.g., only rank 0 has bias).
-    params_seqparallel = {name: p for name, p in model.named_parameters()
-                          if getattr(p, '_sequence_parallel', False)}
-    for _, p in sorted(params_seqparallel.items()):
-        if getattr(p, '_sequence_parallel', False):
-            torch.distributed.all_reduce(p.grad, group=parallel_state.get_tensor_model_parallel_group())
+    allreduce_sequence_parallel_grad(model, parallel_state.get_tensor_model_parallel_group())
     parallel_state.destroy_model_parallel()
 
     assert torch.allclose(

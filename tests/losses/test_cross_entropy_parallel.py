@@ -46,8 +46,9 @@ def test_cross_entropy_loss_apex(vocab_size, world_size, smoothing, inplace_back
     y[torch.randperm(batch_size * seqlen)[:10]] = -100
     model_pt = torch.nn.CrossEntropyLoss(label_smoothing=smoothing, reduction='none')
     model = CrossEntropyLoss(label_smoothing=smoothing, reduction='none',
-                                     inplace_backward=inplace_backward)
-    out = model(x, y, process_group=parallel_state.get_tensor_model_parallel_group())
+                             inplace_backward=inplace_backward,
+                             process_group=parallel_state.get_tensor_model_parallel_group())
+    out = model(x, y)
     out_pt = model_pt(x_pt.float(), y)
     assert torch.allclose(out, out_pt, rtol=1e-5, atol=1e-6)
 

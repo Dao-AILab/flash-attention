@@ -106,7 +106,7 @@ class SoftmaxCrossEntropyLossFn(torch.autograd.Function):
 class CrossEntropyLoss(nn.Module):
 
     def __init__(self, ignore_index=-100, reduction='mean', label_smoothing=0.0,
-                 inplace_backward=False):
+                 inplace_backward=False, process_group=None):
         super().__init__()
         if reduction not in ['mean', 'none']:
             raise NotImplementedError("Only support reduction = 'mean' or 'none'")
@@ -114,13 +114,14 @@ class CrossEntropyLoss(nn.Module):
         self.reduction = reduction
         self.label_smoothing = label_smoothing
         self.inplace_backward = inplace_backward
+        self.process_group = process_group
 
-    def forward(self, input, target, process_group=None):
+    def forward(self, input, target):
         assert input.is_cuda and target.is_cuda
         # SoftmaxCrossEntropyLoss implicitly casts to float
         loss = SoftmaxCrossEntropyLossFn.apply(
             input, target, self.label_smoothing, self.ignore_index, self.inplace_backward,
-            process_group
+            self.process_group
         )
         if self.reduction == 'mean':
             return loss.sum() / (target != self.ignore_index).sum()

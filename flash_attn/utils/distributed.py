@@ -72,3 +72,26 @@ class ReduceScatterFunc(torch.autograd.Function):
 
 # Supports autograd, but does not support async
 reduce_scatter = ReduceScatterFunc.apply
+
+
+def sync_sequence_parallel_params(model: torch.nn.Module, process_group: ProcessGroup):
+    # We want to iterate over parameters with _sequence_parallel=True in the same order,
+    # as different ranks might have different number of parameters (e.g., only rank 0 has bias).
+    params_seqparallel = {name: p for name, p in model.named_parameters()
+                          if getattr(p, '_sequence_parallel', False)}
+    for _, p in sorted(params_seqparallel.items()):
+        with torch.no_grad():
+            # Broadcast needs src to be global rank, not group rank
+            torch.distributed.broadcast(
+                p, src=torch.distributed.get_global_rank(process_group, 0), group=process_group
+            )
+
+
+def allreduce_sequence_parallel_grad(model: torch.nn.Module, process_group: ProcessGroup):
+    # We want to iterate over parameters with _sequence_parallel=True in the same order,
+    # as different ranks might have different number of parameters (e.g., only rank 0 has bias).
+    params_seqparallel = {name: p for name, p in model.named_parameters()
+                          if getattr(p, '_sequence_parallel', False)}
+    for _, p in sorted(params_seqparallel.items()):
+        with torch.no_grad():
+            torch.distributed.all_reduce(p.grad, group=process_group)
