@@ -28,6 +28,7 @@ from flash_attn.modules.block import Block
 from flash_attn.modules.embedding import BertEmbeddings
 from flash_attn.bert_padding import unpad_input, pad_input
 from flash_attn.bert_padding import index_first_axis, index_first_axis_residual
+from flash_attn.utils.pretrained import state_dict_from_pretrained
 
 try:
     from flash_attn.ops.fused_dense import FusedDense
@@ -437,12 +438,6 @@ class BertForPreTraining(BertPreTrainedModel):
             prediction_logits=prediction_scores,
             seq_relationship_logits=seq_relationship_score,
         )
-
-
-def state_dict_from_pretrained(model_name):
-    from transformers.utils import WEIGHTS_NAME
-    from transformers.utils.hub import cached_file
-    return torch.load(cached_file(model_name, WEIGHTS_NAME))
 
 
 def remap_state_dict(state_dict, config):

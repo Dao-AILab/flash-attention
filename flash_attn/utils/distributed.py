@@ -87,11 +87,15 @@ def sync_sequence_parallel_params(model: torch.nn.Module, process_group: Process
             )
 
 
+# Ref: https://github.com/NVIDIA/Megatron-LM/blob/52e636888cccc41e931251c417a7181fc36de926/megatron/optimizer/optimizer.py#L256
 def allreduce_sequence_parallel_grad(model: torch.nn.Module, process_group: ProcessGroup):
     # We want to iterate over parameters with _sequence_parallel=True in the same order,
     # as different ranks might have different number of parameters (e.g., only rank 0 has bias).
     params_seqparallel = {name: p for name, p in model.named_parameters()
                           if getattr(p, '_sequence_parallel', False)}
-    for _, p in sorted(params_seqparallel.items()):
-        with torch.no_grad():
-            torch.distributed.all_reduce(p.grad, group=process_group)
+    grads = [p.grad for _, p in sorted(params_seqparallel.items())]
+    with torch.no_grad():
+        coalesced = torch._utils._flatten_dense_tensors(grads)
+        torch.distributed.all_reduce(coalesced, group=process_group)
+        for buf, synced in zip(grads, torch._utils._unflatten_dense_tensors(coalesced, grads)):
+            buf.copy_(synced)
