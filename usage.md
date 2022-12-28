@@ -24,6 +24,8 @@ PR or email us. We'd very much like to hear from you!
 - MosaicML [Composer](https://github.com/mosaicml/composer)
   [library](https://www.mosaicml.com/blog/gpt-3-quality-for-500k). Composer is a
   library for efficient neural network training.
+  
+- EleutherAI's [GPT-NeoX](https://github.com/EleutherAI/gpt-neox/pull/725). This is a research library for training large language transformer models at scale based on NVIDIA's Megatron-LM and Microsoft's DeepSpeed.
 
 ## MLPerf benchmarks
 
