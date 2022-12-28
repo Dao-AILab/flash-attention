@@ -436,7 +436,7 @@ class MHA(nn.Module):
                 kv = self._update_kv_cache(qkv[:, :, 1:], inference_params)
                 # If we're processing the prompt, causal=None (use self.causal).
                 # If we're decoding, then causal=False.
-                causal = False if inference_params.sequence_len_offset == 0 else None
+                causal = None if inference_params.sequence_len_offset == 0 else False
                 context = self.inner_cross_attn(q, kv, causal=causal)
         else:
             if not self.return_residual:

@@ -40,7 +40,7 @@ def greedy_decode(input_ids, model, max_length):
         inference_params.sequence_len_offset = seqlen_og
         while True:
             position_ids = torch.full((batch_size, 1), inference_params.sequence_len_offset,
-                                    dtype=torch.long, device=input_ids.device)
+                                      dtype=torch.long, device=input_ids.device)
             logits = model(rearrange(next_token, 'b -> b 1'), position_ids=position_ids,
                            inference_params=inference_params).logits[:, -1]
             scores.append(logits)
