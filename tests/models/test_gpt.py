@@ -23,16 +23,6 @@ def test_gpt2_state_dict(model_name):
         assert state_dict[k].shape == pretrained_state_dict[k].shape
 
 
-def get_hf_models(model_name, config, dtype):
-    pretrained_state_dict = state_dict_from_pretrained(model_name)
-    model_hf = GPT2LMHeadModelHF(config)
-    # Missing key(s) in state_dict: "bert.embeddings.position_ids", "cls.predictions.decoder.bias"
-    # position_ids is a buffer, and predictions.decoder.bias is tied to predictions.bias.
-    model_hf.load_state_dict(pretrained_state_dict, strict=False)
-    model_hf.cuda().to(dtype=dtype)
-    return model_hf
-
-
 @pytest.mark.parametrize('model_name', ["gpt2", "gpt2-medium"])
 # @pytest.mark.parametrize('model_name', ["gpt2"])
 def test_gpt2_non_optimized(model_name):

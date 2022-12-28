@@ -20,6 +20,7 @@ from flash_attn.modules.block import Block
 from flash_attn.modules.embedding import GPT2Embeddings, ParallelGPT2Embeddings
 from flash_attn.utils.distributed import sync_sequence_parallel_params
 from flash_attn.utils.pretrained import state_dict_from_pretrained
+from flash_attn.utils.generation import GenerationMixin
 
 try:
     from flash_attn.ops.fused_dense import ColumnParallelLinear
@@ -61,7 +62,7 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
                      if process_group is None else {})
     parallel_kwargs = {'process_group': process_group} if process_group is not None else {}
     mixer_cls = partial(mha_cls, num_heads=config.num_attention_heads, dropout=config.attn_pdrop,
-                        softmax_scale=softmax_scale, causal=True,
+                        softmax_scale=softmax_scale, causal=True, layer_idx=layer_idx,
                         rotary_emb_dim=rotary_emb_dim, rotary_emb_scale_base=rotary_emb_scale_base,
                         use_flash_attn=use_flash_attn,
                         **serial_kwargs, **parallel_kwargs, **factory_kwargs)
@@ -220,7 +221,7 @@ class GPTModel(GPTPreTrainedModel):
         if self.process_group is not None:
             sync_sequence_parallel_params(self, self.process_group)
 
-    def forward(self, input_ids, position_ids=None):
+    def forward(self, input_ids, position_ids=None, inference_params=None):
         # If using Tensor Parallel with sequence parallel, we combine the batch and the seqlen
         # dimensions so that we can split on it easily, in case of small batch size.
         # Only the attention layers need to know the seqlen.
@@ -238,12 +239,14 @@ class GPTModel(GPTPreTrainedModel):
                 residual_in_fp32=True
             )
         mixer_kwargs = ({'seqlen': input_ids.shape[1]} if self.process_group is not None else {})
+        if inference_params is not None:
+            mixer_kwargs['inference_params'] = inference_params
         for layer in self.layers:
             hidden_states, residual = layer(hidden_states, residual, mixer_kwargs=mixer_kwargs)
         return hidden_states
 
 
-class GPTLMHeadModel(GPTPreTrainedModel):
+class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
 
     def __init__(self, config: GPT2Config, process_group=None, device=None, dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
@@ -267,8 +270,13 @@ class GPTLMHeadModel(GPTPreTrainedModel):
     def tie_weights(self):
         self.lm_head.weight = self.transformer.embeddings.word_embeddings.weight
 
-    def forward(self, input_ids, position_ids=None):
-        hidden_states = self.transformer(input_ids, position_ids=position_ids)
+    def forward(self, input_ids, position_ids=None, inference_params=None):
+        """
+            inference_params: for generation. Adapted from Megatron-LM (and Apex)
+            https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
+        """
+        hidden_states = self.transformer(input_ids, position_ids=position_ids,
+                                         inference_params=inference_params)
         lm_logits = self.lm_head(hidden_states)
         CausalLMOutput = namedtuple('CausalLMOutput', ['logits'])
         return CausalLMOutput(logits=lm_logits)
