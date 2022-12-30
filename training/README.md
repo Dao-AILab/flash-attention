@@ -82,7 +82,7 @@ cd ../csrc/rotary && pip install .
 ```
 5. Fused dropout + residual + LayerNorm, adapted from Apex's
 [FastLayerNorm](https://github.com/NVIDIA/apex/tree/master/apex/contrib/layer_norm). We add dropout and residual, and make it work for both pre-norm and post-norm architecture.
-This only supports a limited set of dimensions, see `csrc/layer_norm/ln_fwd_cuda_kernel.cu`.
+This supports dimensions divisible by 8, up to 6144.
 ```sh
 cd ../csrc/layer_norm && pip install .
 ```
