@@ -156,13 +156,13 @@ python run.py experiment=pile/gpt3-2.7B-flash-hdim128 trainer.devices=8  # 2.7B
 ```
 The default parameters are set for 8 x A100 80GB. We train with bf16 by default.
 
-To train with rotary embedding, run the experiments `pile/gpt3{s,m,l,xl**-flash-rotary**.
+To train with rotary embedding, run the experiments `pile/gpt3{s,m,l,xl}-flash-rotary`.
 
 ### Training options
 
 **Gradient accumulation**: to adjust device batch size to fit into GPU memory
 (the global batch size stays the same, and gradient accumulation is calculated
-automatically), set `datamodule.batch_size=blah**.
+automatically), set `datamodule.batch_size=blah`.
 
 **Multi-node**: to train on multiple nodes, add `trainer.num_nodes=blah`.
 
