@@ -135,12 +135,13 @@ class RotaryEmbedding(torch.nn.Module):
     .. _repo: https://github.com/ZhuiyiTechnology/roformer
     .. _GPT-NeoX: https://github.com/EleutherAI/gpt-neox
 
+    If scale_base > 0, this implements XPos (Sun et al., https://arxiv.org/abs/2212.10554).
+    A recommended value for scale_base is 512: https://github.com/HazyResearch/flash-attention/issues/96
+    Reference: https://github.com/sunyt32/torchscale/blob/main/torchscale/component/xpos_relative_position.py
     """
 
     def __init__(self, dim: int, base=10000, scale_base=0, device=None):
         """
-        If scale_base > 0, this implements XPos (Sun et al., https://arxiv.org/abs/2212.10554).
-        Reference: https://github.com/sunyt32/torchscale/blob/main/torchscale/component/xpos_relative_position.py
         """
         super().__init__()
         # Generate and save the inverse frequency buffer (non trainable)
