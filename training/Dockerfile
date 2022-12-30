@@ -78,7 +78,8 @@ RUN pip install pytest matplotlib jupyter ipython ipdb gpustat scikit-learn spac
 # hydra
 RUN pip install hydra-core==1.3.1 hydra-colorlog==1.2.0 hydra-optuna-sweeper==1.2.0 pyrootutils rich
 # Core packages
-RUN pip install transformers==4.25.1 datasets==2.8.0 pytorch-lightning==1.8.6 triton==2.0.0.dev20221202 wandb==0.13.7 timm==0.6.12 torchmetrics==0.11.0
+RUN pip install transformers==4.25.1 datasets==2.8.0 pytorch-lightning==1.8.6 triton==2.0.0.dev20221202 wandb==0.13.7 timm==0.6.12 torchmetrics==0.10.3
+# torchmetrics 0.11.0 broke hydra's instantiate
 
 # For MLPerf
 RUN pip install git+https://github.com/mlcommons/logging.git@2.1.0
