@@ -14,6 +14,8 @@ import torch.nn.functional as F
 
 from transformers import GPT2Config
 
+from einops import rearrange
+
 from flash_attn.modules.mha import MHA, ParallelMHA
 from flash_attn.modules.mlp import Mlp, FusedDenseGeluDense, ParallelFusedDenseGeluDense
 from flash_attn.modules.block import Block
@@ -337,4 +339,52 @@ def remap_state_dict_gpt2(state_dict, config):
         return key
     state_dict = OrderedDict((key_mapping_attn(k), v) for k, v in state_dict.items())
 
+    return state_dict
+
+
+def shard_state_dict_tp(state_dict, config, world_size, rank):
+    """Convert the state_dict of a standard GPT model to the state_dict of a GPT model
+    with tensor parallel.
+    """
+    vocab_size = config.vocab_size
+    if config.vocab_size % config.pad_vocab_size_multiple != 0:
+        vocab_size += (config.pad_vocab_size_multiple
+                       - (config.vocab_size % config.pad_vocab_size_multiple))
+    assert vocab_size % world_size == 0
+    assert config.hidden_size % world_size == 0
+    inner_dim = config.n_inner if config.n_inner is not None else 4 * config.hidden_size
+    assert inner_dim % world_size == 0
+
+    def shard_first_dim(state_dict, key):
+        x = state_dict[key]
+        dim = x.shape[0] // world_size
+        state_dict[key] = x[rank * dim:(rank + 1) * dim]
+
+    def shard_last_dim(state_dict, key):
+        x = state_dict[key]
+        dim = x.shape[-1] // world_size
+        state_dict[key] = x[..., rank * dim:(rank + 1) * dim]
+
+    def shard_qkv_headdim(state_dict, key):
+        x = rearrange(state_dict[key], '(three d) ... -> three d ...', three=3)
+        dim = x.shape[1] // world_size
+        state_dict[key] = rearrange(x[:, rank * dim:(rank + 1) * dim],
+                                    'three d ... -> (three d) ...')
+
+    shard_first_dim(state_dict, 'transformer.embeddings.word_embeddings.weight')
+    if 'lm_head.weight' in state_dict:
+        shard_first_dim(state_dict, 'lm_head.weight')
+    if 'transformer.embeddings.position_embeddings.weight' in state_dict:
+        shard_last_dim(state_dict, 'transformer.embeddings.position_embeddings.weight')
+    for i in range(config.num_hidden_layers):
+        shard_qkv_headdim(state_dict, f'transformer.layers.{i}.mixer.Wqkv.weight')
+        shard_qkv_headdim(state_dict, f'transformer.layers.{i}.mixer.Wqkv.bias')
+        shard_last_dim(state_dict, f'transformer.layers.{i}.mixer.out_proj.weight')
+        if rank != 0:
+            state_dict.pop(f'transformer.layers.{i}.mixer.out_proj.bias')
+        shard_first_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.weight')
+        shard_first_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.bias')
+        shard_last_dim(state_dict, f'transformer.layers.{i}.mlp.fc2.weight')
+        if rank != 0:
+            state_dict.pop(f'transformer.layers.{i}.mlp.fc2.bias')
     return state_dict
