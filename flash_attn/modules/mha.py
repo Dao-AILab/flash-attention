@@ -472,13 +472,15 @@ class ParallelMHA(nn.Module):
     """
 
     def __init__(self, embed_dim, num_heads, process_group, bias=True, dropout=0.0,
-                 softmax_scale=None, causal=False, rotary_emb_dim=0, rotary_emb_scale_base=0,
+                 softmax_scale=None, causal=False, layer_idx=None, rotary_emb_dim=0,
+                 rotary_emb_scale_base=0,
                  use_flash_attn=False, checkpointing=False, device=None, dtype=None) -> None:
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
         self.process_group = process_group
         self.embed_dim = embed_dim
         self.causal = causal
+        self.layer_idx = layer_idx
         self.rotary_emb_dim = rotary_emb_dim
         self.use_flash_attn = use_flash_attn
         self.checkpointing = checkpointing
