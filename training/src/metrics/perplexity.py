@@ -11,7 +11,7 @@ from torch import Tensor
 from torchmetrics import Metric
 
 try:
-    from src.losses.cross_entropy import CrossEntropyLoss
+    from flash_attn.losses.cross_entropy import CrossEntropyLoss
 except ImportError:
     CrossEntropyLoss = torch.nn.CrossEntropyLoss
 
