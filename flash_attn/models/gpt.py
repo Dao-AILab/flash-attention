@@ -220,6 +220,9 @@ class GPTModel(GPTPreTrainedModel):
 
         self.apply(partial(_init_weights, n_layer=config.num_hidden_layers,
                            initializer_range=config.initializer_range))
+        self.tie_weights()
+
+    def tie_weights(self):
         if self.process_group is not None:
             sync_sequence_parallel_params(self, self.process_group)
 
@@ -266,11 +269,11 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         self.apply(partial(_init_weights, n_layer=config.num_hidden_layers,
                            initializer_range=config.initializer_range))
         self.tie_weights()
-        if self.process_group is not None:
-            sync_sequence_parallel_params(self, self.process_group)
 
     def tie_weights(self):
         self.lm_head.weight = self.transformer.embeddings.word_embeddings.weight
+        if self.process_group is not None:
+            sync_sequence_parallel_params(self, self.process_group)
 
     def forward(self, input_ids, position_ids=None, inference_params=None):
         """
