@@ -15,10 +15,11 @@ from flash_attn.utils.generation import greedy_decode
 
 
 # TODO: test with rotary embedding
+@pytest.mark.parametrize('fused_ft_kernel', [False, True])
 @pytest.mark.parametrize('optimized', [False, True])
-# @pytest.mark.parametrize('optimized', [False])
+# @pytest.mark.parametrize('optimized', [True])
 @pytest.mark.parametrize('model_name', ["gpt2"])
-def test_greedy_decode(model_name, optimized):
+def test_greedy_decode(model_name, optimized, fused_ft_kernel):
     """Check that our implementation of GPT2 generation matches the HF implementation:
     the scores in fp16 should be around the same as the HF scores in fp16, when compared to
     the HF scores in fp32.
@@ -62,6 +63,7 @@ def test_greedy_decode(model_name, optimized):
     scores = tuple(scores)
 
     out = model.generate(input_ids=input_ids, max_length=max_length,
+                         fused_ft_kernel=fused_ft_kernel,
                          return_dict_in_generate=True, output_scores=True)
 
     out_hf = model_hf.generate(input_ids=input_ids, max_length=max_length,
