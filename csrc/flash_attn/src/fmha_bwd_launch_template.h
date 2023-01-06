@@ -61,7 +61,7 @@ void run_fmha_bwd_loop(FMHA_dgrad_params &params, cudaStream_t stream, const boo
 
     bool is_dropout = params.p_dropout < 1.f;  // params.p_dropout is the probability of "keeping"
     // Work-around for gcc 7. It doesn't like nested BOOL_SWITCH.
-    BOOL_SWITCH(is_dropout, IsDropoutConst, ({
+    BOOL_SWITCH(is_dropout, IsDropoutConst, ([&] {
         auto kernel = params.is_causal
             ? &fmha_bwd_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, true>
             : &fmha_bwd_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, false>;

@@ -56,7 +56,7 @@ void run_fmha_fwd_loop(Launch_params<FMHA_fprop_params> &launch_params) {
     // Work-around for gcc 7. It doesn't like nested BOOL_SWITCH.
     // https://github.com/kokkos/kokkos-kernels/issues/349
     // https://github.com/HazyResearch/flash-attention/issues/21
-    BOOL_SWITCH(launch_params.is_dropout, IsDropoutConst, ({
+    BOOL_SWITCH(launch_params.is_dropout, IsDropoutConst, ([&] {
         auto kernel = launch_params.params.is_causal
             ? (launch_params.return_softmax
                ? &fmha_fwd_loop_kernel<Kernel_traits, IsDropoutConst, true, true>
