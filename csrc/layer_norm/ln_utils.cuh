@@ -308,6 +308,13 @@ struct Vec {
         }
     }
 
+    inline __device__ void zero_() {
+        #pragma unroll
+        for( int it = 0; it < NUM_ELT; it++ ) {
+            this->data.elt[it] = Elt_type(0.f);
+        }
+    }
+
     inline __device__ void load_from(const void *base_ptr, const size_t idx) {
         this->data.vec = static_cast<const Vec_type *>(base_ptr)[idx];
     }

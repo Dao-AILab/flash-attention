@@ -125,7 +125,7 @@ void ln_bwd_kernel(layer_norm::BwdParams params) {
                     #pragma unroll
                     for( int jt = 0; jt < NUM_ELTS; jt++ ) {
                         compute_t x_tmp = x.data.elt[jt];
-                        compute_t y_tmp = rs_r * (x_tmp - mu_r);
+                        compute_t y_tmp = rs_r * (x_tmp - (!params.is_rms_norm ? mu_r : 0.f));
                         compute_t dy_tmp = compute_t(gamma[it].data.elt[jt]) * compute_t(dz.data.elt[jt]);
                         compute_t dz_tmp = dz.data.elt[jt];
 
@@ -173,7 +173,7 @@ void ln_bwd_kernel(layer_norm::BwdParams params) {
                     if (load_dz) {
                         compute_t dy_tmp = dy[it * NUM_ELTS + jt];
                         compute_t y_tmp = y[it * NUM_ELTS + jt];
-                        compute_t dx_tmp = rs_r * (dy_tmp - (mdyy_local * y_tmp + mdy_local));
+                        compute_t dx_tmp = rs_r * (dy_tmp - (mdyy_local * y_tmp + (!params.is_rms_norm ? mdy_local : 0.f)));
                         dx_tmp_res = prenorm ? dx_tmp + compute_t(dx[it].data.elt[jt]) : dx_tmp;
                     } else {
                         dx_tmp_res = prenorm ? compute_t(dx[it].data.elt[jt]) : 0.f;

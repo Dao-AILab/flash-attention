@@ -8,11 +8,20 @@ from einops import rearrange, repeat
 
 from flash_attn.ops.layer_norm import DropoutAddLayerNorm, dropout_add_layer_norm
 from flash_attn.ops.layer_norm import dropout_add_layer_norm_subset
+from flash_attn.ops.rms_norm import DropoutAddRMSNorm, dropout_add_rms_norm
+from flash_attn.ops.rms_norm import dropout_add_rms_norm_subset
+
+try:
+    from apex.normalization import FusedRMSNorm
+except:
+    FusedRMSNorm = None
 
 
 is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
 
+@pytest.mark.parametrize('is_rms_norm', [False, True])
 @pytest.mark.parametrize('has_colscale', [True, False])
+# @pytest.mark.parametrize('has_colscale', [False])
 @pytest.mark.parametrize('has_rowscale', [True, False])
 # @pytest.mark.parametrize('has_rowscale', [True])
 @pytest.mark.parametrize('has_residual', [True, False])
@@ -26,11 +35,17 @@ is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
                           (torch.float32, torch.float32)]
                          + ([(torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32)] if is_sm8x else []))
 # @pytest.mark.parametrize('input_dtype,residual_dtype', [(torch.float16, torch.float32)])
-@pytest.mark.parametrize('hidden_size', [192, 256, 384, 768, 1024, 1280, 1536, 1600, 2048, 2560, 3000, 3072, 4096, 5120, 6144])
+# @pytest.mark.parametrize('hidden_size', [192, 256, 384, 768, 1024, 1280, 1536, 1600, 2048, 2560, 3000, 3072, 4096, 5120, 6144])
+@pytest.mark.parametrize('hidden_size', [256])
 def test_dropout_layer_norm_training(hidden_size, input_dtype, residual_dtype, weight_dtype,
-                                     dropout_p, has_residual, has_rowscale, has_colscale):
+                                     dropout_p, has_residual, has_rowscale, has_colscale, is_rms_norm):
     if weight_dtype == torch.float16 and input_dtype == torch.bfloat16:
         pytest.skip()  # Not supported
+    if is_rms_norm and FusedRMSNorm is None:
+        pytest.skip()  # We need Apex's FusedRMSNorm to test
+    layer_norm_cls = torch.nn.LayerNorm if not is_rms_norm else FusedRMSNorm
+    our_layer_norm_cls = DropoutAddLayerNorm if not is_rms_norm else DropoutAddRMSNorm
+    our_layer_norm_func = dropout_add_layer_norm if not is_rms_norm else dropout_add_rms_norm
     device = 'cuda'
     # rtol, atol = (1e-5, 1e-6) if input_dtype == torch.float32 else (1e-3, 1e-4)
     rtol, atol = (1e-3, 1e-4)
@@ -67,20 +82,22 @@ def test_dropout_layer_norm_training(hidden_size, input_dtype, residual_dtype, w
     if has_colscale:
         x0_scaled_pt = x0_scaled_pt * colscale_pt
         x0_scaled_ref = x0_scaled_ref * colscale_ref
-    model_pt = torch.nn.LayerNorm(hidden_size, device=device, dtype=weight_dtype)
+    model_pt = layer_norm_cls(hidden_size).to(device=device, dtype=weight_dtype)
     torch.nn.init.normal_(model_pt.weight)
-    torch.nn.init.normal_(model_pt.bias)
-    model_ref = torch.nn.LayerNorm(hidden_size, device=device, dtype=torch.float32)
-    model = DropoutAddLayerNorm(hidden_size, p=dropout_p, device=device, dtype=weight_dtype)
+    if not is_rms_norm:
+        torch.nn.init.normal_(model_pt.bias)
+    model_ref = layer_norm_cls(hidden_size).to(device=device, dtype=torch.float32)
+    model = our_layer_norm_cls(hidden_size, p=dropout_p, device=device, dtype=weight_dtype)
     with torch.no_grad():
         model.weight.copy_(model_pt.weight)
-        model.bias.copy_(model_pt.bias)
         model_ref.weight.copy_(model_pt.weight)
-        model_ref.bias.copy_(model_pt.bias)
+        if not is_rms_norm:
+            model.bias.copy_(model_pt.bias)
+            model_ref.bias.copy_(model_pt.bias)
     residual_in_fp32 = (not has_residual) and residual_dtype == torch.float32
-    out, dmask = dropout_add_layer_norm(x0, x1, model.weight, model.bias, model.p,
-                                        model.epsilon, rowscale=rowscale, layerscale=colscale,
-                                        residual_in_fp32=residual_in_fp32, return_dropout_mask=True)
+    out, dmask = our_layer_norm_func(x0, x1, model.weight, model.bias, model.p,
+                                     model.epsilon, rowscale=rowscale, layerscale=colscale,
+                                     residual_in_fp32=residual_in_fp32, return_dropout_mask=True)
     assert out.dtype == input_dtype
     print(f'Actual dropout fraction: {1 - dmask.float().mean().item()}')
     if has_residual:
@@ -101,7 +118,8 @@ def test_dropout_layer_norm_training(hidden_size, input_dtype, residual_dtype, w
     if has_residual:
         assert (x1.grad - x1_ref.grad).abs().max() <= 4 * (x1_pt.grad - x1_ref.grad).abs().max() + 1e-4
     assert (model.weight.grad - model_ref.weight.grad).abs().max() <= 2 * (model_pt.weight.grad - model_ref.weight.grad).abs().max() + 3e-5
-    assert (model.bias.grad - model_ref.bias.grad).abs().max() <= 2 * (model_pt.bias.grad - model_ref.bias.grad).abs().max() + 3e-5
+    if not is_rms_norm:
+        assert (model.bias.grad - model_ref.bias.grad).abs().max() <= 2 * (model_pt.bias.grad - model_ref.bias.grad).abs().max() + 3e-5
     if has_colscale:
         assert (colscale.grad - colscale_ref.grad).abs().max() <= 2 * (colscale_pt.grad - colscale_ref.grad).abs().max() + 2e-4
 
@@ -151,27 +169,34 @@ def test_dropout_layer_norm_eval(hidden_size, input_dtype, residual_dtype, weigh
     assert (out - out_ref).abs().max() <= 4 * (out_pt - out_ref).abs().max() + 1e-4
 
 
-# @pytest.mark.parametrize('has_colscale', [True, False])
-# @pytest.mark.parametrize('has_rowscale', [True, False])
-# @pytest.mark.parametrize('has_residual', [True, False])
-# @pytest.mark.parametrize('dropout_p', [0.37, 0.0])
-# @pytest.mark.parametrize('weight_dtype', [torch.float32, torch.float16])
-# @pytest.mark.parametrize('input_dtype,residual_dtype',
-#                          [(torch.float16, torch.float16), (torch.float16, torch.float32),
-#                           (torch.float32, torch.float32)]
-#                          + ([(torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32)] if is_sm8x else []))
-@pytest.mark.parametrize('has_colscale', [True])
-@pytest.mark.parametrize('has_rowscale', [False])
-@pytest.mark.parametrize('has_residual', [True])
-@pytest.mark.parametrize('dropout_p', [0.0])
-@pytest.mark.parametrize('weight_dtype', [torch.float32])
-@pytest.mark.parametrize('input_dtype,residual_dtype', [(torch.float32, torch.float32)])
-# @pytest.mark.parametrize('hidden_size', [192, 256, 384, 768, 1024, 1280, 1536, 1600, 2048, 2560, 3000, 3072, 4096, 5120, 6144])
-@pytest.mark.parametrize('hidden_size', [256])
+@pytest.mark.parametrize('is_rms_norm', [False, True])
+@pytest.mark.parametrize('has_colscale', [True, False])
+@pytest.mark.parametrize('has_rowscale', [True, False])
+@pytest.mark.parametrize('has_residual', [True, False])
+@pytest.mark.parametrize('dropout_p', [0.37, 0.0])
+@pytest.mark.parametrize('weight_dtype', [torch.float32, torch.float16])
+@pytest.mark.parametrize('input_dtype,residual_dtype',
+                         [(torch.float16, torch.float16), (torch.float16, torch.float32),
+                          (torch.float32, torch.float32)]
+                         + ([(torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32)] if is_sm8x else []))
+# @pytest.mark.parametrize('has_colscale', [True])
+# @pytest.mark.parametrize('has_rowscale', [False])
+# @pytest.mark.parametrize('has_residual', [True])
+# @pytest.mark.parametrize('dropout_p', [0.0])
+# @pytest.mark.parametrize('weight_dtype', [torch.float32])
+# @pytest.mark.parametrize('input_dtype,residual_dtype', [(torch.float32, torch.float32)])
+@pytest.mark.parametrize('hidden_size', [192, 256, 384, 768, 1024, 1280, 1536, 1600, 2048, 2560, 3000, 3072, 4096, 5120, 6144])
+# @pytest.mark.parametrize('hidden_size', [256])
 def test_dropout_layer_norm_prenorm_training(hidden_size, input_dtype, residual_dtype, weight_dtype,
-                                             dropout_p, has_residual, has_rowscale, has_colscale):
+                                             dropout_p, has_residual, has_rowscale, has_colscale,
+                                             is_rms_norm):
     if weight_dtype == torch.float16 and input_dtype == torch.bfloat16:
         pytest.skip()  # Not supported
+    if is_rms_norm and FusedRMSNorm is None:
+        pytest.skip()  # We need Apex's FusedRMSNorm to test
+    layer_norm_cls = torch.nn.LayerNorm if not is_rms_norm else FusedRMSNorm
+    our_layer_norm_cls = DropoutAddLayerNorm if not is_rms_norm else DropoutAddRMSNorm
+    our_layer_norm_func = dropout_add_layer_norm if not is_rms_norm else dropout_add_rms_norm
     device = 'cuda'
     # rtol, atol = (1e-5, 1e-6) if input_dtype == torch.float32 else (1e-3, 1e-4)
     rtol, atol = (1e-3, 2e-4)
@@ -208,23 +233,25 @@ def test_dropout_layer_norm_prenorm_training(hidden_size, input_dtype, residual_
     if has_colscale:
         x0_scaled_pt = x0_scaled_pt * colscale_pt
         x0_scaled_ref = x0_scaled_ref * colscale_ref
-    model_pt = torch.nn.LayerNorm(hidden_size, device=device, dtype=weight_dtype)
+    model_pt = layer_norm_cls(hidden_size).to(device=device, dtype=weight_dtype)
     torch.nn.init.normal_(model_pt.weight)
-    torch.nn.init.normal_(model_pt.bias)
-    model_ref = torch.nn.LayerNorm(hidden_size, device=device, dtype=torch.float32)
-    model = DropoutAddLayerNorm(hidden_size, prenorm=True, p=dropout_p, device=device,
-                                dtype=weight_dtype)
+    if not is_rms_norm:
+        torch.nn.init.normal_(model_pt.bias)
+    model_ref = layer_norm_cls(hidden_size).to(device=device, dtype=torch.float32)
+    model = our_layer_norm_cls(hidden_size, prenorm=True, p=dropout_p, device=device,
+                               dtype=weight_dtype)
     with torch.no_grad():
         model.weight.copy_(model_pt.weight)
-        model.bias.copy_(model_pt.bias)
         model_ref.weight.copy_(model_pt.weight)
-        model_ref.bias.copy_(model_pt.bias)
+        if not is_rms_norm:
+            model.bias.copy_(model_pt.bias)
+            model_ref.bias.copy_(model_pt.bias)
     residual_in_fp32 = (not has_residual) and residual_dtype == torch.float32
-    out, residual, dmask = dropout_add_layer_norm(x0, x1, model.weight, model.bias, model.p,
-                                                  model.epsilon, rowscale=rowscale,
-                                                  layerscale=colscale, prenorm=True,
-                                                  residual_in_fp32=residual_in_fp32,
-                                                  return_dropout_mask=True)
+    out, residual, dmask = our_layer_norm_func(x0, x1, model.weight, model.bias, model.p,
+                                               model.epsilon, rowscale=rowscale,
+                                               layerscale=colscale, prenorm=True,
+                                               residual_in_fp32=residual_in_fp32,
+                                               return_dropout_mask=True)
     print(f'Actual dropout fraction: {1 - dmask.float().mean().item()}')
     if has_residual:
         residual_pt = ((x0_scaled_pt.float() * dmask.float()) / (1 - dropout_p) + x1_pt.float()).to(dtype=residual_dtype)
@@ -247,7 +274,8 @@ def test_dropout_layer_norm_prenorm_training(hidden_size, input_dtype, residual_
     if has_residual:
         assert (x1.grad - x1_ref.grad).abs().max() <= 4 * (x1_pt.grad - x1_ref.grad).abs().max() + 1e-4
     assert (model.weight.grad - model_ref.weight.grad).abs().max() <= 2 * (model_pt.weight.grad - model_ref.weight.grad).abs().max() + 2e-4
-    assert (model.bias.grad - model_ref.bias.grad).abs().max() <= 2 * (model_pt.bias.grad - model_ref.bias.grad).abs().max() + 2e-4
+    if not is_rms_norm:
+        assert (model.bias.grad - model_ref.bias.grad).abs().max() <= 2 * (model_pt.bias.grad - model_ref.bias.grad).abs().max() + 2e-4
     if has_colscale:
         assert (colscale.grad - colscale_ref.grad).abs().max() <= 2 * (colscale_pt.grad - colscale_ref.grad).abs().max() + 2e-4
 

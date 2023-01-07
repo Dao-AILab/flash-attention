@@ -89,7 +89,11 @@ void ln_fwd_kernel(FwdParams params) {
     for( int it = 0; it < LDGS; it++ ) {
         if (Is_even_cols || (it < num_valid_ldgs)) {
             gamma[it].load_from(params.gamma, idx);
-            beta[it].load_from(params.beta, idx);
+            if (params.beta != nullptr) {
+                beta[it].load_from(params.beta, idx);
+            } else {
+                beta[it].zero_();
+            }
             if (Has_colscale) { colscale[it].load_from(params.colscale, idx); }
             idx += VEC_COLS_PER_LDG;
         }
@@ -159,7 +163,7 @@ void ln_fwd_kernel(FwdParams params) {
             mu_ptr[row] = mu;
         }
 
-        compute_t rs = rsqrtf(m2 * params.inverse_cols + params.epsilon);
+        compute_t rs = rsqrtf(m2 * params.inverse_cols + params.epsilon + (!params.is_rms_norm ? 0.f : mu * mu));
 
         if( bidn == 0 && warp_n == 0 && lane == 0 ) {
             rs_ptr[row] = rs;
@@ -174,7 +178,7 @@ void ln_fwd_kernel(FwdParams params) {
                     Ovec z;
                     #pragma unroll
                     for( int jt = 0; jt < NUM_ELTS; jt++ ) {
-                        compute_t y_ij = compute_t(rs * (xf[it * NUM_ELTS + jt] - mu));
+                        compute_t y_ij = compute_t(rs * (xf[it * NUM_ELTS + jt] - (!params.is_rms_norm ? mu : 0.f)));
                         compute_t g_ij = gamma[it].data.elt[jt];
                         compute_t b_ij = beta[it].data.elt[jt];
                         z.data.elt[jt] = output_t(g_ij * y_ij + b_ij);

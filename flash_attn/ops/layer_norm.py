@@ -8,7 +8,7 @@ import dropout_layer_norm
 
 
 def _dropout_add_layer_norm_forward(x0, x1, gamma, beta, rowscale, colscale, dropout_p, epsilon,
-                                    residual_in_fp32):
+                                    residual_in_fp32=False, is_rms_norm=False):
     """ Assume that arguments are contiguous
     """
     hidden_size = gamma.numel()
@@ -17,7 +17,7 @@ def _dropout_add_layer_norm_forward(x0, x1, gamma, beta, rowscale, colscale, dro
     rowscale = rowscale.view(-1) if rowscale is not None else None
     zmat, xmat, dmask, mu, rsigma = dropout_layer_norm.dropout_add_ln_fwd(
         x0mat, x1mat, gamma, beta, rowscale, colscale, None, None, dropout_p, epsilon,
-        1.0, 0, None, residual_in_fp32
+        1.0, 0, None, residual_in_fp32, is_rms_norm
     )
     # dmask is None if dropout_p == 0.0
     # xmat is None if dropout_p == 0.0 and x1 is None and residual_dtype != input_dtype
@@ -25,7 +25,7 @@ def _dropout_add_layer_norm_forward(x0, x1, gamma, beta, rowscale, colscale, dro
 
 
 def _dropout_add_layer_norm_backward(dz, dx, x, x0, dmask, mu, rsigma, gamma, rowscale, colscale,
-                                     dropout_p, has_residual):
+                                     dropout_p, has_residual, is_rms_norm=False):
     """ Assume that arguments are contiguous
     dx == None means that it was a post-norm architecture
     (x = drop(x0) + x1 was not returned in the fwd).
@@ -41,7 +41,7 @@ def _dropout_add_layer_norm_backward(dz, dx, x, x0, dmask, mu, rsigma, gamma, ro
         assert x0 is not None, 'x0 is required to compute the gradient of colscale'
     dx0mat, dx1mat, dgamma, dbeta, _, _, *rest = dropout_layer_norm.dropout_add_ln_bwd(
         dzmat, dxmat, xmat, x0mat, dmask, mu, rsigma, gamma, rowscale, colscale, None, None,
-        dropout_p, 1.0, 0, has_residual
+        dropout_p, 1.0, 0, has_residual, is_rms_norm
     )
     # dx1mat is None if not has_residual
     if colscale is None:
@@ -53,7 +53,7 @@ def _dropout_add_layer_norm_backward(dz, dx, x, x0, dmask, mu, rsigma, gamma, ro
 
 def _dropout_add_layer_norm_subset_forward(x0, x1, gamma, beta, colscale, x0_subset, out_subset,
                                            dropout_p, epsilon, rowscale_const, out_numrows,
-                                           residual_in_fp32):
+                                           residual_in_fp32=False, is_rms_norm=False):
     """ Assume that arguments are contiguous
     """
     hidden_size = gamma.numel()
@@ -63,7 +63,7 @@ def _dropout_add_layer_norm_subset_forward(x0, x1, gamma, beta, colscale, x0_sub
     out_subset = out_subset.view(-1) if out_subset is not None else None
     zmat, xmat, dmask, mu, rsigma = dropout_layer_norm.dropout_add_ln_fwd(
         x0mat, x1mat, gamma, beta, None, colscale, x0_subset, out_subset, dropout_p, epsilon,
-        rowscale_const, out_numrows, None, residual_in_fp32
+        rowscale_const, out_numrows, None, residual_in_fp32, is_rms_norm
     )
     # dmask is None if dropout_p == 0.0
     # xmat is None if dropout_p == 0.0 and x1 is None and residual_dtype != input_dtype
@@ -72,7 +72,7 @@ def _dropout_add_layer_norm_subset_forward(x0, x1, gamma, beta, colscale, x0_sub
 
 def _dropout_add_layer_norm_subset_backward(dz, dx, x, x0, dmask, mu, rsigma, gamma, colscale,
                                             x0_subset, out_subset, dropout_p, rowscale_const,
-                                            x0_numrows, has_residual):
+                                            x0_numrows, has_residual, is_rms_norm=False):
     """ Assume that arguments are contiguous
     dx == None means that it was a post-norm architecture
     (x = drop(x0) + x1 was not returned in the fwd).
@@ -89,7 +89,7 @@ def _dropout_add_layer_norm_subset_backward(dz, dx, x, x0, dmask, mu, rsigma, ga
         assert x0 is not None, 'x0 is required to compute the gradient of colscale'
     dx0mat, dx1mat, dgamma, dbeta, _, _, *rest = dropout_layer_norm.dropout_add_ln_bwd(
         dzmat, dxmat, xmat, x0mat, dmask, mu, rsigma, gamma, None, colscale, x0_subset, out_subset,
-        dropout_p, rowscale_const, x0_numrows, has_residual
+        dropout_p, rowscale_const, x0_numrows, has_residual, is_rms_norm
     )
     # dx1mat is None if not has_residual
     if colscale is None:
@@ -101,16 +101,17 @@ def _dropout_add_layer_norm_subset_backward(dz, dx, x, x0, dmask, mu, rsigma, ga
 
 class DropoutAddLayerNormFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x0, x1, gamma, beta, rowscale, colscale, dropout_p, epsilon, residual_in_fp32,
-                prenorm=False, return_dmask=False):
+    def forward(ctx, x0, x1, gamma, beta, rowscale, colscale, dropout_p, epsilon,
+                residual_in_fp32=False, prenorm=False, is_rms_norm=False, return_dmask=False):
         x0 = x0.contiguous()
         x1 = x1.contiguous() if x1 is not None else None
         gamma = gamma.contiguous()
-        beta = beta.contiguous()
+        beta = beta.contiguous() if beta is not None else None
         rowscale = rowscale.contiguous() if rowscale is not None else None
         colscale = colscale.contiguous() if colscale is not None else None
         zmat, xmat, dmask, mu, rsigma = _dropout_add_layer_norm_forward(
-            x0, x1, gamma, beta, rowscale, colscale, dropout_p, epsilon, residual_in_fp32
+            x0, x1, gamma, beta, rowscale, colscale, dropout_p, epsilon,
+            residual_in_fp32, is_rms_norm
         )
         # Only need to save x0 if we need to compute gradient wrt colscale
         x0_saved = x0 if colscale is not None else None
@@ -118,6 +119,8 @@ class DropoutAddLayerNormFn(torch.autograd.Function):
         ctx.prenorm = prenorm
         ctx.dropout_p = dropout_p
         ctx.has_residual = x1 is not None
+        ctx.is_rms_norm = is_rms_norm
+        ctx.has_beta = beta is not None
         if not return_dmask:
             return (zmat.view(x0.shape) if not prenorm
                     else (zmat.view(x0.shape), xmat.view(x0.shape)))
@@ -138,26 +141,29 @@ class DropoutAddLayerNormFn(torch.autograd.Function):
         dropout_p = ctx.dropout_p
         has_residual = ctx.has_residual
         dx0mat, dx1mat, dgamma, dbeta, *rest = _dropout_add_layer_norm_backward(
-            dz, dx, x, x0, dmask, mu, rsigma, gamma, rowscale, colscale, dropout_p, has_residual
+            dz, dx, x, x0, dmask, mu, rsigma, gamma, rowscale, colscale, dropout_p, has_residual,
+            ctx.is_rms_norm
         )
         dx0 = dx0mat.view(x.shape)
         dx1 = dx1mat.view(x.shape) if dx1mat is not None else None
         dcolscale = rest[0] if colscale is not None else None
-        return dx0, dx1, dgamma, dbeta, None, dcolscale, None, None, None, None, None
+        return (dx0, dx1, dgamma, dbeta if ctx.has_beta else None, None, dcolscale, None, None,
+                None, None, None, None)
 
 
 class DropoutAddLayerNormSubsetFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x0, x1, gamma, beta, colscale, x0_subset, out_subset, dropout_p, epsilon,
-                rowscale_const, out_numrows, residual_in_fp32, prenorm=False, return_dmask=False):
+                rowscale_const, out_numrows, residual_in_fp32=False,
+                prenorm=False, is_rms_norm=False, return_dmask=False):
         x0 = x0.contiguous()
         x1 = x1.contiguous() if x1 is not None else None
         gamma = gamma.contiguous()
-        beta = beta.contiguous()
+        beta = beta.contiguous() if beta is not None else None
         colscale = colscale.contiguous() if colscale is not None else None
         zmat, xmat, dmask, mu, rsigma = _dropout_add_layer_norm_subset_forward(
             x0, x1, gamma, beta, colscale, x0_subset, out_subset, dropout_p, epsilon,
-            rowscale_const, out_numrows, residual_in_fp32
+            rowscale_const, out_numrows, residual_in_fp32, is_rms_norm
         )
         # Only need to save x0 if we need to compute gradient wrt colscale
         x0_saved = x0 if colscale is not None else None
@@ -169,6 +175,8 @@ class DropoutAddLayerNormSubsetFn(torch.autograd.Function):
         ctx.rowscale_const = rowscale_const
         ctx.x0_numrows = x0.shape[:-1].numel()
         ctx.has_residual = x1 is not None
+        ctx.is_rms_norm = is_rms_norm
+        ctx.has_beta = beta is not None
         z_shape = (-1, *x0.shape[1:])
         if not return_dmask:
             return (zmat.view(z_shape) if not prenorm
@@ -191,13 +199,13 @@ class DropoutAddLayerNormSubsetFn(torch.autograd.Function):
         has_residual = ctx.has_residual
         dx0mat, dx1mat, dgamma, dbeta, *rest = _dropout_add_layer_norm_subset_backward(
             dz, dx, x, x0, dmask, mu, rsigma, gamma, colscale, x0_subset, out_subset, dropout_p,
-            ctx.rowscale_const, ctx.x0_numrows, has_residual
+            ctx.rowscale_const, ctx.x0_numrows, has_residual, ctx.is_rms_norm
         )
         dx0 = dx0mat.view(-1, *x.shape[1:])
         dx1 = dx1mat.view(x.shape) if dx1mat is not None else None
         dcolscale = rest[0] if colscale is not None else None
-        return (dx0, dx1, dgamma, dbeta, dcolscale, None, None, None, None, None, None, None,
-                None, None)
+        return (dx0, dx1, dgamma, dbeta if ctx.has_beta else None, dcolscale, None, None, None,
+                None, None, None, None, None, None, None)
 
 
 def layer_norm(x, weight, bias, epsilon):
@@ -212,7 +220,7 @@ def dropout_add_layer_norm(x0, x1, weight, bias, dropout_p, epsilon, rowscale=No
     """
     return DropoutAddLayerNormFn.apply(
         x0, x1, weight, bias, rowscale, layerscale, dropout_p, epsilon, residual_in_fp32, prenorm,
-        return_dropout_mask
+        False, return_dropout_mask
     )
 
 
@@ -225,7 +233,7 @@ def dropout_add_layer_norm_subset(x0, x1, weight, bias, dropout_p, epsilon, laye
     """
     return DropoutAddLayerNormSubsetFn.apply(
         x0, x1, weight, bias, layerscale, x0_subset, out_subset, dropout_p, epsilon,
-        rowscale_const, out_numrows, residual_in_fp32, prenorm, return_dropout_mask
+        rowscale_const, out_numrows, residual_in_fp32, prenorm, False, return_dropout_mask
     )
 
 
