@@ -23,11 +23,13 @@ is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
 
 
 @pytest.mark.parametrize('dtype', [torch.float16] + ([torch.bfloat16] if is_sm8x else []))
-# @pytest.mark.parametrize('dtype', [torch.bfloat16])
+# @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize('world_size', [1, 2, 4, 8])
 # @pytest.mark.parametrize('world_size', [2])
+@pytest.mark.parametrize('sequence_parallel', [True, False])
+# @pytest.mark.parametrize('sequence_parallel', [False])
 @pytest.mark.parametrize('dim', [1024])
-def test_block_parallel(dim, world_size, dtype):
+def test_block_parallel(dim, sequence_parallel, world_size, dtype):
     head_dim = 64
     assert dim % head_dim == 0
     num_heads = dim // head_dim
@@ -41,7 +43,7 @@ def test_block_parallel(dim, world_size, dtype):
     rank = parallel_state.get_tensor_model_parallel_rank()
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 8
+    batch_size = 2
     seqlen = 1024
     assert (batch_size * seqlen) % world_size == 0
     x_pt = torch.randn(batch_size * seqlen, dim, device=device, dtype=dtype,
@@ -51,8 +53,12 @@ def test_block_parallel(dim, world_size, dtype):
     # as rank 0 will have an extra bias that changes the RNG.
     # If we don't divide by batch_size, the gradient gets a bit too large.
     g = torch.randn_like(x_pt) / 32
-    x = tensor_parallel.scatter_to_sequence_parallel_region(x_pt).detach().clone().requires_grad_()
-    residual = tensor_parallel.scatter_to_sequence_parallel_region(residual_pt).detach().clone().requires_grad_()
+    if sequence_parallel:
+        x = tensor_parallel.scatter_to_sequence_parallel_region(x_pt).detach().clone().requires_grad_()
+        residual = tensor_parallel.scatter_to_sequence_parallel_region(residual_pt).detach().clone().requires_grad_()
+    else:
+        x = x_pt.detach().clone().requires_grad_()
+        residual = residual_pt.detach().clone().requires_grad_()
 
     mixer_cls_pt = partial(MHA, num_heads=num_heads, rotary_emb_dim=int(head_dim // 2),
                            use_flash_attn=True, device=device, dtype=dtype)
@@ -69,12 +75,12 @@ def test_block_parallel(dim, world_size, dtype):
     mixer_cls = partial(ParallelMHA, num_heads=num_heads,
                         process_group=parallel_state.get_tensor_model_parallel_group(),
                         rotary_emb_dim=int(head_dim // 2), use_flash_attn=True,
-                        device=device, dtype=dtype)
+                        sequence_parallel=sequence_parallel, device=device, dtype=dtype)
     mlp_cls = partial(ParallelFusedDenseGeluDense, hidden_features=4 * dim,
                       process_group=parallel_state.get_tensor_model_parallel_group(),
-                      device=device, dtype=dtype)
+                      sequence_parallel=sequence_parallel, device=device, dtype=dtype)
     model = Block(dim, mixer_cls, mlp_cls, norm_cls, fused_dropout_add_ln=True,
-                  sequence_parallel=True)
+                  sequence_parallel=sequence_parallel, mark_shared_params=True)
 
     partition_dim = dim // world_size
     partition_hidden_dim = 4 * dim // world_size
@@ -115,25 +121,34 @@ def test_block_parallel(dim, world_size, dtype):
     out_pt, out_residual_pt = [rearrange(x, 'b s d -> (b s) d') for x in [out_pt, out_residual_pt]]
     partition_batch_dim = batch_size * seqlen // world_size
     assert torch.allclose(
-        out, out_pt[rank * partition_batch_dim:(rank + 1) * partition_batch_dim],
+        out,
+        out_pt[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+        if sequence_parallel else out_pt,
         rtol=rtol, atol=atol
     )
     assert torch.allclose(
-        out_residual, out_residual_pt[rank * partition_batch_dim:(rank + 1) * partition_batch_dim],
+        out_residual,
+        out_residual_pt[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+        if sequence_parallel else out_residual_pt,
         rtol=rtol, atol=atol
     )
 
-    out_pt.backward(g)
-    out.backward(g[rank * partition_batch_dim:(rank + 1) * partition_batch_dim])
+    (out_pt + 2 * out_residual_pt).backward(g)
+    (out + 2 * out_residual).backward(g[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+                                      if sequence_parallel else g)
     allreduce_sequence_parallel_grad(model, parallel_state.get_tensor_model_parallel_group())
     parallel_state.destroy_model_parallel()
 
     assert torch.allclose(
-        x.grad, x_pt.grad[rank * partition_batch_dim:(rank + 1) * partition_batch_dim],
-        rtol=rtol, atol=atol
+        x.grad,
+        x_pt.grad[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+        if sequence_parallel else x_pt.grad,
+        rtol=rtol, atol=atol / 100  # magnitude of x.grad is quite small
     )
     assert torch.allclose(
-        residual.grad, residual_pt.grad[rank * partition_batch_dim:(rank + 1) * partition_batch_dim],
+        residual.grad,
+        residual_pt.grad[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+        if sequence_parallel else residual_pt.grad,
         rtol=rtol, atol=atol
     )
     # The error for d_weight and d_bias is quite a bit higher

@@ -15,26 +15,29 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 import fused_dense_lib as fused_dense_cuda
 
 from flash_attn.ops.gelu_activation import gelu_bwd
-from flash_attn.utils.distributed import all_gather_raw, reduce_scatter_raw, reduce_scatter
+from flash_attn.utils.distributed import all_gather_raw, reduce_scatter_raw, all_reduce_raw
+from flash_attn.utils.distributed import reduce_scatter, all_reduce
 
 
 class FusedDenseFunc(torch.autograd.Function):
 
     @staticmethod
     @custom_fwd
-    def forward(ctx, x, weight, bias, return_residual=False, process_group=None):
+    def forward(ctx, x, weight, bias, return_residual=False, process_group=None,
+                sequence_parallel=True):
         """
-        If process_group is not None, we're doing Tensor Parallel with sequence parallelism:
-        we do an all_gather_raw of x before doing the matmul.
+        If process_group is not None and sequence_parallel=True, we're doing Tensor Parallel
+        with sequence parallelism: we do an all_gather_raw of x before doing the matmul.
         """
         ctx.compute_weight_gradient = weight.requires_grad
         ctx.return_residual = return_residual
         ctx.process_group = process_group
+        ctx.sequence_parallel = sequence_parallel
 
         if torch.is_autocast_enabled():
             x = x.to(dtype=torch.get_autocast_gpu_dtype())
         x = x.contiguous()
-        if process_group is not None:
+        if process_group is not None and sequence_parallel:
             # We want to kick off the all_gather early, before weight dtype conversion
             total_x, handle_x = all_gather_raw(x, process_group, async_op=True)
         else:
@@ -44,7 +47,7 @@ class FusedDenseFunc(torch.autograd.Function):
             weight = weight.to(dtype=torch.get_autocast_gpu_dtype())
             bias = bias.to(dtype=torch.get_autocast_gpu_dtype()) if bias is not None else None
         weight = weight.contiguous()
-        if process_group is not None:
+        if process_group is not None and sequence_parallel:
             handle_x.wait()
         batch_shape, n = total_x.shape[:-1], total_x.shape[-1]
         batch_dim = batch_shape.numel()
@@ -66,9 +69,10 @@ class FusedDenseFunc(torch.autograd.Function):
             grad_input, = args
             grad_input = grad_input.contiguous()
         process_group = ctx.process_group
+        sequence_parallel = ctx.sequence_parallel
         if ctx.compute_weight_gradient:
             x, weight = ctx.saved_tensors
-            if process_group is not None:
+            if process_group is not None and sequence_parallel:
                 total_x, handle_x = all_gather_raw(x, process_group, async_op=True)
             else:
                 total_x = x
@@ -86,13 +90,13 @@ class FusedDenseFunc(torch.autograd.Function):
                                          grad_output, weight)
             grad_input = grad_input.reshape(*batch_shape, grad_input.shape[-1])
             if process_group is not None:
-                grad_input, handle_grad_input = reduce_scatter_raw(grad_input, process_group,
-                                                                   async_op=True)
+                reduce_fn = reduce_scatter_raw if sequence_parallel else all_reduce_raw
+                grad_input, handle_grad_input = reduce_fn(grad_input, process_group, async_op=True)
         else:
             grad_input = None
         if ctx.needs_input_grad[1]:
             assert ctx.compute_weight_gradient
-            if process_group is not None:
+            if process_group is not None and sequence_parallel:
                 handle_x.wait()
             grad_weight, grad_bias = fused_dense_cuda.linear_bias_wgrad(
                 total_x.reshape(batch_dim, total_x.shape[-1]), grad_output, ctx.needs_input_grad[2]
@@ -102,15 +106,17 @@ class FusedDenseFunc(torch.autograd.Function):
             grad_bias = grad_output if ctx.needs_input_grad[2] else None
         if process_group is not None and ctx.needs_input_grad[0]:
             handle_grad_input.wait()
-        return grad_input, grad_weight, grad_bias, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None
 
 
 def fused_dense_func(x: Tensor, weight: Tensor, bias: Optional[Tensor] = None,
-                     return_residual: bool = False, process_group: Optional[ProcessGroup] = None):
+                     return_residual: bool = False, process_group: Optional[ProcessGroup] = None,
+                     sequence_parallel: bool = True):
     dtype_eligible = (x.dtype in [torch.float16, torch.bfloat16]
                       or (x.dtype == torch.float32 and torch.is_autocast_enabled()))
     if x.is_cuda and weight.is_cuda and (bias is None or bias.is_cuda) and dtype_eligible:
-        return FusedDenseFunc.apply(x, weight, bias, return_residual, process_group)
+        return FusedDenseFunc.apply(x, weight, bias, return_residual, process_group,
+                                    sequence_parallel)
     else:
         assert process_group is None
         out = F.linear(x, weight, bias)
@@ -136,7 +142,7 @@ class FusedDense(nn.Linear):
 class ColumnParallelLinear(nn.Linear):
 
     def __init__(self, in_features: int, out_features: int, process_group: ProcessGroup,
-                 bias: bool = True, device=None, dtype=None) -> None:
+                 bias: bool = True, sequence_parallel=True, device=None, dtype=None) -> None:
         world_size = torch.distributed.get_world_size(process_group)
         if out_features % world_size != 0:
             raise ValueError(f'out_features ({out_features}) must be divisible by '
@@ -144,19 +150,20 @@ class ColumnParallelLinear(nn.Linear):
         super().__init__(in_features, out_features // world_size, bias=bias,
                          device=device, dtype=dtype)
         self.process_group = process_group
+        self.sequence_parallel = sequence_parallel
 
     def forward(self, x):
-        """
-        We're doing Tensor Parallel with sequence parallelism: we do an all_gather of
-        x before doing the matmul.
-        """
-        return fused_dense_func(x, self.weight, self.bias, process_group=self.process_group)
+        # If self.sequence_parallel is True, we're doing Tensor Parallel with sequence parallelism:
+        # we do an all_gather of x before doing the matmul.
+        # If not, then the input is already gathered.
+        return fused_dense_func(x, self.weight, self.bias, process_group=self.process_group,
+                                sequence_parallel=self.sequence_parallel)
 
 
 class RowParallelLinear(nn.Linear):
 
     def __init__(self, in_features: int, out_features: int, process_group: ProcessGroup,
-                 bias: bool = True, device=None, dtype=None) -> None:
+                 bias: bool = True, sequence_parallel=True, device=None, dtype=None) -> None:
         world_size = torch.distributed.get_world_size(process_group)
         rank = torch.distributed.get_rank(process_group)
         if in_features % world_size != 0:
@@ -166,6 +173,7 @@ class RowParallelLinear(nn.Linear):
         super().__init__(in_features // world_size, out_features, bias=bias and rank == 0,
                          device=device, dtype=dtype)
         self.process_group = process_group
+        self.sequence_parallel = sequence_parallel
 
     def forward(self, x):
         """
@@ -173,7 +181,8 @@ class RowParallelLinear(nn.Linear):
         a reduce_scatter of the result.
         """
         out = fused_dense_func(x, self.weight, self.bias)
-        return reduce_scatter(out, self.process_group)
+        reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
+        return reduce_fn(out, self.process_group)
 
 
 class FusedDenseGeluDenseFunc(torch.autograd.Function):
@@ -181,10 +190,11 @@ class FusedDenseGeluDenseFunc(torch.autograd.Function):
     @staticmethod
     @custom_fwd
     def forward(ctx, x, weight1, bias1, weight2, bias2, save_pre_act=True, return_residual=False,
-                checkpoint_lvl=0, heuristic=0, process_group=None):
+                checkpoint_lvl=0, heuristic=0, process_group=None, sequence_parallel=True):
         """
-        If process_group is not None, we're doing Tensor Parallel with sequence parallelism:
-        we do an all_gather of x before doing the matmul.
+        If process_group is not None and sequence_parallel=True, we're doing Tensor Parallel
+        with sequence parallelism: we do an all_gather of x before doing the matmul.
+        If sequence_parallel=False, then the input is already gathered.
 
         checkpoint_lvl:
         0: no recomputation in the bwd
@@ -197,13 +207,14 @@ class FusedDenseGeluDenseFunc(torch.autograd.Function):
         assert checkpoint_lvl in [0, 1, 2]
         ctx.return_residual = return_residual
         ctx.process_group = process_group
+        ctx.sequence_parallel = sequence_parallel
         ctx.checkpoint_lvl = checkpoint_lvl
         ctx.heuristic = heuristic
 
         if torch.is_autocast_enabled():
             x = x.to(dtype=torch.get_autocast_gpu_dtype())
         x = x.contiguous()
-        if process_group is not None:
+        if process_group is not None and sequence_parallel:
             # We want to kick off the all_gather early, before weight dtype conversion
             total_x, handle_x = all_gather_raw(x, process_group, async_op=True)
         else:
@@ -218,7 +229,7 @@ class FusedDenseGeluDenseFunc(torch.autograd.Function):
         bias1 = bias1.contiguous() if bias1 is not None else None
         weight2 = weight2.contiguous()
         bias2 = bias2.contiguous() if bias2 is not None else None
-        if process_group is not None:
+        if process_group is not None and sequence_parallel:
             handle_x.wait()
         batch_shape, n = total_x.shape[:-1], total_x.shape[-1]
         batch_dim = batch_shape.numel()
@@ -257,13 +268,14 @@ class FusedDenseGeluDenseFunc(torch.autograd.Function):
             grad_input, = args
             grad_input = grad_input.contiguous()
         process_group = ctx.process_group
+        sequence_parallel = ctx.sequence_parallel
         x, weight1, weight2, *rest = ctx.saved_tensors
-        if process_group is None:
+        if process_group is None or not sequence_parallel:
             total_x = x
         batch_shape = grad_output.shape[:-1]
         batch_dim = batch_shape.numel()
         if checkpoint_lvl in [0, 1]:
-            if process_group is not None:
+            if process_group is not None and sequence_parallel:
                 total_x, handle_x = all_gather_raw(x, process_group, async_op=True)
             if checkpoint_lvl == 0:
                 gelu_in, output1 = rest
@@ -272,7 +284,7 @@ class FusedDenseGeluDenseFunc(torch.autograd.Function):
                 output1 = F.gelu(gelu_in, approximate='tanh')
         elif checkpoint_lvl == 2:
             bias1, = rest
-            if process_group is not None:
+            if process_group is not None and sequence_parallel:
                 total_x, _ = all_gather_raw(x, process_group)
             if ctx.heuristic == -1:
                 gelu_in = F.linear(total_x, weight1, bias1)
@@ -314,13 +326,13 @@ class FusedDenseGeluDenseFunc(torch.autograd.Function):
                                          grad_gelu, weight1)
             grad_input = grad_input.reshape(*batch_shape, grad_input.shape[-1])
             if process_group is not None:
-                grad_input, handle_grad_input = reduce_scatter_raw(grad_input, process_group,
-                                                                   async_op=True)
+                reduce_fn = reduce_scatter_raw if sequence_parallel else all_reduce_raw
+                grad_input, handle_grad_input = reduce_fn(grad_input, process_group, async_op=True)
         else:
             grad_input = None
         if ctx.heuristic == -1:
             if ctx.needs_input_grad[1]:
-                if process_group is not None:
+                if process_group is not None and sequence_parallel:
                     handle_x.wait()
                 grad_weight1, grad_bias1 = fused_dense_cuda.linear_bias_wgrad(
                     total_x.reshape(batch_dim, total_x.shape[-1]), grad_gelu,
@@ -331,7 +343,7 @@ class FusedDenseGeluDenseFunc(torch.autograd.Function):
                 grad_bias1 = grad_gelu if ctx.needs_input_grad[2] else None
         else:
             if ctx.needs_input_grad[1]:
-                if process_group is not None:
+                if process_group is not None and sequence_parallel:
                     handle_x.wait()
                 grad_weight1 = F.linear(grad_gelu.t(),
                                         total_x.reshape(batch_dim, total_x.shape[-1]).t())
@@ -340,7 +352,7 @@ class FusedDenseGeluDenseFunc(torch.autograd.Function):
         if process_group is not None and ctx.needs_input_grad[0]:
             handle_grad_input.wait()
         return (grad_input, grad_weight1, grad_bias1, grad_weight2, grad_bias2,
-                None, None, None, None, None)
+                None, None, None, None, None, None)
 
 
 def fused_dense_gelu_dense_func(
@@ -348,15 +360,16 @@ def fused_dense_gelu_dense_func(
     bias2: Optional[Tensor] = None,
     save_pre_act: bool = True, return_residual: bool = False,
     checkpoint_lvl: int = 0, heuristic: int = 0,
-    process_group: Optional[ProcessGroup] = None
+    process_group: Optional[ProcessGroup] = None,
+    sequence_parallel: bool = True
 ):
     dtype_eligible = (x.dtype in [torch.float16, torch.bfloat16]
                       or (x.dtype == torch.float32 and torch.is_autocast_enabled()))
     if (x.is_cuda and weight1.is_cuda and weight2.is_cuda and (bias1 is None or bias1.is_cuda)
         and (bias2 is None or bias2.is_cuda) and dtype_eligible):
         return FusedDenseGeluDenseFunc.apply(
-            x, weight1, bias1, weight2, bias2,
-            save_pre_act, return_residual, checkpoint_lvl, heuristic, process_group
+            x, weight1, bias1, weight2, bias2, save_pre_act, return_residual,
+            checkpoint_lvl, heuristic, process_group, sequence_parallel
         )
     else:
         assert process_group is None
@@ -418,7 +431,7 @@ class ParallelFusedDenseGeluDense(nn.Module):
 
     def __init__(self, in_features, hidden_features, out_features=None,
                  process_group: ProcessGroup = None, bias1=True, bias2=True,
-                 checkpoint_lvl=0, heuristic=0, device=None, dtype=None):
+                 sequence_parallel=True, checkpoint_lvl=0, heuristic=0, device=None, dtype=None):
         """
         process_group is required. We're doing Tensor Parallel with sequence parallelism:
         we do an all_gather of x before doing the matmul, gelu, then matmul.
@@ -441,6 +454,7 @@ class ParallelFusedDenseGeluDense(nn.Module):
         if out_features is None:
             out_features = in_features
         self.process_group = process_group
+        self.sequence_parallel = sequence_parallel
         self.checkpoint_lvl = checkpoint_lvl
         self.heuristic = heuristic
         self.fc1 = ColumnParallelLinear(in_features, hidden_features, process_group,
@@ -452,6 +466,9 @@ class ParallelFusedDenseGeluDense(nn.Module):
         out = fused_dense_gelu_dense_func(
             x, self.fc1.weight, self.fc2.weight, self.fc1.bias, self.fc2.bias,
             save_pre_act=self.training, checkpoint_lvl=self.checkpoint_lvl,
-            heuristic=self.heuristic, process_group=self.process_group
+            heuristic=self.heuristic,
+            process_group=self.process_group,
+            sequence_parallel=self.sequence_parallel
         )
-        return reduce_scatter(out, self.process_group)
+        reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
+        return reduce_fn(out, self.process_group)

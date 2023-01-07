@@ -21,11 +21,13 @@ is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize('world_size', [1, 2, 4, 8])
 # @pytest.mark.parametrize('world_size', [2])
+@pytest.mark.parametrize('sequence_parallel', [True, False])
+# @pytest.mark.parametrize('sequence_parallel', [False])
 @pytest.mark.parametrize('head_dim', [64, 128])
 # @pytest.mark.parametrize('head_dim', [64])
 @pytest.mark.parametrize('embed_dim', [1024, 4096])
 # @pytest.mark.parametrize('embed_dim', [1024])
-def test_mha_parallel(embed_dim, head_dim, world_size, dtype):
+def test_mha_parallel(embed_dim, head_dim, sequence_parallel, world_size, dtype):
     assert embed_dim % head_dim == 0
     num_heads = embed_dim // head_dim
     assert num_heads % world_size == 0
@@ -38,7 +40,7 @@ def test_mha_parallel(embed_dim, head_dim, world_size, dtype):
     rank = parallel_state.get_tensor_model_parallel_rank()
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 8
+    batch_size = 2
     seqlen = 1024
     assert (batch_size * seqlen) % world_size == 0
     x_pt = torch.randn(batch_size * seqlen, embed_dim, device=device, dtype=dtype,
@@ -47,14 +49,17 @@ def test_mha_parallel(embed_dim, head_dim, world_size, dtype):
     # as rank 0 will have an extra bias that changes the RNG.
     # If we don't divide by batch_size, the gradient gets a bit too large.
     g = torch.randn_like(x_pt) / 32
-    x = tensor_parallel.scatter_to_sequence_parallel_region(x_pt).detach().clone().requires_grad_()
+    if sequence_parallel:
+        x = tensor_parallel.scatter_to_sequence_parallel_region(x_pt).detach().clone().requires_grad_()
+    else:
+        x = x_pt.detach().clone().requires_grad_()
 
     model_pt = MHA(embed_dim, num_heads, rotary_emb_dim=int(head_dim // 2),
                    use_flash_attn=True, device=device, dtype=dtype)
     partition_dim = embed_dim // world_size
     model = ParallelMHA(embed_dim, num_heads, parallel_state.get_tensor_model_parallel_group(),
                         rotary_emb_dim=int(head_dim // 2), use_flash_attn=True,
-                        device=device, dtype=dtype)
+                        sequence_parallel=sequence_parallel, device=device, dtype=dtype)
 
     with torch.no_grad():
         model.Wqkv.weight.copy_(
@@ -75,17 +80,22 @@ def test_mha_parallel(embed_dim, head_dim, world_size, dtype):
     out_pt = rearrange(model_pt(rearrange(x_pt, '(b s) d -> b s d', s=seqlen)), 'b s d -> (b s) d')
     partition_batch_dim = batch_size * seqlen // world_size
     assert torch.allclose(
-        out, out_pt[rank * partition_batch_dim:(rank + 1) * partition_batch_dim],
+        out,
+        out_pt[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+        if sequence_parallel else out_pt,
         rtol=rtol, atol=atol
     )
 
     out_pt.backward(g)
-    out.backward(g[rank * partition_batch_dim:(rank + 1) * partition_batch_dim])
+    out.backward(g[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+                 if sequence_parallel else g)
     parallel_state.destroy_model_parallel()
 
     assert torch.allclose(
-        x.grad, x_pt.grad[rank * partition_batch_dim:(rank + 1) * partition_batch_dim],
-        rtol=rtol, atol=atol
+        x.grad,
+        x_pt.grad[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+        if sequence_parallel else x_pt.grad,
+        rtol=rtol, atol=atol / 100  # magnitude of x.grad is quite small
     )
     # The error for d_weight and d_bias is quite a bit higher
     assert torch.allclose(

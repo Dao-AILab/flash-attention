@@ -23,10 +23,12 @@ is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
 # @pytest.mark.parametrize('dtype', [torch.bfloat16])
 @pytest.mark.parametrize('world_size', [1, 2, 4, 8])
 # @pytest.mark.parametrize('world_size', [2])
+@pytest.mark.parametrize('sequence_parallel', [True, False])
+# @pytest.mark.parametrize('sequence_parallel', [False])
 @pytest.mark.parametrize('has_pos_emb', [True, False])
 # @pytest.mark.parametrize('has_pos_emb', [True])
 @pytest.mark.parametrize('dim', [1024])
-def test_gpt_parallel(dim, has_pos_emb, world_size, dtype):
+def test_gpt_parallel(dim, has_pos_emb, sequence_parallel, world_size, dtype):
     head_dim = 64
     assert dim % head_dim == 0
     num_heads = dim // head_dim
@@ -59,7 +61,8 @@ def test_gpt_parallel(dim, has_pos_emb, world_size, dtype):
                         scale_attn_by_inverse_layer_idx=True, use_flash_attn=True,
                         fused_dense_gelu_dense=True, fused_bias_fc=True, fused_dropout_add_ln=True,
                         rotary_emb_fraction=0.0 if has_pos_emb else 0.5,
-                        pad_vocab_size_multiple=8 * world_size)
+                        pad_vocab_size_multiple=8 * world_size,
+                        sequence_parallel=sequence_parallel)
     model_pt = GPTLMHeadModel(config, device=device)
 
     def init_layer_norm(module):
@@ -75,16 +78,15 @@ def test_gpt_parallel(dim, has_pos_emb, world_size, dtype):
     torch.distributed.all_gather_into_tensor(
         sharded_nparams_all, torch.tensor([sharded_nparams], device=device), group=process_group
     )
-    sequence_parallel_nparams = sum(p.numel() for p in model.parameters()
-                                    if getattr(p, '_sequence_parallel', False))
-    sequence_parallel_nparams_all = torch.empty(world_size, dtype=torch.long, device=device)
+    shared_nparams = sum(p.numel() for p in model.parameters()
+                                    if getattr(p, '_shared_params', False))
+    shared_nparams_all = torch.empty(world_size, dtype=torch.long, device=device)
     torch.distributed.all_gather_into_tensor(
-        sequence_parallel_nparams_all, torch.tensor([sequence_parallel_nparams], device=device),
-        group=process_group
+        shared_nparams_all, torch.tensor([shared_nparams], device=device), group=process_group
     )
-    assert torch.all(sequence_parallel_nparams_all == sequence_parallel_nparams)
-    assert total_nparams == ((sharded_nparams_all - sequence_parallel_nparams_all).sum().item()
-                             + sequence_parallel_nparams)
+    assert torch.all(shared_nparams_all == shared_nparams)
+    assert total_nparams == ((sharded_nparams_all - shared_nparams_all).sum().item()
+                             + shared_nparams)
 
     # vocab_size has been rounded up here
     partition_vocab_size = config.vocab_size // world_size
@@ -96,6 +98,8 @@ def test_gpt_parallel(dim, has_pos_emb, world_size, dtype):
 
     with torch.autocast(device_type='cuda', dtype=dtype):
         out = model(input_ids[:, :-1]).logits
+        if not sequence_parallel:
+            out = rearrange(out, 'b s d -> (b s) d')
         out_pt = rearrange(model_pt(input_ids[:, :-1]).logits, 'b s d -> (b s) d')
     partition_batch_dim = batch_size * seqlen // world_size
     assert torch.allclose(

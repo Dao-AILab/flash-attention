@@ -497,11 +497,10 @@ class ParallelMHA(nn.Module):
 
     def __init__(self, embed_dim, num_heads, process_group, bias=True, dropout=0.0,
                  softmax_scale=None, causal=False, layer_idx=None, rotary_emb_dim=0,
-                 rotary_emb_scale_base=0,
-                 use_flash_attn=False, checkpointing=False, device=None, dtype=None) -> None:
+                 rotary_emb_scale_base=0, use_flash_attn=False, checkpointing=False,
+                 sequence_parallel=True, device=None, dtype=None) -> None:
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
-        self.process_group = process_group
         self.embed_dim = embed_dim
         self.causal = causal
         self.layer_idx = layer_idx
@@ -521,12 +520,13 @@ class ParallelMHA(nn.Module):
         if ColumnParallelLinear is None or RowParallelLinear is None:
             raise ImportError('fused_dense is not installed')
         self.Wqkv = ColumnParallelLinear(embed_dim, 3 * embed_dim, process_group, bias=bias,
-                                         **factory_kwargs)
+                                         sequence_parallel=sequence_parallel, **factory_kwargs)
         inner_attn_cls = FlashSelfAttention if use_flash_attn else SelfAttention
         self.inner_attn = inner_attn_cls(causal=causal, softmax_scale=softmax_scale,
                                          attention_dropout=dropout)
         # output projection always have the bias (for now)
-        self.out_proj = RowParallelLinear(embed_dim, embed_dim, process_group, **factory_kwargs)
+        self.out_proj = RowParallelLinear(embed_dim, embed_dim, process_group,
+                                          sequence_parallel=sequence_parallel, **factory_kwargs)
 
     def forward(self, x, seqlen=None, **kwargs):
         """

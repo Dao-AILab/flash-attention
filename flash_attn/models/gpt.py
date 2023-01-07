@@ -20,7 +20,7 @@ from flash_attn.modules.mha import MHA, ParallelMHA
 from flash_attn.modules.mlp import Mlp, FusedDenseGeluDense, ParallelFusedDenseGeluDense
 from flash_attn.modules.block import Block
 from flash_attn.modules.embedding import GPT2Embeddings, ParallelGPT2Embeddings
-from flash_attn.utils.distributed import sync_sequence_parallel_params
+from flash_attn.utils.distributed import sync_shared_params
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 from flash_attn.utils.generation import GenerationMixin
 
@@ -62,7 +62,9 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
     mha_cls = MHA if process_group is None else ParallelMHA
     serial_kwargs = ({'fused_bias_fc': fused_bias_fc, 'dwconv': dwconv}
                      if process_group is None else {})
-    parallel_kwargs = {'process_group': process_group} if process_group is not None else {}
+    parallel_kwargs = ({'process_group': process_group,
+                        'sequence_parallel': getattr(config, 'sequence_parallel', True)}
+                       if process_group is not None else {})
     mixer_cls = partial(mha_cls, num_heads=config.num_attention_heads, dropout=config.attn_pdrop,
                         softmax_scale=softmax_scale, causal=True, layer_idx=layer_idx,
                         rotary_emb_dim=rotary_emb_dim, rotary_emb_scale_base=rotary_emb_scale_base,
@@ -99,7 +101,9 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
             if FusedDenseGeluDense is None:
                 raise ImportError('fused_dense is not installed')
             mlp_cls = FusedDenseGeluDense if process_group is None else ParallelFusedDenseGeluDense
-            parallel_kwargs = {'process_group': process_group} if process_group is not None else {}
+            parallel_kwargs = ({'process_group': process_group,
+                                'sequence_parallel': getattr(config, 'sequence_parallel', True)}
+                               if process_group is not None else {})
             mlp_cls = partial(mlp_cls, hidden_features=inner_dim, checkpoint_lvl=mlp_checkpoint_lvl,
                               **parallel_kwargs, **factory_kwargs)
         elif fused_dense_sqrelu_dense:
@@ -113,13 +117,15 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
 
 def create_block(config, layer_idx=None, process_group=None, device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
+    sequence_parallel = getattr(config, 'sequence_parallel', True)
     mixer_cls = create_mixer_cls(config, layer_idx, process_group=process_group, **factory_kwargs)
     mlp_cls = create_mlp_cls(config, layer_idx, process_group=process_group, **factory_kwargs)
     norm_cls = partial(nn.LayerNorm, eps=config.layer_norm_epsilon, **factory_kwargs)
     block = Block(config.hidden_size, mixer_cls, mlp_cls, norm_cls=norm_cls,
                   prenorm=True, resid_dropout=config.resid_pdrop,
                   fused_dropout_add_ln=getattr(config, 'fused_dropout_add_ln', False),
-                  sequence_parallel=process_group is not None)
+                  sequence_parallel=sequence_parallel and process_group is not None,
+                  mark_shared_params=process_group is not None)
     block.layer_idx = layer_idx
     return block
 
@@ -180,6 +186,7 @@ class GPTModel(GPTPreTrainedModel):
         super().__init__(config)
         factory_kwargs = {'device': device, 'dtype': dtype}
         self.process_group = process_group
+        self.sequence_parallel = getattr(config, 'sequence_parallel', True)
         assert config.activation_function in ['gelu', 'gelu_new', 'gelu_fast', 'sqrelu']
         self.pad_vocab_size_multiple = getattr(config, 'pad_vocab_size_multiple', 1)
         if config.vocab_size % self.pad_vocab_size_multiple != 0:
@@ -192,7 +199,8 @@ class GPTModel(GPTPreTrainedModel):
         else:
             self.embeddings = ParallelGPT2Embeddings(
                 config.hidden_size, config.vocab_size, config.max_position_embeddings,
-                process_group=process_group, **factory_kwargs
+                process_group=process_group, sequence_parallel=self.sequence_parallel,
+                **factory_kwargs
             )
         self.emb_drop = nn.Dropout(config.embd_pdrop)
 
@@ -209,10 +217,13 @@ class GPTModel(GPTPreTrainedModel):
         # is the final layer norm.
         self.ln_0 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon,
                                  **factory_kwargs)
-        # Mark the norm parameters as "sequence_parallel" so that we run all-reduce on their grads.
         if process_group is not None:
             for p in self.ln_0.parameters():
-                p._sequence_parallel = True
+                # Mark the norm parameters as "shared_params" so that we sync their values at init.
+                p._shared_params = True
+                # Mark the norm params as "sequence_parallel" so we run all-reduce on their grads.
+                if self.sequence_parallel:
+                    p._sequence_parallel = True
 
         self.layers = nn.ModuleList([create_block(config, layer_idx=i, process_group=process_group,
                                                   **factory_kwargs)
@@ -224,14 +235,14 @@ class GPTModel(GPTPreTrainedModel):
 
     def tie_weights(self):
         if self.process_group is not None:
-            sync_sequence_parallel_params(self, self.process_group)
+            sync_shared_params(self, self.process_group)
 
     def forward(self, input_ids, position_ids=None, inference_params=None):
         # If using Tensor Parallel with sequence parallel, we combine the batch and the seqlen
         # dimensions so that we can split on it easily, in case of small batch size.
         # Only the attention layers need to know the seqlen.
         embedding_kwargs = ({'combine_batch_seqlen_dim': True}
-                            if self.process_group is not None else {})
+                            if self.process_group is not None and self.sequence_parallel else {})
         hidden_states = self.embeddings(input_ids, position_ids=position_ids, **embedding_kwargs)
         # TD [2022-07-30]: Force residual in fp32, seems to make fp16 training more stable
         if not self.fused_dropout_add_ln:
@@ -243,7 +254,8 @@ class GPTModel(GPTPreTrainedModel):
                 self.emb_drop.p if self.training else 0.0, self.ln_0.eps, prenorm=True,
                 residual_in_fp32=True
             )
-        mixer_kwargs = ({'seqlen': input_ids.shape[1]} if self.process_group is not None else {})
+        mixer_kwargs = ({'seqlen': input_ids.shape[1]}
+                        if self.process_group is not None and self.sequence_parallel else {})
         if inference_params is not None:
             mixer_kwargs['inference_params'] = inference_params
         for layer in self.layers:
@@ -263,8 +275,10 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         else:
             if ColumnParallelLinear is None:
                 raise ImportError('fused_dense_lib is not installed')
-            self.lm_head = ColumnParallelLinear(config.n_embd, config.vocab_size, process_group,
-                                                bias=False, **factory_kwargs)
+            self.lm_head = ColumnParallelLinear(
+                config.n_embd, config.vocab_size, process_group, bias=False,
+                sequence_parallel=getattr(config, 'sequence_parallel', True), **factory_kwargs
+            )
         # Initialize weights and apply final processing
         self.apply(partial(_init_weights, n_layer=config.num_hidden_layers,
                            initializer_range=config.initializer_range))
@@ -273,7 +287,7 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
     def tie_weights(self):
         self.lm_head.weight = self.transformer.embeddings.word_embeddings.weight
         if self.process_group is not None:
-            sync_sequence_parallel_params(self, self.process_group)
+            sync_shared_params(self, self.process_group)
 
     def forward(self, input_ids, position_ids=None, inference_params=None):
         """

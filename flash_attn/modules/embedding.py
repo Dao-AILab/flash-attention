@@ -6,7 +6,7 @@ from torch import Tensor
 
 from einops import rearrange
 
-from flash_attn.utils.distributed import reduce_scatter
+from flash_attn.utils.distributed import reduce_scatter, all_reduce
 
 
 class GPT2Embeddings(nn.Module):
@@ -130,13 +130,14 @@ class ColumnParallelEmbedding(nn.Embedding):
 class ParallelGPT2Embeddings(nn.Module):
 
     def __init__(self, embed_dim, vocab_size, max_position_embeddings, process_group,
-                 padding_idx=None, device=None, dtype=None):
+                 padding_idx=None, sequence_parallel=True, device=None, dtype=None):
         """
             If max_position_embeddings <= 0, there's no position embeddings
         """
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
         self.process_group = process_group
+        self.sequence_parallel = sequence_parallel
         self.word_embeddings = VocabParallelEmbedding(
             vocab_size, embed_dim, padding_idx=padding_idx, process_group=process_group,
             **factory_kwargs
@@ -167,4 +168,5 @@ class ParallelGPT2Embeddings(nn.Module):
                 embeddings[..., rank * partition_dim:(rank + 1) * partition_dim] += position_embeddings
         if combine_batch_seqlen_dim:
             embeddings = rearrange(embeddings, 'b s d -> (b s) d')
-        return embeddings if world_size <= 1 else reduce_scatter(embeddings, self.process_group)
+        reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
+        return embeddings if world_size <= 1 else reduce_fn(embeddings, self.process_group)

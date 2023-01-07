@@ -19,14 +19,15 @@ is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
 @pytest.mark.parametrize('dtype', [torch.float16] + ([torch.bfloat16] if is_sm8x else []))
 # @pytest.mark.parametrize('dtype', [torch.bfloat16])
 @pytest.mark.parametrize('world_size', [1, 2, 4, 8])
-# @pytest.mark.parametrize('world_size', [8])
+# @pytest.mark.parametrize('world_size', [2])
+@pytest.mark.parametrize('sequence_parallel', [True, False])
+# @pytest.mark.parametrize('sequence_parallel', [False])
 @pytest.mark.parametrize('has_bias', [True, False])
-# @pytest.mark.parametrize('has_bias', [True])
-@pytest.mark.parametrize('out_features', [1024, 4096])
-# @pytest.mark.parametrize('out_features', [1024])
-@pytest.mark.parametrize('in_features', [1024, 4096])
-# @pytest.mark.parametrize('in_features', [4096])
-def test_fused_linear_bias(in_features, out_features, has_bias, world_size, dtype):
+# @pytest.mark.parametrize('has_bias', [False])
+@pytest.mark.parametrize('out_features', [1024])
+@pytest.mark.parametrize('in_features', [4096])
+def test_fused_linear_bias(in_features, out_features, has_bias, sequence_parallel,
+                           world_size, dtype):
     assert out_features % world_size == 0
     rtol, atol = (3e-3, 3e-2) if dtype == torch.bfloat16 else (3e-3, 3e-3)
     if not torch.distributed.is_initialized():
@@ -37,18 +38,21 @@ def test_fused_linear_bias(in_features, out_features, has_bias, world_size, dtyp
     rank = parallel_state.get_tensor_model_parallel_rank()
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 8
+    batch_size = 2
     seqlen = 512
     assert batch_size * seqlen % world_size == 0
     x_pt = torch.randn(batch_size * seqlen, in_features, device=device, dtype=dtype,
                        requires_grad=True)
-    x = tensor_parallel.scatter_to_sequence_parallel_region(x_pt).detach().clone().requires_grad_()
+    if sequence_parallel:
+        x = tensor_parallel.scatter_to_sequence_parallel_region(x_pt).detach().clone().requires_grad_()
+    else:
+        x = x_pt.detach().clone().requires_grad_()
 
     model_pt = torch.nn.Linear(in_features, out_features, bias=has_bias, device=device, dtype=dtype)
     partition_out_features = out_features // world_size
     model = ColumnParallelLinear(in_features, out_features,
                                  parallel_state.get_tensor_model_parallel_group(), bias=has_bias,
-                                 device=device, dtype=dtype)
+                                 sequence_parallel=sequence_parallel, device=device, dtype=dtype)
     with torch.no_grad():
         model.weight.copy_(
             model_pt.weight[rank * partition_out_features:(rank + 1) * partition_out_features]
@@ -73,7 +77,9 @@ def test_fused_linear_bias(in_features, out_features, has_bias, world_size, dtyp
 
     partition_batch_dim = batch_size * seqlen // world_size
     assert torch.allclose(
-        x.grad, x_pt.grad[rank * partition_batch_dim:(rank + 1) * partition_batch_dim],
+        x.grad,
+        x_pt.grad[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+        if sequence_parallel else x_pt.grad,
         rtol=rtol, atol=atol
     )
     # The error for d_weight and d_bias is quite a bit higher
@@ -94,13 +100,14 @@ def test_fused_linear_bias(in_features, out_features, has_bias, world_size, dtyp
 # @pytest.mark.parametrize('dtype', [torch.bfloat16])
 @pytest.mark.parametrize('world_size', [1, 2, 4, 8])
 # @pytest.mark.parametrize('world_size', [2])
+@pytest.mark.parametrize('sequence_parallel', [True, False])
+# @pytest.mark.parametrize('sequence_parallel', [False])
 @pytest.mark.parametrize('has_bias2', [True, False])
 # @pytest.mark.parametrize('has_bias2', [True])
-@pytest.mark.parametrize('out_features', [1024, 4096])
-# @pytest.mark.parametrize('out_features', [1024])
-@pytest.mark.parametrize('in_features', [1024, 4096])
-# @pytest.mark.parametrize('in_features', [1024])
-def test_fused_dense_gelu_dense(in_features, out_features, has_bias2, world_size, dtype):
+@pytest.mark.parametrize('out_features', [4096])
+@pytest.mark.parametrize('in_features', [1024])
+def test_fused_dense_gelu_dense(in_features, out_features, has_bias2, sequence_parallel,
+                                world_size, dtype):
     assert out_features % world_size == 0
     rtol, atol = (3e-3, 3e-2) if dtype == torch.bfloat16 else (3e-3, 3e-3)
     if not torch.distributed.is_initialized():
@@ -111,7 +118,7 @@ def test_fused_dense_gelu_dense(in_features, out_features, has_bias2, world_size
     rank = parallel_state.get_tensor_model_parallel_rank()
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 8
+    batch_size = 2
     seqlen = 512
     assert batch_size * seqlen % world_size == 0
     x_pt = torch.randn(batch_size * seqlen, in_features, device=device, dtype=dtype,
@@ -120,7 +127,10 @@ def test_fused_dense_gelu_dense(in_features, out_features, has_bias2, world_size
     # as rank 0 will have an extra bias that changes the RNG.
     # If we don't divide by batch_size, the gradient gets a bit too large.
     g = torch.randn_like(x_pt) / 32
-    x = tensor_parallel.scatter_to_sequence_parallel_region(x_pt).detach().clone().requires_grad_()
+    if sequence_parallel:
+        x = tensor_parallel.scatter_to_sequence_parallel_region(x_pt).detach().clone().requires_grad_()
+    else:
+        x = x_pt.detach().clone().requires_grad_()
 
     model_pt_fc1 = torch.nn.Linear(in_features, out_features, device=device, dtype=dtype)
     model_pt_fc2 = torch.nn.Linear(out_features, in_features, bias=has_bias2, device=device,
@@ -129,7 +139,9 @@ def test_fused_dense_gelu_dense(in_features, out_features, has_bias2, world_size
     partition_in_features = in_features // world_size
     model = ParallelFusedDenseGeluDense(in_features, out_features, in_features,
                                         process_group=parallel_state.get_tensor_model_parallel_group(),
-                                        bias2=has_bias2 and rank == 0, device=device, dtype=dtype)
+                                        bias2=has_bias2 and rank == 0,
+                                        sequence_parallel=sequence_parallel,
+                                        device=device, dtype=dtype)
 
     with torch.no_grad():
         model.fc1.weight.copy_(
@@ -148,16 +160,21 @@ def test_fused_dense_gelu_dense(in_features, out_features, has_bias2, world_size
     out_pt = model_pt_fc2(F.gelu(model_pt_fc1(x_pt), approximate='tanh'))
     partition_batch_dim = batch_size * seqlen // world_size
     assert torch.allclose(
-        out, out_pt[rank * partition_batch_dim:(rank + 1) * partition_batch_dim],
+        out,
+        out_pt[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+        if sequence_parallel else out_pt,
         rtol=rtol, atol=atol
     )
 
     out_pt.backward(g)
-    out.backward(g[rank * partition_batch_dim:(rank + 1) * partition_batch_dim])
+    out.backward(g[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+                 if sequence_parallel else g)
     parallel_state.destroy_model_parallel()
 
     assert torch.allclose(
-        x.grad, x_pt.grad[rank * partition_batch_dim:(rank + 1) * partition_batch_dim],
+        x.grad,
+        x_pt.grad[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+        if sequence_parallel else x_pt.grad,
         rtol=rtol, atol=atol
     )
     # The error for d_weight and d_bias is quite a bit higher

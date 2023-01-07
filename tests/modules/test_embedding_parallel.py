@@ -19,10 +19,12 @@ is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
 # @pytest.mark.parametrize('dtype', [torch.bfloat16])
 @pytest.mark.parametrize('world_size', [1, 2, 4, 8])
 # @pytest.mark.parametrize('world_size', [2])
+@pytest.mark.parametrize('sequence_parallel', [True, False])
+# @pytest.mark.parametrize('sequence_parallel', [False])
 @pytest.mark.parametrize('has_pos_emb', [True, False])
 # @pytest.mark.parametrize('has_pos_emb', [True])
 @pytest.mark.parametrize('dim', [1024])
-def test_embedding_parallel(dim, world_size, has_pos_emb, dtype):
+def test_embedding_parallel(dim, has_pos_emb, sequence_parallel, world_size, dtype):
     vocab_size = 50264
     seqlen = 2048
     assert vocab_size % world_size == 0
@@ -46,7 +48,7 @@ def test_embedding_parallel(dim, world_size, has_pos_emb, dtype):
                               device=device, dtype=dtype)
     model = ParallelGPT2Embeddings(dim, vocab_size, seqlen if has_pos_emb else 0,
                                    parallel_state.get_tensor_model_parallel_group(),
-                                   device=device, dtype=dtype)
+                                   sequence_parallel=sequence_parallel, device=device, dtype=dtype)
     partition_vocab_size = vocab_size // world_size
     partition_dim = dim // world_size
     with torch.no_grad():
@@ -62,13 +64,16 @@ def test_embedding_parallel(dim, world_size, has_pos_emb, dtype):
     out_pt = rearrange(model_pt(input_ids), 'b s d -> (b s) d')
     partition_batch_dim = batch_size * seqlen // world_size
     assert torch.allclose(
-        out, out_pt[rank * partition_batch_dim:(rank + 1) * partition_batch_dim],
+        out,
+        out_pt[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+        if sequence_parallel else out_pt,
         rtol=rtol, atol=atol
     )
 
     g = torch.randn_like(out_pt)
     out_pt.backward(g)
-    out.backward(g[rank * partition_batch_dim:(rank + 1) * partition_batch_dim])
+    out.backward(g[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+                 if sequence_parallel else g)
     parallel_state.destroy_model_parallel()
 
     assert torch.allclose(
