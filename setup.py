@@ -156,7 +156,7 @@ ext_modules.append(
 
 setup(
     name="flash_attn",
-    version="0.2.6-1",
+    version="0.2.7",
     packages=find_packages(
         exclude=("build", "csrc", "include", "tests", "dist", "docs", "benchmarks", "flash_attn.egg-info",)
     ),
