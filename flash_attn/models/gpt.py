@@ -146,15 +146,17 @@ class GPTPreTrainedModel(nn.Module):
         self.config = config
 
     @classmethod
-    def from_pretrained(cls, model_name, config, *inputs, **kwargs):
+    def from_pretrained(cls, model_name, config, *args, strict=True, device=None, **kwargs):
         """
         Instantiate a GPTPreTrainedModel from a pre-trained model file or a pytorch state dict.
         Download and cache the pre-trained model file if needed.
         """
         # Instantiate model.
-        model = cls(config, *inputs, **kwargs)
+        model = cls(config, *args, device=device, **kwargs)
         load_return = model.load_state_dict(
-            remap_state_dict_gpt2(state_dict_from_pretrained(model_name), config))
+            remap_state_dict_gpt2(state_dict_from_pretrained(model_name, device=device), config),
+            strict=strict
+        )
         logger.info(load_return)
         return model
 

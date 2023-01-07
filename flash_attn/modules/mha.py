@@ -341,7 +341,6 @@ class MHA(nn.Module):
                 self.dwconv_qkv = nn.Conv1d(3 * embed_dim, 3 * embed_dim, kernel_size=3, padding=2,
                                             groups=3 * embed_dim)
         else:
-            inner_attn_cls = inner_cross_attn_cls
             self.Wq = linear_cls(embed_dim, embed_dim, bias=bias, **factory_kwargs)
             if not self.return_residual:
                 self.Wkv = linear_cls(embed_dim, 2 * embed_dim, bias=bias, **factory_kwargs)
@@ -482,9 +481,9 @@ class MHA(nn.Module):
                                'b d s -> b s d').contiguous()
             if inference_params is None:
                 if not self.checkpointing:
-                    context = self.inner_attn(q, kv, **kwargs)
+                    context = self.inner_cross_attn(q, kv, **kwargs)
                 else:
-                    context = torch.utils.checkpoint.checkpoint(self.inner_attn, q, kv, **kwargs)
+                    context = torch.utils.checkpoint.checkpoint(self.inner_cross_attn, q, kv, **kwargs)
             else:
                 kv = self._update_kv_cache(kv)
                 context = self.inner_cross_attn(q, kv, causal=False)

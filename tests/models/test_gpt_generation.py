@@ -14,39 +14,49 @@ from flash_attn.utils.pretrained import state_dict_from_pretrained
 from flash_attn.utils.generation import greedy_decode
 
 
-# TODO: test with rotary embedding
 @pytest.mark.parametrize('fused_ft_kernel', [False, True])
 @pytest.mark.parametrize('optimized', [False, True])
+# @pytest.mark.parametrize('fused_ft_kernel', [False])
 # @pytest.mark.parametrize('optimized', [True])
+# @pytest.mark.parametrize('optimized', [True])
+@pytest.mark.parametrize('rotary', [False, True])
 @pytest.mark.parametrize('model_name', ["gpt2"])
-def test_greedy_decode(model_name, optimized, fused_ft_kernel):
+def test_greedy_decode(model_name, rotary, optimized, fused_ft_kernel):
     """Check that our implementation of GPT2 generation matches the HF implementation:
     the scores in fp16 should be around the same as the HF scores in fp16, when compared to
     the HF scores in fp32.
     """
     dtype = torch.float16
+    device = 'cuda'
     rtol, atol = 3e-3, 3e-1
     config = GPT2Config.from_pretrained(model_name)
+    if rotary:
+        config.n_positions = 0
+        config.rotary_emb_dim = 64
     if optimized:
         config.use_flash_attn = True
         config.fused_bias_fc = True
         config.fused_dense_gelu_dense = True
         config.fused_dropout_add_ln = True
 
-    model = GPTLMHeadModel.from_pretrained(model_name, config)
-    model = model.cuda().to(dtype=dtype)
-
-    model_ref = GPT2LMHeadModelHF.from_pretrained(model_name).cuda()
-    model_hf = GPT2LMHeadModelHF.from_pretrained(model_name).cuda().to(dtype=dtype)
-
+    # if not rotary, we load the weight from HF but ignore the position embeddings.
+    # The model would be nonsense but it doesn't matter for the test.
+    model = GPTLMHeadModel.from_pretrained(model_name, config, strict=not rotary, device=device)
+    model = model.to(dtype=dtype)
     model.eval()
-    model_ref.eval()
-    model_hf.eval()
+
+    if not rotary:
+        model_ref = GPT2LMHeadModelHF.from_pretrained(model_name).cuda()
+        model_hf = GPT2LMHeadModelHF.from_pretrained(model_name).cuda().to(dtype=dtype)
+        model_ref.eval()
+        model_hf.eval()
 
     torch.manual_seed(0)
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     input_ids = tokenizer("Hello, my dog is cute and ", return_tensors="pt").input_ids.cuda()
     max_length = 30
+    # input_ids = torch.randint(0, 100, (1, 512), dtype=torch.long, device='cuda')
+    # max_length = 512 + 50
 
     # Slow generation for reference
     sequences = []
@@ -66,20 +76,22 @@ def test_greedy_decode(model_name, optimized, fused_ft_kernel):
                          fused_ft_kernel=fused_ft_kernel,
                          return_dict_in_generate=True, output_scores=True)
 
-    out_hf = model_hf.generate(input_ids=input_ids, max_length=max_length,
-                               return_dict_in_generate=True, output_scores=True)
-    out_ref = model_ref.generate(input_ids=input_ids, max_length=max_length,
-                                 return_dict_in_generate=True, output_scores=True)
+    if not rotary:
+        out_hf = model_hf.generate(input_ids=input_ids, max_length=max_length,
+                                return_dict_in_generate=True, output_scores=True)
+        out_ref = model_ref.generate(input_ids=input_ids, max_length=max_length,
+                                    return_dict_in_generate=True, output_scores=True)
 
-    print(f'Scores max diff: {(torch.stack(out.scores, 1) - torch.stack(out_ref.scores, 1)).abs().max().item()}')
-    print(f'Scores mean diff: {(torch.stack(out.scores, 1) - torch.stack(out_ref.scores, 1)).abs().mean().item()}')
-    print(f'HF fp16 max diff: {(torch.stack(out_hf.scores, 1) - torch.stack(out_ref.scores, 1)).abs().max().item()}')
-    print(f'HF fp16 mean diff: {(torch.stack(out_hf.scores, 1) - torch.stack(out_ref.scores, 1)).abs().mean().item()}')
+        print(f'Scores max diff: {(torch.stack(out.scores, 1) - torch.stack(out_ref.scores, 1)).abs().max().item()}')
+        print(f'Scores mean diff: {(torch.stack(out.scores, 1) - torch.stack(out_ref.scores, 1)).abs().mean().item()}')
+        print(f'HF fp16 max diff: {(torch.stack(out_hf.scores, 1) - torch.stack(out_ref.scores, 1)).abs().max().item()}')
+        print(f'HF fp16 mean diff: {(torch.stack(out_hf.scores, 1) - torch.stack(out_ref.scores, 1)).abs().mean().item()}')
 
     assert torch.all(out.sequences == sequences)
     assert torch.allclose(torch.stack(out.scores, dim=1), torch.stack(scores, dim=1),
                           rtol=rtol, atol=atol)
-    assert torch.all(out.sequences == out_ref.sequences)
-    assert torch.all(out.sequences == out_hf.sequences)
+    if not rotary:
+        assert torch.all(out.sequences == out_ref.sequences)
+        assert torch.all(out.sequences == out_hf.sequences)
 
-    assert (torch.stack(out.scores, 1) - torch.stack(out_ref.scores, 1)).abs().max().item() < 3 * (torch.stack(out_hf.scores, 1) - torch.stack(out_ref.scores, 1)).abs().max().item()
+        assert (torch.stack(out.scores, 1) - torch.stack(out_ref.scores, 1)).abs().max().item() < 3 * (torch.stack(out_hf.scores, 1) - torch.stack(out_ref.scores, 1)).abs().max().item()
