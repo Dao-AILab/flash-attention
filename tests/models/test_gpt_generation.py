@@ -11,13 +11,11 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel as GPT2LMHead
 from flash_attn.models.gpt import GPTLMHeadModel
 from flash_attn.models.gpt import remap_state_dict_gpt2
 from flash_attn.utils.pretrained import state_dict_from_pretrained
-from flash_attn.utils.generation import greedy_decode
 
 
 @pytest.mark.parametrize('fused_ft_kernel', [False, True])
 @pytest.mark.parametrize('optimized', [False, True])
 # @pytest.mark.parametrize('fused_ft_kernel', [False])
-# @pytest.mark.parametrize('optimized', [True])
 # @pytest.mark.parametrize('optimized', [True])
 @pytest.mark.parametrize('rotary', [False, True])
 @pytest.mark.parametrize('model_name', ["gpt2"])
