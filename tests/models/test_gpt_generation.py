@@ -14,10 +14,11 @@ from flash_attn.utils.pretrained import state_dict_from_pretrained
 
 
 @pytest.mark.parametrize('fused_ft_kernel', [False, True])
+# @pytest.mark.parametrize('fused_ft_kernel', [True])
 @pytest.mark.parametrize('optimized', [False, True])
-# @pytest.mark.parametrize('fused_ft_kernel', [False])
-# @pytest.mark.parametrize('optimized', [True])
+# @pytest.mark.parametrize('optimized', [False])
 @pytest.mark.parametrize('rotary', [False, True])
+# @pytest.mark.parametrize('rotary', [False])
 @pytest.mark.parametrize('model_name', ["gpt2"])
 def test_greedy_decode(model_name, rotary, optimized, fused_ft_kernel):
     """Check that our implementation of GPT2 generation matches the HF implementation:
