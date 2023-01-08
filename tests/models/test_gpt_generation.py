@@ -54,8 +54,8 @@ def test_greedy_decode(model_name, rotary, optimized, fused_ft_kernel):
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     input_ids = tokenizer("Hello, my dog is cute and ", return_tensors="pt").input_ids.cuda()
     max_length = 30
-    # input_ids = torch.randint(0, 100, (1, 512), dtype=torch.long, device='cuda')
-    # max_length = 512 + 50
+    # input_ids = torch.randint(0, 100, (1, 10), dtype=torch.long, device='cuda')
+    # max_length = input_ids.shape[1] + 40
 
     # Slow generation for reference
     sequences = []
@@ -73,7 +73,13 @@ def test_greedy_decode(model_name, rotary, optimized, fused_ft_kernel):
 
     out = model.generate(input_ids=input_ids, max_length=max_length,
                          fused_ft_kernel=fused_ft_kernel,
-                         return_dict_in_generate=True, output_scores=True)
+                         return_dict_in_generate=True, output_scores=True, timing=True)
+    print(out.sequences)
+    if fused_ft_kernel:
+        out_cg = model.generate(input_ids=input_ids, max_length=max_length,
+                                fused_ft_kernel=fused_ft_kernel, cg=True,
+                                return_dict_in_generate=True, output_scores=True, timing=True)
+        print(out_cg.sequences)
 
     if not rotary:
         out_hf = model_hf.generate(input_ids=input_ids, max_length=max_length,
