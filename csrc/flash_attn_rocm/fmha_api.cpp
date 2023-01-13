@@ -121,6 +121,140 @@ void set_params_fprop(FMHA_fprop_params &params,
 
     params.is_causal = is_causal;
     params.num_splits = num_splits;
+    free(params.host_seqlens_q);
+    free(params.host_seqlens_k);
+}
+
+void set_params_dgrad(FMHA_dgrad_params &params,
+                      // sizes
+                      const size_t b,
+                      const size_t seqlen_q,
+                      const size_t seqlen_k,
+                      const size_t h,
+                      const size_t d,
+                      // device pointers
+                      const at::Tensor q,
+                      const at::Tensor k,
+                      const at::Tensor v,
+                      const at::Tensor y,
+                      const at::Tensor lse,
+                      const at::Tensor ygrad,
+                      at::Tensor qgrad,
+                      at::Tensor kgrad,
+                      at::Tensor vgrad,
+                      void *cu_seqlens_q_d,
+                      void *cu_seqlens_k_d,
+                      void *s_d,
+                      void *softmax_lse_d,
+                      float p_dropout,
+                      float softmax_scale,
+                      bool is_causal,
+                      int num_splits) {
+
+    Data_type acc_type = DATA_TYPE_FP32;
+    Data_type data_type = !(q.dtype() == at::kBFloat16) ? DATA_TYPE_FP16 : DATA_TYPE_BF16;
+
+    // Reset the parameters
+    memset(&params, 0, sizeof(params));
+
+    params.is_bf16 = q.dtype() == at::kBFloat16;
+
+    params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
+    params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
+
+    // S = softmax(P)
+    // params.s_ptr = s_d;
+    // params.s_stride_in_bytes = get_size_in_bytes(b * h * seqlen_k, data_type);
+
+    // Softmax sum
+    // params.softmax_lse_ptr = softmax_lse_d;
+
+    // Set the dimensions.
+    params.b = b;
+    params.h = h;
+    params.seqlen_q = seqlen_q;
+    params.seqlen_k = seqlen_k;
+    params.d = d;
+
+    params.host_seqlens_q = (int*)malloc((params.b+1)*sizeof(int));
+    params.host_seqlens_k = (int*)malloc((params.b+1)*sizeof(int));
+    FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_q, params.cu_seqlens_q, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
+    FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_k, params.cu_seqlens_k, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
+
+    //at::Tensor q_ = q.view({params.b, params.seqlen_q , params.h , params.d});
+    //at::Tensor k_ = k.view({params.b, params.seqlen_k , params.h , params.d});
+    //at::Tensor v_ = v.view({params.b, params.seqlen_q , params.h , params.d});
+    //out = out.view({params.b, params.seqlen_q , params.h , params.d});
+
+    char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
+    char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
+    char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
+    char* y_ptr = reinterpret_cast<char*>(y.data_ptr());
+    char* lse_ptr = reinterpret_cast<char*>(lse.data_ptr());
+    char* ygrad_ptr = reinterpret_cast<char*>(ygrad.data_ptr());
+    char* qgrad_ptr = reinterpret_cast<char*>(qgrad.data_ptr());
+    char* kgrad_ptr = reinterpret_cast<char*>(kgrad.data_ptr());
+    char* vgrad_ptr = reinterpret_cast<char*>(vgrad.data_ptr());
+
+    //std::cout << "multiply" << params.seqlen_q * params.h * params.d<< std::endl;
+
+    //std::cout << " q.data_ptr() " << q.data_ptr() << std::endl;
+    //std::cout << " q_.data_ptr() " << q_.data_ptr() << std::endl;
+    //std::cout << " q_[0].data_ptr() " << q_[0].data_ptr() << std::endl;
+    //std::cout << " q_[1].data_ptr() " << q_[1].data_ptr() << std::endl;
+    //std::cout << " new q[1] " << reinterpret_cast<void*>(q_ptr + params.seqlen_q * params.h * params.d * 2) << std::endl;
+    //std::cout << " q_[0][0][0][0].data_ptr() " << q_[0][0][0][0].data_ptr() << std::endl;
+    //std::cout << " q_[0][0][0][1].data_ptr() " << q_[0][0][0][1].data_ptr() << std::endl;
+    //std::cout << " q_[0][0][1][0].data_ptr() " << q_[0][0][1][0].data_ptr() << std::endl;
+    //std::cout << " q_[0][1][0][0].data_ptr() " << q_[0][1][0][0].data_ptr() << std::endl;
+    //std::cout << " q_[1][0][0][0].data_ptr() " << q_[1][0][0][0].data_ptr() << std::endl;
+/*
+    for (int i = 0; i < b; i++){
+        params.q_ptr.push_back(q_[i].data_ptr());
+        params.k_ptr.push_back(k_[i].data_ptr());
+        params.v_ptr.push_back(v_[i].data_ptr());
+        params.o_ptr.push_back(out[i].data_ptr());
+    }
+*/
+
+    for (int i = 0; i < b; i++){
+        int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
+        int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
+        int temp_q_stride = get_size_in_bytes(i * d * h * temp_seqlen_q, data_type);
+        int temp_k_stride = get_size_in_bytes(i * d * h * temp_seqlen_k, data_type);
+        params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr   + temp_q_stride));
+        params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr   + temp_k_stride));
+        params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr   + temp_k_stride));
+        params.y_ptr.push_back(reinterpret_cast<void*>(y_ptr   + temp_q_stride));
+        params.lse_ptr.push_back(reinterpret_cast<void*>(lse_ptr   + temp_q_stride));
+        params.ygrad_ptr.push_back(reinterpret_cast<void*>(ygrad_ptr   + temp_q_stride));
+        params.qgrad_ptr.push_back(reinterpret_cast<void*>(qgrad_ptr   + temp_q_stride));
+        params.kgrad_ptr.push_back(reinterpret_cast<void*>(kgrad_ptr   + temp_k_stride));
+        params.vgrad_ptr.push_back(reinterpret_cast<void*>(vgrad_ptr   + temp_k_stride));
+    }
+
+    // Set the different scale values.
+    // const float scale_bmm1 = 1.f / sqrtf(d);
+    const float scale_bmm1 = softmax_scale;
+
+    params.scale_bmm1f = scale_bmm1;
+    //set_alpha(params.scale_bmm1, scale_bmm1, data_type);
+
+    // Set this to probability of keeping an element to simplify things.
+    params.p_dropout = 1.f - p_dropout;
+    // Convert p from float to int so we don't have to convert the random uint to float to compare.
+    // [Minor] We want to round down since when we do the comparison we use <= instead of <
+    params.p_dropout_in_uint = uint32_t(std::floor(params.p_dropout * 4294967295.0));
+    params.p_dropout_in_uint16_t = uint16_t(std::floor(params.p_dropout * 65535.0));
+    params.rp_dropout = 1.f / params.p_dropout;
+    params.scale_bmm1_rp_dropout = params.rp_dropout * params.scale_bmm1f;
+    //TORCH_CHECK(p_dropout < 1.f);
+    //set_alpha(params.scale_dropout, params.rp_dropout, data_type);
+
+    params.is_causal = is_causal;
+    params.num_splits = num_splits;
+    free(params.host_seqlens_q);
+    free(params.host_seqlens_k);
 }
 
 std::vector<at::Tensor>
@@ -253,6 +387,137 @@ mha_fwd(const at::Tensor &q,
     return result;
 }
 
+
+std::vector<at::Tensor>
+mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
+        const at::Tensor &q,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+        const at::Tensor &k,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const at::Tensor &v,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const at::Tensor &out,   // total_q x num_heads x head_size
+        const at::Tensor &softmax_lse_,     // b x h x s softmax logsumexp
+        at::Tensor &dq,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+        at::Tensor &dk,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        at::Tensor &dv,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const at::Tensor &cu_seqlens_q,  // b+1
+        const at::Tensor &cu_seqlens_k,  // b+1
+        const int max_seqlen_q_,
+        const int max_seqlen_k_,          // max sequence length to choose the kernel
+        const float p_dropout,         // probability to drop
+        const float softmax_scale,
+        const bool zero_tensors,
+        const bool is_causal,
+        const int num_splits,
+        c10::optional<at::Generator> gen_
+) {
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+
+    bool is_dropout = p_dropout > 0.0;
+    auto stream = at::cuda::getCurrentHIPStream().stream();
+    Launch_params<FMHA_dgrad_params> launch_params(dprops, stream, is_dropout, false);
+
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16);
+    TORCH_CHECK(k.dtype() == q_dtype);
+    TORCH_CHECK(v.dtype() == q_dtype);
+    TORCH_CHECK(out.dtype() == q_dtype);
+    TORCH_CHECK(dout.dtype() == q_dtype);
+    TORCH_CHECK(dq.dtype() == q_dtype);
+    TORCH_CHECK(dk.dtype() == q_dtype);
+    TORCH_CHECK(dv.dtype() == q_dtype);
+    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32);
+    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32);
+
+    TORCH_CHECK(q.is_cuda());
+    TORCH_CHECK(k.is_cuda());
+    TORCH_CHECK(v.is_cuda());
+    TORCH_CHECK(out.is_cuda());
+    TORCH_CHECK(dout.is_cuda());
+    TORCH_CHECK(softmax_lse_.is_cuda());
+    TORCH_CHECK(cu_seqlens_q.is_cuda());
+    TORCH_CHECK(cu_seqlens_k.is_cuda());
+
+    TORCH_CHECK(q.stride(-1) == 1);
+    TORCH_CHECK(k.stride(-1) == 1);
+    TORCH_CHECK(v.stride(-1) == 1);
+    TORCH_CHECK(out.is_contiguous());
+    TORCH_CHECK(dout.is_contiguous());
+    TORCH_CHECK(dq.stride(-1) == 1);
+    TORCH_CHECK(dk.stride(-1) == 1);
+    TORCH_CHECK(dv.stride(-1) == 1);
+    TORCH_CHECK(cu_seqlens_q.is_contiguous());
+    TORCH_CHECK(cu_seqlens_k.is_contiguous());
+
+    const auto sizes = q.sizes();
+
+    const int batch_size = cu_seqlens_q.numel() - 1;
+    const int total_q = sizes[TOTAL_DIM];
+    const int num_heads = sizes[H_DIM];
+    const int head_size = sizes[D_DIM];
+    const int total_k = k.size(TOTAL_DIM);
+    TORCH_CHECK(batch_size > 0);
+    TORCH_CHECK((head_size % 8 == 0) && (head_size <= 128));
+
+    CHECK_SHAPE(q, total_q, num_heads, head_size);
+    CHECK_SHAPE(k, total_k, num_heads, head_size);
+    CHECK_SHAPE(v, total_k, num_heads, head_size);
+    CHECK_SHAPE(out, total_q, num_heads, head_size);
+    CHECK_SHAPE(dout, total_q, num_heads, head_size);
+    CHECK_SHAPE(dq, total_q, num_heads, head_size);
+    CHECK_SHAPE(dk, total_k, num_heads, head_size);
+    CHECK_SHAPE(dv, total_k, num_heads, head_size);
+    CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+    CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+
+    int blocksize_c = (head_size > 64 || (head_size > 32)) ? 128 : 256;
+    int max_seqlen_k = ((max_seqlen_k_ + blocksize_c - 1) / blocksize_c) * blocksize_c;
+    if( max_seqlen_k_ <= 128 ) {
+        max_seqlen_k = 128;
+    } else if( max_seqlen_k_ <= 256 ) {
+        max_seqlen_k = 256;
+    }
+    int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
+    bool loop = max_seqlen_k > blocksize_c;
+
+    // Otherwise the kernel will be launched from cuda:0 device
+    // Cast to char to avoid compiler warning about narrowing
+    // at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+
+    // It's possible the softmax_lse_ from the fwd has a different length since blocksize_c could be different.
+    auto softmax_lse = softmax_lse_.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, max_seqlen_q)}).contiguous();
+
+    auto opts = q.options();
+    auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+    at::Tensor dq_tmp;
+    if (loop) { dq_tmp = torch::empty({total_q, num_heads, head_size}, opts.dtype(at::kFloat)); }
+
+    if( zero_tensors ) {
+        dq.zero_();
+        dk.zero_();
+        dv.zero_();
+        softmax_d.zero_();
+    }
+
+    set_params_dgrad(launch_params.params,
+                     batch_size,
+                     max_seqlen_q,
+                     max_seqlen_k,
+                     num_heads,
+                     head_size,
+                     q, k, v, out, softmax_lse,
+                     dout, dq, dk, dv,
+                     cu_seqlens_q.data_ptr(),
+                     cu_seqlens_k.data_ptr(),
+                     nullptr,
+                     softmax_lse.data_ptr(),
+                     p_dropout,
+                     softmax_scale,
+                     is_causal,
+                     num_splits);
+
+    run_fmha_dgrad_fp16_bf16_gfx90a(launch_params);
+
+    return { dq, dk, dv, softmax_d };
+}
 
 /*
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
