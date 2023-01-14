@@ -14,7 +14,6 @@ from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtensio
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
-
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -127,18 +126,21 @@ cc_flag = []
 # _, bare_metal_major, _ = get_cuda_bare_metal_version(CUDA_HOME)
 # if int(bare_metal_major) < 11:
 #     raise RuntimeError("FlashAttention is only supported on CUDA 11")
-cc_flag.append("-gencode")
-cc_flag.append("arch=compute_75,code=sm_75")
-cc_flag.append("-gencode")
-cc_flag.append("arch=compute_80,code=sm_80")
+# cc_flag.append("-gencode")
+# cc_flag.append("arch=compute_75,code=sm_75")
+# cc_flag.append("-gencode")
+# cc_flag.append("arch=compute_80,code=sm_80")
 
 subprocess.run(["git", "submodule", "update", "--init", "csrc/flash_attn_rocm/composable_kernel"])
 ext_modules.append(
     CUDAExtension(
         name="flash_attn_cuda",
         sources=[
-            "csrc/flash_attn_rocm/fmha_api.cpp",
-            "csrc/flash_attn_rocm/src/fmha_fprop_fp16_bf16_kernel.gfx90a.cpp",
+            "csrc/flash_attn_rocm/fmha_api.cu",
+            "csrc/flash_attn_rocm/src/fmha_fprop_fp16_bf16_kernel.gfx90a.cu",
+            "csrc/flash_attn_rocm/composable_kernel/library/src/utility/convolution_parameter.cu",
+            "csrc/flash_attn_rocm/composable_kernel/library/src/utility/device_memory.cu",
+            "csrc/flash_attn_rocm/composable_kernel/library/src/utility/host_tensor.cu"
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"] + generator_flag,
@@ -146,25 +148,18 @@ ext_modules.append(
                 [
                     "-O3",
                     "-std=c++17",
-                    "-U__HIP_NO_HALF_OPERATORS__",
-                    "-U__HIP_NO_HALF_CONVERSIONS__",
-                    "--expt-relaxed-constexpr",
-                    "--expt-extended-lambda",
-                    "--use_fast_math"
+                    "-U__CUDA_NO_HALF_OPERATORS__",
+                    "-U__CUDA_NO_HALF_CONVERSIONS__",
                 ]
                 + generator_flag
                 + cc_flag
             ,
         },
+        exclude_dirs=[Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel'],
         include_dirs=[
             Path(this_dir) / 'csrc' / 'flash_attn_rocm',
             Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'src',
             Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' ,
-            # Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' ,
-            # Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'tensor_operation' / 'gpu' / 'device',
-            # Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'tensor_operation' / 'gpu' /' element',
-            # Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'library' / 'utility',
-            # Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'library' / 'reference_tensor_operation',
         ],
     )
 )
