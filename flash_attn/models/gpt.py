@@ -20,7 +20,7 @@ from flash_attn.modules.mha import MHA, ParallelMHA
 from flash_attn.modules.mlp import Mlp, FusedDenseGeluDense, ParallelFusedDenseGeluDense
 from flash_attn.modules.block import Block
 from flash_attn.modules.embedding import GPT2Embeddings, ParallelGPT2Embeddings
-from flash_attn.utils.distributed import sync_shared_params
+from flash_attn.utils.distributed import sync_shared_params, all_gather_raw
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 from flash_attn.utils.generation import GenerationMixin
 
@@ -146,17 +146,23 @@ class GPTPreTrainedModel(nn.Module):
         self.config = config
 
     @classmethod
-    def from_pretrained(cls, model_name, config, *args, strict=True, device=None, **kwargs):
+    def from_pretrained(cls, model_name, config, *args, strict=True, device=None, dtype=None,
+                        world_size=1, rank=0, **kwargs):
         """
         Instantiate a GPTPreTrainedModel from a pre-trained model file or a pytorch state dict.
         Download and cache the pre-trained model file if needed.
         """
         # Instantiate model.
-        model = cls(config, *args, device=device, **kwargs)
-        load_return = model.load_state_dict(
-            remap_state_dict_gpt2(state_dict_from_pretrained(model_name, device=device), config),
-            strict=strict
+        model = cls(config, *args, device=device, dtype=dtype, **kwargs)
+        state_dict = remap_state_dict_gpt2(
+            # If we're going to shard the model, then don't load fp32 weights to GPU.
+            state_dict_from_pretrained(model_name, device=device if world_size == 1 else None,
+                                       dtype=dtype), config
         )
+        if world_size > 1:
+            state_dict = shard_state_dict_tp(state_dict, config, world_size, rank)
+            state_dict = {k: v.to(device=device) for k, v in state_dict.items()}
+        load_return = model.load_state_dict(state_dict, strict=strict)
         logger.info(load_return)
         return model
 
@@ -190,17 +196,16 @@ class GPTModel(GPTPreTrainedModel):
         self.process_group = process_group
         self.sequence_parallel = getattr(config, 'sequence_parallel', True)
         assert config.activation_function in ['gelu', 'gelu_new', 'gelu_fast', 'sqrelu']
-        self.pad_vocab_size_multiple = getattr(config, 'pad_vocab_size_multiple', 1)
-        if config.vocab_size % self.pad_vocab_size_multiple != 0:
-            config.vocab_size += (self.pad_vocab_size_multiple
-                                  - (config.vocab_size % self.pad_vocab_size_multiple))
+        pad_vocab_size_multiple = getattr(config, 'pad_vocab_size_multiple', 1)
+        vocab_size = (math.ceil(config.vocab_size / pad_vocab_size_multiple)
+                      * pad_vocab_size_multiple)
 
         if process_group is None:
-            self.embeddings = GPT2Embeddings(config.hidden_size, config.vocab_size,
+            self.embeddings = GPT2Embeddings(config.hidden_size, vocab_size,
                                              config.max_position_embeddings, **factory_kwargs)
         else:
             self.embeddings = ParallelGPT2Embeddings(
-                config.hidden_size, config.vocab_size, config.max_position_embeddings,
+                config.hidden_size, vocab_size, config.max_position_embeddings,
                 process_group=process_group, sequence_parallel=self.sequence_parallel,
                 **factory_kwargs
             )
@@ -248,8 +253,9 @@ class GPTModel(GPTPreTrainedModel):
         hidden_states = self.embeddings(input_ids, position_ids=position_ids, **embedding_kwargs)
         # TD [2022-07-30]: Force residual in fp32, seems to make fp16 training more stable
         if not self.fused_dropout_add_ln:
-            residual = self.emb_drop(hidden_states).float()
+            residual = self.emb_drop(hidden_states)
             hidden_states = self.ln_0(residual.to(dtype=self.ln_0.weight.dtype))
+            residual = residual.float()
         else:
             hidden_states, residual = dropout_add_layer_norm(
                 hidden_states, None, self.ln_0.weight, self.ln_0.bias,
@@ -272,13 +278,16 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.process_group = process_group
         self.transformer = GPTModel(config, process_group=process_group, **factory_kwargs)
+        pad_vocab_size_multiple = getattr(config, 'pad_vocab_size_multiple', 1)
+        vocab_size = (math.ceil(config.vocab_size / pad_vocab_size_multiple)
+                      * pad_vocab_size_multiple)
         if process_group is None:
-            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False, **factory_kwargs)
+            self.lm_head = nn.Linear(config.n_embd, vocab_size, bias=False, **factory_kwargs)
         else:
             if ColumnParallelLinear is None:
                 raise ImportError('fused_dense_lib is not installed')
             self.lm_head = ColumnParallelLinear(
-                config.n_embd, config.vocab_size, process_group, bias=False,
+                config.n_embd, vocab_size, process_group, bias=False,
                 sequence_parallel=getattr(config, 'sequence_parallel', True), **factory_kwargs
             )
         # Initialize weights and apply final processing
@@ -299,6 +308,10 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         hidden_states = self.transformer(input_ids, position_ids=position_ids,
                                          inference_params=inference_params)
         lm_logits = self.lm_head(hidden_states)
+        # During inference, we want the full logit for sampling
+        if isinstance(self.lm_head, ColumnParallelLinear) and inference_params is not None:
+            lm_logits, _ = all_gather_raw(lm_logits, self.lm_head.process_group)
+            lm_logits = rearrange(lm_logits, '(n b) s d -> b s (n d)', b=hidden_states.shape[0])
         CausalLMOutput = namedtuple('CausalLMOutput', ['logits'])
         return CausalLMOutput(logits=lm_logits)
 
@@ -310,8 +323,10 @@ def remap_state_dict_gpt2(state_dict, config):
     state_dict = OrderedDict((key_mapping_pos_emb(k), v) for k, v in state_dict.items())
     word_embeddings = state_dict.pop('wte.weight')
     # It's possible that vocab_size is padded to be a multiple of 8, for example.
+    pad_vocab_size_multiple = getattr(config, 'pad_vocab_size_multiple', 1)
+    vocab_size = (math.ceil(config.vocab_size / pad_vocab_size_multiple) * pad_vocab_size_multiple)
     state_dict['transformer.embeddings.word_embeddings.weight'] = F.pad(
-        word_embeddings, (0, 0, 0, config.vocab_size - word_embeddings.shape[0])
+        word_embeddings, (0, 0, 0, vocab_size - word_embeddings.shape[0])
     )
     state_dict['lm_head.weight'] = state_dict['transformer.embeddings.word_embeddings.weight']
 
@@ -365,10 +380,8 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
     """Convert the state_dict of a standard GPT model to the state_dict of a GPT model
     with tensor parallel.
     """
-    vocab_size = config.vocab_size
-    if config.vocab_size % config.pad_vocab_size_multiple != 0:
-        vocab_size += (config.pad_vocab_size_multiple
-                       - (config.vocab_size % config.pad_vocab_size_multiple))
+    pad_vocab_size_multiple = getattr(config, 'pad_vocab_size_multiple', 1)
+    vocab_size = (math.ceil(config.vocab_size / pad_vocab_size_multiple) * pad_vocab_size_multiple)
     assert vocab_size % world_size == 0
     assert config.hidden_size % world_size == 0
     inner_dim = config.n_inner if config.n_inner is not None else 4 * config.hidden_size

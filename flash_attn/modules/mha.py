@@ -289,6 +289,60 @@ class LinearResidual(nn.Linear):
         return super().forward(input), input
 
 
+def _update_kv_cache(kv, inference_params, layer_idx):
+    """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)
+    """
+    # Pre-allocate memory for key-values for inference.
+    num_heads, head_dim = kv.shape[-2:]
+    if layer_idx not in inference_params.key_value_memory_dict:
+        kv_cache = torch.empty(
+            inference_params.max_batch_size, inference_params.max_sequence_len, 2,
+            num_heads, head_dim, dtype=kv.dtype, device=kv.device
+        )
+        inference_params.key_value_memory_dict[layer_idx] = kv_cache
+    else:
+        if not inference_params.fused_ft_kernel:
+            kv_cache = inference_params.key_value_memory_dict[layer_idx]
+        else:
+            # For FT, k_cache has shape (b, h, headdim / packsize, s, packsize)
+            # where packsize = 4 if fp32, 8 if fp16 or bf16.
+            # v_cache has shape (b, h, s, headdim)
+            k_cache, v_cache = inference_params.key_value_memory_dict[layer_idx]
+            kv_cache = None
+    # Adjust key and value for inference
+    batch_start = inference_params.batch_size_offset
+    batch_end = batch_start + kv.shape[0]
+    sequence_start = inference_params.sequence_len_offset
+    sequence_end = sequence_start + kv.shape[1]
+    assert batch_end <= (kv_cache.shape[0] if kv_cache is not None else v_cache.shape[0])
+    assert sequence_end <= (kv_cache.shape[1] if kv_cache is not None else v_cache.shape[2])
+    # Copy key and values.
+    if not inference_params.fused_ft_kernel:
+        assert kv_cache is not None
+        kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
+        kv = kv_cache[batch_start:batch_end, :sequence_end, ...]
+        return kv
+    else:
+        assert inference_params.sequence_len_offset == 0
+        # FT kernel requires different layouts for the k_cache and v_cache.
+        assert kv.dtype in [torch.float16, torch.bfloat16, torch.float32]
+        packsize = 4 if kv.dtype == torch.float32 else 8
+        if kv_cache is not None:
+            kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
+            k_cache = rearrange(kv_cache[:, :, 0], 'b s h (d packsize) -> b h d s packsize',
+                                packsize=packsize).contiguous()
+            v_cache = rearrange(kv_cache[:, :, 1], 'b s h d -> b h s d').contiguous()
+            inference_params.key_value_memory_dict[layer_idx] = (k_cache, v_cache)
+        else:
+            k_cache[batch_start:batch_end, :, :, :sequence_end, :] = rearrange(
+                kv[:, :, 0], 'b s h (d packsize) -> b h d s packsize', packsize=packsize
+            )
+            v_cache[batch_start:batch_end, :, :sequence_end, :] = rearrange(
+                kv[:, :, 1], 'b s h d -> b h s d'
+            )
+        return kv
+
+
 class MHA(nn.Module):
     """Multi-head self-attention and cross-attention
     """
@@ -363,54 +417,7 @@ class MHA(nn.Module):
         """
         assert not self.dwconv, 'Generation does not support dwconv yet'
         assert self.layer_idx is not None, 'Generation requires layer_idx in the constructor'
-        # Pre-allocate memory for key-values for inference.
-        if self.layer_idx not in inference_params.key_value_memory_dict:
-            kv_cache = torch.empty(
-                inference_params.max_batch_size, inference_params.max_sequence_len, 2,
-                self.num_heads, self.head_dim, dtype=kv.dtype, device=kv.device
-            )
-            inference_params.key_value_memory_dict[self.layer_idx] = kv_cache
-        else:
-            if not inference_params.fused_ft_kernel:
-                kv_cache = inference_params.key_value_memory_dict[self.layer_idx]
-            else:
-                # For FT, k_cache has shape (b, h, headdim / packsize, s, packsize)
-                # where packsize = 4 if fp32, 8 if fp16 or bf16.
-                # v_cache has shape (b, h, s, headdim)
-                k_cache, v_cache = inference_params.key_value_memory_dict[self.layer_idx]
-                kv_cache = None
-        # Adjust key and value for inference
-        batch_start = inference_params.batch_size_offset
-        batch_end = batch_start + kv.shape[0]
-        sequence_start = inference_params.sequence_len_offset
-        sequence_end = sequence_start + kv.shape[1]
-        assert batch_end <= (kv_cache.shape[0] if kv_cache is not None else v_cache.shape[0])
-        assert sequence_end <= (kv_cache.shape[1] if kv_cache is not None else v_cache.shape[2])
-        # Copy key and values.
-        if not inference_params.fused_ft_kernel:
-            assert kv_cache is not None
-            kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
-            kv = kv_cache[batch_start:batch_end, :sequence_end, ...]
-            return kv
-        else:
-            assert inference_params.sequence_len_offset == 0
-            # FT kernel requires different layouts for the k_cache and v_cache.
-            assert kv.dtype in [torch.float16, torch.bfloat16, torch.float32]
-            packsize = 4 if kv.dtype == torch.float32 else 8
-            if kv_cache is not None:
-                kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
-                k_cache = rearrange(kv_cache[:, :, 0], 'b s h (d packsize) -> b h d s packsize',
-                                    packsize=packsize).contiguous()
-                v_cache = rearrange(kv_cache[:, :, 1], 'b s h d -> b h s d').contiguous()
-                inference_params.key_value_memory_dict[self.layer_idx] = (k_cache, v_cache)
-            else:
-                k_cache[batch_start:batch_end, :, :, :sequence_end, :] = rearrange(
-                    kv[:, :, 0], 'b s h (d packsize) -> b h d s packsize', packsize=packsize
-                )
-                v_cache[batch_start:batch_end, :, :sequence_end, :] = rearrange(
-                    kv[:, :, 1], 'b s h d -> b h s d'
-                )
-            return kv
+        return _update_kv_cache(kv, inference_params, self.layer_idx)
 
     def forward(self, x, x_kv=None, key_padding_mask=None, cu_seqlens=None, max_seqlen=None,
                 inference_params=None, **kwargs):
@@ -473,6 +480,7 @@ class MHA(nn.Module):
                     causal = None if inference_params.sequence_len_offset == 0 else False
                     context = self.inner_cross_attn(q, kv, causal=causal)
                 else:
+                    assert inference_params.fused_ft_kernel
                     assert ft_attention is not None
                     context = ft_attention.single_query_attention(
                         *rearrange(qkv, 'b 1 three h d -> b three h d').unbind(dim=1),
@@ -541,13 +549,16 @@ class ParallelMHA(nn.Module):
         self.Wqkv = ColumnParallelLinear(embed_dim, 3 * embed_dim, process_group, bias=bias,
                                          sequence_parallel=sequence_parallel, **factory_kwargs)
         inner_attn_cls = FlashSelfAttention if use_flash_attn else SelfAttention
+        inner_cross_attn_cls = FlashCrossAttention if use_flash_attn else CrossAttention
         self.inner_attn = inner_attn_cls(causal=causal, softmax_scale=softmax_scale,
                                          attention_dropout=dropout)
+        self.inner_cross_attn = inner_cross_attn_cls(causal=causal, softmax_scale=softmax_scale,
+                                                     attention_dropout=dropout)
         # output projection always have the bias (for now)
         self.out_proj = RowParallelLinear(embed_dim, embed_dim, process_group,
                                           sequence_parallel=sequence_parallel, **factory_kwargs)
 
-    def forward(self, x, seqlen=None, **kwargs):
+    def forward(self, x, seqlen=None, inference_params=None, **kwargs):
         """
         Arguments:
             x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim) if seqlen=None.
@@ -561,12 +572,34 @@ class ParallelMHA(nn.Module):
         else:
             qkv = rearrange(qkv, '(b s) (three h d) -> b s three h d', s=seqlen, three=3,
                             d=self.head_dim)
-        if self.rotary_emb_dim > 0:
-            qkv = self.rotary_emb(qkv)
-        if not self.checkpointing:
-            context = self.inner_attn(qkv, **kwargs)
+        if inference_params is None:
+            if self.rotary_emb_dim > 0:
+                qkv = self.rotary_emb(qkv)
+            if not self.checkpointing:
+                context = self.inner_attn(qkv, **kwargs)
+            else:
+                context = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv, **kwargs)
         else:
-            context = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv, **kwargs)
+            if (not inference_params.fused_ft_kernel) or inference_params.sequence_len_offset == 0:
+                if self.rotary_emb_dim > 0:
+                    qkv = self.rotary_emb(qkv, seqlen_offset=inference_params.sequence_len_offset)
+                q = qkv[:, :, 0]
+                assert self.layer_idx is not None, 'Generation requires layer_idx in the constructor'
+                kv = _update_kv_cache(qkv[:, :, 1:], inference_params, self.layer_idx)
+                # If we're processing the prompt, causal=None (use self.causal).
+                # If we're decoding, then causal=False.
+                causal = None if inference_params.sequence_len_offset == 0 else False
+                context = self.inner_cross_attn(q, kv, causal=causal)
+            else:
+                assert inference_params.fused_ft_kernel
+                assert ft_attention is not None
+                context = ft_attention.single_query_attention(
+                    *rearrange(qkv, 'b 1 three h d -> b three h d').unbind(dim=1),
+                    *inference_params.key_value_memory_dict[self.layer_idx],
+                    inference_params.lengths_per_sample, inference_params.sequence_len_offset,
+                    self.rotary_emb_dim
+                )
+                context = rearrange(context, 'b h d -> b 1 h d')
         if seqlen is None:
             context = rearrange(context, 'b s h d -> b s (h d)')
         else:

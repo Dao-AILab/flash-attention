@@ -1,5 +1,7 @@
 #include <torch/extension.h>
 #include "ATen/cuda/CUDAContext.h"
+#include <c10/cuda/CUDAGuard.h>
+
 
 #include "decoder_masked_multihead_attention.h"
 
@@ -137,6 +139,10 @@ torch::Tensor single_query_attention(const torch::Tensor q,
         CHECK_CONTIGUOUS(length_per_sample);
         TORCH_CHECK(length_per_sample.dtype() == torch::kInt32);
     }
+
+    // Otherwise the kernel will be launched from cuda:0 device
+    // Cast to char to avoid compiler warning about narrowing
+    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     torch::Tensor out = torch::empty_like(q);
 

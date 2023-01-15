@@ -1,6 +1,7 @@
-# Copyright (c) 2022, Tri Dao.
+# Copyright (c) 2023, Tri Dao.
 # Adapted from https://github.com/NVIDIA/Megatron-LM/blob/0bb597b42c53355a567aba2a1357cc34b9d99ddd/megatron/text_generation/forward_step.py#L31
-from typing import Optional
+from typing import Optional, Union, Sequence, Callable
+import gc
 import time
 
 from dataclasses import dataclass, field
@@ -70,7 +71,7 @@ def sample(logits, top_k=1, top_p=0.0, temperature=1.0):
 
 
 def decode(input_ids, model, max_length, top_k=1, top_p=0.0, temperature=1.0,
-           fused_ft_kernel=False, cg=False, timing=False):
+           vocab_size=None, tensor_parallel=1, fused_ft_kernel=False, cg=False, timing=False):
     """Decoding, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
     Top-k and top-p can be used together. If top_k > 0 and top_p > 0, then top-k is applied first,
@@ -85,18 +86,30 @@ def decode(input_ids, model, max_length, top_k=1, top_p=0.0, temperature=1.0,
         scores: tuples of (batch, vocab_size)
     """
     batch_size, seqlen_og = input_ids.shape
-    inference_params = InferenceParams(max_sequence_len=max_length, max_batch_size=batch_size,
-                                       fused_ft_kernel=fused_ft_kernel)
+    if cg:
+        assert fused_ft_kernel
+        if not hasattr(model, '_decoding_cache'):
+            model._decoding_cache = None
+        model._decoding_cache = update_graph_cache(
+            model, model._decoding_cache, batch_size, seqlen_og, max_length,
+            tensor_parallel=tensor_parallel
+        )
+        inference_params = model._decoding_cache.inference_params
+        inference_params.max_sequence_len = max_length
+        inference_params.max_batch_size = batch_size
+        inference_params.sequence_len_offset = 0
+    else:
+        inference_params = InferenceParams(max_sequence_len=max_length, max_batch_size=batch_size,
+                                           fused_ft_kernel=fused_ft_kernel)
     scores = []
     with torch.inference_mode():
         logits = model(input_ids, inference_params=inference_params).logits[:, -1]
+        if vocab_size is not None:
+            logits = logits[..., :vocab_size]
         scores.append(logits)
         next_token = sample(logits, top_k=top_k, top_p=top_p, temperature=temperature)
         sequences = [next_token]
         inference_params.sequence_len_offset = seqlen_og
-        if cg:
-            assert fused_ft_kernel
-            run, cg_cache = capture_cg(model, inference_params, batch_size, seqlen_og, max_length)
         if timing:
             start = time.time()
         while True:
@@ -106,8 +119,10 @@ def decode(input_ids, model, max_length, top_k=1, top_p=0.0, temperature=1.0,
                 logits = model(rearrange(next_token, 'b -> b 1'), position_ids=position_ids,
                                inference_params=inference_params).logits[:, -1]
             else:
-                logits = run(rearrange(next_token, 'b -> b 1'), position_ids,
-                             inference_params.sequence_len_offset)
+                logits = model._decoding_cache.run(rearrange(next_token, 'b -> b 1'), position_ids,
+                                                   inference_params.sequence_len_offset)
+            if vocab_size is not None:
+                logits = logits[..., :vocab_size]
             scores.append(logits)
             next_token = sample(logits, top_k=top_k, temperature=temperature)
             sequences.append(next_token)
@@ -115,6 +130,7 @@ def decode(input_ids, model, max_length, top_k=1, top_p=0.0, temperature=1.0,
             if inference_params.sequence_len_offset >= max_length - 1:
                 break
         if timing:
+            torch.cuda.synchronize()
             print(f'Decoding time: {time.time() - start}')
     output_cls = GreedySearchDecoderOnlyOutput if top_k == 1 else SampleDecoderOnlyOutput
     return output_cls(
@@ -134,8 +150,18 @@ class GenerationMixin:
         return output if return_dict_in_generate else output.sequences
 
 
-CgKey = namedtuple('CgKey', ['batch_size', 'seqlen_type', 'max_length'])
-CgVal = namedtuple('CgVal', ['graph', 'input_ids', 'position_ids', 'lengths', 'logits'])
+def allocate_kv_cache(max_batch_size, max_seqlen, nheads, headdim, layers: Union[int, Sequence],
+                      device, dtype=torch.float16):
+    assert dtype in [torch.float16, torch.bfloat16, torch.float32]
+    packsize = 4 if dtype == torch.float32 else 8
+    assert headdim % packsize == 0
+    k_cache_shape = (max_batch_size, nheads, headdim // packsize, max_seqlen, packsize)
+    v_cache_shape = (max_batch_size, nheads, max_seqlen, headdim)
+    if isinstance(layers, int):
+        layers = range(layers)
+    return {i: (torch.empty(k_cache_shape, device=device, dtype=dtype),
+                torch.empty(v_cache_shape, device=device, dtype=dtype))
+            for i in layers}
 
 
 def seqlen_to_seqlen_type(seqlen: int) -> int:
@@ -152,63 +178,91 @@ def seqlen_type_to_seqlen(seqlen_type: int) -> int:
     return 1 if seqlen_type == 0 else (32 if seqlen_type == 1 else 2048)
 
 
-def capture_cg(model, inference_params, batch_size, seqlen_og, max_length, copy_output=False):
-    """Build a cache of cuda graphs for decoding.
-    Arguments:
-        model: a GPTLMHeadModel
-        batch_size: int
-        seqlen_og: int. Length of the prompt.
-        max_length: int
-    TODO: how do we deal with the k_cache and v_cache memory? I think the CUDA graph also
-    has to own the k_cache and v_cache?
-    Here we assume that the model already has inference_params from the prompt processing.
-    """
-    assert max_length > seqlen_og
-    cg_cache: dict[CgKey, CgVal] = {}
+@dataclass
+class DecodingCGCache:
+    max_batch_size: int = 0
+    max_seqlen: int = 0
+    device = None
+    dtype = None
+    callables: dict = field(default_factory=dict)
+    mempool = None
+    inference_params: Optional[InferenceParams] = None
+    run: Optional[Callable] = None
+
+
+@torch.inference_mode()
+def update_graph_cache(model, cache, batch_size, seqlen_og, max_seqlen, tensor_parallel=1,
+                       dtype=None):
+    if cache is None:
+        cache = DecodingCGCache()
+    param_example = next(iter(model.parameters()))
+    device = param_example.device
+    if dtype is None:
+        dtype = param_example.dtype
+    if ((device, dtype) != (cache.device, cache.dtype) or batch_size > cache.max_batch_size
+        or max_seqlen > cache.max_seqlen):  # Invalidate the cache
+        cache.callables = {}
+        cache.mempool = None
+        cache.inference_params = None
+        gc.collect()
+        cache.device, cache.dtype = device, dtype
+        cache.max_batch_size, cache.max_seqlen = batch_size, max_seqlen
+        headdim = getattr(model.config, 'head_dim',
+                          model.config.hidden_size // model.config.num_attention_heads)
+        kv_cache = allocate_kv_cache(
+            batch_size, max_seqlen, model.config.num_attention_heads // tensor_parallel, headdim,
+            model.config.num_hidden_layers, device, dtype
+        )
+        lengths_per_sample = torch.full((batch_size,), seqlen_og, dtype=torch.int32, device=device)
+        cache.inference_params = InferenceParams(
+            max_sequence_len=max_seqlen, max_batch_size=batch_size,
+            sequence_len_offset=seqlen_og, key_value_memory_dict=kv_cache, fused_ft_kernel=True,
+            lengths_per_sample=lengths_per_sample
+        )
+        cache.mempool = torch.cuda.graphs.graph_pool_handle()
+    for s_type in range(seqlen_to_seqlen_type(seqlen_og), seqlen_to_seqlen_type(max_seqlen) + 1):
+        if s_type not in cache.callables:
+            seqlen = min(max(seqlen_og, seqlen_type_to_seqlen(s_type)), max_seqlen)
+            cache.callables[s_type] = capture_graph(
+                model, cache.inference_params, batch_size, seqlen_og, seqlen, mempool=cache.mempool
+            )
+
+    def dispatch(input_ids, position_ids, seqlen):
+        return cache.callables[seqlen_to_seqlen_type(seqlen)](input_ids, position_ids, seqlen)
+
+    cache.run = dispatch
+    cache.inference_params.sequence_length_offset = 0  # Reset so it's not confusing
+    return cache
+
+
+def capture_graph(model, inference_params, batch_size, seqlen_og, max_seqlen, mempool=None):
+    assert max_seqlen >= seqlen_og
     device = next(iter(model.parameters())).device
-    sequence_length_offset_og = inference_params.sequence_len_offset
     input_ids = torch.full((batch_size, 1), 0, dtype=torch.long, device=device)
     position_ids = torch.full((batch_size, 1), 0, dtype=torch.long, device=device)
-    inference_params.lengths_per_sample = torch.full((batch_size,), seqlen_og, dtype=torch.int32,
-                                                        device=device)
+    inference_params.lengths_per_sample[:] = seqlen_og
 
-    memory_pool = None
-    for s_type in range(seqlen_to_seqlen_type(seqlen_og), seqlen_to_seqlen_type(max_length) + 1):
-        seqlen = max(seqlen_og, seqlen_type_to_seqlen(s_type))
-        input_ids = torch.full((batch_size, 1), 0, dtype=torch.long, device=device)
-        position_ids = torch.full((batch_size, 1), 0, dtype=torch.long, device=device)
-        inference_params.lengths_per_sample[:] = seqlen
-        inference_params.sequence_len_offset = seqlen
-        g = torch.cuda.CUDAGraph()
-        # Warmup before capture
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(2):
-                logits = model(input_ids, position_ids=position_ids,
-                               inference_params=inference_params).logits[:, -1]
-        torch.cuda.current_stream().wait_stream(s)
-        # Captures the graph
-        # To allow capture, automatically sets a side stream as the current stream in the context
-        with torch.cuda.graph(g, pool=memory_pool):
+    # Warmup before capture
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
             logits = model(input_ids, position_ids=position_ids,
-                            inference_params=inference_params).logits[:, -1]
-        if memory_pool is None:
-            memory_pool = g.pool()
-        cg_cache[CgKey(batch_size, s_type, max_length)] = CgVal(
-            g, input_ids, position_ids, inference_params.lengths_per_sample, logits
-        )
+                           inference_params=inference_params).logits[:, -1]
+        s.synchronize()
+    torch.cuda.current_stream().wait_stream(s)
+    # Captures the graph
+    # To allow capture, automatically sets a side stream as the current stream in the context
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, pool=mempool):
+        logits = model(input_ids, position_ids=position_ids,
+                        inference_params=inference_params).logits[:, -1]
 
     def run(new_input_ids, new_position_ids, seqlen):
-        cg_val = cg_cache[CgKey(batch_size, seqlen_to_seqlen_type(seqlen), max_length)]
-        inference_params.lengths_per_sample = cg_val.lengths
         inference_params.lengths_per_sample[:] = seqlen
-        cg_val.input_ids.copy_(new_input_ids)
-        cg_val.position_ids.copy_(new_position_ids)
-        cg_val.graph.replay()
-        output = cg_val.logits
-        return output.clone() if copy_output else output
+        input_ids.copy_(new_input_ids)
+        position_ids.copy_(new_position_ids)
+        graph.replay()
+        return logits
 
-    inference_params.sequence_len_offset = sequence_length_offset_og
-
-    return run, cg_cache
+    return run
