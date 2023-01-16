@@ -122,7 +122,7 @@ set(CMAKE_MODULE_PATH ${HIP_PATH}/cmake ${CMAKE_MODULE_PATH})
 find_package(HIP)
 
 set(CMAKE_CXX_COMPILER /opt/rocm/hip/bin/hipcc)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 
 list(APPEND CMAKE_PREFIX_PATH "/opt/conda/lib/python3.7/site-packages/torch/share/cmake")
 find_package(Torch REQUIRED)
