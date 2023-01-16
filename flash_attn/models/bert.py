@@ -94,7 +94,8 @@ def create_block(config, layer_idx=None):
     mlp_cls = create_mlp_cls(config, layer_idx, return_residual=return_residual)
     norm_cls = partial(nn.LayerNorm, eps=config.layer_norm_eps)
     block = Block(config.hidden_size, mixer_cls, mlp_cls, norm_cls=norm_cls,
-                  prenorm=False, resid_dropout=config.hidden_dropout_prob,
+                  prenorm=False, resid_dropout1=config.hidden_dropout_prob,
+                  resid_dropout2=config.hidden_dropout_prob,
                   fused_dropout_add_ln=getattr(config, 'fused_dropout_add_ln', False),
                   return_residual=return_residual)
     return block

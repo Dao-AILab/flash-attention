@@ -84,6 +84,7 @@ def test_gpt2_optimized(model_name):
     config.fused_bias_fc = True
     config.fused_dense_gelu_dense = True
     config.fused_dropout_add_ln = True
+    config.residual_in_fp32 = True
     config.pad_vocab_size_multiple = 8
 
     model = GPTLMHeadModel.from_pretrained(model_name, config)

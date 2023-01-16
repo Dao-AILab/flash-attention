@@ -22,10 +22,22 @@ except ImportError:
 class Block(nn.Module):
 
     def __init__(self, dim, mixer_cls=None, mlp_cls=None, norm_cls=nn.LayerNorm,
-                 dropout_cls=nn.Dropout, prenorm=True, resid_dropout=0., drop_path=0.,
-                 fused_dropout_add_ln=False, return_residual=False, sequence_parallel=False,
-                 mark_shared_params=False):
+                 dropout_cls=nn.Dropout, prenorm=True, resid_dropout1=0., resid_dropout2=0.,
+                 drop_path1=0., drop_path2=0., fused_dropout_add_ln=False, return_residual=False,
+                 residual_in_fp32=False, sequence_parallel=False, mark_shared_params=False):
         """
+        For prenorm=True, this Block has a slightly different structure compared to a regular
+        prenorm Transformer block.
+        The standard block is: LN -> MHA -> Dropout -> Add -> LN -> MLP -> Dropout -> Add.
+        [Ref: https://arxiv.org/abs/2002.04745]
+        Here we have: Dropout -> Add -> LN -> MHA -> Dropout -> Add -> LN -> MLP, returning both
+        the hidden_states (output of the MLP) and the residual.
+        This is for performance reasons, as we can fuse the dropout, add and LayerNorm.
+        The residual needs to be provided (except for the very first block).
+
+        For prenorm=False, this Block has the same structure as a regular postnorm Transformer
+        block: MHA -> Dropout -> Add -> LN -> MLP -> Dropout -> Add -> LN.
+
         return_residual: whether each of the sub-layers (mixer and mlp) will return the residual.
         This is for performance reason: for post-norm architecture, returning the input allows us
         to fuse the backward of nn.Linear with the residual connection.
@@ -34,18 +46,21 @@ class Block(nn.Module):
         self.prenorm = prenorm
         self.fused_dropout_add_ln = fused_dropout_add_ln
         self.return_residual = return_residual
+        self.residual_in_fp32 = residual_in_fp32
+        if self.residual_in_fp32:
+            assert self.prenorm, 'residual_in_fp32 is only compatible with prenorm=True'
         if mixer_cls is None:
             mixer_cls = partial(MHA, num_heads=dim // 64)
         if mlp_cls is None:
             mlp_cls = partial(Mlp, hidden_features=4 * dim)
         self.mixer = mixer_cls(dim)
-        self.dropout1 = dropout_cls(resid_dropout)
-        self.drop_path1 = StochasticDepth(drop_path, mode='row')
+        self.dropout1 = dropout_cls(resid_dropout1)
+        self.drop_path1 = StochasticDepth(drop_path1, mode='row')
         self.norm1 = norm_cls(dim)
         self.mlp = mlp_cls(dim)
         if not isinstance(self.mlp, nn.Identity):
-            self.dropout2 = dropout_cls(resid_dropout)
-            self.drop_path2 = StochasticDepth(drop_path, mode='row')
+            self.dropout2 = dropout_cls(resid_dropout2)
+            self.drop_path2 = StochasticDepth(drop_path2, mode='row')
             self.norm2 = norm_cls(dim)
 
         if self.fused_dropout_add_ln:
@@ -82,41 +97,48 @@ class Block(nn.Module):
             residual: if postnorm, residual=None, If prenorm, hidden_states = LayerNorm(residual)
         """
         if self.prenorm:
-            assert residual is not None
-            mixer_out = self.mixer(hidden_states,
-                                   **(mixer_kwargs if mixer_kwargs is not None else {}))
             if not self.fused_dropout_add_ln:
-                residual = self.drop_path1(self.dropout1(mixer_out)) + residual
+                dropped = self.drop_path1(self.dropout1(hidden_states))
+                residual = (dropped + residual) if residual is not None else dropped
                 hidden_states = self.norm1(residual.to(dtype=self.norm1.weight.dtype))
+                if self.residual_in_fp32:
+                    residual = residual.to(torch.float32)
             else:
                 if self.drop_path1.p == 0 or not self.training:
                     rowscale1 = None
                 else:
                     rowscale1 = self.drop_path1(torch.ones(
-                        mixer_out.shape[:-1], device=mixer_out.device, dtype=mixer_out.dtype)
+                        hidden_states.shape[:-1], device=hidden_states.device,
+                        dtype=hidden_states.dtype)
                     )
                 hidden_states, residual = dropout_add_layer_norm(
-                    mixer_out, residual, self.norm1.weight, self.norm1.bias,
+                    hidden_states, residual, self.norm1.weight, self.norm1.bias,
                     self.dropout1.p if self.training else 0.0, self.norm1.eps,
-                    rowscale=rowscale1, prenorm=True
+                    rowscale=rowscale1, prenorm=True, residual_in_fp32=self.residual_in_fp32
                 )
+            hidden_states = self.mixer(hidden_states,
+                                       **(mixer_kwargs if mixer_kwargs is not None else {}))
             if not isinstance(self.mlp, nn.Identity):
-                mlp_out = self.mlp(hidden_states)
                 if not self.fused_dropout_add_ln:
-                    residual = self.drop_path2(self.dropout2(mlp_out)) + residual
+                    dropped = self.drop_path2(self.dropout2(hidden_states))
+                    residual = (dropped + residual) if residual is not None else dropped
                     hidden_states = self.norm2(residual.to(dtype=self.norm2.weight.dtype))
+                    if self.residual_in_fp32:
+                        residual = residual.to(torch.float32)
                 else:
                     if self.drop_path2.p == 0 or not self.training:
                         rowscale2 = None
                     else:
                         rowscale2 = self.drop_path2(torch.ones(
-                            mlp_out.shape[:-1], device=mlp_out.device, dtype=mlp_out.dtype)
+                            hidden_states.shape[:-1], device=hidden_states.device,
+                            dtype=hidden_states.dtype)
                         )
                     hidden_states, residual = dropout_add_layer_norm(
-                        mlp_out, residual, self.norm2.weight, self.norm2.bias,
+                        hidden_states, residual, self.norm2.weight, self.norm2.bias,
                         self.dropout2.p if self.training else 0.0, self.norm2.eps,
-                        rowscale=rowscale2, prenorm=True
+                        rowscale=rowscale2, prenorm=True, residual_in_fp32=self.residual_in_fp32
                     )
+                hidden_states = self.mlp(hidden_states)
             return hidden_states, residual
         else:
             assert residual is None
