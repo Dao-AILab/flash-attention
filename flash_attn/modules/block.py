@@ -89,12 +89,15 @@ class Block(nn.Module):
                     p._shared_params = True
 
     def forward(self, hidden_states: Tensor, residual: Optional[Tensor] = None,
-                mixer_kwargs=None):
+                mixer_subset=None, mixer_kwargs=None):
         r"""Pass the input through the encoder layer.
 
         Args:
             hidden_states: the sequence to the encoder layer (required).
             residual: if postnorm, residual=None, If prenorm, hidden_states = Attn/MLP(LN(residual))
+            mixer_subset: for cross-attention only. If not None, will take a subset of x
+                before applying the query projection. Useful for e.g., ViT where we only care
+                about the CLS token in the last layer.
         """
         if self.prenorm:
             if not self.fused_dropout_add_ln:
@@ -116,8 +119,12 @@ class Block(nn.Module):
                     self.dropout1.p if self.training else 0.0, self.norm1.eps,
                     rowscale=rowscale1, prenorm=True, residual_in_fp32=self.residual_in_fp32
                 )
-            hidden_states = self.mixer(hidden_states,
-                                       **(mixer_kwargs if mixer_kwargs is not None else {}))
+            if mixer_kwargs is None:
+                mixer_kwargs = {}
+            mixer_kwargs['mixer_subset'] = mixer_subset
+            hidden_states = self.mixer(hidden_states, **mixer_kwargs)
+            if mixer_subset is not None:
+                residual = residual[:, mixer_subset]
             if not isinstance(self.mlp, nn.Identity):
                 if not self.fused_dropout_add_ln:
                     dropped = self.drop_path2(self.dropout2(hidden_states))

@@ -26,7 +26,7 @@ def test_opt_state_dict(model_name):
 @pytest.mark.parametrize('model_name', ["facebook/opt-125m", "facebook/opt-350m", "facebook/opt-1.3b"])
 # @pytest.mark.parametrize('model_name', ["facebook/opt-350m"])
 def test_opt_optimized(model_name):
-    """Check that our implementation of OPT (without any optimizations enabled) matches the
+    """Check that our implementation of OPT (without all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
     forward pass in fp16, when compared to the HF forward pass in fp32.
     """

@@ -1,8 +1,11 @@
 # Copyright (c) 2022, Tri Dao.
 # Inspired by / adapted from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
 import math
+import re
 from functools import partial
 from copy import deepcopy
+
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -218,6 +221,7 @@ class VisionTransformer(nn.Module):
         hidden_states = self._pos_embed(x)
         residual = None
         if self.global_pool != 'token' or all_tokens:
+        # if True:
             for block in self.blocks:
                 hidden_states, residual = block(hidden_states, residual)
         else:
@@ -225,10 +229,8 @@ class VisionTransformer(nn.Module):
                 hidden_states, residual = block(hidden_states, residual)
             # For the last layer, we only want the 1st token of the output. So we do cross-attention
             # where the query is the 1st token and the key/value is the whole sequence.
-            hidden_states_1st = rearrange(hidden_states[:, 0], 'b d -> b 1 d')
-            residual_1st = rearrange(residual[:, 0], 'b d -> b 1 d')
-            hidden_states, residual = self.blocks[-1](hidden_states_1st, residual_1st,
-                                                      mixer_kwargs={'x_kv': hidden_states})
+            hidden_states, residual = self.blocks[-1](hidden_states, residual,
+                                                      mixer_subset=slice(0, 1))
         if not self.fused_dropout_add_ln:
             residual = self.drop_path(self.dropout(hidden_states)) + residual
             hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
@@ -257,6 +259,29 @@ class VisionTransformer(nn.Module):
         x = self.forward_features(x, all_tokens=False)
         x = self.forward_head(x)
         return x
+
+    def load_state_dict(self, state_dict, strict=True):
+        patch_embed_weight = state_dict['patch_embed.proj.weight']
+        if patch_embed_weight.dim() == 4:
+            # convert from Conv2d to Linear
+            state_dict['patch_embed.proj.weight'] = rearrange(patch_embed_weight,
+                                                              'o c h w -> o (c h w)')
+        def key_mapping_attn(key):
+            key = re.sub(r'^blocks.(\d+).attn.qkv.', r'blocks.\1.mixer.Wqkv.', key)
+            key = re.sub(r'^blocks.(\d+).attn.proj.', r'blocks.\1.mixer.out_proj.', key)
+            return key
+        state_dict = OrderedDict((key_mapping_attn(k), v) for k, v in state_dict.items())
+        n_layer = len(self.blocks)
+        # Convert from Wqkv to Wq and Wkv for cross attention (last layer)
+        if (self.blocks[-1].mixer.cross_attn
+            and f'blocks.{n_layer - 1}.mixer.Wqkv.weight' in state_dict):
+            Wqkv = state_dict.pop(f'blocks.{n_layer - 1}.mixer.Wqkv.weight')
+            bqkv = state_dict.pop(f'blocks.{n_layer - 1}.mixer.Wqkv.bias')
+            state_dict[f'blocks.{n_layer - 1}.mixer.Wq.weight'] = Wqkv[:self.embed_dim]
+            state_dict[f'blocks.{n_layer - 1}.mixer.Wkv.weight'] = Wqkv[self.embed_dim:]
+            state_dict[f'blocks.{n_layer - 1}.mixer.Wq.bias'] = bqkv[:self.embed_dim]
+            state_dict[f'blocks.{n_layer - 1}.mixer.Wkv.bias'] = bqkv[self.embed_dim:]
+        return super().load_state_dict(state_dict, strict=strict)
 
 
 def init_weights_vit_timm(module: nn.Module, name: str = ''):

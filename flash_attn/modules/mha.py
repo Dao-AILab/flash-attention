@@ -420,7 +420,7 @@ class MHA(nn.Module):
         return _update_kv_cache(kv, inference_params, self.layer_idx)
 
     def forward(self, x, x_kv=None, key_padding_mask=None, cu_seqlens=None, max_seqlen=None,
-                inference_params=None, **kwargs):
+                mixer_subset=None, inference_params=None, **kwargs):
         """
         Arguments:
             x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim) if
@@ -433,6 +433,9 @@ class MHA(nn.Module):
             max_seqlen: int. Maximum sequence length in the batch.
             key_padding_mask: boolean mask, True means to keep, False means to mask out.
                 (batch, seqlen). Only applicable when not using FlashAttention.
+            mixer_subset: for cross-attention only. If not None, will take a subset of x
+                before applying the query projection. Useful for e.g., ViT where we only care
+                about the CLS token in the last layer.
             inference_params: for generation. Adapted from Megatron-LM (and Apex)
             https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
         """
@@ -454,6 +457,7 @@ class MHA(nn.Module):
         kwargs = ({'cu_seqlens': cu_seqlens, 'max_seqlen': max_seqlen, **kwargs}
                   if self.use_flash_attn else {'key_padding_mask': key_padding_mask, **kwargs})
         if not self.cross_attn:
+            assert x_kv is None and mixer_subset is None
             if not self.return_residual:
                 qkv = self.Wqkv(x)
             else:
@@ -491,14 +495,14 @@ class MHA(nn.Module):
                     context = rearrange(context, 'b h d -> b 1 h d')
         else:
             if not self.return_residual:
-                q = self.Wq(x)
+                q = self.Wq(x if mixer_subset is None else x[:, mixer_subset])
                 kv = self.Wkv(x_kv if x_kv is not None else x)
             else:
                 if x_kv is not None:
                     kv, x_kv = self.Wkv(x_kv)
                 else:
                     kv, x = self.Wkv(x)
-                q = self.Wq(x)
+                q = self.Wq(x if mixer_subset is None else x[:, mixer_subset])
             q = rearrange(q, '... (h d) -> ... h d', d=self.head_dim)
             kv = rearrange(kv, '... (two h d) -> ... two h d', two=2, d=self.head_dim)
             if self.dwconv:
