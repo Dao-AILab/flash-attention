@@ -94,7 +94,7 @@ class Block(nn.Module):
 
         Args:
             hidden_states: the sequence to the encoder layer (required).
-            residual: if postnorm, residual=None, If prenorm, hidden_states = LayerNorm(residual)
+            residual: if postnorm, residual=None, If prenorm, hidden_states = Attn/MLP(LN(residual))
         """
         if self.prenorm:
             if not self.fused_dropout_add_ln:
