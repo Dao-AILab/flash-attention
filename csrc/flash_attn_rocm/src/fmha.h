@@ -2,6 +2,9 @@
 
 #include <vector>
 #include <iostream>
+#include <ATen/cuda/CUDAGeneratorImpl.h>
+
+//#include <ATen/cuda/detail/PhiloxCudaStateRaw.cuh>
 
 #include "fmha_utils.h"
 
@@ -88,7 +91,7 @@ struct FMHA_fprop_params : public Qkv_params {
     uint32_t scale_dropout;
 
     // Random state.
-    // at::PhiloxCudaState philox_args;
+    at::PhiloxCudaState philox_args;
 
     bool is_bf16;
     bool is_causal;

@@ -1,5 +1,8 @@
 #include <ATen/ATen.h>
 #include <torch/extension.h>
+//#include <ATen/cuda/CUDAContext.h>
+//#include <ATen/core/Generator.h>
+//#include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/hip/HIPContext.h>
 #include <c10/hip/HIPGuard.h>
 #include "fmha.h"
@@ -128,8 +131,8 @@ mha_fwd(const at::Tensor &q,
         const bool zero_tensors,
         const bool is_causal,
         const bool return_softmax,
-        const int num_splits/*,   // num_splits is not used in rocm
-        c10::optional<at::Generator> gen_*/) {
+        const int num_splits,   // num_splits is not used in rocm
+        c10::optional<at::Generator> gen_) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentHIPStream().stream();
@@ -205,8 +208,8 @@ mha_fwd(const at::Tensor &q,
         if (return_softmax) {s.zero_();}
     }
 
-    //auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-    //    gen_, at::cuda::detail::getDefaultCUDAGenerator());
+    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+        gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
     set_params_fprop(launch_params.params,
                      batch_size,
@@ -228,14 +231,15 @@ mha_fwd(const at::Tensor &q,
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-    int64_t counter_offset = launch_params.params.b * launch_params.params.h * 32;
+    // int64_t counter_offset = launch_params.params.b * launch_params.params.h * 32;
+    int64_t counter_offset = 512;
     // at::PhiloxCudaState rng_engine_inputs;
 
-    //if( is_dropout ) {
-    //    // See Note [Acquire lock when using random generators]
-    //    std::lock_guard<std::mutex> lock(gen->mutex_);
-    //    launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
-    //}
+    if( is_dropout ) {
+        // See Note [Acquire lock when using random generators]
+        std::lock_guard<std::mutex> lock(gen->mutex_);
+        launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
+    }
 
     run_fmha_fp16_bf16_gfx90a(launch_params);
 
@@ -297,14 +301,14 @@ int main(){
     int max_seqlen_k_ = 256;
     
     //other parameters
-    float p_dropout = 0;           
+    float p_dropout = 0.1;           
     float softmax_scale = 0.125;  
     bool zero_tensors = false;    
     bool is_causal = false;       
     bool return_softmax = false;  
     int num_splits = 0;        
 
-
+    c10::optional<at::Generator> gen_;
 
     auto result = 
     mha_fwd(q,   
@@ -320,8 +324,8 @@ int main(){
             zero_tensors,
             is_causal,
             return_softmax,
-            num_splits/*,
-            gen_*/);
+            num_splits,
+            gen_);
 
 
     using FP16 = ck::half_t;

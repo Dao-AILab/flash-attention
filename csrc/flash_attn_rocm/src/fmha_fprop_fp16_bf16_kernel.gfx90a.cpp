@@ -6,6 +6,8 @@
 #include <initializer_list>
 #include <cstdlib>
 
+//#include <ATen/cuda/detail/UnpackRaw.cuh>
+
 template <ck::index_t... Is>
 using S = ck::Sequence<Is...>;
 using MaskingSpecialization = ck::tensor_operation::device::MaskingSpecialization;
@@ -27,6 +29,14 @@ struct SimpleDeviceMem
 
     void* p_mem_;
 };
+
+std::tuple<uint64_t, uint64_t> unpack(at::PhiloxCudaState arg) {
+  if (arg.captured_) {
+    return std::make_tuple(arg.seed_, static_cast<uint64_t>(*(arg.offset_.ptr) + arg.offset_intragraph_));
+  } else {
+    return std::make_tuple(arg.seed_, arg.offset_.val);
+  }
+}
 
 template<typename InputType, 
          ck::index_t MPerBlock,    ck::index_t NPerBlock, ck::index_t KPerBlock,   ck::index_t Gemm1NPerBlock,
@@ -163,12 +173,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     int num_heads = launch_params.params.h;
     int head_dim = launch_params.params.d;
 
-    //int* host_seqlens_q;
-    //int* host_seqlens_k;
-    //host_seqlens_q = (int*)malloc((launch_params.params.b+1)*sizeof(int));
-    //host_seqlens_k = (int*)malloc((launch_params.params.b+1)*sizeof(int));
-    //FMHA_CHECK_HIP(hipMemcpy(host_seqlens_q, launch_params.params.cu_seqlens_q, (launch_params.params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
-    //FMHA_CHECK_HIP(hipMemcpy(host_seqlens_k, launch_params.params.cu_seqlens_k, (launch_params.params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
+    auto seeds = unpack(launch_params.params.philox_args);
 
     for(size_t i = 0; i < batch_size ; i++){
         int M     = launch_params.params.host_seqlens_q[i + 1] - launch_params.params.host_seqlens_q[i]; //seqlen Q
