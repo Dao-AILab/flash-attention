@@ -59,11 +59,6 @@ void set_params_fprop(FMHA_fprop_params &params,
     FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_q, params.cu_seqlens_q, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
     FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_k, params.cu_seqlens_k, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
 
-    //at::Tensor q_ = q.view({params.b, params.seqlen_q , params.h , params.d});
-    //at::Tensor k_ = k.view({params.b, params.seqlen_k , params.h , params.d});
-    //at::Tensor v_ = v.view({params.b, params.seqlen_q , params.h , params.d});
-    //out = out.view({params.b, params.seqlen_q , params.h , params.d});
-
     char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
     char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
     char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
@@ -81,24 +76,20 @@ void set_params_fprop(FMHA_fprop_params &params,
     //std::cout << " q_[0][0][1][0].data_ptr() " << q_[0][0][1][0].data_ptr() << std::endl;
     //std::cout << " q_[0][1][0][0].data_ptr() " << q_[0][1][0][0].data_ptr() << std::endl;
     //std::cout << " q_[1][0][0][0].data_ptr() " << q_[1][0][0][0].data_ptr() << std::endl;
-/*
-    for (int i = 0; i < b; i++){
-        params.q_ptr.push_back(q_[i].data_ptr());
-        params.k_ptr.push_back(k_[i].data_ptr());
-        params.v_ptr.push_back(v_[i].data_ptr());
-        params.o_ptr.push_back(out[i].data_ptr());
-    }
-*/
 
     for (int i = 0; i < b; i++){
+        params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
+        params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr));
+        params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr));
+        params.o_ptr.push_back(reinterpret_cast<void*>(out_ptr));
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
-        int temp_q_stride = get_size_in_bytes(i * d * h * temp_seqlen_q, data_type);
-        int temp_k_stride = get_size_in_bytes(i * d * h * temp_seqlen_k, data_type);
-        params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr   + temp_q_stride));
-        params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr   + temp_k_stride));
-        params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr   + temp_k_stride));
-        params.o_ptr.push_back(reinterpret_cast<void*>(out_ptr + temp_q_stride));
+        int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, data_type);
+        int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, data_type);
+        q_ptr = q_ptr     + temp_q_stride;
+        k_ptr = k_ptr     + temp_k_stride;
+        v_ptr = v_ptr     + temp_k_stride;
+        out_ptr = out_ptr + temp_q_stride;
     }
 
     // Set the different scale values.
@@ -137,7 +128,7 @@ mha_fwd(const at::Tensor &q,
         const bool zero_tensors,
         const bool is_causal,
         const bool return_softmax,
-        const int num_splits/*,
+        const int num_splits/*,   // num_splits is not used in rocm
         c10::optional<at::Generator> gen_*/) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -311,7 +302,9 @@ int main(){
     bool zero_tensors = false;    
     bool is_causal = false;       
     bool return_softmax = false;  
-    int num_splits = 0;           
+    int num_splits = 0;        
+
+
 
     auto result = 
     mha_fwd(q,   
@@ -328,7 +321,7 @@ int main(){
             is_causal,
             return_softmax,
             num_splits/*,
-            c10::optional<at::Generator> gen_*/);
+            gen_*/);
 
 
     using FP16 = ck::half_t;
