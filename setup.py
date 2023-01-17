@@ -2,6 +2,7 @@
 import sys
 import warnings
 import os
+import shutil
 from pathlib import Path
 
 from setuptools import setup, find_packages
@@ -73,6 +74,10 @@ def append_nvcc_threads(nvcc_extra_args):
     #     return nvcc_extra_args + ["--threads", "4"]
     return nvcc_extra_args
 
+def rename_cpp_cu(cpp_files):
+    for entry in cpp_files:
+        shutil.copy(entry, os.path.splitext(entry)[0] + '.cu')
+
 
 # if not torch.cuda.is_available():
 #     # https://github.com/NVIDIA/apex/issues/486
@@ -131,6 +136,11 @@ cc_flag = []
 # cc_flag.append("-gencode")
 # cc_flag.append("arch=compute_80,code=sm_80")
 
+
+ck_sources = ["csrc/flash_attn_rocm/composable_kernel/library/src/utility/convolution_parameter.cpp", "csrc/flash_attn_rocm/composable_kernel/library/src/utility/device_memory.cpp", "csrc/flash_attn_rocm/composable_kernel/library/src/utility/host_tensor.cpp"]
+
+rename_cpp_cu(ck_sources)
+
 subprocess.run(["git", "submodule", "update", "--init", "csrc/flash_attn_rocm/composable_kernel"])
 ext_modules.append(
     CUDAExtension(
@@ -155,11 +165,18 @@ ext_modules.append(
                 + cc_flag
             ,
         },
-        exclude_dirs=[Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel'],
         include_dirs=[
             Path(this_dir) / 'csrc' / 'flash_attn_rocm',
             Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'src',
             Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' ,
+            Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' ,
+            Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'tensor_operation' / 'gpu' / 'device',
+            Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'tensor_operation' / 'gpu' /' element',
+            Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'library' / 'utility',
+            Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'library' / 'include' / 'ck' / 'library' / 'utility',
+            Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'library' / 'include',
+            Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'utility' / 'library',
+            Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'library' / 'reference_tensor_operation',
         ],
     )
 )
