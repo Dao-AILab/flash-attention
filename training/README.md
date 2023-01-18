@@ -48,7 +48,7 @@ config = GPT2Config(vocab_size=50257, n_positions=seqlen, n_embd=hidden_dim,
                     n_layer=n_layer, n_head=nheads, 
                     scale_attn_by_inverse_layer_idx=True, 
                     rotary_emb_fraction=rotary_emb_fraction,
-                    use_flash_attn=True, fused_dense_gelu_dense=True,
+                    use_flash_attn=True, fused_mlp=True,
                     fused_bias_fc=True, fused_dropout_add_ln=True, 
                     pad_vocab_size_multiple=8)
 model = GPTLMHeadModel(config)

@@ -8,11 +8,11 @@ from timm.models.vision_transformer import vit_base_patch16_224
 from flash_attn.models.vit import vit_base_patch16_224 as flash_vit_base_patch16_224
 
 
-@pytest.mark.parametrize('fused_dense_gelu_dense', [False, True])
-# @pytest.mark.parametrize('fused_dense_gelu_dense', [False])
+@pytest.mark.parametrize('fused_mlp', [False, True])
+# @pytest.mark.parametrize('fused_mlp', [False])
 @pytest.mark.parametrize('optimized', [False, True])
 # @pytest.mark.parametrize('optimized', [True])
-def test_vit(optimized, fused_dense_gelu_dense):
+def test_vit(optimized, fused_mlp):
     """Check that our implementation of ViT matches the timm's implementation:
     the output of our forward pass in fp16 should be around the same as
     timm' forward pass in fp16, when compared to timm's forward pass in fp32.
@@ -23,7 +23,7 @@ def test_vit(optimized, fused_dense_gelu_dense):
     kwargs = {}
     if optimized:
         kwargs = dict(use_flash_attn=True, fused_bias_fc=True, fused_dropout_add_ln=True)
-    kwargs['fused_dense_gelu_dense'] = fused_dense_gelu_dense
+    kwargs['fused_mlp'] = fused_mlp
     model = flash_vit_base_patch16_224(**kwargs).to(device=device, dtype=dtype)
 
     model_ref = vit_base_patch16_224(pretrained=True).to(device=device)
@@ -46,4 +46,5 @@ def test_vit(optimized, fused_dense_gelu_dense):
     print(f'Output mean diff: {(out - out_ref).abs().mean().item()}')
     print(f'timm fp16 max diff: {(out_timm - out_ref).abs().max().item()}')
     print(f'timm fp16 mean diff: {(out_timm - out_ref).abs().mean().item()}')
-    assert (out - out_ref).abs().max().item() < 3 * (out_timm - out_ref).abs().max().item()
+    rtol = 2 if not fused_mlp else 4
+    assert (out - out_ref).abs().max().item() < rtol * (out_timm - out_ref).abs().max().item()

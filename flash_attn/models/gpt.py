@@ -17,7 +17,7 @@ from transformers import GPT2Config
 from einops import rearrange
 
 from flash_attn.modules.mha import MHA, ParallelMHA
-from flash_attn.modules.mlp import Mlp, FusedDenseGeluDense, ParallelFusedDenseGeluDense
+from flash_attn.modules.mlp import Mlp, FusedMLP, ParallelFusedMLP
 from flash_attn.modules.block import Block
 from flash_attn.modules.embedding import GPT2Embeddings, ParallelGPT2Embeddings
 from flash_attn.utils.distributed import sync_shared_params, all_gather_raw
@@ -77,22 +77,22 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
 def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
     inner_dim = config.n_inner if config.n_inner is not None else 4 * config.hidden_size
-    fused_dense_gelu_dense = getattr(config, 'fused_dense_gelu_dense', False)
-    if fused_dense_gelu_dense:
-        assert config.activation_function in ['gelu_new', 'gelu_fast'], ('fused_dense_gelu_dense only '
-                                                                'supports approximate gelu')
+    fused_mlp = getattr(config, 'fused_mlp', False)
+    if fused_mlp:
+        assert config.activation_function in ['gelu_new', 'gelu_fast', 'gelu_approx', 'relu']
     fused_dense_sqrelu_dense = getattr(config, 'fused_dense_sqrelu_dense', False)
     if fused_dense_sqrelu_dense:
         assert config.activation_function == 'sqrelu', ('fused_dense_sqrelu_dense only '
                                                'supports approximate activation_function sqrelu')
-    assert not (fused_dense_sqrelu_dense and fused_dense_gelu_dense)
+    assert not (fused_dense_sqrelu_dense and fused_mlp)
     if process_group is not None:
-        assert fused_dense_gelu_dense, 'Tensor Parallel is only implemented for FusedDenseGeluDense'
-    if not fused_dense_gelu_dense and not fused_dense_sqrelu_dense:
+        assert fused_mlp, 'Tensor Parallel is only implemented for FusedMLP'
+    if not fused_mlp and not fused_dense_sqrelu_dense:
         if config.activation_function == 'relu':
             activation = partial(F.relu, inplace=True)
         else:
-            approximate = 'tanh' if config.activation_function in ['gelu_new', 'gelu_fast'] else 'none'
+            approximate = ('tanh' if config.activation_function
+                           in ['gelu_new', 'gelu_fast', 'gelu_approx'] else 'none')
             activation=partial(F.gelu, approximate=approximate)
         mlp_cls = partial(Mlp, hidden_features=inner_dim, activation=activation, **factory_kwargs)
     else:
@@ -101,14 +101,17 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
         if isinstance(mlp_checkpoint_lvl, Sequence):
             assert layer_idx is not None
             mlp_checkpoint_lvl = mlp_checkpoint_lvl[layer_idx]
-        if fused_dense_gelu_dense:
-            if FusedDenseGeluDense is None:
+        if fused_mlp:
+            if FusedMLP is None:
                 raise ImportError('fused_dense is not installed')
-            mlp_cls = FusedDenseGeluDense if process_group is None else ParallelFusedDenseGeluDense
+            activation = ('gelu_approx' if config.activation_function
+                          in ['gelu_new', 'gelu_fast', 'gelu_approx'] else 'relu')
+            mlp_cls = FusedMLP if process_group is None else ParallelFusedMLP
             parallel_kwargs = ({'process_group': process_group,
                                 'sequence_parallel': getattr(config, 'sequence_parallel', True)}
                                if process_group is not None else {})
-            mlp_cls = partial(mlp_cls, hidden_features=inner_dim, checkpoint_lvl=mlp_checkpoint_lvl,
+            mlp_cls = partial(mlp_cls, hidden_features=inner_dim, activation=activation,
+                              checkpoint_lvl=mlp_checkpoint_lvl,
                               **parallel_kwargs, **factory_kwargs)
         elif fused_dense_sqrelu_dense:
             assert FusedDenseSqreluDense is not None
@@ -210,7 +213,8 @@ class GPTModel(GPTPreTrainedModel):
         factory_kwargs = {'device': device, 'dtype': dtype}
         self.process_group = process_group
         self.sequence_parallel = getattr(config, 'sequence_parallel', True)
-        assert config.activation_function in ['gelu', 'gelu_new', 'gelu_fast', 'relu', 'sqrelu']
+        assert config.activation_function in ['gelu', 'gelu_new', 'gelu_fast', 'gelu_approx',
+                                              'relu', 'sqrelu']
         pad_vocab_size_multiple = getattr(config, 'pad_vocab_size_multiple', 1)
         vocab_size = (math.ceil(config.vocab_size / pad_vocab_size_multiple)
                       * pad_vocab_size_multiple)

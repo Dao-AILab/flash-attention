@@ -121,7 +121,8 @@ class Block(nn.Module):
                 )
             if mixer_kwargs is None:
                 mixer_kwargs = {}
-            mixer_kwargs['mixer_subset'] = mixer_subset
+            if mixer_subset is not None:
+                mixer_kwargs['mixer_subset'] = mixer_subset
             hidden_states = self.mixer(hidden_states, **mixer_kwargs)
             if mixer_subset is not None:
                 residual = residual[:, mixer_subset]

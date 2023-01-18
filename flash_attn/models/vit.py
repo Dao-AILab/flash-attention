@@ -20,7 +20,7 @@ from timm.models.helpers import named_apply
 from flash_attn.layers.patch_embed import PatchEmbed
 
 from flash_attn.modules.mha import MHA
-from flash_attn.modules.mlp import Mlp, FusedDenseGeluDense
+from flash_attn.modules.mlp import Mlp, FusedMLP
 from flash_attn.modules.block import Block
 
 try:
@@ -37,22 +37,22 @@ def create_mixer_cls(num_heads, qkv_bias, attn_drop, use_flash_attn, fused_bias_
     return mixer_cls
 
 
-def create_mlp_cls(embed_dim, mlp_ratio, act_layer, fused_dense_gelu_dense):
+def create_mlp_cls(embed_dim, mlp_ratio, act_layer, fused_mlp):
     inner_dim = int(embed_dim * mlp_ratio)
-    if not fused_dense_gelu_dense:
+    if not fused_mlp:
         mlp_cls = partial(Mlp, hidden_features=inner_dim, activation=act_layer())
     else:
-        mlp_cls = partial(FusedDenseGeluDense, hidden_features=inner_dim)
+        mlp_cls = partial(FusedMLP, hidden_features=inner_dim)
     return mlp_cls
 
 
 def create_block(embed_dim, num_heads, mlp_ratio, qkv_bias, drop_rate, attn_drop_rate,
                  drop_path1, drop_path2, norm_layer, act_layer, use_flash_attn, fused_bias_fc,
-                 fused_dense_gelu_dense, fused_dropout_add_ln, layer_idx=None, n_layer=None,
+                 fused_mlp, fused_dropout_add_ln, layer_idx=None, n_layer=None,
                  last_layer_subset=False):
     mixer_cls = create_mixer_cls(num_heads, qkv_bias, attn_drop_rate, use_flash_attn, fused_bias_fc,
                                  cross_attn=(last_layer_subset and layer_idx == n_layer - 1))
-    mlp_cls = create_mlp_cls(embed_dim, mlp_ratio, act_layer, fused_dense_gelu_dense)
+    mlp_cls = create_mlp_cls(embed_dim, mlp_ratio, act_layer, fused_mlp)
     # TD [2022-10-15]: Force residual in fp32 in case of DeepSpeed
     block = Block(embed_dim, mixer_cls, mlp_cls, norm_cls=norm_layer,
                   prenorm=True, resid_dropout1=drop_rate, resid_dropout2=drop_rate,
@@ -92,7 +92,7 @@ class VisionTransformer(nn.Module):
             act_layer=None,
             use_flash_attn=False,
             fused_bias_fc=False,
-            fused_dense_gelu_dense=False,
+            fused_mlp=False,
             fused_dropout_add_ln=False,
     ):
         """
@@ -164,7 +164,7 @@ class VisionTransformer(nn.Module):
             embed_dim, num_heads, mlp_ratio, qkv_bias, drop_rate, attn_drop_rate,
             drop_path1=dpr[i-1] if i > 0 else 0., drop_path2=dpr[i],
             norm_layer=norm_layer, act_layer=act_layer, use_flash_attn=use_flash_attn,
-            fused_bias_fc=fused_bias_fc, fused_dense_gelu_dense=fused_dense_gelu_dense,
+            fused_bias_fc=fused_bias_fc, fused_mlp=fused_mlp,
             fused_dropout_add_ln=fused_dropout_add_ln, layer_idx=i, n_layer=depth,
             last_layer_subset=(global_pool == 'token')
         ) for i in range(depth)])

@@ -95,13 +95,13 @@ def test_bert_optimized(model_name):
     """
     dtype = torch.float16
     config = BertConfig.from_pretrained(model_name)
-    # Our implementation of fused_dense_gelu_dense assumes the activation is
+    # Our implementation of fused_mlp assumes the activation is
     # nn.GELU(approximate='tanh'). Huggingface calls it "gelu_new" or "gelu_fast".
-    # If you just want "gelu", disable fused_dense_gelu_dense.
+    # If you just want "gelu", disable fused_mlp.
     config.hidden_act = "gelu_new"
     config.use_flash_attn = True
     config.fused_bias_fc = True
-    config.fused_dense_gelu_dense = True
+    config.fused_mlp = True
     config.fused_dropout_add_ln = True
 
     model = BertForPreTraining.from_pretrained(model_name, config)
@@ -171,13 +171,13 @@ def test_bert_dense_seq_output(model_name, has_key_padding_mask, last_layer_subs
     """
     dtype = torch.float16
     config = BertConfig.from_pretrained(model_name)
-    # Our implementation of fused_dense_gelu_dense assumes the activation is
+    # Our implementation of fused_mlp assumes the activation is
     # nn.GELU(approximate='tanh'). Huggingface calls it "gelu_new" or "gelu_fast".
-    # If you just want "gelu", disable fused_dense_gelu_dense.
+    # If you just want "gelu", disable fused_mlp.
     config.hidden_act = "gelu_new"
     config.use_flash_attn = True
     config.fused_bias_fc = True
-    config.fused_dense_gelu_dense = True
+    config.fused_mlp = True
     config.fused_dropout_add_ln = True
     config.dense_seq_output = True
     config.last_layer_subset = last_layer_subset

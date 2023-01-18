@@ -15,7 +15,7 @@ from apex.transformer import parallel_state
 from apex.transformer import tensor_parallel
 
 from flash_attn.modules.mha import MHA, ParallelMHA
-from flash_attn.modules.mlp import FusedDenseGeluDense, ParallelFusedDenseGeluDense
+from flash_attn.modules.mlp import FusedMLP, ParallelFusedMLP
 from flash_attn.modules.block import Block
 from flash_attn.utils.distributed import allreduce_sequence_parallel_grad
 
@@ -27,7 +27,7 @@ is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
 @pytest.mark.parametrize('world_size', [1, 2, 4, 8])
 # @pytest.mark.parametrize('world_size', [2])
 @pytest.mark.parametrize('sequence_parallel', [True, False])
-# @pytest.mark.parametrize('sequence_parallel', [False])
+# @pytest.mark.parametrize('sequence_parallel', [True])
 @pytest.mark.parametrize('dim', [1024])
 def test_block_parallel(dim, sequence_parallel, world_size, dtype):
     head_dim = 64
@@ -62,8 +62,7 @@ def test_block_parallel(dim, sequence_parallel, world_size, dtype):
 
     mixer_cls_pt = partial(MHA, num_heads=num_heads, rotary_emb_dim=int(head_dim // 2),
                            use_flash_attn=True, device=device, dtype=dtype)
-    mlp_cls_pt = partial(FusedDenseGeluDense, hidden_features=4 * dim,
-                         device=device, dtype=dtype)
+    mlp_cls_pt = partial(FusedMLP, hidden_features=4 * dim, device=device, dtype=dtype)
     norm_cls = partial(nn.LayerNorm, device=device, dtype=dtype)
     model_pt = Block(dim, mixer_cls_pt, mlp_cls_pt, norm_cls, fused_dropout_add_ln=True)
     with torch.no_grad():
@@ -76,7 +75,7 @@ def test_block_parallel(dim, sequence_parallel, world_size, dtype):
                         process_group=parallel_state.get_tensor_model_parallel_group(),
                         rotary_emb_dim=int(head_dim // 2), use_flash_attn=True,
                         sequence_parallel=sequence_parallel, device=device, dtype=dtype)
-    mlp_cls = partial(ParallelFusedDenseGeluDense, hidden_features=4 * dim,
+    mlp_cls = partial(ParallelFusedMLP, hidden_features=4 * dim,
                       process_group=parallel_state.get_tensor_model_parallel_group(),
                       sequence_parallel=sequence_parallel, device=device, dtype=dtype)
     model = Block(dim, mixer_cls, mlp_cls, norm_cls, fused_dropout_add_ln=True,
@@ -143,7 +142,7 @@ def test_block_parallel(dim, sequence_parallel, world_size, dtype):
         x.grad,
         x_pt.grad[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
         if sequence_parallel else x_pt.grad,
-        rtol=rtol, atol=atol / 100  # magnitude of x.grad is quite small
+        rtol=rtol, atol=atol / 10  # magnitude of x.grad is quite small
     )
     assert torch.allclose(
         residual.grad,

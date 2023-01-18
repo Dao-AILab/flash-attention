@@ -1,6 +1,8 @@
 # Run test with:
 # torchrun --no_python --nproc_per_node=8 pytest -q -s tests/models/test_gpt_parallel.py
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -59,10 +61,12 @@ def test_gpt_parallel(dim, has_pos_emb, sequence_parallel, world_size, dtype):
                         n_positions=seqlen if has_pos_emb else 0,
                         vocab_size=50257, resid_pdrop=0.0, embd_pdrop=0.0, attn_pdrop=0.0,
                         scale_attn_by_inverse_layer_idx=True, use_flash_attn=True,
-                        fused_dense_gelu_dense=True, fused_bias_fc=True, fused_dropout_add_ln=True,
+                        fused_mlp=True, fused_bias_fc=True, fused_dropout_add_ln=True,
+                        residual_in_fp32=True,
                         rotary_emb_fraction=0.0 if has_pos_emb else 0.5,
                         pad_vocab_size_multiple=8 * world_size,
                         sequence_parallel=sequence_parallel)
+    config.vocab_size = math.ceil(config.vocab_size / (8 * world_size)) * (8 * world_size)
     model_pt = GPTLMHeadModel(config, device=device)
 
     def init_layer_norm(module):
@@ -131,9 +135,9 @@ def test_gpt_parallel(dim, has_pos_emb, sequence_parallel, world_size, dtype):
             grad_dict['transformer.embeddings.position_embeddings.weight'],
             rtol=rtol, atol=atol
         )
-    assert torch.allclose(model.transformer.ln_0.weight.grad, grad_dict['transformer.ln_0.weight'],
+    assert torch.allclose(model.transformer.ln_f.weight.grad, grad_dict['transformer.ln_f.weight'],
                           rtol=rtol, atol=atol)
-    assert torch.allclose(model.transformer.ln_0.bias.grad, grad_dict['transformer.ln_0.bias'],
+    assert torch.allclose(model.transformer.ln_f.bias.grad, grad_dict['transformer.ln_f.bias'],
                           rtol=rtol, atol=atol)
     for i in range(num_layers):
         assert torch.allclose(

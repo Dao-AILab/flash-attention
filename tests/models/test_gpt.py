@@ -82,7 +82,7 @@ def test_gpt2_optimized(model_name):
     vocab_size_og = config.vocab_size
     config.use_flash_attn = True
     config.fused_bias_fc = True
-    config.fused_dense_gelu_dense = True
+    config.fused_mlp = True
     config.fused_dropout_add_ln = True
     config.residual_in_fp32 = True
     config.pad_vocab_size_multiple = 8

@@ -10,8 +10,8 @@ import pytest
 from apex.transformer import parallel_state
 from apex.transformer import tensor_parallel
 
-from flash_attn.ops.fused_dense import FusedDense, FusedDenseGeluDense
-from flash_attn.ops.fused_dense import ColumnParallelLinear, ParallelFusedDenseGeluDense
+from flash_attn.ops.fused_dense import FusedDense, FusedMLP
+from flash_attn.ops.fused_dense import ColumnParallelLinear, ParallelFusedMLP
 
 is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
 
@@ -106,8 +106,7 @@ def test_fused_linear_bias(in_features, out_features, has_bias, sequence_paralle
 # @pytest.mark.parametrize('has_bias2', [True])
 @pytest.mark.parametrize('out_features', [4096])
 @pytest.mark.parametrize('in_features', [1024])
-def test_fused_dense_gelu_dense(in_features, out_features, has_bias2, sequence_parallel,
-                                world_size, dtype):
+def test_fused_mlp(in_features, out_features, has_bias2, sequence_parallel, world_size, dtype):
     assert out_features % world_size == 0
     rtol, atol = (3e-3, 3e-2) if dtype == torch.bfloat16 else (3e-3, 3e-3)
     if not torch.distributed.is_initialized():
@@ -137,11 +136,11 @@ def test_fused_dense_gelu_dense(in_features, out_features, has_bias2, sequence_p
                                    dtype=dtype)
     partition_out_features = out_features // world_size
     partition_in_features = in_features // world_size
-    model = ParallelFusedDenseGeluDense(in_features, out_features, in_features,
-                                        process_group=parallel_state.get_tensor_model_parallel_group(),
-                                        bias2=has_bias2 and rank == 0,
-                                        sequence_parallel=sequence_parallel,
-                                        device=device, dtype=dtype)
+    model = ParallelFusedMLP(in_features, out_features, in_features,
+                             process_group=parallel_state.get_tensor_model_parallel_group(),
+                             bias2=has_bias2 and rank == 0,
+                             sequence_parallel=sequence_parallel,
+                             device=device, dtype=dtype)
 
     with torch.no_grad():
         model.fc1.weight.copy_(

@@ -23,7 +23,7 @@ from transformers.models.bert.modeling_bert import BertForPreTrainingOutput
 from einops import rearrange
 
 from flash_attn.modules.mha import MHA
-from flash_attn.modules.mlp import Mlp, FusedDenseGeluDense
+from flash_attn.modules.mlp import Mlp, FusedMLP
 from flash_attn.modules.block import Block
 from flash_attn.modules.embedding import BertEmbeddings
 from flash_attn.bert_padding import unpad_input, pad_input
@@ -61,24 +61,24 @@ def create_mixer_cls(config, cross_attn=False, return_residual=False):
 
 def create_mlp_cls(config, layer_idx=None, return_residual=False):
     inner_dim = config.intermediate_size
-    fused_dense_gelu_dense = getattr(config, 'fused_dense_gelu_dense', False)
-    if fused_dense_gelu_dense:
-        assert config.hidden_act in ['gelu_new', 'gelu_fast'], ('fused_dense_gelu_dense only '
+    fused_mlp = getattr(config, 'fused_mlp', False)
+    if fused_mlp:
+        assert config.hidden_act in ['gelu_new', 'gelu_fast'], ('fused_mlp only '
                                                                 'supports approximate gelu')
-    if not fused_dense_gelu_dense:
+    if not fused_mlp:
         approximate = 'tanh' if config.hidden_act in ['gelu_new', 'gelu_fast'] else 'none'
         mlp_cls = partial(Mlp, hidden_features=inner_dim,
                           activation=partial(F.gelu, approximate=approximate),
                           return_residual=return_residual)
     else:
-        if FusedDenseGeluDense is None:
+        if FusedMLP is None:
             raise ImportError('fused_dense is not installed')
         mlp_checkpoint_lvl = getattr(config, 'mlp_checkpoint_lvl', 0)
         # mlp_checkpoint_lvl could be a list, which contains the checkpoint_lvl for each layer
         if isinstance(mlp_checkpoint_lvl, Sequence):
             assert layer_idx is not None
             mlp_checkpoint_lvl = mlp_checkpoint_lvl[layer_idx]
-        mlp_cls = partial(FusedDenseGeluDense, hidden_features=inner_dim,
+        mlp_cls = partial(FusedMLP, hidden_features=inner_dim,
                           checkpoint_lvl=mlp_checkpoint_lvl, return_residual=return_residual)
     return mlp_cls
 
