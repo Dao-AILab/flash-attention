@@ -1,8 +1,5 @@
 #include <ATen/ATen.h>
 #include <torch/extension.h>
-//#include <ATen/cuda/CUDAContext.h>
-//#include <ATen/core/Generator.h>
-//#include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/hip/HIPContext.h>
 #include <c10/hip/HIPGuard.h>
 #include "fmha.h"
@@ -43,19 +40,16 @@ void set_params_fprop(FMHA_fprop_params &params,
     params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
 
-    // S = softmax(P)
+    // S = softmax(P)     //TO DO
     // params.s_ptr = s_d;
     // params.s_stride_in_bytes = get_size_in_bytes(b * h * seqlen_k, data_type);
 
-    // Softmax sum
-    // params.softmax_lse_ptr = softmax_lse_d;
-
     // Set the dimensions.
-    params.b = b;
-    params.h = h;
-    params.seqlen_q = seqlen_q;
-    params.seqlen_k = seqlen_k;
-    params.d = d;
+    params.b = b;                 // batch_size
+    params.h = h;                 // num_heads
+    params.seqlen_q = seqlen_q;   // seqlen q
+    params.seqlen_k = seqlen_k;   // seqlen k
+    params.d = d;                 // head_dim
 
     params.host_seqlens_q = (int*)malloc((params.b+1)*sizeof(int));
     params.host_seqlens_k = (int*)malloc((params.b+1)*sizeof(int));
@@ -66,6 +60,7 @@ void set_params_fprop(FMHA_fprop_params &params,
     char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
     char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
     char* out_ptr = reinterpret_cast<char*>(out.data_ptr());
+    char* lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
 
     //std::cout << "multiply" << params.seqlen_q * params.h * params.d<< std::endl;
 
@@ -93,6 +88,12 @@ void set_params_fprop(FMHA_fprop_params &params,
         k_ptr = k_ptr     + temp_k_stride;
         v_ptr = v_ptr     + temp_k_stride;
         out_ptr = out_ptr + temp_q_stride;
+
+        std::cout << "h , seqlen_q , " << h << seqlen_q <<std::endl; 
+
+        params.softmax_lse_ptr.push_back(reinterpret_cast<void*>(lse_ptr));
+        int temp_lse_stride = get_size_in_bytes(h * seqlen_q, acc_type);
+        softmax_lse_d = lse_ptr + temp_lse_stride;
     }
 
     // Set the different scale values.
@@ -100,18 +101,9 @@ void set_params_fprop(FMHA_fprop_params &params,
     const float scale_bmm1 = softmax_scale;
 
     params.scale_bmm1f = scale_bmm1;
-    //set_alpha(params.scale_bmm1, scale_bmm1, data_type);
 
     // Set this to probability of keeping an element to simplify things.
-    params.p_dropout = 1.f - p_dropout;
-    // Convert p from float to int so we don't have to convert the random uint to float to compare.
-    // [Minor] We want to round down since when we do the comparison we use <= instead of <
-    params.p_dropout_in_uint = uint32_t(std::floor(params.p_dropout * 4294967295.0));
-    params.p_dropout_in_uint16_t = uint16_t(std::floor(params.p_dropout * 65535.0));
-    params.rp_dropout = 1.f / params.p_dropout;
-    params.scale_bmm1_rp_dropout = params.rp_dropout * params.scale_bmm1f;
-    //TORCH_CHECK(p_dropout < 1.f);
-    //set_alpha(params.scale_dropout, params.rp_dropout, data_type);
+    params.p_dropout = p_dropout;
 
     params.is_causal = is_causal;
     params.num_splits = num_splits;
@@ -231,8 +223,8 @@ mha_fwd(const at::Tensor &q,
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-    // int64_t counter_offset = launch_params.params.b * launch_params.params.h * 32;
-    int64_t counter_offset = 512;
+    int64_t counter_offset = launch_params.params.b * launch_params.params.h * 32;
+    // int64_t counter_offset = 512;
     // at::PhiloxCudaState rng_engine_inputs;
 
     if( is_dropout ) {
@@ -301,11 +293,11 @@ int main(){
     int max_seqlen_k_ = 256;
     
     //other parameters
-    float p_dropout = 0.1;           
+    float p_dropout = 0;           
     float softmax_scale = 0.125;  
-    bool zero_tensors = false;    
-    bool is_causal = false;       
-    bool return_softmax = false;  
+    bool zero_tensors = true;
+    bool is_causal = false;
+    bool return_softmax = false; // TO DO
     int num_splits = 0;        
 
     c10::optional<at::Generator> gen_;
@@ -340,6 +332,7 @@ int main(){
     using AccDataType      = F32;
     using CShuffleDataType = F32;
     using CDataType        = BF16;
+    using LSEDataType      = F32;
     using Acc0BiasDataType = ck::Tuple<>;
     using Acc1BiasDataType = ck::Tuple<>;
 
@@ -385,10 +378,10 @@ int main(){
         k_host = k_host.view({ batch_size, seqlen, nheads, d });
         v_host = v_host.view({ batch_size, seqlen, nheads, d });
 
-        const int M   = seqlen;   //seqlen Q
-        const int N   = seqlen;   //seqlen K
-        const int K   = d;        //head_dim
-        const int O   = d;        //head_dim
+        const int M   = seqlen;   // seqlen Q
+        const int N   = seqlen;   // seqlen K
+        const int K   = d;        // head_dim
+        const int O   = d;        // head_dim
         const int G0  = 1;        // G0 = batch_size
         const int G1  = nheads;   // num_heads
 
@@ -396,6 +389,7 @@ int main(){
         std::vector<Tensor<B0DataType>> b0_tensors;
         std::vector<Tensor<B1DataType>> b1_tensors;
         std::vector<Tensor<CDataType>>  c_tensors;
+        std::vector<Tensor<LSEDataType>> lse_tensors;
 
         auto a_element_op    = AElementOp{};
         auto b0_element_op   = B0ElementOp{};
@@ -417,12 +411,17 @@ int main(){
 
             std::vector<ck::index_t> c_gs_ms_os_lengths{G0, G1, M, O};
             std::vector<ck::index_t> c_gs_ms_os_strides ={M * G1 * O, O, G1 * O, 1};
-
+        
+            std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
+            std::vector<ck::index_t> lse_gs_ms_strides =
+                std::vector<ck::index_t>{G1 * M, M, 1}; // LSE layout [G0, G1, M]
+            
             // C_m_o = A_m_k * B0_k_n * B1_n_o
             Tensor<ADataType> a_gs_ms_ks(a_gs_ms_ks_lengths, a_gs_ms_ks_strides);
             Tensor<B0DataType> b0_gs_ns_ks(b0_gs_ns_ks_lengths, b0_gs_ns_ks_strides);
             Tensor<B1DataType> b1_gs_os_ns(b1_gs_os_ns_lengths, b1_gs_os_ns_strides);
             Tensor<CDataType> c_gs_ms_os_device_result(c_gs_ms_os_lengths, c_gs_ms_os_strides);
+            Tensor<LSEDataType> lse_gs_ms_device_result(lse_gs_ms_lengths, lse_gs_ms_strides);
 
             void* q_h_ptr_f = q_host[i].data_ptr();
             void* k_h_ptr_f = k_host[i].data_ptr();
@@ -447,10 +446,14 @@ int main(){
             b0_tensors.push_back(b0_gs_ns_ks);
             b1_tensors.push_back(b1_gs_os_ns);
             c_tensors.push_back(c_gs_ms_os_device_result);
+            lse_tensors.push_back(lse_gs_ms_device_result);
 
         }
 
         at::Tensor out_device_result = out.to(torch::kCPU).view({batch_size, seqlen, nheads, d});
+        at::Tensor lse_device_result = result[0].to(torch::kCPU);
+
+        std::cout<<"lse_device_result.shape() is " << lse_device_result.sizes() <<std::endl;
 
         for(std::size_t i = 0; i < batch_size; i++)
         {
@@ -458,6 +461,7 @@ int main(){
             const auto& b0_gs_ns_ks        = b0_tensors[i];
             const auto& b1_gs_os_ns        = b1_tensors[i];
             auto& c_gs_ms_os_device_result = c_tensors[i];
+            auto& lse_gs_ms_device_result = lse_tensors[i];
             //auto& c_gs_ms_os_device_buf    = *c_tensors_device[i];
 
             //at::Tensor out_device_result = out.to(torch::kCPU).view({batch_size, seqlen, nheads, d});
@@ -465,6 +469,11 @@ int main(){
             CDataType* out_host_ptr = reinterpret_cast<CDataType*>(out_host_ptr_f);
             std::vector<CDataType> result_vector(out_host_ptr, out_host_ptr + out_device_result[i].numel()); //transfer tensor into vector
             c_gs_ms_os_device_result.mData.assign(result_vector.begin(), result_vector.end());
+
+            void* lse_host_ptr_f = lse_device_result[i].data_ptr();
+            LSEDataType* lse_host_ptr = reinterpret_cast<LSEDataType*>(lse_host_ptr_f);
+            std::vector<LSEDataType> result_lse_vector(lse_host_ptr, lse_host_ptr + lse_device_result[i].numel()); //transfer tensor into vector
+            lse_gs_ms_device_result.mData.assign(result_lse_vector.begin(), result_lse_vector.end());
 
             //c_gs_ms_os_device_buf.FromDevice(c_gs_ms_os_device_result.mData.data());//
 
@@ -474,6 +483,8 @@ int main(){
             Tensor<AccDataType> acc0_g_m_n({G0 * G1, M, N});        // scratch object after gemm0
             Tensor<ADataType> a1_g_m_n({G0 * G1, M, N});            // scratch object after softmax
             Tensor<CDataType> c_g_m_o_host_result({G0 * G1, M, O}); // scratch object after gemm1
+            Tensor<LSEDataType> lse_g_m_host_result({G0 * G1, M}); // scratch object after gemm1
+
 
             std::vector<ck::index_t> c_gs_ms_os_lengths{G0, G1, M, O};
             std::vector<ck::index_t> c_gs_ms_os_strides{M * G1 * O, O, G1 * O, 1};
@@ -481,7 +492,11 @@ int main(){
             //        ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1} // C layout [G0, M, G1, O]
             //        : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // C layout [G0, G1, M, O]
 
+            std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
+            std::vector<ck::index_t> lse_gs_ms_strides{M * G1, M, 1};
+
             Tensor<CDataType> c_gs_ms_os_host_result(c_gs_ms_os_lengths, c_gs_ms_os_strides);
+            Tensor<LSEDataType> lse_gs_ms_host_result(lse_gs_ms_lengths, lse_gs_ms_strides);
 
             // permute
             a_gs_ms_ks.ForEach([&](auto& self, auto idx) {
@@ -512,7 +527,7 @@ int main(){
             // softmax
             auto ref_softmax          = ReferenceSoftmaxInstance{};
             auto ref_softmax_invoker  = ref_softmax.MakeInvoker();
-            auto ref_softmax_argument = ref_softmax.MakeArgument(acc0_g_m_n, a1_g_m_n, 1, 0, {2});
+            auto ref_softmax_argument = ref_softmax.MakeArgument(acc0_g_m_n, a1_g_m_n, 1, 0, {2}, &lse_g_m_host_result);
 
             ref_softmax_invoker.Run(ref_softmax_argument);
 
@@ -538,13 +553,29 @@ int main(){
                 self(idx) = c_g_m_o_host_result(g, idx[2], idx[3]);
             });
 
+            lse_gs_ms_host_result.ForEach([&](auto& self, auto idx) {
+                const size_t& g0 = idx[0];
+                const size_t& g1 = idx[1];
+
+                const size_t g = g0 * G1 + g1;
+
+                self(idx) = lse_g_m_host_result(g, idx[2]);
+            });
+
             double rtol = 1e-2;
             double atol = 1e-2;
 
             bool pass_ =
-                ck::utils::check_err(c_gs_ms_os_device_result.mData, c_gs_ms_os_host_result.mData, "Error: Incorrect results!",
-                                    rtol,
-                                    atol);
+                ck::utils::check_err(c_gs_ms_os_device_result.mData, 
+                                     c_gs_ms_os_host_result.mData, 
+                                     "Error: Incorrect results!",
+                                     rtol,
+                                     atol) &&
+                ck::utils::check_err(lse_gs_ms_device_result.mData,
+                                     lse_gs_ms_host_result.mData,
+                                     "Error: Incorrect results lse!",
+                                     rtol,
+                                     atol);
             pass &= pass_;
 
             //for (int j = 0; j < 4 ; j++){

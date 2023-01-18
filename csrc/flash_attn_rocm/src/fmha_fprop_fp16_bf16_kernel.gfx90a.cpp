@@ -6,8 +6,6 @@
 #include <initializer_list>
 #include <cstdlib>
 
-//#include <ATen/cuda/detail/UnpackRaw.cuh>
-
 template <ck::index_t... Is>
 using S = ck::Sequence<Is...>;
 using MaskingSpecialization = ck::tensor_operation::device::MaskingSpecialization;
@@ -57,6 +55,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     using AccDataType      = F32;
     using CShuffleDataType = F32;
     using CDataType        = InputType;
+    using LSEDataType      = F32;
     using Acc0BiasDataType = ck::Tuple<>;
     using Acc1BiasDataType = ck::Tuple<>;
 
@@ -73,8 +72,6 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     using CElementOp    = PassThrough;
 
     static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::MNKOPadding;
-    //static constexpr auto MaskingSpec =
-    //    ck::tensor_operation::device::MaskingSpecialization::MaskDisabled;
 
     static constexpr auto TensorSpecA  = ck::tensor_operation::device::TensorSpecialization::Default;
     static constexpr auto TensorSpecB0 = ck::tensor_operation::device::TensorSpecialization::Default;
@@ -83,7 +80,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     
     //init the instance with parameters
     using DeviceGemmInstance =
-        ck::tensor_operation::device::DeviceGroupedGemmSoftmaxGemmPermute_Xdl_CShuffle<
+        ck::tensor_operation::device::DeviceGroupedGemmSoftmaxGemmPermute_Train_Xdl_CShuffle<
             NumDimG,
             NumDimM,
             NumDimN,
@@ -93,6 +90,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
             B0DataType,
             B1DataType,
             CDataType,
+            LSEDataType,
             Acc0BiasDataType,
             Acc1BiasDataType,
             AccDataType,
@@ -166,12 +164,15 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     auto p_b0 = launch_params.params.k_ptr;
     auto p_b1 = launch_params.params.v_ptr;
     auto p_c = launch_params.params.o_ptr;
+    auto p_lse = launch_params.params.softmax_lse_ptr;
 
     std::vector<typename DeviceGemmInstance::ProblemDesc> problem_descs;
 
     int batch_size = launch_params.params.b;
     int num_heads = launch_params.params.h;
     int head_dim = launch_params.params.d;
+
+    float dropout_ratio = launch_params.params.p_dropout;
 
     auto seeds = unpack(launch_params.params.philox_args);
 
@@ -208,6 +209,10 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
                 ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1} // C layout [G0, M, G1, O]
                 : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // C layout [G0, G1, M, O]
 
+        std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
+        std::vector<ck::index_t> lse_gs_ms_strides =
+            std::vector<ck::index_t>{G1 * M, M, 1}; // LSE layout [G0, G1, M]
+
         problem_descs.push_back({a_gs_ms_ks_lengths,
                                  a_gs_ms_ks_strides,
                                  b0_gs_ns_ks_lengths,
@@ -216,6 +221,8 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
                                  b1_gs_os_ns_strides,
                                  c_gs_ms_os_lengths,
                                  c_gs_ms_os_strides,
+                                 lse_gs_ms_lengths,
+                                 lse_gs_ms_strides,
                                  {},   // acc0_biases_gs_ms_ns_lengths
                                  {},   // acc0_biases_gs_ms_ns_strides
                                  {},   // acc1_biases_gs_ms_os_lengths
@@ -230,6 +237,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
                                       p_b0,
                                       p_b1,
                                       p_c,
+                                      p_lse,
                                       {},
                                       {},
                                       problem_descs,
@@ -237,7 +245,9 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
                                       b0_element_op,
                                       acc0_element_op,
                                       b1_element_op,
-                                      c_element_op);
+                                      c_element_op,
+                                      dropout_ratio,
+                                      seeds);
 
     // specify workspace for problem_desc
     SimpleDeviceMem problem_desc_workspace(gemm.GetWorkSpaceSize(&argument));
