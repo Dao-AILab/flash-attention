@@ -35,6 +35,7 @@ def test_opt_optimized(model_name):
     config = opt_config_to_gpt2_config(OPTConfig.from_pretrained(model_name))
     config.use_flash_attn = True
     config.fused_bias_fc = True
+    config.fused_mlp = True
     config.fused_dropout_add_ln = True
     # Only prenorm supports residual_in_fp32
     config.residual_in_fp32 = getattr(config, 'prenorm', True)
