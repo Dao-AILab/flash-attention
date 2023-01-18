@@ -89,11 +89,14 @@ void set_params_fprop(FMHA_fprop_params &params,
         v_ptr = v_ptr     + temp_k_stride;
         out_ptr = out_ptr + temp_q_stride;
 
-        std::cout << "h , seqlen_q , " << h << seqlen_q <<std::endl; 
+        //std::cout << "h , seqlen_q , " << h << " , " << seqlen_q <<std::endl; 
 
         params.softmax_lse_ptr.push_back(reinterpret_cast<void*>(lse_ptr));
         int temp_lse_stride = get_size_in_bytes(h * seqlen_q, acc_type);
-        softmax_lse_d = lse_ptr + temp_lse_stride;
+        
+        //std::cout << "temp_lse_stride" << temp_lse_stride <<std::endl; 
+        
+        lse_ptr = lse_ptr + temp_lse_stride;
     }
 
     // Set the different scale values.
@@ -188,7 +191,7 @@ mha_fwd(const at::Tensor &q,
 
     auto opts = q.options();
 
-    auto softmax_lse = at::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+    auto softmax_lse_host = at::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
     // auto softmax_lse = torch::full({batch_size, num_heads, max_seqlen_k}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
 
     at::Tensor s;
@@ -196,9 +199,11 @@ mha_fwd(const at::Tensor &q,
 
     if( zero_tensors ) {
         out.zero_();
-        softmax_lse.fill_(-std::numeric_limits<float>::infinity());
+        softmax_lse_host.fill_(-std::numeric_limits<float>::infinity());
         if (return_softmax) {s.zero_();}
     }
+
+    at::Tensor softmax_lse = softmax_lse_host.to(at::kCUDA);
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
@@ -235,7 +240,11 @@ mha_fwd(const at::Tensor &q,
 
     run_fmha_fp16_bf16_gfx90a(launch_params);
 
-    std::vector<at::Tensor> result = {softmax_lse};
+
+
+    at::Tensor softmax_lse_result = softmax_lse.to(torch::kCPU);
+
+    std::vector<at::Tensor> result = {softmax_lse_result};
     if (return_softmax) {result.push_back(s);}
     return result;
 }
@@ -451,7 +460,7 @@ int main(){
         }
 
         at::Tensor out_device_result = out.to(torch::kCPU).view({batch_size, seqlen, nheads, d});
-        at::Tensor lse_device_result = result[0].to(torch::kCPU);
+        at::Tensor lse_device_result = result[0];
 
         std::cout<<"lse_device_result.shape() is " << lse_device_result.sizes() <<std::endl;
 
