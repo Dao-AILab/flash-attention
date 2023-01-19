@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <iostream>
+#include <ATen/cuda/CUDAGeneratorImpl.h>
 
 #include "fmha_utils.h"
 
@@ -60,7 +61,8 @@ struct FMHA_fprop_params : public Qkv_params {
     uint32_t s_stride_in_bytes;
 
     // The pointer to the softmax sum.
-    void * __restrict__ softmax_lse_ptr;
+    // void * __restrict__ softmax_lse_ptr;
+    std::vector<void*> softmax_lse_ptr;
 
     // The dimensions.
     int b, seqlen_q, seqlen_k, d;
@@ -88,7 +90,7 @@ struct FMHA_fprop_params : public Qkv_params {
     uint32_t scale_dropout;
 
     // Random state.
-    // at::PhiloxCudaState philox_args;
+    at::PhiloxCudaState philox_args;
 
     bool is_bf16;
     bool is_causal;
