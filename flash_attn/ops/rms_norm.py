@@ -12,26 +12,27 @@ def rms_norm(x, weight, epsilon):
                                        False, True)
 
 
-def dropout_add_rms_norm(x0, x1, weight, bias, dropout_p, epsilon, rowscale=None, layerscale=None,
-                         prenorm=False, residual_in_fp32=False, return_dropout_mask=False):
-    """residual_in_fp32 only has an effect if x1 is None.
-    Otherwise residual dtype is x1.dtype.
+def dropout_add_rms_norm(x0, residual, weight, bias, dropout_p, epsilon, rowscale=None,
+                         layerscale=None, prenorm=False, residual_in_fp32=False,
+                         return_dropout_mask=False):
+    """residual_in_fp32 only has an effect if residual is None.
+    Otherwise residual dtype is residual.dtype.
     """
     return DropoutAddLayerNormFn.apply(
-        x0, x1, weight, bias, rowscale, layerscale, dropout_p, epsilon, residual_in_fp32, prenorm,
+        x0, residual, weight, bias, rowscale, layerscale, dropout_p, epsilon, residual_in_fp32, prenorm,
         True, return_dropout_mask
     )
 
 
-def dropout_add_rms_norm_subset(x0, x1, weight, bias, dropout_p, epsilon, layerscale=None,
+def dropout_add_rms_norm_subset(x0, residual, weight, bias, dropout_p, epsilon, layerscale=None,
                                   x0_subset=None, out_subset=None, rowscale_const=1.0,
                                   out_numrows=0, prenorm=False, residual_in_fp32=False,
                                   return_dropout_mask=False):
-    """residual_in_fp32 only has an effect if x1 is None.
-    Otherwise residual dtype is x1.dtype.
+    """residual_in_fp32 only has an effect if residual is None.
+    Otherwise residual dtype is residual.dtype.
     """
     return DropoutAddLayerNormSubsetFn.apply(
-        x0, x1, weight, bias, layerscale, x0_subset, out_subset, dropout_p, epsilon,
+        x0, residual, weight, bias, layerscale, x0_subset, out_subset, dropout_p, epsilon,
         rowscale_const, out_numrows, residual_in_fp32, prenorm, True, return_dropout_mask
     )
 
@@ -52,7 +53,7 @@ class DropoutAddRMSNorm(torch.nn.Module):
     def reset_parameters(self):
         init.ones_(self.weight)
 
-    def forward(self, x0, x1=None):
-        return dropout_add_rms_norm(x0, x1, self.weight, None,
+    def forward(self, x0, residual=None):
+        return dropout_add_rms_norm(x0, residual, self.weight, None,
                                     self.p if self.training else 0.0, self.epsilon,
                                     prenorm=self.prenorm, residual_in_fp32=self.residual_in_fp32)

@@ -59,7 +59,7 @@ struct ParamsBase {
 
     // Common data pointers.
     void *x0;
-    void *x1;
+    void *residual;
     void *x;
     void *dmask;
     void *mu;
@@ -117,7 +117,7 @@ struct BwdParams : public ParamsBase {
         , dgamma_part(nullptr)
         , dcolscale_part(nullptr)
         , dx0(nullptr)
-        , dx1(nullptr)
+        , dresidual(nullptr)
         , dbeta(nullptr)
         , dgamma(nullptr)
         , dcolscale(nullptr)
@@ -136,7 +136,7 @@ struct BwdParams : public ParamsBase {
 
     // Output: Dgrad.
     void *dx0;
-    void *dx1;
+    void *dresidual;
     // Output: Wgrad.
     void *dbeta;
     void *dgamma;

@@ -37,7 +37,7 @@ void ln_bwd_kernel(layer_norm::BwdParams params) {
 
     extern __shared__ char smem_[];
 
-    const bool has_residual = params.dx1 != nullptr;
+    const bool has_residual = params.dresidual != nullptr;
     const bool prenorm = params.dx != nullptr;
 
     const index_t tidx = threadIdx.x;
@@ -164,7 +164,7 @@ void ln_bwd_kernel(layer_norm::BwdParams params) {
         for( int it = 0; it < LDGS; it++ ) {
             if (Is_even_cols || (it < num_valid_ldgs)) {
                 Ivec dx0;
-                Rvec dx1;
+                Rvec dresidual;
                 Ivec x0;
                 if (Has_colscale && save_dx0) { x0.load_from(params.x0, !Has_subset ? idx_x : idx_x0); }
                 #pragma unroll
@@ -178,7 +178,7 @@ void ln_bwd_kernel(layer_norm::BwdParams params) {
                     } else {
                         dx_tmp_res = prenorm ? compute_t(dx[it].data.elt[jt]) : 0.f;
                     }
-                    if (has_residual) { dx1.data.elt[jt] = dx_tmp_res; }
+                    if (has_residual) { dresidual.data.elt[jt] = dx_tmp_res; }
                     if (save_dx0) {
                         compute_t dx0_tmp_res = dx_tmp_res * rowscale_val;
                         if (Is_dropout) {
@@ -199,7 +199,7 @@ void ln_bwd_kernel(layer_norm::BwdParams params) {
                         }
                     }
                 }
-                if (has_residual) { dx1.store_to(params.dx1, idx_x); }
+                if (has_residual) { dresidual.store_to(params.dresidual, idx_x); }
                 if (save_dx0) { dx0.store_to(params.dx0, !Has_subset ? idx_x : idx_x0); }
                 idx_x += Ktraits::VEC_COLS_PER_LDG;
                 idx_x0 += Ktraits::VEC_COLS_PER_LDG;

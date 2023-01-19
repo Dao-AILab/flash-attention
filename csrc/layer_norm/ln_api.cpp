@@ -81,7 +81,7 @@ layer_norm::BwdFunction & get_bwd_launcher(torch::Dtype wtype, torch::Dtype ityp
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: BxSxhidden_size
-                                           c10::optional<const at::Tensor> &x1_,      // Residual: BxSxhidden_size
+                                           c10::optional<const at::Tensor> &residual_,  // Residual: BxSxhidden_size
                                            const at::Tensor &gamma,   // hidden_size
                                            c10::optional<const at::Tensor> &beta_,   // hidden_size
                                            c10::optional<const at::Tensor> &rowscale_,      // BxS
@@ -97,8 +97,8 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
                                            bool is_rms_norm=false
 ) {
     auto itype = x0.scalar_type();
-    auto rtype = x1_.has_value()
-        ? x1_.value().scalar_type()
+    auto rtype = residual_.has_value()
+        ? residual_.value().scalar_type()
         : (residual_in_fp32 ? torch::kFloat32 : x0.scalar_type());
     auto wtype = gamma.scalar_type();
     auto otype = itype;
@@ -129,11 +129,11 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
         TORCH_CHECK(gamma.sizes() == beta.sizes());
     }
 
-    if (x1_.has_value()) {
-        auto x1 = x1_.value();
-        TORCH_CHECK(x1.is_cuda())
-        TORCH_CHECK(x1.is_contiguous());
-        TORCH_CHECK(x1.sizes() == sizes);
+    if (residual_.has_value()) {
+        auto residual = residual_.value();
+        TORCH_CHECK(residual.is_cuda())
+        TORCH_CHECK(residual.is_contiguous());
+        TORCH_CHECK(residual.sizes() == sizes);
     }
 
     if (rowscale_.has_value()) {
@@ -178,7 +178,7 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
 
     auto opts = x0.options();
 
-    bool save_x = x1_.has_value() || (dropout_p > 0.f) || rowscale_.has_value() || colscale_.has_value() || x0_subset_.has_value() || (itype != rtype);
+    bool save_x = residual_.has_value() || (dropout_p > 0.f) || rowscale_.has_value() || colscale_.has_value() || x0_subset_.has_value() || (itype != rtype);
     at::Tensor x;
     if (save_x) { x = torch::empty(sizes, opts.dtype(rtype)); }
     at::Tensor dmask;
@@ -194,7 +194,7 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
     launch_params.stream = at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK(dropout_p < 1.f);
     launch_params.params.dropout_keep_p = 1.f - dropout_p;
-    launch_params.params.x1 = x1_.has_value() ? x1_.value().data_ptr() : nullptr;
+    launch_params.params.residual = residual_.has_value() ? residual_.value().data_ptr() : nullptr;
     launch_params.params.rowscale = rowscale_.has_value() ? rowscale_.value().data_ptr() : nullptr;
     launch_params.params.colscale = colscale_.has_value() ? colscale_.value().data_ptr() : nullptr;
     launch_params.params.x0_subset = x0_subset_.has_value() ? x0_subset_.value().data_ptr() : nullptr;
@@ -383,8 +383,8 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
     auto opts = x.options();
 
     auto dx0 = torch::empty(x0_sizes, opts.dtype(itype));
-    at::Tensor dx1;
-    if (has_residual) { dx1 = torch::empty_like(x, opts.dtype(rtype)); }
+    at::Tensor dresidual;
+    if (has_residual) { dresidual = torch::empty_like(x, opts.dtype(rtype)); }
     auto dgamma = torch::empty_like(gamma);
     auto dbeta = torch::empty_like(gamma);
     at::Tensor dcolscale;
@@ -397,7 +397,7 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
     launch_params.props = at::cuda::getCurrentDeviceProperties();
     TORCH_CHECK(dropout_p < 1.f);
     launch_params.params.dropout_keep_p = 1.f - dropout_p;
-    launch_params.params.dx1 = has_residual ? dx1.data_ptr() : nullptr;
+    launch_params.params.dresidual = has_residual ? dresidual.data_ptr() : nullptr;
     launch_params.params.rowscale = rowscale_.has_value() ? rowscale_.value().data_ptr() : nullptr;
     launch_params.params.colscale = colscale_.has_value() ? colscale_.value().data_ptr() : nullptr;
     launch_params.params.x0_subset = x0_subset_.has_value() ? x0_subset_.value().data_ptr() : nullptr;
@@ -450,7 +450,7 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
 
     launcher(launch_params, false);
 
-    std::vector<at::Tensor> result = { dx0, dx1, dgamma, dbeta, dgamma_part, dbeta_part };
+    std::vector<at::Tensor> result = { dx0, dresidual, dgamma, dbeta, dgamma_part, dbeta_part };
     if (colscale_.has_value()) {
         result.push_back(dcolscale);
         result.push_back(dcolscale_part);
@@ -462,7 +462,7 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "CUDA DropoutAddLayerNorm";
   m.def("dropout_add_ln_fwd", &dropout_add_ln_fwd, "Run Dropout + Add + LayerNorm forward kernel",
-        py::arg("x0"), py::arg("x1"), py::arg("gamma"), py::arg("beta"),
+        py::arg("x0"), py::arg("residual"), py::arg("gamma"), py::arg("beta"),
         py::arg("rowscale_"), py::arg("colscale_"), py::arg("x0_subset_"), py::arg("z_subset_"),
         py::arg("dropout_p"), py::arg("epsilon"), py::arg("rowscale_const"), py::arg("z_numrows"),
         py::arg("gen_"), py::arg("residual_in_fp32")=false, py::arg("is_rms_norm")=false);

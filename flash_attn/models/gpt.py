@@ -292,7 +292,7 @@ class GPTModel(GPTPreTrainedModel):
                 residual = (dropped + residual) if residual is not None else dropped
                 hidden_states = self.ln_f(residual.to(dtype=self.ln_f.weight.dtype))
             else:
-                # Set prenorm=False here since we don't need to the residual
+                # Set prenorm=False here since we don't need the residual
                 hidden_states = dropout_add_layer_norm(
                     hidden_states, residual, self.ln_f.weight, self.ln_f.bias,
                     self.drop_f.p if self.training else 0.0, self.ln_f.eps, prenorm=False,
@@ -359,7 +359,7 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         # Previous: Attn / MLP -> Dropout -> Add -> LN
         # Current: Dropout -> Add -> LN -> Attn / MLP
         if 'transformer.ln_0.weight' in state_dict:
-            n_layers = self.config.num_hidden_layers
+            n_layers = len(self.transformer.layers)
             ln_weight = state_dict.pop(f'transformer.layers.{n_layers - 1}.norm2.weight')
             ln_bias = state_dict.pop(f'transformer.layers.{n_layers - 1}.norm2.bias')
             state_dict['transformer.ln_f.weight'] = ln_weight

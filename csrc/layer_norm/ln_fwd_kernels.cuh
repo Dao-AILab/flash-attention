@@ -46,7 +46,7 @@ void ln_fwd_kernel(FwdParams params) {
     using Stats = typename Ktraits::Stats;
     using stats_t = typename Stats::stats_t;
 
-    const bool has_residual = params.x1 != nullptr;
+    const bool has_residual = params.residual != nullptr;
     const bool save_x = has_residual || Is_dropout || Has_colscale || (params.rowscale != nullptr) || Has_subset || !(std::is_same<input_t, residual_t>::value);
 
     extern __shared__ char smem_[];
@@ -111,11 +111,11 @@ void ln_fwd_kernel(FwdParams params) {
         for( int it = 0; it < LDGS; it++ ) {
             if (Is_even_cols || (it < num_valid_ldgs)) {
                 Ivec x0;
-                Rvec x1;
+                Rvec residual;
                 Rvec x;
                 Mvec dmask;
                 if (load_x0) { x0.load_from(params.x0, !Has_subset ? idx_x : idx_x0); }
-                if (has_residual) { x1.load_from(params.x1, idx_x); }
+                if (has_residual) { residual.load_from(params.residual, idx_x); }
                 #pragma unroll
                 for( int jt = 0; jt < NUM_ELTS; jt++ ) {
                     // TD [2022-04-22]: We're memory bound, not compute bound, so we don't need to use
@@ -127,9 +127,9 @@ void ln_fwd_kernel(FwdParams params) {
                         compute_t x0_ij = compute_t(x0.data.elt[jt]) * rowscale_val;
                         x0_ij = keep ? (Is_dropout ? x0_ij * params.dropout_scale : x0_ij) : 0.0f;
                         if (Has_colscale) { x0_ij *= compute_t(colscale[it].data.elt[jt]); }
-                        x_ij = has_residual ? x0_ij + compute_t(x1.data.elt[jt]) : x0_ij;
+                        x_ij = has_residual ? x0_ij + compute_t(residual.data.elt[jt]) : x0_ij;
                     } else {
-                        x_ij = has_residual ? compute_t(x1.data.elt[jt]) : 0.f;
+                        x_ij = has_residual ? compute_t(residual.data.elt[jt]) : 0.f;
                     }
                     if (save_x) { x.data.elt[jt] = x_ij; }
                     xf[it * NUM_ELTS + jt] = x_ij;
