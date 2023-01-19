@@ -89,13 +89,8 @@ void set_params_fprop(FMHA_fprop_params &params,
         v_ptr = v_ptr     + temp_k_stride;
         out_ptr = out_ptr + temp_q_stride;
 
-        //std::cout << "h , seqlen_q , " << h << " , " << seqlen_q <<std::endl; 
-
         params.softmax_lse_ptr.push_back(reinterpret_cast<void*>(lse_ptr));
-        int temp_lse_stride = get_size_in_bytes(h * seqlen_q, acc_type);
-        
-        //std::cout << "temp_lse_stride" << temp_lse_stride <<std::endl; 
-        
+        int temp_lse_stride = get_size_in_bytes(h * seqlen_q, acc_type);        
         lse_ptr = lse_ptr + temp_lse_stride;
     }
 
@@ -125,8 +120,8 @@ mha_fwd(const at::Tensor &q,
         const float softmax_scale,
         const bool zero_tensors,
         const bool is_causal,
-        const bool return_softmax,
-        const int num_splits,   // num_splits is not used in rocm
+        const bool return_softmax, // TO DO
+        const int num_splits,      // num_splits is not used in rocm
         c10::optional<at::Generator> gen_) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -183,15 +178,15 @@ mha_fwd(const at::Tensor &q,
         max_seqlen_k = 256;
     }
     int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
-    bool loop = false;
+    // bool loop = false;
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    // at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    // at::cuda::CUDAGuard device_guard{(char)q.get_device()}; 
 
     auto opts = q.options();
 
-    auto softmax_lse_host = at::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+    auto softmax_lse = at::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
     // auto softmax_lse = torch::full({batch_size, num_heads, max_seqlen_k}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
 
     at::Tensor s;
@@ -199,11 +194,9 @@ mha_fwd(const at::Tensor &q,
 
     if( zero_tensors ) {
         out.zero_();
-        softmax_lse_host.fill_(-std::numeric_limits<float>::infinity());
+        softmax_lse.fill_(-std::numeric_limits<float>::infinity()).to(at::kCUDA);
         if (return_softmax) {s.zero_();}
     }
-
-    at::Tensor softmax_lse = softmax_lse_host.to(at::kCUDA);
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
@@ -229,7 +222,7 @@ mha_fwd(const at::Tensor &q,
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = launch_params.params.b * launch_params.params.h * 32;
-    // int64_t counter_offset = 512;
+
     // at::PhiloxCudaState rng_engine_inputs;
 
     if( is_dropout ) {
@@ -240,11 +233,9 @@ mha_fwd(const at::Tensor &q,
 
     run_fmha_fp16_bf16_gfx90a(launch_params);
 
+    //at::Tensor softmax_lse_result = softmax_lse.to(torch::kCPU);
 
-
-    at::Tensor softmax_lse_result = softmax_lse.to(torch::kCPU);
-
-    std::vector<at::Tensor> result = {softmax_lse_result};
+    std::vector<at::Tensor> result = {softmax_lse};
     if (return_softmax) {result.push_back(s);}
     return result;
 }
@@ -303,7 +294,7 @@ int main(){
     
     //other parameters
     float p_dropout = 0;           
-    float softmax_scale = 0.125;  
+    float softmax_scale = 0.125;
     bool zero_tensors = true;
     bool is_causal = false;
     bool return_softmax = false; // TO DO
@@ -460,9 +451,7 @@ int main(){
         }
 
         at::Tensor out_device_result = out.to(torch::kCPU).view({batch_size, seqlen, nheads, d});
-        at::Tensor lse_device_result = result[0];
-
-        std::cout<<"lse_device_result.shape() is " << lse_device_result.sizes() <<std::endl;
+        at::Tensor lse_device_result = result[0].to(torch::kCPU);
 
         for(std::size_t i = 0; i < batch_size; i++)
         {
@@ -497,10 +486,6 @@ int main(){
 
             std::vector<ck::index_t> c_gs_ms_os_lengths{G0, G1, M, O};
             std::vector<ck::index_t> c_gs_ms_os_strides{M * G1 * O, O, G1 * O, 1};
-            //    output_permute
-            //        ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1} // C layout [G0, M, G1, O]
-            //        : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // C layout [G0, G1, M, O]
-
             std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
             std::vector<ck::index_t> lse_gs_ms_strides{M * G1, M, 1};
 
@@ -593,6 +578,14 @@ int main(){
             //    << " , " 
             //    << ck::type_convert<float>(c_gs_ms_os_host_result.mData[j]) 
             //    <<std::endl;
+            //}
+
+            //for (int j = 0; j < 16 ; j++){
+            //    std::cout << "lse data at " << j << " is " 
+            //    << ck::type_convert<float>(lse_gs_ms_device_result.mData[j]) 
+            //    << " , " 
+            //    << ck::type_convert<float>(lse_gs_ms_host_result.mData[j]) 
+            //   <<std::endl;
             //}
 
         }
