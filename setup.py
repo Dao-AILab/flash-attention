@@ -138,8 +138,10 @@ cc_flag = []
 
 
 ck_sources = ["csrc/flash_attn_rocm/composable_kernel/library/src/utility/convolution_parameter.cpp", "csrc/flash_attn_rocm/composable_kernel/library/src/utility/device_memory.cpp", "csrc/flash_attn_rocm/composable_kernel/library/src/utility/host_tensor.cpp"]
+fmha_sources = ["csrc/flash_attn_rocm/fmha_api.cpp", "csrc/flash_attn_rocm/src/fmha_fprop_fp16_bf16_kernel.gfx90a.cpp"]
 
 rename_cpp_cu(ck_sources)
+rename_cpp_cu(fmha_sources)
 
 subprocess.run(["git", "submodule", "update", "--init", "csrc/flash_attn_rocm/composable_kernel"])
 ext_modules.append(
@@ -171,12 +173,14 @@ ext_modules.append(
             Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' ,
             Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' ,
             Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'tensor_operation' / 'gpu' / 'device',
+            Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'tensor_operation' / 'gpu' / 'device' / 'impl',
             Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'tensor_operation' / 'gpu' /' element',
             Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'library' / 'utility',
             Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'library' / 'include' / 'ck' / 'library' / 'utility',
             Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'library' / 'include',
             Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'utility' / 'library',
             Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'library' / 'reference_tensor_operation',
+            Path(this_dir) / 'csrc' / 'flash_attn_rocm' / 'composable_kernel' / 'include' / 'ck' / 'tensor_operation' / 'reference_tensor_operation',
         ],
     )
 )
