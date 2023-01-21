@@ -206,14 +206,14 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
-    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    bool is_gt_sm80 = dprops->major >= 8 && dprops->minor >= 0;
     // TORCH_CHECK(is_sm8x || is_sm75);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     bool is_dropout = p_dropout > 0.0;
     Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || (is_sm8x && q_dtype == torch::kBFloat16));
+    TORCH_CHECK(q_dtype == torch::kFloat16 || (is_gt_sm80 && q_dtype == torch::kBFloat16));
     TORCH_CHECK(k.dtype() == q_dtype);
     TORCH_CHECK(v.dtype() == q_dtype);
     TORCH_CHECK(out.dtype() == q_dtype);
@@ -358,7 +358,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
-    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    bool is_gt_sm80 = dprops->major >= 8 && dprops->minor >= 0;
     // TORCH_CHECK(is_sm8x || is_sm75);
     auto launch = &run_fmha_bwd;
 
@@ -366,7 +366,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || (is_sm8x && q_dtype == torch::kBFloat16));
+    TORCH_CHECK(q_dtype == torch::kFloat16 || (is_gt_sm80 && q_dtype == torch::kBFloat16));
     TORCH_CHECK(k.dtype() == q_dtype);
     TORCH_CHECK(v.dtype() == q_dtype);
     TORCH_CHECK(out.dtype() == q_dtype);
@@ -649,8 +649,8 @@ mha_bwd_block(const at::Tensor &dout,  // total x num_heads, x head_size
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
-    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
-    TORCH_CHECK(dprops->major == 8 && dprops->minor >= 0);
+    bool is_gt_sm80 = dprops->major >= 8 && dprops->minor >= 0;
+    TORCH_CHECK(is_gt_sm80);
     auto launch = &run_fmha_block_dgrad_fp16_sm80;
 
     bool is_dropout = p_dropout > 0.0;
