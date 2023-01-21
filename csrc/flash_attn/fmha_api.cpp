@@ -207,7 +207,7 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
     bool is_gt_sm80 = dprops->major >= 8 && dprops->minor >= 0;
-    // TORCH_CHECK(is_sm8x || is_sm75);
+    TORCH_CHECK(is_gt_sm80 || is_sm75);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     bool is_dropout = p_dropout > 0.0;
     Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
@@ -359,7 +359,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
     bool is_gt_sm80 = dprops->major >= 8 && dprops->minor >= 0;
-    // TORCH_CHECK(is_sm8x || is_sm75);
+    TORCH_CHECK(is_gt_sm80 || is_sm75);
     auto launch = &run_fmha_bwd;
 
     bool is_dropout = p_dropout > 0.0;
