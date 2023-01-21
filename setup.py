@@ -112,6 +112,8 @@ cc_flag.append("-gencode")
 cc_flag.append("arch=compute_75,code=sm_75")
 cc_flag.append("-gencode")
 cc_flag.append("arch=compute_80,code=sm_80")
+cc_flag.append("-gencode")
+cc_flag.append("arch=compute_90,code=sm_90")
 
 subprocess.run(["git", "submodule", "update", "--init", "csrc/flash_attn/cutlass"])
 ext_modules.append(
