@@ -7,6 +7,8 @@ from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 
 
 def state_dict_from_pretrained(model_name, device=None, dtype=None):
+    # If not fp32, then we don't want to load directly to the GPU
+    mapped_device = 'cpu' if dtype not in [torch.float32, None] else device
     is_sharded = False
     resolved_archive_file = cached_file(model_name, WEIGHTS_NAME,
                                         _raise_exceptions_for_missing_entries=False)
@@ -25,9 +27,11 @@ def state_dict_from_pretrained(model_name, device=None, dtype=None):
         )
         state_dict = {}
         for sharded_file in resolved_archive_file:
-            state_dict.update(torch.load(sharded_file, map_location=device))
+            state_dict.update(torch.load(sharded_file, map_location=mapped_device))
     else:
         state_dict = torch.load(cached_file(model_name, WEIGHTS_NAME), map_location=device)
+    # Convert dtype before moving to GPU to save memory
     if dtype is not None:
-        state_dict = {k: v.to(dtype) for k, v in state_dict.items()}
+        state_dict = {k: v.to(dtype=dtype) for k, v in state_dict.items()}
+    state_dict = {k: v.to(device=device) for k, v in state_dict.items()}
     return state_dict

@@ -196,7 +196,7 @@ class DecodingCGCache:
 
 @torch.inference_mode()
 def update_graph_cache(model, cache, batch_size, seqlen_og, max_seqlen, tensor_parallel=1,
-                       dtype=None):
+                       dtype=None, n_warmups=2):
     if cache is None:
         cache = DecodingCGCache()
     param_example = next(iter(model.parameters()))
@@ -228,7 +228,8 @@ def update_graph_cache(model, cache, batch_size, seqlen_og, max_seqlen, tensor_p
         if s_type not in cache.callables:
             seqlen = min(max(seqlen_og, seqlen_type_to_seqlen(s_type)), max_seqlen)
             cache.callables[s_type] = capture_graph(
-                model, cache.inference_params, batch_size, seqlen_og, seqlen, mempool=cache.mempool
+                model, cache.inference_params, batch_size, seqlen_og, seqlen, mempool=cache.mempool,
+                n_warmups=n_warmups
             )
 
     def dispatch(input_ids, position_ids, seqlen):
@@ -239,7 +240,8 @@ def update_graph_cache(model, cache, batch_size, seqlen_og, max_seqlen, tensor_p
     return cache
 
 
-def capture_graph(model, inference_params, batch_size, seqlen_og, max_seqlen, mempool=None):
+def capture_graph(model, inference_params, batch_size, seqlen_og, max_seqlen, mempool=None,
+                  n_warmups=2):
     assert max_seqlen >= seqlen_og
     device = next(iter(model.parameters())).device
     input_ids = torch.full((batch_size, 1), 0, dtype=torch.long, device=device)
@@ -250,10 +252,15 @@ def capture_graph(model, inference_params, batch_size, seqlen_og, max_seqlen, me
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
-        for _ in range(2):
+        for _ in range(n_warmups):
             logits = model(input_ids, position_ids=position_ids,
                            inference_params=inference_params).logits[:, -1]
         s.synchronize()
+        # This might be needed for correctness if we run with NCCL_GRAPH_MIXING_SUPPORT=0,
+        # which requires that graph launch and non-captured launch to not overlap (I think,
+        # that's how I interpret the documentation). I'm not sure if this is required.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
     torch.cuda.current_stream().wait_stream(s)
     # Captures the graph
     # To allow capture, automatically sets a side stream as the current stream in the context

@@ -166,9 +166,10 @@ class GPTPreTrainedModel(nn.Module):
         """
         # Instantiate model.
         model = cls(config, *args, device=device, dtype=dtype, **kwargs)
-        # If we're going to shard the model, then don't load fp32 weights to GPU.
+        # Load state_dict in cpu because we already initialized the model in GPU, and we don't
+        # want extra stuff taking up more GPU memory
         state_dict = state_dict_from_pretrained(
-            model_name, device=device if world_size == 1 else None, dtype=dtype
+            model_name, device='cpu', dtype=dtype
         )
         if model_name.startswith('gpt2'):
             state_dict = remap_state_dict_gpt2(state_dict, config)
@@ -178,7 +179,6 @@ class GPTPreTrainedModel(nn.Module):
             raise NotImplementedError(f'Model {model_name} not supported')
         if world_size > 1:
             state_dict = shard_state_dict_tp(state_dict, config, world_size, rank)
-            state_dict = {k: v.to(device=device) for k, v in state_dict.items()}
         load_return = model.load_state_dict(state_dict, strict=strict)
         logger.info(load_return)
         return model

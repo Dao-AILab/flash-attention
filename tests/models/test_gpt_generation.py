@@ -114,7 +114,7 @@ def test_greedy_decode_gpt2(model_name, rotary, optimized, fused_ft_kernel):
 
 
 @pytest.mark.parametrize('model_name', ["facebook/opt-125m", "facebook/opt-350m", "facebook/opt-1.3b", "facebook/opt-2.7b", "facebook/opt-6.7b"])
-# @pytest.mark.parametrize('model_name', ["facebook/opt-6.7b"])
+# @pytest.mark.parametrize('model_name', ["facebook/opt-125m"])
 def test_greedy_decode_opt(model_name):
     """Check that our implementation of OPT generation matches the HF implementation:
     the scores in fp16 should be around the same as the HF scores in fp16, when compared to
@@ -145,7 +145,7 @@ def test_greedy_decode_opt(model_name):
 
     input_ids = tokenizer("Hello, my dog is cute and",
                           return_tensors="pt").input_ids.to(device=device)
-    max_length = 30
+    max_length = 60
     # input_ids = torch.randint(0, 100, (2, 10), dtype=torch.long, device='cuda')
     # max_length = input_ids.shape[1] + 40
 
@@ -192,7 +192,7 @@ def test_greedy_decode_opt(model_name):
         print(f'Prompt processing + decoding time: {(time.time() - start) * 1000:.0f}ms')
         if verbose:
             print(out_cg.sequences)
-        print(tokenizer.batch_decode(out.sequences.tolist()))
+        print(tokenizer.batch_decode(out_cg.sequences.tolist()))
 
     del model
 

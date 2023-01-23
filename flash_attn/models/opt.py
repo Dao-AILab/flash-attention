@@ -43,6 +43,8 @@ def remap_state_dict_opt(state_dict, config):
     # LayerNorm
     def key_mapping_ln(key):
         key = re.sub(r'^transformer.final_layer_norm.', r'transformer.ln_f.', key)
+        # The OPT-175B checkpoint calls this 'decoder.layer_norm' instead of 'decoder.final_layer_norm'
+        key = re.sub(r'^transformer.layer_norm.', r'transformer.ln_f.', key)
         key = re.sub(r'^transformer.layers.(\d+).self_attn_layer_norm.',
                      r'transformer.layers.\1.norm1.', key)
         key = re.sub(r'^transformer.layers.(\d+).final_layer_norm.',
