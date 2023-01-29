@@ -6,6 +6,8 @@
 #include <iostream>
 #include <numeric>
 
+#define FLASH_ATTN_IMPLENTATION 0
+
 template <ck::index_t... Is> using S = ck::Sequence<Is...>;
 using MaskingSpecialization =
     ck::tensor_operation::device::MaskingSpecialization;
@@ -70,8 +72,9 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
       ck::tensor_operation::device::TensorSpecialization::Default;
 
   // init the instance with parameters
-  using DeviceGemmInstance = ck::tensor_operation::device::
-      DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle<
+  #if FLASH_ATTN_IMPLENTATION
+  using DeviceGemmInstance = 
+      ck::tensor_operation::device::DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle<
           NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, DataType, LSEDataType,
           Acc0BiasDataType, Acc1BiasDataType, AccDataType, ShuffleDataType,
           QKVElementOp, QKVElementOp, Scale, QKVElementOp, YElementOp, GemmSpec,
@@ -102,6 +105,40 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
           CShuffleBlockTransferClusterLengths, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
           8,            // CShuffleBlockTransferScalarPerVector_NPerBlock
           MaskingSpec>; // MaskingSpecialization
+  #else
+  using DeviceGemmInstance = 
+      ck::tensor_operation::device::DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V2<
+          NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, DataType, LSEDataType,
+          Acc0BiasDataType, Acc1BiasDataType, AccDataType, ShuffleDataType,
+          QKVElementOp, QKVElementOp, Scale, QKVElementOp, YElementOp, GemmSpec,
+          TensorSpecQ, TensorSpecK, TensorSpecV, TensorSpecY, 1, 256,
+          MPerBlock,        // MPerBlock
+          NPerBlock,        // NPerBlock
+          KPerBlock,        // KPerBlock
+          Gemm1NPerBlock,   // Gemm1NPerBlock
+          64,               // Gemm1KPerBlock
+          8,                // AK1
+          8,                // BK1
+          2,                // B1K1
+          MPerXDL,          // MPerXDL
+          NPerXDL,          // NPerXDL
+          1,                // MXdlPerWave
+          NXdlPerWave,      // NXdlPerWave
+          Gemm1NXdlPerWave, // Gemm1NXdlPerWave
+          ABlockTransfer,   // ABlockTransfer
+          S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8,
+          ABlockLdsExtraM, // ABlockLdsExtraM
+          BBlockTransfer,  // BBlockTransfer
+          S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8,
+          B0BlockLdsExtraN, // B0BlockLdsExtraN
+          B1BlockTransfer,  // B1BlockTransfer
+          S<0, 2, 1>, S<0, 2, 1>, 1, 4, 2, false,
+          1,                             // CShuffleMXdlPerWavePerShuffle
+          CShuffleNXdlPerWavePerShuffle, // CShuffleNXdlPerWavePerShuffle
+          CShuffleBlockTransferClusterLengths, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
+          8,            // CShuffleBlockTransferScalarPerVector_NPerBlock
+          MaskingSpec>; // MaskingSpecialization
+  #endif
 
   bool time_kernel = false;
 
@@ -109,7 +146,6 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
   bool output_permute = true;
 
   float alpha = launch_params.params.scale_bmm1f;
-
   auto a_element_op = QKVElementOp{};
   auto b0_element_op = QKVElementOp{};
   auto acc0_element_op = Scale{alpha};
@@ -150,7 +186,6 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
     int O = head_dim;
     int G0 = 1; // G0 = batch_size
     int G1 = num_heads;
-
     std::vector<ck::index_t> q_gs_ms_ks_lengths{G0, G1, M, K};
     std::vector<ck::index_t> q_gs_ms_ks_strides =
         input_permute ? std::vector<ck::index_t>{M * G1 * K, K, G1 * K, 1}
