@@ -356,7 +356,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
             gmem_mask.move();
 
             // Apply the attn mask.
-            softmax.apply_attn_mask(frag_mask);
+            softmax.apply_attn_mask(frag_mask, mask);
         }
 
         if constexpr (has_attn_bias) {
@@ -366,7 +366,7 @@ inline __device__ void compute_dq_dk_dv_1xN_one_iter(const Params &params, Prng 
             gmem_bias.move();
 
             // Apply the attn mask.
-            softmax.apply_attn_bias(frag_bias, l);
+            softmax.apply_attn_bias(frag_bias, mask);
         }
 
         // Apply the mask.

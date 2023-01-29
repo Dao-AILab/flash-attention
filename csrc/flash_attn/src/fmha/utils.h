@@ -410,6 +410,25 @@ inline __device__ uint32_t float2_pack<__nv_bfloat16>(float a, float b) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template<typename T>
+inline __device__ uint16_t float_pack(float a);
+
+template <>
+inline __device__ uint16_t float_pack<__half>(float a) {
+    __half result = __float2half_rn(a);
+    return reinterpret_cast<uint16_t(&)>(result);
+}
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+template <>
+inline __device__ uint16_t float_pack<__nv_bfloat16>(float a) {
+    __nv_bfloat16 result = __float2bfloat16_rn(a);
+    return reinterpret_cast<uint16_t(&)>(result);
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 static inline __device__ uint32_t float_to_half2(float a) {
     return float2_to_half2(a,a);
 }

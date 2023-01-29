@@ -499,31 +499,71 @@ struct Gmem_tile_mma_mask {
         const void *ptrs[LDGS_PER_THREAD_PER_WARP];
         uint32_t preds[LDGS_PER_THREAD_PER_WARP];
 
-        #pragma unroll
-        for( int mi = 0; mi < M; mi++ ) {
+        if (!(actual_seqlen_k & 1)) {
             #pragma unroll
-            for( int ni = 0; ni < N; ni++ ) {
+            for( int mi = 0; mi < M; mi++ ) {
                 #pragma unroll
-                for ( int ii = 0; ii < 2; ++ii ) {
+                for( int ni = 0; ni < N; ni++ ) {
                     #pragma unroll
-                    for (int jj = 0; jj < 2; ++jj ) {
-                        int offset = ii * 2 + jj;
-                        const int current_row = mi * ROWS + ii * 8;
-                        const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
-                        // to support the mask last two dimension
-                        ptrs[offset] = ptr_ + (uint32_t)(current_row % mask_seq_mod_size) * row_stride_in_bytes +
-                                       (uint32_t)current_col * BYTES_PER_ELEMENT;
-
-                        preds[offset] = (current_row < min(ROWS, actual_seqlen_q))
-                                        && ((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k);
+                    for ( int ii = 0; ii < 2; ++ii ) {
+                        #pragma unroll
+                        for (int jj = 0; jj < 2; ++jj ) {
+                            int offset = ii * 2 + jj;
+                            const int current_row = mi * ROWS + ii * 8;
+                            const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
+                            ptrs[offset] = ptr_ + (uint32_t)(current_row % mask_seq_mod_size) * row_stride_in_bytes +
+                                        (uint32_t)current_col * BYTES_PER_ELEMENT;
+                            preds[offset] = (current_row + (row % mask_seq_mod_size) < min(ROWS, actual_seqlen_q))
+                                            && ((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k);
+                        }
+                    }
+                    // load data
+                    Ldg_functor<StoreType, LDGS_PER_THREAD_PER_WARP> fct(frag[mi][ni].regs_, ptrs);
+                    #pragma unroll
+                    for(int kk = 0; kk < LDGS_PER_THREAD_PER_WARP; ++kk ) {
+                        fct.load(kk, preds[kk]);
                     }
                 }
-
-                // load data
-                Ldg_functor<StoreType, LDGS_PER_THREAD_PER_WARP> fct(frag[mi][ni].regs_, ptrs);
+            }
+        }else{
+            #pragma unroll
+            for( int mi = 0; mi < M; mi++ ) {
                 #pragma unroll
-                for(int kk = 0; kk < LDGS_PER_THREAD_PER_WARP; ++kk ) {
-                    fct.load(kk, preds[kk]);
+                for( int ni = 0; ni < N; ni++ ) {
+                    #pragma unroll
+                    for ( int ii = 0; ii < 2; ++ii ) {
+                        #pragma unroll
+                        for (int jj = 0; jj < 2; ++jj ) {
+                            int offset = ii * 2 + jj;
+                            const int current_row = mi * ROWS + ii * 8;
+                            const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
+                            ptrs[offset] = ptr_ + (uint32_t)(current_row % mask_seq_mod_size) * row_stride_in_bytes +
+                                        (uint32_t)current_col * BYTES_PER_ELEMENT;
+                            preds[offset] = 0;
+                            if ((current_row + (row % mask_seq_mod_size) < min(ROWS, actual_seqlen_q))) {
+                                if(current_col <= actual_seqlen_k) {
+                                    if((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k){
+                                        preds[offset] = 1;
+                                    }else if((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT - 1) == actual_seqlen_k) {
+                                        preds[offset] = 2;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // load data
+                    #pragma unroll
+                    for(int kk = 0; kk < LDGS_PER_THREAD_PER_WARP; ++kk ) {
+                        if (preds[kk] == 1) {
+                            uint16_t dst_16_h = *reinterpret_cast<const uint16_t*>(ptrs[kk]);
+                            uint16_t dst_16_l = *(reinterpret_cast<const uint16_t*>(ptrs[kk]) + 1);
+                            frag[mi][ni].regs_[kk] = ((uint32_t)dst_16_l << 16) + dst_16_h;
+                        }
+                        if (preds[kk] == 2) {
+                            uint16_t dst_16 = *reinterpret_cast<const uint16_t*>(ptrs[kk]);
+                            frag[mi][ni].regs_[kk] = ((uint32_t)0 << 16) + dst_16;
+                        }
+                    }
                 }
             }
         }
@@ -629,38 +669,75 @@ struct Gmem_tile_mma_bias {
     // Load from global memory to Fragment.
     template<typename Fragment, typename elem_type>
     inline __device__ void load(Fragment (&frag)[M][N]) {
-        // using Fragment = typename fmha::Fragment<cutlass::half_t, 8>;
-
         const void *ptrs[LDGS_PER_THREAD_PER_WARP];
         uint32_t preds[LDGS_PER_THREAD_PER_WARP];
 
-        #pragma unroll
-        for( int mi = 0; mi < M; mi++ ) {
+        if (!(actual_seqlen_k & 1)) {
             #pragma unroll
-            for( int ni = 0; ni < N; ni++ ) {
+            for( int mi = 0; mi < M; mi++ ) {
                 #pragma unroll
-                for ( int ii = 0; ii < 2; ++ii ) {
+                for( int ni = 0; ni < N; ni++ ) {
                     #pragma unroll
-                    for (int jj = 0; jj < 2; ++jj ) {
-                        int offset = ii * 2 + jj;
-                        const int current_row = mi * ROWS + ii * 8;
-                        const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
-                        // const int current_col = ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
-                        // 8 is actually col of half data now, for more general case ?
-                        //  the row is already in the right position
-                        ptrs[offset] = ptr_ + (uint32_t)current_row * row_stride_in_bytes +
-                                       (uint32_t)current_col * BYTES_PER_ELEMENT;
+                    for ( int ii = 0; ii < 2; ++ii ) {
+                        #pragma unroll
+                        for (int jj = 0; jj < 2; ++jj ) {
+                            int offset = ii * 2 + jj;
+                            const int current_row = mi * ROWS + ii * 8;
+                            const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
+                            ptrs[offset] = ptr_ + (uint32_t)current_row * row_stride_in_bytes +
+                                        (uint32_t)current_col * BYTES_PER_ELEMENT;
 
-                        preds[offset] = (current_row < min(ROWS, actual_seqlen_q))
-                                        && ((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k);
+                            preds[offset] = (current_row + row < min(ROWS, actual_seqlen_q))
+                                            && ((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k);
+                        }
+                    }
+
+                    Ldg_functor<StoreType, LDGS_PER_THREAD_PER_WARP> fct(frag[mi][ni].regs_, ptrs);
+                    #pragma unroll
+                    for(int kk = 0; kk < LDGS_PER_THREAD_PER_WARP; ++kk ) {
+                        fct.load(kk, preds[kk]);
                     }
                 }
-
-                // load data
-                Ldg_functor<StoreType, LDGS_PER_THREAD_PER_WARP> fct(frag[mi][ni].regs_, ptrs);
+            }
+        }else{
+            #pragma unroll
+            for( int mi = 0; mi < M; mi++ ) {
                 #pragma unroll
-                for(int kk = 0; kk < LDGS_PER_THREAD_PER_WARP; ++kk ) {
-                    fct.load(kk, preds[kk]);
+                for( int ni = 0; ni < N; ni++ ) {
+                    #pragma unroll
+                    for ( int ii = 0; ii < 2; ++ii ) {
+                        #pragma unroll
+                        for (int jj = 0; jj < 2; ++jj ) {
+                            int offset = ii * 2 + jj;
+                            const int current_row = mi * ROWS + ii * 8;
+                            const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
+                            ptrs[offset] = ptr_ + (uint32_t)current_row * row_stride_in_bytes +
+                                        (uint32_t)current_col * BYTES_PER_ELEMENT;
+                            preds[offset] = 0;
+                            if ((current_row + row < min(ROWS, actual_seqlen_q))) {
+                                if(current_col <= actual_seqlen_k) {
+                                    if((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k){
+                                        preds[offset] = 1;
+                                    }else if((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT - 1) == actual_seqlen_k) {
+                                        preds[offset] = 2;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // load data
+                    #pragma unroll
+                    for(int kk = 0; kk < LDGS_PER_THREAD_PER_WARP; ++kk ) {
+                        if (preds[kk] == 1) {
+                            uint16_t dst_16_h = *reinterpret_cast<const uint16_t*>(ptrs[kk]);
+                            uint16_t dst_16_l = *(reinterpret_cast<const uint16_t*>(ptrs[kk]) + 1);
+                            frag[mi][ni].regs_[kk] = ((uint32_t)dst_16_l << 16) + dst_16_h;
+                        }
+                        if (preds[kk] == 2) {
+                            uint16_t dst_16 = *reinterpret_cast<const uint16_t*>(ptrs[kk]);
+                            frag[mi][ni].regs_[kk] = ((uint32_t)0 << 16) + dst_16;
+                        }
+                    }
                 }
             }
         }
@@ -762,34 +839,74 @@ struct Gmem_tile_mma_ds {
 
     // Store to global memory.
     template<typename elem_type>
-    inline __device__ void store(const float (&softmax)[2 * M][4 * N]) {
+    inline __device__ void store(const float (&softmax)[2 * M][4 * N], int l=0) {
         uint32_t preds;
         uint32_t dst;
 
-        #pragma unroll
-        for( int mi = 0; mi < M; mi++ ) {
+        if (!(actual_seqlen_k & 1)) {
             #pragma unroll
-            for( int ni = 0; ni < N; ni++ ) {
+            for( int mi = 0; mi < M; mi++ ) {
                 #pragma unroll
-                for ( int ii = 0; ii < 2; ++ii ) {
+                for( int ni = 0; ni < N; ni++ ) {
                     #pragma unroll
-                    for (int jj = 0; jj < 2; ++jj ) {
-                        float tmp00 = softmax[2 * mi + ii][4 * ni + jj * 2];
-                        float tmp01 = softmax[2 * mi + ii][4 * ni + jj * 2 + 1];
-                        // dst = fmha::float2_to_half2(tmp00, tmp01);
-                        dst = fmha::float2_pack<elem_type>(tmp00, tmp01);
+                    for ( int ii = 0; ii < 2; ++ii ) {
+                        #pragma unroll
+                        for (int jj = 0; jj < 2; ++jj ) {
+                            float tmp00 = softmax[2 * mi + ii][4 * ni + jj * 2];
+                            float tmp01 = softmax[2 * mi + ii][4 * ni + jj * 2 + 1];
+                            dst = fmha::float2_pack<elem_type>(tmp00, tmp01);
 
-                        const int current_row = mi * ROWS + ii * 8;
-                        const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
+                            const int current_row = mi * ROWS + ii * 8;
+                            const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
 
-                        char *ptrs = ptr_ + (uint32_t)current_row * row_stride_in_bytes +
-                                        (uint32_t)current_col * BYTES_PER_ELEMENT;
+                            char *ptrs = ptr_ + (uint32_t)current_row * row_stride_in_bytes +
+                                            (uint32_t)current_col * BYTES_PER_ELEMENT;
 
-                        preds = (current_row < min(ROWS, actual_seqlen_q))
-                                        && ((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k);
+                            preds = (current_row + row < min(ROWS, actual_seqlen_q))
+                                            && ((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k);
+                            if (preds) {
+                                fmha::stg(ptrs, dst);
+                            }
+                        }
+                    }
+                }
+            }
+        }else{
+            #pragma unroll
+            for( int mi = 0; mi < M; mi++ ) {
+                #pragma unroll
+                for( int ni = 0; ni < N; ni++ ) {
+                    #pragma unroll
+                    for ( int ii = 0; ii < 2; ++ii ) {
+                        #pragma unroll
+                        for (int jj = 0; jj < 2; ++jj ) {
+                            float tmp00 = softmax[2 * mi + ii][4 * ni + jj * 2];
+                            float tmp01 = softmax[2 * mi + ii][4 * ni + jj * 2 + 1];
+                            uint16_t data1 = fmha::float_pack<elem_type>(tmp00);
+                            uint16_t data2 = fmha::float_pack<elem_type>(tmp01);
 
-                        if (preds) {
-                            fmha::stg(ptrs, dst);
+                            const int current_row = mi * ROWS + ii * 8;
+                            const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
+
+                            char *ptrs = ptr_ + (uint32_t)current_row * row_stride_in_bytes +
+                                            (uint32_t)current_col * BYTES_PER_ELEMENT;
+                            preds = 0;
+                            if ((current_row + row < min(ROWS, actual_seqlen_q))) {
+                                if(current_col <= actual_seqlen_k) {
+                                    if((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k){
+                                        preds = 1;
+                                    }else if((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT - 1) == actual_seqlen_k) {
+                                        preds = 2;
+                                    }
+                                }
+                            }
+
+                            if (preds == 1) {
+                                fmha::stg(reinterpret_cast<uint16_t*>(ptrs), data1);
+                                fmha::stg(reinterpret_cast<uint16_t*>(ptrs) + 1, data2);
+                            }else if (preds == 2) {
+                                fmha::stg(reinterpret_cast<uint16_t*>(ptrs), data1);
+                            }
                         }
                     }
                 }

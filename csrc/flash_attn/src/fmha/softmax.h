@@ -491,8 +491,8 @@ struct Softmax : public Softmax_base<Cta_tile, Kernel_traits> {
         , smem_max_(static_cast<float*>(smem) + Smem_tile_red::ELTS_PER_TILE, tidx) {
     }
 
-    template<bool zero=false, typename Fragment>
-    inline __device__ void apply_attn_mask(const Fragment (&mask)[MMAS_M][MMAS_N], int l = 0, int loop_step_idx = 0) {
+    template<bool zero=false, typename Fragment, typename Mask>
+    inline __device__ void apply_attn_mask(const Fragment (&attn_mask)[MMAS_M][MMAS_N], const Mask &mask, int l = 0, int loop_step_idx = 0) {
         #pragma unroll
         for( int mi = 0; mi < MMAS_M; ++mi ) {
             #pragma unroll
@@ -501,8 +501,10 @@ struct Softmax : public Softmax_base<Cta_tile, Kernel_traits> {
                 for( int ni = 0; ni < MMAS_N; ++ni ) {
                     #pragma unroll
                     for( int jj = 0; jj < 4; ++jj ) {
-                        float value = toFloat(mask[mi][ni].elt(ii * 4 + jj));
-                        this->elt_[2 * mi + ii][4 * ni + jj] += value;
+                        if( mask.is_valid(mi, ni, ii, jj) ) {
+                            float value = toFloat(attn_mask[mi][ni].elt(ii * 4 + jj));
+                            this->elt_[2 * mi + ii][4 * ni + jj] += value;
+                        }
                     }
                 }
             }
@@ -510,8 +512,8 @@ struct Softmax : public Softmax_base<Cta_tile, Kernel_traits> {
     }
 
 
-    template<bool zero=false, typename Fragment>
-    inline __device__ void apply_attn_bias(const Fragment (&bias)[MMAS_M][MMAS_N], int l) {
+    template<bool zero=false, typename Fragment, typename Mask>
+    inline __device__ void apply_attn_bias(const Fragment (&bias)[MMAS_M][MMAS_N], const Mask &mask, int l = 0) {
         #pragma unroll
         for( int mi = 0; mi < MMAS_M; ++mi ) {
             #pragma unroll
@@ -520,8 +522,10 @@ struct Softmax : public Softmax_base<Cta_tile, Kernel_traits> {
                 for( int ni = 0; ni < MMAS_N; ++ni ) {
                     #pragma unroll
                     for( int jj = 0; jj < 4; ++jj ) {
-                        float value = toFloat(bias[mi][ni].elt(ii * 4 + jj));
-                        this->elt_[2 * mi + ii][4 * ni + jj] += value;
+                        if( mask.is_valid(mi, ni, ii, jj) ) {
+                            float value = toFloat(bias[mi][ni].elt(ii * 4 + jj));
+                            this->elt_[2 * mi + ii][4 * ni + jj] += value;
+                        }
                     }
                 }
             }
