@@ -147,9 +147,9 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
             8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
             MaskingSpec>;   // MaskingSpecialization
         
-    bool time_kernel     = false;
+    bool time_kernel    = false;
 
-    bool input_permute  = true;//////////
+    bool input_permute  = false;//////////
     bool output_permute = true;
 
     float alpha = launch_params.params.scale_bmm1f;
