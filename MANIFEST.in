@@ -7,3 +7,8 @@ recursive-include flash_attn *.cu
 recursive-include flash_attn *.h
 recursive-include flash_attn *.cuh
 recursive-include flash_attn *.cpp
+
+recursive-include flash_attn_rocm *.cu
+recursive-include flash_attn_rocm *.h
+recursive-include flash_attn_rocm *.cuh
+recursive-include flash_attn_rocm *.cpp

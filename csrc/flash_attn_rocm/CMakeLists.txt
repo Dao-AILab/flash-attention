@@ -124,7 +124,7 @@ find_package(HIP)
 set(CMAKE_CXX_COMPILER /opt/rocm/hip/bin/hipcc)
 set(CMAKE_CXX_STANDARD 17)
 
-list(APPEND CMAKE_PREFIX_PATH "/opt/conda/lib/python3.7/site-packages/torch/share/cmake")
+list(APPEND CMAKE_PREFIX_PATH "/opt/conda/lib/python3.8/site-packages/torch/share/cmake")
 find_package(Torch REQUIRED)
 
 find_package(rocblas)
@@ -135,7 +135,7 @@ find_package(hipsparse)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/composable_kernel/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/composable_kernel/library/include)
-include_directories(/opt/conda/include/python3.7m)
+include_directories(/opt/conda/include/python3.8)
 
 aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR}/src FLA_SRCS)
 aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR}/composable_kernel/library/src/utility CK_SRCS)

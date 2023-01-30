@@ -1,6 +1,7 @@
 #include <ATen/ATen.h>
 #include <torch/extension.h>
 #include <ATen/hip/HIPContext.h>
+#include <ATen/hip/HIPGeneratorImpl.h>
 #include <c10/hip/HIPGuard.h>
 #include "fmha.h"
 
@@ -90,7 +91,7 @@ void set_params_fprop(FMHA_fprop_params &params,
         out_ptr = out_ptr + temp_q_stride;
 
         params.softmax_lse_ptr.push_back(reinterpret_cast<void*>(lse_ptr));
-        int temp_lse_stride = get_size_in_bytes(h * seqlen_q, acc_type);        
+        int temp_lse_stride = get_size_in_bytes(h * seqlen_q, acc_type);
         lse_ptr = lse_ptr + temp_lse_stride;
     }
 
@@ -108,12 +109,12 @@ void set_params_fprop(FMHA_fprop_params &params,
 }
 
 std::vector<at::Tensor>
-mha_fwd(const at::Tensor &q,        
-        const at::Tensor &k,        
-        const at::Tensor &v,        
-        at::Tensor &out,            
-        const at::Tensor &cu_seqlens_q,  
-        const at::Tensor &cu_seqlens_k,  
+mha_fwd(const at::Tensor &q,
+        const at::Tensor &k,
+        const at::Tensor &v,
+        at::Tensor &out,
+        const at::Tensor &cu_seqlens_q,
+        const at::Tensor &cu_seqlens_k,
         const int max_seqlen_q_,
         const int max_seqlen_k_,
         const float p_dropout,
@@ -158,7 +159,7 @@ mha_fwd(const at::Tensor &q,
     const int num_heads = sizes[H_DIM];
     const int head_size = sizes[D_DIM];
     const int total_k = k.size(TOTAL_DIM);
-    
+
     TORCH_CHECK(batch_size > 0);
     TORCH_CHECK((head_size % 8 == 0) && (head_size <= 128));
 
@@ -182,7 +183,7 @@ mha_fwd(const at::Tensor &q,
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    // at::cuda::CUDAGuard device_guard{(char)q.get_device()}; 
+    // at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
 
@@ -240,16 +241,14 @@ mha_fwd(const at::Tensor &q,
     return result;
 }
 
-
-/*
+//Commented functions yet to be supported.
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "Fused Multi-head Self-attention";
     m.def("fwd", &mha_fwd, "Forward pass");
-    m.def("bwd", &mha_bwd, "Backward pass");
-    m.def("fwd_block", &mha_fwd_block, "Forward pass (blocksparse)");
-    m.def("bwd_block", &mha_bwd_block, "Backward pass (blocksparse)");
+    // m.def("bwd", &mha_bwd, "Backward pass");
+    // m.def("fwd_block", &mha_fwd_block, "Forward pass (blocksparse)");
+    // m.def("bwd_block", &mha_bwd_block, "Backward pass (blocksparse)");
 }
-*/
 
 
 //main function to test with the API
@@ -291,24 +290,24 @@ int main(){
 
     int max_seqlen_q_ = 256;
     int max_seqlen_k_ = 256;
-    
+
     //other parameters
-    float p_dropout = 0;           
+    float p_dropout = 0;
     float softmax_scale = 0.125;
     bool zero_tensors = true;
     bool is_causal = false;
     bool return_softmax = false; // TO DO
-    int num_splits = 0;        
+    int num_splits = 0;
 
-    c10::optional<at::Generator> gen_;
+    c10::optional<at::Generator> gen_ = c10::nullopt;
 
-    auto result = 
-    mha_fwd(q,   
-            k,   
-            v,   
-            out, 
-            cu_seqlens_q, 
-            cu_seqlens_k, 
+    auto result =
+    mha_fwd(q,
+            k,
+            v,
+            out,
+            cu_seqlens_q,
+            cu_seqlens_k,
             max_seqlen_q_,
             max_seqlen_k_,
             p_dropout,
@@ -370,7 +369,7 @@ int main(){
                                                                                     B1ElementOp,
                                                                                     CElementOp>;
 
-    
+
     bool pass = true;
     if(do_verification)
     {
@@ -411,11 +410,11 @@ int main(){
 
             std::vector<ck::index_t> c_gs_ms_os_lengths{G0, G1, M, O};
             std::vector<ck::index_t> c_gs_ms_os_strides ={M * G1 * O, O, G1 * O, 1};
-        
+
             std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
             std::vector<ck::index_t> lse_gs_ms_strides =
                 std::vector<ck::index_t>{G1 * M, M, 1}; // LSE layout [G0, G1, M]
-            
+
             // C_m_o = A_m_k * B0_k_n * B1_n_o
             Tensor<ADataType> a_gs_ms_ks(a_gs_ms_ks_lengths, a_gs_ms_ks_strides);
             Tensor<B0DataType> b0_gs_ns_ks(b0_gs_ns_ks_lengths, b0_gs_ns_ks_strides);
@@ -438,7 +437,7 @@ int main(){
 
             std::vector<B0DataType> b0_vector(k_h_ptr, k_h_ptr + k_host[i].numel()); //transfer tensor into vector
             b0_gs_ns_ks.mData.assign(b0_vector.begin(), b0_vector.end());
-            
+
             std::vector<B1DataType> b1_vector(v_h_ptr, v_h_ptr + v_host[i].numel()); //transfer tensor into vector
             b1_gs_os_ns.mData.assign(b1_vector.begin(), b1_vector.end());
 
@@ -560,8 +559,8 @@ int main(){
             double atol = 1e-2;
 
             bool pass_ =
-                ck::utils::check_err(c_gs_ms_os_device_result.mData, 
-                                     c_gs_ms_os_host_result.mData, 
+                ck::utils::check_err(c_gs_ms_os_device_result.mData,
+                                     c_gs_ms_os_host_result.mData,
                                      "Error: Incorrect results!",
                                      rtol,
                                      atol) &&
@@ -573,18 +572,18 @@ int main(){
             pass &= pass_;
 
             //for (int j = 0; j < 4 ; j++){
-            //    std::cout << "data at j is " 
-            //    << ck::type_convert<float>(c_gs_ms_os_device_result.mData[j]) 
-            //    << " , " 
-            //    << ck::type_convert<float>(c_gs_ms_os_host_result.mData[j]) 
+            //    std::cout << "data at j is "
+            //    << ck::type_convert<float>(c_gs_ms_os_device_result.mData[j])
+            //    << " , "
+            //    << ck::type_convert<float>(c_gs_ms_os_host_result.mData[j])
             //    <<std::endl;
             //}
 
             //for (int j = 0; j < 16 ; j++){
-            //    std::cout << "lse data at " << j << " is " 
-            //    << ck::type_convert<float>(lse_gs_ms_device_result.mData[j]) 
-            //    << " , " 
-            //    << ck::type_convert<float>(lse_gs_ms_host_result.mData[j]) 
+            //    std::cout << "lse data at " << j << " is "
+            //    << ck::type_convert<float>(lse_gs_ms_device_result.mData[j])
+            //    << " , "
+            //    << ck::type_convert<float>(lse_gs_ms_host_result.mData[j])
             //   <<std::endl;
             //}
 
