@@ -4,4 +4,4 @@
 [submodule "csrc/flash_attn_rocm/composable_kernel"]
 	path = csrc/flash_attn_rocm/composable_kernel
 	url = https://github.com/fsx950223/composable_kernel
-	branch = my-attn-bwd
+	branch = my-attn-bwd2
