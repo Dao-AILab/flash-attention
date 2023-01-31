@@ -116,7 +116,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
           NPerBlock,        // NPerBlock
           KPerBlock,        // KPerBlock
           Gemm1NPerBlock,   // Gemm1NPerBlock
-          64,               // Gemm1KPerBlock
+          32,               // Gemm1KPerBlock
           8,                // AK1
           8,                // BK1
           2,                // B1K1
@@ -272,7 +272,6 @@ void run_fmha_dgrad_fp16_bf16_gfx90a(
   // CShuffleNXdlPerWavePerShuffle >
 
   FP16_SWITCH(launch_params.params.is_bf16, [&] {
-    // run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 32, 128, 32, 32, 4, 4, S<4, 64, 1>, true, S<4, 64, 1>, true, S<8, 32, 1>, 4, S<1, 32, 1, 8>, MaskingSpec_causal>(launch_params);
     if (launch_params.params.is_causal) {
       if (launch_params.params.b <= 16) {
         if (launch_params.params.d <= 32) {
