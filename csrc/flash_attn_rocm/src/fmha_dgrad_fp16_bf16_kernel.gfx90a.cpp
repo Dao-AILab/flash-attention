@@ -6,7 +6,7 @@
 #include <iostream>
 #include <numeric>
 
-#define FLASH_ATTN_IMPLENTATION 0
+#define FLASH_ATTN_IMPLENTATION 1
 
 template <ck::index_t... Is> using S = ck::Sequence<Is...>;
 using MaskingSpecialization =
