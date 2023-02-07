@@ -18,6 +18,10 @@ struct Qkv_params {
     std::vector<const void*> k_ptr;
     std::vector<const void*> v_ptr;
 
+    std::vector<at::Tensor> q_tensors;
+    std::vector<at::Tensor> k_tensors;
+    std::vector<at::Tensor> v_tensors;
+
     // The stride between rows of the Q, K and V matrices.
     // size_t qkv_stride_in_elts;
     // size_t qkv_stride_in_bytes;

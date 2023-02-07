@@ -57,9 +57,6 @@ void set_params_fprop(FMHA_fprop_params &params,
     FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_q, params.cu_seqlens_q, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
     FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_k, params.cu_seqlens_k, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
 
-    char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
-    char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
-    char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
     char* out_ptr = reinterpret_cast<char*>(out.data_ptr());
     char* lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
 
@@ -77,17 +74,39 @@ void set_params_fprop(FMHA_fprop_params &params,
     //std::cout << " q_[1][0][0][0].data_ptr() " << q_[1][0][0][0].data_ptr() << std::endl;
 
     for (int i = 0; i < b; i++){
-        params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
-        params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr));
-        params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr));
-        params.o_ptr.push_back(reinterpret_cast<void*>(out_ptr));
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
+
+        std::vector<int> index_q_v;
+        for(int i_q = 0; i_q < temp_seqlen_q; i_q++){
+            index_q_v.push_back(params.host_seqlens_q[i] + i_q);
+        }
+
+        std::vector<int> index_k_v;
+        for(int i_k = 0; i_k < temp_seqlen_k; i_k++){
+            index_k_v.push_back(params.host_seqlens_k[i] + i_k);
+        }
+
+        at::TensorOptions opts_=at::TensorOptions().dtype(at::kInt);
+
+        at::Tensor index_q_t = at::from_blob(index_q_v.data(), {temp_seqlen_q}, opts_).clone().to(at::kCUDA);
+        at::Tensor index_k_t = at::from_blob(index_k_v.data(), {temp_seqlen_k}, opts_).clone().to(at::kCUDA);
+
+        at::Tensor q_each_tmp = torch::index_select(q, 0, index_q_t).clone().transpose(0,1).contiguous();
+        at::Tensor k_each_tmp = torch::index_select(k, 0, index_k_t).clone().transpose(0,1).contiguous();
+        at::Tensor v_each_tmp = torch::index_select(v, 0, index_k_t).clone().transpose(0,1).contiguous();
+
+        params.q_tensors.push_back(q_each_tmp);
+        params.k_tensors.push_back(k_each_tmp);
+        params.v_tensors.push_back(v_each_tmp);
+
+        params.q_ptr.push_back(reinterpret_cast<void*>(q_each_tmp.data_ptr()));
+        params.k_ptr.push_back(reinterpret_cast<void*>(k_each_tmp.data_ptr()));
+        params.v_ptr.push_back(reinterpret_cast<void*>(v_each_tmp.data_ptr()));
+        
+        params.o_ptr.push_back(reinterpret_cast<void*>(out_ptr));
         int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, data_type);
-        int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, data_type);
-        q_ptr = q_ptr     + temp_q_stride;
-        k_ptr = k_ptr     + temp_k_stride;
-        v_ptr = v_ptr     + temp_k_stride;
+
         out_ptr = out_ptr + temp_q_stride;
 
         params.softmax_lse_ptr.push_back(reinterpret_cast<void*>(lse_ptr));
@@ -288,8 +307,8 @@ int main(){
     at::Tensor cu_seqlens_q=at::from_blob(cu_seqlens_q_vec.data(),{batch_size + 1},opts).clone().to(at::kCUDA);
     at::Tensor cu_seqlens_k=at::from_blob(cu_seqlens_k_vec.data(),{batch_size + 1},opts).clone().to(at::kCUDA);
 
-    int max_seqlen_q_ = 256;
-    int max_seqlen_k_ = 256;
+    int max_seqlen_q_ = seqlen;
+    int max_seqlen_k_ = seqlen;
 
     //other parameters
     float p_dropout = 0;
