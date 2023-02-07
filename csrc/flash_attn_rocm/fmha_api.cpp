@@ -168,11 +168,12 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     //at::Tensor k_ = k.view({params.b, params.seqlen_k , params.h , params.d});
     //at::Tensor v_ = v.view({params.b, params.seqlen_q , params.h , params.d});
     //out = out.view({params.b, params.seqlen_q , params.h , params.d});
-
+    auto z = at::empty({params.b*params.seqlen_q, params.h, params.d}, torch::kInt32).to(at::kCUDA);
     char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
     char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
     char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
     char* y_ptr = reinterpret_cast<char*>(y.data_ptr());
+    char* z_ptr = reinterpret_cast<char*>(z.data_ptr());
     char* lse_ptr = reinterpret_cast<char*>(lse.data_ptr());
     char* ygrad_ptr = reinterpret_cast<char*>(ygrad.data_ptr());
     char* qgrad_ptr = reinterpret_cast<char*>(qgrad.data_ptr());
@@ -211,6 +212,7 @@ void set_params_dgrad(FMHA_dgrad_params &params,
         params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr   + temp_k_stride));
         params.y_ptr.push_back(reinterpret_cast<void*>(y_ptr   + temp_q_stride));
         params.lse_ptr.push_back(reinterpret_cast<void*>(lse_ptr   + temp_lse_stride));
+        params.z_ptr.push_back(reinterpret_cast<void*>(z_ptr   + temp_lse_stride));
         params.ygrad_ptr.push_back(reinterpret_cast<void*>(ygrad_ptr   + temp_q_stride));
         params.qgrad_ptr.push_back(reinterpret_cast<void*>(qgrad_ptr   + temp_q_stride));
         params.kgrad_ptr.push_back(reinterpret_cast<void*>(kgrad_ptr   + temp_k_stride));
@@ -353,12 +355,13 @@ mha_fwd(const at::Tensor &q,
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-    int64_t counter_offset = launch_params.params.b * launch_params.params.h * 32;
+    
 
     // at::PhiloxCudaState rng_engine_inputs;
 
     if( is_dropout ) {
         // See Note [Acquire lock when using random generators]
+        int64_t counter_offset = launch_params.params.b * launch_params.params.h * 32;
         std::lock_guard<std::mutex> lock(gen->mutex_);
         launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
     }
@@ -391,8 +394,8 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         const float softmax_scale,
         const bool zero_tensors,
         const bool is_causal,
-        const int num_splits
-        //c10::optional<at::Generator> gen_
+        const int num_splits,
+        c10::optional<at::Generator> gen_
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
 
@@ -481,7 +484,8 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         dv.zero_();
         softmax_d.zero_();
     }
-
+    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+        gen_, at::cuda::detail::getDefaultCUDAGenerator());
     set_params_dgrad(launch_params.params,
                      batch_size,
                      max_seqlen_q,
@@ -498,6 +502,13 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      softmax_scale,
                      is_causal,
                      num_splits);
+    
+    if( is_dropout ) {
+        // See Note [Acquire lock when using random generators]
+        int64_t counter_offset = launch_params.params.b * launch_params.params.h * 32;
+        std::lock_guard<std::mutex> lock(gen->mutex_);
+        launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
+    }
 
     run_fmha_dgrad_fp16_bf16_gfx90a(launch_params);
 
@@ -910,9 +921,8 @@ bool bwd_test(bool do_verification){
             softmax_scale,
             zero_tensors,
             is_causal,
-            // return_softmax,
-            num_splits/*,
-            c10::optional<at::Generator> gen_*/);
+            num_splits,
+            gen_);
     using F16 = ck::half_t;
     using BF16 = ck::bhalf_t;
     using F32 = float;

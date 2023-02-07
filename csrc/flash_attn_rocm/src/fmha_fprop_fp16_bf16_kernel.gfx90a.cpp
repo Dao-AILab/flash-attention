@@ -28,14 +28,6 @@ struct SimpleDeviceMem
     void* p_mem_;
 };
 
-std::tuple<uint64_t, uint64_t> unpack(at::PhiloxCudaState arg) {
-  if (arg.captured_) {
-    return std::make_tuple(arg.seed_, static_cast<uint64_t>(*(arg.offset_.ptr) + arg.offset_intragraph_));
-  } else {
-    return std::make_tuple(arg.seed_, arg.offset_.val);
-  }
-}
-
 template<typename InputType, 
          ck::index_t MPerBlock,    ck::index_t NPerBlock, ck::index_t KPerBlock,   ck::index_t Gemm1NPerBlock,
          ck::index_t MPerXDL,      ck::index_t NPerXDL,   ck::index_t NXdlPerWave, ck::index_t Gemm1NXdlPerWave,

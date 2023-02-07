@@ -105,6 +105,7 @@ struct FMHA_dgrad_params : public Qkv_params {
 
     // The O matrix (output).
     std::vector<const void*> y_ptr;
+    std::vector<void*> z_ptr;
     std::vector<const void*> lse_ptr;
     std::vector<const void*> ygrad_ptr;
     std::vector<void*> qgrad_ptr;
@@ -134,7 +135,7 @@ struct FMHA_dgrad_params : public Qkv_params {
     uint32_t scale_dropout;
 
     // Random state.
-    // at::PhiloxCudaState philox_args;
+    at::PhiloxCudaState philox_args;
 
     bool is_bf16;
     bool is_causal;

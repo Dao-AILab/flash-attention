@@ -6,7 +6,7 @@
 #include <iostream>
 #include <numeric>
 
-#define FLASH_ATTN_IMPLENTATION 1
+#define FLASH_ATTN_IMPLENTATION 0
 
 template <ck::index_t... Is> using S = ck::Sequence<Is...>;
 using MaskingSpecialization =
@@ -39,6 +39,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
     Launch_params<FMHA_dgrad_params> &launch_params) {
   using F16 = ck::half_t;
   using F32 = float;
+  using U16 = unsigned short;
 
   using PassThrough = ck::tensor_operation::element_wise::PassThrough;
   using Scale = ck::tensor_operation::element_wise::Scale;
@@ -50,6 +51,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
   using AccDataType = F32;
   using ShuffleDataType = F32;
   using LSEDataType = F32;
+  using ZDataType = U16;
   using Acc0BiasDataType = ck::Tuple<>;
   using Acc1BiasDataType = ck::Tuple<>;
 
@@ -71,10 +73,10 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
   static constexpr auto TensorSpecY =
       ck::tensor_operation::device::TensorSpecialization::Default;
 
-  // init the instance with parameters
-  #if FLASH_ATTN_IMPLENTATION
-  using DeviceGemmInstance = 
-      ck::tensor_operation::device::DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle<
+// init the instance with parameters
+#if FLASH_ATTN_IMPLENTATION
+  using DeviceGemmInstance = ck::tensor_operation::device::
+      DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle<
           NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, DataType, LSEDataType,
           Acc0BiasDataType, Acc1BiasDataType, AccDataType, ShuffleDataType,
           QKVElementOp, QKVElementOp, Scale, QKVElementOp, YElementOp, GemmSpec,
@@ -105,13 +107,14 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
           CShuffleBlockTransferClusterLengths, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
           8,            // CShuffleBlockTransferScalarPerVector_NPerBlock
           MaskingSpec>; // MaskingSpecialization
-  #else
-  using DeviceGemmInstance = 
-      ck::tensor_operation::device::DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V2<
-          NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, DataType, LSEDataType,
-          Acc0BiasDataType, Acc1BiasDataType, AccDataType, ShuffleDataType,
-          QKVElementOp, QKVElementOp, Scale, QKVElementOp, YElementOp, GemmSpec,
-          TensorSpecQ, TensorSpecK, TensorSpecV, TensorSpecY, 1, 256,
+#else
+  using DeviceGemmInstance = ck::tensor_operation::device::
+      DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V2<
+          NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, DataType, ZDataType,
+          LSEDataType, Acc0BiasDataType, Acc1BiasDataType, AccDataType,
+          ShuffleDataType, QKVElementOp, QKVElementOp, Scale, QKVElementOp,
+          YElementOp, GemmSpec, TensorSpecQ, TensorSpecK, TensorSpecV,
+          TensorSpecY, 1, 256,
           MPerBlock,        // MPerBlock
           NPerBlock,        // NPerBlock
           KPerBlock,        // KPerBlock
@@ -138,7 +141,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
           CShuffleBlockTransferClusterLengths, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
           8,            // CShuffleBlockTransferScalarPerVector_NPerBlock
           MaskingSpec>; // MaskingSpecialization
-  #endif
+#endif
 
   bool time_kernel = false;
 
@@ -146,6 +149,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
   bool output_permute = true;
 
   float alpha = launch_params.params.scale_bmm1f;
+  auto seeds = unpack(launch_params.params.philox_args);
   auto a_element_op = QKVElementOp{};
   auto b0_element_op = QKVElementOp{};
   auto acc0_element_op = Scale{alpha};
@@ -156,6 +160,9 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
   auto p_k = launch_params.params.k_ptr;
   auto p_v = launch_params.params.v_ptr;
   auto p_y = launch_params.params.y_ptr;
+#if FLASH_ATTN_IMPLENTATION == 0
+  auto p_z = launch_params.params.z_ptr;
+#endif
   auto p_lse = launch_params.params.lse_ptr;
   auto p_ygrad = launch_params.params.ygrad_ptr;
   auto p_qgrad = launch_params.params.qgrad_ptr;
@@ -181,7 +188,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
     int M = launch_params.params.host_seqlens_q[i + 1] -
             launch_params.params.host_seqlens_q[i]; // seqlen Q
     int N = launch_params.params.host_seqlens_k[i + 1] -
-            launch_params.params.host_seqlens_k[i]; // seqlen K    
+            launch_params.params.host_seqlens_k[i]; // seqlen K
     int K = head_dim;
     int O = head_dim;
     int G0 = 1; // G0 = batch_size
@@ -218,29 +225,44 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
     std::vector<ck::index_t> lse_gs_ms_strides{G1 * M, M,
                                                1}; // LSE layout [G0, G1, M]
 
-    problem_descs.push_back({q_gs_ms_ks_lengths,
-                             q_gs_ms_ks_strides,
-                             k_gs_ns_ks_lengths,
-                             k_gs_ns_ks_strides,
-                             v_gs_os_ns_lengths,
-                             v_gs_os_ns_strides,
-                             y_gs_ms_os_lengths,
-                             y_gs_ms_os_strides,
-                             lse_gs_ms_lengths,
-                             lse_gs_ms_strides,
-                             {},   // acc0_biases_gs_ms_ns_lengths
-                             {},   // acc0_biases_gs_ms_ns_strides
-                             {},   // acc1_biases_gs_ms_os_lengths
-                             {}}); // acc1_biases_gs_ms_os_strides
-  }
+#if FLASH_ATTN_IMPLENTATION == 0
+    std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
+    std::vector<ck::index_t> z_gs_ms_ns_strides =
+        input_permute ? std::vector<ck::index_t>{M * G1 * N, N, G1 * N, 1}
+                      // Z layout [G0, M, G1, N]
+                      : std::vector<ck::index_t>{G1 * M * N, M * N, N,
+                                                 1}; // Z layout [G0, G1, M, N]
+#endif
 
+    problem_descs.push_back({
+      q_gs_ms_ks_lengths, q_gs_ms_ks_strides, k_gs_ns_ks_lengths,
+          k_gs_ns_ks_strides,
+#if FLASH_ATTN_IMPLENTATION == 0
+          z_gs_ms_ns_lengths, z_gs_ms_ns_strides,
+#endif
+          v_gs_os_ns_lengths, v_gs_os_ns_strides, y_gs_ms_os_lengths,
+          y_gs_ms_os_strides, lse_gs_ms_lengths, lse_gs_ms_strides,
+          {}, // acc0_biases_gs_ms_ns_lengths
+          {}, // acc0_biases_gs_ms_ns_strides
+          {}, // acc1_biases_gs_ms_os_lengths
+      {}
+    }); // acc1_biases_gs_ms_os_strides
+  }
+  float dropout_ratio = launch_params.params.p_dropout;
   // do GEMM
   auto gemm = DeviceGemmInstance{};
   auto invoker = gemm.MakeInvoker();
+#if FLASH_ATTN_IMPLENTATION
   auto argument = gemm.MakeArgument(
       p_q, p_k, p_v, p_y, p_lse, p_ygrad, p_qgrad, p_kgrad, p_vgrad, {}, {},
       problem_descs, a_element_op, b0_element_op, acc0_element_op,
       b1_element_op, c_element_op);
+#else
+  auto argument = gemm.MakeArgument(
+      p_q, p_k, p_z, p_v, p_y, p_lse, p_ygrad, p_qgrad, p_kgrad, p_vgrad, {},
+      {}, problem_descs, a_element_op, b0_element_op, acc0_element_op,
+      b1_element_op, c_element_op, dropout_ratio, seeds);
+#endif
 
   // specify workspace for problem_desc
   SimpleDeviceMem problem_desc_workspace(gemm.GetWorkSpaceSize(&argument));
