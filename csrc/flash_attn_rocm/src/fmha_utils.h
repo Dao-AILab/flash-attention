@@ -9,6 +9,8 @@
 
 #include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
 #include "ck/tensor_operation/gpu/device/tensor_specialization.hpp"
+#include "ck/tensor_operation/gpu/device/impl/device_grouped_multihead_attention_backward_xdl_cshuffle.hpp"
+#include "ck/tensor_operation/gpu/device/impl/device_grouped_multihead_attention_backward_xdl_cshuffle_v2.hpp"
 #include "ck/tensor_operation/gpu/device/impl/device_grouped_gemm_softmax_gemm_permute_train_xdl_cshuffle.hpp"
 #include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
 
@@ -83,4 +85,11 @@ static inline size_t get_size_in_bytes( size_t n, Data_type dtype ) {
     }
 }
 
+static std::tuple<uint64_t, uint64_t> unpack(at::PhiloxCudaState arg) {
+  if (arg.captured_) {
+    return std::make_tuple(arg.seed_, static_cast<uint64_t>(*(arg.offset_.ptr) + arg.offset_intragraph_));
+  } else {
+    return std::make_tuple(arg.seed_, arg.offset_.val);
+  }
+}
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -2,7 +2,7 @@
 
 #include <vector>
 #include <iostream>
-#include <ATen/cuda/CUDAGeneratorImpl.h>
+#include <ATen/hip/HIPGeneratorImpl.h>
 
 #include "fmha_utils.h"
 
@@ -99,8 +99,53 @@ struct FMHA_fprop_params : public Qkv_params {
     bool is_bf16;
     bool is_causal;
 
-    int* host_seqlens_q;
-    int* host_seqlens_k;
+    std::vector<int> host_seqlens_q;
+    std::vector<int> host_seqlens_k;
+
+    int num_splits; // How many SMs per attention matrix.
+};
+
+struct FMHA_dgrad_params : public Qkv_params {
+
+    // The O matrix (output).
+    std::vector<const void*> y_ptr;
+    std::vector<void*> z_ptr;
+    std::vector<const void*> lse_ptr;
+    std::vector<const void*> ygrad_ptr;
+    std::vector<void*> qgrad_ptr;
+    std::vector<void*> kgrad_ptr;
+    std::vector<void*> vgrad_ptr;
+
+    // The dimensions.
+    int b, seqlen_q, seqlen_k, d;
+
+    // The scaling factors for the kernel.
+    float scale_bmm1f;
+
+    // array of length b+1 holding starting offset of each sequence.
+    int * __restrict__ cu_seqlens_q;
+    int * __restrict__ cu_seqlens_k;
+
+    // The dropout probability (probability of keeping an activation).
+    float p_dropout;
+    uint32_t p_dropout_in_uint;
+    uint16_t p_dropout_in_uint16_t;
+
+    // Scale factor of 1 / (1 - p_dropout).
+    float rp_dropout;
+    float scale_bmm1_rp_dropout;
+
+    // Scale factor of 1 / (1 - p_dropout), in half2.
+    uint32_t scale_dropout;
+
+    // Random state.
+    at::PhiloxCudaState philox_args;
+
+    bool is_bf16;
+    bool is_causal;
+
+    std::vector<int> host_seqlens_q;
+    std::vector<int> host_seqlens_k;
 
     int num_splits; // How many SMs per attention matrix.
 };
@@ -140,7 +185,7 @@ struct Launch_params{
 
 void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params);
 
-//void run_fmha_dgrad_fp16_gfx90a(FMHA_dgrad_params &params, hipStream_t stream, const bool configure);
+void run_fmha_dgrad_fp16_bf16_gfx90a(Launch_params<FMHA_dgrad_params> &launch_params);
 
 //void run_fmha_block_fp16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
 

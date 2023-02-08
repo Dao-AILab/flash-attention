@@ -3,4 +3,5 @@
 	url = https://github.com/NVIDIA/cutlass.git
 [submodule "csrc/flash_attn_rocm/composable_kernel"]
 	path = csrc/flash_attn_rocm/composable_kernel
-	url = https://github.com/ROCmSoftwarePlatform/composable_kernel
+	url = https://github.com/fsx950223/composable_kernel
+	branch = my-attn-bwd3

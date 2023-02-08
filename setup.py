@@ -1,6 +1,4 @@
 # Adapted from https://github.com/NVIDIA/apex/blob/master/setup.py
-import sys
-import warnings
 import os
 import shutil
 from pathlib import Path
@@ -138,18 +136,19 @@ cc_flag = []
 
 
 ck_sources = ["csrc/flash_attn_rocm/composable_kernel/library/src/utility/convolution_parameter.cpp", "csrc/flash_attn_rocm/composable_kernel/library/src/utility/device_memory.cpp", "csrc/flash_attn_rocm/composable_kernel/library/src/utility/host_tensor.cpp"]
-fmha_sources = ["csrc/flash_attn_rocm/fmha_api.cpp", "csrc/flash_attn_rocm/src/fmha_fprop_fp16_bf16_kernel.gfx90a.cpp"]
+fmha_sources = ["csrc/flash_attn_rocm/fmha_api.cpp", "csrc/flash_attn_rocm/src/fmha_fprop_fp16_bf16_kernel.gfx90a.cpp", "csrc/flash_attn_rocm/src/fmha_dgrad_fp16_bf16_kernel.gfx90a.cpp"]
 
 rename_cpp_cu(ck_sources)
 rename_cpp_cu(fmha_sources)
 
-subprocess.run(["git", "submodule", "update", "--init", "csrc/flash_attn_rocm/composable_kernel"])
+# subprocess.run(["git", "submodule", "update", "--init", "csrc/flash_attn_rocm/composable_kernel"])
 ext_modules.append(
     CUDAExtension(
         name="flash_attn_cuda",
         sources=[
             "csrc/flash_attn_rocm/fmha_api.cu",
             "csrc/flash_attn_rocm/src/fmha_fprop_fp16_bf16_kernel.gfx90a.cu",
+            "csrc/flash_attn_rocm/src/fmha_dgrad_fp16_bf16_kernel.gfx90a.cu",
             "csrc/flash_attn_rocm/composable_kernel/library/src/utility/convolution_parameter.cu",
             "csrc/flash_attn_rocm/composable_kernel/library/src/utility/device_memory.cu",
             "csrc/flash_attn_rocm/composable_kernel/library/src/utility/host_tensor.cu"
