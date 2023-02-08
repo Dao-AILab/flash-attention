@@ -119,7 +119,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
           NPerBlock,        // NPerBlock
           KPerBlock,        // KPerBlock
           Gemm1NPerBlock,   // Gemm1NPerBlock
-          32,               // Gemm1KPerBlock
+          64,               // Gemm1KPerBlock
           8,                // AK1
           8,                // BK1
           2,                // B1K1

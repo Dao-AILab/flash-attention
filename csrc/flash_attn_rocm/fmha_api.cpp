@@ -153,8 +153,9 @@ void set_params_dgrad(FMHA_dgrad_params &params,
                       bool is_causal,
                       int num_splits) {
 
-    // Data_type acc_type = DATA_TYPE_FP32;
-    Data_type data_type = !(q.dtype() == at::kBFloat16) ? DATA_TYPE_FP16 : DATA_TYPE_BF16;
+    Data_type acc_type = DATA_TYPE_FP32;
+    Data_type z_type = DATA_TYPE_INT32;
+    Data_type data_type = q.dtype() == at::kBFloat16 ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -188,9 +189,11 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     //at::Tensor v_ = v.view({params.b, params.seqlen_q , params.h , params.d});
     //out = out.view({params.b, params.seqlen_q , params.h , params.d});
     auto z = at::empty({params.b*params.seqlen_q, params.h, params.d}, torch::kInt32).to(at::kCUDA);
+
     char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
     char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
     char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
+
     char* y_ptr = reinterpret_cast<char*>(y.data_ptr());
     char* z_ptr = reinterpret_cast<char*>(z.data_ptr());
     char* lse_ptr = reinterpret_cast<char*>(lse.data_ptr());
@@ -225,17 +228,68 @@ void set_params_dgrad(FMHA_dgrad_params &params,
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
         int temp_q_stride = get_size_in_bytes(i * d * h * temp_seqlen_q, data_type);
         int temp_k_stride = get_size_in_bytes(i * d * h * temp_seqlen_k, data_type);
-        int temp_lse_stride = get_size_in_bytes(i * h * temp_seqlen_q, data_type);
+        int temp_lse_stride = get_size_in_bytes(i * h * temp_seqlen_q, acc_type);
+        int temp_z_stride = get_size_in_bytes(i * d * h * temp_seqlen_q, z_type);
         params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr   + temp_q_stride));
         params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr   + temp_k_stride));
         params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr   + temp_k_stride));
         params.y_ptr.push_back(reinterpret_cast<void*>(y_ptr   + temp_q_stride));
         params.lse_ptr.push_back(reinterpret_cast<void*>(lse_ptr   + temp_lse_stride));
-        params.z_ptr.push_back(reinterpret_cast<void*>(z_ptr   + temp_lse_stride));
+        params.z_ptr.push_back(reinterpret_cast<void*>(z_ptr   + temp_z_stride));
         params.ygrad_ptr.push_back(reinterpret_cast<void*>(ygrad_ptr   + temp_q_stride));
         params.qgrad_ptr.push_back(reinterpret_cast<void*>(qgrad_ptr   + temp_q_stride));
         params.kgrad_ptr.push_back(reinterpret_cast<void*>(kgrad_ptr   + temp_k_stride));
         params.vgrad_ptr.push_back(reinterpret_cast<void*>(vgrad_ptr   + temp_k_stride));
+        
+        // std::vector<int> index_q_v;
+        // for(int i_q = 0; i_q < temp_seqlen_q; i_q++){
+        //     index_q_v.push_back(params.host_seqlens_q[i] + i_q);
+        // }
+
+        // std::vector<int> index_k_v;
+        // for(int i_k = 0; i_k < temp_seqlen_k; i_k++){
+        //     index_k_v.push_back(params.host_seqlens_k[i] + i_k);
+        // }
+
+        // at::TensorOptions opts_ = at::TensorOptions().dtype(at::kInt);
+
+        // at::Tensor index_q_t = at::from_blob(index_q_v.data(), {temp_seqlen_q}, opts_).clone().to(at::kCUDA);
+        // at::Tensor index_k_t = at::from_blob(index_k_v.data(), {temp_seqlen_k}, opts_).clone().to(at::kCUDA);
+
+        // at::Tensor q_each_tmp = torch::index_select(q, 0, index_q_t).clone().transpose(0,1).contiguous();
+        // at::Tensor k_each_tmp = torch::index_select(k, 0, index_k_t).clone().transpose(0,1).contiguous();
+        // at::Tensor v_each_tmp = torch::index_select(v, 0, index_k_t).clone().transpose(0,1).contiguous();
+        // at::Tensor y_each_tmp = torch::index_select(y, 0, index_k_t).clone().transpose(0,1).contiguous();
+        // at::Tensor ygrad_each_tmp = torch::index_select(ygrad, 0, index_q_t).clone().transpose(0,1).contiguous();
+
+        // params.q_tensors.push_back(q_each_tmp);
+        // params.k_tensors.push_back(k_each_tmp);
+        // params.v_tensors.push_back(v_each_tmp);
+        // params.y_tensors.push_back(y_each_tmp);
+        // params.ygrad_tensors.push_back(ygrad_each_tmp);
+
+        // params.q_ptr.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
+        // params.k_ptr.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
+        // params.v_ptr.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
+        // params.z_ptr.push_back(reinterpret_cast<void*>(z_ptr));
+        // params.y_ptr.push_back(reinterpret_cast<const void*>(y_each_tmp.data_ptr()));
+        // params.lse_ptr.push_back(reinterpret_cast<const void*>(lse_ptr));
+        // params.ygrad_ptr.push_back(reinterpret_cast<void*>(ygrad_each_tmp.data_ptr()));
+        // params.qgrad_ptr.push_back(reinterpret_cast<void*>(qgrad_ptr));
+        // params.kgrad_ptr.push_back(reinterpret_cast<void*>(kgrad_ptr));
+        // params.vgrad_ptr.push_back(reinterpret_cast<void*>(vgrad_ptr));
+
+        // int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, data_type);
+        // int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, data_type);
+        // int temp_lse_stride = get_size_in_bytes(h * seqlen_q, acc_type);
+        // int temp_z_stride = get_size_in_bytes(d * h * temp_seqlen_q, z_type);
+        // // y_ptr += temp_q_stride;
+        // // ygrad_ptr += temp_q_stride;
+        // qgrad_ptr += temp_q_stride;
+        // kgrad_ptr += temp_k_stride;
+        // vgrad_ptr += temp_k_stride;
+        // lse_ptr += temp_lse_stride;
+        // z_ptr += temp_z_stride;
     }
 
     // Set the different scale values.
@@ -246,15 +300,7 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     //set_alpha(params.scale_bmm1, scale_bmm1, data_type);
 
     // Set this to probability of keeping an element to simplify things.
-    params.p_dropout = 1.f - p_dropout;
-    // Convert p from float to int so we don't have to convert the random uint to float to compare.
-    // [Minor] We want to round down since when we do the comparison we use <= instead of <
-    params.p_dropout_in_uint = uint32_t(std::floor(params.p_dropout * 4294967295.0));
-    params.p_dropout_in_uint16_t = uint16_t(std::floor(params.p_dropout * 65535.0));
-    params.rp_dropout = 1.f / params.p_dropout;
-    params.scale_bmm1_rp_dropout = params.rp_dropout * params.scale_bmm1f;
-    //TORCH_CHECK(p_dropout < 1.f);
-    //set_alpha(params.scale_dropout, params.rp_dropout, data_type);
+    params.p_dropout = p_dropout;
 
     params.is_causal = is_causal;
     params.num_splits = num_splits;
@@ -535,13 +581,13 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 }
 
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "Fused Multi-head Self-attention";
-    m.def("fwd", &mha_fwd, "Forward pass");
-    m.def("bwd", &mha_bwd, "Backward pass");
-    // m.def("fwd_block", &mha_fwd_block, "Forward pass (blocksparse)");
-    // m.def("bwd_block", &mha_bwd_block, "Backward pass (blocksparse)");
-}
+// PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+//     m.doc() = "Fused Multi-head Self-attention";
+//     m.def("fwd", &mha_fwd, "Forward pass");
+//     m.def("bwd", &mha_bwd, "Backward pass");
+//     // m.def("fwd_block", &mha_fwd_block, "Forward pass (blocksparse)");
+//     // m.def("bwd_block", &mha_bwd_block, "Backward pass (blocksparse)");
+// }
 
 
 //main function to test with the API
@@ -856,7 +902,7 @@ bool fwd_test(bool do_verification){
 }
 
 bool bwd_test(bool do_verification){
-    int batch_size = 64;
+    int batch_size = 2;
     int nheads = 16;
     int seqlen = 256;
     int n = 1024;
@@ -867,6 +913,7 @@ bool bwd_test(bool do_verification){
     at::Tensor k_host = at::rand({batch_size*seqlen, nheads, d}, torch::kFloat16);
     at::Tensor v_host = at::rand({batch_size*seqlen, nheads, d}, torch::kFloat16);
     at::Tensor y_host = at::empty({batch_size*seqlen, nheads, d}, torch::kFloat16);
+    at::Tensor z_host = at::empty({batch_size*seqlen, nheads, d}, torch::kInt32);
     at::Tensor lse_host = at::empty({batch_size, nheads, seqlen}, torch::kFloat32);
 
     at::Tensor ygrad_host = at::rand({batch_size*seqlen, nheads, d}, torch::kFloat16);
@@ -897,11 +944,16 @@ bool bwd_test(bool do_verification){
     at::Tensor cu_seqlens_q=at::from_blob(cu_seqlens_q_vec.data(),{batch_size + 1},opts).clone().to(at::kCUDA);
     at::Tensor cu_seqlens_k=at::from_blob(cu_seqlens_k_vec.data(),{batch_size + 1},opts).clone().to(at::kCUDA);
 
-    int max_seqlen_q_ = 256;
-    int max_seqlen_k_ = 256;
+    int max_seqlen_q_ = seqlen;
+    int max_seqlen_k_ = seqlen;
     
     //other parameters
-    float p_dropout = 0;           
+    float p_dropout = 0;
+    float p_dropout2                = 1 - p_dropout;
+    uint16_t p_dropout_in_16bits    = uint16_t(std::floor(p_dropout2 * 65535.0));
+    float rp_dropout                = 1.0 / p_dropout2;
+    const unsigned long long seed   = 1;
+    const unsigned long long offset = 0;           
     float softmax_scale = 0.125;  
     bool zero_tensors = false;    
     bool is_causal = false;       
@@ -945,6 +997,7 @@ bool bwd_test(bool do_verification){
     using F16 = ck::half_t;
     using BF16 = ck::bhalf_t;
     using F32 = float;
+    using U16 = unsigned short;
 
     using PassThrough = ck::tensor_operation::element_wise::PassThrough;
     using Scale       = ck::tensor_operation::element_wise::Scale;
@@ -953,6 +1006,7 @@ bool bwd_test(bool do_verification){
     using YElementOp   = PassThrough;
 
     using DataType         = F16;
+    using ZDataType        = U16;
     using AccDataType      = F32;
     using ShuffleDataType  = F32;
     using LSEDataType      = F32;
@@ -964,7 +1018,7 @@ bool bwd_test(bool do_verification){
     static constexpr ck::index_t NumDimN = 1;
     static constexpr ck::index_t NumDimK = 1;
     static constexpr ck::index_t NumDimO = 1;
-    // Ref Gemm0: S =  * Q * K^T
+    // Ref Gemm0: S = alpha * Q * K^T
     // fp16 in, fp32 out
     using ReferenceGemm0Instance = ck::tensor_operation::host::ReferenceBatchedGemm<DataType,
                                                                                     DataType,
@@ -998,22 +1052,32 @@ bool bwd_test(bool do_verification){
                                                                                     PassThrough,
                                                                                     PassThrough,
                                                                                     Scale>;
+
+    using ReferenceDropoutInstance =
+        ck::tensor_operation::host::ReferenceDropout<ushort, DataType, DataType>;
                                                                                     
     if(do_verification){
+        bool input_permute = true;
+        bool output_permute = true;
         auto run_attention_fwd_host = []<typename TensorQ,
           typename TensorK,
           typename TensorV,
           typename TensorS,
           typename TensorP,
+          typename TensorZ,
           typename TensorY,
           typename TensorLSE = TensorP>(const TensorQ& q_g_m_k,
-                                    const TensorK& k_g_n_k,
-                                    const TensorV& v_g_n_o,
-                                    const float alpha,
-                                    TensorS& s_g_m_n,
-                                    TensorP& p_g_m_n,
-                                    TensorY& y_g_m_o,
-                                    TensorLSE& lse_g_m)
+                                        const TensorK& k_g_n_k,
+                                        const TensorV& v_g_n_o,
+                                        const float alpha,
+                                        TensorS& s_g_m_n,
+                                        TensorP& p_g_m_n,
+                                        TensorY& y_g_m_o,
+                                        TensorLSE& lse_g_m,
+                                        TensorP& p_drop_g_m_n,
+                                        TensorZ& z_g_m_n,
+                                        ushort p_dropout_in_16bits,
+                                        float rp_dropout)
         {
             // S = alpha * Q * K^T
             auto k_g_k_n            = k_g_n_k.Transpose({0, 2, 1});
@@ -1024,14 +1088,15 @@ bool bwd_test(bool do_verification){
 
             ref_gemm0_invoker.Run(ref_gemm0_argument);
 
-            // if(is_causal){
-            //     auto N          = s_g_m_n.GetLengths()[2];
-            //     const auto mask = DeviceGemmInstance::C0MatrixMask(N);
-            //     s_g_m_n.ForEach([&](auto& self, auto idx) {
-            //         if(mask.IsMaskedElement(idx[1], idx[2]))
-            //             self(idx) = -ck::NumericLimits<float>::Infinity();
-            //     });
-            // }
+            // masking
+        // #if USING_MASK
+        //     auto N          = s_g_m_n.GetLengths()[2];
+        //     const auto mask = DeviceGemmInstance::C0MatrixMask(N);
+        //     s_g_m_n.ForEach([&](auto& self, auto idx) {
+        //         if(mask.IsMaskedElement(idx[1], idx[2]))
+        //             self(idx) = -ck::NumericLimits<float>::Infinity();
+        //     });
+        // #endif
 
             // P = Softmax(S)
             auto ref_softmax          = ReferenceSoftmaxInstance{};
@@ -1040,17 +1105,25 @@ bool bwd_test(bool do_verification){
 
             ref_softmax_invoker.Run(ref_softmax_argument);
 
-            // Y = P * V
+            // P_dropped
+            auto ref_dropout         = ReferenceDropoutInstance{};
+            auto ref_dropout_invoker = ref_dropout.MakeInvoker();
+            auto ref_dropout_argment =
+                ref_dropout.MakeArgument(z_g_m_n, p_g_m_n, p_drop_g_m_n, p_dropout_in_16bits, rp_dropout);
+            ref_dropout_invoker.Run(ref_dropout_argment);
+
+            // Y = P_dropout * V
             auto ref_gemm1          = ReferenceGemm1Instance{};
             auto ref_gemm1_invoker  = ref_gemm1.MakeInvoker();
             auto ref_gemm1_argument = ref_gemm1.MakeArgument(
-                p_g_m_n, v_g_n_o, y_g_m_o, PassThrough{}, PassThrough{}, PassThrough{});
+                p_drop_g_m_n, v_g_n_o, y_g_m_o, PassThrough{}, PassThrough{}, PassThrough{});
 
             ref_gemm1_invoker.Run(ref_gemm1_argument);
         };
         q_host = q_host.view({ batch_size, seqlen, nheads, d }); //64 256 16 64
         k_host = k_host.view({ batch_size, seqlen, nheads, d });
         v_host = v_host.view({ batch_size, seqlen, nheads, d });
+        z_host = z_host.view({ batch_size, seqlen, nheads, d });
         ygrad_host = ygrad_host.view({ batch_size, seqlen, nheads, d });
 
         const int M   = seqlen;   //seqlen Q
@@ -1072,25 +1145,49 @@ bool bwd_test(bool do_verification){
         y_host = y.to(torch::kCPU).view({batch_size, seqlen, nheads, d});
 
         for(std::size_t i=0; i<batch_size; i++){
-            std::vector<ck::index_t> q_gs_ms_ks_lengths{G0, G1, M, K};
-            std::vector<ck::index_t> q_gs_ms_ks_strides{M * G1 * K, K, G1 * K, 1}; // Q layout [G0, M, G1, K]
+        std::vector<ck::index_t> q_gs_ms_ks_lengths{G0, G1, M, K};
+        std::vector<ck::index_t> q_gs_ms_ks_strides =
+            input_permute
+                ? std::vector<ck::index_t>{M * G1 * K, K, G1 * K, 1} // Q layout [G0, M, G1, K]
+                : std::vector<ck::index_t>{G1 * M * K, M * K, K, 1}; // Q layout [G0, G1, M, K]
 
-            std::vector<ck::index_t> k_gs_ns_ks_lengths{G0, G1, N, K};
-            std::vector<ck::index_t> k_gs_ns_ks_strides{N * G1 * K, K, G1 * K, 1}; // K layout [G0, N, G1, K]
+        std::vector<ck::index_t> k_gs_ns_ks_lengths{G0, G1, N, K};
+        std::vector<ck::index_t> k_gs_ns_ks_strides =
+            input_permute
+                ? std::vector<ck::index_t>{N * G1 * K, K, G1 * K, 1} // K layout [G0, N, G1, K]
+                : std::vector<ck::index_t>{G1 * N * K, N * K, K, 1}; // K layout [G0, G1, N, K]
 
-            std::vector<ck::index_t> v_gs_os_ns_lengths{G0, G1, O, N};
-            std::vector<ck::index_t> v_gs_os_ns_strides{N * G1 * O, O, 1, G1 * O}; // V layout [G0, N, G1, O]
+        std::vector<ck::index_t> v_gs_os_ns_lengths{G0, G1, O, N};
+        std::vector<ck::index_t> v_gs_os_ns_strides =
+            input_permute
+                ? std::vector<ck::index_t>{N * G1 * O, O, 1, G1 * O} // V layout [G0, N, G1, O]
+                : std::vector<ck::index_t>{G1 * N * O, N * O, 1, O}; // V layout [G0, G1, N, O]
 
-            std::vector<ck::index_t> y_gs_ms_os_lengths{G0, G1, M, O};
-            std::vector<ck::index_t> y_gs_ms_os_strides{M * G1 * O, O, G1 * O, 1}; // Y layout [G0, M, G1, O]
+        std::vector<ck::index_t> y_gs_ms_os_lengths{G0, G1, M, O};
+        std::vector<ck::index_t> y_gs_ms_os_strides =
+            output_permute
+                ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1} // Y layout [G0, M, G1, O]
+                : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // Y layout [G0, G1, M, O]
 
-            std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
-            std::vector<ck::index_t> lse_gs_ms_strides{G1 * M, M, 1}; // LSE layout [G0, G1, M]
+        std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
+        std::vector<ck::index_t> z_gs_ms_ns_strides =
+            input_permute
+                ? std::vector<ck::index_t>{M * G1 * N, N, G1 * N, 1} // Z layout [G0, M, G1, N]
+                : std::vector<ck::index_t>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
+        // The softmax stat log-sum-exp (LSE) is used to speed up softmax calculation in backward
+        // pass Pi = exp(Si) / sum(exp(S0) + exp(S1) + ...)
+        //    = exp(Si) / exp(log(sum(exp() + ...)))
+        //    = exp(Si - log(sum(exp() + ...)))
+        //               ^^^^^^^^^^^^^^^^^^^^^
+        //                       LSE
+        std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
+        std::vector<ck::index_t> lse_gs_ms_strides{G1 * M, M, 1}; // LSE layout [G0, G1, M]
 
             Tensor<DataType> q_gs_ms_ks(q_gs_ms_ks_lengths, q_gs_ms_ks_strides);
             Tensor<DataType> k_gs_ns_ks(k_gs_ns_ks_lengths, k_gs_ns_ks_strides);
             Tensor<DataType> v_gs_os_ns(v_gs_os_ns_lengths, v_gs_os_ns_strides);
             Tensor<DataType> y_gs_ms_os(y_gs_ms_os_lengths, y_gs_ms_os_strides);
+            Tensor<ZDataType> z_gs_ms_ns(z_gs_ms_ns_lengths, z_gs_ms_ns_strides);
             // Tensor<DataType> y_gs_ms_os_device(y_gs_ms_os_lengths, y_gs_ms_os_strides);
             Tensor<DataType> ygrad_gs_ms_os(y_gs_ms_os_lengths, y_gs_ms_os_strides);
             Tensor<LSEDataType> lse_gs_ms(lse_gs_ms_lengths, lse_gs_ms_strides);
@@ -1098,25 +1195,17 @@ bool bwd_test(bool do_verification){
             Tensor<DataType> qgrad_gs_ms_ks(q_gs_ms_ks_lengths, q_gs_ms_ks_strides);
             Tensor<DataType> kgrad_gs_ns_ks(k_gs_ns_ks_lengths, k_gs_ns_ks_strides);
             Tensor<DataType> vgrad_gs_os_ns(v_gs_os_ns_lengths, v_gs_os_ns_strides);
-            void* q_h_ptr_f = q_host[i].data_ptr();
-            void* k_h_ptr_f = k_host[i].data_ptr();
-            void* v_h_ptr_f = v_host[i].data_ptr();
-            void* y_h_ptr_f = y_host[i].data_ptr();
-            void* lse_h_ptr_f = lse_host[i].data_ptr();
-            void* ygrad_h_ptr_f = ygrad_host[i].data_ptr();
-            void* qgrad_h_ptr_f = qgrad_host[i].data_ptr();
-            void* kgrad_h_ptr_f = kgrad_host[i].data_ptr();
-            void* vgrad_h_ptr_f = vgrad_host[i].data_ptr();
 
-            DataType* q_h_ptr = reinterpret_cast<DataType*>(q_h_ptr_f);
-            DataType* k_h_ptr = reinterpret_cast<DataType*>(k_h_ptr_f);
-            DataType* v_h_ptr = reinterpret_cast<DataType*>(v_h_ptr_f);
-            DataType* y_h_ptr = reinterpret_cast<DataType*>(y_h_ptr_f);
-            LSEDataType* lse_h_ptr = reinterpret_cast<LSEDataType*>(lse_h_ptr_f);
-            DataType* ygrad_h_ptr = reinterpret_cast<DataType*>(ygrad_h_ptr_f);
-            DataType* qgrad_h_ptr = reinterpret_cast<DataType*>(qgrad_h_ptr_f);
-            DataType* kgrad_h_ptr = reinterpret_cast<DataType*>(kgrad_h_ptr_f);
-            DataType* vgrad_h_ptr = reinterpret_cast<DataType*>(vgrad_h_ptr_f);
+            DataType* q_h_ptr = reinterpret_cast<DataType*>(q_host[i].data_ptr());
+            DataType* k_h_ptr = reinterpret_cast<DataType*>(k_host[i].data_ptr());
+            DataType* v_h_ptr = reinterpret_cast<DataType*>(v_host[i].data_ptr());
+            DataType* y_h_ptr = reinterpret_cast<DataType*>(y_host[i].data_ptr());
+            ZDataType* z_h_ptr = reinterpret_cast<ZDataType*>(z_host[i].data_ptr());
+            LSEDataType* lse_h_ptr = reinterpret_cast<LSEDataType*>(lse_host[i].data_ptr());
+            DataType* ygrad_h_ptr = reinterpret_cast<DataType*>(ygrad_host[i].data_ptr());
+            DataType* qgrad_h_ptr = reinterpret_cast<DataType*>(qgrad_host[i].data_ptr());
+            DataType* kgrad_h_ptr = reinterpret_cast<DataType*>(kgrad_host[i].data_ptr());
+            DataType* vgrad_h_ptr = reinterpret_cast<DataType*>(vgrad_host[i].data_ptr());
 
             std::vector<DataType> q_vector(q_h_ptr, q_h_ptr + q_host[i].numel()); 
             q_gs_ms_ks.mData.assign(q_vector.begin(), q_vector.end());
@@ -1124,6 +1213,10 @@ bool bwd_test(bool do_verification){
             k_gs_ns_ks.mData.assign(k_vector.begin(), k_vector.end());
             std::vector<DataType> v_vector(v_h_ptr, v_h_ptr + v_host[i].numel()); 
             v_gs_os_ns.mData.assign(v_vector.begin(), v_vector.end());
+            std::vector<ZDataType> z_vector(z_h_ptr, z_h_ptr + z_host[i].numel()); 
+            z_gs_ms_ns.mData.assign(z_vector.begin(), z_vector.end());
+            std::vector<DataType> y_vector(y_h_ptr, y_h_ptr + y_host[i].numel()); 
+            y_gs_ms_os.mData.assign(y_vector.begin(), y_vector.end());
 
             std::vector<DataType> lse_vector(lse_h_ptr, lse_h_ptr + lse_host[i].numel()); 
             lse_gs_ms.mData.assign(lse_vector.begin(), lse_vector.end());
@@ -1140,11 +1233,13 @@ bool bwd_test(bool do_verification){
             Tensor<DataType> q_g_m_k({BatchCount, M, K});
             Tensor<DataType> k_g_n_k({BatchCount, N, K});
             Tensor<DataType> v_g_n_o({BatchCount, N, O});
+            Tensor<ZDataType> z_g_m_n({BatchCount, M, N});
             Tensor<AccDataType> s_g_m_n({BatchCount, M, N});
             Tensor<DataType> p_g_m_n({BatchCount, M, N});
             Tensor<DataType> y_g_m_o({BatchCount, M, O});
             Tensor<LSEDataType> lse_g_m({BatchCount, M});            
             Tensor<DataType> ygrad_g_m_o({BatchCount, M, O});
+            Tensor<DataType> p_drop_g_m_n({BatchCount, M, N});
 
             q_gs_ms_ks.ForEach(
                 [&](auto& self, auto idx) { q_g_m_k(idx[0] * G1 + idx[1], idx[2], idx[3]) = self(idx); });
@@ -1152,7 +1247,10 @@ bool bwd_test(bool do_verification){
                 [&](auto& self, auto idx) { k_g_n_k(idx[0] * G1 + idx[1], idx[2], idx[3]) = self(idx); });
             v_gs_os_ns.ForEach(
                 [&](auto& self, auto idx) { v_g_n_o(idx[0] * G1 + idx[1], idx[3], idx[2]) = self(idx); });
-            run_attention_fwd_host(q_g_m_k, k_g_n_k, v_g_n_o, softmax_scale, s_g_m_n, p_g_m_n, y_g_m_o, lse_g_m);
+            z_gs_ms_ns.ForEach(
+                [&](auto& self, auto idx) { z_g_m_n(idx[0] * G1 + idx[1], idx[2], idx[3]) = self(idx); });
+
+            run_attention_fwd_host(q_g_m_k, k_g_n_k, v_g_n_o, softmax_scale, s_g_m_n, p_g_m_n, y_g_m_o, lse_g_m, p_drop_g_m_n, z_g_m_n, p_dropout_in_16bits, rp_dropout);
             std::cout << "Checking lse:\n";
             ck::utils::check_err(lse_g_m.mData,
                                  lse_gs_ms.mData,

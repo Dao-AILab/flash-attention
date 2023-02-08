@@ -21,6 +21,7 @@ struct Qkv_params {
     std::vector<at::Tensor> q_tensors;
     std::vector<at::Tensor> k_tensors;
     std::vector<at::Tensor> v_tensors;
+    std::vector<at::Tensor> y_tensors;
 
     // The stride between rows of the Q, K and V matrices.
     // size_t qkv_stride_in_elts;
@@ -45,7 +46,7 @@ struct FMHA_fprop_params : public Qkv_params {
     // The O matrix (output).
     // void * __restrict__ o_ptr;
     std::vector<void*> o_ptr;
-
+    
     // The stride between rows of O.
     // size_t o_stride_in_elts;
     // size_t o_stride_in_bytes;
@@ -116,6 +117,7 @@ struct FMHA_dgrad_params : public Qkv_params {
     std::vector<void*> kgrad_ptr;
     std::vector<void*> vgrad_ptr;
 
+    std::vector<at::Tensor> ygrad_tensors;
     // The dimensions.
     int b, seqlen_q, seqlen_k, d;
 
