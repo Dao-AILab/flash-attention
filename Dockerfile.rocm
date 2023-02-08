@@ -1,0 +1,10 @@
+FROM rocm/pytorch:rocm5.3.2_ubuntu20.04_py3.7_pytorch_1.12.1
+
+WORKDIR /workspace
+USER root
+
+RUN pip install ninja
+COPY ./ /workspace/flash-attention_private/
+RUN cd /workspace/flash-attention_private \
+       && patch /opt/conda/lib/python3.7/site-packages/torch/utils/hipify/hipify_python.py hipify_patch.patch \
+       && python setup.py install
