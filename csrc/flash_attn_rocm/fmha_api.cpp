@@ -139,7 +139,6 @@ void set_params_dgrad(FMHA_dgrad_params &params,
                       const at::Tensor k,
                       const at::Tensor v,
                       const at::Tensor y,
-                      const at::Tensor lse,
                       const at::Tensor ygrad,
                       at::Tensor qgrad,
                       at::Tensor kgrad,
@@ -188,108 +187,65 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     //at::Tensor k_ = k.view({params.b, params.seqlen_k , params.h , params.d});
     //at::Tensor v_ = v.view({params.b, params.seqlen_q , params.h , params.d});
     //out = out.view({params.b, params.seqlen_q , params.h , params.d});
-    auto z = at::empty({params.b*params.seqlen_q, params.h, params.d}, torch::kInt32).to(at::kCUDA);
-
-    char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
-    char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
-    char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
+    auto z = at::empty({params.b*params.h, params.seqlen_q, params.seqlen_k}, torch::kInt32).to(at::kCUDA);
 
     char* y_ptr = reinterpret_cast<char*>(y.data_ptr());
     char* z_ptr = reinterpret_cast<char*>(z.data_ptr());
-    char* lse_ptr = reinterpret_cast<char*>(lse.data_ptr());
+    char* lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
     char* ygrad_ptr = reinterpret_cast<char*>(ygrad.data_ptr());
-    char* qgrad_ptr = reinterpret_cast<char*>(qgrad.data_ptr());
-    char* kgrad_ptr = reinterpret_cast<char*>(kgrad.data_ptr());
-    char* vgrad_ptr = reinterpret_cast<char*>(vgrad.data_ptr());
-
-    //std::cout << "multiply" << params.seqlen_q * params.h * params.d<< std::endl;
-
-    //std::cout << " q.data_ptr() " << q.data_ptr() << std::endl;
-    //std::cout << " q_.data_ptr() " << q_.data_ptr() << std::endl;
-    //std::cout << " q_[0].data_ptr() " << q_[0].data_ptr() << std::endl;
-    //std::cout << " q_[1].data_ptr() " << q_[1].data_ptr() << std::endl;
-    //std::cout << " new q[1] " << reinterpret_cast<void*>(q_ptr + params.seqlen_q * params.h * params.d * 2) << std::endl;
-    //std::cout << " q_[0][0][0][0].data_ptr() " << q_[0][0][0][0].data_ptr() << std::endl;
-    //std::cout << " q_[0][0][0][1].data_ptr() " << q_[0][0][0][1].data_ptr() << std::endl;
-    //std::cout << " q_[0][0][1][0].data_ptr() " << q_[0][0][1][0].data_ptr() << std::endl;
-    //std::cout << " q_[0][1][0][0].data_ptr() " << q_[0][1][0][0].data_ptr() << std::endl;
-    //std::cout << " q_[1][0][0][0].data_ptr() " << q_[1][0][0][0].data_ptr() << std::endl;
-/*
-    for (int i = 0; i < b; i++){
-        params.q_ptr.push_back(q_[i].data_ptr());
-        params.k_ptr.push_back(k_[i].data_ptr());
-        params.v_ptr.push_back(v_[i].data_ptr());
-        params.o_ptr.push_back(out[i].data_ptr());
-    }
-*/
 
     for (int i = 0; i < b; i++){
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
-        int temp_q_stride = get_size_in_bytes(i * d * h * temp_seqlen_q, data_type);
-        int temp_k_stride = get_size_in_bytes(i * d * h * temp_seqlen_k, data_type);
-        int temp_lse_stride = get_size_in_bytes(i * h * temp_seqlen_q, acc_type);
-        int temp_z_stride = get_size_in_bytes(i * d * h * temp_seqlen_q, z_type);
-        params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr   + temp_q_stride));
-        params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr   + temp_k_stride));
-        params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr   + temp_k_stride));
-        params.y_ptr.push_back(reinterpret_cast<void*>(y_ptr   + temp_q_stride));
-        params.lse_ptr.push_back(reinterpret_cast<void*>(lse_ptr   + temp_lse_stride));
-        params.z_ptr.push_back(reinterpret_cast<void*>(z_ptr   + temp_z_stride));
-        params.ygrad_ptr.push_back(reinterpret_cast<void*>(ygrad_ptr   + temp_q_stride));
-        params.qgrad_ptr.push_back(reinterpret_cast<void*>(qgrad_ptr   + temp_q_stride));
-        params.kgrad_ptr.push_back(reinterpret_cast<void*>(kgrad_ptr   + temp_k_stride));
-        params.vgrad_ptr.push_back(reinterpret_cast<void*>(vgrad_ptr   + temp_k_stride));
-        
-        // std::vector<int> index_q_v;
-        // for(int i_q = 0; i_q < temp_seqlen_q; i_q++){
-        //     index_q_v.push_back(params.host_seqlens_q[i] + i_q);
-        // }
 
-        // std::vector<int> index_k_v;
-        // for(int i_k = 0; i_k < temp_seqlen_k; i_k++){
-        //     index_k_v.push_back(params.host_seqlens_k[i] + i_k);
-        // }
+        std::vector<int> index_q_v;
+        for(int i_q = 0; i_q < temp_seqlen_q; i_q++){
+            index_q_v.push_back(params.host_seqlens_q[i] + i_q);
+        }
 
-        // at::TensorOptions opts_ = at::TensorOptions().dtype(at::kInt);
+        std::vector<int> index_k_v;
+        for(int i_k = 0; i_k < temp_seqlen_k; i_k++){
+            index_k_v.push_back(params.host_seqlens_k[i] + i_k);
+        }
 
-        // at::Tensor index_q_t = at::from_blob(index_q_v.data(), {temp_seqlen_q}, opts_).clone().to(at::kCUDA);
-        // at::Tensor index_k_t = at::from_blob(index_k_v.data(), {temp_seqlen_k}, opts_).clone().to(at::kCUDA);
+        at::TensorOptions opts_=at::TensorOptions().dtype(at::kInt);
 
-        // at::Tensor q_each_tmp = torch::index_select(q, 0, index_q_t).clone().transpose(0,1).contiguous();
-        // at::Tensor k_each_tmp = torch::index_select(k, 0, index_k_t).clone().transpose(0,1).contiguous();
-        // at::Tensor v_each_tmp = torch::index_select(v, 0, index_k_t).clone().transpose(0,1).contiguous();
-        // at::Tensor y_each_tmp = torch::index_select(y, 0, index_k_t).clone().transpose(0,1).contiguous();
-        // at::Tensor ygrad_each_tmp = torch::index_select(ygrad, 0, index_q_t).clone().transpose(0,1).contiguous();
+        at::Tensor index_q_t = at::from_blob(index_q_v.data(), {temp_seqlen_q}, opts_).clone().to(at::kCUDA);
+        at::Tensor index_k_t = at::from_blob(index_k_v.data(), {temp_seqlen_k}, opts_).clone().to(at::kCUDA);
 
-        // params.q_tensors.push_back(q_each_tmp);
-        // params.k_tensors.push_back(k_each_tmp);
-        // params.v_tensors.push_back(v_each_tmp);
-        // params.y_tensors.push_back(y_each_tmp);
-        // params.ygrad_tensors.push_back(ygrad_each_tmp);
+        at::Tensor q_each_tmp = torch::index_select(q, 0, index_q_t).clone().transpose(0,1).contiguous();
+        at::Tensor k_each_tmp = torch::index_select(k, 0, index_k_t).clone().transpose(0,1).contiguous();
+        at::Tensor v_each_tmp = torch::index_select(v, 0, index_k_t).clone().transpose(0,1).contiguous();
+        at::Tensor qgrad_each_tmp = torch::index_select(qgrad, 0, index_q_t).transpose(0,1).contiguous();
+        at::Tensor kgrad_each_tmp = torch::index_select(kgrad, 0, index_k_t).transpose(0,1).contiguous();
+        at::Tensor vgrad_each_tmp = torch::index_select(vgrad, 0, index_k_t).transpose(0,1).contiguous();
 
-        // params.q_ptr.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
-        // params.k_ptr.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
-        // params.v_ptr.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
-        // params.z_ptr.push_back(reinterpret_cast<void*>(z_ptr));
-        // params.y_ptr.push_back(reinterpret_cast<const void*>(y_each_tmp.data_ptr()));
-        // params.lse_ptr.push_back(reinterpret_cast<const void*>(lse_ptr));
-        // params.ygrad_ptr.push_back(reinterpret_cast<void*>(ygrad_each_tmp.data_ptr()));
-        // params.qgrad_ptr.push_back(reinterpret_cast<void*>(qgrad_ptr));
-        // params.kgrad_ptr.push_back(reinterpret_cast<void*>(kgrad_ptr));
-        // params.vgrad_ptr.push_back(reinterpret_cast<void*>(vgrad_ptr));
+        params.q_tensors.push_back(q_each_tmp);
+        params.k_tensors.push_back(k_each_tmp);
+        params.v_tensors.push_back(v_each_tmp);
+        params.qgrad_tensors.push_back(qgrad_each_tmp);
+        params.kgrad_tensors.push_back(kgrad_each_tmp);
+        params.vgrad_tensors.push_back(vgrad_each_tmp);
 
-        // int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, data_type);
-        // int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, data_type);
-        // int temp_lse_stride = get_size_in_bytes(h * seqlen_q, acc_type);
-        // int temp_z_stride = get_size_in_bytes(d * h * temp_seqlen_q, z_type);
-        // // y_ptr += temp_q_stride;
-        // // ygrad_ptr += temp_q_stride;
-        // qgrad_ptr += temp_q_stride;
-        // kgrad_ptr += temp_k_stride;
-        // vgrad_ptr += temp_k_stride;
-        // lse_ptr += temp_lse_stride;
-        // z_ptr += temp_z_stride;
+        params.q_ptr.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
+        params.k_ptr.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
+        params.v_ptr.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
+        params.z_ptr.push_back(reinterpret_cast<void*>(z_ptr));
+        params.y_ptr.push_back(reinterpret_cast<const void*>(y_ptr));
+        params.lse_ptr.push_back(reinterpret_cast<const void*>(lse_ptr));
+        params.ygrad_ptr.push_back(reinterpret_cast<const void*>(ygrad_ptr));
+        params.qgrad_ptr.push_back(reinterpret_cast<void*>(qgrad_each_tmp.data_ptr()));
+        params.kgrad_ptr.push_back(reinterpret_cast<void*>(kgrad_each_tmp.data_ptr()));
+        params.vgrad_ptr.push_back(reinterpret_cast<void*>(vgrad_each_tmp.data_ptr()));
+
+        int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, data_type);
+        int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, data_type);
+        int temp_lse_stride = get_size_in_bytes(h * seqlen_q, acc_type);
+        int temp_z_stride = get_size_in_bytes(h * temp_seqlen_k * temp_seqlen_q, z_type);
+        y_ptr += temp_q_stride;
+        ygrad_ptr += temp_q_stride;
+        lse_ptr += temp_lse_stride;
+        z_ptr += temp_z_stride;
     }
 
     // Set the different scale values.
@@ -557,7 +513,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      max_seqlen_k,
                      num_heads,
                      head_size,
-                     q, k, v, out, softmax_lse,
+                     q, k, v, out,
                      dout, dq, dk, dv,
                      cu_seqlens_q.data_ptr(),
                      cu_seqlens_k.data_ptr(),
@@ -576,7 +532,9 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
 
     run_fmha_dgrad_fp16_bf16_gfx90a(launch_params);
-
+    dq = torch::cat(launch_params.params.qgrad_tensors, 1).transpose(0,1).contiguous();
+    dk = torch::cat(launch_params.params.kgrad_tensors, 1).transpose(0,1).contiguous();
+    dv = torch::cat(launch_params.params.vgrad_tensors, 1).transpose(0,1).contiguous();
     return { dq, dk, dv, softmax_d };
 }
 

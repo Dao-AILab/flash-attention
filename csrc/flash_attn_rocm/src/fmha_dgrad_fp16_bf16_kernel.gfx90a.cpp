@@ -145,7 +145,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
 
   bool time_kernel = false;
 
-  bool input_permute = true;
+  bool input_permute = false;
   bool output_permute = true;
 
   float alpha = launch_params.params.scale_bmm1f;
