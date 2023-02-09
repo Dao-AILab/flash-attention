@@ -183,10 +183,6 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_q.data(), params.cu_seqlens_q, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
     FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_k.data(), params.cu_seqlens_k, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
 
-    //at::Tensor q_ = q.view({params.b, params.seqlen_q , params.h , params.d});
-    //at::Tensor k_ = k.view({params.b, params.seqlen_k , params.h , params.d});
-    //at::Tensor v_ = v.view({params.b, params.seqlen_q , params.h , params.d});
-    //out = out.view({params.b, params.seqlen_q , params.h , params.d});
     auto z = at::empty({params.b*params.h, params.seqlen_q, params.seqlen_k}, torch::kInt32).to(at::kCUDA);
 
     char* y_ptr = reinterpret_cast<char*>(y.data_ptr());
@@ -227,13 +223,13 @@ void set_params_dgrad(FMHA_dgrad_params &params,
         params.kgrad_tensors.push_back(kgrad_each_tmp);
         params.vgrad_tensors.push_back(vgrad_each_tmp);
 
-        params.q_ptr.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
-        params.k_ptr.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
-        params.v_ptr.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
+        params.q_ptr.push_back(reinterpret_cast<void*>(q_each_tmp.data_ptr()));
+        params.k_ptr.push_back(reinterpret_cast<void*>(k_each_tmp.data_ptr()));
+        params.v_ptr.push_back(reinterpret_cast<void*>(v_each_tmp.data_ptr()));
         params.z_ptr.push_back(reinterpret_cast<void*>(z_ptr));
-        params.y_ptr.push_back(reinterpret_cast<const void*>(y_ptr));
-        params.lse_ptr.push_back(reinterpret_cast<const void*>(lse_ptr));
-        params.ygrad_ptr.push_back(reinterpret_cast<const void*>(ygrad_ptr));
+        params.y_ptr.push_back(reinterpret_cast<void*>(y_ptr));
+        params.lse_ptr.push_back(reinterpret_cast<void*>(lse_ptr));
+        params.ygrad_ptr.push_back(reinterpret_cast<void*>(ygrad_ptr));
         params.qgrad_ptr.push_back(reinterpret_cast<void*>(qgrad_each_tmp.data_ptr()));
         params.kgrad_ptr.push_back(reinterpret_cast<void*>(kgrad_each_tmp.data_ptr()));
         params.vgrad_ptr.push_back(reinterpret_cast<void*>(vgrad_each_tmp.data_ptr()));
@@ -723,8 +719,6 @@ bool fwd_test(bool do_verification){
             B0DataType* k_h_ptr = reinterpret_cast<B0DataType*>(k_h_ptr_f);
             B1DataType* v_h_ptr = reinterpret_cast<B1DataType*>(v_h_ptr_f);
 
-            //std::cout << "q_host[i].numel() " << q_host[i].numel() << std::endl;
-
             std::vector<ADataType> a_vector(q_h_ptr, q_h_ptr + q_host[i].numel()); //transfer tensor into vector
             a_gs_ms_ks.mData.assign(a_vector.begin(), a_vector.end());
 
@@ -871,7 +865,7 @@ bool bwd_test(bool do_verification){
     at::Tensor k_host = at::rand({batch_size*seqlen, nheads, d}, torch::kFloat16);
     at::Tensor v_host = at::rand({batch_size*seqlen, nheads, d}, torch::kFloat16);
     at::Tensor y_host = at::empty({batch_size*seqlen, nheads, d}, torch::kFloat16);
-    at::Tensor z_host = at::empty({batch_size*seqlen, nheads, d}, torch::kInt32);
+    at::Tensor z_host = at::empty({batch_size*nheads, seqlen, seqlen}, torch::kInt32);
     at::Tensor lse_host = at::empty({batch_size, nheads, seqlen}, torch::kFloat32);
 
     at::Tensor ygrad_host = at::rand({batch_size*seqlen, nheads, d}, torch::kFloat16);
@@ -1081,7 +1075,7 @@ bool bwd_test(bool do_verification){
         q_host = q_host.view({ batch_size, seqlen, nheads, d }); //64 256 16 64
         k_host = k_host.view({ batch_size, seqlen, nheads, d });
         v_host = v_host.view({ batch_size, seqlen, nheads, d });
-        z_host = z_host.view({ batch_size, seqlen, nheads, d });
+        z_host = z_host.view({ batch_size, nheads, seqlen, seqlen });
         ygrad_host = ygrad_host.view({ batch_size, seqlen, nheads, d });
 
         const int M   = seqlen;   //seqlen Q
