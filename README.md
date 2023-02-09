@@ -65,14 +65,15 @@ FlashAttention currently supports:
 Our tentative roadmap:
 1. ~~[Jun 2022] Make package pip-installable~~[Done, thanks to lucidrains].
 2. ~~[Jun 2022] Support SM86 GPUs (e.g., RTX 3080, 3090)~~[Done].
-3. [Jun 2022] Refactor to use Cutlass.
-4. ~~[Jun 2022] Support SM75 GPUs (e.g. T4)~~[Done].
-5. ~~[Jun 2022] Support bf16~~[Done].
-6. ~~[Jul 2022] Implement cross-attention~~[Done].
-7. ~~[Jul 2022] Support head dimension 128~~[Done].
-8. [Jul 2022] Support SM70 GPUs (V100).
-9. ~~[Aug 2022] Fuse rotary embedding~~[Done].
-10. [Aug 2022] Support attention bias (e.g. ALiBi, relative positional encoding).
+3. ~~[Jun 2022] Support SM75 GPUs (e.g. T4)~~[Done].
+4. ~~[Jun 2022] Support bf16~~[Done].
+5. ~~[Jul 2022] Implement cross-attention~~[Done].
+6. ~~[Jul 2022] Support head dimension 128~~[Done].
+7. ~~[Aug 2022] Fuse rotary embedding~~[Done].
+8. [Apr 2023] Refactor to use Cutlass 3.x.
+9. [May 2023] Support attention bias (e.g. ALiBi, relative positional encoding).
+10. [Jun 2023] Support SM70 GPUs (V100).
+11. [Jun 2023] Support SM90 GPUs (H100).
 
 ## Speedup and Memory Savings
 
