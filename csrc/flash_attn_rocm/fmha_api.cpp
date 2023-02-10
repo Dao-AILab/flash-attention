@@ -209,12 +209,12 @@ void set_params_dgrad(FMHA_dgrad_params &params,
         at::Tensor index_q_t = at::from_blob(index_q_v.data(), {temp_seqlen_q}, opts_).clone().to(at::kCUDA);
         at::Tensor index_k_t = at::from_blob(index_k_v.data(), {temp_seqlen_k}, opts_).clone().to(at::kCUDA);
 
-        at::Tensor q_each_tmp = torch::index_select(q, 0, index_q_t).clone().transpose(0,1).contiguous();
-        at::Tensor k_each_tmp = torch::index_select(k, 0, index_k_t).clone().transpose(0,1).contiguous();
-        at::Tensor v_each_tmp = torch::index_select(v, 0, index_k_t).clone().transpose(0,1).contiguous();
-        at::Tensor qgrad_each_tmp = torch::index_select(qgrad, 0, index_q_t).transpose(0,1).contiguous();
-        at::Tensor kgrad_each_tmp = torch::index_select(kgrad, 0, index_k_t).transpose(0,1).contiguous();
-        at::Tensor vgrad_each_tmp = torch::index_select(vgrad, 0, index_k_t).transpose(0,1).contiguous();
+        at::Tensor q_each_tmp = torch::index_select(q, 0, index_q_t).clone().transpose(0, 1).contiguous();
+        at::Tensor k_each_tmp = torch::index_select(k, 0, index_k_t).clone().transpose(0, 1).contiguous();
+        at::Tensor v_each_tmp = torch::index_select(v, 0, index_k_t).clone().transpose(0, 1).contiguous();
+        at::Tensor qgrad_each_tmp = torch::index_select(qgrad, 0, index_q_t).transpose(0, 1).contiguous();
+        at::Tensor kgrad_each_tmp = torch::index_select(kgrad, 0, index_k_t).transpose(0, 1).contiguous();
+        at::Tensor vgrad_each_tmp = torch::index_select(vgrad, 0, index_k_t).transpose(0, 1).contiguous();
 
         params.q_tensors.push_back(q_each_tmp);
         params.k_tensors.push_back(k_each_tmp);
@@ -223,13 +223,13 @@ void set_params_dgrad(FMHA_dgrad_params &params,
         params.kgrad_tensors.push_back(kgrad_each_tmp);
         params.vgrad_tensors.push_back(vgrad_each_tmp);
 
-        params.q_ptr.push_back(reinterpret_cast<void*>(q_each_tmp.data_ptr()));
-        params.k_ptr.push_back(reinterpret_cast<void*>(k_each_tmp.data_ptr()));
-        params.v_ptr.push_back(reinterpret_cast<void*>(v_each_tmp.data_ptr()));
+        params.q_ptr.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
+        params.k_ptr.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
+        params.v_ptr.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
         params.z_ptr.push_back(reinterpret_cast<void*>(z_ptr));
-        params.y_ptr.push_back(reinterpret_cast<void*>(y_ptr));
-        params.lse_ptr.push_back(reinterpret_cast<void*>(lse_ptr));
-        params.ygrad_ptr.push_back(reinterpret_cast<void*>(ygrad_ptr));
+        params.y_ptr.push_back(reinterpret_cast<const void*>(y_ptr));
+        params.lse_ptr.push_back(reinterpret_cast<const void*>(lse_ptr));
+        params.ygrad_ptr.push_back(reinterpret_cast<const void*>(ygrad_ptr));
         params.qgrad_ptr.push_back(reinterpret_cast<void*>(qgrad_each_tmp.data_ptr()));
         params.kgrad_ptr.push_back(reinterpret_cast<void*>(kgrad_each_tmp.data_ptr()));
         params.vgrad_ptr.push_back(reinterpret_cast<void*>(vgrad_each_tmp.data_ptr()));
@@ -528,9 +528,9 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
 
     run_fmha_dgrad_fp16_bf16_gfx90a(launch_params);
-    dq = torch::cat(launch_params.params.qgrad_tensors, 1).transpose(0,1).contiguous();
-    dk = torch::cat(launch_params.params.kgrad_tensors, 1).transpose(0,1).contiguous();
-    dv = torch::cat(launch_params.params.vgrad_tensors, 1).transpose(0,1).contiguous();
+    dq.copy_(torch::cat(launch_params.params.qgrad_tensors, 1).transpose(0,1).contiguous(), true);
+    dk.copy_(torch::cat(launch_params.params.kgrad_tensors, 1).transpose(0,1).contiguous(), true);
+    dv.copy_(torch::cat(launch_params.params.vgrad_tensors, 1).transpose(0,1).contiguous(), true);
     return { dq, dk, dv, softmax_d };
 }
 
@@ -769,7 +769,6 @@ bool fwd_test(bool do_verification){
             Tensor<CDataType> c_g_m_o_host_result({G0 * G1, M, O}); // scratch object after gemm1
             Tensor<LSEDataType> lse_g_m_host_result({G0 * G1, M}); // scratch object after gemm1
 
-
             std::vector<ck::index_t> c_gs_ms_os_lengths{G0, G1, M, O};
             std::vector<ck::index_t> c_gs_ms_os_strides{M * G1 * O, O, G1 * O, 1};
             std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
@@ -900,7 +899,7 @@ bool bwd_test(bool do_verification){
     int max_seqlen_k_ = seqlen;
     
     //other parameters
-    float p_dropout = 0;
+    float p_dropout = 0.0;
     float p_dropout2                = 1 - p_dropout;
     uint16_t p_dropout_in_16bits    = uint16_t(std::floor(p_dropout2 * 65535.0));
     float rp_dropout                = 1.0 / p_dropout2;
