@@ -536,9 +536,9 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
 
     run_fmha_dgrad_fp16_bf16_gfx90a(launch_params);
-    dq.copy_(torch::cat(launch_params.params.qgrad_tensors, 1).transpose(0,1).contiguous(), true);
-    dk.copy_(torch::cat(launch_params.params.kgrad_tensors, 1).transpose(0,1).contiguous(), true);
-    dv.copy_(torch::cat(launch_params.params.vgrad_tensors, 1).transpose(0,1).contiguous(), true);
+    dq.copy_(torch::cat(launch_params.params.qgrad_tensors, 1).transpose(0,1), true);
+    dk.copy_(torch::cat(launch_params.params.kgrad_tensors, 1).transpose(0,1), true);
+    dv.copy_(torch::cat(launch_params.params.vgrad_tensors, 1).transpose(0,1), true);
     return { dq, dk, dv, softmax_d };
 }
 
