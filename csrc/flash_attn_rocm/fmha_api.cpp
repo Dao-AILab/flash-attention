@@ -147,6 +147,7 @@ void set_params_dgrad(FMHA_dgrad_params &params,
                       const at::Tensor k,
                       const at::Tensor v,
                       const at::Tensor y,
+                      const at::Tensor z,
                       const at::Tensor ygrad,
                       at::Tensor qgrad,
                       at::Tensor kgrad,
@@ -191,8 +192,6 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_q.data(), params.cu_seqlens_q, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
     FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_k.data(), params.cu_seqlens_k, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
 
-    auto z = at::empty({params.b*params.h, params.seqlen_q, params.seqlen_k}, torch::kInt32).to(at::kCUDA);
-
     char* y_ptr = reinterpret_cast<char*>(y.data_ptr());
     char* z_ptr = reinterpret_cast<char*>(z.data_ptr());
     char* lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
@@ -201,17 +200,14 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     for (int i = 0; i < b; i++){
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
-
         std::vector<int> index_q_v;
         for(int i_q = 0; i_q < temp_seqlen_q; i_q++){
             index_q_v.push_back(params.host_seqlens_q[i] + i_q);
         }
-
         std::vector<int> index_k_v;
         for(int i_k = 0; i_k < temp_seqlen_k; i_k++){
             index_k_v.push_back(params.host_seqlens_k[i] + i_k);
         }
-
         at::TensorOptions opts_=at::TensorOptions().dtype(at::kInt);
 
         at::Tensor index_q_t = at::from_blob(index_q_v.data(), {temp_seqlen_q}, opts_).clone().to(at::kCUDA);
@@ -223,7 +219,6 @@ void set_params_dgrad(FMHA_dgrad_params &params,
         at::Tensor qgrad_each_tmp = torch::index_select(qgrad, 0, index_q_t).transpose(0, 1).contiguous();
         at::Tensor kgrad_each_tmp = torch::index_select(kgrad, 0, index_k_t).transpose(0, 1).contiguous();
         at::Tensor vgrad_each_tmp = torch::index_select(vgrad, 0, index_k_t).transpose(0, 1).contiguous();
-
         params.q_tensors.push_back(q_each_tmp);
         params.k_tensors.push_back(k_each_tmp);
         params.v_tensors.push_back(v_each_tmp);
@@ -234,7 +229,11 @@ void set_params_dgrad(FMHA_dgrad_params &params,
         params.q_ptr.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
         params.k_ptr.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
         params.v_ptr.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
-        params.z_ptr.push_back(reinterpret_cast<void*>(z_ptr));
+        if(p_dropout>0){
+            params.z_ptr.push_back(reinterpret_cast<void*>(z_ptr));
+        }else{
+            params.z_ptr.push_back(nullptr);
+        }
         params.y_ptr.push_back(reinterpret_cast<const void*>(y_ptr));
         params.lse_ptr.push_back(reinterpret_cast<const void*>(lse_ptr));
         params.ygrad_ptr.push_back(reinterpret_cast<const void*>(ygrad_ptr));
@@ -245,7 +244,7 @@ void set_params_dgrad(FMHA_dgrad_params &params,
         int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, data_type);
         int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, data_type);
         int temp_lse_stride = get_size_in_bytes(h * seqlen_q, acc_type);
-        int temp_z_stride = get_size_in_bytes(h * temp_seqlen_k * temp_seqlen_q, z_type);
+        int temp_z_stride = get_size_in_bytes(h * seqlen_k * seqlen_q, z_type);
         y_ptr += temp_q_stride;
         ygrad_ptr += temp_q_stride;
         lse_ptr += temp_lse_stride;
@@ -489,7 +488,6 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         max_seqlen_k = 256;
     }
     int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
-    bool loop = max_seqlen_k > blocksize_c;
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
@@ -500,8 +498,6 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
-    at::Tensor dq_tmp;
-    if (loop) { dq_tmp = torch::empty({total_q, num_heads, head_size}, opts.dtype(at::kFloat)); }
 
     if (zero_tensors) {
         dq.zero_();
@@ -511,13 +507,15 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
+
+    auto z = at::empty({batch_size*num_heads, max_seqlen_q, max_seqlen_k}, torch::kInt32).to(at::kCUDA);
     set_params_dgrad(launch_params.params,
                      batch_size,
                      max_seqlen_q,
                      max_seqlen_k,
                      num_heads,
                      head_size,
-                     q, k, v, out,
+                     q, k, v, out, z,
                      dout, dq, dk, dv,
                      cu_seqlens_q.data_ptr(),
                      cu_seqlens_k.data_ptr(),
@@ -534,7 +532,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         std::lock_guard<std::mutex> lock(gen->mutex_);
         launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
     }
-
+    
     run_fmha_dgrad_fp16_bf16_gfx90a(launch_params);
     dq.copy_(torch::cat(launch_params.params.qgrad_tensors, 1).transpose(0,1), true);
     dk.copy_(torch::cat(launch_params.params.kgrad_tensors, 1).transpose(0,1), true);
@@ -913,7 +911,7 @@ bool bwd_test(bool do_verification){
     float rp_dropout                = 1.0 / p_dropout2;
     const unsigned long long seed   = 1;
     const unsigned long long offset = 0;           
-    float softmax_scale = 0.125;  
+    float softmax_scale = 1/sqrt(d);  
     bool zero_tensors = false;    
     bool is_causal = false;       
     bool return_softmax = false;  
