@@ -53,7 +53,7 @@ struct FMHA_fprop_params : public Qkv_params {
     // The O matrix (output).
     // void * __restrict__ o_ptr;
     std::vector<void*> o_ptr;
-
+    
     // The stride between rows of O.
     // size_t o_stride_in_elts;
     // size_t o_stride_in_bytes;
@@ -124,6 +124,9 @@ struct FMHA_dgrad_params : public Qkv_params {
     std::vector<void*> kgrad_ptr;
     std::vector<void*> vgrad_ptr;
 
+    std::vector<at::Tensor> qgrad_tensors;
+    std::vector<at::Tensor> kgrad_tensors;
+    std::vector<at::Tensor> vgrad_tensors;
     // The dimensions.
     int b, seqlen_q, seqlen_k, d;
 

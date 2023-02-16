@@ -127,7 +127,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
           NPerBlock,        // NPerBlock
           KPerBlock,        // KPerBlock
           Gemm1NPerBlock,   // Gemm1NPerBlock
-          32,               // Gemm1KPerBlock
+          64,               // Gemm1KPerBlock
           8,                // AK1
           8,                // BK1
           2,                // B1K1
@@ -153,7 +153,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
 
   bool time_kernel = false;
 
-  bool input_permute = true;
+  bool input_permute = false;
   bool output_permute = true;
 
   float alpha = launch_params.params.scale_bmm1f;
@@ -183,15 +183,6 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
   int num_heads = launch_params.params.h;
   int head_dim = launch_params.params.d;
 
-  // int* host_seqlens_q;
-  // int* host_seqlens_k;
-  // host_seqlens_q = (int*)malloc((launch_params.params.b+1)*sizeof(int));
-  // host_seqlens_k = (int*)malloc((launch_params.params.b+1)*sizeof(int));
-  // FMHA_CHECK_HIP(hipMemcpy(host_seqlens_q, launch_params.params.cu_seqlens_q,
-  // (launch_params.params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
-  // FMHA_CHECK_HIP(hipMemcpy(host_seqlens_k, launch_params.params.cu_seqlens_k,
-  // (launch_params.params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
-
   for (size_t i = 0; i < batch_size; i++) {
     int M = launch_params.params.host_seqlens_q[i + 1] -
             launch_params.params.host_seqlens_q[i]; // seqlen Q
@@ -201,6 +192,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
     int O = head_dim;
     int G0 = 1; // G0 = batch_size
     int G1 = num_heads;
+
     std::vector<ck::index_t> q_gs_ms_ks_lengths{G0, G1, M, K};
     std::vector<ck::index_t> q_gs_ms_ks_strides =
         input_permute ? std::vector<ck::index_t>{M * G1 * K, K, G1 * K, 1}

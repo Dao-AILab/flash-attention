@@ -29,6 +29,7 @@
 #include "ck/library/utility/literals.hpp"
 #include "ck/library/reference_tensor_operation/cpu/reference_batched_gemm.hpp"
 #include "ck/library/reference_tensor_operation/cpu/reference_softmax.hpp"
+#include "ck/library/reference_tensor_operation/cpu/reference_dropout.hpp"
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
