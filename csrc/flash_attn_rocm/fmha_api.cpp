@@ -137,11 +137,11 @@ void set_params_fprop(FMHA_fprop_params &params,
 
 void set_params_dgrad(FMHA_dgrad_params &params,
                       // sizes
-                      const long b,
-                      const long seqlen_q,
-                      const long seqlen_k,
-                      const long h,
-                      const long d,
+                      const size_t b,
+                      const size_t seqlen_q,
+                      const size_t seqlen_k,
+                      const size_t h,
+                      const size_t d,
                       // device pointers
                       const at::Tensor q,
                       const at::Tensor k,
@@ -196,9 +196,6 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     char* z_ptr = reinterpret_cast<char*>(z.data_ptr());
     char* lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
     char* ygrad_ptr = reinterpret_cast<char*>(ygrad.data_ptr());
-    long q_offset = 0;
-    long k_offset = 0;
-    long v_offset = 0;
     
     for (int i = 0; i < b; i++){
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
