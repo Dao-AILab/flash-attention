@@ -137,11 +137,11 @@ void set_params_fprop(FMHA_fprop_params &params,
 
 void set_params_dgrad(FMHA_dgrad_params &params,
                       // sizes
-                      const size_t b,
-                      const size_t seqlen_q,
-                      const size_t seqlen_k,
-                      const size_t h,
-                      const size_t d,
+                      const long b,
+                      const long seqlen_q,
+                      const long seqlen_k,
+                      const long h,
+                      const long d,
                       // device pointers
                       const at::Tensor q,
                       const at::Tensor k,
@@ -196,29 +196,21 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     char* z_ptr = reinterpret_cast<char*>(z.data_ptr());
     char* lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
     char* ygrad_ptr = reinterpret_cast<char*>(ygrad.data_ptr());
-
+    long q_offset = 0;
+    long k_offset = 0;
+    long v_offset = 0;
+    
     for (int i = 0; i < b; i++){
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
-        std::vector<int> index_q_v;
-        for(int i_q = 0; i_q < temp_seqlen_q; i_q++){
-            index_q_v.push_back(params.host_seqlens_q[i] + i_q);
-        }
-        std::vector<int> index_k_v;
-        for(int i_k = 0; i_k < temp_seqlen_k; i_k++){
-            index_k_v.push_back(params.host_seqlens_k[i] + i_k);
-        }
-        at::TensorOptions opts_=at::TensorOptions().dtype(at::kInt);
+        
+        auto q_each_tmp = q.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).transpose(0, 1).contiguous();
+        auto k_each_tmp = k.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).transpose(0, 1).contiguous();
+        auto v_each_tmp = v.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).transpose(0, 1).contiguous();
+        auto qgrad_each_tmp = qgrad.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).transpose(0, 1).contiguous();
+        auto kgrad_each_tmp = kgrad.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).transpose(0, 1).contiguous();
+        auto vgrad_each_tmp = vgrad.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).transpose(0, 1).contiguous();
 
-        at::Tensor index_q_t = at::from_blob(index_q_v.data(), {temp_seqlen_q}, opts_).clone().to(at::kCUDA);
-        at::Tensor index_k_t = at::from_blob(index_k_v.data(), {temp_seqlen_k}, opts_).clone().to(at::kCUDA);
-
-        at::Tensor q_each_tmp = torch::index_select(q, 0, index_q_t).clone().transpose(0, 1).contiguous();
-        at::Tensor k_each_tmp = torch::index_select(k, 0, index_k_t).clone().transpose(0, 1).contiguous();
-        at::Tensor v_each_tmp = torch::index_select(v, 0, index_k_t).clone().transpose(0, 1).contiguous();
-        at::Tensor qgrad_each_tmp = torch::index_select(qgrad, 0, index_q_t).transpose(0, 1).contiguous();
-        at::Tensor kgrad_each_tmp = torch::index_select(kgrad, 0, index_k_t).transpose(0, 1).contiguous();
-        at::Tensor vgrad_each_tmp = torch::index_select(vgrad, 0, index_k_t).transpose(0, 1).contiguous();
         params.q_tensors.push_back(q_each_tmp);
         params.k_tensors.push_back(k_each_tmp);
         params.v_tensors.push_back(v_each_tmp);
