@@ -496,8 +496,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
-
-    auto z = at::empty({batch_size*num_heads, max_seqlen_q, max_seqlen_k}, torch::kInt32).to(at::kCUDA);
+    auto z = at::empty({batch_size*num_heads, max_seqlen_q, max_seqlen_k}, opts.dtype(torch::kInt32).device(at::kCUDA));
     set_params_dgrad(launch_params.params,
                      batch_size,
                      max_seqlen_q,
