@@ -80,7 +80,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     
     //init the instance with parameters
     using DeviceGemmInstance =
-        ck::tensor_operation::device::DeviceGroupedGemmSoftmaxGemmPermute_Train_Xdl_CShuffle<
+        ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle<
             NumDimG,
             NumDimM,
             NumDimN,
