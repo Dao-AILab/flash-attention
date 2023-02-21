@@ -12,7 +12,7 @@ WORKDIR /workspace
 USER root
 
 RUN pip install ninja
-COPY ./ /workspace/flash-attention_private/
-RUN cd /workspace/flash-attention_private \
+RUN git clone --recurse-submodules --branch flash_attention_for_rocm https://github.com/ROCmSoftwarePlatform/flash-attention.git
+RUN cd /workspace/flash-attention \
        && patch /opt/conda/lib/python3.7/site-packages/torch/utils/hipify/hipify_python.py hipify_patch.patch \
        && python setup.py install
