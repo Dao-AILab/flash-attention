@@ -37,7 +37,7 @@ def attention_ref(qkv, attn_mask, dropout_p, upcast=False, causal=False):
 
 
 torch.manual_seed(0)
-repeats = 30
+repeats = 250
 batch_size = [1,32,64,128]
 nheads = 16
 seqlen = [1024,2048,4096]
@@ -79,8 +79,8 @@ for bs in batch_size:
 
         relative_perf = ((pyt_measurement.mean-fa_measurement.mean)/pyt_measurement.mean) * 100
 
-        result_summary.append([bs,sq,relative_perf])
+        result_summary.append([bs,sq,pyt_measurement.mean,fa_measurement.mean,relative_perf])
         
         print(f'Flash Attention Speedup: {relative_perf}\n')
 
-print(f'batch size, sequence length, speedup relative to PyTorch\n {result_summary}')
+print(f'batch size, sequence length, PyTorch Standard Attention, FlashAttention, speedup relative to PyTorch\n {result_summary}')
