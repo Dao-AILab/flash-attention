@@ -46,6 +46,7 @@ template<typename InputType,
 void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_params){
     
     using F32 = float;
+    using U16 = unsigned short;
 
     using PassThrough = ck::tensor_operation::element_wise::PassThrough;
 
@@ -55,6 +56,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     using AccDataType      = F32;
     using CShuffleDataType = F32;
     using CDataType        = InputType;
+    using ZDataType        = U16;
     using LSEDataType      = F32;
     using Acc0BiasDataType = ck::Tuple<>;
     using Acc1BiasDataType = ck::Tuple<>;
@@ -80,7 +82,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     
     //init the instance with parameters
     using DeviceGemmInstance =
-        ck::tensor_operation::device::DeviceGroupedGemmSoftmaxGemmPermute_Train_Xdl_CShuffle<
+        ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle<
             NumDimG,
             NumDimM,
             NumDimN,
@@ -90,6 +92,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
             B0DataType,
             B1DataType,
             CDataType,
+            ZDataType,
             LSEDataType,
             Acc0BiasDataType,
             Acc1BiasDataType,
@@ -164,6 +167,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     auto p_b0 = launch_params.params.k_ptr;
     auto p_b1 = launch_params.params.v_ptr;
     auto p_c = launch_params.params.o_ptr;
+    auto p_z = launch_params.params.s_ptr;
     auto p_lse = launch_params.params.softmax_lse_ptr;
 
     std::vector<typename DeviceGemmInstance::ProblemDesc> problem_descs;
@@ -208,6 +212,12 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
             output_permute
                 ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1} // C layout [G0, M, G1, O]
                 : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // C layout [G0, G1, M, O]
+        
+        std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
+        std::vector<ck::index_t> z_gs_ms_ns_strides =
+            output_permute
+                ? std::vector<ck::index_t>{M * G1 * N, N, G1 * N, 1} // Z layout [G0, M, G1, N]
+                : std::vector<ck::index_t>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
 
         std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
         std::vector<ck::index_t> lse_gs_ms_strides =
@@ -221,6 +231,8 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
                                  b1_gs_os_ns_strides,
                                  c_gs_ms_os_lengths,
                                  c_gs_ms_os_strides,
+                                 z_gs_ms_ns_lengths,
+                                 z_gs_ms_ns_strides,
                                  lse_gs_ms_lengths,
                                  lse_gs_ms_strides,
                                  {},   // acc0_biases_gs_ms_ns_lengths
@@ -237,6 +249,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
                                       p_b0,
                                       p_b1,
                                       p_c,
+                                      p_z,
                                       p_lse,
                                       {},
                                       {},

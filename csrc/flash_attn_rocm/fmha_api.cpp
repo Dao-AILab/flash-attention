@@ -67,6 +67,7 @@ void set_params_fprop(FMHA_fprop_params &params,
 
     char* out_ptr = reinterpret_cast<char*>(out.data_ptr());
     char* lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
+    char* s_ptr = reinterpret_cast<char*>(s_d);
 
     //std::cout << "multiply" << params.seqlen_q * params.h * params.d<< std::endl;
 
@@ -120,6 +121,13 @@ void set_params_fprop(FMHA_fprop_params &params,
         params.softmax_lse_ptr.push_back(reinterpret_cast<void*>(lse_ptr));
         int temp_lse_stride = get_size_in_bytes(h * seqlen_q, acc_type);
         lse_ptr = lse_ptr + temp_lse_stride;
+
+        if(s_d){
+            params.s_ptr.push_back(reinterpret_cast<void*>(s_ptr + i * h * seqlen_q * seqlen_k * sizeof(uint16_t)));
+        }
+        else{
+            params.s_ptr.push_back(nullptr);
+        }
     }
 
     // Set the different scale values.
@@ -134,7 +142,7 @@ void set_params_fprop(FMHA_fprop_params &params,
     params.is_causal = is_causal;
     params.num_splits = num_splits;
 }
-
+/*
 void set_params_dgrad(FMHA_dgrad_params &params,
                       // sizes
                       const size_t b,
@@ -253,7 +261,7 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     params.is_causal = is_causal;
     params.num_splits = num_splits;
 }
-
+*/
 std::vector<at::Tensor>
 mha_fwd(const at::Tensor &q,
         const at::Tensor &k,
@@ -337,12 +345,15 @@ mha_fwd(const at::Tensor &q,
     // auto softmax_lse = torch::full({batch_size, num_heads, max_seqlen_k}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
 
     at::Tensor s;
-    if (return_softmax) { s = at::empty({ batch_size, num_heads, max_seqlen_q, max_seqlen_k }, opts); }
+    if (return_softmax) { 
+        s = at::empty({ batch_size, num_heads, max_seqlen_q, max_seqlen_k }, opts);
+        s.zero_(); 
+    }
 
     if (zero_tensors) {
         out.zero_();
         softmax_lse.fill_(-std::numeric_limits<float>::infinity()).to(at::kCUDA);
-        if (return_softmax) {s.zero_();}
+        //if (return_softmax) {s.zero_();}
     }
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
@@ -381,14 +392,12 @@ mha_fwd(const at::Tensor &q,
 
     run_fmha_fp16_bf16_gfx90a(launch_params);
 
-    //at::Tensor softmax_lse_result = softmax_lse.to(torch::kCPU);
-
     std::vector<at::Tensor> result = {softmax_lse};
     if (return_softmax) {result.push_back(s);}
     return result;
 }
 
-
+/*
 std::vector<at::Tensor>
 mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         const at::Tensor &q,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
@@ -528,16 +537,16 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     dv.copy_(torch::cat(launch_params.params.vgrad_tensors, 1).transpose(0,1), true);
     return { dq, dk, dv, softmax_d };
 }
-
+*/
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "Fused Multi-head Self-attention";
     m.def("fwd", &mha_fwd, "Forward pass");
-    m.def("bwd", &mha_bwd, "Backward pass");
+    // m.def("bwd", &mha_bwd, "Backward pass");
     // m.def("fwd_block", &mha_fwd_block, "Forward pass (blocksparse)");
     // m.def("bwd_block", &mha_bwd_block, "Backward pass (blocksparse)");
 }
-
+/*
 
 //main function to test with the API
 bool fwd_test(bool do_verification){
@@ -846,6 +855,7 @@ bool fwd_test(bool do_verification){
     }
     return true;
 }
+
 
 bool bwd_test(bool do_verification){
     int batch_size = 2;
@@ -1296,7 +1306,7 @@ int main(){
     bool pass = true;
     bool do_verification = true; // whether do verification
     pass &= fwd_test(do_verification);
-    pass &= bwd_test(do_verification);
+    //pass &= bwd_test(do_verification);
     if(do_verification){
         if(pass)
             std::cout << "Verification passed!" <<std::endl;
@@ -1305,3 +1315,4 @@ int main(){
     }
     return pass ? 0 : 1;
 }
+*/
