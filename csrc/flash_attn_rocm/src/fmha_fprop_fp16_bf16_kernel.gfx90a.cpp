@@ -152,7 +152,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
         
     bool time_kernel    = false;
 
-    bool input_permute  = false;//////////
+    bool input_permute  = false;
     bool output_permute = true;
 
     float alpha = launch_params.params.scale_bmm1f;
@@ -215,7 +215,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
         
         std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
         std::vector<ck::index_t> z_gs_ms_ns_strides =
-            output_permute
+            input_permute
                 ? std::vector<ck::index_t>{M * G1 * N, N, G1 * N, 1} // Z layout [G0, M, G1, N]
                 : std::vector<ck::index_t>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
 

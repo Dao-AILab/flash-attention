@@ -344,10 +344,13 @@ mha_fwd(const at::Tensor &q,
     auto softmax_lse = at::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
     // auto softmax_lse = torch::full({batch_size, num_heads, max_seqlen_k}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
 
-    at::Tensor s;
+    //at::Tensor s;
+    DeviceMem z_device_buf(sizeof(unsigned short) * batch_size * num_heads * max_seqlen_q * max_seqlen_k);
     if (return_softmax) { 
-        s = at::empty({ batch_size, num_heads, max_seqlen_q, max_seqlen_k }, opts.dtype(at::kShort));
-        s.zero_(); 
+        //s = at::empty({ batch_size, num_heads, max_seqlen_q, max_seqlen_k }, opts.dtype(at::kInt));
+        //s.zero_().to(at::kCPU); 
+        //z_device_buf(sizeof(unsigned short) * batch_size * num_heads * max_seqlen_q * max_seqlen_k);
+        z_device_buf.SetZero();
     }
 
     if (zero_tensors) {
@@ -369,7 +372,8 @@ mha_fwd(const at::Tensor &q,
                      cu_seqlens_q.data_ptr(),
                      cu_seqlens_k.data_ptr(),
                      nullptr,
-                     return_softmax ? s.data_ptr() : nullptr,
+                     //return_softmax ? s.data_ptr() : nullptr,
+                     return_softmax ? z_device_buf.GetDeviceBuffer() : nullptr,
                      softmax_lse.data_ptr(),
                      p_dropout,
                      softmax_scale,
@@ -393,7 +397,32 @@ mha_fwd(const at::Tensor &q,
     run_fmha_fp16_bf16_gfx90a(launch_params);
 
     std::vector<at::Tensor> result = {softmax_lse};
-    if (return_softmax) {result.push_back(s);}
+    if (return_softmax) {
+        const int M   = max_seqlen_q;   // seqlen Q
+        const int N   = max_seqlen_k;   // seqlen K
+        const int G0  = batch_size;     // G0 = batch_size
+        const int G1  = num_heads;   // num_heads
+        //std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
+        //std::vector<ck::index_t> z_gs_ms_ns_strides{M * G1 * N, N, G1 * N, 1}; // Z layout [G0, G1, M, N]
+
+        Tensor<unsigned short> z_host({G0, G1, M, N});
+        Tensor<int> z_host_int({G0, G1, M, N});
+
+        z_device_buf.FromDevice(z_host.mData.data());
+
+        //printf("print z_host \n");
+        //z_host.ForEach([&](auto& self, auto idx) {printf("%u ", self(idx));});
+
+        z_host.ForEach([&](auto& self, auto idx) {
+            z_host_int(idx) = static_cast<int>(self(idx));
+        });
+
+        at::TensorOptions s_opts_=at::TensorOptions().dtype(at::kInt);
+        at::Tensor s = at::from_blob(z_host_int.mData.data(), {G0, G1, M, N}, s_opts_).clone().to(at::kCUDA);
+        //at::Tensor s = i_s.transpose(1,2).clone().contiguous();
+
+        result.push_back(s);
+    }
     return result;
 }
 
@@ -539,7 +568,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 }
 */
 
-/*
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "Fused Multi-head Self-attention";
     m.def("fwd", &mha_fwd, "Forward pass");
@@ -547,7 +576,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // m.def("fwd_block", &mha_fwd_block, "Forward pass (blocksparse)");
     // m.def("bwd_block", &mha_bwd_block, "Backward pass (blocksparse)");
 }
-*/
+
 //main function to test with the API
 bool fwd_test(bool do_verification){
     int batch_size = 64;
@@ -845,8 +874,8 @@ bool fwd_test(bool do_verification){
 
             ref_softmax_invoker.Run(ref_softmax_argument);
 
-            printf("print z_g_m_n \n");
-            z_g_m_n.ForEach([&](auto& self, auto idx) {printf("%u ", self(idx));});
+            //printf("print z_g_m_n \n");
+            //z_g_m_n.ForEach([&](auto& self, auto idx) {printf("%u ", self(idx));});
 
             // dropout after softmax
             auto ref_dropout         = ReferenceDropoutInstance{};
