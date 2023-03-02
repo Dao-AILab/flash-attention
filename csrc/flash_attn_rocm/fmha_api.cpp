@@ -405,20 +405,25 @@ mha_fwd(const at::Tensor &q,
         //std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
         //std::vector<ck::index_t> z_gs_ms_ns_strides{M * G1 * N, N, G1 * N, 1}; // Z layout [G0, G1, M, N]
 
-        Tensor<unsigned short> z_host({G0, G1, M, N});
+        bool input_permute = false;
+
+        std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
+        std::vector<ck::index_t> z_gs_ms_ns_strides =
+            input_permute
+                ? std::vector<ck::index_t>{M * G1 * N, N, G1 * N, 1} // Z layout [G0, M, G1, N]
+                : std::vector<ck::index_t>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
+
+        Tensor<unsigned short> z_host(z_gs_ms_ns_lengths, z_gs_ms_ns_strides);
         Tensor<int> z_host_int({G0, G1, M, N});
 
         z_device_buf.FromDevice(z_host.mData.data());
 
-        //printf("print z_host \n");
-        //z_host.ForEach([&](auto& self, auto idx) {printf("%u ", self(idx));});
-
         z_host.ForEach([&](auto& self, auto idx) {
-            z_host_int(idx) = static_cast<int>(self(idx));
+            z_host_int(idx[0],idx[1],idx[2],idx[3]) = static_cast<int>(self(idx));
         });
 
         at::TensorOptions s_opts_=at::TensorOptions().dtype(at::kInt);
-        at::Tensor s = at::from_blob(z_host_int.mData.data(), {G0, G1, M, N}, s_opts_).clone().to(at::kCUDA);
+        at::Tensor s = at::from_blob(z_host_int.mData.data(), {G0, G1, M, N}, s_opts_).contiguous().clone().to(at::kCUDA);
         //at::Tensor s = i_s.transpose(1,2).clone().contiguous();
 
         result.push_back(s);
@@ -568,14 +573,15 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 }
 */
 
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "Fused Multi-head Self-attention";
-    m.def("fwd", &mha_fwd, "Forward pass");
-    // m.def("bwd", &mha_bwd, "Backward pass");
-    // m.def("fwd_block", &mha_fwd_block, "Forward pass (blocksparse)");
-    // m.def("bwd_block", &mha_bwd_block, "Backward pass (blocksparse)");
-}
+//
+//PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+//    m.doc() = "Fused Multi-head Self-attention";
+//    m.def("fwd", &mha_fwd, "Forward pass");
+//    // m.def("bwd", &mha_bwd, "Backward pass");
+//    // m.def("fwd_block", &mha_fwd_block, "Forward pass (blocksparse)");
+//    // m.def("bwd_block", &mha_bwd_block, "Backward pass (blocksparse)");
+//}
+//
 
 //main function to test with the API
 bool fwd_test(bool do_verification){
@@ -813,7 +819,7 @@ bool fwd_test(bool do_verification){
             lse_gs_ms_device_result.mData.assign(result_lse_vector.begin(), result_lse_vector.end());
 
             void* z_host_ptr_f = z_device_result[i].data_ptr();
-            ZDataType* z_host_ptr = reinterpret_cast<ZDataType*>(z_host_ptr_f);
+            ZDataType* z_host_ptr = reinterpret_cast<int*>(z_host_ptr_f);
             std::vector<ZDataType> result_z_vector(z_host_ptr, z_host_ptr + z_device_result[i].numel()); //transfer tensor into vector
             z_gs_ms_ns_device_result.mData.assign(result_z_vector.begin(), result_z_vector.end());
 
