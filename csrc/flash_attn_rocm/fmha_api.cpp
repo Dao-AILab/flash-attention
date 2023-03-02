@@ -573,15 +573,15 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 }
 */
 
-//
-//PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-//    m.doc() = "Fused Multi-head Self-attention";
-//    m.def("fwd", &mha_fwd, "Forward pass");
-//    // m.def("bwd", &mha_bwd, "Backward pass");
-//    // m.def("fwd_block", &mha_fwd_block, "Forward pass (blocksparse)");
-//    // m.def("bwd_block", &mha_bwd_block, "Backward pass (blocksparse)");
-//}
-//
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.doc() = "Fused Multi-head Self-attention";
+    m.def("fwd", &mha_fwd, "Forward pass");
+    // m.def("bwd", &mha_bwd, "Backward pass");
+    // m.def("fwd_block", &mha_fwd_block, "Forward pass (blocksparse)");
+    // m.def("bwd_block", &mha_bwd_block, "Backward pass (blocksparse)");
+}
+
 
 //main function to test with the API
 bool fwd_test(bool do_verification){
@@ -819,7 +819,7 @@ bool fwd_test(bool do_verification){
             lse_gs_ms_device_result.mData.assign(result_lse_vector.begin(), result_lse_vector.end());
 
             void* z_host_ptr_f = z_device_result[i].data_ptr();
-            ZDataType* z_host_ptr = reinterpret_cast<int*>(z_host_ptr_f);
+            ZDataType* z_host_ptr = reinterpret_cast<ZDataType*>(z_host_ptr_f);
             std::vector<ZDataType> result_z_vector(z_host_ptr, z_host_ptr + z_device_result[i].numel()); //transfer tensor into vector
             z_gs_ms_ns_device_result.mData.assign(result_z_vector.begin(), result_z_vector.end());
 
