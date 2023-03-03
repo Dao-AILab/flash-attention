@@ -41,11 +41,13 @@ template<typename InputType,
          ck::index_t MPerXDL,      ck::index_t NPerXDL,   ck::index_t NXdlPerWave, ck::index_t Gemm1NXdlPerWave,
          typename ABlockTransfer,  bool ABlockLdsExtraM,  typename BBlockTransfer, bool B0BlockLdsExtraN,
          typename B1BlockTransfer, ck::index_t CShuffleNXdlPerWavePerShuffle, 
-         typename CShuffleBlockTransferClusterLengths, 
+         ck::index_t B1BlockTransferSrcScalarPerVector, typename CShuffleBlockTransferClusterLengths, 
+         //typename CShuffleBlockTransferClusterLengths, 
          MaskingSpecialization MaskingSpec>
 void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_params){
     
     using F32 = float;
+    using U16 = unsigned short;
 
     using PassThrough = ck::tensor_operation::element_wise::PassThrough;
 
@@ -55,6 +57,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     using AccDataType      = F32;
     using CShuffleDataType = F32;
     using CDataType        = InputType;
+    using ZDataType        = U16;
     using LSEDataType      = F32;
     using Acc0BiasDataType = ck::Tuple<>;
     using Acc1BiasDataType = ck::Tuple<>;
@@ -90,6 +93,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
             B0DataType,
             B1DataType,
             CDataType,
+            ZDataType,
             LSEDataType,
             Acc0BiasDataType,
             Acc1BiasDataType,
@@ -111,7 +115,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
             NPerBlock,         // NPerBlock
             KPerBlock,         // KPerBlock
             Gemm1NPerBlock,    // Gemm1NPerBlock
-            32,                // Gemm1KPerBlock
+            64,                // Gemm1KPerBlock //
             8,                 // AK1
             8,                 // BK1
             2,                 // B1K1
@@ -138,7 +142,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
             S<0, 2, 1>,
             S<0, 2, 1>,
             1,
-            4,
+            B1BlockTransferSrcScalarPerVector,             //B1BlockTransferSrcScalarPerVector
             2,
             false,
             1,              // CShuffleMXdlPerWavePerShuffle
@@ -149,7 +153,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
         
     bool time_kernel    = false;
 
-    bool input_permute  = false;//////////
+    bool input_permute  = false;
     bool output_permute = true;
 
     float alpha = launch_params.params.scale_bmm1f;
@@ -164,6 +168,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     auto p_b0 = launch_params.params.k_ptr;
     auto p_b1 = launch_params.params.v_ptr;
     auto p_c = launch_params.params.o_ptr;
+    auto p_z = launch_params.params.s_ptr;
     auto p_lse = launch_params.params.softmax_lse_ptr;
 
     std::vector<typename DeviceGemmInstance::ProblemDesc> problem_descs;
@@ -208,6 +213,12 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
             output_permute
                 ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1} // C layout [G0, M, G1, O]
                 : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // C layout [G0, G1, M, O]
+        
+        std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
+        std::vector<ck::index_t> z_gs_ms_ns_strides =
+            input_permute
+                ? std::vector<ck::index_t>{M * G1 * N, N, G1 * N, 1} // Z layout [G0, M, G1, N]
+                : std::vector<ck::index_t>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
 
         std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
         std::vector<ck::index_t> lse_gs_ms_strides =
@@ -221,6 +232,8 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
                                  b1_gs_os_ns_strides,
                                  c_gs_ms_os_lengths,
                                  c_gs_ms_os_strides,
+                                 z_gs_ms_ns_lengths,
+                                 z_gs_ms_ns_strides,
                                  lse_gs_ms_lengths,
                                  lse_gs_ms_strides,
                                  {},   // acc0_biases_gs_ms_ns_lengths
@@ -237,6 +250,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
                                       p_b0,
                                       p_b1,
                                       p_c,
+                                      p_z,
                                       p_lse,
                                       {},
                                       {},
@@ -275,8 +289,50 @@ void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) 
     //ck::index_t MPerBlock,    ck::index_t NPerBlock, ck::index_t KPerBlock,   ck::index_t Gemm1NPerBlock,
     //ck::index_t MPerXDL,      ck::index_t NPerXDL,   ck::index_t NXdlPerWave, ck::index_t Gemm1NXdlPerWave,
     //typename ABlockTransfer,  bool ABlockLdsExtraM,  typename BBlockTransfer, bool B0BlockLdsExtraN,
-    //typename B1BlockTransfer, ck::index_t CShuffleNXdlPerWavePerShuffle >
+    //typename B1BlockTransfer, ck::index_t CShuffleNXdlPerWavePerShuffle 
+    //ck::index_t B1BlockTransferSrcScalarPerVector, typename CShuffleBlockTransferClusterLengths>
 
+    FP16_SWITCH(launch_params.params.is_bf16, [&] {
+        if(launch_params.params.is_causal){
+            if(launch_params.params.d <= 32){
+                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 32, 
+                                                            32,  32,  4,  1, 
+                                                            S<4, 64, 1>, true, S<4, 64, 1>, true,
+                                                            S<16, 16, 1>, 1, 
+                                                            2, S<1, 64, 1, 4>,
+                                                            MaskingSpec_causal>(launch_params);
+            }
+            else if(launch_params.params.d <= 128){
+                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 128, 
+                                                            32,  32,  4,  4, 
+                                                            S<4, 64, 1>, true, S<4, 64, 1>, true,
+                                                            S<16, 16, 1>, 2, 
+                                                            4, S<1, 32, 1, 8>,
+                                                            MaskingSpec_causal>(launch_params);
+
+            }
+        }
+        else{
+            if(launch_params.params.d <= 32){
+                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 32, 
+                                                            32,  32,  4,  1, 
+                                                            S<4, 64, 1>, true, S<4, 64, 1>, true,
+                                                            S<16, 16, 1>, 1, 
+                                                            2, S<1, 64, 1, 4>,
+                                                            MaskingSpec_default>(launch_params);
+            }
+            else if(launch_params.params.d <= 128){
+                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 128, 
+                                                            32,  32,  4,  4, 
+                                                            S<4, 64, 1>, true, S<4, 64, 1>, true,
+                                                            S<16, 16, 1>, 2, 
+                                                            4, S<1, 32, 1, 8>,
+                                                            MaskingSpec_default>(launch_params);
+            }
+        }
+    });
+
+/*
     FP16_SWITCH(launch_params.params.is_bf16, [&] {
         if(launch_params.params.is_causal){
             if(launch_params.params.b <= 16){
@@ -433,5 +489,5 @@ void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) 
             }
         }
     });
-
+*/
 }
