@@ -197,7 +197,7 @@ struct Launch_params{
 
 void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params);
 
-//void run_fmha_dgrad_fp16_bf16_gfx90a(Launch_params<FMHA_dgrad_params> &launch_params);
+void run_fmha_dgrad_fp16_bf16_gfx90a(Launch_params<FMHA_dgrad_params> &launch_params);
 
 //void run_fmha_block_fp16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
 

@@ -62,9 +62,9 @@ void set_params_fprop(FMHA_fprop_params &params,
 
     params.host_seqlens_q = std::vector<int>(params.b+1);
     params.host_seqlens_k = std::vector<int>(params.b+1);
-    FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_q.data(), params.cu_seqlens_q, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
-    FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_k.data(), params.cu_seqlens_k, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
-
+    auto stream = at::cuda::getCurrentHIPStream().stream();
+    FMHA_CHECK_HIP(hipMemcpyAsync(params.host_seqlens_q.data(), params.cu_seqlens_q, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost, stream));
+    FMHA_CHECK_HIP(hipMemcpyAsync(params.host_seqlens_k.data(), params.cu_seqlens_k, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost, stream));
     char* out_ptr = reinterpret_cast<char*>(out.data_ptr());
     char* lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
     char* s_ptr = reinterpret_cast<char*>(s_d);
@@ -86,24 +86,9 @@ void set_params_fprop(FMHA_fprop_params &params,
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
 
-        std::vector<int> index_q_v;
-        for(int i_q = 0; i_q < temp_seqlen_q; i_q++){
-            index_q_v.push_back(params.host_seqlens_q[i] + i_q);
-        }
-
-        std::vector<int> index_k_v;
-        for(int i_k = 0; i_k < temp_seqlen_k; i_k++){
-            index_k_v.push_back(params.host_seqlens_k[i] + i_k);
-        }
-
-        at::TensorOptions opts_=at::TensorOptions().dtype(at::kInt);
-
-        at::Tensor index_q_t = at::from_blob(index_q_v.data(), {temp_seqlen_q}, opts_).clone().to(at::kCUDA);
-        at::Tensor index_k_t = at::from_blob(index_k_v.data(), {temp_seqlen_k}, opts_).clone().to(at::kCUDA);
-
-        at::Tensor q_each_tmp = torch::index_select(q, 0, index_q_t).clone().transpose(0,1).contiguous();
-        at::Tensor k_each_tmp = torch::index_select(k, 0, index_k_t).clone().transpose(0,1).contiguous();
-        at::Tensor v_each_tmp = torch::index_select(v, 0, index_k_t).clone().transpose(0,1).contiguous();
+        auto q_each_tmp = q.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).transpose(0, 1).contiguous();
+        auto k_each_tmp = k.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).transpose(0, 1).contiguous();
+        auto v_each_tmp = v.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).transpose(0, 1).contiguous();
 
         params.q_tensors.push_back(q_each_tmp);
         params.k_tensors.push_back(k_each_tmp);
@@ -142,7 +127,7 @@ void set_params_fprop(FMHA_fprop_params &params,
     params.is_causal = is_causal;
     params.num_splits = num_splits;
 }
-/*
+
 void set_params_dgrad(FMHA_dgrad_params &params,
                       // sizes
                       const size_t b,
@@ -197,8 +182,9 @@ void set_params_dgrad(FMHA_dgrad_params &params,
 
     params.host_seqlens_q = std::vector<int>(params.b+1);
     params.host_seqlens_k = std::vector<int>(params.b+1);
-    FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_q.data(), params.cu_seqlens_q, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
-    FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_k.data(), params.cu_seqlens_k, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
+    auto stream = at::cuda::getCurrentHIPStream().stream();
+    FMHA_CHECK_HIP(hipMemcpyAsync(params.host_seqlens_q.data(), params.cu_seqlens_q, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost, stream));
+    FMHA_CHECK_HIP(hipMemcpyAsync(params.host_seqlens_k.data(), params.cu_seqlens_k, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost, stream));
 
     char* y_ptr = reinterpret_cast<char*>(y.data_ptr());
     char* z_ptr = reinterpret_cast<char*>(z.data_ptr());
@@ -261,7 +247,7 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     params.is_causal = is_causal;
     params.num_splits = num_splits;
 }
-*/
+
 std::vector<at::Tensor>
 mha_fwd(const at::Tensor &q,
         const at::Tensor &k,
@@ -278,7 +264,7 @@ mha_fwd(const at::Tensor &q,
         const bool return_softmax, // in rocm ,this will return the random number matrix when doing dropout
         const int num_splits,      // num_splits is not used in rocm
         c10::optional<at::Generator> gen_) {
-
+    at::cuda::HIPGuard device_guard{(char)q.get_device()};
     auto dprops = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentHIPStream().stream();
     bool is_dropout = p_dropout > 0.0;
@@ -355,7 +341,7 @@ mha_fwd(const at::Tensor &q,
 
     if (zero_tensors) {
         out.zero_();
-        softmax_lse.fill_(-std::numeric_limits<float>::infinity()).to(at::kCUDA);
+        softmax_lse.fill_(-std::numeric_limits<float>::infinity());
         //if (return_softmax) {s.zero_();}
     }
 
@@ -417,7 +403,6 @@ mha_fwd(const at::Tensor &q,
         Tensor<int> z_host_int({G0, G1, M, N});
 
         z_device_buf.FromDevice(z_host.mData.data());
-
         z_host.ForEach([&](auto& self, auto idx) {
             z_host_int(idx[0],idx[1],idx[2],idx[3]) = static_cast<int>(self(idx));
         });
@@ -431,7 +416,7 @@ mha_fwd(const at::Tensor &q,
     return result;
 }
 
-/*
+
 std::vector<at::Tensor>
 mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         const at::Tensor &q,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
@@ -453,6 +438,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         const int num_splits,
         c10::optional<at::Generator> gen_
 ) {
+    at::cuda::HIPGuard device_guard{(char)q.get_device()};
     auto dprops = at::cuda::getCurrentDeviceProperties();
 
     bool is_dropout = p_dropout > 0.0;
@@ -539,7 +525,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
-    auto z = at::empty({batch_size*num_heads, max_seqlen_q, max_seqlen_k}, opts.dtype(torch::kInt32).device(at::kCUDA));
+    auto z = at::empty({batch_size*num_heads, max_seqlen_q, max_seqlen_k}, opts.dtype(torch::kInt32));
     set_params_dgrad(launch_params.params,
                      batch_size,
                      max_seqlen_q,
@@ -565,21 +551,20 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
     
     run_fmha_dgrad_fp16_bf16_gfx90a(launch_params);
-    dq.copy_(torch::cat(launch_params.params.qgrad_tensors, 1).transpose(0,1), true);
-    dk.copy_(torch::cat(launch_params.params.kgrad_tensors, 1).transpose(0,1), true);
-    dv.copy_(torch::cat(launch_params.params.vgrad_tensors, 1).transpose(0,1), true);
+    dq.copy_(torch::cat(launch_params.params.qgrad_tensors, 1).transpose(0, 1), true);
+    dk.copy_(torch::cat(launch_params.params.kgrad_tensors, 1).transpose(0, 1), true);
+    dv.copy_(torch::cat(launch_params.params.vgrad_tensors, 1).transpose(0, 1), true);
     return { dq, dk, dv, softmax_d };
 }
-*/
 
 
-// PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-//     m.doc() = "Fused Multi-head Self-attention";
-//     m.def("fwd", &mha_fwd, "Forward pass");
-//     m.def("bwd", &mha_bwd, "Backward pass");
-//     // m.def("fwd_block", &mha_fwd_block, "Forward pass (blocksparse)");
-//     // m.def("bwd_block", &mha_bwd_block, "Backward pass (blocksparse)");
-// }
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.doc() = "Fused Multi-head Self-attention";
+    m.def("fwd", &mha_fwd, "Forward pass");
+    m.def("bwd", &mha_bwd, "Backward pass");
+    // m.def("fwd_block", &mha_fwd_block, "Forward pass (blocksparse)");
+    // m.def("bwd_block", &mha_bwd_block, "Backward pass (blocksparse)");
+}
 
 
 //main function to test with the API
