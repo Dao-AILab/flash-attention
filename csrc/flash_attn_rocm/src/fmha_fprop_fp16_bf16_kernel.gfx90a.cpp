@@ -56,6 +56,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     using AccDataType      = F32;
     using CShuffleDataType = F32;
     using CDataType        = InputType;
+    using GemmDataType     = InputType;
     using ZDataType        = U16;
     using LSEDataType      = F32;
     using Acc0BiasDataType = ck::Tuple<>;
@@ -92,6 +93,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
             B0DataType,
             B1DataType,
             CDataType,
+            GemmDataType,
             ZDataType,
             LSEDataType,
             Acc0BiasDataType,
