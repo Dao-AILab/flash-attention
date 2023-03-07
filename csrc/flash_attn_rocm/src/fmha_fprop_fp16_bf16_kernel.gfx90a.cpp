@@ -37,12 +37,11 @@ struct SimpleDeviceMem
 };
 
 template<typename InputType, 
-         ck::index_t MPerBlock,    ck::index_t NPerBlock, ck::index_t KPerBlock,   ck::index_t Gemm1NPerBlock,
+         ck::index_t MPerBlock,    ck::index_t NPerBlock, ck::index_t KPerBlock,   ck::index_t Gemm1NPerBlock, ck::index_t Gemm1KPerBlock,
          ck::index_t MPerXDL,      ck::index_t NPerXDL,   ck::index_t NXdlPerWave, ck::index_t Gemm1NXdlPerWave,
          typename ABlockTransfer,  bool ABlockLdsExtraM,  typename BBlockTransfer, bool B0BlockLdsExtraN,
-         typename B1BlockTransfer, ck::index_t CShuffleNXdlPerWavePerShuffle, 
-         ck::index_t B1BlockTransferSrcScalarPerVector, typename CShuffleBlockTransferClusterLengths, 
-         //typename CShuffleBlockTransferClusterLengths, 
+         typename B1BlockTransfer, ck::index_t B1BlockTransferSrcScalarPerVector, 
+         ck::index_t CShuffleNXdlPerWavePerShuffle, typename CShuffleBlockTransferClusterLengths, 
          MaskingSpecialization MaskingSpec>
 void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_params){
     
@@ -115,7 +114,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
             NPerBlock,         // NPerBlock
             KPerBlock,         // KPerBlock
             Gemm1NPerBlock,    // Gemm1NPerBlock
-            64,                // Gemm1KPerBlock //
+            Gemm1KPerBlock,    // Gemm1KPerBlock
             8,                 // AK1
             8,                 // BK1
             2,                 // B1K1
@@ -142,14 +141,14 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
             S<0, 2, 1>,
             S<0, 2, 1>,
             1,
-            B1BlockTransferSrcScalarPerVector,             //B1BlockTransferSrcScalarPerVector
+            B1BlockTransferSrcScalarPerVector,    //B1BlockTransferSrcScalarPerVector
             2,
             false,
-            1,              // CShuffleMXdlPerWavePerShuffle
-            CShuffleNXdlPerWavePerShuffle,              // CShuffleNXdlPerWavePerShuffle
-            CShuffleBlockTransferClusterLengths, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-            8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
-            MaskingSpec>;   // MaskingSpecialization
+            1,                                    // CShuffleMXdlPerWavePerShuffle
+            CShuffleNXdlPerWavePerShuffle,        // CShuffleNXdlPerWavePerShuffle
+            CShuffleBlockTransferClusterLengths,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
+            8,                                    // CShuffleBlockTransferScalarPerVector_NPerBlock
+            MaskingSpec>;                         // MaskingSpecialization
         
     bool time_kernel    = false;
 
@@ -286,47 +285,65 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
 
 void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) {
 
-    //ck::index_t MPerBlock,    ck::index_t NPerBlock, ck::index_t KPerBlock,   ck::index_t Gemm1NPerBlock,
+    //template<typename InputType, 
+    //ck::index_t MPerBlock,    ck::index_t NPerBlock, ck::index_t KPerBlock,   ck::index_t Gemm1NPerBlock, ck::index_t Gemm1KPerBlock,
     //ck::index_t MPerXDL,      ck::index_t NPerXDL,   ck::index_t NXdlPerWave, ck::index_t Gemm1NXdlPerWave,
     //typename ABlockTransfer,  bool ABlockLdsExtraM,  typename BBlockTransfer, bool B0BlockLdsExtraN,
-    //typename B1BlockTransfer, ck::index_t CShuffleNXdlPerWavePerShuffle 
-    //ck::index_t B1BlockTransferSrcScalarPerVector, typename CShuffleBlockTransferClusterLengths>
+    //typename B1BlockTransfer, ck::index_t B1BlockTransferSrcScalarPerVector, 
+    //ck::index_t CShuffleNXdlPerWavePerShuffle, typename CShuffleBlockTransferClusterLengths, 
+    //MaskingSpecialization MaskingSpec>
 
     FP16_SWITCH(launch_params.params.is_bf16, [&] {
         if(launch_params.params.is_causal){
             if(launch_params.params.d <= 32){
-                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 32, 
+                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 32, 32,
                                                             32,  32,  4,  1, 
                                                             S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                            S<16, 16, 1>, 1, 
-                                                            2, S<1, 64, 1, 4>,
+                                                            S<16, 16, 1>, 2, 
+                                                            1, S<1, 64, 1, 4>,
+                                                            MaskingSpec_causal>(launch_params);
+            }
+            else if(launch_params.params.d <= 64){
+                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 64, 32,
+                                                            32,  32,  4,  2,
+                                                            S<4, 64, 1>, true, S<4, 64, 1>, true,
+                                                            S<16, 16, 1>, 4, 
+                                                            2, S<1, 32, 1, 8>,
                                                             MaskingSpec_causal>(launch_params);
             }
             else if(launch_params.params.d <= 128){
-                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 128, 
+                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 128, 32,
                                                             32,  32,  4,  4, 
                                                             S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                            S<16, 16, 1>, 2, 
-                                                            4, S<1, 32, 1, 8>,
+                                                            S<8, 32, 1>, 4, 
+                                                            2, S<1, 32, 1, 8>,
                                                             MaskingSpec_causal>(launch_params);
 
             }
         }
         else{
             if(launch_params.params.d <= 32){
-                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 32, 
+                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 32, 32,
                                                             32,  32,  4,  1, 
                                                             S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                            S<16, 16, 1>, 1, 
-                                                            2, S<1, 64, 1, 4>,
+                                                            S<16, 16, 1>, 2, 
+                                                            1, S<1, 64, 1, 4>,
+                                                            MaskingSpec_default>(launch_params);
+            }
+            else if(launch_params.params.d <= 64){
+                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 64, 32,
+                                                            32,  32,  4,  2, 
+                                                            S<4, 64, 1>, true, S<4, 64, 1>, true,
+                                                            S<16, 16, 1>, 4, 
+                                                            2, S<1, 32, 1, 8>,
                                                             MaskingSpec_default>(launch_params);
             }
             else if(launch_params.params.d <= 128){
-                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 128, 
+                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 128, 32,
                                                             32,  32,  4,  4, 
                                                             S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                            S<16, 16, 1>, 2, 
-                                                            4, S<1, 32, 1, 8>,
+                                                            S<8, 32, 1>, 4, 
+                                                            2, S<1, 32, 1, 8>,
                                                             MaskingSpec_default>(launch_params);
             }
         }
