@@ -359,12 +359,12 @@ def get_dropout_fraction(dropout_mask, query_padding_mask=None, key_padding_mask
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize('causal', [False, True])
 # @pytest.mark.parametrize('causal', [False])
-# @pytest.mark.parametrize('d', [128, 64, 80, 40, 32, 16])
-@pytest.mark.parametrize('d', [8])
-# @pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
-@pytest.mark.parametrize('seqlen', [8])
-# @pytest.mark.parametrize('dropout_p', [0.0, 0.17])
-@pytest.mark.parametrize('dropout_p', [0.17])
+@pytest.mark.parametrize('d', [128, 64, 80, 40, 32, 16])
+# @pytest.mark.parametrize('d', [128])
+@pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
+# @pytest.mark.parametrize('seqlen', [128])
+@pytest.mark.parametrize('dropout_p', [0.0, 0.17])
+#v@pytest.mark.parametrize('dropout_p', [0.17])
 def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     if seqlen >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
@@ -381,9 +381,9 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     x = torch.randn(batch_size, seqlen, nheads * d, device=device, dtype=dtype, requires_grad=True)
     Wqkv = torch.nn.Linear(nheads * d, 3 * nheads * d, device=device, dtype=dtype)
 
-    key_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode='random')
+    #key_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode='random')
     
-    # key_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode='full')
+    key_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode='full')
 
     qkv_unpad, cu_seqlens, max_seqlen, qkv, output_pad_fn, dqkv_pad_fn = generate_qkv(
         x, Wqkv, nheads, key_padding_mask, key_padding_mask, qkvpacked=True
@@ -393,16 +393,33 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
         qkv_unpad, cu_seqlens, max_seqlen, dropout_p, return_attn_probs=True, causal=causal
     )
     output = output_pad_fn(output_unpad)
-    
-    S_dmask_converted = convert_flash_attn_S_to_softmax(
-       S_dmask, key_padding_mask, key_padding_mask, d, dropout_p > 0.0, causal=causal
-    )
 
-    S_dmask_converted = torch.full(S_dmask_converted.size() , 1, device='cuda') #work around for no dropout
-    dropout_mask = S_dmask_converted >= 0
-    attn_unnorm = S_dmask_converted.abs()
-    attn = normalize_flash_attn_S(attn_unnorm, qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2],
-                                 key_padding_mask, key_padding_mask, dropout_p > 0.0, causal=causal)
+    if(dropout_p == 0.0):
+        dropout_mask = torch.full([batch_size, nheads, seqlen, seqlen], True , device='cuda')
+    else:
+        S_dmask_converted = torch.full([batch_size, nheads, seqlen, seqlen], 0, dtype=torch.int32 , device='cuda')
+        for i in range(batch_size):
+            current_seqlen = cu_seqlens[i+1] - cu_seqlens[i]
+            #print(f'current_seqlen: {current_seqlen}')
+            S_dmask_each = S_dmask[i].view(-1).contiguous()
+            #print(f'S_dmask_each.size(): {S_dmask_each.size()}')
+            for j in range(nheads):
+                for k in range(current_seqlen):
+                    for m in range(current_seqlen):
+                        index_for_S_dmask = j * current_seqlen * current_seqlen + k* current_seqlen + m
+                        S_dmask_converted[i][j][k][m] = S_dmask_each[index_for_S_dmask]
+        dropout_mask_t = S_dmask_converted <= ((1 - dropout_p) * 65535)
+        dropout_mask = dropout_mask_t.contiguous()
+    #dropout_mask = S_dmask_converted >= 0
+    #attn_unnorm = S_dmask_converted.abs()
+    #attn = normalize_flash_attn_S(attn_unnorm, qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2],
+    #                              key_padding_mask, key_padding_mask, dropout_p > 0.0, causal=causal)
+    
+    #S_dmask_converted = convert_flash_attn_S_to_softmax(
+    #   S_dmask, key_padding_mask, key_padding_mask, d, dropout_p > 0.0, causal=causal
+    #)
+
+    #S_dmask_converted = torch.full(S_dmask_converted.size() , 1, device='cuda') #work around for no dropout
     dropout_fraction = get_dropout_fraction(dropout_mask, key_padding_mask, key_padding_mask,
                                             causal=causal).item()
 
@@ -410,7 +427,6 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
                                                    causal=causal)
     output_pt, attn_pt = attention_qkvpacked_ref(qkv, key_padding_mask, dropout_p, dropout_mask,
                                                  causal=causal, upcast=False, reorder_ops=True)
-    print(f'key_padding_mask: {key_padding_mask}')
     print(f'Actual dropout fraction: {dropout_fraction}')
     print(f'Output max diff: {(output - output_ref).abs().max().item()}')
     print(f'Output mean diff: {(output - output_ref).abs().mean().item()}')

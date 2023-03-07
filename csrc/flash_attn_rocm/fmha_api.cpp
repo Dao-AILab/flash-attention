@@ -331,7 +331,11 @@ mha_fwd(const at::Tensor &q,
     // auto softmax_lse = torch::full({batch_size, num_heads, max_seqlen_k}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
 
     //at::Tensor s;
-    DeviceMem z_device_buf(sizeof(unsigned short) * batch_size * num_heads * max_seqlen_q * max_seqlen_k);
+    int z_device_buf_space = 0;
+    if (return_softmax) { 
+        z_device_buf_space = sizeof(unsigned short) * batch_size * num_heads * max_seqlen_q * max_seqlen_k;
+    }
+    DeviceMem z_device_buf(z_device_buf_space);
     if (return_softmax) { 
         //s = at::empty({ batch_size, num_heads, max_seqlen_q, max_seqlen_k }, opts.dtype(at::kInt));
         //s.zero_().to(at::kCPU); 
