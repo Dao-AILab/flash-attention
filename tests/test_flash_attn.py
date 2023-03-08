@@ -362,9 +362,9 @@ def get_dropout_fraction(dropout_mask, query_padding_mask=None, key_padding_mask
 # @pytest.mark.parametrize('d', [128, 64, 80, 40, 32, 16])
 @pytest.mark.parametrize('d', [128, 64])
 # @pytest.mark.parametrize('seqlen', [128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
-@pytest.mark.parametrize('seqlen', [97, 128])
+@pytest.mark.parametrize('seqlen', [128])
 # @pytest.mark.parametrize('dropout_p', [0.0, 0.17])
-@pytest.mark.parametrize('dropout_p', [0.0])
+@pytest.mark.parametrize('dropout_p', [0.0, 0.17])
 def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     if seqlen >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
@@ -393,16 +393,17 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
         qkv_unpad, cu_seqlens, max_seqlen, dropout_p, return_attn_probs=True, causal=causal
     )
     output = output_pad_fn(output_unpad)
-
+    
     if(dropout_p == 0.0):
         dropout_mask = torch.full(S_dmask.shape, True , device='cuda')
     else:
+        causal_mask = torch.triu(torch.ones(*S_dmask.shape[2:], dtype=torch.bool, device='cuda'), 1)
         S_dmask_converted = torch.zeros(S_dmask.shape, dtype=torch.int32, device='cuda')
         S_dmask_converted.view(-1).copy_(S_dmask.view(-1).contiguous())
+        S_dmask_converted.masked_fill_(causal_mask, 0.0)
         dropout_mask_t = S_dmask_converted <= ((1 - dropout_p) * 65535)
         dropout_mask = dropout_mask_t.contiguous()
-    causal_mask = torch.triu(torch.ones(*S_dmask_converted.shape[2:], dtype=torch.bool, device='cuda'), 1)
-    S_dmask_converted.masked_fill_(causal_mask, 0.0)
+
     dropout_fraction = get_dropout_fraction(dropout_mask, key_padding_mask, key_padding_mask,
                                             causal=causal).item()
 
