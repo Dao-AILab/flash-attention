@@ -397,10 +397,11 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     if(dropout_p == 0.0):
         dropout_mask = torch.full(S_dmask.shape, True , device='cuda')
     else:
-        causal_mask = torch.triu(torch.ones(*S_dmask.shape[2:], dtype=torch.bool, device='cuda'), 1)
         S_dmask_converted = torch.zeros(S_dmask.shape, dtype=torch.int32, device='cuda')
         S_dmask_converted.view(-1).copy_(S_dmask.view(-1).contiguous())
-        S_dmask_converted.masked_fill_(causal_mask, 0.0)
+        if causal:
+            causal_mask = torch.triu(torch.ones(*S_dmask.shape[2:], dtype=torch.bool, device='cuda'), 1)
+            S_dmask_converted.masked_fill_(causal_mask, 0.0)
         dropout_mask_t = S_dmask_converted <= ((1 - dropout_p) * 65535)
         dropout_mask = dropout_mask_t.contiguous()
 
