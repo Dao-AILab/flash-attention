@@ -140,7 +140,6 @@ void set_params_dgrad(FMHA_dgrad_params &params,
                       const at::Tensor k,
                       const at::Tensor v,
                       const at::Tensor y,
-                      const at::Tensor z,
                       const at::Tensor ygrad,
                       at::Tensor qgrad,
                       at::Tensor kgrad,
@@ -187,7 +186,6 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     FMHA_CHECK_HIP(hipMemcpyAsync(params.host_seqlens_k.data(), params.cu_seqlens_k, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost, stream));
 
     char* y_ptr = reinterpret_cast<char*>(y.data_ptr());
-    char* z_ptr = reinterpret_cast<char*>(z.data_ptr());
     char* lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
     char* ygrad_ptr = reinterpret_cast<char*>(ygrad.data_ptr());
     
@@ -212,11 +210,7 @@ void set_params_dgrad(FMHA_dgrad_params &params,
         params.q_ptr.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
         params.k_ptr.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
         params.v_ptr.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
-        if(p_dropout>0){
-            params.z_ptr.push_back(reinterpret_cast<void*>(z_ptr));
-        }else{
-            params.z_ptr.push_back(nullptr);
-        }
+        params.z_ptr.push_back(nullptr);
         params.y_ptr.push_back(reinterpret_cast<const void*>(y_ptr));
         params.lse_ptr.push_back(reinterpret_cast<const void*>(lse_ptr));
         params.ygrad_ptr.push_back(reinterpret_cast<const void*>(ygrad_ptr));
@@ -231,7 +225,6 @@ void set_params_dgrad(FMHA_dgrad_params &params,
         y_ptr += temp_q_stride;
         ygrad_ptr += temp_q_stride;
         lse_ptr += temp_lse_stride;
-        z_ptr += temp_z_stride;
     }
 
     // Set the different scale values.
@@ -329,24 +322,18 @@ mha_fwd(const at::Tensor &q,
 
     auto softmax_lse = at::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
     // auto softmax_lse = torch::full({batch_size, num_heads, max_seqlen_k}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
-
-    //at::Tensor s;
     int z_device_buf_space = 0;
     if (return_softmax) { 
         z_device_buf_space = sizeof(unsigned short) * batch_size * num_heads * max_seqlen_q * max_seqlen_k;
     }
     DeviceMem z_device_buf(z_device_buf_space);
     if (return_softmax) { 
-        //s = at::empty({ batch_size, num_heads, max_seqlen_q, max_seqlen_k }, opts.dtype(at::kInt));
-        //s.zero_().to(at::kCPU); 
-        //z_device_buf(sizeof(unsigned short) * batch_size * num_heads * max_seqlen_q * max_seqlen_k);
         z_device_buf.SetZero();
     }
 
     if (zero_tensors) {
         out.zero_();
         softmax_lse.fill_(-std::numeric_limits<float>::infinity());
-        //if (return_softmax) {s.zero_();}
     }
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
@@ -529,14 +516,13 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
-    auto z = at::empty({batch_size*num_heads, max_seqlen_q, max_seqlen_k}, opts.dtype(torch::kInt32));
     set_params_dgrad(launch_params.params,
                      batch_size,
                      max_seqlen_q,
                      max_seqlen_k,
                      num_heads,
                      head_size,
-                     q, k, v, out, z,
+                     q, k, v, out,
                      dout, dq, dk, dv,
                      cu_seqlens_q.data_ptr(),
                      cu_seqlens_k.data_ptr(),
