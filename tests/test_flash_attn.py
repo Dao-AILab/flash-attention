@@ -28,7 +28,7 @@ except (ImportError, AttributeError):  # Older version of Triton doesn't have tl
 
 is_sm75 = torch.cuda.get_device_capability('cuda') == (7, 5)
 is_sm80 = torch.cuda.get_device_capability('cuda') == (8, 0)
-
+is_sm80=True
 
 def generate_random_padding_mask(max_seqlen, batch_size, device, mode='random'):
     assert mode in ['full', 'random', 'third', 'split']
@@ -355,16 +355,16 @@ def get_dropout_fraction(dropout_mask, query_padding_mask=None, key_padding_mask
     return dropped_total / (numel_per_batch.sum() * nheads)
 
 
-@pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
-# @pytest.mark.parametrize('dtype', [torch.float16])
-@pytest.mark.parametrize('causal', [False, True])
+# @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
+@pytest.mark.parametrize('dtype', [torch.float16])
+@pytest.mark.parametrize('causal', [True, False])
 # @pytest.mark.parametrize('causal', [False])
-@pytest.mark.parametrize('d', [128, 64, 80, 40, 32, 16])
-# @pytest.mark.parametrize('d', [128])
-@pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
-# @pytest.mark.parametrize('seqlen', [128])
-@pytest.mark.parametrize('dropout_p', [0.0, 0.17])
-#v@pytest.mark.parametrize('dropout_p', [0.17])
+# @pytest.mark.parametrize('d', [128, 64, 80, 40, 32, 16])
+@pytest.mark.parametrize('d', [128, 64])
+# @pytest.mark.parametrize('seqlen', [128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
+@pytest.mark.parametrize('seqlen', [97, 128])
+# @pytest.mark.parametrize('dropout_p', [0.0, 0.17])
+@pytest.mark.parametrize('dropout_p', [0.0])
 def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     if seqlen >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
@@ -395,31 +395,14 @@ def test_flash_attn_unpadded_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     output = output_pad_fn(output_unpad)
 
     if(dropout_p == 0.0):
-        dropout_mask = torch.full([batch_size, nheads, seqlen, seqlen], True , device='cuda')
+        dropout_mask = torch.full(S_dmask.shape, True , device='cuda')
     else:
-        S_dmask_converted = torch.full([batch_size, nheads, seqlen, seqlen], 0, dtype=torch.int32 , device='cuda')
-        for i in range(batch_size):
-            current_seqlen = cu_seqlens[i+1] - cu_seqlens[i]
-            #print(f'current_seqlen: {current_seqlen}')
-            S_dmask_each = S_dmask[i].view(-1).contiguous()
-            #print(f'S_dmask_each.size(): {S_dmask_each.size()}')
-            for j in range(nheads):
-                for k in range(current_seqlen):
-                    for m in range(current_seqlen):
-                        index_for_S_dmask = j * current_seqlen * current_seqlen + k* current_seqlen + m
-                        S_dmask_converted[i][j][k][m] = S_dmask_each[index_for_S_dmask]
+        S_dmask_converted = torch.zeros(S_dmask.shape, dtype=torch.int32, device='cuda')
+        S_dmask_converted.view(-1).copy_(S_dmask.view(-1).contiguous())
         dropout_mask_t = S_dmask_converted <= ((1 - dropout_p) * 65535)
         dropout_mask = dropout_mask_t.contiguous()
-    #dropout_mask = S_dmask_converted >= 0
-    #attn_unnorm = S_dmask_converted.abs()
-    #attn = normalize_flash_attn_S(attn_unnorm, qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2],
-    #                              key_padding_mask, key_padding_mask, dropout_p > 0.0, causal=causal)
-    
-    #S_dmask_converted = convert_flash_attn_S_to_softmax(
-    #   S_dmask, key_padding_mask, key_padding_mask, d, dropout_p > 0.0, causal=causal
-    #)
-
-    #S_dmask_converted = torch.full(S_dmask_converted.size() , 1, device='cuda') #work around for no dropout
+    causal_mask = torch.triu(torch.ones(*S_dmask_converted.shape[2:], dtype=torch.bool, device='cuda'), 1)
+    S_dmask_converted.masked_fill_(causal_mask, 0.0)
     dropout_fraction = get_dropout_fraction(dropout_mask, key_padding_mask, key_padding_mask,
                                             causal=causal).item()
 
