@@ -37,7 +37,6 @@ struct SimpleDeviceMem {
 template <typename InputType, ck::index_t Version, MaskingSpecialization MaskingSpec>
 void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
     Launch_params<FMHA_dgrad_params> &launch_params) {
-  using F16 = ck::half_t;
   using F32 = float;
   using U16 = unsigned short;
 
@@ -47,8 +46,8 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
   using QKVElementOp = PassThrough;
   using YElementOp = PassThrough;
 
-  using DataType = F16;
-  using GemmDataType = F16;
+  using DataType = InputType;
+  using GemmDataType = InputType;
   using AccDataType = F32;
   using ShuffleDataType = F32;
   using LSEDataType = F32;
@@ -261,76 +260,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
     auto gemm = DeviceGemmInstance{};
     run_kernel(gemm);
   }else if(Version == 2){
-    using DeviceGemmInstance = ck::tensor_operation::device::DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V2<
-        NumDimG,
-        NumDimM,
-        NumDimN,
-        NumDimK,
-        NumDimO,
-        DataType,
-        GemmDataType,
-        ZDataType,
-        LSEDataType,
-        Acc0BiasDataType,
-        Acc1BiasDataType,
-        AccDataType,
-        ShuffleDataType,
-        QKVElementOp,
-        QKVElementOp,
-        Scale,
-        QKVElementOp,
-        YElementOp,
-        GemmSpec,
-        TensorSpecQ,
-        TensorSpecK,
-        TensorSpecV,
-        TensorSpecY,
-        1,
-        256,
-        128,         // MPerBlock
-        128,         // NPerBlock
-        64,          // KPerBlock
-        64,          // Gemm1NPerBlock
-        64,          // Gemm1KPerBlock
-        8,           // AK1
-        8,           // BK1
-        2,           // B1K1
-        32,          // MPerXDL
-        32,          // NPerXDL
-        1,           // MXdlPerWave
-        4,           // NXdlPerWave
-        2,           // Gemm1NXdlPerWave
-        2,           // Gemm2NXdlPerWave
-        S<4, 64, 1>, // ABlockTransfer
-        S<1, 0, 2>,
-        S<1, 0, 2>,
-        2,
-        8,
-        8,
-        true,
-        S<4, 64, 1>, // BBlockTransfer
-        S<1, 0, 2>,
-        S<1, 0, 2>,
-        2,
-        8,
-        8,
-        true,
-        S<8, 32, 1>, // B1BlockTransfer
-        S<0, 2, 1>,
-        S<0, 2, 1>,
-        1,
-        2,
-        2,
-        false,
-        1,              // CShuffleMXdlPerWavePerShuffle
-        2,              // CShuffleNXdlPerWavePerShuffle
-        S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-        8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
-        MaskingSpec>;   // MaskingSpecialization
-    auto gemm = DeviceGemmInstance{};
-    run_kernel(gemm);
-  }else if(Version == 3){
-    using DeviceGemmInstance = ck::tensor_operation::device::DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_PT1<
+    using DeviceGemmInstance = ck::tensor_operation::device::DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V1<
         NumDimG,
         NumDimM,
         NumDimN,
@@ -399,7 +329,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
     auto gemm = DeviceGemmInstance{};
     run_kernel(gemm);
   }else{
-    using DeviceGemmInstance = ck::tensor_operation::device::DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_PT1<
+    using DeviceGemmInstance = ck::tensor_operation::device::DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V1<
         NumDimG,
         NumDimM,
         NumDimN,
@@ -474,24 +404,20 @@ void run_fmha_dgrad_fp16_bf16_gfx90a(
     Launch_params<FMHA_dgrad_params> &launch_params) {
   FP16_SWITCH(launch_params.params.is_bf16, [&] {
     if(launch_params.params.is_causal){
-      if(launch_params.params.d >= 128) {
+      if(launch_params.params.d > 64){
         run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 1, MaskingSpec_causal>(launch_params);
-      }else if(launch_params.params.d > 64){
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 2, MaskingSpec_causal>(launch_params);
       }else if(launch_params.params.d > 32){
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 3, MaskingSpec_causal>(launch_params);
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 2, MaskingSpec_causal>(launch_params);
       }else{
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 4, MaskingSpec_causal>(launch_params);
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 3, MaskingSpec_causal>(launch_params);
       }
     }else{
-      if(launch_params.params.d >= 128) {
+      if(launch_params.params.d > 64){
         run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 1, MaskingSpec_default>(launch_params);
-      }else if(launch_params.params.d > 64){
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 2, MaskingSpec_default>(launch_params);
       }else if(launch_params.params.d > 32){
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 3, MaskingSpec_default>(launch_params);
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 2, MaskingSpec_default>(launch_params);
       }else{
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 4, MaskingSpec_default>(launch_params);
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 3, MaskingSpec_default>(launch_params);
       }
     }
   });

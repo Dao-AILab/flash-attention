@@ -154,7 +154,6 @@ void set_params_dgrad(FMHA_dgrad_params &params,
                       int num_splits) {
 
     Data_type acc_type = DATA_TYPE_FP32;
-    Data_type z_type = DATA_TYPE_INT32;
     Data_type data_type = q.dtype() == at::kBFloat16 ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
 
     // Reset the parameters
@@ -221,7 +220,6 @@ void set_params_dgrad(FMHA_dgrad_params &params,
         int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, data_type);
         int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, data_type);
         int temp_lse_stride = get_size_in_bytes(h * seqlen_q, acc_type);
-        int temp_z_stride = get_size_in_bytes(h * seqlen_k * seqlen_q, z_type);
         y_ptr += temp_q_stride;
         ygrad_ptr += temp_q_stride;
         lse_ptr += temp_lse_stride;
@@ -257,7 +255,6 @@ mha_fwd(const at::Tensor &q,
         const bool return_softmax, // in rocm ,this will return the random number matrix when doing dropout
         const int num_splits,      // num_splits is not used in rocm
         c10::optional<at::Generator> gen_) {
-    at::cuda::HIPGuard device_guard{(char)q.get_device()};
     auto dprops = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentHIPStream().stream();
     bool is_dropout = p_dropout > 0.0;
@@ -312,6 +309,7 @@ mha_fwd(const at::Tensor &q,
         max_seqlen_k = 256;
     }
     int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
+    at::cuda::HIPGuard device_guard{(char)q.get_device()};
     // bool loop = false;
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -414,7 +412,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         const at::Tensor &k,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const at::Tensor &v,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const at::Tensor &out,   // total_q x num_heads x head_size
-        const at::Tensor &softmax_lse_,     // b x h x s softmax logsumexp
+        const at::Tensor &softmax_lse,     // b x h x s softmax logsumexp
         at::Tensor &dq,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
         at::Tensor &dk,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         at::Tensor &dv,   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
@@ -429,7 +427,6 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         const int num_splits,
         c10::optional<at::Generator> gen_
 ) {
-    at::cuda::HIPGuard device_guard{(char)q.get_device()};
     auto dprops = at::cuda::getCurrentDeviceProperties();
 
     bool is_dropout = p_dropout > 0.0;
@@ -453,7 +450,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     TORCH_CHECK(v.is_cuda());
     TORCH_CHECK(out.is_cuda());
     TORCH_CHECK(dout.is_cuda());
-    TORCH_CHECK(softmax_lse_.is_cuda());
+    TORCH_CHECK(softmax_lse.is_cuda());
     TORCH_CHECK(cu_seqlens_q.is_cuda());
     TORCH_CHECK(cu_seqlens_k.is_cuda());
 
@@ -497,22 +494,22 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         max_seqlen_k = 256;
     }
     int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
-
+    at::cuda::HIPGuard device_guard{(char)q.get_device()};
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
     // at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     // It's possible the softmax_lse_ from the fwd has a different length since blocksize_c could be different.
-    auto softmax_lse = softmax_lse_.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, max_seqlen_q)}).contiguous();
+    // auto softmax_lse = softmax_lse_.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, max_seqlen_q)}).contiguous();
 
-    auto opts = q.options();
-    auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+    // auto opts = q.options();
+    at::Tensor softmax_d;
 
     if (zero_tensors) {
         dq.zero_();
         dk.zero_();
         dv.zero_();
-        softmax_d.zero_();
+        // softmax_d.zero_();
     }
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
