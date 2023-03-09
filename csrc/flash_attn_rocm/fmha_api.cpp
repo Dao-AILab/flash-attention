@@ -434,7 +434,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     Launch_params<FMHA_dgrad_params> launch_params(dprops, stream, is_dropout, false);
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16);
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16);
     TORCH_CHECK(k.dtype() == q_dtype);
     TORCH_CHECK(v.dtype() == q_dtype);
     TORCH_CHECK(out.dtype() == q_dtype);
