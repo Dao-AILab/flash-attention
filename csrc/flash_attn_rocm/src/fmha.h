@@ -184,7 +184,6 @@ struct Launch_params{
 
     bool is_dropout;
     bool return_softmax;
-    bool input_permute;
 
     Kernel_params params;
     int num_full_heads;
