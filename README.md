@@ -40,7 +40,11 @@ to what's used in our paper.
 
 ## Beta release (0.2).
 
-To install (requiring CUDA 11, NVCC, and an Turing or Ampere GPU):
+Requirements:
+- CUDA 11.4 and above.
+- PyTorch 1.12 and above.
+
+To install:
 ```sh
 pip install flash-attn
 ```
