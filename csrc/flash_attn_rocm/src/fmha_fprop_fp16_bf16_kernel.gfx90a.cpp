@@ -45,7 +45,7 @@ template<typename InputType,
          MaskingSpecialization MaskingSpec>
 void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_params){
     using F32 = float;
-    using U16 = unsigned short;
+    using INT32 = int;
     using BF16 = ck::bhalf_t;
     using FP16 = ck::half_t;
 
@@ -58,7 +58,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     using CShuffleDataType = F32;
     using CDataType        = InputType;
     using GemmDataType     = InputType;
-    using ZDataType        = U16;
+    using ZDataType        = INT32;
     using LSEDataType      = F32;
     using Acc0BiasDataType = ck::Tuple<>;
     using Acc1BiasDataType = ck::Tuple<>;
@@ -158,6 +158,8 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     bool input_permute = true;
     bool output_permute = true;
 
+    bool z_tensor_permute = false;
+
     float alpha = launch_params.params.scale_bmm1f;
 
     auto a_element_op    = AElementOp{};
@@ -218,7 +220,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
         
         std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
         std::vector<ck::index_t> z_gs_ms_ns_strides =
-            input_permute
+            z_tensor_permute
                 ? std::vector<ck::index_t>{M * G1 * N, N, G1 * N, 1} // Z layout [G0, M, G1, N]
                 : std::vector<ck::index_t>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
 
@@ -352,162 +354,4 @@ void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) 
         }
     });
 
-/*
-    FP16_SWITCH(launch_params.params.is_bf16, [&] {
-        if(launch_params.params.is_causal){
-            if(launch_params.params.b <= 16){
-                if(launch_params.params.d <= 32){
-                    if(launch_params.params.seqlen_k <= 128){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 64, 32, 128, 
-                                                                   32 , 32,  2,   4,
-                                                                   S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                                   S<8, 32, 1>, 2, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_causal>(launch_params);
-                    }
-                    else{ // if(launch_params.params.seqlen_k <= 256){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 64, 128, 
-                                                                    32,  32,  4,   4,
-                                                                   S<8, 32, 1>, false, S<8, 32, 1>, false,
-                                                                   S<8, 32, 1>, 2, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_causal>(launch_params);
-                    }
-                }
-                else {  //if(launch_params.params.d <= 128){
-                    if(launch_params.params.seqlen_k <= 128){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 32, 64, 
-                                                                    32,  32,  4,  2, 
-                                                                   S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                                   S<16, 16, 1>, 2, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_causal>(launch_params);
-                    }
-                    else {//if(launch_params.params.seqlen_k <= 256){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 64, 256, 32, 64, 
-                                                                   16,  16, 16,  4, 
-                                                                   S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                                   S<16, 16, 1>, 4, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_causal>(launch_params);
-                   }
-                }
-            }
-            else{
-                if(launch_params.params.seqlen_k <= 128){
-                    if(launch_params.params.d > 32 && launch_params.params.d <= 64){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 32, 64, 
-                                                                    32,  32,  4,  2, 
-                                                                   S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                                   S<16, 16, 1>, 2, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_causal>(launch_params);
-                    }
-                    else{
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 64, 128, 
-                                                                    32,  32,  4,   4,
-                                                                   S<8, 32, 1>, false, S<8, 32, 1>, false,
-                                                                   S<8, 32, 1>, 2, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_causal>(launch_params);
-                    }
-                }
-                else{
-                    if(launch_params.params.d <= 32){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 64, 128, 
-                                                                    32,  32,  4,   4,
-                                                                   S<8, 32, 1>, false, S<8, 32, 1>, false,
-                                                                   S<8, 32, 1>, 2, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_causal>(launch_params);
-                    }
-                    else if(launch_params.params.d <= 64){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 32, 64, 
-                                                                    32,  32,  4,  2, 
-                                                                   S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                                   S<16, 16, 1>, 2, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_causal>(launch_params);
-                    }
-                   else {//if(launch_params.params.d <= 128){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 64, 256,  32, 128, 
-                                                                   16,  16,  16,   8, 
-                                                                   S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                                   S< 8, 32, 1>, 8, S<1, 16, 1,16>, 
-                                                                   MaskingSpec_causal>(launch_params);
-                   }
-                }
-            }
-        }
-        else{
-            if(launch_params.params.b <= 16){
-                if(launch_params.params.d <= 32){
-                    if(launch_params.params.seqlen_k <= 128){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 64, 32, 128, 
-                                                                   32 , 32,  2,   4,
-                                                                   S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                                   S<8, 32, 1>, 2, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_default>(launch_params);
-                    }
-                    else{ //if(launch_params.params.seqlen_k <= 256){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 64, 128, 
-                                                                    32,  32,  4,   4,
-                                                                   S<8, 32, 1>, false, S<8, 32, 1>, false,
-                                                                   S<8, 32, 1>, 2, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_default>(launch_params);
-                    }
-                }
-                else if(launch_params.params.d <= 128){
-                    if(launch_params.params.seqlen_k <= 128){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 32, 64, 
-                                                                    32,  32,  4,  2, 
-                                                                   S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                                   S<16, 16, 1>, 2, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_default>(launch_params);
-                    }
-                    else{ // if(launch_params.params.seqlen_k <= 256){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 64, 256, 32, 64, 
-                                                                   16,  16, 16,  4, 
-                                                                   S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                                   S<16, 16, 1>, 4, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_default>(launch_params);
-                   }
-                }
-            }
-            else{
-                if(launch_params.params.seqlen_k <= 128){
-                    if(launch_params.params.d > 32 && launch_params.params.d <= 64){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 32, 64, 
-                                                                    32,  32,  4,  2, 
-                                                                   S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                                   S<16, 16, 1>, 2, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_default>(launch_params);
-                    }
-                    else{
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 64, 128, 
-                                                                    32,  32,  4,   4,
-                                                                   S<8, 32, 1>, false, S<8, 32, 1>, false,
-                                                                   S<8, 32, 1>, 2, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_default>(launch_params);
-                    }
-                }
-                else{
-                    if(launch_params.params.d <= 32){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 64, 128, 
-                                                                    32,  32,  4,   4,
-                                                                   S<8, 32, 1>, false, S<8, 32, 1>, false,
-                                                                   S<8, 32, 1>, 2, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_default>(launch_params);
-                    }
-                    else if(launch_params.params.d <= 64){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 128, 128, 32, 64, 
-                                                                    32,  32,  4,  2, 
-                                                                   S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                                   S<16, 16, 1>, 2, S<1, 32, 1, 8>,
-                                                                   MaskingSpec_default>(launch_params);
-                    }
-                   else {//if(launch_params.params.d <= 128){
-                        run_fmha_fp16_bf16_gfx90a_loop_<elem_type, 64, 256,  32, 128, 
-                                                                   16,  16,  16,   8, 
-                                                                   S<4, 64, 1>, true, S<4, 64, 1>, true,
-                                                                   S< 8, 32, 1>, 8, S<1, 16, 1,16>, 
-                                                                   MaskingSpec_default>(launch_params);
-                   }
-                }
-            }
-        }
-    });
-*/
 }
