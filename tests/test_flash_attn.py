@@ -568,10 +568,8 @@ def test_flash_attn_unpadded(seqlen, d, dropout_p, causal, dtype):
     #     rtol, atol = (3e-3, 3e-3) if not causal else (1e-3, 1e-3)
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 2
+    batch_size = 32
     nheads = 4
-    #batch_size = 32
-    #nheads = 4
     x = torch.randn(batch_size, seqlen, nheads * d, device=device, dtype=dtype, requires_grad=True)
     Wqkv = torch.nn.Linear(nheads * d, 3 * nheads * d, device=device, dtype=dtype)
 
