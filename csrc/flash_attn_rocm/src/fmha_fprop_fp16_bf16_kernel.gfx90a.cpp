@@ -44,9 +44,10 @@ template<typename InputType,
          ck::index_t CShuffleNXdlPerWavePerShuffle, typename CShuffleBlockTransferClusterLengths, 
          MaskingSpecialization MaskingSpec>
 void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_params){
-    
     using F32 = float;
     using U16 = unsigned short;
+    using BF16 = ck::bhalf_t;
+    using FP16 = ck::half_t;
 
     using PassThrough = ck::tensor_operation::element_wise::PassThrough;
 
@@ -154,7 +155,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
         
     bool time_kernel    = false;
 
-    bool input_permute  = false;
+    bool input_permute = true;
     bool output_permute = true;
 
     float alpha = launch_params.params.scale_bmm1f;
