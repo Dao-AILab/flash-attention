@@ -74,19 +74,6 @@ void set_params_fprop(FMHA_fprop_params &params,
     char* lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
     char* s_ptr = reinterpret_cast<char*>(s_d);
 
-    //std::cout << "multiply" << params.seqlen_q * params.h * params.d<< std::endl;
-
-    //std::cout << " q.data_ptr() " << q.data_ptr() << std::endl;
-    //std::cout << " q_.data_ptr() " << q_.data_ptr() << std::endl;
-    //std::cout << " q_[0].data_ptr() " << q_[0].data_ptr() << std::endl;
-    //std::cout << " q_[1].data_ptr() " << q_[1].data_ptr() << std::endl;
-    //std::cout << " new q[1] " << reinterpret_cast<void*>(q_ptr + params.seqlen_q * params.h * params.d * 2) << std::endl;
-    //std::cout << " q_[0][0][0][0].data_ptr() " << q_[0][0][0][0].data_ptr() << std::endl;
-    //std::cout << " q_[0][0][0][1].data_ptr() " << q_[0][0][0][1].data_ptr() << std::endl;
-    //std::cout << " q_[0][0][1][0].data_ptr() " << q_[0][0][1][0].data_ptr() << std::endl;
-    //std::cout << " q_[0][1][0][0].data_ptr() " << q_[0][1][0][0].data_ptr() << std::endl;
-    //std::cout << " q_[1][0][0][0].data_ptr() " << q_[1][0][0][0].data_ptr() << std::endl;
-
     for (int i = 0; i < b; i++){
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
         int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, data_type);
@@ -357,18 +344,10 @@ mha_fwd(const at::Tensor &q,
     at::Tensor s;
     if (return_softmax) { s = torch::empty({ batch_size, num_heads, max_seqlen_q, max_seqlen_k }, opts.dtype(at::kInt)); }
 
-    //int z_device_buf_space = 0;
-    //if (return_softmax) { 
-    //    z_device_buf_space = sizeof(unsigned short) * batch_size * num_heads * max_seqlen_q * max_seqlen_k;
-    //}
-    //DeviceMem z_device_buf(z_device_buf_space);
-    //if (return_softmax) { 
-    //    z_device_buf.SetZero();
-    //}
-
     if (zero_tensors) {
         out.zero_();
         softmax_lse.fill_(-std::numeric_limits<float>::infinity());
+        if (return_softmax) { s.zero_(); }
     }
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
@@ -408,33 +387,8 @@ mha_fwd(const at::Tensor &q,
     run_fmha_fp16_bf16_gfx90a(launch_params);
 
     std::vector<at::Tensor> result = {softmax_lse};
+
     if (return_softmax) {
-        //const int M   = max_seqlen_q;   // seqlen Q
-        //const int N   = max_seqlen_k;   // seqlen K
-        //const int G0  = batch_size;     // G0 = batch_size
-        //const int G1  = num_heads;   // num_heads
-        //std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
-        //std::vector<ck::index_t> z_gs_ms_ns_strides{M * G1 * N, N, G1 * N, 1}; // Z layout [G0, G1, M, N]
-
-        //bool input_permute = false;
-
-        //std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
-        //std::vector<ck::index_t> z_gs_ms_ns_strides =
-        //    input_permute
-        //        ? std::vector<ck::index_t>{M * G1 * N, N, G1 * N, 1} // Z layout [G0, M, G1, N]
-        //        : std::vector<ck::index_t>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
-
-        //Tensor<unsigned short> z_host(z_gs_ms_ns_lengths, z_gs_ms_ns_strides);
-        //Tensor<int> z_host_int({G0, G1, M, N});
-
-        //z_device_buf.FromDevice(z_host.mData.data());
-        //z_host.ForEach([&](auto& self, auto idx) {
-        //    z_host_int(idx[0],idx[1],idx[2],idx[3]) = static_cast<int>(self(idx));
-        //});
-
-        //at::TensorOptions s_opts_=at::TensorOptions().dtype(at::kInt);
-        //at::Tensor s = at::from_blob(z_host_int.mData.data(), {G0, G1, M, N}, s_opts_).contiguous().clone().to(at::kCUDA);
-
         result.push_back(s);
     }
     return result;
