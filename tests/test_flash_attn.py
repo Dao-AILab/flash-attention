@@ -27,7 +27,7 @@ except (ImportError, AttributeError):  # Older version of Triton doesn't have tl
     flash_attn_func = None
 
 
-is_sm75 = True #torch.cuda.get_device_capability('cuda') == (7, 5)
+is_sm75 = False #torch.cuda.get_device_capability('cuda') == (7, 5)
 is_sm80 = True #torch.cuda.get_device_capability('cuda') == (8, 0)
 
 
