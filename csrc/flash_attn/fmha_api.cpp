@@ -207,13 +207,14 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
-    TORCH_CHECK(is_sm8x || is_sm75);
+    bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    TORCH_CHECK(is_sm90 || is_sm8x || is_sm75);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     bool is_dropout = p_dropout > 0.0;
     Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || (is_sm8x && q_dtype == torch::kBFloat16));
+    TORCH_CHECK(q_dtype == torch::kFloat16 || ((is_sm8x || is_sm90) && q_dtype == torch::kBFloat16));
     TORCH_CHECK(k.dtype() == q_dtype);
     TORCH_CHECK(v.dtype() == q_dtype);
     TORCH_CHECK(out.dtype() == q_dtype);
@@ -358,14 +359,15 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
-    TORCH_CHECK(is_sm8x || is_sm75);
+    bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    TORCH_CHECK(is_sm90 || is_sm8x || is_sm75);
     auto launch = &run_fmha_bwd;
 
     bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || (is_sm8x && q_dtype == torch::kBFloat16));
+    TORCH_CHECK(q_dtype == torch::kFloat16 || ((is_sm8x || is_sm90) && q_dtype == torch::kBFloat16));
     TORCH_CHECK(k.dtype() == q_dtype);
     TORCH_CHECK(v.dtype() == q_dtype);
     TORCH_CHECK(out.dtype() == q_dtype);
@@ -406,7 +408,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     TORCH_CHECK(batch_size > 0);
     TORCH_CHECK((head_size % 8 == 0) && (head_size <= 128));
     if (head_size > 64) {  // TODO: eventually we should support SM86 and SM70 with d=128 as well
-        TORCH_CHECK(is_sm80);
+        TORCH_CHECK(is_sm80 || is_sm90);
     }
 
     CHECK_SHAPE(q, total_q, num_heads, head_size);
@@ -518,7 +520,10 @@ mha_fwd_block(const at::Tensor &q,         // total_q x num_heads x head_size, t
               c10::optional<at::Generator> gen_) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
-    TORCH_CHECK(dprops->major == 8 && dprops->minor >= 0);
+    bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
+    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    TORCH_CHECK(is_sm8x || is_sm90);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     bool is_dropout = p_dropout > 0.0;
     Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
@@ -648,7 +653,8 @@ mha_bwd_block(const at::Tensor &dout,  // total x num_heads, x head_size
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
-    TORCH_CHECK(dprops->major == 8 && dprops->minor >= 0);
+    bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    TORCH_CHECK(is_sm8x || is_sm90);
     auto launch = &run_fmha_block_dgrad_fp16_sm80;
 
     bool is_dropout = p_dropout > 0.0;
@@ -698,7 +704,7 @@ mha_bwd_block(const at::Tensor &dout,  // total x num_heads, x head_size
     TORCH_CHECK(batch_size > 0);
     TORCH_CHECK(head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
     if (head_size == 128) {  // TODO: eventually we should support SM86 and SM70 with d=128 as well
-        TORCH_CHECK(is_sm80);
+        TORCH_CHECK(is_sm80 || is_sm90);
     }
 
     CHECK_SHAPE(q, total_q, num_heads, head_size);

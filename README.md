@@ -62,9 +62,10 @@ PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
 ```
 
 FlashAttention currently supports:
-1. Turing or Ampere GPUs (e.g., A100, RTX 3090, T4, RTX 2080).
-2. fp16 and bf16 (bf16 requires Ampere GPUs).
-3. Head dimensions that are multiples of 8, up to 128 (e.g., 8, 16, 24, ..., 128). Head dim > 64 backward requires A100.
+1. Turing, Ampere, Ada, or Hopper GPUs (e.g., H100, A100, RTX 3090, T4, RTX 2080).
+2. fp16 and bf16 (bf16 requires Ampere, Ada, or Hopper GPUs).
+3. Head dimensions that are multiples of 8, up to 128 (e.g., 8, 16, 24, ...,
+   128). Head dim > 64 backward requires A100 or H100.
 
 Our tentative roadmap:
 1. ~~[Jun 2022] Make package pip-installable~~[Done, thanks to lucidrains].
@@ -74,10 +75,11 @@ Our tentative roadmap:
 5. ~~[Jul 2022] Implement cross-attention~~[Done].
 6. ~~[Jul 2022] Support head dimension 128~~[Done].
 7. ~~[Aug 2022] Fuse rotary embedding~~[Done].
-8. [Apr 2023] Refactor to use Cutlass 3.x.
-9. [May 2023] Support attention bias (e.g. ALiBi, relative positional encoding).
-10. [Jun 2023] Support SM70 GPUs (V100).
-11. [Jun 2023] Support SM90 GPUs (H100).
+8. ~~[Mar 2023] Support SM90 GPUs (H100)~~[Done].
+9. [Apr 2023] Refactor to use Cutlass 3.x.
+10. [May 2023] Support attention bias (e.g. ALiBi, relative positional encoding).
+11. [Jun 2023] Support SM70 GPUs (V100).
+12. [Jun 2023] Support fp8 (H100).
 
 
 ## How to use FlashAttention
