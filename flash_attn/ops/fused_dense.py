@@ -421,6 +421,8 @@ class FusedMLP(nn.Module):
             'auto': heuristic will be picked automatically:
                 For CUDA >= 11.8, we set heuristic=0 for both fp16 and bf16 for best perf.
                 For CUDA <= 11.7, we set heuristic=1 for fp16 and heuristic=-1 for bf16.
+                For H100, we set heuristic=-1 for both fp16 and bf16 as the fused cuBlasLt implementation
+                is slower than the unfused version.
         return_residual: whether to return the input x along with the output. This is for
             performance reason: for post-norm architecture, returning the input allows us
             to fuse the backward of nn.Linear with the residual connection.
@@ -442,8 +444,11 @@ class FusedMLP(nn.Module):
         dtype = x.dtype if not torch.is_autocast_enabled() else torch.get_autocast_gpu_dtype()
         if self.heuristic == 'auto':
             if self.activation == 'gelu_approx':
-                cuda_ver = tuple(map(int, torch.version.cuda.split('.')))
-                heuristic = 0 if cuda_ver >= (11, 8) else (1 if dtype == torch.float16 else -1)
+                if torch.cuda.get_device_capability('cuda') == (9, 0):
+                    heuristic = -1
+                else:
+                    cuda_ver = tuple(map(int, torch.version.cuda.split('.')))
+                    heuristic = 0 if cuda_ver >= (11, 8) else (1 if dtype == torch.float16 else -1)
             else:
                 heuristic = 0
         else:
