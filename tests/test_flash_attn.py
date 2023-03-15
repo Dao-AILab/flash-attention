@@ -11,6 +11,7 @@ from functools import partial
 
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 
 import pytest
 
@@ -366,10 +367,18 @@ def get_dropout_mask(S_dmask, dropout_p, cu_seqlens_q, cu_seqlens_k, batch_size,
             S_dmask_each = S_dmask[i].view(-1).contiguous()
             #print(f'S_dmask_each.size(): {S_dmask_each.size()}')
             for j in range(nheads):
-                for k in range(current_seqlen_q):
-                    for m in range(current_seqlen_k):
-                        index_for_S_dmask = j * current_seqlen_q * current_seqlen_k + k* current_seqlen_k + m
-                        S_dmask_converted[i][j][k][m] = S_dmask_each[index_for_S_dmask]
+                ZeroPad = nn.ZeroPad2d(padding=(0, seqlen - current_seqlen_k, 0, seqlen - current_seqlen_q))
+                S_dmask_converted_each = S_dmask_each[j * current_seqlen_q * current_seqlen_k : (j+1) * current_seqlen_q * current_seqlen_k]
+                S_dmask_converted_each_2d = S_dmask_converted_each.view(current_seqlen_q, current_seqlen_k).contiguous()
+                S_dmask_converted_each_2d_pad = ZeroPad(S_dmask_converted_each_2d)
+                S_dmask_converted[i][j] = S_dmask_converted_each_2d_pad
+                #for k in range(current_seqlen_q):
+                #    index_for_S_dmask_start = j * current_seqlen_q * current_seqlen_k + k* current_seqlen_k
+                #    index_for_S_dmask_end = j * current_seqlen_q * current_seqlen_k + k* current_seqlen_k + current_seqlen_k
+                #    S_dmask_converted[i][j][k][0 : current_seqlen_k] = S_dmask_each[index_for_S_dmask_start : index_for_S_dmask_end]
+                #    #for m in range(current_seqlen_k):
+                #    #    index_for_S_dmask = j * current_seqlen_q * current_seqlen_k + k* current_seqlen_k + m
+                #    #    S_dmask_converted[i][j][k][m] = S_dmask_each[index_for_S_dmask]
         dropout_mask_t = S_dmask_converted <= ((1 - dropout_p) * 65535)
         dropout_mask = dropout_mask_t.contiguous()
     return dropout_mask
