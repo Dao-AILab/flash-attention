@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from transformers import GPT2Config, OPTConfig
 
 
-def remap_state_dict_opt(state_dict, config):
+def remap_state_dict_hf_opt(state_dict, config):
     def key_mapping_model(key):
         key = re.sub(r'^model.decoder.', 'transformer.', key)
         # The OPT-350m model uses '^decoder' instead of '^model.decoder'

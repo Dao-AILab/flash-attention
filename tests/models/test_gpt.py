@@ -7,7 +7,7 @@ from transformers import GPT2Config
 from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel as GPT2LMHeadModelHF
 
 from flash_attn.models.gpt import GPTLMHeadModel
-from flash_attn.models.gpt import remap_state_dict_gpt2
+from flash_attn.models.gpt import remap_state_dict_hf_gpt2
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 
 
@@ -15,7 +15,7 @@ from flash_attn.utils.pretrained import state_dict_from_pretrained
 # @pytest.mark.parametrize('model_name', ["gpt2"])
 def test_gpt2_state_dict(model_name):
     config = GPT2Config.from_pretrained(model_name)
-    pretrained_state_dict = remap_state_dict_gpt2(state_dict_from_pretrained(model_name), config)
+    pretrained_state_dict = remap_state_dict_hf_gpt2(state_dict_from_pretrained(model_name), config)
     model = GPTLMHeadModel(config)
     state_dict = model.state_dict()
     assert state_dict.keys() == pretrained_state_dict.keys()

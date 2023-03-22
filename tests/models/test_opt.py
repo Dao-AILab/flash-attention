@@ -7,7 +7,7 @@ from transformers import OPTConfig
 from transformers.models.opt.modeling_opt import OPTForCausalLM
 
 from flash_attn.models.gpt import GPTLMHeadModel
-from flash_attn.models.opt import remap_state_dict_opt, opt_config_to_gpt2_config
+from flash_attn.models.opt import remap_state_dict_hf_opt, opt_config_to_gpt2_config
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 
 
@@ -15,7 +15,7 @@ from flash_attn.utils.pretrained import state_dict_from_pretrained
 # @pytest.mark.parametrize('model_name', ["facebook/opt-350m"])
 def test_opt_state_dict(model_name):
     config = opt_config_to_gpt2_config(OPTConfig.from_pretrained(model_name))
-    pretrained_state_dict = remap_state_dict_opt(state_dict_from_pretrained(model_name), config)
+    pretrained_state_dict = remap_state_dict_hf_opt(state_dict_from_pretrained(model_name), config)
     model = GPTLMHeadModel(config)
     state_dict = model.state_dict()
     assert state_dict.keys() == pretrained_state_dict.keys()

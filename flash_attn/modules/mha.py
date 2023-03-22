@@ -347,9 +347,10 @@ class MHA(nn.Module):
     """Multi-head self-attention and cross-attention
     """
 
-    def __init__(self, embed_dim, num_heads, cross_attn=False, bias=True, dropout=0.0,
-                 softmax_scale=None, causal=False, layer_idx=None, dwconv=False, rotary_emb_dim=0,
-                 rotary_emb_scale_base=0,
+    def __init__(self, embed_dim, num_heads, cross_attn=False,
+                 qkv_proj_bias=True, out_proj_bias=True,
+                 dropout=0.0, softmax_scale=None, causal=False, layer_idx=None, dwconv=False,
+                 rotary_emb_dim=0, rotary_emb_scale_base=None, rotary_emb_interleaved=False,
                  fused_bias_fc=False, use_flash_attn=False, return_residual=False,
                  checkpointing=False, device=None, dtype=None) -> None:
         """
@@ -377,7 +378,7 @@ class MHA(nn.Module):
             assert not cross_attn, 'MHA with rotary embedding does not support cross-attention yet'
             assert RotaryEmbedding is not None, 'rotary_emb is not installed'
             self.rotary_emb = RotaryEmbedding(self.rotary_emb_dim, scale_base=rotary_emb_scale_base,
-                                              device=device)
+                                              interleaved=rotary_emb_interleaved, device=device)
 
         if fused_bias_fc and FusedDense is None:
             raise ImportError('fused_dense is not installed')
@@ -388,29 +389,32 @@ class MHA(nn.Module):
         inner_cross_attn_cls = FlashCrossAttention if use_flash_attn else CrossAttention
         if not self.cross_attn:
             if not self.return_residual:
-                self.Wqkv = linear_cls(embed_dim, 3 * embed_dim, bias=bias, **factory_kwargs)
+                self.Wqkv = linear_cls(embed_dim, 3 * embed_dim, bias=qkv_proj_bias,
+                                       **factory_kwargs)
             else:
-                self.Wqkv = linear_resid_cls(embed_dim, 3 * embed_dim, bias=bias, **factory_kwargs)
+                self.Wqkv = linear_resid_cls(embed_dim, 3 * embed_dim, bias=qkv_proj_bias,
+                                             **factory_kwargs)
             if self.dwconv:
                 self.dwconv_qkv = nn.Conv1d(3 * embed_dim, 3 * embed_dim, kernel_size=3, padding=2,
                                             groups=3 * embed_dim)
         else:
-            self.Wq = linear_cls(embed_dim, embed_dim, bias=bias, **factory_kwargs)
+            self.Wq = linear_cls(embed_dim, embed_dim, bias=qkv_proj_bias, **factory_kwargs)
             if not self.return_residual:
-                self.Wkv = linear_cls(embed_dim, 2 * embed_dim, bias=bias, **factory_kwargs)
+                self.Wkv = linear_cls(embed_dim, 2 * embed_dim, bias=qkv_proj_bias,
+                                      **factory_kwargs)
             else:
-                self.Wkv = linear_resid_cls(embed_dim, 2 * embed_dim, bias=bias, **factory_kwargs)
+                self.Wkv = linear_resid_cls(embed_dim, 2 * embed_dim, bias=qkv_proj_bias,
+                                            **factory_kwargs)
             if self.dwconv:
                 self.dwconv_q = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=2,
-                                        groups=embed_dim)
+                                          groups=embed_dim)
                 self.dwconv_kv = nn.Conv1d(2 * embed_dim, 2 * embed_dim, kernel_size=3, padding=2,
-                                        groups=2 * embed_dim)
+                                          groups=2 * embed_dim)
         self.inner_attn = inner_attn_cls(causal=causal, softmax_scale=softmax_scale,
                                          attention_dropout=dropout)
         self.inner_cross_attn = inner_cross_attn_cls(causal=causal, softmax_scale=softmax_scale,
                                                      attention_dropout=dropout)
-        # output projection always have the bias (for now)
-        self.out_proj = linear_cls(embed_dim, embed_dim, **factory_kwargs)
+        self.out_proj = linear_cls(embed_dim, embed_dim, bias=out_proj_bias, **factory_kwargs)
 
     def _update_kv_cache(self, kv, inference_params):
         """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)
@@ -526,9 +530,10 @@ class ParallelMHA(nn.Module):
     """Multi-head self-attention and cross-attention
     """
 
-    def __init__(self, embed_dim, num_heads, process_group, bias=True, dropout=0.0,
-                 softmax_scale=None, causal=False, layer_idx=None, rotary_emb_dim=0,
-                 rotary_emb_scale_base=0, use_flash_attn=False, checkpointing=False,
+    def __init__(self, embed_dim, num_heads, process_group, qkv_proj_bias=True, out_proj_bias=True,
+                 dropout=0.0, softmax_scale=None, causal=False, layer_idx=None,
+                 rotary_emb_dim=0, rotary_emb_scale_base=None, rotary_emb_interleaved=False,
+                 use_flash_attn=False, checkpointing=False,
                  sequence_parallel=True, device=None, dtype=None) -> None:
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
@@ -546,11 +551,12 @@ class ParallelMHA(nn.Module):
         if self.rotary_emb_dim > 0:
             assert RotaryEmbedding is not None, 'rotary_emb is not installed'
             self.rotary_emb = RotaryEmbedding(self.rotary_emb_dim, scale_base=rotary_emb_scale_base,
-                                              device=device)
+                                              interleaved=rotary_emb_interleaved, device=device)
 
         if ColumnParallelLinear is None or RowParallelLinear is None:
             raise ImportError('fused_dense is not installed')
-        self.Wqkv = ColumnParallelLinear(embed_dim, 3 * embed_dim, process_group, bias=bias,
+        self.Wqkv = ColumnParallelLinear(embed_dim, 3 * embed_dim, process_group,
+                                         bias=qkv_proj_bias,
                                          sequence_parallel=sequence_parallel, **factory_kwargs)
         inner_attn_cls = FlashSelfAttention if use_flash_attn else SelfAttention
         inner_cross_attn_cls = FlashCrossAttention if use_flash_attn else CrossAttention
@@ -558,8 +564,8 @@ class ParallelMHA(nn.Module):
                                          attention_dropout=dropout)
         self.inner_cross_attn = inner_cross_attn_cls(causal=causal, softmax_scale=softmax_scale,
                                                      attention_dropout=dropout)
-        # output projection always have the bias (for now)
         self.out_proj = RowParallelLinear(embed_dim, embed_dim, process_group,
+                                          bias=out_proj_bias,
                                           sequence_parallel=sequence_parallel, **factory_kwargs)
 
     def forward(self, x, seqlen=None, inference_params=None, **kwargs):

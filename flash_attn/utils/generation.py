@@ -71,8 +71,8 @@ def sample(logits, top_k=1, top_p=0.0, temperature=1.0):
 
 
 def decode(input_ids, model, max_length, top_k=1, top_p=0.0, temperature=1.0,
-           eos_token_id=None, vocab_size=None, tensor_parallel=1, fused_ft_kernel=False,
-           cg=False, timing=False):
+           eos_token_id=None, teacher_outputs=None, vocab_size=None, tensor_parallel=1,
+           fused_ft_kernel=False, cg=False, timing=False):
     """Decoding, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
     Top-k and top-p can be used together. If top_k > 0 and top_p > 0, then top-k is applied first,
@@ -87,6 +87,7 @@ def decode(input_ids, model, max_length, top_k=1, top_p=0.0, temperature=1.0,
         scores: tuples of (batch, vocab_size)
     """
     batch_size, seqlen_og = input_ids.shape
+    teacher_output_len = teacher_outputs.shape[1] if teacher_outputs is not None else 0
     if cg:
         assert fused_ft_kernel
         if not hasattr(model, '_decoding_cache'):
@@ -111,7 +112,10 @@ def decode(input_ids, model, max_length, top_k=1, top_p=0.0, temperature=1.0,
         if vocab_size is not None:
             logits = logits[..., :vocab_size]
         scores.append(logits)
-        next_token = sample(logits, top_k=top_k, top_p=top_p, temperature=temperature)
+        if teacher_outputs is None or teacher_output_len <= seqlen_og:
+            next_token = sample(logits, top_k=top_k, top_p=top_p, temperature=temperature)
+        else:
+            next_token = teacher_outputs[:, seqlen_og]
         sequences = [next_token]
         inference_params.sequence_len_offset = seqlen_og
         while True:
@@ -126,7 +130,10 @@ def decode(input_ids, model, max_length, top_k=1, top_p=0.0, temperature=1.0,
             if vocab_size is not None:
                 logits = logits[..., :vocab_size]
             scores.append(logits)
-            next_token = sample(logits, top_k=top_k, temperature=temperature)
+            if teacher_outputs is None or teacher_output_len <= inference_params.sequence_len_offset + 1:
+                next_token = sample(logits, top_k=top_k, temperature=temperature)
+            else:
+                next_token = teacher_outputs[:, inference_params.sequence_len_offset + 1]
             sequences.append(next_token)
             inference_params.sequence_len_offset += 1
             if eos_token_id is not None and (next_token == eos_token_id).all():
