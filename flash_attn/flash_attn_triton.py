@@ -1,5 +1,10 @@
 """
 *Experimental* implementation of FlashAttention in Triton.
+Tested with triton==2.0.0.dev20221202.
+Triton 2.0 has a new backend (MLIR) but seems like it doesn't yet work for head dimensions
+other than 64:
+https://github.com/openai/triton/blob/d376020f90002757eea3ea9475d4f7cfc2ec5ead/python/triton/ops/flash_attention.py#L207
+We'll update this implementation with the new Triton backend once this is fixed.
 
 We use the FlashAttention implementation from Phil Tillet a starting point.
 https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention.py
@@ -773,7 +778,8 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         q, kv, o, lse, bias = ctx.saved_tensors
-        assert not ctx.needs_input_grad[2], 'FlashAttention does not support bias gradient yet'
+        if len(ctx.needs_input_grad) >= 3:
+            assert not ctx.needs_input_grad[2], 'FlashAttention does not support bias gradient yet'
         # Triton's autotune causes the Tensor._version to change, and so Pytorch autograd
         # does a memcpy. To avoid this we run in inference_mode, which doesn't track the version.
         with torch.inference_mode():
