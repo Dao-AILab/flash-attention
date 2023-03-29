@@ -1669,22 +1669,6 @@ __device__ __inline__ void write_smem_transpose(const float& vec, float* smem, i
     return;
 }
 
-#ifdef ENABLE_BF16
-template<>
-__device__ __inline__ void
-write_smem_transpose(const bf16_4_t& vec, __nv_bfloat16* smem, int transpose_idx, int smem_pitch)
-{
-    return;
-}
-
-template<>
-__device__ __inline__ void
-write_smem_transpose(const bf16_8_t& vec, __nv_bfloat16* smem, int transpose_idx, int smem_pitch)
-{
-    return;
-}
-#endif
-
 template<>
 __device__ __inline__ void write_smem_transpose(const uint4& vec, uint16_t* smem, int transpose_idx, int smem_pitch)
 {
@@ -1775,6 +1759,20 @@ write_smem_transpose(const __nv_bfloat162& vec, __nv_bfloat16* smem, int transpo
 {
     smem[transpose_idx]              = vec.x;
     smem[smem_pitch + transpose_idx] = vec.y;
+}
+
+template<>
+__device__ __inline__ void
+write_smem_transpose(const bf16_4_t& vec, __nv_bfloat16* smem, int transpose_idx, int smem_pitch)
+{
+    write_smem_transpose(reinterpret_cast<const uint2&>(vec), reinterpret_cast<uint16_t*>(smem), transpose_idx, smem_pitch);
+}
+
+template<>
+__device__ __inline__ void
+write_smem_transpose(const bf16_8_t& vec, __nv_bfloat16* smem, int transpose_idx, int smem_pitch)
+{
+    write_smem_transpose(reinterpret_cast<const uint4&>(vec), reinterpret_cast<uint16_t*>(smem), transpose_idx, smem_pitch);
 }
 #endif
 

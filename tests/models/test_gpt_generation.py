@@ -15,7 +15,6 @@ from flash_attn.models.gpt import GPTLMHeadModel
 from flash_attn.models.gpt import remap_state_dict_hf_gpt2
 from flash_attn.models.opt import remap_state_dict_hf_opt, opt_config_to_gpt2_config
 from flash_attn.utils.pretrained import state_dict_from_pretrained
-from flash_attn.utils.distributed import all_gather_raw
 from flash_attn.utils.generation import update_graph_cache
 
 
@@ -61,7 +60,7 @@ def test_greedy_decode_gpt2(model_name, rotary, optimized, fused_ft_kernel):
     torch.manual_seed(0)
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     input_ids = tokenizer("Hello, my dog is cute and",
-                          return_tensors="pt").input_ids.to(device=device)
+                         return_tensors="pt").input_ids.to(device=device)
     max_length = 30
     # input_ids = torch.randint(0, 100, (2, 10), dtype=torch.long, device='cuda')
     # max_length = input_ids.shape[1] + 40

@@ -82,6 +82,8 @@ def decode(input_ids, model, max_length, top_k=1, top_p=0.0, temperature=1.0,
     Arguments:
         input_ids: (batch, seq_len)
         max_length: int
+        teacher_outputs (optional): (batch, seq_len). If provided, instead of sampling from the
+            logits, the next token is taken from the teacher_outputs. Useful for testing.
     Returns: GreedySearchDecoderOnlyOutput or SampleDecoderOnlyOutput, with the following fields:
         sequences: (batch, max_length)
         scores: tuples of (batch, vocab_size)
@@ -111,7 +113,7 @@ def decode(input_ids, model, max_length, top_k=1, top_p=0.0, temperature=1.0,
             start = time.time()
         if vocab_size is not None:
             logits = logits[..., :vocab_size]
-        scores.append(logits)
+        scores.append(logits if not cg else logits.clone())
         if teacher_outputs is None or teacher_output_len <= seqlen_og:
             next_token = sample(logits, top_k=top_k, top_p=top_p, temperature=temperature)
         else:
@@ -129,7 +131,7 @@ def decode(input_ids, model, max_length, top_k=1, top_p=0.0, temperature=1.0,
                                                    inference_params.sequence_len_offset)
             if vocab_size is not None:
                 logits = logits[..., :vocab_size]
-            scores.append(logits)
+            scores.append(logits if not cg else logits.clone())
             if teacher_outputs is None or teacher_output_len <= inference_params.sequence_len_offset + 1:
                 next_token = sample(logits, top_k=top_k, temperature=temperature)
             else:
