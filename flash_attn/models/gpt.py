@@ -25,6 +25,7 @@ from flash_attn.utils.pretrained import state_dict_from_pretrained
 from flash_attn.utils.generation import GenerationMixin
 from flash_attn.models.opt import remap_state_dict_hf_opt
 from flash_attn.models.gptj import remap_state_dict_hf_gptj
+from flash_attn.models.gpt_neox import remap_state_dict_hf_gpt_neox
 
 try:
     from flash_attn.ops.fused_dense import ColumnParallelLinear
@@ -205,6 +206,8 @@ class GPTPreTrainedModel(nn.Module):
         elif model_name.startswith('EleutherAI/gpt-j-'):
             state_dict = remap_state_dict_hf_gptj(state_dict, config)
             strict = False  # We have rotary_emb.inf_freq buffers not in the GPT-J checkpoint
+        elif model_name.startswith('EleutherAI/gpt-neox-'):
+            state_dict = remap_state_dict_hf_gpt_neox(state_dict, config)
         else:
             raise NotImplementedError(f'Model {model_name} not supported')
         if world_size > 1:
@@ -355,6 +358,7 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         self.process_group = process_group
         self.transformer = GPTModel(config, process_group=process_group, **factory_kwargs)
         self.tie_word_embeddings = getattr(config, 'tie_word_embeddings', True)
+        lm_head_bias = getattr(config, 'lm_head_bias', False)
         pad_vocab_size_multiple = getattr(config, 'pad_vocab_size_multiple', 1)
         vocab_size = (math.ceil(config.vocab_size / pad_vocab_size_multiple)
                       * pad_vocab_size_multiple)
@@ -366,13 +370,12 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         else:
             self.project_out = None
         if process_group is None:
-            self.lm_head = nn.Linear(embed_dim, vocab_size, bias=not self.tie_word_embeddings,
-                                     **factory_kwargs)
+            self.lm_head = nn.Linear(embed_dim, vocab_size, bias=lm_head_bias, **factory_kwargs)
         else:
             if ColumnParallelLinear is None:
                 raise ImportError('fused_dense_lib is not installed')
             self.lm_head = ColumnParallelLinear(
-                embed_dim, vocab_size, process_group, bias=not self.tie_word_embeddings,
+                embed_dim, vocab_size, process_group, bias=lm_head_bias,
                 sequence_parallel=getattr(config, 'sequence_parallel', True), **factory_kwargs
             )
         # Initialize weights and apply final processing

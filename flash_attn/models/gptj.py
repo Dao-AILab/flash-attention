@@ -34,6 +34,10 @@ def remap_state_dict_hf_gptj(state_dict, config):
         state_dict['lm_head.weight'] = F.pad(
             output_embeddings, (0, 0, 0, vocab_size - output_embeddings.shape[0])
         )
+        output_embeddings_bias = state_dict.pop('lm_head.bias')
+        state_dict['lm_head.bias'] = F.pad(
+            output_embeddings_bias, (0, vocab_size - output_embeddings_bias.shape[0])
+        )
 
     # LayerNorm
     def key_mapping_ln(key):
@@ -92,4 +96,5 @@ def gptj_config_to_gpt2_config(gptj_config: GPTJConfig) -> GPT2Config:
         tie_word_embeddings=False,
         qkv_proj_bias=False,
         out_proj_bias=False,
+        lm_head_bias=True,
     )
