@@ -35,7 +35,7 @@ def test_gpt_neox_optimized(model_name):
     config.use_flash_attn = True
     config.fused_bias_fc = True
     config.fused_mlp = True  # GPT-NeoX-20B uses "gelu_fast"
-    config.fused_dropout_add_ln = False  # We don't support parallel block yet
+    config.fused_dropout_add_ln = True
     config.residual_in_fp32 = True
 
     model = GPTLMHeadModel.from_pretrained(model_name, config, device=device, dtype=dtype)

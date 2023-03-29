@@ -38,6 +38,11 @@ except ImportError:
     dropout_add_layer_norm = None
 
 try:
+    from flash_attn.ops.layer_norm import dropout_add_layer_norm_parallel_residual
+except ImportError:
+    dropout_add_layer_norm_parallel_residual = None
+
+try:
     from flash_attn.ops.triton.mlp import FusedDenseSqreluDense, sqrelu_fwd
 except ImportError:
     FusedDenseSqreluDense = None
@@ -282,8 +287,10 @@ class GPTModel(GPTPreTrainedModel):
                                      for i in range(config.num_hidden_layers)])
 
         self.fused_dropout_add_ln = getattr(config, 'fused_dropout_add_ln', False)
-        if self.fused_dropout_add_ln and dropout_add_layer_norm is None:
-            raise ImportError('dropout_add_layer_norm is not installed')
+        if self.fused_dropout_add_ln:
+            if ((not self.parallel_block and dropout_add_layer_norm is None)
+                or (self.parallel_block and dropout_add_layer_norm_parallel_residual is None)):
+                raise ImportError('dropout_layer_norm is not installed')
         if self.prenorm:
             self.drop_f = nn.Dropout(config.resid_pdrop)
             self.ln_f = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon,
@@ -340,13 +347,19 @@ class GPTModel(GPTPreTrainedModel):
                                 if residual is not None else dropped + dropped2)
                 hidden_states = self.ln_f(residual.to(dtype=self.ln_f.weight.dtype))
             else:
-                assert not self.parallel_block
                 # Set prenorm=False here since we don't need the residual
-                hidden_states = dropout_add_layer_norm(
-                    hidden_states, residual, self.ln_f.weight, self.ln_f.bias,
-                    self.drop_f.p if self.training else 0.0, self.ln_f.eps, prenorm=False,
-                    residual_in_fp32=self.residual_in_fp32
-                )
+                if not self.parallel_block:
+                    hidden_states = dropout_add_layer_norm(
+                        hidden_states, residual, self.ln_f.weight, self.ln_f.bias,
+                        self.drop_f.p if self.training else 0.0, self.ln_f.eps, prenorm=False,
+                        residual_in_fp32=self.residual_in_fp32
+                    )
+                else:
+                    hidden_states, _ = dropout_add_layer_norm_parallel_residual(
+                        hidden_states, hidden_states2, residual, self.ln_f.weight, self.ln_f.bias,
+                        None, None, self.drop_f.p if self.training else 0.0, self.ln_f.eps,
+                        prenorm=False, residual_in_fp32=self.residual_in_fp32
+                    )
         return hidden_states
 
 

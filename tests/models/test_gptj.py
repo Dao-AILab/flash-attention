@@ -36,7 +36,7 @@ def test_gptj_optimized(model_name):
     config.use_flash_attn = False  # FlashAttention doesn't support hdim 256 yet
     config.fused_bias_fc = True
     config.fused_mlp = True
-    config.fused_dropout_add_ln = False  # We don't support parallel block yet
+    config.fused_dropout_add_ln = True
     config.residual_in_fp32 = True
 
     model = GPTLMHeadModel.from_pretrained(model_name, config, device=device, dtype=dtype)

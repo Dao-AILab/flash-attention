@@ -99,6 +99,46 @@ def _dropout_add_layer_norm_subset_backward(dz, dx, x, x0, dmask, mu, rsigma, ga
         return dx0mat, dresidualmat, dgamma, dbeta, dcolscale
 
 
+def _dropout_add_layer_norm_parallel_residual_forward(
+    x0, x1, residual, gamma0, beta0, gamma1, beta1, dropout_p,
+    epsilon, residual_in_fp32=False, is_rms_norm=False
+):
+    """ Assume that arguments are contiguous
+    """
+    hidden_size = gamma0.numel()
+    x0mat = x0.view((-1, hidden_size))
+    x1mat = x1.view((-1, hidden_size)) if x1 is not None else None
+    residualmat = residual.view((-1, hidden_size)) if residual is not None else None
+    z0mat, z1mat, xmat, dmask0, dmask1, mu, rsigma = dropout_layer_norm.dropout_add_ln_parallel_residual_fwd(
+        x0mat, x1mat, residualmat, gamma0, beta0, gamma1, beta1, dropout_p, epsilon,
+        None, residual_in_fp32, is_rms_norm
+    )
+    # dmask0 and dmask1 are None if dropout_p == 0.0
+    # xmat is None if dropout_p == 0.0 and residual is None and residual_dtype != input_dtype
+    return z0mat, z1mat, xmat if xmat is not None else x0mat, dmask0, dmask1, mu, rsigma
+
+
+def _dropout_add_layer_norm_parallel_residual_backward(
+    dz0, dz1, dx, x, dmask0, dmask1, mu, rsigma, gamma0, gamma1,
+    dropout_p, has_x1, has_residual, is_rms_norm=False
+):
+    """ Assume that arguments are contiguous
+    dx == None means that it was a post-norm architecture
+    (x = drop(x0) + residual was not returned in the fwd).
+    """
+    hidden_size = gamma0.numel()
+    xmat = x.view((-1, hidden_size))
+    dz0mat = dz0.view(xmat.shape)
+    dz1mat = dz1.view(xmat.shape) if dz1 is not None else None
+    dxmat = dx.view(xmat.shape) if dx is not None else None
+    dx0mat, dx1mat, dresidualmat, dgamma0, dbeta0, dgamma1, dbeta1, *rest = dropout_layer_norm.dropout_add_ln_parallel_residual_bwd(
+        dz0mat, dz1mat, dxmat, xmat, dmask0, dmask1, mu, rsigma, gamma0, gamma1,
+        dropout_p, has_x1, has_residual, is_rms_norm
+    )
+    # dresidualmat is None if not has_residual
+    return dx0mat, dx1mat, dresidualmat, dgamma0, dbeta0, dgamma1, dbeta1
+
+
 class DropoutAddLayerNormFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x0, residual, gamma, beta, rowscale, colscale, dropout_p, epsilon,
@@ -115,7 +155,7 @@ class DropoutAddLayerNormFn(torch.autograd.Function):
         )
         # Only need to save x0 if we need to compute gradient wrt colscale
         x0_saved = x0 if colscale is not None else None
-        ctx.save_for_backward(xmat.view(x0.shape), x0, dmask, gamma, mu, rsigma, rowscale, colscale)
+        ctx.save_for_backward(xmat.view(x0.shape), x0_saved, dmask, gamma, mu, rsigma, rowscale, colscale)
         ctx.prenorm = prenorm
         ctx.dropout_p = dropout_p
         ctx.has_residual = residual is not None
@@ -168,7 +208,7 @@ class DropoutAddLayerNormSubsetFn(torch.autograd.Function):
         # Only need to save x0 if we need to compute gradient wrt colscale
         x0_saved = x0 if colscale is not None else None
         x_shape = (-1, *x0.shape[1:])
-        ctx.save_for_backward(xmat.view(x_shape), x0, dmask, gamma, mu, rsigma, colscale,
+        ctx.save_for_backward(xmat.view(x_shape), x0_saved, dmask, gamma, mu, rsigma, colscale,
                               x0_subset, out_subset)
         ctx.prenorm = prenorm
         ctx.dropout_p = dropout_p
@@ -208,6 +248,60 @@ class DropoutAddLayerNormSubsetFn(torch.autograd.Function):
                 None, None, None, None, None, None, None, None)
 
 
+class DropoutAddLayerNormParallelResidualFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x0, x1, residual, gamma0, beta0, gamma1, beta1, dropout_p, epsilon,
+                residual_in_fp32=False, prenorm=False, is_rms_norm=False, return_dmask=False):
+        x0 = x0.contiguous()
+        x1 = x1.contiguous() if x1 is not None else None
+        residual = residual.contiguous() if residual is not None else None
+        gamma0 = gamma0.contiguous()
+        beta0 = beta0.contiguous() if beta0 is not None else None
+        gamma1 = gamma1.contiguous() if gamma1 is not None else None
+        beta1 = beta1.contiguous() if beta1 is not None else None
+        z0mat, z1mat, xmat, dmask0, dmask1, mu, rsigma = _dropout_add_layer_norm_parallel_residual_forward(
+            x0, x1, residual, gamma0, beta0, gamma1, beta1, dropout_p, epsilon,
+            residual_in_fp32, is_rms_norm
+        )
+        ctx.save_for_backward(xmat.view(x0.shape), dmask0, dmask1, gamma0, gamma1, mu, rsigma)
+        ctx.prenorm = prenorm
+        ctx.dropout_p = dropout_p
+        ctx.has_x1 = x1 is not None
+        ctx.has_residual = residual is not None
+        ctx.is_rms_norm = is_rms_norm
+        ctx.has_beta = beta0 is not None
+        z = (z0mat.view(x0.shape), z1mat.view(x0.shape) if z1mat is not None else None)
+        if not return_dmask:
+            return z if not prenorm else (*z, xmat.view(x0.shape))
+        else:
+            dmask0 = (dmask0.view(x0.shape) if dropout_p > 0.
+                      else torch.ones(x0.shape, dtype=torch.uint8, device=x0.device))
+            dmask1 = (dmask1.view(x0.shape) if dropout_p > 0. and x1 is not None
+                      else torch.ones(x0.shape, dtype=torch.uint8, device=x0.device))
+            ctx.mark_non_differentiable(dmask0)
+            ctx.mark_non_differentiable(dmask1)
+            return (*z, dmask0, dmask1) if not prenorm else (*z, xmat.view(x0.shape), dmask0, dmask1)
+
+    @staticmethod
+    def backward(ctx, dz0, dz1, *args):
+        dz0 = dz0.contiguous()  # this happens!
+        dz1 = dz1.contiguous() if dz1 is not None else None
+        dx = args[0].contiguous() if ctx.prenorm else None
+        x, dmask0, dmask1, gamma0, gamma1, mu, rsigma = ctx.saved_tensors
+        dropout_p = ctx.dropout_p
+        has_x1 = ctx.has_x1
+        has_residual = ctx.has_residual
+        dx0mat, dx1mat, dresidualmat, dgamma0, dbeta0, dgamma1, dbeta1 = _dropout_add_layer_norm_parallel_residual_backward(
+            dz0, dz1, dx, x, dmask0, dmask1, mu, rsigma, gamma0, gamma1, dropout_p, has_x1,
+            has_residual, ctx.is_rms_norm
+        )
+        dx0 = dx0mat.view(x.shape)
+        dx1 = dx1mat.view(x.shape) if dx1mat is not None else None
+        dresidual = dresidualmat.view(x.shape) if dresidualmat is not None else None
+        return (dx0, dx1, dresidual, dgamma0, dbeta0 if ctx.has_beta else None, dgamma1,
+                dbeta1 if ctx.has_beta else None, None, None, None, None, None, None)
+
+
 def layer_norm(x, weight, bias, epsilon):
     return DropoutAddLayerNormFn.apply(x, None, weight, bias, None, None, 0.0, epsilon, False)
 
@@ -234,6 +328,19 @@ def dropout_add_layer_norm_subset(x0, residual, weight, bias, dropout_p, epsilon
     return DropoutAddLayerNormSubsetFn.apply(
         x0, residual, weight, bias, layerscale, x0_subset, out_subset, dropout_p, epsilon,
         rowscale_const, out_numrows, residual_in_fp32, prenorm, False, return_dropout_mask
+    )
+
+
+def dropout_add_layer_norm_parallel_residual(
+    x0, x1, residual, weight0, bias0, weight1, bias1, dropout_p, epsilon, prenorm=False,
+    residual_in_fp32=False, return_dropout_mask=False
+):
+    """residual_in_fp32 only has an effect if residual is None.
+    Otherwise residual dtype is residual.dtype.
+    """
+    return DropoutAddLayerNormParallelResidualFn.apply(
+        x0, x1, residual, weight0, bias0, weight1, bias1, dropout_p, epsilon, residual_in_fp32, prenorm,
+        False, return_dropout_mask
     )
 
 

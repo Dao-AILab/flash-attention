@@ -64,6 +64,39 @@ inline void check_cuda_(cudaError_t status, const char *file, int line) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#define REGISTER_PARALLEL_FWD_LAUNCHER(HIDDEN_SIZE, WTYPE, ITYPE, RTYPE, OTYPE, CTYPE, CTAS_PER_ROW, WARPS_M, WARPS_N, BYTES_PER_LDG)                \
+    void ln_parallel_residual_fwd_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##RTYPE##_##OTYPE##_##CTYPE(LaunchParams<FwdParams> &launch_params,            \
+                                                                                const bool configure_params) {                                       \
+        launch_parallel_residual_<WTYPE, ITYPE, RTYPE, OTYPE, CTYPE, uint32_t, HIDDEN_SIZE, CTAS_PER_ROW, WARPS_M, WARPS_N, BYTES_PER_LDG>(          \
+            launch_params, configure_params);                                                                                                        \
+    }                                                                                                                                                \
+    static FwdParallelRegistrar<WTYPE, ITYPE, RTYPE, OTYPE, CTYPE, HIDDEN_SIZE> reg_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##RTYPE##_##OTYPE##_##CTYPE( \
+        ln_parallel_residual_fwd_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##RTYPE##_##OTYPE##_##CTYPE)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#define REGISTER_PARALLEL_BWD_LAUNCHER(                                                                                                              \
+    HIDDEN_SIZE, WTYPE, ITYPE, RTYPE, OTYPE, CTYPE, CTAS_PER_ROW, WARPS_M, WARPS_N, BYTES_PER_LDG, BYTES_PER_LDG_FINALIZE)                           \
+    void ln_parallel_residual_bwd_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##RTYPE##_##OTYPE##_##CTYPE(LaunchParams<BwdParams> &launch_params,            \
+                                                                                const bool configure_params) {                                       \
+        launch_parallel_residual_<WTYPE,                                                                                                             \
+                ITYPE,                                                                                                                               \
+                RTYPE,                                                                                                                               \
+                OTYPE,                                                                                                                               \
+                CTYPE,                                                                                                                               \
+                uint32_t,                                                                                                                            \
+                HIDDEN_SIZE,                                                                                                                         \
+                CTAS_PER_ROW,                                                                                                                        \
+                WARPS_M,                                                                                                                             \
+                WARPS_N,                                                                                                                             \
+                BYTES_PER_LDG,                                                                                                                       \
+                BYTES_PER_LDG_FINALIZE>(launch_params, configure_params);                                                                            \
+    }                                                                                                                                                \
+    static BwdParallelRegistrar<WTYPE, ITYPE, RTYPE, OTYPE, CTYPE, HIDDEN_SIZE> reg_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##RTYPE##_##OTYPE##_##CTYPE( \
+        ln_parallel_residual_bwd_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##RTYPE##_##OTYPE##_##CTYPE)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 inline __device__ float2 operator+(const float2 & a, const float2 & b){
     return {a.x + b.x, a.y + b.y};
 }

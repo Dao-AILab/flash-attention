@@ -14,7 +14,7 @@ namespace layer_norm {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Params> 
+template<typename Params>
 struct LaunchParams{
 
     size_t elts_per_thread;
@@ -40,6 +40,7 @@ struct ParamsBase {
         , mu(nullptr)
         , rs(nullptr)
         , gamma(nullptr)
+        , gamma1(nullptr)
         , rowscale(nullptr)
         , colscale(nullptr)
         , dropout_keep_p(1.f)
@@ -59,12 +60,15 @@ struct ParamsBase {
 
     // Common data pointers.
     void *x0;
+    void *x1;
     void *residual;
     void *x;
     void *dmask;
+    void *dmask1;
     void *mu;
     void *rs;
     void *gamma;
+    void *gamma1;
     void *rowscale;
     void *colscale;
     void *x0_subset;
@@ -92,14 +96,18 @@ struct FwdParams : public ParamsBase {
     FwdParams()
         : ParamsBase()
         , z(nullptr)
+        , z1(nullptr)
         , beta(nullptr)
+        , beta1(nullptr)
         , epsilon(0.f)
     {
     }
 
     // Output of LN FWD.
     void *z;
+    void *z1;
     void *beta;
+    void *beta1;
     float epsilon;
 
     // Random state.
@@ -112,34 +120,46 @@ struct BwdParams : public ParamsBase {
     BwdParams()
         : ParamsBase()
         , dz(nullptr)
+        , dz1(nullptr)
         , dx(nullptr)
         , dbeta_part(nullptr)
         , dgamma_part(nullptr)
+        , dbeta1_part(nullptr)
+        , dgamma1_part(nullptr)
         , dcolscale_part(nullptr)
         , dx0(nullptr)
+        , dx1(nullptr)
         , dresidual(nullptr)
         , dbeta(nullptr)
         , dgamma(nullptr)
+        , dbeta1(nullptr)
+        , dgamma1(nullptr)
         , dcolscale(nullptr)
     {
     }
 
     // Input: gradient wrt. LN FWD output.
     void *dz;
+    void *dz1;
     // Input: gradient wrt residual.
     void *dx;
 
     // Workspace for Wgrad pre-reduction.
     void *dbeta_part;
     void *dgamma_part;
+    void *dbeta1_part;
+    void *dgamma1_part;
     void *dcolscale_part;
 
     // Output: Dgrad.
     void *dx0;
+    void *dx1;
     void *dresidual;
     // Output: Wgrad.
     void *dbeta;
     void *dgamma;
+    void *dbeta1;
+    void *dgamma1;
     void *dcolscale;
 
 };
@@ -152,8 +172,8 @@ using FunctionKey = uint64_t;
 using FwdRegistry = std::unordered_map<FunctionKey, FwdFunction>;
 using BwdRegistry = std::unordered_map<FunctionKey, BwdFunction>;
 
-extern FwdRegistry FWD_FUNCS;
-extern BwdRegistry BWD_FUNCS;
+extern FwdRegistry FWD_FUNCS, PARALLEL_FWD_FUNCS;
+extern BwdRegistry BWD_FUNCS, PARALLEL_BWD_FUNCS;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -233,6 +253,26 @@ struct BwdRegistrar{
     BwdRegistrar(BwdFunction f){
         uint64_t key = Types2Key<W,I,R,O,C>::get(HIDDEN_SIZE);
         BWD_FUNCS.insert({ key, f });
+    }
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<typename W, typename I, typename R, typename O, typename C, uint64_t HIDDEN_SIZE>
+struct FwdParallelRegistrar{
+    FwdParallelRegistrar(FwdFunction f){
+        uint64_t key = Types2Key<W,I,R,O,C>::get(HIDDEN_SIZE);
+        PARALLEL_FWD_FUNCS.insert({ key, f });
+    }
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<typename W, typename I, typename R, typename O, typename C, uint64_t HIDDEN_SIZE>
+struct BwdParallelRegistrar{
+    BwdParallelRegistrar(BwdFunction f){
+        uint64_t key = Types2Key<W,I,R,O,C>::get(HIDDEN_SIZE);
+        PARALLEL_BWD_FUNCS.insert({ key, f });
     }
 };
 
