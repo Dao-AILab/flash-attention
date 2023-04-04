@@ -27,6 +27,8 @@ PR or email us. We'd very much like to hear from you!
   
 - EleutherAI's [GPT-NeoX](https://github.com/EleutherAI/gpt-neox/pull/725). This is a research library for training large language transformer models at scale based on NVIDIA's Megatron-LM and Microsoft's DeepSpeed.
 
+- PaddlePaddle: integrated into the framework with [API](https://github.com/PaddlePaddle/Paddle/blob/develop/python/paddle/nn/functional/flash_attention.py) `paddle.nn.functional.flash_attention`.
+
 ## MLPerf benchmarks
 
 [MLPerf](https://mlcommons.org/en/) is a competitive machine learning performance benchmark. FlashAttention
