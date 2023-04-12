@@ -38,7 +38,7 @@ and experiment with. The notations in the Triton implementation are also closer
 to what's used in our paper.
 
 
-## Beta release (0.2).
+## Installation and features
 
 Requirements:
 - CUDA 11.4 and above.
