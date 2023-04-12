@@ -310,6 +310,10 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = launch_params.params.b * launch_params.params.h * 32;
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
+    // Forward kernel will populate memory with the seed and offset.
+    launch_params.params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     if( is_dropout ) {
         // See Note [Acquire lock when using random generators]
@@ -320,6 +324,7 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     run_fmha_fwd(launch_params);
 
     std::vector<at::Tensor> result = {softmax_lse};
+    result.push_back(rng_state);
     if (return_softmax) {result.push_back(s);}
     return result;
 }
@@ -353,7 +358,8 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         const bool zero_tensors,
         const bool is_causal,
         const int num_splits,
-        c10::optional<at::Generator> gen_
+        c10::optional<at::Generator> gen_,
+        const at::Tensor &rng_state
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
@@ -488,12 +494,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = params.b * params.h * 32;
-
-    if( is_dropout ) {
-        // See Note [Acquire lock when using random generators]
-        std::lock_guard<std::mutex> lock(gen->mutex_);
-        params.philox_args = gen->philox_cuda_state(counter_offset);
-    }
+    params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     launch(params, stream, /*configure=*/false);
 
