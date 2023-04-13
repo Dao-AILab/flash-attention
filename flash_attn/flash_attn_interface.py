@@ -29,8 +29,8 @@ def _flash_attn_forward(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
 
 
 def _flash_attn_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k,
-                         max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, causal, rng_state,
-                         num_splits=0, generator=None):
+                         max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, causal,
+                         rng_state=None, num_splits=0, generator=None):
     """
     num_splits: whether to parallelize over the seqlen_k dimension (num_splits > 1) or
     not (num_splits = 1). num_splits=0 means it will be set by an internal heuristic.
@@ -76,7 +76,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             dout, qkv[:, 0], qkv[:, 1], qkv[:, 2], out, softmax_lse,
             dqkv[:, 0], dqkv[:, 1], dqkv[:, 2], cu_seqlens, cu_seqlens,
             ctx.max_seqlen, ctx.max_seqlen, ctx.dropout_p, ctx.softmax_scale, ctx.causal,
-            rng_state, num_splits=1 if ctx.deterministic else 0,
+            rng_state=rng_state, num_splits=1 if ctx.deterministic else 0,
         )
         return dqkv, None, None, None, None, None, None, None
 
@@ -110,7 +110,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             dout, q, kv[:, 0], kv[:, 1], out, softmax_lse,
             dq, dkv[:, 0], dkv[:, 1], cu_seqlens_q, cu_seqlens_k,
             ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.dropout_p, ctx.softmax_scale, ctx.causal,
-            rng_state, num_splits=1 if ctx.deterministic else 0,
+            rng_state=rng_state, num_splits=1 if ctx.deterministic else 0,
         )
         return dq, dkv, None, None, None, None, None, None, None, None, None
 
@@ -142,7 +142,7 @@ class FlashAttnFunc(torch.autograd.Function):
         _flash_attn_backward(
             dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k,
             ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.dropout_p, ctx.softmax_scale, ctx.causal,
-            rng_state, num_splits=1 if ctx.deterministic else 0,
+            rng_state=rng_state, num_splits=1 if ctx.deterministic else 0,
         )
         return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
