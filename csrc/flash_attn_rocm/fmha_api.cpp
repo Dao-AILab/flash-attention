@@ -160,18 +160,6 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     // Reset the parameters
     memset(&params, 0, sizeof(params));
 
-    //std::cout << "bwd params define dq_opts" << std::endl;
-    //auto dq_opts = dq.options();
-    //auto dk_opts = dk.options();
-    //auto dv_opts = dv.options();
-    ////generate three tmp result which size is same to dq,dk,dv
-    //std::cout << "bwd params define dq_tmps" << std::endl;
-    //params.dq_tmp = torch::zeros_like(dq);//.to(torch::kFloat32).to(at::kCUDA);//at::empty(dq.sizes(),dq_opts.dtype(at::kFloat));
-    //params.dk_tmp = torch::zeros_like(dk);//.to(torch::kFloat32).to(at::kCUDA);//at::empty(dk.sizes(),dk_opts.dtype(at::kFloat));
-    //params.dv_tmp = torch::zeros_like(dv);//.to(torch::kFloat32).to(at::kCUDA);//at::empty(dv.sizes(),dv_opts.dtype(at::kFloat));
-
-    //std::cout << "bwd params dq_tmp.zero_()" << std::endl;
-
     dq_tmp.zero_();
     dk_tmp.zero_();
     dv_tmp.zero_();
@@ -524,9 +512,9 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     auto dv_opts = dv.options();
     //generate three tmp result which size is same to dq,dk,dv
     //std::cout << "bwd define dq_tmps" << std::endl;
-    auto dq_tmp = at::empty(dq.sizes(),dq_opts.dtype(at::kFloat));
-    auto dk_tmp = at::empty(dk.sizes(),dk_opts.dtype(at::kFloat));
-    auto dv_tmp = at::empty(dv.sizes(),dv_opts.dtype(at::kFloat));
+    auto dq_tmp = at::empty(dq.sizes(),dq_opts.dtype(at::kFloat)).contiguous();
+    auto dk_tmp = at::empty(dk.sizes(),dk_opts.dtype(at::kFloat)).contiguous();
+    auto dv_tmp = at::empty(dv.sizes(),dv_opts.dtype(at::kFloat)).contiguous();
 
     
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
@@ -557,15 +545,23 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     //std::cout << "bwd run_fmha_dgrad_fp16_bf16_gfx90a()" << std::endl;
     run_fmha_dgrad_fp16_bf16_gfx90a(launch_params);
 
+    //dq.copy_(dq_tmp, true);
+    //dk.copy_(dk_tmp, true);
+    //dv.copy_(dv_tmp, true);
+
     if(!q.is_contiguous()){
-        dq.copy_(torch::cat(launch_params.params.qgrad_tensors, 0), true);
+        dq_tmp.copy_(torch::cat(launch_params.params.qgrad_tensors, 0), true);
     }
     if(!k.is_contiguous()){
-        dk.copy_(torch::cat(launch_params.params.kgrad_tensors, 0), true);
+        dk_tmp.copy_(torch::cat(launch_params.params.kgrad_tensors, 0), true);
     }
     if(!v.is_contiguous()){
-        dv.copy_(torch::cat(launch_params.params.vgrad_tensors, 0), true);
+        dv_tmp.copy_(torch::cat(launch_params.params.vgrad_tensors, 0), true);
     }
+
+    dq.copy_(dq_tmp, true);
+    dk.copy_(dk_tmp, true);
+    dv.copy_(dv_tmp, true);
 
     return { dq, dk, dv, softmax_d };
 }
