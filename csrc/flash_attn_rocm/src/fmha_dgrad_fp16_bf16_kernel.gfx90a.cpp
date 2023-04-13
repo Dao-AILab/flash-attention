@@ -63,8 +63,9 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
   using QKVElementOp = PassThrough;
   using YElementOp = PassThrough;
 
-  using DataType = InputType;
-  using GemmDataType = InputType;
+  using InputDataType    = InputType;
+  using OutputDataType   = F32;  
+  using GemmDataType     = InputType;
   using AccDataType = F32;
   using ShuffleDataType = F32;
   using LSEDataType = F32;
@@ -229,7 +230,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
   if (Version == 1) {
     using DeviceGemmInstance = ck::tensor_operation::device::
         DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V2<
-            NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, DataType, GemmDataType,
+            NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
             ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
             AccDataType, ShuffleDataType, QKVElementOp, QKVElementOp, Scale,
             QKVElementOp, YElementOp, GemmSpec, TensorSpecQ, TensorSpecK,
@@ -256,9 +257,8 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
             S<0, 2, 1>, S<0, 2, 1>, 1, 4, 2, false,
             1, // CShuffleMXdlPerWavePerShuffle
             4, // CShuffleNXdlPerWavePerShuffle
-            S<1, 32, 1,
-              8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-            8,            // CShuffleBlockTransferScalarPerVector_NPerBlock
+            S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
+            4,            // CShuffleBlockTransferScalarPerVector_NPerBlock
             MaskingSpec>; // MaskingSpecialization
     auto gemm = DeviceGemmInstance{};
     run_kernel(gemm);
@@ -294,7 +294,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
             2, // CShuffleNXdlPerWavePerShuffle
             S<1, 32, 1,
               8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-            8,            // CShuffleBlockTransferScalarPerVector_NPerBlock
+            4,            // CShuffleBlockTransferScalarPerVector_NPerBlock
             MaskingSpec>; // MaskingSpecialization
     auto gemm = DeviceGemmInstance{};
     run_kernel(gemm);
@@ -330,7 +330,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
             1, // CShuffleNXdlPerWavePerShuffle
             S<1, 64, 1,
               4>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-            8,            // CShuffleBlockTransferScalarPerVector_NPerBlock
+            4,            // CShuffleBlockTransferScalarPerVector_NPerBlock
             MaskingSpec>; // MaskingSpecialization
     auto gemm = DeviceGemmInstance{};
     run_kernel(gemm);

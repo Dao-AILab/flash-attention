@@ -157,6 +157,15 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     Data_type acc_type = DATA_TYPE_FP32;
     Data_type data_type = q.dtype() == at::kBFloat16 ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
 
+    Data_type tmp_res_type = DATA_TYPE_FP32; //
+    auto dq_opts = dq.options();
+    auto dk_opts = dk.options();
+    auto dv_opts = dv.options();
+    //generate three tmp result which size is same to dq,dk,dv
+    params.dq_tmp = at::empty(dq_opts.dtype(at::kFloat));
+    params.dk_tmp = at::empty(dk_opts.dtype(at::kFloat));
+    params.dv_tmp = at::empty(dv_opts.dtype(at::kFloat));
+
     // Reset the parameters
     memset(&params, 0, sizeof(params));
 
@@ -192,9 +201,9 @@ void set_params_dgrad(FMHA_dgrad_params &params,
     char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
     char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
     char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
-    char* dq_ptr = reinterpret_cast<char*>(dq.data_ptr());
-    char* dk_ptr = reinterpret_cast<char*>(dk.data_ptr());
-    char* dv_ptr = reinterpret_cast<char*>(dv.data_ptr());
+    char* dq_ptr = reinterpret_cast<char*>(dq_tmp.data_ptr());
+    char* dk_ptr = reinterpret_cast<char*>(dk_tmp.data_ptr());
+    char* dv_ptr = reinterpret_cast<char*>(dv_tmp.data_ptr());
 
     char* y_ptr = reinterpret_cast<char*>(y.data_ptr());
     char* lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
@@ -209,10 +218,10 @@ void set_params_dgrad(FMHA_dgrad_params &params,
             params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
             params.qgrad_ptr.push_back(reinterpret_cast<void*>(dq_ptr));
             q_ptr = q_ptr + temp_q_stride;
-            dq_ptr = dq_ptr + temp_q_stride;
+            dq_ptr = dq_ptr + temp_q_stride * 2; //float to * 2
         }else{
             auto q_each_tmp = q.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
-            auto qgrad_each_tmp = dq.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
+            auto qgrad_each_tmp = dq_tmp.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
             params.q_tensors.push_back(q_each_tmp);
             params.qgrad_tensors.push_back(qgrad_each_tmp);
             params.q_ptr.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
@@ -222,10 +231,10 @@ void set_params_dgrad(FMHA_dgrad_params &params,
             params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr));
             params.kgrad_ptr.push_back(reinterpret_cast<void*>(dk_ptr));
             k_ptr = k_ptr + temp_k_stride;
-            dk_ptr = dk_ptr + temp_k_stride;
+            dk_ptr = dk_ptr + temp_k_stride * 2;
         }else{
             auto k_each_tmp = k.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-            auto kgrad_each_tmp = dk.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
+            auto kgrad_each_tmp = dk_tmp.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
             params.k_tensors.push_back(k_each_tmp);
             params.kgrad_tensors.push_back(kgrad_each_tmp);
             params.k_ptr.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
@@ -235,10 +244,10 @@ void set_params_dgrad(FMHA_dgrad_params &params,
             params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr)); 
             params.vgrad_ptr.push_back(reinterpret_cast<void*>(dv_ptr));
             v_ptr = v_ptr + temp_k_stride;   
-            dv_ptr = dv_ptr + temp_k_stride;  
+            dv_ptr = dv_ptr + temp_k_stride * 2;  
         }else{
             auto v_each_tmp = v.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-            auto vgrad_each_tmp = dv.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
+            auto vgrad_each_tmp = dv_tmp.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
             params.v_tensors.push_back(v_each_tmp);
             params.vgrad_tensors.push_back(vgrad_each_tmp);
             params.v_ptr.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
@@ -494,6 +503,8 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         dv.zero_();
         // softmax_d.zero_();
     }
+
+    
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
     set_params_dgrad(launch_params.params,

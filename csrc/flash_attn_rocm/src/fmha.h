@@ -128,6 +128,10 @@ struct FMHA_dgrad_params : public Qkv_params {
     std::vector<at::Tensor> qgrad_tensors;
     std::vector<at::Tensor> kgrad_tensors;
     std::vector<at::Tensor> vgrad_tensors;
+
+    at::Tensor dq_tmp;
+    at::Tensor dk_tmp;
+    at::Tensor dv_tmp;
     // The dimensions.
     int b, seqlen_q, seqlen_k, d;
 
