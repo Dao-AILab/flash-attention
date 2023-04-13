@@ -10,7 +10,12 @@
 
 #include <vector>
 #include <iostream>
+#include <ATen/ATen.h>
+#include <torch/extension.h>
+#include <ATen/hip/HIPContext.h>
 #include <ATen/hip/HIPGeneratorImpl.h>
+#include <c10/hip/HIPGuard.h>
+#include <c10/core/DeviceType.h>
 
 #include "fmha_utils.h"
 
@@ -129,9 +134,9 @@ struct FMHA_dgrad_params : public Qkv_params {
     std::vector<at::Tensor> kgrad_tensors;
     std::vector<at::Tensor> vgrad_tensors;
 
-    at::Tensor dq_tmp;
-    at::Tensor dk_tmp;
-    at::Tensor dv_tmp;
+    // at::Tensor dq_tmp;
+    // at::Tensor dk_tmp;
+    // at::Tensor dv_tmp;
     // The dimensions.
     int b, seqlen_q, seqlen_k, d;
 
