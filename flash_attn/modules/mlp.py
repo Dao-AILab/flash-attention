@@ -17,7 +17,7 @@ class Mlp(nn.Module):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
         out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
+        hidden_features = hidden_features or in_features * 4
         self.return_residual = return_residual
         self.fc1 = nn.Linear(in_features, hidden_features, **factory_kwargs)
         self.activation = activation
