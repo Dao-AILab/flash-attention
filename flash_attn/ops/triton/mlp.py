@@ -8,17 +8,7 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 import fused_dense_lib as fused_dense_cuda
 
 from flash_attn.ops.triton.linear import triton_linear_act, triton_dgrad_act
-
-
-@torch.jit.script
-def sqrelu_fwd(x):
-    r = F.relu(x)
-    return (r * r).to(dtype=x.dtype)
-
-
-@torch.jit.script
-def sqrelu_bwd(g, x):
-    return (2.0 * g * F.relu(x)).to(dtype=x.dtype)
+from flash_attn.ops.activations import sqrelu_fwd, sqrelu_bwd
 
 
 class FusedDenseSqreluDenseFunc(torch.autograd.Function):

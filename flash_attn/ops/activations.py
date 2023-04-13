@@ -2,7 +2,8 @@
 import math
 
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 # 1/sqrt(2*pi)-> 0.3989423
@@ -80,3 +81,19 @@ class FastGeLUFunction(torch.autograd.Function):
         return tmp
 
 fast_gelu_impl = FastGeLUFunction.apply
+
+
+@torch.jit.script
+def relu_bwd(g, x):
+    return torch.where(x >= 0, g, 0.0).to(dtype=x.dtype)
+
+
+@torch.jit.script
+def sqrelu_fwd(x):
+    r = F.relu(x)
+    return (r * r).to(dtype=x.dtype)
+
+
+@torch.jit.script
+def sqrelu_bwd(g, x):
+    return (2.0 * g * F.relu(x)).to(dtype=x.dtype)
