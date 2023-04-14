@@ -190,9 +190,9 @@ def seqlen_to_seqlen_type(seqlen: int) -> int:
     return 0 if seqlen < 32 else (1 if seqlen < 2048 else 2)
 
 
-def seqlen_type_to_seqlen(seqlen_type: int) -> int:
+def seqlen_type_to_max_seqlen(seqlen_type: int) -> int:
     assert seqlen_type in [0, 1, 2]
-    return 1 if seqlen_type == 0 else (32 if seqlen_type == 1 else 2048)
+    return 32 if seqlen_type == 0 else (2048 if seqlen_type == 1 else 2**32)
 
 
 @dataclass
@@ -239,9 +239,9 @@ def update_graph_cache(model, cache, batch_size, seqlen_og, max_seqlen, tensor_p
         cache.mempool = torch.cuda.graphs.graph_pool_handle()
     for s_type in range(seqlen_to_seqlen_type(seqlen_og), seqlen_to_seqlen_type(max_seqlen) + 1):
         if s_type not in cache.callables:
-            seqlen = min(max(seqlen_og, seqlen_type_to_seqlen(s_type)), max_seqlen)
+            max_seqlen_ = min(max(seqlen_og, seqlen_type_to_max_seqlen(s_type)), max_seqlen)
             cache.callables[s_type] = capture_graph(
-                model, cache.inference_params, batch_size, seqlen_og, seqlen, mempool=cache.mempool,
+                model, cache.inference_params, batch_size, max_seqlen_, mempool=cache.mempool,
                 n_warmups=n_warmups
             )
 
@@ -249,17 +249,19 @@ def update_graph_cache(model, cache, batch_size, seqlen_og, max_seqlen, tensor_p
         return cache.callables[seqlen_to_seqlen_type(seqlen)](input_ids, position_ids, seqlen)
 
     cache.run = dispatch
-    cache.inference_params.sequence_length_offset = 0  # Reset so it's not confusing
+    cache.inference_params.sequence_len_offset = 0  # Reset so it's not confusing
     return cache
 
 
-def capture_graph(model, inference_params, batch_size, seqlen_og, max_seqlen, mempool=None,
-                  n_warmups=2):
-    assert max_seqlen >= seqlen_og
+def capture_graph(model, inference_params, batch_size, max_seqlen, mempool=None, n_warmups=2):
     device = next(iter(model.parameters())).device
     input_ids = torch.full((batch_size, 1), 0, dtype=torch.long, device=device)
     position_ids = torch.full((batch_size, 1), 0, dtype=torch.long, device=device)
-    inference_params.lengths_per_sample[:] = seqlen_og
+    sequence_len_offset_og = inference_params.sequence_len_offset
+    # TD [2023-04-14]: important for correctness of the FT's attention kernel, as seqlen_cpu is
+    # used to determine the size of smem. Hence seqlen_cpu must be >= lengths_per_sample.
+    inference_params.sequence_len_offset = max_seqlen - 1
+    inference_params.lengths_per_sample[:] = max_seqlen - 1
 
     # Warmup before capture
     s = torch.cuda.Stream()
@@ -289,4 +291,5 @@ def capture_graph(model, inference_params, batch_size, seqlen_og, max_seqlen, me
         graph.replay()
         return logits
 
+    inference_params.sequence_len_offset = sequence_len_offset_og
     return run

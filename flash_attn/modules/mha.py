@@ -495,7 +495,8 @@ class MHA(nn.Module):
                         *inference_params.key_value_memory_dict[self.layer_idx],
                         inference_params.lengths_per_sample, inference_params.sequence_len_offset,
                         self.rotary_emb_dim,
-                        not self.rotary_emb.interleaved  # neox_rotary_style
+                        # neox_rotary_style
+                        (not self.rotary_emb.interleaved) if self.rotary_emb_dim > 0 else True
                     )
                     context = rearrange(context, 'b h d -> b 1 h d')
         else:
@@ -609,7 +610,8 @@ class ParallelMHA(nn.Module):
                     *inference_params.key_value_memory_dict[self.layer_idx],
                     inference_params.lengths_per_sample, inference_params.sequence_len_offset,
                     self.rotary_emb_dim,
-                    not self.rotary_emb.interleaved  # neox_rotary_style
+                    # neox_rotary_style
+                    (not self.rotary_emb.interleaved) if self.rotary_emb_dim > 0 else True
                 )
                 context = rearrange(context, 'b h d -> b 1 h d')
         if seqlen is None:
