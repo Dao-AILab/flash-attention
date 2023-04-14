@@ -183,5 +183,6 @@ setup(
     install_requires=[
         "torch",
         "einops",
+        "packaging",
     ],
 )
