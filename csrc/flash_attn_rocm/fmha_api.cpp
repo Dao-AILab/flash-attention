@@ -592,6 +592,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     dv.copy_(dv_tmp, true);
 
     return { dq, dk, dv, softmax_d };
+    //return { dq_tmp.to(q_dtype), dk_tmp.to(q_dtype), dv_tmp.to(q_dtype), softmax_d };
 }
 
 
