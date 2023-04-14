@@ -93,7 +93,7 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
     inner_dim = config.n_inner if config.n_inner is not None else 4 * config.hidden_size
     fused_mlp = getattr(config, 'fused_mlp', False)
     if fused_mlp:
-        assert config.activation_function in ['gelu_new', 'gelu_fast', 'gelu_approx', 'relu']
+        assert config.activation_function in ['gelu_new', 'gelu_fast', 'gelu_approx', 'relu', 'sqrelu']
     fused_dense_sqrelu_dense = getattr(config, 'fused_dense_sqrelu_dense', False)
     if fused_dense_sqrelu_dense:
         assert config.activation_function == 'sqrelu', ('fused_dense_sqrelu_dense only '
@@ -123,7 +123,7 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
             if FusedMLP is None:
                 raise ImportError('fused_dense is not installed')
             activation = ('gelu_approx' if config.activation_function
-                          in ['gelu_new', 'gelu_fast', 'gelu_approx'] else 'relu')
+                          in ['gelu_new', 'gelu_fast', 'gelu_approx'] else config.activation_function)
             mlp_cls = FusedMLP if process_group is None else ParallelFusedMLP
             parallel_kwargs = ({'process_group': process_group,
                                 'sequence_parallel': getattr(config, 'sequence_parallel', True)}
