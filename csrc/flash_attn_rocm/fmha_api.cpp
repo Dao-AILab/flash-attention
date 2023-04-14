@@ -214,7 +214,12 @@ void set_params_dgrad(FMHA_dgrad_params &params,
             params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
             params.qgrad_ptr.push_back(reinterpret_cast<void*>(dq_ptr));
             q_ptr = q_ptr + temp_q_stride;
-            dq_ptr = dq_ptr + temp_q_stride * 2; //float to * 2
+            if(params.is_bf16){
+                dq_ptr = dq_ptr + temp_q_stride * 2;
+            }
+            else{
+                dq_ptr = dq_ptr + temp_q_stride;
+            }
         }else{
             //std::cout << "q.is_not_contiguous()" << std::endl;
             auto q_each_tmp = q.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
@@ -229,7 +234,13 @@ void set_params_dgrad(FMHA_dgrad_params &params,
             params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr));
             params.kgrad_ptr.push_back(reinterpret_cast<void*>(dk_ptr));
             k_ptr = k_ptr + temp_k_stride;
-            dk_ptr = dk_ptr + temp_k_stride * 2;
+            if(params.is_bf16){
+                dk_ptr = dk_ptr + temp_k_stride * 2;
+            }
+            else{
+                dk_ptr = dk_ptr + temp_k_stride;
+            }
+            //dk_ptr = dk_ptr + temp_k_stride * 2;
         }else{
             //std::cout << "k.is_not_contiguous()" << std::endl;
             auto k_each_tmp = k.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
@@ -244,7 +255,13 @@ void set_params_dgrad(FMHA_dgrad_params &params,
             params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr)); 
             params.vgrad_ptr.push_back(reinterpret_cast<void*>(dv_ptr));
             v_ptr = v_ptr + temp_k_stride;   
-            dv_ptr = dv_ptr + temp_k_stride * 2;  
+            if(params.is_bf16){
+                dv_ptr = dv_ptr + temp_k_stride * 2;
+            }
+            else{
+                dv_ptr = dv_ptr + temp_k_stride;
+            }
+            //dv_ptr = dv_ptr + temp_k_stride * 2;  
         }else{
             //std::cout << "v.is_not_contiguous()" << std::endl;
             auto v_each_tmp = v.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
@@ -512,9 +529,20 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     auto dv_opts = dv.options();
     //generate three tmp result which size is same to dq,dk,dv
     //std::cout << "bwd define dq_tmps" << std::endl;
-    auto dq_tmp = at::empty(dq.sizes(),dq_opts.dtype(at::kFloat)).contiguous();
-    auto dk_tmp = at::empty(dk.sizes(),dk_opts.dtype(at::kFloat)).contiguous();
-    auto dv_tmp = at::empty(dv.sizes(),dv_opts.dtype(at::kFloat)).contiguous();
+    at::Tensor dq_tmp ;
+    at::Tensor dk_tmp ;
+    at::Tensor dv_tmp ;
+
+    if(q_dtype == torch::kFloat16){
+        dq_tmp = at::empty(dq.sizes(),dq_opts).contiguous();
+        dk_tmp = at::empty(dk.sizes(),dk_opts).contiguous();
+        dv_tmp = at::empty(dv.sizes(),dv_opts).contiguous();
+    }
+    else{
+        dq_tmp = at::empty(dq.sizes(),dq_opts.dtype(at::kFloat)).contiguous();
+        dk_tmp = at::empty(dk.sizes(),dk_opts.dtype(at::kFloat)).contiguous();
+        dv_tmp = at::empty(dv.sizes(),dv_opts.dtype(at::kFloat)).contiguous();
+    }
 
     
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(

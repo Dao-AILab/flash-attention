@@ -48,7 +48,7 @@ struct SimpleDeviceMem {
   void *p_mem_;
 };
 
-template <typename InputType, ck::index_t Version,
+template <typename InputType, typename OutputType, ck::index_t Version,
           MaskingSpecialization MaskingSpec>
 void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
     Launch_params<FMHA_dgrad_params> &launch_params) {
@@ -64,7 +64,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
   using YElementOp = PassThrough;
 
   using InputDataType    = InputType;
-  using OutputDataType   = F32;  
+  using OutputDataType   = OutputType;
   using GemmDataType     = InputType;
   using AccDataType = F32;
   using ShuffleDataType = F32;
@@ -339,32 +339,66 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
 
 void run_fmha_dgrad_fp16_bf16_gfx90a(
     Launch_params<FMHA_dgrad_params> &launch_params) {
-  FP16_SWITCH(launch_params.params.is_bf16, [&] {
+  
+  using F32 = float;
+  using U16 = unsigned short;
+  using BF16 = ck::bhalf_t;
+  using FP16 = ck::half_t;
+
+  if (launch_params.params.is_bf16) {
     if (launch_params.params.is_causal) {
       if (launch_params.params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 1, MaskingSpec_causal>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32 , 1, MaskingSpec_causal>(
             launch_params);
       } else if (launch_params.params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 2, MaskingSpec_causal>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32 , 2, MaskingSpec_causal>(
             launch_params);
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 3, MaskingSpec_causal>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32 , 3, MaskingSpec_causal>(
             launch_params);
       }
     } else {
       if (launch_params.params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 1,
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32, 1,
                                               MaskingSpec_default>(
             launch_params);
       } else if (launch_params.params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 2,
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32, 2,
                                               MaskingSpec_default>(
             launch_params);
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<elem_type, 3,
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32, 3,
                                               MaskingSpec_default>(
             launch_params);
       }
     }
-  });
+  }
+  else{
+    if (launch_params.params.is_causal) {
+      if (launch_params.params.d > 64) {
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, 1, MaskingSpec_causal>(
+            launch_params);
+      } else if (launch_params.params.d > 32) {
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, 2, MaskingSpec_causal>(
+            launch_params);
+      } else {
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, 3, MaskingSpec_causal>(
+            launch_params);
+      }
+    } else {
+      if (launch_params.params.d > 64) {
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, 1,
+                                              MaskingSpec_default>(
+            launch_params);
+      } else if (launch_params.params.d > 32) {
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, 2,
+                                              MaskingSpec_default>(
+            launch_params);
+      } else {
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, 3,
+                                              MaskingSpec_default>(
+            launch_params);
+      }
+    }
+  }
 }
