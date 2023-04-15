@@ -35,7 +35,7 @@ PR or email us. We'd very much like to hear from you!
 yields the fastest BERT training on cloud instances in MLPerf training 2.0 (June
 2022) and MLPerf training 2.1 (November 2022).
 
-- MLPerf 2.0: IEEE Spectrum [article](https://spectrum.ieee.org/mlperf-rankings-2022) about our submission to the MLPerf 2.0 benchmark using FlashAttention.
+- MLPerf 2.0: [IEEE Spectrum](https://spectrum.ieee.org/mlperf-rankings-2022) and [Forbes](ttps://www.forbes.com/sites/moorinsights/2022/07/12/google-dethrones-nvidia-in-latest-artificial-intelligence-benchmarking-tests/) articles about our submission to the MLPerf 2.0 benchmark using FlashAttention.
 
 - MLPerf 2.1 -
   collaboration
