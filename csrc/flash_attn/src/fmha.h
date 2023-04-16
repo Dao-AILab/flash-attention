@@ -125,6 +125,8 @@ struct FMHA_fprop_params : public Qkv_params {
 
     // Random state.
     at::PhiloxCudaState philox_args;
+    // Pointer to the RNG seed (idx 0) and offset (idx 1).
+    uint64_t * rng_state;
 
     bool is_bf16;
     bool is_causal;
