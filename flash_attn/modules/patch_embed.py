@@ -8,7 +8,7 @@ from torch import _assert, nn
 from torch.nn.modules.utils import _pair
 
 try:
-    from flash_attn.ops.fused_dense import FusedDense
+    from flash_attn.functional.fused_dense import FusedDense
 except ImportError:
     FusedDense = None
 

@@ -20,7 +20,7 @@ from flash_attn.modules.mha import MHA
 from flash_attn.modules.mlp import FusedMLP, Mlp
 
 try:
-    from flash_attn.ops.layer_norm import dropout_add_layer_norm
+    from flash_attn.functional.layer_norm import dropout_add_layer_norm
 except ImportError:
     dropout_add_layer_norm = None
 

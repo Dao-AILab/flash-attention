@@ -4,8 +4,8 @@
 import torch
 from torch.nn import init
 
-from flash_attn.ops.layer_norm import (DropoutAddLayerNormFn, DropoutAddLayerNormParallelResidualFn,
-                                       DropoutAddLayerNormSubsetFn)
+from flash_attn.functional.layer_norm import (DropoutAddLayerNormFn, DropoutAddLayerNormParallelResidualFn,
+                                              DropoutAddLayerNormSubsetFn)
 
 
 def rms_norm(x, weight, epsilon):

@@ -9,8 +9,8 @@ from torch.autograd.function import FunctionCtx
 from torch.cuda.amp import custom_fwd
 from triton.ops.matmul_perf_model import early_config_prune, estimate_matmul_time
 
-from flash_attn.ops.triton.k_activations import (gelu, gelu_approx, gelu_approx_grad, gelu_grad, squared_relu,
-                                                 squared_relu_grad)
+from flash_attn.functional.triton.k_activations import (gelu, gelu_approx, gelu_approx_grad, gelu_grad, squared_relu,
+                                                        squared_relu_grad)
 
 # CREDITS: Initially inspired by the Triton tutorial on matrix multiplications
 

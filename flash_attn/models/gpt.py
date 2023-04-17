@@ -25,22 +25,22 @@ from flash_attn.utils.generation import GenerationMixin
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 
 try:
-    from flash_attn.ops.fused_dense import ColumnParallelLinear
+    from flash_attn.functional.fused_dense import ColumnParallelLinear
 except ImportError:
     ColumnParallelLinear = None
 
 try:
-    from flash_attn.ops.layer_norm import dropout_add_layer_norm
+    from flash_attn.functional.layer_norm import dropout_add_layer_norm
 except ImportError:
     dropout_add_layer_norm = None
 
 try:
-    from flash_attn.ops.layer_norm import dropout_add_layer_norm_parallel_residual
+    from flash_attn.functional.layer_norm import dropout_add_layer_norm_parallel_residual
 except ImportError:
     dropout_add_layer_norm_parallel_residual = None
 
 try:
-    from flash_attn.ops.triton.mlp import FusedDenseSqreluDense, sqrelu_fwd
+    from flash_attn.functional.triton.mlp import FusedDenseSqreluDense, sqrelu_fwd
 except ImportError:
     FusedDenseSqreluDense = None
     sqrelu_fwd = None

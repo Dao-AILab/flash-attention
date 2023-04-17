@@ -6,10 +6,10 @@ from einops import rearrange, repeat
 from torch import nn
 from torch.nn import functional as F
 
-from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
 # from flash_attn.triton.fused_attention import attention as attention
 from flash_attn.flash_attn_triton import flash_attn_qkvpacked_func
 from flash_attn.flash_attn_triton_og import attention as attention_og
+from flash_attn.functional.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
 from flash_attn.utils.benchmark import benchmark_all, benchmark_forward, pytorch_profiler
 
 try:

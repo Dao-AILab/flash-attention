@@ -5,8 +5,8 @@ import torch
 from einops import rearrange
 from torch import nn
 
-from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
-from flash_attn.flash_blocksparse_attn_interface import convert_blockmask, flash_blocksparse_attn_func
+from flash_attn.functional.bert_padding import index_first_axis, pad_input, unpad_input
+from flash_attn.functional.flash_blocksparse_attn_interface import convert_blockmask, flash_blocksparse_attn_func
 
 
 class FlashBlocksparseAttention(nn.Module):
