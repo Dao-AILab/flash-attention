@@ -1,11 +1,10 @@
 # Copied from https://github.com/fadel/pytorch_ema/blob/master/torch_ema/ema.py
-from __future__ import division
-from __future__ import unicode_literals
+from __future__ import division, unicode_literals
 
-from typing import Iterable, Optional
-import weakref
-import copy
 import contextlib
+import copy
+import weakref
+from typing import Iterable, Optional
 
 import torch
 
@@ -26,19 +25,14 @@ class ExponentialMovingAverage:
         use_num_updates: Whether to use number of updates when computing
             averages.
     """
-    def __init__(
-        self,
-        parameters: Iterable[torch.nn.Parameter],
-        decay: float,
-        use_num_updates: bool = True
-    ):
+
+    def __init__(self, parameters: Iterable[torch.nn.Parameter], decay: float, use_num_updates: bool = True):
         if decay < 0.0 or decay > 1.0:
-            raise ValueError('Decay must be between 0 and 1')
+            raise ValueError("Decay must be between 0 and 1")
         self.decay = decay
         self.num_updates = 0 if use_num_updates else None
         parameters = list(parameters)
-        self.shadow_params = [to_float_maybe(p.clone().detach())
-                              for p in parameters if p.requires_grad]
+        self.shadow_params = [to_float_maybe(p.clone().detach()) for p in parameters if p.requires_grad]
         self.collected_params = None
         # By maintaining only a weakref to each parameter,
         # we maintain the old GC behaviour of ExponentialMovingAverage:
@@ -47,10 +41,7 @@ class ExponentialMovingAverage:
         # maintained, and the model will be cleaned up.
         self._params_refs = [weakref.ref(p) for p in parameters]
 
-    def _get_parameters(
-        self,
-        parameters: Optional[Iterable[torch.nn.Parameter]]
-    ) -> Iterable[torch.nn.Parameter]:
+    def _get_parameters(self, parameters: Optional[Iterable[torch.nn.Parameter]]) -> Iterable[torch.nn.Parameter]:
         if parameters is None:
             parameters = [p() for p in self._params_refs]
             if any(p is None for p in parameters):
@@ -73,10 +64,7 @@ class ExponentialMovingAverage:
                 )
             return parameters
 
-    def update(
-        self,
-        parameters: Optional[Iterable[torch.nn.Parameter]] = None
-    ) -> None:
+    def update(self, parameters: Optional[Iterable[torch.nn.Parameter]] = None) -> None:
         """
         Update currently maintained parameters.
         Call this every time the parameters are updated, such as the result of
@@ -91,10 +79,7 @@ class ExponentialMovingAverage:
         decay = self.decay
         if self.num_updates is not None:
             self.num_updates += 1
-            decay = min(
-                decay,
-                (1 + self.num_updates) / (10 + self.num_updates)
-            )
+            decay = min(decay, (1 + self.num_updates) / (10 + self.num_updates))
         one_minus_decay = 1.0 - decay
         if parameters[0].device != self.shadow_params[0].device:
             self.to(device=parameters[0].device)
@@ -103,10 +88,7 @@ class ExponentialMovingAverage:
             for s_param, param in zip(self.shadow_params, parameters):
                 torch.lerp(s_param, param.to(dtype=s_param.dtype), one_minus_decay, out=s_param)
 
-    def copy_to(
-        self,
-        parameters: Optional[Iterable[torch.nn.Parameter]] = None
-    ) -> None:
+    def copy_to(self, parameters: Optional[Iterable[torch.nn.Parameter]] = None) -> None:
         """
         Copy current averaged parameters into given collection of parameters.
         Args:
@@ -120,10 +102,7 @@ class ExponentialMovingAverage:
             if param.requires_grad:
                 param.data.copy_(s_param.data)
 
-    def store(
-        self,
-        parameters: Optional[Iterable[torch.nn.Parameter]] = None
-    ) -> None:
+    def store(self, parameters: Optional[Iterable[torch.nn.Parameter]] = None) -> None:
         """
         Save the current parameters for restoring later.
         Args:
@@ -132,16 +111,9 @@ class ExponentialMovingAverage:
                 `ExponentialMovingAverage` was initialized will be used.
         """
         parameters = self._get_parameters(parameters)
-        self.collected_params = [
-            param.clone()
-            for param in parameters
-            if param.requires_grad
-        ]
+        self.collected_params = [param.clone() for param in parameters if param.requires_grad]
 
-    def restore(
-        self,
-        parameters: Optional[Iterable[torch.nn.Parameter]] = None
-    ) -> None:
+    def restore(self, parameters: Optional[Iterable[torch.nn.Parameter]] = None) -> None:
         """
         Restore the parameters stored with the `store` method.
         Useful to validate the model with EMA parameters without affecting the
@@ -155,20 +127,14 @@ class ExponentialMovingAverage:
                 initialized will be used.
         """
         if self.collected_params is None:
-            raise RuntimeError(
-                "This ExponentialMovingAverage has no `store()`ed weights "
-                "to `restore()`"
-            )
+            raise RuntimeError("This ExponentialMovingAverage has no `store()`ed weights " "to `restore()`")
         parameters = self._get_parameters(parameters)
         for c_param, param in zip(self.collected_params, parameters):
             if param.requires_grad:
                 param.data.copy_(c_param.data)
 
     @contextlib.contextmanager
-    def average_parameters(
-        self,
-        parameters: Optional[Iterable[torch.nn.Parameter]] = None
-    ):
+    def average_parameters(self, parameters: Optional[Iterable[torch.nn.Parameter]] = None):
         r"""
         Context manager for validation/inference with averaged parameters.
         Equivalent to:
@@ -199,16 +165,12 @@ class ExponentialMovingAverage:
         """
         # .to() on the tensors handles None correctly
         self.shadow_params = [
-            p.to(device=device, dtype=dtype)
-            if p.is_floating_point()
-            else p.to(device=device)
+            p.to(device=device, dtype=dtype) if p.is_floating_point() else p.to(device=device)
             for p in self.shadow_params
         ]
         if self.collected_params is not None:
             self.collected_params = [
-                p.to(device=device, dtype=dtype)
-                if p.is_floating_point()
-                else p.to(device=device)
+                p.to(device=device, dtype=dtype) if p.is_floating_point() else p.to(device=device)
                 for p in self.collected_params
             ]
         return
@@ -222,7 +184,7 @@ class ExponentialMovingAverage:
             "decay": self.decay,
             "num_updates": self.num_updates,
             "shadow_params": self.shadow_params,
-            "collected_params": self.collected_params
+            "collected_params": self.collected_params,
         }
 
     def load_state_dict(self, state_dict: dict) -> None:
@@ -235,27 +197,23 @@ class ExponentialMovingAverage:
         state_dict = copy.deepcopy(state_dict)
         self.decay = state_dict["decay"]
         if self.decay < 0.0 or self.decay > 1.0:
-            raise ValueError('Decay must be between 0 and 1')
+            raise ValueError("Decay must be between 0 and 1")
         self.num_updates = state_dict["num_updates"]
-        assert self.num_updates is None or isinstance(self.num_updates, int), \
-            "Invalid num_updates"
+        assert self.num_updates is None or isinstance(self.num_updates, int), "Invalid num_updates"
 
         self.shadow_params = state_dict["shadow_params"]
-        assert isinstance(self.shadow_params, list), \
-            "shadow_params must be a list"
-        assert all(
-            isinstance(p, torch.Tensor) for p in self.shadow_params
-        ), "shadow_params must all be Tensors"
+        assert isinstance(self.shadow_params, list), "shadow_params must be a list"
+        assert all(isinstance(p, torch.Tensor) for p in self.shadow_params), "shadow_params must all be Tensors"
 
         self.collected_params = state_dict["collected_params"]
         if self.collected_params is not None:
-            assert isinstance(self.collected_params, list), \
-                "collected_params must be a list"
+            assert isinstance(self.collected_params, list), "collected_params must be a list"
             assert all(
                 isinstance(p, torch.Tensor) for p in self.collected_params
             ), "collected_params must all be Tensors"
-            assert len(self.collected_params) == len(self.shadow_params), \
-                "collected_params and shadow_params had different lengths"
+            assert len(self.collected_params) == len(
+                self.shadow_params
+            ), "collected_params and shadow_params had different lengths"
 
         if len(self.shadow_params) == len(self._params_refs):
             # Consistent with torch.optim.Optimizer, cast things to consistent
@@ -266,15 +224,8 @@ class ExponentialMovingAverage:
             if not any(p is None for p in params):
                 # ^ parameter references are still good
                 for i, p in enumerate(params):
-                    self.shadow_params[i] = to_float_maybe(self.shadow_params[i].to(
-                        device=p.device, dtype=p.dtype
-                    ))
+                    self.shadow_params[i] = to_float_maybe(self.shadow_params[i].to(device=p.device, dtype=p.dtype))
                     if self.collected_params is not None:
-                        self.collected_params[i] = self.collected_params[i].to(
-                            device=p.device, dtype=p.dtype
-                        )
+                        self.collected_params[i] = self.collected_params[i].to(device=p.device, dtype=p.dtype)
         else:
-            raise ValueError(
-                "Tried to `load_state_dict()` with the wrong number of "
-                "parameters in the saved state."
-            )
+            raise ValueError("Tried to `load_state_dict()` with the wrong number of " "parameters in the saved state.")

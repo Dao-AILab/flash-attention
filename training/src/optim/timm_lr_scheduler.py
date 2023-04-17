@@ -1,12 +1,11 @@
 import torch
-from torch.optim import Optimizer
-
 from timm.scheduler import CosineLRScheduler
+from torch.optim import Optimizer
 
 
 # We need to subclass torch.optim.lr_scheduler._LRScheduler, or Pytorch-lightning will complain
 class TimmCosineLRScheduler(CosineLRScheduler, torch.optim.lr_scheduler._LRScheduler):
-    """ Wrap timm.scheduler.CosineLRScheduler so we can call scheduler.step() without passing in epoch.
+    """Wrap timm.scheduler.CosineLRScheduler so we can call scheduler.step() without passing in epoch.
     It supports resuming as well.
     """
 

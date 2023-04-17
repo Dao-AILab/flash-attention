@@ -2,13 +2,12 @@ from typing import Any, Dict, Optional
 
 import torch
 from torch import Tensor
-
 from torchmetrics import Metric
 
 
 class NumTokens(Metric):
-    """Keep track of how many tokens we've seen.
-    """
+    """Keep track of how many tokens we've seen."""
+
     # TODO: how do we prevent the reset between the epochs? The reset happens on the 1st batch
     # of the next epoch.
     # Right now the hack is that we override reset(), which would mess up the forward method.
@@ -21,8 +20,9 @@ class NumTokens(Metric):
 
     def __init__(self, **kwargs: Dict[str, Any]):
         super().__init__(**kwargs)
-        self.add_state("count", default=torch.tensor(0, dtype=torch.int64), dist_reduce_fx="sum",
-                       persistent=True)  # We want the count to be saved to state-dict
+        self.add_state(
+            "count", default=torch.tensor(0, dtype=torch.int64), dist_reduce_fx="sum", persistent=True
+        )  # We want the count to be saved to state-dict
 
     def update(self, preds: Tensor, target: Tensor, loss: Optional[Tensor] = None) -> None:  # type: ignore
         self.count += target.numel()

@@ -6,9 +6,7 @@ import torch
 import torch.distributed as dist
 
 
-def fp16_compress_hook(
-    process_group: dist.ProcessGroup, bucket: dist.GradBucket
-) -> torch.futures.Future[torch.Tensor]:
+def fp16_compress_hook(process_group: dist.ProcessGroup, bucket: dist.GradBucket) -> torch.futures.Future[torch.Tensor]:
     """
     This DDP communication hook implements a simple gradient compression
     approach that casts ``GradBucket`` tensor to half-precision floating-point format (``torch.float16``)
@@ -24,12 +22,11 @@ def fp16_compress_hook(
 
     # Divide first before converting to fp16
     # Use out argument to fuse the division and the conversion.
-    compressed_tensor = torch.div(bucket.buffer(), world_size,
-                                  out=torch.empty_like(bucket.buffer(), dtype=torch.float16))
+    compressed_tensor = torch.div(
+        bucket.buffer(), world_size, out=torch.empty_like(bucket.buffer(), dtype=torch.float16)
+    )
 
-    fut = dist.all_reduce(
-        compressed_tensor, group=group_to_use, async_op=True
-    ).get_future()
+    fut = dist.all_reduce(compressed_tensor, group=group_to_use, async_op=True).get_future()
 
     def decompress(fut):
         decompressed_tensor = bucket.buffer()

@@ -1,11 +1,11 @@
 import math
+
 import torch
-import torch.nn as nn
-
 from einops import rearrange
+from torch import nn
 
+from flash_attn.bert_padding import pad_input, unpad_input
 from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
-from flash_attn.bert_padding import unpad_input, pad_input
 
 
 class FlashAttention(nn.Module):
@@ -18,13 +18,13 @@ class FlashAttention(nn.Module):
         attention_dropout: The dropout rate to apply to the attention
                            (default: 0.0)
     """
+
     def __init__(self, softmax_scale=None, attention_dropout=0.0):
         super().__init__()
         self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
 
-    def forward(self, qkv, key_padding_mask=None, causal=False, cu_seqlens=None,
-                max_s=None, need_weights=False):
+    def forward(self, qkv, key_padding_mask=None, causal=False, cu_seqlens=None, max_s=None, need_weights=False):
         """Implements the multihead softmax attention.
         Arguments
         ---------
@@ -40,43 +40,66 @@ class FlashAttention(nn.Module):
             batch_size = qkv.shape[0]
             seqlen = qkv.shape[1]
             if key_padding_mask is None:
-                qkv = rearrange(qkv, 'b s ... -> (b s) ...')
+                qkv = rearrange(qkv, "b s ... -> (b s) ...")
                 max_s = seqlen
-                cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32,
-                                        device=qkv.device)
-                output = flash_attn_unpadded_qkvpacked_func(
-                    qkv, cu_seqlens, max_s, self.dropout_p if self.training else 0.0,
-                    softmax_scale=self.softmax_scale, causal=causal
+                cu_seqlens = torch.arange(
+                    0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32, device=qkv.device
                 )
-                output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
+                output = flash_attn_unpadded_qkvpacked_func(
+                    qkv,
+                    cu_seqlens,
+                    max_s,
+                    self.dropout_p if self.training else 0.0,
+                    softmax_scale=self.softmax_scale,
+                    causal=causal,
+                )
+                output = rearrange(output, "(b s) ... -> b s ...", b=batch_size)
             else:
                 nheads = qkv.shape[-2]
-                x = rearrange(qkv, 'b s three h d -> b s (three h d)')
+                x = rearrange(qkv, "b s three h d -> b s (three h d)")
                 x_unpad, indices, cu_seqlens, max_s = unpad_input(x, key_padding_mask)
-                x_unpad = rearrange(x_unpad, 'nnz (three h d) -> nnz three h d', three=3, h=nheads)
+                x_unpad = rearrange(x_unpad, "nnz (three h d) -> nnz three h d", three=3, h=nheads)
                 output_unpad = flash_attn_unpadded_qkvpacked_func(
-                    x_unpad, cu_seqlens, max_s, self.dropout_p if self.training else 0.0,
-                    softmax_scale=self.softmax_scale, causal=causal
+                    x_unpad,
+                    cu_seqlens,
+                    max_s,
+                    self.dropout_p if self.training else 0.0,
+                    softmax_scale=self.softmax_scale,
+                    causal=causal,
                 )
-                output = rearrange(pad_input(rearrange(output_unpad, 'nnz h d -> nnz (h d)'),
-                                            indices, batch_size, seqlen),
-                                'b s (h d) -> b s h d', h=nheads)
+                output = rearrange(
+                    pad_input(rearrange(output_unpad, "nnz h d -> nnz (h d)"), indices, batch_size, seqlen),
+                    "b s (h d) -> b s h d",
+                    h=nheads,
+                )
         else:
             assert max_s is not None
             output = flash_attn_unpadded_qkvpacked_func(
-                qkv, cu_seqlens, max_s, self.dropout_p if self.training else 0.0,
-                softmax_scale=self.softmax_scale, causal=causal
+                qkv,
+                cu_seqlens,
+                max_s,
+                self.dropout_p if self.training else 0.0,
+                softmax_scale=self.softmax_scale,
+                causal=causal,
             )
 
         return output, None
 
 
 class FlashMHA(nn.Module):
-
-    def __init__(self, embed_dim, num_heads, bias=True, batch_first=True, attention_dropout=0.0,
-                 causal=False, device=None, dtype=None) -> None:
+    def __init__(
+        self,
+        embed_dim,
+        num_heads,
+        bias=True,
+        batch_first=True,
+        attention_dropout=0.0,
+        causal=False,
+        device=None,
+        dtype=None,
+    ) -> None:
         assert batch_first
-        factory_kwargs = {'device': device, 'dtype': dtype}
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.embed_dim = embed_dim
         self.causal = causal
@@ -95,7 +118,8 @@ class FlashMHA(nn.Module):
         key_padding_mask: bool tensor of shape (batch, seqlen)
         """
         qkv = self.Wqkv(x)
-        qkv = rearrange(qkv, 'b s (three h d) -> b s three h d', three=3, h=self.num_heads)
-        context, attn_weights = self.inner_attn(qkv, key_padding_mask=key_padding_mask,
-                                                need_weights=need_weights, causal=self.causal)
-        return self.out_proj(rearrange(context, 'b s h d -> b s (h d)')), attn_weights
+        qkv = rearrange(qkv, "b s (three h d) -> b s three h d", three=3, h=self.num_heads)
+        context, attn_weights = self.inner_attn(
+            qkv, key_padding_mask=key_padding_mask, need_weights=need_weights, causal=self.causal
+        )
+        return self.out_proj(rearrange(context, "b s h d -> b s (h d)")), attn_weights

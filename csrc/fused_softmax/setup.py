@@ -5,7 +5,7 @@ import subprocess
 
 import torch
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
+from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 
 
 def get_cuda_bare_metal_version(cuda_dir):
@@ -33,17 +33,22 @@ cc_flag.append("-gencode")
 cc_flag.append("arch=compute_80,code=sm_80")
 
 setup(
-    name='fused_softmax_lib',
+    name="fused_softmax_lib",
     ext_modules=[
         CUDAExtension(
-            name='fused_softmax_lib',
-            sources=['fused_softmax.cpp', 'scaled_masked_softmax_cuda.cu', 'scaled_upper_triang_masked_softmax_cuda.cu'],
+            name="fused_softmax_lib",
+            sources=[
+                "fused_softmax.cpp",
+                "scaled_masked_softmax_cuda.cu",
+                "scaled_upper_triang_masked_softmax_cuda.cu",
+            ],
             extra_compile_args={
-                               'cxx': ['-O3',],
-                               'nvcc': append_nvcc_threads(['-O3', '--use_fast_math'] + cc_flag)
-                               }
-            )
+                "cxx": [
+                    "-O3",
+                ],
+                "nvcc": append_nvcc_threads(["-O3", "--use_fast_math"] + cc_flag),
+            },
+        )
     ],
-    cmdclass={
-        'build_ext': BuildExtension
-})
+    cmdclass={"build_ext": BuildExtension},
+)

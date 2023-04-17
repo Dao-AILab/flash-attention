@@ -1,37 +1,34 @@
 import math
-from functools import partial
 from collections import namedtuple
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn.modules.utils import _pair
+from functools import partial
 
 import hydra
+import torch
+from einops import rearrange, reduce
+from torch import nn
+from torch.nn import functional as F
+from torch.nn.modules.utils import _pair
 
-from einops import reduce, rearrange
 
-
-def pooling(x, pooling_mode='CLS', key_padding_mask=None, batch_first=True):
-    if pooling_mode not in ['MEAN', 'SUM', 'CLS', 'LAST', 'FLATTEN']:
-        raise NotImplementedError(f'pooling_mode must be MEAN, SUM, CLS, LAST, FLATTEN')
-    if pooling_mode in ['MEAN', 'SUM']:
+def pooling(x, pooling_mode="CLS", key_padding_mask=None, batch_first=True):
+    if pooling_mode not in ["MEAN", "SUM", "CLS", "LAST", "FLATTEN"]:
+        raise NotImplementedError(f"pooling_mode must be MEAN, SUM, CLS, LAST, FLATTEN")
+    if pooling_mode in ["MEAN", "SUM"]:
         if key_padding_mask is not None:
-            mask = rearrange(~key_padding_mask.bool_matrix,
-                             'b s -> b s 1' if batch_first else 'b s -> s b 1')
+            mask = rearrange(~key_padding_mask.bool_matrix, "b s -> b s 1" if batch_first else "b s -> s b 1")
             x = x.masked_fill(mask, 0)
-        s = reduce(x, 'b s ... -> b ...' if batch_first else 's b ... -> b ...', 'sum')
-        if pooling_mode == 'SUM':
+        s = reduce(x, "b s ... -> b ..." if batch_first else "s b ... -> b ...", "sum")
+        if pooling_mode == "SUM":
             return s
         else:
             if key_padding_mask is None:
                 return s / x.shape[1 if batch_first else 0]
             else:
-                lengths = rearrange(key_padding_mask._lengths, 'b -> b 1')
+                lengths = rearrange(key_padding_mask._lengths, "b -> b 1")
                 return s / lengths
-    elif pooling_mode == 'CLS':
+    elif pooling_mode == "CLS":
         return x[:, 0] if batch_first else x[0]
-    elif pooling_mode == 'LAST':
+    elif pooling_mode == "LAST":
         if key_padding_mask is None:
             return x[:, -1] if batch_first else x[-1]
         else:
@@ -42,27 +39,30 @@ def pooling(x, pooling_mode='CLS', key_padding_mask=None, batch_first=True):
             else:
                 batch_size = x.shape[1]
                 return x[lengths - 1, torch.arange(batch_size, device=x.device)]
-    elif pooling_mode == 'FLATTEN':
-        return rearrange(x, 'b ... -> b (...)' if batch_first else 's b ... -> b (s ...)')
+    elif pooling_mode == "FLATTEN":
+        return rearrange(x, "b ... -> b (...)" if batch_first else "s b ... -> b (s ...)")
 
 
 class ClassificationHeadLinear(nn.Module):
     """Head for sentence-level classification tasks."""
 
-    def __init__(self, d_model, num_classes, pooling_mode='MEAN',
-                 batch_first=False, **kwargs):
+    def __init__(self, d_model, num_classes, pooling_mode="MEAN", batch_first=False, **kwargs):
         super().__init__()
-        assert pooling_mode in ['MEAN', 'SUM', 'CLS', 'LAST', 'FLATTEN'], 'pooling_mode not supported'
+        assert pooling_mode in ["MEAN", "SUM", "CLS", "LAST", "FLATTEN"], "pooling_mode not supported"
         self.pooling_mode = pooling_mode
         self.batch_first = batch_first
         self.out_proj = nn.Linear(d_model, num_classes)
 
     def forward(self, hidden_states, key_padding_mask=None, **kwargs):
         """
-            hidden_states: (B, S, D) if batch_first else (S, B, D)
+        hidden_states: (B, S, D) if batch_first else (S, B, D)
         """
-        hidden_states = pooling(hidden_states, pooling_mode=self.pooling_mode,
-                                key_padding_mask=key_padding_mask, batch_first=self.batch_first)
+        hidden_states = pooling(
+            hidden_states,
+            pooling_mode=self.pooling_mode,
+            key_padding_mask=key_padding_mask,
+            batch_first=self.batch_first,
+        )
         hidden_states = self.out_proj(hidden_states)
         return hidden_states
 
@@ -71,10 +71,9 @@ class ClassificationHeadLinear(nn.Module):
 class ClassificationHead(nn.Module):
     """Head for sentence-level classification tasks."""
 
-    def __init__(self, d_model, d_inner, num_classes, dropout=0.0, pooling_mode='MEAN',
-                 batch_first=False):
+    def __init__(self, d_model, d_inner, num_classes, dropout=0.0, pooling_mode="MEAN", batch_first=False):
         super().__init__()
-        assert pooling_mode in ['MEAN', 'SUM', 'CLS', 'LAST', 'FLATTEN'], 'pooling_mode not supported'
+        assert pooling_mode in ["MEAN", "SUM", "CLS", "LAST", "FLATTEN"], "pooling_mode not supported"
         self.pooling_mode = pooling_mode
         self.batch_first = batch_first
         self.dense = nn.Linear(d_model, d_inner)
@@ -83,10 +82,14 @@ class ClassificationHead(nn.Module):
 
     def forward(self, hidden_states, key_padding_mask=None, **kwargs):
         """
-            hidden_states: (B, S, D) if batch_first else (S, B, D)
+        hidden_states: (B, S, D) if batch_first else (S, B, D)
         """
-        hidden_states = pooling(hidden_states, pooling_mode=self.pooling_mode,
-                                key_padding_mask=key_padding_mask, batch_first=self.batch_first)
+        hidden_states = pooling(
+            hidden_states,
+            pooling_mode=self.pooling_mode,
+            key_padding_mask=key_padding_mask,
+            batch_first=self.batch_first,
+        )
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.dense(hidden_states)
         # Huggingface uses tanh instead of relu
@@ -99,29 +102,38 @@ class ClassificationHead(nn.Module):
 class ClassificationHeadDual(nn.Module):
     """Head for sentence-level classification tasks."""
 
-    def __init__(self, d_model, d_inner, num_classes, dropout=0.0, pooling_mode='MEAN',
-                 batch_first=False, interaction='NLI'):
+    def __init__(
+        self, d_model, d_inner, num_classes, dropout=0.0, pooling_mode="MEAN", batch_first=False, interaction="NLI"
+    ):
         super().__init__()
-        assert pooling_mode in ['MEAN', 'SUM', 'CLS'], 'pooling_mode not supported'
-        assert interaction in [None, 'NLI'], 'interaction not supported'
+        assert pooling_mode in ["MEAN", "SUM", "CLS"], "pooling_mode not supported"
+        assert interaction in [None, "NLI"], "interaction not supported"
         self.pooling_mode = pooling_mode
         self.batch_first = batch_first
         self.interaction = interaction
-        self.dense = nn.Linear(d_model * (4 if self.interaction == 'NLI' else 2), d_inner)
+        self.dense = nn.Linear(d_model * (4 if self.interaction == "NLI" else 2), d_inner)
         self.dropout = nn.Dropout(dropout)
         self.out_proj = nn.Linear(d_inner, num_classes)
 
-    def forward(self, hidden_states1, hidden_states2,
-                key_padding_mask1=None, key_padding_mask2=None, **kwargs):
+    def forward(self, hidden_states1, hidden_states2, key_padding_mask1=None, key_padding_mask2=None, **kwargs):
         """
-            hidden_states: (B, S, D) if batch_first else (S, B, D)
+        hidden_states: (B, S, D) if batch_first else (S, B, D)
         """
-        x1 = pooling(hidden_states1, pooling_mode=self.pooling_mode,
-                     key_padding_mask=key_padding_mask1, batch_first=self.batch_first)
-        x2 = pooling(hidden_states2, pooling_mode=self.pooling_mode,
-                     key_padding_mask=key_padding_mask2, batch_first=self.batch_first)
-        hidden_states = (torch.cat([x1, x2, x1 * x2, x1 - x2], dim=-1) if self.interaction == 'NLI'
-                         else torch.cat([x1, x2], dim=-1))
+        x1 = pooling(
+            hidden_states1,
+            pooling_mode=self.pooling_mode,
+            key_padding_mask=key_padding_mask1,
+            batch_first=self.batch_first,
+        )
+        x2 = pooling(
+            hidden_states2,
+            pooling_mode=self.pooling_mode,
+            key_padding_mask=key_padding_mask2,
+            batch_first=self.batch_first,
+        )
+        hidden_states = (
+            torch.cat([x1, x2, x1 * x2, x1 - x2], dim=-1) if self.interaction == "NLI" else torch.cat([x1, x2], dim=-1)
+        )
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.dense(hidden_states)
         # Huggingface uses tanh instead of relu
@@ -132,25 +144,24 @@ class ClassificationHeadDual(nn.Module):
 
 
 class LMHead(nn.Module):
-
     def __init__(self, d_model, num_classes, batch_first=True, bias=True):
         super().__init__()
         self.lm_head = nn.Linear(d_model, num_classes, bias=bias)
 
     def forward(self, hidden_states, **kwargs):
         """
-            hidden_states: (B, S, D) if batch_first else (S, B, D)
+        hidden_states: (B, S, D) if batch_first else (S, B, D)
         """
-        CausalLMOutput = namedtuple('CausalLMOutput', ['logits'])
+        CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
         return CausalLMOutput(self.lm_head(hidden_states))
 
 
 def sinusoidal_init_(tensor):
     """
-        tensor: (max_len, d_model)
+    tensor: (max_len, d_model)
     """
     max_len, d_model = tensor.shape
-    position = rearrange(torch.arange(0.0, max_len), 's -> s 1')
+    position = rearrange(torch.arange(0.0, max_len), "s -> s 1")
     div_term = torch.exp(-math.log(10000.0) * torch.arange(0.0, d_model, 2.0) / d_model)
     tensor[:, 0::2] = torch.sin(position * div_term)
     tensor[:, 1::2] = torch.cos(position * div_term)
@@ -182,11 +193,11 @@ class PositionalEncoding(nn.Module):
         pe = torch.empty(max_len, d_model)
         if initializer is None:
             sinusoidal_init_(pe)
-            pe = rearrange(pe, 's d -> 1 s d' if self.batch_first else 's d -> s 1 d')
-            self.register_buffer('pe', pe)
+            pe = rearrange(pe, "s d -> 1 s d" if self.batch_first else "s d -> s 1 d")
+            self.register_buffer("pe", pe)
         else:
             hydra.utils.call(initializer, pe)
-            pe = rearrange(pe, 's d -> 1 s d' if self.batch_first else 's d -> s 1 d')
+            pe = rearrange(pe, "s d -> 1 s d" if self.batch_first else "s d -> s 1 d")
             self.pe = nn.Parameter(pe)
 
     def forward(self, x):
@@ -199,21 +210,30 @@ class PositionalEncoding(nn.Module):
         Examples:
             >>> output = pos_encoder(x)
         """
-        x = x + (self.pe[:, :x.size(1)] if self.batch_first else self.pe[:x.size(0)])
+        x = x + (self.pe[:, : x.size(1)] if self.batch_first else self.pe[: x.size(0)])
         return self.dropout(x)
 
 
 # Adapted from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/layers/mlp.py
 class Mlp(nn.Module):
-    """ MLP as used in Vision Transformer, MLP-Mixer and related networks
-    """
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU,
-                 act_fn=None, drop=0., device=None, dtype=None):
+    """MLP as used in Vision Transformer, MLP-Mixer and related networks"""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        act_layer=nn.GELU,
+        act_fn=None,
+        drop=0.0,
+        device=None,
+        dtype=None,
+    ):
         """TD [2021-10-27] act_fn takes precedence over act_layer if set.
         This is to support Pytorch 1.10 Transformer interface that construct the activation
         *function*, not the activation *layer*.
         """
-        factory_kwargs = {'device': device, 'dtype': dtype}
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -234,13 +254,21 @@ class Mlp(nn.Module):
 
 
 class MlpBig(nn.Module):
-    """ MLP as used in Vision Transformer, MLP-Mixer and related networks
-    """
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU,
-                 act_fn=None, drop=0., device=None, dtype=None):
-        """Copied from Mlp above. If num_layers > 2, add more Mlp layers, doubling each time.
-        """
-        factory_kwargs = {'device': device, 'dtype': dtype}
+    """MLP as used in Vision Transformer, MLP-Mixer and related networks"""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        act_layer=nn.GELU,
+        act_fn=None,
+        drop=0.0,
+        device=None,
+        dtype=None,
+    ):
+        """Copied from Mlp above. If num_layers > 2, add more Mlp layers, doubling each time."""
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -259,11 +287,13 @@ class MlpBig(nn.Module):
     def forward(self, x):
         return self.fwd(x)
 
+
 class GluMlp(nn.Module):
-    """ MLP w/ GLU style gating
+    """MLP w/ GLU style gating
     See: https://arxiv.org/abs/1612.08083, https://arxiv.org/abs/2002.05202
     """
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.Sigmoid, drop=0.):
+
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.Sigmoid, drop=0.0):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -290,10 +320,11 @@ class GluMlp(nn.Module):
 
 
 class GatedMlp(nn.Module):
-    """ MLP as used in gMLP
-    """
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU,
-                 gate_layer=None, drop=0.):
+    """MLP as used in gMLP"""
+
+    def __init__(
+        self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, gate_layer=None, drop=0.0
+    ):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -319,10 +350,11 @@ class GatedMlp(nn.Module):
 
 
 class ConvMlp(nn.Module):
-    """ MLP using 1x1 convs that keeps spatial dims
-    """
+    """MLP using 1x1 convs that keeps spatial dims"""
+
     def __init__(
-            self, in_features, hidden_features=None, out_features=None, act_layer=nn.ReLU, norm_layer=None, drop=0.):
+        self, in_features, hidden_features=None, out_features=None, act_layer=nn.ReLU, norm_layer=None, drop=0.0
+    ):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -339,4 +371,3 @@ class ConvMlp(nn.Module):
         x = self.drop(x)
         x = self.fc2(x)
         return x
-

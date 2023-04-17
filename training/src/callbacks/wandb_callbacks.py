@@ -29,9 +29,7 @@ def get_wandb_logger(trainer: Trainer) -> WandbLogger:
             if isinstance(logger, WandbLogger):
                 return logger
 
-    raise Exception(
-        "You are using wandb related callback, but WandbLogger was not found for some reason..."
-    )
+    raise Exception("You are using wandb related callback, but WandbLogger was not found for some reason...")
 
 
 class WatchModel(Callback):
@@ -81,9 +79,7 @@ class UploadCodeAsArtifact(Callback):
                     # ignore files in .git
                     and not str(path).startswith(str(git_dir_path))  # noqa: W503
                     # ignore files ignored by git
-                    and (  # noqa: W503
-                        subprocess.run(["git", "check-ignore", "-q", str(path)]).returncode == 1
-                    )
+                    and (subprocess.run(["git", "check-ignore", "-q", str(path)]).returncode == 1)  # noqa: W503
                 ):
                     code.add_file(str(path), name=str(path.relative_to(self.code_dir)))
 
@@ -138,9 +134,7 @@ class LogConfusionMatrix(Callback):
         """Start executing this callback only after all validation sanity checks end."""
         self.ready = True
 
-    def on_validation_batch_end(
-        self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx
-    ):
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
         """Gather data from single batch."""
         if self.ready:
             self.preds.append(outputs["preds"])
@@ -196,9 +190,7 @@ class LogF1PrecRecHeatmap(Callback):
         """Start executing this callback only after all validation sanity checks end."""
         self.ready = True
 
-    def on_validation_batch_end(
-        self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx
-    ):
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
         """Gather data from single batch."""
         if self.ready:
             self.preds.append(outputs["preds"])

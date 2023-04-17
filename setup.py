@@ -1,16 +1,14 @@
 # Adapted from https://github.com/NVIDIA/apex/blob/master/setup.py
+import os
+import subprocess
 import sys
 import warnings
-import os
 from pathlib import Path
-from packaging.version import parse, Version
-
-from setuptools import setup, find_packages
-import subprocess
 
 import torch
-from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
-
+from packaging.version import Version, parse
+from setuptools import find_packages, setup
+from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CppExtension, CUDAExtension
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -36,7 +34,7 @@ def check_cuda_torch_binary_vs_bare_metal(cuda_dir):
     print("\nCompiling cuda extensions with")
     print(raw_output + "from " + cuda_dir + "/bin\n")
 
-    if (bare_metal_version != torch_binary_version):
+    if bare_metal_version != torch_binary_version:
         raise RuntimeError(
             "Cuda extensions are being compiled with a version of Cuda that does "
             "not match the version used to compile Pytorch binaries.  "
@@ -146,16 +144,16 @@ ext_modules.append(
                     "--expt-extended-lambda",
                     "--use_fast_math",
                     "--ptxas-options=-v",
-                    "-lineinfo"
+                    "-lineinfo",
                 ]
                 + generator_flag
                 + cc_flag
             ),
         },
         include_dirs=[
-            Path(this_dir) / 'csrc' / 'flash_attn',
-            Path(this_dir) / 'csrc' / 'flash_attn' / 'src',
-            Path(this_dir) / 'csrc' / 'flash_attn' / 'cutlass' / 'include',
+            Path(this_dir) / "csrc" / "flash_attn",
+            Path(this_dir) / "csrc" / "flash_attn" / "src",
+            Path(this_dir) / "csrc" / "flash_attn" / "cutlass" / "include",
         ],
     )
 )
@@ -164,7 +162,16 @@ setup(
     name="flash_attn",
     version="1.0.2",
     packages=find_packages(
-        exclude=("build", "csrc", "include", "tests", "dist", "docs", "benchmarks", "flash_attn.egg-info",)
+        exclude=(
+            "build",
+            "csrc",
+            "include",
+            "tests",
+            "dist",
+            "docs",
+            "benchmarks",
+            "flash_attn.egg-info",
+        )
     ),
     author="Tri Dao",
     author_email="trid@stanford.edu",

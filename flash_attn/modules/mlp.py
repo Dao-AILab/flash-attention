@@ -1,8 +1,8 @@
 # Copyright (c) 2022, Tri Dao.
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
+from torch.nn import functional as F
 
 try:
     from flash_attn.ops.fused_dense import FusedMLP, ParallelFusedMLP
@@ -11,10 +11,17 @@ except ImportError:
 
 
 class Mlp(nn.Module):
-
-    def __init__(self, in_features, hidden_features=None, out_features=None, activation=F.gelu,
-                 return_residual=False, device=None, dtype=None):
-        factory_kwargs = {'device': device, 'dtype': dtype}
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        activation=F.gelu,
+        return_residual=False,
+        device=None,
+        dtype=None,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features * 4

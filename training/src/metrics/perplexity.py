@@ -6,8 +6,8 @@
 from typing import Any, Dict, Optional
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
+from torch.nn import functional as F
 from torchmetrics import Metric
 
 try:
@@ -15,7 +15,7 @@ try:
 except ImportError:
     CrossEntropyLoss = torch.nn.CrossEntropyLoss
 
-__all__ = ['Perplexity']
+__all__ = ["Perplexity"]
 
 
 class Perplexity(Metric):
@@ -42,8 +42,7 @@ class Perplexity(Metric):
 
     def __init__(self, **kwargs: Dict[str, Any]):
         super().__init__(**kwargs)
-        self.add_state("total_log_probs", default=torch.tensor(0.0, dtype=torch.float64),
-                       dist_reduce_fx="sum")
+        self.add_state("total_log_probs", default=torch.tensor(0.0, dtype=torch.float64), dist_reduce_fx="sum")
         self.add_state("count", default=torch.tensor(0, dtype=torch.int64), dist_reduce_fx="sum")
 
         self.loss_fn = CrossEntropyLoss()

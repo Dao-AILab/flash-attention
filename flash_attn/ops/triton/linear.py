@@ -9,8 +9,8 @@ from torch.autograd.function import FunctionCtx
 from torch.cuda.amp import custom_fwd
 from triton.ops.matmul_perf_model import early_config_prune, estimate_matmul_time
 
-from flash_attn.ops.triton.k_activations import gelu, gelu_grad, gelu_approx, gelu_approx_grad, squared_relu, squared_relu_grad
-
+from flash_attn.ops.triton.k_activations import (gelu, gelu_approx, gelu_approx_grad, gelu_grad, squared_relu,
+                                                 squared_relu_grad)
 
 # CREDITS: Initially inspired by the Triton tutorial on matrix multiplications
 
@@ -109,7 +109,6 @@ def kernel_fwd(
     SAVE_ACT_INPUT: tl.constexpr,
     ACTIVATION: tl.constexpr,
 ):
-
     """
     Kernel for computing Out = activation(A x W + C)
     - Input has shape (M, K)
@@ -204,7 +203,7 @@ def triton_linear_act(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    activation: str = 'id',
+    activation: str = "id",
     save_act_input: bool = False,
 ) -> torch.Tensor:
     """
@@ -221,7 +220,7 @@ def triton_linear_act(
     #     dtype = torch.get_autocast_gpu_dtype()
     #     x, weight, bias = [a.to(dtype=dtype) for a in [x, weight, bias]]
 
-    assert activation in ['id', 'gelu', 'gelu_approx', 'squared_relu']
+    assert activation in ["id", "gelu", "gelu_approx", "squared_relu"]
 
     batch_shape, n = x.shape[:-1], x.shape[-1]
     batch_dim = batch_shape.numel()
@@ -278,8 +277,7 @@ def triton_linear_act(
     if not save_act_input:
         return output.reshape(*batch_shape, output.shape[-1])
     else:
-        return (output.reshape(*batch_shape, output.shape[-1]),
-                act_input.reshape(*batch_shape, act_input.shape[-1]))
+        return (output.reshape(*batch_shape, output.shape[-1]), act_input.reshape(*batch_shape, act_input.shape[-1]))
 
 
 @triton.autotune(
@@ -345,7 +343,6 @@ def kernel_bwd(
     EVEN_K: tl.constexpr,
     ACTIVATION: tl.constexpr,
 ):
-
     """
     Kernel for computing Out = activation(A x W + C)
     - Input has shape (M, K)
@@ -395,7 +392,7 @@ def kernel_bwd(
         B += BLOCK_K * stride_bk
 
     # optional: fused activation (while the data is in shared memory)
-    if ACTIVATION != 'id':
+    if ACTIVATION != "id":
         act_in_ptrs = ACT_INPUT + ram[:, None] * stride_cm + rbn[None, :]
         act_input = tl.load(act_in_ptrs).to(acc.dtype)
     if ACTIVATION == "gelu":
@@ -418,7 +415,7 @@ def kernel_bwd(
 def triton_dgrad_act(
     grad_output: torch.Tensor,
     weight: torch.Tensor,
-    activation: str = 'id',
+    activation: str = "id",
     act_input: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
@@ -430,7 +427,7 @@ def triton_dgrad_act(
     :param act_input: an optional tensor to save the activation inputs (for backward)
     :return: result tensor
     """
-    assert activation in ['id', 'gelu', 'gelu_approx', 'squared_relu']
+    assert activation in ["id", "gelu", "gelu_approx", "squared_relu"]
 
     batch_shape, n = grad_output.shape[:-1], grad_output.shape[-1]
     batch_dim = batch_shape.numel()
@@ -441,10 +438,14 @@ def triton_dgrad_act(
     if weight.stride(0) > 1 and weight.stride(1) > 1:
         weight = weight.contiguous()
 
-    assert grad_output.dtype == weight.dtype, f"grad_output and weight must have the same dtype, got {grad_output.dtype} and {weight.dtype}"
-    assert grad_output_reshaped.shape[1] == weight.shape[0], f"Incompatible dimensions: {grad_output_reshaped.shape} - {weight.shape}"
-    if activation != 'id':
-        assert act_input is not None, f'act_input is required for activation {activation}'
+    assert (
+        grad_output.dtype == weight.dtype
+    ), f"grad_output and weight must have the same dtype, got {grad_output.dtype} and {weight.dtype}"
+    assert (
+        grad_output_reshaped.shape[1] == weight.shape[0]
+    ), f"Incompatible dimensions: {grad_output_reshaped.shape} - {weight.shape}"
+    if activation != "id":
+        assert act_input is not None, f"act_input is required for activation {activation}"
 
     # M, N, K in bwd are different from M, N, K in fwd
     M, K = grad_output_reshaped.shape

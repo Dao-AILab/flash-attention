@@ -26,12 +26,11 @@ def init_distributed(cuda):
     :param cuda: (bool) if True initializes nccl backend, if False initializes
         gloo backend
     """
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
-    distributed = (world_size > 1)
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    distributed = world_size > 1
     if distributed:
-        backend = 'nccl' if cuda else 'gloo'
-        torch.distributed.init_process_group(backend=backend,
-                                             init_method='env://')
+        backend = "nccl" if cuda else "gloo"
+        torch.distributed.init_process_group(backend=backend, init_method="env://")
         assert torch.distributed.is_initialized()
     return distributed
 
@@ -67,33 +66,33 @@ def get_world_size():
     return world_size
 
 
-def all_reduce_item(value, op='sum'):
+def all_reduce_item(value, op="sum"):
     """
     All-reduces single scalar value if distributed is in use
     """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        if op == 'sum' or op == 'mean':
+        if op == "sum" or op == "mean":
             dop = torch.distributed.ReduceOp.SUM
-        elif op == 'min':
+        elif op == "min":
             dop = torch.distributed.ReduceOp.MIN
-        elif op == 'max':
+        elif op == "max":
             dop = torch.distributed.ReduceOp.MAX
-        elif op == 'product':
+        elif op == "product":
             dop = torch.distributed.ReduceOp.PRODUCT
         else:
-            raise RuntimeError('Unsupported reduce op')
+            raise RuntimeError("Unsupported reduce op")
 
         backend = torch.distributed.get_backend()
         if backend == torch.distributed.Backend.NCCL:
-            device = torch.device('cuda')
+            device = torch.device("cuda")
         elif backend == torch.distributed.Backend.GLOO:
-            device = torch.device('cpu')
+            device = torch.device("cpu")
         else:
-            raise RuntimeError('Unsupported distributed backend')
+            raise RuntimeError("Unsupported distributed backend")
 
         tensor = torch.tensor(value, device=device)
         torch.distributed.all_reduce(tensor, dop)
-        if op == 'mean':
+        if op == "mean":
             tensor /= get_world_size()
         ret = tensor.item()
     else:

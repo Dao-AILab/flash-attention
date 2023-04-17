@@ -1,21 +1,18 @@
 # Adapted from https://github.com/PyTorchLightning/lightning-bolts/blob/master/pl_bolts/datamodules/imagenet_datamodule.py
 import os
 from pathlib import Path
-from typing import Any, List, Union, Callable, Optional
+from typing import Any, Callable, List, Optional, Union
 
 import torch
-from torch.utils.data import Dataset, DataLoader, SequentialSampler
+from pytorch_lightning import LightningDataModule
+from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from torch.utils.data.dataloader import default_collate
 from torch.utils.data.distributed import DistributedSampler
-
-from pytorch_lightning import LightningDataModule
-
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
 
 class DictDataset(Dataset):
-
     def __init__(self, dataset_dict, length=None):
         """dataset_dict: dictionary mapping from index to batch
         length is used in the case of DistributedSampler: e.g. the dataset could have size 1k, but
@@ -67,7 +64,7 @@ class ImagenetDataModule(LightningDataModule):
         train_transforms=None,
         val_transforms=None,
         test_transforms=None,
-        img_dtype='float32',  # Using str since OmegaConf doesn't support non-primitive type
+        img_dtype="float32",  # Using str since OmegaConf doesn't support non-primitive type
         cache_val_dataset=False,
         mixup: Optional[Callable] = None,
         num_aug_repeats: int = 0,
@@ -98,7 +95,7 @@ class ImagenetDataModule(LightningDataModule):
         self.train_transforms = train_transforms
         self.val_transforms = val_transforms
         self.test_transforms = test_transforms
-        assert img_dtype in ['float32', 'float16', 'bfloat16']
+        assert img_dtype in ["float32", "float16", "bfloat16"]
         self.img_dtype = torch.__getattribute__(img_dtype)
         self.cache_val_dataset = cache_val_dataset
         self.mixup = mixup
@@ -139,27 +136,24 @@ class ImagenetDataModule(LightningDataModule):
     def setup(self, stage: Optional[str] = None) -> None:
         """Creates train, val, and test dataset."""
         if stage == "fit" or stage is None:
-            train_transforms = (self.train_transform() if self.train_transforms is None
-                                else self.train_transforms)
-            val_transforms = (self.val_transform() if self.val_transforms is None
-                              else self.val_transforms)
+            train_transforms = self.train_transform() if self.train_transforms is None else self.train_transforms
+            val_transforms = self.val_transform() if self.val_transforms is None else self.val_transforms
             if self.img_dtype is not torch.float32:
                 assert isinstance(train_transforms, transforms.Compose)
                 assert isinstance(val_transforms, transforms.Compose)
                 convert_dtype = transforms.Lambda(lambda x: x.to(dtype=self.img_dtype))
                 train_transforms.transforms.append(convert_dtype)
                 val_transforms.transforms.append(convert_dtype)
-            self.dataset_train = ImageFolder(self.data_dir / 'train', transform=train_transforms)
-            self.dataset_val = ImageFolder(self.data_dir / 'val', transform=val_transforms)
+            self.dataset_train = ImageFolder(self.data_dir / "train", transform=train_transforms)
+            self.dataset_val = ImageFolder(self.data_dir / "val", transform=val_transforms)
 
         if stage == "test" or stage is None:
-            test_transforms = (self.val_transform() if self.test_transforms is None
-                               else self.test_transforms)
+            test_transforms = self.val_transform() if self.test_transforms is None else self.test_transforms
             if self.img_dtype is not torch.float32:
                 assert isinstance(test_transforms, transforms.Compose)
                 convert_dtype = transforms.Lambda(lambda x: x.to(dtype=self.img_dtype))
                 test_transforms.transforms.append(convert_dtype)
-            self.dataset_test = ImageFolder(self.data_dir / 'val', transform=test_transforms)
+            self.dataset_test = ImageFolder(self.data_dir / "val", transform=test_transforms)
 
     def train_transform(self) -> Callable:
         """The standard imagenet transforms.
@@ -210,53 +204,69 @@ class ImagenetDataModule(LightningDataModule):
         return preprocessing
 
     def train_dataloader(self, *args: Any, **kwargs: Any) -> DataLoader:
-        """ The train dataloader """
+        """The train dataloader"""
         if self.num_aug_repeats == 0:
             shuffle = self.shuffle
             sampler = None
         else:
             shuffle = False
             from timm.data.distributed_sampler import RepeatAugSampler
+
             sampler = RepeatAugSampler(self.dataset_train, num_repeats=self.num_aug_repeats)
-        return self._data_loader(self.dataset_train, batch_size=self.batch_size,
-                                 shuffle=shuffle, mixup=self.mixup, sampler=sampler)
+        return self._data_loader(
+            self.dataset_train, batch_size=self.batch_size, shuffle=shuffle, mixup=self.mixup, sampler=sampler
+        )
 
     def val_dataloader(self, *args: Any, **kwargs: Any) -> Union[DataLoader, List[DataLoader]]:
-        """ The val dataloader """
+        """The val dataloader"""
         # If using RepeatAugment, we set trainer.replace_sampler_ddp=False, so we have to
         # construct the DistributedSampler ourselves.
         if not self.cache_val_dataset:
-            sampler = (DistributedSampler(self.dataset_val, shuffle=False, drop_last=self.drop_last)
-                       if self.num_aug_repeats != 0 else None)
-            return self._data_loader(self.dataset_val, batch_size=self.batch_size_eval,
-                                     sampler=sampler)
+            sampler = (
+                DistributedSampler(self.dataset_val, shuffle=False, drop_last=self.drop_last)
+                if self.num_aug_repeats != 0
+                else None
+            )
+            return self._data_loader(self.dataset_val, batch_size=self.batch_size_eval, sampler=sampler)
         else:
-            print('Caching val dataset')
-            sampler = (SequentialSampler(self.dataset_val) if self.trainer.world_size <= 1
-                       else DistributedSampler(self.dataset_val, shuffle=False,
-                                               drop_last=self.drop_last))
+            print("Caching val dataset")
+            sampler = (
+                SequentialSampler(self.dataset_val)
+                if self.trainer.world_size <= 1
+                else DistributedSampler(self.dataset_val, shuffle=False, drop_last=self.drop_last)
+            )
             indices = list(iter(sampler))
-            loader = DataLoader(self.dataset_val, batch_size=None, shuffle=False, sampler=sampler,
-                                num_workers=self.num_workers, drop_last=self.drop_last)
+            loader = DataLoader(
+                self.dataset_val,
+                batch_size=None,
+                shuffle=False,
+                sampler=sampler,
+                num_workers=self.num_workers,
+                drop_last=self.drop_last,
+            )
             batches = list(loader)
             assert len(batches) == len(indices)
-            self.dataset_val = DictDataset(dict(zip(indices, batches)),
-                                           length=len(self.dataset_val))
-            sampler = (DistributedSampler(self.dataset_val, shuffle=False, drop_last=self.drop_last)
-                       if self.num_aug_repeats != 0 else None)
-            return self._data_loader(self.dataset_val, batch_size=self.batch_size_eval,
-                                     sampler=sampler)
+            self.dataset_val = DictDataset(dict(zip(indices, batches)), length=len(self.dataset_val))
+            sampler = (
+                DistributedSampler(self.dataset_val, shuffle=False, drop_last=self.drop_last)
+                if self.num_aug_repeats != 0
+                else None
+            )
+            return self._data_loader(self.dataset_val, batch_size=self.batch_size_eval, sampler=sampler)
 
     def test_dataloader(self, *args: Any, **kwargs: Any) -> Union[DataLoader, List[DataLoader]]:
-        """ The test dataloader """
-        sampler = (DistributedSampler(self.dataset_test, shuffle=False, drop_last=self.drop_last)
-                   if self.num_aug_repeats != 0 else None)
+        """The test dataloader"""
+        sampler = (
+            DistributedSampler(self.dataset_test, shuffle=False, drop_last=self.drop_last)
+            if self.num_aug_repeats != 0
+            else None
+        )
         return self._data_loader(self.dataset_test, batch_size=self.batch_size_eval, sampler=sampler)
 
-    def _data_loader(self, dataset: Dataset, batch_size: int, shuffle: bool = False,
-                     mixup: Optional[Callable] = None, sampler=None) -> DataLoader:
-        collate_fn = ((lambda batch: mixup(*default_collate(batch))) if mixup is not None
-                      else default_collate)
+    def _data_loader(
+        self, dataset: Dataset, batch_size: int, shuffle: bool = False, mixup: Optional[Callable] = None, sampler=None
+    ) -> DataLoader:
+        collate_fn = (lambda batch: mixup(*default_collate(batch))) if mixup is not None else default_collate
         return DataLoader(
             dataset,
             collate_fn=collate_fn,
@@ -266,13 +276,12 @@ class ImagenetDataModule(LightningDataModule):
             num_workers=self.num_workers,
             drop_last=self.drop_last,
             pin_memory=self.pin_memory,
-            persistent_workers=True
+            persistent_workers=True,
         )
 
 
 class Imagenet21kPDataModule(ImagenetDataModule):
-    """ImageNet-21k (winter 21) processed with https://github.com/Alibaba-MIIL/ImageNet21K
-    """
+    """ImageNet-21k (winter 21) processed with https://github.com/Alibaba-MIIL/ImageNet21K"""
 
     @property
     def num_classes(self) -> int:

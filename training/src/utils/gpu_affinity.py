@@ -29,12 +29,10 @@ class device:
         return pynvml.nvmlDeviceGetName(self.handle)
 
     def getCpuAffinity(self):
-        affinity_string = ''
-        for j in pynvml.nvmlDeviceGetCpuAffinity(
-            self.handle, device._nvml_affinity_elements
-        ):
+        affinity_string = ""
+        for j in pynvml.nvmlDeviceGetCpuAffinity(self.handle, device._nvml_affinity_elements):
             # assume nvml returns list of 64 bit ints
-            affinity_string = '{:064b}'.format(j) + affinity_string
+            affinity_string = "{:064b}".format(j) + affinity_string
         affinity_list = [int(x) for x in affinity_string]
         affinity_list.reverse()  # so core 0 is in 0th element of list
 
@@ -98,12 +96,12 @@ def set_socket_unique_affinity(gpu_id, nproc_per_node, mode):
         cores_per_device = len(socket_affinity) // devices_per_group
         for group_id, device_id in enumerate(device_ids):
             if device_id == gpu_id:
-                if mode == 'interleaved':
+                if mode == "interleaved":
                     affinity = list(socket_affinity[group_id::devices_per_group])
-                elif mode == 'continuous':
-                    affinity = list(socket_affinity[group_id*cores_per_device:(group_id+1)*cores_per_device])
+                elif mode == "continuous":
+                    affinity = list(socket_affinity[group_id * cores_per_device : (group_id + 1) * cores_per_device])
                 else:
-                    raise RuntimeError('Unknown set_socket_unique_affinity mode')
+                    raise RuntimeError("Unknown set_socket_unique_affinity mode")
 
                 # reintroduce siblings
                 affinity += [siblings_dict[aff] for aff in affinity if aff in siblings_dict]
@@ -111,9 +109,9 @@ def set_socket_unique_affinity(gpu_id, nproc_per_node, mode):
 
 
 def get_thread_siblings_list():
-    path = '/sys/devices/system/cpu/cpu*/topology/thread_siblings_list'
+    path = "/sys/devices/system/cpu/cpu*/topology/thread_siblings_list"
     thread_siblings_list = []
-    pattern = re.compile(r'(\d+)\D(\d+)')
+    pattern = re.compile(r"(\d+)\D(\d+)")
     for fname in pathlib.Path(path[0]).glob(path[1:]):
         with open(fname) as f:
             content = f.read().strip()
@@ -124,19 +122,19 @@ def get_thread_siblings_list():
     return thread_siblings_list
 
 
-def set_affinity(gpu_id, nproc_per_node, mode='socket'):
-    if mode == 'socket':
+def set_affinity(gpu_id, nproc_per_node, mode="socket"):
+    if mode == "socket":
         set_socket_affinity(gpu_id)
-    elif mode == 'single':
+    elif mode == "single":
         set_single_affinity(gpu_id)
-    elif mode == 'single_unique':
+    elif mode == "single_unique":
         set_single_unique_affinity(gpu_id, nproc_per_node)
-    elif mode == 'socket_unique_interleaved':
-        set_socket_unique_affinity(gpu_id, nproc_per_node, 'interleaved')
-    elif mode == 'socket_unique_continuous':
-        set_socket_unique_affinity(gpu_id, nproc_per_node, 'continuous')
+    elif mode == "socket_unique_interleaved":
+        set_socket_unique_affinity(gpu_id, nproc_per_node, "interleaved")
+    elif mode == "socket_unique_continuous":
+        set_socket_unique_affinity(gpu_id, nproc_per_node, "continuous")
     else:
-        raise RuntimeError('Unknown affinity mode')
+        raise RuntimeError("Unknown affinity mode")
 
     affinity = os.sched_getaffinity(0)
     return affinity

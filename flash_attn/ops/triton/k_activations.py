@@ -11,7 +11,6 @@ from typing import Optional
 import triton
 import triton.language as tl
 
-
 _sqrt2pi = math.sqrt(2.0 / math.pi)
 _sqrt1_2 = math.sqrt(1.0 / 2)
 _gaussian_pdf_normalization = 1.0 / math.sqrt(2 * math.pi)
@@ -67,6 +66,7 @@ def cosh(x):
 
 # a Triton implementation of the most used activations
 # See for instance http://arxiv.org/abs/1606.08415 for an overview
+
 
 # ReLU
 @triton.jit
@@ -142,6 +142,7 @@ def gelu_grad(x):
     pdf = tl.exp(-0.5 * x * x) * _gaussian_pdf_normalization
     return cdf + x * pdf
 
+
 @triton.jit
 def gelu_approx(x):
     """
@@ -157,6 +158,4 @@ def gelu_approx_grad(x):
     # CREDITS: Fast implementation proposed in
     # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/model/fused_bias_gelu.py#L30
     tanh_out = tanh(0.79788456 * x * (1 + 0.044715 * x * x))
-    return 0.5 * x * (
-        (1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)
-    ) + 0.5 * (1 + tanh_out)
+    return 0.5 * x * ((1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)) + 0.5 * (1 + tanh_out)

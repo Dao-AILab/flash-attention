@@ -1,13 +1,12 @@
 # Adapted from https://github.com/Lightning-AI/lightning/blob/2845e7565dbe6b765ae32870e7d2bc456529c30a/tests/tests_pytorch/utilities/test_auto_restart.py#L1397
-from typing import Iterator
 import math
+from typing import Iterator
 
 import torch
-from torch.utils.data import RandomSampler, DistributedSampler
+from torch.utils.data import DistributedSampler, RandomSampler
 
 
 class RandomFaultTolerantSampler(RandomSampler):
-
     def __init__(self, *args, generator=None, **kwargs):
         # generator = torch.Generator().manual_seed(seed)
         # super().__init__(*args, generator=generator, **kwargs)
@@ -49,7 +48,7 @@ class RandomFaultTolerantSampler(RandomSampler):
         if not self.restarting:
             self.counter = 0
         else:
-            indices = indices[self.counter:]
+            indices = indices[self.counter :]
             self.restarting = False
         # self.start_counter = self.counter
 
@@ -62,7 +61,6 @@ class RandomFaultTolerantSampler(RandomSampler):
 
 
 class FaultTolerantDistributedSampler(DistributedSampler):
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.counter = 0
@@ -81,7 +79,7 @@ class FaultTolerantDistributedSampler(DistributedSampler):
     # TD [2022-08-28] Setting the len will cause PL to think there are only a few batches left per
     # epoch, and subsequent epoch will have very few batches.
     # def __len__(self) -> int:
-        # return self.num_samples - self.start_counter
+    # return self.num_samples - self.start_counter
 
     def __iter__(self):
         if self.shuffle:
@@ -101,17 +99,17 @@ class FaultTolerantDistributedSampler(DistributedSampler):
                 indices += (indices * math.ceil(padding_size / len(indices)))[:padding_size]
         else:
             # remove tail of data to make it evenly divisible.
-            indices = indices[:self.total_size]
+            indices = indices[: self.total_size]
         assert len(indices) == self.total_size
 
         # subsample
-        indices = indices[self.rank:self.total_size:self.num_replicas]
+        indices = indices[self.rank : self.total_size : self.num_replicas]
         assert len(indices) == self.num_samples
 
         if not self.restarting:
             self.counter = 0
         else:
-            indices = indices[self.counter:]
+            indices = indices[self.counter :]
             self.restarting = False
         # self.start_counter = self.counter
 

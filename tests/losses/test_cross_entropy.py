@@ -1,24 +1,23 @@
 import math
 
-import torch
-import torch.nn.functional as F
 import pytest
-
+import torch
 from einops import rearrange
+from torch.nn import functional as F
 
 from flash_attn.losses.cross_entropy import CrossEntropyLossApex
 
-is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
+is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 
 
-@pytest.mark.parametrize('dtype', [torch.float16, torch.float32] + ([torch.bfloat16] if is_sm8x else []))
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32] + ([torch.bfloat16] if is_sm8x else []))
 # @pytest.mark.parametrize('dtype', [torch.float16])
-@pytest.mark.parametrize('inplace_backward', [False, True])
+@pytest.mark.parametrize("inplace_backward", [False, True])
 # @pytest.mark.parametrize('inplace_backward', [False])
-@pytest.mark.parametrize('smoothing', [0.0, 0.9])
-@pytest.mark.parametrize('vocab_size', [50257])
+@pytest.mark.parametrize("smoothing", [0.0, 0.9])
+@pytest.mark.parametrize("vocab_size", [50257])
 def test_cross_entropy_loss_apex(vocab_size, smoothing, inplace_backward, dtype):
-    device = 'cuda'
+    device = "cuda"
     rtol, atol = (1e-5, 1e-6) if dtype == torch.float32 else (1e-3, 1e-4)
     # set seed
     torch.random.manual_seed(0)

@@ -1,13 +1,13 @@
 # Adapted from https://github.com/NVIDIA/apex/blob/master/setup.py
+import os
+import subprocess
 import sys
 import warnings
-import os
-from packaging.version import parse, Version
 
 import torch
-from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
-from setuptools import setup, find_packages
-import subprocess
+from packaging.version import Version, parse
+from setuptools import find_packages, setup
+from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CppExtension, CUDAExtension
 
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -29,7 +29,7 @@ def check_cuda_torch_binary_vs_bare_metal(cuda_dir):
     print("\nCompiling cuda extensions with")
     print(raw_output + "from " + cuda_dir + "/bin\n")
 
-    if (bare_metal_version != torch_binary_version):
+    if bare_metal_version != torch_binary_version:
         raise RuntimeError(
             "Cuda extensions are being compiled with a version of Cuda that does "
             "not match the version used to compile Pytorch binaries.  "
