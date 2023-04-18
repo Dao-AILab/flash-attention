@@ -404,7 +404,7 @@ def fused_mlp_func(
 
 class FusedMLP(nn.Module):
 
-    def __init__(self, in_features, hidden_features, out_features=None, bias1=True,
+    def __init__(self, in_features, hidden_features=None, out_features=None, bias1=True,
                  bias2=True, activation='gelu_approx', return_residual=False,
                  checkpoint_lvl=0, heuristic='auto', device=None, dtype=None):
         """
@@ -432,8 +432,8 @@ class FusedMLP(nn.Module):
         assert activation in ['gelu_approx', 'relu', 'sqrelu']
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
-        if out_features is None:
-            out_features = in_features
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features * 4
         self.activation = activation
         self.return_residual = return_residual
         self.checkpoint_lvl = checkpoint_lvl
@@ -469,9 +469,9 @@ class FusedMLP(nn.Module):
 
 class ParallelFusedMLP(nn.Module):
 
-    def __init__(self, in_features, hidden_features, out_features=None, activation='gelu_approx',
-                 process_group: ProcessGroup = None, bias1=True, bias2=True,
-                 sequence_parallel=True, checkpoint_lvl=0, heuristic='auto',
+    def __init__(self, in_features, hidden_features=None, out_features=None,
+                 activation='gelu_approx', process_group: ProcessGroup = None,
+                 bias1=True, bias2=True, sequence_parallel=True, checkpoint_lvl=0, heuristic='auto',
                  device=None, dtype=None):
         """
         process_group is required. We're doing Tensor Parallel with sequence parallelism:
@@ -494,8 +494,8 @@ class ParallelFusedMLP(nn.Module):
         assert process_group is not None
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
-        if out_features is None:
-            out_features = in_features
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features * 4
         self.activation = activation
         self.process_group = process_group
         self.sequence_parallel = sequence_parallel

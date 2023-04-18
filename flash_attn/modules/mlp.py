@@ -28,3 +28,28 @@ class Mlp(nn.Module):
         y = self.activation(y)
         y = self.fc2(y)
         return y if not self.return_residual else (y, x)
+
+
+class GatedMlp(nn.Module):
+
+    def __init__(self, in_features, hidden_features=None, out_features=None, activation=F.sigmoid,
+                 multiple_of=128, return_residual=False, device=None, dtype=None):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or int(8 * in_features / 3)
+        hidden_features = (hidden_features + multiple_of - 1) // multiple_of * multiple_of
+        self.return_residual = return_residual
+        self.fc1 = nn.Linear(in_features, 2 * hidden_features, **factory_kwargs)
+        self.activation = activation
+        self.fc2 = nn.Linear(hidden_features, out_features, **factory_kwargs)
+
+    def forward(self, x):
+        y = self.fc1(x)
+        if self.activation == F.sigmoid:  # Special case for GLU
+            y = F.glu(y, dim=-1)
+        else:
+            y, gate = y.chunk(2, dim=-1)
+            y = y * self.activation(gate)
+        y = self.fc2(y)
+        return y if not self.return_residual else (y, x)
