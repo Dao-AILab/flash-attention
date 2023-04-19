@@ -538,6 +538,11 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         dk_tmp = at::empty(dk.sizes(),dk_opts).contiguous();
         dv_tmp = at::empty(dv.sizes(),dv_opts).contiguous();
     }
+    //else{
+    //    dq_tmp = at::empty(dq.sizes(),dq_opts).contiguous();
+    //    dk_tmp = at::empty(dk.sizes(),dk_opts).contiguous();
+    //    dv_tmp = at::empty(dv.sizes(),dv_opts).contiguous();
+    //}
     else{
         dq_tmp = at::empty(dq.sizes(),dq_opts.dtype(at::kFloat)).contiguous();
         dk_tmp = at::empty(dk.sizes(),dk_opts.dtype(at::kFloat)).contiguous();

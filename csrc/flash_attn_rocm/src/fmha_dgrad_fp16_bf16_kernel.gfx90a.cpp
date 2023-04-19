@@ -48,7 +48,7 @@ struct SimpleDeviceMem {
   void *p_mem_;
 };
 
-template <typename InputType, typename OutputType, typename DropoutType, ck::index_t Version,
+template <typename InputType, typename OutputType, typename DropoutType, ck::index_t Version, ck::index_t CShuffleBlockTransferScalarPerVector_NPerBlock,
           MaskingSpecialization MaskingSpec>
 void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
     Launch_params<FMHA_dgrad_params> &launch_params) {
@@ -91,6 +91,8 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
   static constexpr auto TensorSpecY =
       ck::tensor_operation::device::TensorSpecialization::Default;
 
+  static constexpr bool Deterministic = true;
+
   bool time_kernel = false;
 
   bool input_permute = true;
@@ -98,6 +100,13 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
 
   float alpha = launch_params.params.scale_bmm1f;
   auto seeds = unpack(launch_params.params.philox_args);
+
+  auto seed_   = std::get<0>(seeds);
+  auto offset_ = std::get<1>(seeds);
+
+  std::cout << "bwd seed is " << seed_ ;
+  std::cout << " , bwd offset is " << offset_ << std::endl;
+
   auto a_element_op = QKVElementOp{};
   auto b0_element_op = QKVElementOp{};
   auto acc0_element_op = Scale{alpha};
@@ -258,8 +267,9 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
             1, // CShuffleMXdlPerWavePerShuffle
             4, // CShuffleNXdlPerWavePerShuffle
             S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-            4,            // CShuffleBlockTransferScalarPerVector_NPerBlock
-            MaskingSpec>; // MaskingSpecialization
+            CShuffleBlockTransferScalarPerVector_NPerBlock,            // CShuffleBlockTransferScalarPerVector_NPerBlock
+            MaskingSpec,
+            Deterministic>; // MaskingSpecialization
     auto gemm = DeviceGemmInstance{};
     run_kernel(gemm);
   } else if (Version == 2) {
@@ -294,8 +304,9 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
             2, // CShuffleNXdlPerWavePerShuffle
             S<1, 32, 1,
               8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-            4,            // CShuffleBlockTransferScalarPerVector_NPerBlock
-            MaskingSpec>; // MaskingSpecialization
+            CShuffleBlockTransferScalarPerVector_NPerBlock,            // CShuffleBlockTransferScalarPerVector_NPerBlock
+            MaskingSpec,
+            Deterministic>; // MaskingSpecialization
     auto gemm = DeviceGemmInstance{};
     run_kernel(gemm);
   } else {
@@ -330,8 +341,9 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
             1, // CShuffleNXdlPerWavePerShuffle
             S<1, 64, 1,
               4>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-            4,            // CShuffleBlockTransferScalarPerVector_NPerBlock
-            MaskingSpec>; // MaskingSpecialization
+            CShuffleBlockTransferScalarPerVector_NPerBlock,            // CShuffleBlockTransferScalarPerVector_NPerBlock
+            MaskingSpec,
+            Deterministic>; // MaskingSpecialization
     auto gemm = DeviceGemmInstance{};
     run_kernel(gemm);
   }
@@ -347,24 +359,24 @@ void run_fmha_dgrad_fp16_bf16_gfx90a(
   if (launch_params.params.is_bf16) {
     if (launch_params.params.is_causal) {
       if (launch_params.params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32 , int, 1, MaskingSpec_causal>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32 , int, 1, 4, MaskingSpec_causal>(
             launch_params);
       } else if (launch_params.params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32 , int, 2, MaskingSpec_causal>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32 , int, 2, 4, MaskingSpec_causal>(
             launch_params);
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32 , int, 3, MaskingSpec_causal>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32 , int, 3, 4, MaskingSpec_causal>(
             launch_params);
       }
     } else {
       if (launch_params.params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32, int, 1, MaskingSpec_default>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32, int, 1, 4, MaskingSpec_default>(
             launch_params);
       } else if (launch_params.params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32, int, 2, MaskingSpec_default>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32, int, 2, 4, MaskingSpec_default>(
             launch_params);
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32, int, 3, MaskingSpec_default>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32, int, 3, 4, MaskingSpec_default>(
             launch_params);
       }
     }
@@ -372,24 +384,24 @@ void run_fmha_dgrad_fp16_bf16_gfx90a(
   else{
     if (launch_params.params.is_causal) {
       if (launch_params.params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,1, MaskingSpec_causal>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,1, 8, MaskingSpec_causal>(
             launch_params);
       } else if (launch_params.params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,2, MaskingSpec_causal>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,2, 8, MaskingSpec_causal>(
             launch_params);
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,3, MaskingSpec_causal>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,3, 8, MaskingSpec_causal>(
             launch_params);
       }
     } else {
       if (launch_params.params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,1, MaskingSpec_default>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,1, 8, MaskingSpec_default>(
             launch_params);
       } else if (launch_params.params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,2, MaskingSpec_default>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,2, 8, MaskingSpec_default>(
             launch_params);
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,3, MaskingSpec_default>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,3, 8, MaskingSpec_default>(
             launch_params);
       }
     }
