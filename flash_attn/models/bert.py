@@ -487,18 +487,14 @@ def remap_state_dict(state_dict, config):
             state_dict[f'bert.encoder.layers.{d}.mixer.Wqkv.weight'] = torch.cat(
                 [Wq, Wk, Wv], dim=0
             )
-            state_dict[f'bert.encoder.layers.{d}.mixer.Wqkv.bias'] = torch.cat(
-                [bq, bk, bv], dim=0
-            )
+            state_dict[f'bert.encoder.layers.{d}.mixer.Wqkv.bias'] = torch.cat([bq, bk, bv], dim=0)
         else:
             state_dict[f'bert.encoder.layers.{d}.mixer.Wq.weight'] = Wq
             state_dict[f'bert.encoder.layers.{d}.mixer.Wkv.weight'] = torch.cat(
                 [Wk, Wv], dim=0
             )
             state_dict[f'bert.encoder.layers.{d}.mixer.Wq.bias'] = bq
-            state_dict[f'bert.encoder.layers.{d}.mixer.Wkv.bias'] = torch.cat(
-                [bk, bv], dim=0
-            )
+            state_dict[f'bert.encoder.layers.{d}.mixer.Wkv.bias'] = torch.cat([bk, bv], dim=0)
     def key_mapping_attn(key):
         return re.sub(r'^bert.encoder.layers.(\d+).attention.output.dense.(weight|bias)',
                       r'bert.encoder.layers.\1.mixer.out_proj.\2', key)

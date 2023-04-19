@@ -105,7 +105,7 @@ fused_dense_sqrelu_dense_function = FusedDenseSqreluDenseFunc.apply
 
 class FusedDenseSqreluDense(nn.Module):
 
-    def __init__(self, in_features, hidden_features=None, out_features=None, bias=True,
+    def __init__(self, in_features, hidden_features=None, out_features=None, bias1=True, bias2=True,
                  checkpoint_lvl=0, device=None, dtype=None):
         """
         checkpoint_lvl (increasing lvl means slower but more memory saving):
@@ -117,11 +117,12 @@ class FusedDenseSqreluDense(nn.Module):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
         out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        assert bias == True, "DenseSqreluDense module without bias is currently not supported"
+        hidden_features = hidden_features or in_features * 4
+        assert bias1 == True, "DenseSqreluDense module without bias is currently not supported"
+        assert bias2 == True, "DenseSqreluDense module without bias is currently not supported"
         self.checkpoint_lvl = checkpoint_lvl
-        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias, **factory_kwargs)
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias, **factory_kwargs)
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias1, **factory_kwargs)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias2, **factory_kwargs)
 
     def forward(self, x):
         assert x.is_cuda

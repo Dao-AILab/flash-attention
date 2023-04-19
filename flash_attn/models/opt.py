@@ -66,12 +66,8 @@ def remap_state_dict_hf_opt(state_dict, config):
         bq = state_dict.pop(f'transformer.layers.{l}.self_attn.q_proj.bias')
         bk = state_dict.pop(f'transformer.layers.{l}.self_attn.k_proj.bias')
         bv = state_dict.pop(f'transformer.layers.{l}.self_attn.v_proj.bias')
-        state_dict[f'transformer.layers.{l}.mixer.Wqkv.weight'] = torch.cat(
-            [Wq, Wk, Wv], dim=0
-        )
-        state_dict[f'transformer.layers.{l}.mixer.Wqkv.bias'] = torch.cat(
-            [bq, bk, bv], dim=0
-        )
+        state_dict[f'transformer.layers.{l}.mixer.Wqkv.weight'] = torch.cat([Wq, Wk, Wv], dim=0)
+        state_dict[f'transformer.layers.{l}.mixer.Wqkv.bias'] = torch.cat([bq, bk, bv], dim=0)
     def key_mapping_attn(key):
         return re.sub(r'^transformer.layers.(\d+).self_attn.out_proj.',
                       r'transformer.layers.\1.mixer.out_proj.', key)

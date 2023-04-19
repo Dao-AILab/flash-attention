@@ -56,9 +56,7 @@ def remap_state_dict_hf_gptj(state_dict, config):
         Wq = state_dict.pop(f'transformer.layers.{l}.attn.q_proj.weight')
         Wk = state_dict.pop(f'transformer.layers.{l}.attn.k_proj.weight')
         Wv = state_dict.pop(f'transformer.layers.{l}.attn.v_proj.weight')
-        state_dict[f'transformer.layers.{l}.mixer.Wqkv.weight'] = torch.cat(
-            [Wq, Wk, Wv], dim=0
-        )
+        state_dict[f'transformer.layers.{l}.mixer.Wqkv.weight'] = torch.cat([Wq, Wk, Wv], dim=0)
         # We don't store these biases
         state_dict.pop(f'transformer.layers.{l}.attn.bias')
         state_dict.pop(f'transformer.layers.{l}.attn.masked_bias')

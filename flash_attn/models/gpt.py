@@ -44,6 +44,16 @@ except ImportError:
     dropout_add_layer_norm_parallel_residual = None
 
 try:
+    from flash_attn.ops.rms_norm import RMSNorm, dropout_add_rms_norm
+except ImportError:
+    RMSNorm, dropout_add_rms_norm = None
+
+try:
+    from flash_attn.ops.rms_norm import dropout_add_rms_norm_parallel_residual
+except ImportError:
+    dropout_add_rms_norm_parallel_residual = None
+
+try:
     from flash_attn.ops.triton.mlp import FusedDenseSqreluDense
 except ImportError:
     FusedDenseSqreluDense = None
@@ -90,6 +100,8 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
 
 def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
+    mlp_fc1_bias = getattr(config, 'mlp_fc1_bias', True)
+    mlp_fc2_bias = getattr(config, 'mlp_fc2_bias', True)
     fused_mlp = getattr(config, 'fused_mlp', False)
     if fused_mlp:
         assert config.activation_function in ['gelu_new', 'gelu_fast', 'gelu_approx', 'relu', 'sqrelu']
@@ -108,7 +120,7 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
                           else (F.silu if config.activation_function == 'swiglu'
                                 else F.gelu))
             mlp_cls = partial(GatedMlp, hidden_features=config.n_inner, activation=activation,
-                              **factory_kwargs)
+                              bias1=mlp_fc1_bias, bias2=mlp_fc2_bias, **factory_kwargs)
         else:
             if config.activation_function == 'relu':
                 activation = partial(F.relu, inplace=True)
@@ -119,7 +131,7 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
                             in ['gelu_new', 'gelu_fast', 'gelu_approx'] else 'none')
                 activation=partial(F.gelu, approximate=approximate)
             mlp_cls = partial(Mlp, hidden_features=config.n_inner, activation=activation,
-                              **factory_kwargs)
+                              bias1=mlp_fc1_bias, bias2=mlp_fc2_bias, **factory_kwargs)
     else:
         mlp_checkpoint_lvl = getattr(config, 'mlp_checkpoint_lvl', 0)
         # mlp_checkpoint_lvl could be a list, which contains the checkpoint_lvl for each layer
@@ -137,6 +149,7 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
                                if process_group is not None else {})
             mlp_cls = partial(mlp_cls, hidden_features=config.n_inner, activation=activation,
                               checkpoint_lvl=mlp_checkpoint_lvl,
+                              bias1=mlp_fc1_bias, bias2=mlp_fc2_bias,
                               **parallel_kwargs, **factory_kwargs)
         elif fused_dense_sqrelu_dense:
             assert FusedDenseSqreluDense is not None
@@ -152,7 +165,9 @@ def create_block(config, layer_idx=None, process_group=None, device=None, dtype=
     sequence_parallel = getattr(config, 'sequence_parallel', True)
     mixer_cls = create_mixer_cls(config, layer_idx, process_group=process_group, **factory_kwargs)
     mlp_cls = create_mlp_cls(config, layer_idx, process_group=process_group, **factory_kwargs)
-    norm_cls = partial(nn.LayerNorm, eps=config.layer_norm_epsilon, **factory_kwargs)
+    use_rms_norm = getattr(config, 'rms_norm', False)
+    norm_cls = partial(nn.LayerNorm if not use_rms_norm else RMSNorm,
+                       eps=config.layer_norm_epsilon, **factory_kwargs)
     # TD [2022-07-30]: Force residual in fp32, seems to make fp16 training more stable
     residual_in_fp32 = getattr(config, 'residual_in_fp32', False)
     resid_dropout1 = config.resid_pdrop if layer_idx is None or layer_idx > 0 else config.embd_pdrop
@@ -267,6 +282,7 @@ class GPTModel(GPTPreTrainedModel):
         self.residual_in_fp32 = getattr(config, 'residual_in_fp32', False)
         # These 2 options are for OPT-350m
         self.prenorm = getattr(config, 'prenorm', True)
+        use_rms_norm = getattr(config, 'rms_norm', False)
         word_embed_proj_dim = getattr(config, 'word_embed_proj_dim', None)
         # For GPT-J, GPT-NeoX
         self.parallel_block = getattr(config, 'parallel_block', False)
@@ -300,8 +316,9 @@ class GPTModel(GPTPreTrainedModel):
                 raise ImportError('dropout_layer_norm is not installed')
         if self.prenorm:
             self.drop_f = nn.Dropout(config.resid_pdrop)
-            self.ln_f = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon,
-                                    **factory_kwargs)
+            norm_cls = nn.LayerNorm if not use_rms_norm else RMSNorm
+            self.ln_f = norm_cls(config.hidden_size, eps=config.layer_norm_epsilon,
+                                 **factory_kwargs)
         if process_group is not None:
             for p in self.ln_f.parameters():
                 # Mark the norm parameters as "shared_params" so that we sync their values at init.
@@ -512,18 +529,25 @@ def combine_state_dicts_tp(state_dicts, config):
     inner_dim = config.n_inner if config.n_inner is not None else 4 * config.hidden_size
     assert inner_dim % world_size == 0
 
-    # The word embeddings from Megatron are weird, for each shard only the first
+    # Sometimes the word embeddings are sharded on the 0th dim, sometimes on the 1st dim.
     # vocab_size // world_size coordinates are nonzero.
     def combine_word_embeddings(state_dicts, state_dict, key):
-        assert all(s[key].shape[0] == vocab_size for s in state_dicts)
-        state_dict[key] = torch.cat([s[key][:vocab_size // world_size] for s in state_dicts], dim=0)
-
-    def combine_dim(state_dicts, state_dict, key, dim=-1):
+        dim = 0 if state_dicts[0][key].shape[0] == vocab_size // world_size else 1
         state_dict[key] = torch.cat([s[key] for s in state_dicts], dim=dim)
 
+    def combine_dim(state_dicts, state_dict, key, dim=-1):
+        if key in state_dict:
+            state_dict[key] = torch.cat([s[key] for s in state_dicts], dim=dim)
+
     def combine_qkv_headdim(state_dicts, state_dict, key):
-        xs = [rearrange(s[key], '(three d) ... -> three d ...', three=3) for s in state_dicts]
-        state_dict[key] = rearrange(torch.cat(xs, dim=1), 'three d ... -> (three d) ...')
+        if key in state_dict:
+            xs = [rearrange(s[key], '(three d) ... -> three d ...', three=3) for s in state_dicts]
+            state_dict[key] = rearrange(torch.cat(xs, dim=1), 'three d ... -> (three d) ...')
+
+    def combine_gated_mlp(state_dicts, state_dict, key):
+        if key in state_dict:
+            xs = [rearrange(s[key], '(two d) ... -> two d ...', two=2) for s in state_dicts]
+            state_dict[key] = rearrange(torch.cat(xs, dim=1), 'two d ... -> (two d) ...')
 
     state_dict = state_dicts[0].copy()  # don't modify state_dict[0] inplace
     combine_word_embeddings(state_dicts, state_dict, 'transformer.embeddings.word_embeddings.weight')
@@ -531,11 +555,13 @@ def combine_state_dicts_tp(state_dicts, config):
         combine_word_embeddings(state_dicts, state_dict, 'lm_head.weight')
     if 'transformer.embeddings.position_embeddings.weight' in state_dict:
         combine_dim(state_dicts, state_dict, 'transformer.embeddings.position_embeddings.weight', -1)
+    mlp_combine_fn = (combine_gated_mlp if config.activation_function in ['glu', 'swiglu', 'geglu']
+                      else partial(combine_dim, dim=0))
     for i in range(config.num_hidden_layers):
         combine_qkv_headdim(state_dicts, state_dict, f'transformer.layers.{i}.mixer.Wqkv.weight')
         combine_qkv_headdim(state_dicts, state_dict, f'transformer.layers.{i}.mixer.Wqkv.bias')
         combine_dim(state_dicts, state_dict, f'transformer.layers.{i}.mixer.out_proj.weight', -1)
-        combine_dim(state_dicts, state_dict, f'transformer.layers.{i}.mlp.fc1.weight', 0)
+        mlp_combine_fn(state_dicts, state_dict, f'transformer.layers.{i}.mlp.fc1.weight')
         combine_dim(state_dicts, state_dict, f'transformer.layers.{i}.mlp.fc1.bias', 0)
         combine_dim(state_dicts, state_dict, f'transformer.layers.{i}.mlp.fc2.weight', -1)
     return state_dict
@@ -603,7 +629,8 @@ def remap_state_dict_megatron(state_dict, config):
     word_embeddings = state_dict.pop('transformer.embedding.word_embeddings.weight')
     # It's possible that vocab_size is padded to be a multiple of 8, for example.
     pad_vocab_size_multiple = getattr(config, 'pad_vocab_size_multiple', 1)
-    vocab_size = (math.ceil(config.vocab_size / pad_vocab_size_multiple) * pad_vocab_size_multiple)
+    vocab_size = (math.ceil(word_embeddings.shape[0] / pad_vocab_size_multiple)
+                  * pad_vocab_size_multiple)
     state_dict['transformer.embeddings.word_embeddings.weight'] = F.pad(
         word_embeddings, (0, 0, 0, vocab_size - word_embeddings.shape[0])
     )

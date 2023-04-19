@@ -13,15 +13,15 @@ except ImportError:
 class Mlp(nn.Module):
 
     def __init__(self, in_features, hidden_features=None, out_features=None, activation=F.gelu,
-                 return_residual=False, device=None, dtype=None):
+                 bias1=True, bias2=True, return_residual=False, device=None, dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features * 4
         self.return_residual = return_residual
-        self.fc1 = nn.Linear(in_features, hidden_features, **factory_kwargs)
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias1, **factory_kwargs)
         self.activation = activation
-        self.fc2 = nn.Linear(hidden_features, out_features, **factory_kwargs)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias2, **factory_kwargs)
 
     def forward(self, x):
         y = self.fc1(x)
@@ -33,16 +33,17 @@ class Mlp(nn.Module):
 class GatedMlp(nn.Module):
 
     def __init__(self, in_features, hidden_features=None, out_features=None, activation=F.sigmoid,
-                 multiple_of=128, return_residual=False, device=None, dtype=None):
+                 bias1=True, bias2=True, multiple_of=256, return_residual=False,
+                 device=None, dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or int(8 * in_features / 3)
         hidden_features = (hidden_features + multiple_of - 1) // multiple_of * multiple_of
         self.return_residual = return_residual
-        self.fc1 = nn.Linear(in_features, 2 * hidden_features, **factory_kwargs)
+        self.fc1 = nn.Linear(in_features, 2 * hidden_features, bias=bias1, **factory_kwargs)
         self.activation = activation
-        self.fc2 = nn.Linear(hidden_features, out_features, **factory_kwargs)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias1, **factory_kwargs)
 
     def forward(self, x):
         y = self.fc1(x)
