@@ -490,10 +490,15 @@ class MHA(nn.Module):
                 else:
                     assert inference_params.fused_ft_kernel
                     assert ft_attention is not None
+                    batch_start = inference_params.batch_size_offset
+                    batch_end = batch_start + qkv.shape[0]
+                    k_cache, v_cache = inference_params.key_value_memory_dict[self.layer_idx]
+                    lengths_per_sample = (inference_params.lengths_per_sample[batch_start:batch_end]
+                                          if inference_params.lengths_per_sample is not None else None)
                     context = ft_attention.single_query_attention(
                         *rearrange(qkv, 'b 1 three h d -> b three h d').unbind(dim=1),
-                        *inference_params.key_value_memory_dict[self.layer_idx],
-                        inference_params.lengths_per_sample, inference_params.sequence_len_offset,
+                        k_cache[batch_start:batch_end], v_cache[batch_start:batch_end],
+                        lengths_per_sample, inference_params.sequence_len_offset,
                         self.rotary_emb_dim,
                         # neox_rotary_style
                         (not self.rotary_emb.interleaved) if self.rotary_emb_dim > 0 else True
@@ -605,11 +610,16 @@ class ParallelMHA(nn.Module):
             else:
                 assert inference_params.fused_ft_kernel
                 assert ft_attention is not None
+                batch_start = inference_params.batch_size_offset
+                batch_end = batch_start + qkv.shape[0]
+                k_cache, v_cache = inference_params.key_value_memory_dict[self.layer_idx]
+                lengths_per_sample = (inference_params.lengths_per_sample[batch_start:batch_end]
+                                      if inference_params.lengths_per_sample is not None else None)
                 context = ft_attention.single_query_attention(
                     *rearrange(qkv, 'b 1 three h d -> b three h d').unbind(dim=1),
-                    *inference_params.key_value_memory_dict[self.layer_idx],
-                    inference_params.lengths_per_sample, inference_params.sequence_len_offset,
-                    self.rotary_emb_dim,
+                    k_cache[batch_start:batch_end], v_cache[batch_start:batch_end],
+                    lengths_per_sample, inference_params.sequence_len_offset,
+                    self.rotary_emb_dim, inference_params.sequence_len_offset,
                     # neox_rotary_style
                     (not self.rotary_emb.interleaved) if self.rotary_emb_dim > 0 else True
                 )

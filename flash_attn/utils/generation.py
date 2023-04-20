@@ -238,15 +238,16 @@ def update_graph_cache(model, cache, batch_size, seqlen_og, max_seqlen, tensor_p
         )
         cache.mempool = torch.cuda.graphs.graph_pool_handle()
     for s_type in range(seqlen_to_seqlen_type(seqlen_og), seqlen_to_seqlen_type(max_seqlen) + 1):
-        if s_type not in cache.callables:
+        if (batch_size, s_type) not in cache.callables:
             max_seqlen_ = min(max(seqlen_og, seqlen_type_to_max_seqlen(s_type)), max_seqlen)
-            cache.callables[s_type] = capture_graph(
+            cache.callables[batch_size, s_type] = capture_graph(
                 model, cache.inference_params, batch_size, max_seqlen_, mempool=cache.mempool,
                 n_warmups=n_warmups
             )
 
     def dispatch(input_ids, position_ids, seqlen):
-        return cache.callables[seqlen_to_seqlen_type(seqlen)](input_ids, position_ids, seqlen)
+        batch_size = input_ids.shape[0]
+        return cache.callables[batch_size, seqlen_to_seqlen_type(seqlen)](input_ids, position_ids, seqlen)
 
     cache.run = dispatch
     cache.inference_params.sequence_len_offset = 0  # Reset so it's not confusing
