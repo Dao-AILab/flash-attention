@@ -6,12 +6,6 @@
 // 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// #include <ATen/ATen.h>
-// #include <torch/extension.h>
-// #include <ATen/hip/HIPContext.h>
-// #include <ATen/hip/HIPGeneratorImpl.h>
-// #include <c10/hip/HIPGuard.h>
-// #include <c10/core/DeviceType.h>
 #include "fmha.h"
 
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
@@ -214,12 +208,7 @@ void set_params_dgrad(FMHA_dgrad_params &params,
             params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
             params.qgrad_ptr.push_back(reinterpret_cast<void*>(dq_ptr));
             q_ptr = q_ptr + temp_q_stride;
-            if(params.is_bf16){
-                dq_ptr = dq_ptr + temp_q_stride * 2;
-            }
-            else{
-                dq_ptr = dq_ptr + temp_q_stride * 2;
-            }
+            dq_ptr = dq_ptr + temp_q_stride * 2;
         }else{
             //std::cout << "q.is_not_contiguous()" << std::endl;
             auto q_each_tmp = q.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
@@ -234,13 +223,7 @@ void set_params_dgrad(FMHA_dgrad_params &params,
             params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr));
             params.kgrad_ptr.push_back(reinterpret_cast<void*>(dk_ptr));
             k_ptr = k_ptr + temp_k_stride;
-            if(params.is_bf16){
-                dk_ptr = dk_ptr + temp_k_stride * 2;
-            }
-            else{
-                dk_ptr = dk_ptr + temp_k_stride * 2;
-            }
-            //dk_ptr = dk_ptr + temp_k_stride * 2;
+            dk_ptr = dk_ptr + temp_k_stride * 2;
         }else{
             //std::cout << "k.is_not_contiguous()" << std::endl;
             auto k_each_tmp = k.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
@@ -255,13 +238,7 @@ void set_params_dgrad(FMHA_dgrad_params &params,
             params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr)); 
             params.vgrad_ptr.push_back(reinterpret_cast<void*>(dv_ptr));
             v_ptr = v_ptr + temp_k_stride;   
-            if(params.is_bf16){
-                dv_ptr = dv_ptr + temp_k_stride * 2;
-            }
-            else{
-                dv_ptr = dv_ptr + temp_k_stride * 2;
-            }
-            //dv_ptr = dv_ptr + temp_k_stride * 2;  
+            dv_ptr = dv_ptr + temp_k_stride * 2;
         }else{
             //std::cout << "v.is_not_contiguous()" << std::endl;
             auto v_each_tmp = v.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
@@ -521,7 +498,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     dq.zero_();
     dk.zero_();
     dv.zero_();
-        // softmax_d.zero_();
+    // softmax_d.zero_();
     //}
 
     //std::cout << "bwd define dq_opts" << std::endl;
@@ -533,7 +510,6 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     softmax_d.zero_();
 
     //generate three tmp result which size is same to dq,dk,dv
-    //std::cout << "bwd define dq_tmps" << std::endl;
     at::Tensor dq_tmp ;
     at::Tensor dk_tmp ;
     at::Tensor dv_tmp ;
@@ -543,11 +519,6 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     //    dk_tmp = at::empty(dk.sizes(),dk_opts).contiguous();
     //    dv_tmp = at::empty(dv.sizes(),dv_opts).contiguous();
     //}
-    ////else{
-    ////    dq_tmp = at::empty(dq.sizes(),dq_opts).contiguous();
-    ////    dk_tmp = at::empty(dk.sizes(),dk_opts).contiguous();
-    ////    dv_tmp = at::empty(dv.sizes(),dv_opts).contiguous();
-    ////}
     //else{
         dq_tmp = at::empty(dq.sizes(),dq_opts.dtype(at::kFloat)).contiguous();
         dk_tmp = at::empty(dk.sizes(),dk_opts.dtype(at::kFloat)).contiguous();
@@ -580,12 +551,8 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         std::lock_guard<std::mutex> lock(gen->mutex_);
         launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
     }
-    //std::cout << "bwd run_fmha_dgrad_fp16_bf16_gfx90a()" << std::endl;
-    run_fmha_dgrad_fp16_bf16_gfx90a(launch_params);
 
-    //dq.copy_(dq_tmp, true);
-    //dk.copy_(dk_tmp, true);
-    //dv.copy_(dv_tmp, true);
+    run_fmha_dgrad_fp16_bf16_gfx90a(launch_params);
 
     if(!q.is_contiguous()){
         dq_tmp.copy_(torch::cat(launch_params.params.qgrad_tensors, 0).contiguous(), true);
@@ -602,7 +569,6 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     dv.copy_(dv_tmp, true);
 
     return { dq, dk, dv, softmax_d };
-    //return { dq_tmp.to(q_dtype), dk_tmp.to(q_dtype), dv_tmp.to(q_dtype), softmax_d };
 }
 
 
