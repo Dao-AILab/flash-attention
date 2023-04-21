@@ -112,7 +112,7 @@ def decode(input_ids, model, max_length, top_k=1, top_p=0.0, temperature=1.0,
                 torch.distributed.barrier()
             torch.cuda.synchronize()
             start = time.time()
-        logits = model(input_ids, inference_params=inference_params).logits[:, -1]
+        logits = model(input_ids, inference_params=inference_params, last_token_only=True).logits
         if vocab_size is not None:
             logits = logits[..., :vocab_size]
         scores.append(logits if not cg else logits.clone())
@@ -127,7 +127,7 @@ def decode(input_ids, model, max_length, top_k=1, top_p=0.0, temperature=1.0,
                                     dtype=torch.long, device=input_ids.device)
             if not cg:
                 logits = model(rearrange(next_token, 'b -> b 1'), position_ids=position_ids,
-                               inference_params=inference_params).logits[:, -1]
+                               inference_params=inference_params, last_token_only=True).logits
             else:
                 logits = model._decoding_cache.run(rearrange(next_token, 'b -> b 1'), position_ids,
                                                    inference_params.sequence_len_offset)
@@ -269,8 +269,8 @@ def capture_graph(model, inference_params, batch_size, max_seqlen, mempool=None,
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(n_warmups):
-            logits = model(input_ids, position_ids=position_ids,
-                           inference_params=inference_params).logits[:, -1]
+            logits = model(input_ids, position_ids=position_ids, inference_params=inference_params,
+                           last_token_only=True).logits
         s.synchronize()
         # This might be needed for correctness if we run with NCCL_GRAPH_MIXING_SUPPORT=0,
         # which requires that graph launch and non-captured launch to not overlap (I think,
@@ -282,8 +282,8 @@ def capture_graph(model, inference_params, batch_size, max_seqlen, mempool=None,
     # To allow capture, automatically sets a side stream as the current stream in the context
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, pool=mempool):
-        logits = model(input_ids, position_ids=position_ids,
-                        inference_params=inference_params).logits[:, -1]
+        logits = model(input_ids, position_ids=position_ids, inference_params=inference_params,
+                       last_token_only=True).logits
 
     def run(new_input_ids, new_position_ids, seqlen):
         inference_params.lengths_per_sample[:] = seqlen

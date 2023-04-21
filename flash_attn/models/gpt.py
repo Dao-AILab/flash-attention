@@ -426,20 +426,24 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         if self.process_group is not None:
             sync_shared_params(self, self.process_group)
 
-    def forward(self, input_ids, position_ids=None, inference_params=None):
+    def forward(self, input_ids, position_ids=None, inference_params=None, last_token_only=False):
         """
             inference_params: for generation. Adapted from Megatron-LM (and Apex)
             https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
+            last_token_only: whether to return the logit for the last token only,
+                of shape (batch_size, vocab_size)
         """
         hidden_states = self.transformer(input_ids, position_ids=position_ids,
                                          inference_params=inference_params)
+        if last_token_only:
+            hidden_states = hidden_states[:, -1]
         if self.project_out is not None:
             hidden_states = self.project_out(hidden_states)
         lm_logits = self.lm_head(hidden_states)
         # During inference, we want the full logit for sampling
         if isinstance(self.lm_head, ColumnParallelLinear) and inference_params is not None:
             lm_logits, _ = all_gather_raw(lm_logits, self.lm_head.process_group)
-            lm_logits = rearrange(lm_logits, '(n b) s d -> b s (n d)', b=hidden_states.shape[0])
+            lm_logits = rearrange(lm_logits, '(n b) ... d -> b ... (n d)', b=hidden_states.shape[0])
         CausalLMOutput = namedtuple('CausalLMOutput', ['logits'])
         return CausalLMOutput(logits=lm_logits)
 
