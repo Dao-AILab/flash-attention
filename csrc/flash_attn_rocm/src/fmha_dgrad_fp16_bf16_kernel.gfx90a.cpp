@@ -104,8 +104,8 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
   auto seed_   = std::get<0>(seeds);
   auto offset_ = std::get<1>(seeds);
 
-  std::cout << "bwd seed is " << seed_ ;
-  std::cout << " , bwd offset is " << offset_ << std::endl;
+  //std::cout << "bwd seed is " << seed_ ;
+  //std::cout << " , bwd offset is " << offset_ << std::endl;
 
   auto a_element_op = QKVElementOp{};
   auto b0_element_op = QKVElementOp{};
@@ -384,24 +384,24 @@ void run_fmha_dgrad_fp16_bf16_gfx90a(
   else{
     if (launch_params.params.is_causal) {
       if (launch_params.params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,1, 8, MaskingSpec_causal>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, F32, unsigned short,1, 4, MaskingSpec_causal>(
             launch_params);
       } else if (launch_params.params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,2, 8, MaskingSpec_causal>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, F32, unsigned short,2, 4, MaskingSpec_causal>(
             launch_params);
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,3, 8, MaskingSpec_causal>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, F32, unsigned short,3, 4, MaskingSpec_causal>(
             launch_params);
       }
     } else {
       if (launch_params.params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,1, 8, MaskingSpec_default>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, F32, unsigned short,1, 4, MaskingSpec_default>(
             launch_params);
       } else if (launch_params.params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,2, 8, MaskingSpec_default>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, F32, unsigned short,2, 4, MaskingSpec_default>(
             launch_params);
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, FP16, unsigned short,3, 8, MaskingSpec_default>(
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, F32, unsigned short,3, 4, MaskingSpec_default>(
             launch_params);
       }
     }

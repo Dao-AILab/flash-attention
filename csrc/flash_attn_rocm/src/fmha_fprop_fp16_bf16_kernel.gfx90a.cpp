@@ -191,8 +191,8 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
     auto seed_   = std::get<0>(seeds);
     auto offset_ = std::get<1>(seeds);
 
-    std::cout << "fwd seed is " << seed_ ;
-    std::cout << " , fwd offset is " << offset_ << std::endl;
+    //std::cout << "fwd seed is " << seed_ ;
+    //std::cout << " , fwd offset is " << offset_ << std::endl;
 
     for(size_t i = 0; i < batch_size ; i++){
         int M     = launch_params.params.host_seqlens_q[i + 1] - launch_params.params.host_seqlens_q[i]; //seqlen Q
