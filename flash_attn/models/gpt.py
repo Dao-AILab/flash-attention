@@ -335,6 +335,10 @@ class GPTModel(GPTPreTrainedModel):
         if self.process_group is not None:
             sync_shared_params(self, self.process_group)
 
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        return {i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+                for i, layer in enumerate(self.layers)}
+
     def forward(self, input_ids, position_ids=None, inference_params=None):
         # If using Tensor Parallel with sequence parallel, we combine the batch and the seqlen
         # dimensions so that we can split on it easily, in case of small batch size.
@@ -425,6 +429,10 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
             self.lm_head.weight = self.transformer.embeddings.word_embeddings.weight
         if self.process_group is not None:
             sync_shared_params(self, self.process_group)
+
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        return self.transformer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype,
+                                                         **kwargs)
 
     def forward(self, input_ids, position_ids=None, inference_params=None, last_token_only=False):
         """

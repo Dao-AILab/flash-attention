@@ -105,6 +105,9 @@ class Block(nn.Module):
                 for p in self.norm2.parameters():
                     p._shared_params = True
 
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+
     def forward(self, hidden_states: Tensor, residual: Optional[Tensor] = None,
                 mixer_subset=None, mixer_kwargs=None):
         r"""Pass the input through the encoder layer.

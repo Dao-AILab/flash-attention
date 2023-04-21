@@ -416,6 +416,22 @@ class MHA(nn.Module):
                                                      attention_dropout=dropout)
         self.out_proj = linear_cls(embed_dim, embed_dim, bias=out_proj_bias, **factory_kwargs)
 
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, fused_ft_kernel=True):
+        dtype = self.out_proj.weight.dtype if dtype is None else dtype
+        device = self.out_proj.weight.device
+        if not fused_ft_kernel:
+            return torch.empty(batch_size, max_seqlen, 2, self.num_heads, self.head_dim,
+                               dtype=dtype, device=device)
+        else:
+            assert dtype in [torch.float16, torch.bfloat16, torch.float32]
+            packsize = 4 if dtype == torch.float32 else 8
+            assert self.head_dim % packsize == 0
+            k_cache = torch.empty(batch_size, self.num_heads, self.head_dim // packsize, max_seqlen,
+                                  packsize, dtype=dtype, device=device)
+            v_cache = torch.empty(batch_size, self.num_heads, max_seqlen, self.head_dim,
+                                  dtype=dtype, device=device)
+            return k_cache, v_cache
+
     def _update_kv_cache(self, kv, inference_params):
         """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)
         """

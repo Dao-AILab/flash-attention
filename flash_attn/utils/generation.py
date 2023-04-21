@@ -167,8 +167,8 @@ class GenerationMixin:
         return output if return_dict_in_generate else output.sequences
 
 
-def allocate_kv_cache(max_batch_size, max_seqlen, nheads, headdim, layers: Union[int, Sequence],
-                      device, dtype=torch.float16):
+def allocate_inference_cache(max_batch_size, max_seqlen, nheads, headdim, layers: Union[int, Sequence],
+                             device, dtype=torch.float16):
     assert dtype in [torch.float16, torch.bfloat16, torch.float32]
     packsize = 4 if dtype == torch.float32 else 8
     assert headdim % packsize == 0
@@ -226,14 +226,17 @@ def update_graph_cache(model, cache, batch_size, seqlen_og, max_seqlen, tensor_p
         cache.max_batch_size, cache.max_seqlen = batch_size, max_seqlen
         headdim = getattr(model.config, 'head_dim',
                           model.config.hidden_size // model.config.num_attention_heads)
-        kv_cache = allocate_kv_cache(
-            batch_size, max_seqlen, model.config.num_attention_heads // tensor_parallel, headdim,
-            model.config.num_hidden_layers, device, dtype
-        )
+        if hasattr(model, 'allocate_inference_cache'):
+            inf_cache = model.allocate_inference_cache(batch_size, max_seqlen, dtype)
+        else:
+            inf_cache = allocate_inference_cache(
+                batch_size, max_seqlen, model.config.num_attention_heads // tensor_parallel, headdim,
+                model.config.num_hidden_layers, device, dtype
+            )
         lengths_per_sample = torch.full((batch_size,), seqlen_og, dtype=torch.int32, device=device)
         cache.inference_params = InferenceParams(
             max_sequence_len=max_seqlen, max_batch_size=batch_size,
-            sequence_len_offset=seqlen_og, key_value_memory_dict=kv_cache, fused_ft_kernel=True,
+            sequence_len_offset=seqlen_og, key_value_memory_dict=inf_cache, fused_ft_kernel=True,
             lengths_per_sample=lengths_per_sample
         )
         cache.mempool = torch.cuda.graphs.graph_pool_handle()
