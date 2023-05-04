@@ -61,7 +61,7 @@ void set_params_fprop(FMHA_fprop_params &params,
     Data_type data_type = !(q.dtype() == torch::kBFloat16) ? DATA_TYPE_FP16 : DATA_TYPE_BF16;
 
     // Reset the parameters
-    memset(&params, 0, sizeof(params));
+    params = {0};
 
     params.is_bf16 = q.dtype() == torch::kBFloat16;
 
