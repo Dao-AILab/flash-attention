@@ -166,8 +166,8 @@ struct BwdParams : public ParamsBase {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-using FwdFunction = std::function<void(LaunchParams<FwdParams>&, const bool)>;
-using BwdFunction = std::function<void(LaunchParams<BwdParams>&, const bool)>;
+typedef void(*FwdFunction)(LaunchParams<FwdParams>&, const bool);
+typedef void(*BwdFunction)(LaunchParams<BwdParams>&, const bool);
 using FunctionKey = uint64_t;
 using FwdRegistry = std::unordered_map<FunctionKey, FwdFunction>;
 using BwdRegistry = std::unordered_map<FunctionKey, BwdFunction>;
