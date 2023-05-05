@@ -176,13 +176,13 @@ def test_llama_parallel(model_name, world_size):
     print(f'Output mean diff: {(out - out_ref).abs().mean().item()}')
     print(f'HF fp16 max diff: {(out_hf - out_ref).abs().max().item()}')
     print(f'HF fp16 mean diff: {(out_hf - out_ref).abs().mean().item()}')
-    assert (out - out_ref).abs().max().item() < 3 * (out_hf - out_ref).abs().max().item()
+    assert (out - out_ref).abs().max().item() < 2 * (out_hf - out_ref).abs().max().item()
 
     print(f'Logits max diff: {(logits - logits_ref).abs().max().item()}')
     print(f'Logits mean diff: {(logits - logits_ref).abs().mean().item()}')
     print(f'HF fp16 max diff: {(logits_hf - logits_ref).abs().max().item()}')
     print(f'HF fp16 mean diff: {(logits_hf - logits_ref).abs().mean().item()}')
-    assert (logits - logits_ref).abs().max().item() < 3 * (logits_hf - logits_ref).abs().max().item()
+    assert (logits - logits_ref).abs().max().item() < 2 * (logits_hf - logits_ref).abs().max().item()
 
 
 @pytest.mark.parametrize('model_name', ["7B"])
@@ -267,11 +267,10 @@ def test_llama_generation(model_name):
     del model
 
     hf_error = (logits_hf - logits_ref).abs().max().item()
-    # For some reason logits_parallel is off by quite a bit more than 2x
-    assert (logits_parallel - logits_ref).abs().max().item() < 8 * hf_error
+    assert (logits_parallel - logits_ref).abs().max().item() < 2 * hf_error
 
     print(f'HF fp16 logits max diff: {hf_error}')
-    print(f'Logits max diff: {(logits - logits_parallel).abs().max().item() }')
-    assert (logits - logits_parallel).abs().max().item() < 2 * hf_error
-    print(f'Logits CG max diff: {(logits_cg - logits_parallel).abs().max().item() }')
+    print(f'Logits max diff: {(logits - logits_ref).abs().max().item() }')
+    assert (logits - logits_ref).abs().max().item() < 2 * hf_error
+    print(f'Logits CG max diff: {(logits_cg - logits_ref).abs().max().item() }')
     assert torch.equal(logits_cg, logits)

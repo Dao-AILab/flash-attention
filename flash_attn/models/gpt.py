@@ -377,13 +377,18 @@ class GPTModel(GPTPreTrainedModel):
             else:
                 # Set prenorm=False here since we don't need the residual
                 if not self.parallel_block:
-                    hidden_states = dropout_add_layer_norm(
+                    fused_add_norm_fn = (dropout_add_rms_norm if isinstance(self.ln_f, RMSNorm)
+                                         else dropout_add_layer_norm)
+                    hidden_states = fused_add_norm_fn(
                         hidden_states, residual, self.ln_f.weight, self.ln_f.bias,
                         self.drop_f.p if self.training else 0.0, self.ln_f.eps, prenorm=False,
                         residual_in_fp32=self.residual_in_fp32
                     )
                 else:
-                    hidden_states, _ = dropout_add_layer_norm_parallel_residual(
+                    fused_add_norm_fn = (dropout_add_rms_norm_parallel_residual
+                                         if isinstance(self.ln_f, RMSNorm)
+                                         else dropout_add_layer_norm_parallel_residual)
+                    hidden_states, _ = fused_add_norm_fn(
                         hidden_states, hidden_states2, residual, self.ln_f.weight, self.ln_f.bias,
                         None, None, self.drop_f.p if self.training else 0.0, self.ln_f.eps,
                         prenorm=False, residual_in_fp32=self.residual_in_fp32
