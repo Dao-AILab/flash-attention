@@ -162,7 +162,7 @@ ext_modules.append(
 
 setup(
     name="flash_attn",
-    version="1.0.4",
+    version="1.0.5",
     packages=find_packages(
         exclude=("build", "csrc", "include", "tests", "dist", "docs", "benchmarks", "flash_attn.egg-info",)
     ),
@@ -184,5 +184,6 @@ setup(
         "torch",
         "einops",
         "packaging",
+        "ninja",
     ],
 )
