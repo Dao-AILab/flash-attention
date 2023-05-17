@@ -37,6 +37,10 @@ As Triton is a higher-level language than CUDA, it might be easier to understand
 and experiment with. The notations in the Triton implementation are also closer
 to what's used in our paper.
 
+We also have an experimental implementation in Triton that support attention
+bias (e.g. ALiBi):
+https://github.com/HazyResearch/flash-attention/blob/main/flash_attn/flash_attn_triton.py
+
 
 ## Installation and features
 
@@ -76,10 +80,6 @@ Our tentative roadmap:
 6. ~~[Jul 2022] Support head dimension 128~~[Done].
 7. ~~[Aug 2022] Fuse rotary embedding~~[Done].
 8. ~~[Mar 2023] Support SM90 GPUs (H100)~~[Done].
-9. [Apr 2023] Refactor to use Cutlass 3.x.
-10. [May 2023] Support attention bias (e.g. ALiBi, relative positional encoding).
-11. [Jun 2023] Support SM70 GPUs (V100).
-12. [Jun 2023] Support fp8 (H100).
 
 
 ## How to use FlashAttention
