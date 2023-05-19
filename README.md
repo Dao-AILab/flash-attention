@@ -48,6 +48,10 @@ Requirements:
 - CUDA 11.4 and above.
 - PyTorch 1.12 and above.
 
+We recommend the
+[Pytorch](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch)
+container from Nvidia, which has all the required tools to install FlashAttention.
+
 To install:
 ```sh
 pip install flash-attn
