@@ -39,6 +39,13 @@ namespace fmha {
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Return_softmax, bool Is_first, bool Is_last, typename Params, typename Prng>
 inline __device__ void device_block_1xN_(const Params &params, const int bidb, const int bidh, int steps, Prng &ph0, Prng &ph1, const int loop_step_idx) {
 
+#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
+    using elem_type = typename Kernel_traits::elem_type;
+#else
+    constexpr bool is_fp16_type = std::is_same<typename Kernel_traits::elem_type, __half>::value;
+    assert(is_fp16_type);
+    using elem_type = __half;
+#endif
 
     // The description of the CTA tile for the 1st batched GEMM.
     using Cta_tile_p = typename Kernel_traits::Cta_tile_p;
@@ -73,7 +80,7 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
 
     using Smem_softmax_sum = typename Kernel_traits::Smem_dp_sum;
 
-    using Gemm1 = Gemm_Q_K<Kernel_traits, Kernel_traits::K_IN_REGS>;
+    using Gemm1 = Gemm_Q_K<Kernel_traits, Kernel_traits::K_IN_REGS, elem_type>;
 
     using Softmax = fmha::Softmax<Cta_tile_p, Kernel_traits>;
 
@@ -340,7 +347,7 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
         Frag_p frag_p[Mma_tile_o::MMAS_K][Mma_tile_o::MMAS_M];
         static_assert(Mma_tile_o::MMAS_M == Mma_tile_p::MMAS_M);
         static_assert(Mma_tile_o::MMAS_K == Mma_tile_p::MMAS_N);
-        softmax.template pack<__half>(frag_p);
+        softmax.template pack<elem_type>(frag_p);
         if (Return_softmax) {
             gmem_s.store(frag_p, mask);
             if (not_last_iter) {
@@ -358,7 +365,7 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
             for( int ki = 0; ki < Mma_tile_o::MMAS_K; ki++ ) {
                 #pragma unroll
                 for( int mi = 0; mi < Mma_tile_o::MMAS_M; mi++ ) {
-                    frag_p[ki][mi].template hrelu_<__half>();
+                    frag_p[ki][mi].template hrelu_<elem_type>();
                 }
             }
         }
@@ -370,7 +377,7 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
         // Do this part of O = P^T * V^T.
         #pragma unroll
         for( int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki ) {
-            fmha::gemm_cl<__half>(acc_o, frag_p[ki], frag_v[ki]);
+            fmha::gemm_cl<elem_type>(acc_o, frag_p[ki], frag_v[ki]);
         }
 
         // The mapping from tidx to rows changes between the softmax and the O-reduction.
@@ -471,7 +478,7 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
 
         // Output the values.
         if (is_final_write) {
-            gmem_o.template store<__half>(out, 0);
+            gmem_o.template store<elem_type>(out, 0);
         } else {
             gmem_o_tmp.store(out, 0);
         }

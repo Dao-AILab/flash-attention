@@ -622,7 +622,7 @@ mha_fwd_block(const at::Tensor &q,         // total_q x num_heads x head_size, t
                      /*num_splits=*/1);
     launch_params.params.blockmask = static_cast<int *>(blockmask.data_ptr());
 
-    run_fmha_block_fp16_sm80(launch_params, /*configure=*/ true);
+    run_fmha_block_sm80(launch_params, /*configure=*/ true);
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
     int64_t counter_offset = launch_params.elts_per_thread;
@@ -633,7 +633,7 @@ mha_fwd_block(const at::Tensor &q,         // total_q x num_heads x head_size, t
         launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
     }
 
-    run_fmha_block_fp16_sm80(launch_params, /*configure=*/false);
+    run_fmha_block_sm80(launch_params, /*configure=*/false);
 
     std::vector<at::Tensor> result = {o, softmax_lse};
     if (return_softmax) {result.push_back(s);}
@@ -665,7 +665,7 @@ mha_bwd_block(const at::Tensor &dout,  // total x num_heads, x head_size
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
     TORCH_CHECK(is_sm8x || is_sm90);
-    auto launch = &run_fmha_block_dgrad_fp16_sm80;
+    auto launch = &run_fmha_block_dgrad_sm80;
 
     bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
