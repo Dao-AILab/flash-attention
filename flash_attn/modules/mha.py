@@ -350,9 +350,9 @@ class MHA(nn.Module):
     def __init__(self, embed_dim, num_heads, cross_attn=False,
                  qkv_proj_bias=True, out_proj_bias=True,
                  dropout=0.0, softmax_scale=None, causal=False, layer_idx=None, dwconv=False,
-                 rotary_emb_dim=0, rotary_emb_scale_base=None, rotary_emb_interleaved=False,
-                 fused_bias_fc=False, use_flash_attn=False, return_residual=False,
-                 checkpointing=False, device=None, dtype=None) -> None:
+                 rotary_emb_dim=0, rotary_emb_base=10000.0, rotary_emb_scale_base=None,
+                 rotary_emb_interleaved=False, fused_bias_fc=False, use_flash_attn=False,
+                 return_residual=False, checkpointing=False, device=None, dtype=None) -> None:
         """
             return_residual: whether to return the input x along with the output. This is for
                 performance reason: for post-norm architecture, returning the input allows us
@@ -377,7 +377,8 @@ class MHA(nn.Module):
         if self.rotary_emb_dim > 0:
             assert not cross_attn, 'MHA with rotary embedding does not support cross-attention yet'
             assert RotaryEmbedding is not None, 'rotary_emb is not installed'
-            self.rotary_emb = RotaryEmbedding(self.rotary_emb_dim, scale_base=rotary_emb_scale_base,
+            self.rotary_emb = RotaryEmbedding(self.rotary_emb_dim, base=rotary_emb_base,
+                                              scale_base=rotary_emb_scale_base,
                                               interleaved=rotary_emb_interleaved, device=device)
 
         if fused_bias_fc and FusedDense is None:
@@ -511,11 +512,12 @@ class MHA(nn.Module):
                     k_cache, v_cache = inference_params.key_value_memory_dict[self.layer_idx]
                     lengths_per_sample = (inference_params.lengths_per_sample[batch_start:batch_end]
                                           if inference_params.lengths_per_sample is not None else None)
+                    rotary_emb_base = self.rotary_emb.base if self.rotary_emb_dim > 0 else 0
                     context = ft_attention.single_query_attention(
                         *rearrange(qkv, 'b 1 three h d -> b three h d').unbind(dim=1),
                         k_cache[batch_start:batch_end], v_cache[batch_start:batch_end],
                         lengths_per_sample, inference_params.sequence_len_offset,
-                        self.rotary_emb_dim,
+                        self.rotary_emb_dim, rotary_emb_base,
                         # neox_rotary_style
                         (not self.rotary_emb.interleaved) if self.rotary_emb_dim > 0 else True
                     )
@@ -555,8 +557,8 @@ class ParallelMHA(nn.Module):
 
     def __init__(self, embed_dim, num_heads, process_group, qkv_proj_bias=True, out_proj_bias=True,
                  dropout=0.0, softmax_scale=None, causal=False, layer_idx=None,
-                 rotary_emb_dim=0, rotary_emb_scale_base=None, rotary_emb_interleaved=False,
-                 use_flash_attn=False, checkpointing=False,
+                 rotary_emb_dim=0, rotary_emb_base=10000.0, rotary_emb_scale_base=None,
+                 rotary_emb_interleaved=False, use_flash_attn=False, checkpointing=False,
                  sequence_parallel=True, device=None, dtype=None) -> None:
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
@@ -573,7 +575,8 @@ class ParallelMHA(nn.Module):
 
         if self.rotary_emb_dim > 0:
             assert RotaryEmbedding is not None, 'rotary_emb is not installed'
-            self.rotary_emb = RotaryEmbedding(self.rotary_emb_dim, scale_base=rotary_emb_scale_base,
+            self.rotary_emb = RotaryEmbedding(self.rotary_emb_dim, base=rotary_emb_base,
+                                              scale_base=rotary_emb_scale_base,
                                               interleaved=rotary_emb_interleaved, device=device)
 
         if ColumnParallelLinear is None or RowParallelLinear is None:
@@ -631,11 +634,12 @@ class ParallelMHA(nn.Module):
                 k_cache, v_cache = inference_params.key_value_memory_dict[self.layer_idx]
                 lengths_per_sample = (inference_params.lengths_per_sample[batch_start:batch_end]
                                       if inference_params.lengths_per_sample is not None else None)
+                rotary_emb_base = self.rotary_emb.base if self.rotary_emb_dim > 0 else 0
                 context = ft_attention.single_query_attention(
                     *rearrange(qkv, 'b 1 three h d -> b three h d').unbind(dim=1),
                     k_cache[batch_start:batch_end], v_cache[batch_start:batch_end],
                     lengths_per_sample, inference_params.sequence_len_offset,
-                    self.rotary_emb_dim, inference_params.sequence_len_offset,
+                    self.rotary_emb_dim, rotary_emb_base,
                     # neox_rotary_style
                     (not self.rotary_emb.interleaved) if self.rotary_emb_dim > 0 else True
                 )

@@ -84,6 +84,7 @@ struct Multihead_attention_params_base {
     // The per-head latent space reserved for rotary embeddings.
     int  rotary_embedding_dim = 0;
     bool neox_rotary_style    = false;
+    float rotary_base = 0.0f;
     // The maximum length of input sentences.
     int max_input_length = 0;
     // The current timestep. TODO(bhsueh) Check that do we only this param in cross attention?

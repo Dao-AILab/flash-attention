@@ -36,7 +36,8 @@ def test_greedy_decode_gpt2(model_name, rotary, optimized, fused_ft_kernel):
     config = GPT2Config.from_pretrained(model_name)
     if rotary:
         config.n_positions = 0
-        config.rotary_emb_dim = 64
+        config.rotary_emb_fraction = 0.5
+        config.rotary_emb_base = 24000
     config.residual_in_fp32 = True
     if optimized:
         config.use_flash_attn = True

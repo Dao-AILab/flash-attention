@@ -75,6 +75,7 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
     qkv_proj_bias = getattr(config, 'qkv_proj_bias', True)
     out_proj_bias = getattr(config, 'out_proj_bias', True)
     rotary_emb_dim = int(getattr(config, 'rotary_emb_fraction', 0.0) * head_dim)
+    rotary_emb_base = getattr(config, 'rotary_emb_base', 10000.0)
     rotary_emb_scale_base = getattr(config, 'rotary_emb_scale_base', None)
     rotary_emb_interleaved = getattr(config, 'rotary_emb_interleaved', False)
     use_flash_attn = getattr(config, 'use_flash_attn', False)
@@ -91,7 +92,8 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
                         qkv_proj_bias=qkv_proj_bias, out_proj_bias=out_proj_bias,
                         dropout=config.attn_pdrop,
                         softmax_scale=softmax_scale, causal=True, layer_idx=layer_idx,
-                        rotary_emb_dim=rotary_emb_dim, rotary_emb_scale_base=rotary_emb_scale_base,
+                        rotary_emb_dim=rotary_emb_dim, rotary_emb_base=rotary_emb_base,
+                        rotary_emb_scale_base=rotary_emb_scale_base,
                         rotary_emb_interleaved=rotary_emb_interleaved,
                         use_flash_attn=use_flash_attn,
                         **serial_kwargs, **parallel_kwargs, **factory_kwargs)

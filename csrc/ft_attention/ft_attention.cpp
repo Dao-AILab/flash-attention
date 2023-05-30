@@ -54,6 +54,7 @@ void set_params(Masked_multihead_attention_params<T> &params,
                 const size_t headdim,
                 const int timestep,
                 const int rotary_embedding_dim,
+                const float rotary_base,
                 const bool neox_rotary_style,
                 const int qkv_batch_stride,
                 T *q_ptr,
@@ -82,6 +83,7 @@ void set_params(Masked_multihead_attention_params<T> &params,
     params.num_heads = nheads;
     params.hidden_size_per_head = headdim;
     params.rotary_embedding_dim = rotary_embedding_dim;
+    params.rotary_base = rotary_base;
     params.neox_rotary_style = neox_rotary_style;
     params.timestep = timestep;
     params.inv_sqrt_dh = 1.f / sqrt(float(headdim));
@@ -107,6 +109,7 @@ torch::Tensor single_query_attention(const torch::Tensor q,
                                      c10::optional<const torch::Tensor> length_per_sample_,
                                      const int timestep,
                                      const int rotary_embedding_dim = 0,
+                                     const float rotary_base = 10000.0f,
                                      const bool neox_rotary_style=true) {
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v); CHECK_DEVICE(k_cache); CHECK_DEVICE(v_cache);
     int batch_size = v_cache.size(0);
@@ -144,7 +147,7 @@ torch::Tensor single_query_attention(const torch::Tensor q,
         using DataType = typename SATypeConverter<scalar_t>::Type;
         Masked_multihead_attention_params<DataType> params;
         set_params(params, batch_size, nheads, memory_max_seqlen, headdim, timestep,
-                   rotary_embedding_dim, neox_rotary_style, q.stride(0),
+                   rotary_embedding_dim, rotary_base, neox_rotary_style, q.stride(0),
                    reinterpret_cast<DataType*>(q.data_ptr()),
                    reinterpret_cast<DataType*>(k.data_ptr()),
                    reinterpret_cast<DataType*>(v.data_ptr()),
@@ -163,5 +166,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("single_query_attention", &single_query_attention, "Attention with a single query",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("k_cache"), py::arg("v_cache"),
           py::arg("length_per_sample_"), py::arg("timestep"), py::arg("rotary_embedding_dim")=0,
-          py::arg("neox_rotary_style")=true);
+          py::arg("rotary_base")=10000.0f, py::arg("neox_rotary_style")=true);
 }

@@ -169,12 +169,13 @@ class RotaryEmbedding(torch.nn.Module):
     Reference: https://github.com/sunyt32/torchscale/blob/main/torchscale/component/xpos_relative_position.py
     """
 
-    def __init__(self, dim: int, base=10000, interleaved=False, scale_base=None, device=None):
+    def __init__(self, dim: int, base=10000.0, interleaved=False, scale_base=None, device=None):
         """
             interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead
                 of 1st half and 2nd half (GPT-NeoX style).
         """
         super().__init__()
+        self.base = float(base)
         # Generate and save the inverse frequency buffer (non trainable)
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device,
                                                 dtype=torch.float32) / dim))
