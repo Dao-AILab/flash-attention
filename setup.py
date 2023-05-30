@@ -10,6 +10,7 @@ from packaging.version import parse, Version
 from setuptools import setup, find_packages
 import subprocess
 
+import urllib
 import torch
 from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
 
@@ -20,6 +21,50 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
+
+
+def get_platform():
+    """
+    Returns the platform string.
+    """
+    if sys.platform.startswith('linux'):
+        return 'linux_x86_64'
+    elif sys.platform == 'darwin':
+        return 'macosx_10_9_x86_64'
+    elif sys.platform == 'win32':
+        return 'win_amd64'
+    else:
+        raise ValueError('Unsupported platform: {}'.format(sys.platform))
+
+from setuptools.command.install import install
+
+# @pierce - TODO: Remove for proper release
+BASE_WHEEL_URL = "https://github.com/piercefreeman/flash-attention/releases/download/{tag_name}/{wheel_name}"
+
+class CustomInstallCommand(install):
+    def run(self):
+        # Determine the version numbers that will be used to determine the correct wheel
+        _, cuda_version = get_cuda_bare_metal_version()
+        torch_version = torch.__version__
+        python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
+        platform_name = get_platform()
+        flash_version = get_package_version()
+
+        # Determine wheel URL based on CUDA version, torch version, python version and OS
+        wheel_filename = f'flash_attn-{flash_version}+cu{cuda_version}torch{torch_version}-{python_version}-{python_version}-{platform_name}.whl'
+        wheel_url = BASE_WHEEL_URL.format(
+            tag_name=f"v{flash_version}",
+            wheel_name=wheel_filename
+        )
+        
+        try:
+            urllib.request.urlretrieve(wheel_url, wheel_filename)
+            os.system(f'pip install {wheel_filename}')
+            os.remove(wheel_filename)
+        except urllib.error.HTTPError:
+            print("Precompiled wheel not found. Building from source...")
+            # If the wheel could not be downloaded, build from source
+            install.run(self)
 
 
 def get_cuda_bare_metal_version(cuda_dir):
@@ -190,7 +235,12 @@ setup(
         "Operating System :: Unix",
     ],
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension} if ext_modules else {},
+    cmdclass={
+        'install': CustomInstallCommand,
+        "build_ext": BuildExtension
+    } if ext_modules else {
+        'install': CustomInstallCommand,
+    },
     python_requires=">=3.7",
     install_requires=[
         "torch",

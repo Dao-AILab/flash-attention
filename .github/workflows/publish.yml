@@ -10,7 +10,7 @@ on:
       - '**'
 
 jobs:
-  release:
+  setup_release:
     name: Create Release
     runs-on: ubuntu-latest
     steps:
@@ -27,23 +27,27 @@ jobs:
         with:
           tag_name: ${{ steps.extract_branch.outputs.branch }}
           release_name: ${{ steps.extract_branch.outputs.branch }}
-      
-  wheel:
+
+  build_wheels:
     name: Build Wheel
     runs-on: ${{ matrix.os }}
-    needs: release
-    
+    needs: setup_release
+
     strategy:
       fail-fast: false
       matrix:
-          # os: [ubuntu-20.04]
-          os: [ubuntu-18.04]
-          python-version: ['3.7', '3.8', '3.9', '3.10']
-          torch-version: [1.11.0, 1.12.0, 1.12.1]
-          cuda-version: ['113', '116']
-          exclude:
-            - torch-version: 1.11.0
-              cuda-version: '116'
+          # TODO: @pierce - again, simplify for prototyping
+          os: [ubuntu-20.04]
+          #os: [ubuntu-20.04, ubuntu-22.04]
+          # python-version: ['3.7', '3.8', '3.9', '3.10']
+          python-version: ['3.10']
+          #torch-version: [1.11.0, 1.12.0, 1.12.1]
+          torch-version: [1.12.1]
+          #cuda-version: ['113', '116']
+          cuda-version: ['113']
+          #exclude:
+          #  - torch-version: 1.11.0
+          #    cuda-version: '116'
 
     steps:
       - name: Checkout
@@ -108,13 +112,13 @@ jobs:
           export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
           export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
           export CUDA_INSTALL_DIR=/usr/local/cuda-11.3$CUDA_INSTALL_DIR
-          pip install wheel
+          pip install ninja packaging setuptools wheel
           python setup.py bdist_wheel --dist-dir=dist
           tmpname=cu${{ matrix.cuda-version }}torch${{ matrix.torch-version }}
           wheel_name=$(ls dist/*whl | xargs -n 1 basename | sed "s/-/+$tmpname-/2")
-          ls dist/*whl |xargs -I {} mv {} ${wheel_name}
+          ls dist/*whl |xargs -I {} mv {} dist/${wheel_name}
           echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
-      
+
       - name: Upload Release Asset
         id: upload_release_asset 
         uses: actions/upload-release-asset@v1
@@ -125,3 +129,36 @@ jobs:
           asset_path: ./${{env.wheel_name}}
           asset_name: ${{env.wheel_name}}
           asset_content_type: application/*
+
+  publish_package:
+    name: Publish package
+    needs: [build_wheels]
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: List contents
+        run: |
+          ls -la dist
+          ls -la dist/*
+
+      - name: Install dependencies
+        run: |
+          pip install ninja packaging setuptools wheel twine
+
+      - name: Build core package
+        run: |
+          python setup.py sdist --dist-dir=dist
+
+      - name: Deploy
+        env:
+          TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          python -m twine upload dist/*
