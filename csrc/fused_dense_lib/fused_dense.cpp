@@ -2,6 +2,7 @@
 // We make it work for bfloat16
 #include <torch/extension.h>
 #include <torch/torch.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <vector>
 
@@ -28,13 +29,13 @@
   }
 
 template <typename T>
-int linear_bias_wgrad_cuda(const T *input, const T *d_output, int64_t in_features, int64_t batch_size, int64_t out_features, T *d_weight, T *d_bias);
+int linear_bias_wgrad_cuda(const T *input, const T *d_output, int64_t in_features, int64_t batch_size, int64_t out_features, T *d_weight, T *d_bias, void *lt_workspace, size_t workspaceSize);
 
 template <typename T>
-int linear_act_forward_cuda(const T *input, const T *weight, const T *bias, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, T *output, void *pre_act);
+int linear_act_forward_cuda(const T *input, const T *weight, const T *bias, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, T *output, void *pre_act, void *lt_workspace, size_t workspaceSize);
 
 template <typename T>
-int bias_act_linear_dgrad_bgrad_cuda(const T *weight, const T *d_output, const void *pre_act, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, T *d_input, T *d_bias);
+int bias_act_linear_dgrad_bgrad_cuda(const T *weight, const T *d_output, const void *pre_act, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, T *d_input, T *d_bias, void *lt_workspace, size_t workspaceSize);
 
 std::vector<at::Tensor> linear_bias_wgrad(at::Tensor input, at::Tensor d_output, bool has_d_bias) {
 
@@ -66,6 +67,11 @@ std::vector<at::Tensor> linear_bias_wgrad(at::Tensor input, at::Tensor d_output,
     d_bias = at::empty({out_features}, opts);
 #endif
   }
+  // See https://github.com/pytorch/pytorch/issues/73328 for reasoning behind setting this to 1M.
+  // However, Apex sets it to 4M and TransformerEngine sets to 32M for Hopper and 4M for other GPUs
+  // https://github.com/NVIDIA/TransformerEngine/blob/a0f0065498bbcfc1da78cf9e8b166f5381613fbc/transformer_engine/pytorch/module.py#L91
+  size_t workspaceSize = 1024 * 1024 * (at::cuda::getCurrentDeviceProperties()->major >= 9 ? 32 : 4);
+  auto lt_workspace = at::empty({static_cast<int64_t>(workspaceSize)}, opts.dtype(torch::kUInt8));
 
   DISPATCH_HALF_AND_BF16(input.scalar_type(), "linear_bias_wgrad", [&] {
     auto result = linear_bias_wgrad_cuda<scalar_t>(
@@ -75,7 +81,9 @@ std::vector<at::Tensor> linear_bias_wgrad(at::Tensor input, at::Tensor d_output,
         batch_size,
         out_features,
         d_weight.data_ptr<scalar_t>(),
-        has_d_bias ? d_bias.data_ptr<scalar_t>() : nullptr);
+        has_d_bias ? d_bias.data_ptr<scalar_t>() : nullptr,
+        (void*) (lt_workspace.data_ptr()),
+        workspaceSize);
     TORCH_CHECK(result == 0, "linear_bias_wgrad failed.");
   });
 
@@ -117,6 +125,11 @@ std::vector<at::Tensor> linear_act_forward(at::Tensor input, at::Tensor weight,
   // If ReLU, cuBlasLT stores a bit-mask (1 bit per element)
   if (save_pre_act) { pre_act = at::empty({batch_size, is_gelu ? out_features : out_features / 8},
                                           is_gelu ? opts : opts.dtype(torch::kUInt8)); }
+  // See https://github.com/pytorch/pytorch/issues/73328 for reasoning behind setting this to 1M.
+  // However, Apex sets it to 4M and TransformerEngine sets to 32M for Hopper and 4M for other GPUs
+  // https://github.com/NVIDIA/TransformerEngine/blob/a0f0065498bbcfc1da78cf9e8b166f5381613fbc/transformer_engine/pytorch/module.py#L91
+  size_t workspaceSize = 1024 * 1024 * (at::cuda::getCurrentDeviceProperties()->major >= 9 ? 32 : 4);
+  auto lt_workspace = at::empty({static_cast<int64_t>(workspaceSize)}, opts.dtype(torch::kUInt8));
 
   DISPATCH_HALF_AND_BF16(input.scalar_type(), "linear_act_forward", [&] {
     auto result = linear_act_forward_cuda<scalar_t>(
@@ -129,7 +142,9 @@ std::vector<at::Tensor> linear_act_forward(at::Tensor input, at::Tensor weight,
         is_gelu,
         heuristic,
         output.data_ptr<scalar_t>(),
-        save_pre_act ? pre_act.data_ptr() : nullptr);
+        save_pre_act ? pre_act.data_ptr() : nullptr,
+        (void*) (lt_workspace.data_ptr()),
+        workspaceSize);
     TORCH_CHECK(result == 0, "linear_act_forward failed.");
   });
 
@@ -168,6 +183,11 @@ std::vector<at::Tensor> bias_act_linear_dgrad_bgrad(
   auto opts = weight.options();
   auto d_bias = at::empty({in_features}, opts);
   auto d_input = at::empty({batch_size, in_features}, opts);
+  // See https://github.com/pytorch/pytorch/issues/73328 for reasoning behind setting this to 1M.
+  // However, Apex sets it to 4M and TransformerEngine sets to 32M for Hopper and 4M for other GPUs
+  // https://github.com/NVIDIA/TransformerEngine/blob/a0f0065498bbcfc1da78cf9e8b166f5381613fbc/transformer_engine/pytorch/module.py#L91
+  size_t workspaceSize = 1024 * 1024 * (at::cuda::getCurrentDeviceProperties()->major >= 9 ? 32 : 4);
+  auto lt_workspace = at::empty({static_cast<int64_t>(workspaceSize)}, opts.dtype(torch::kUInt8));
 
   DISPATCH_HALF_AND_BF16(weight.scalar_type(), "bias_act_linear_dgrad_bgrad", [&] {
     auto result = bias_act_linear_dgrad_bgrad_cuda<scalar_t>(
@@ -180,7 +200,9 @@ std::vector<at::Tensor> bias_act_linear_dgrad_bgrad(
         is_gelu,
         heuristic,
         d_input.data_ptr<scalar_t>(),
-        d_bias.data_ptr<scalar_t>());
+        d_bias.data_ptr<scalar_t>(),
+        (void*) (lt_workspace.data_ptr()),
+        workspaceSize);
     TORCH_CHECK(result == 0, "bias_act_linear_dgrad_bgrad failed.");
   });
 
