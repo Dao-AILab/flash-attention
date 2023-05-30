@@ -25,7 +25,7 @@ constexpr int D_DIM = 2;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct Qkv_params {
+struct QkvParams {
     // The QKV matrices.
     std::vector<const void*> q_ptr; //changed to ck input type
     std::vector<const void*> k_ptr;
@@ -53,7 +53,7 @@ struct Qkv_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct FMHA_fprop_params : public Qkv_params {
+struct FmhaFpropParams : public QkvParams {
 
     // The O matrix (output).
     // void * __restrict__ o_ptr;
@@ -119,7 +119,7 @@ struct FMHA_fprop_params : public Qkv_params {
     int num_splits; // How many SMs per attention matrix.
 };
 
-struct FMHA_dgrad_params : public Qkv_params {
+struct FmhaDgradParams : public FmhaFpropParams {
 
     // The O matrix (output).
     std::vector<const void*> y_ptr;
@@ -162,9 +162,6 @@ struct FMHA_dgrad_params : public Qkv_params {
     // Random state.
     at::PhiloxCudaState philox_args;
 
-    bool is_bf16;
-    bool is_causal;
-
     std::vector<int> host_seqlens_q;
     std::vector<int> host_seqlens_k;
 
@@ -172,12 +169,12 @@ struct FMHA_dgrad_params : public Qkv_params {
 };
 
 
-template<typename Kernel_params>
-struct Launch_params{
-    Launch_params(hipDeviceProp_t * props_,
-                  hipStream_t stream_,
-                  bool is_dropout_,
-                  bool return_softmax_)
+template<typename KernelParams>
+struct LaunchParams{
+    LaunchParams(hipDeviceProp_t * props_,
+                    hipStream_t stream_,
+                    bool is_dropout_,
+                    bool return_softmax_)
         : elts_per_thread(0)
         , props(props_)
         , stream(stream_)
@@ -194,7 +191,7 @@ struct Launch_params{
     bool is_dropout;
     bool return_softmax;
 
-    Kernel_params params;
+    KernelParams params;
     int num_full_heads;
     int num_main_groups;
     int heads_last_wave;
@@ -204,10 +201,10 @@ struct Launch_params{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params);
+void run_fmha_fp16_bf16_gfx90a(LaunchParams<FmhaFpropParams> &launch_params);
 
-void run_fmha_dgrad_fp16_bf16_gfx90a(Launch_params<FMHA_dgrad_params> &launch_params);
+void run_fmha_dgrad_fp16_bf16_gfx90a(FmhaDgradParams &params);
 
-//void run_fmha_block_fp16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
+//void run_fmha_block_fp16_gfx90a(Launch_params<FMHAfprop_params> &launch_params, const bool configure);
 
 //void run_fmha_block_dgrad_fp16_gfx90a(const FMHA_dgrad_params &params, hipStream_t stream);

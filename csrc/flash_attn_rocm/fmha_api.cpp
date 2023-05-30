@@ -11,7 +11,7 @@
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 
 
-void set_params_fprop(FMHA_fprop_params &params,
+void set_params_fprop(FmhaFpropParams &params,
                       // sizes
                       const size_t b,
                       const size_t seqlen_q,
@@ -32,13 +32,13 @@ void set_params_fprop(FMHA_fprop_params &params,
                       float softmax_scale,
                       bool is_causal) {
 
-    Data_type acc_type = DATA_TYPE_FP32;
-    Data_type data_type = !(q.dtype() == at::kBFloat16) ? DATA_TYPE_FP16 : DATA_TYPE_BF16;
+    DataType acc_type = kFloat32;
+    DataType data_type = !(q.dtype() == at::kBFloat16) ? kFloat16 : kBFloat16;
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
 
-    params.is_bf16 = q.dtype() == at::kBFloat16;
+    params.is_bf16 = (q.dtype() == at::kBFloat16);
 
     // S = softmax(P)     //TO DO
     // params.s_ptr = s_d;
@@ -124,7 +124,7 @@ void set_params_fprop(FMHA_fprop_params &params,
     params.is_causal = is_causal;
 }
 
-void set_params_dgrad(FMHA_dgrad_params &params,
+void set_params_dgrad(FmhaDgradParams &params,
                       // sizes
                       const size_t b,
                       const size_t seqlen_q,
@@ -148,8 +148,8 @@ void set_params_dgrad(FMHA_dgrad_params &params,
                       float softmax_scale,
                       bool is_causal) {
 
-    Data_type acc_type = DATA_TYPE_FP32;
-    Data_type data_type = q.dtype() == at::kBFloat16 ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
+    DataType acc_type = kFloat32;
+    DataType data_type = q.dtype() == at::kBFloat16 ? kBFloat16 : kFloat16;
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -290,7 +290,7 @@ mha_fwd(const at::Tensor &q,
     auto dprops = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentHIPStream().stream();
     bool is_dropout = p_dropout > 0.0;
-    Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
+    LaunchParams<FmhaFpropParams> launch_params(dprops, stream, is_dropout, return_softmax);
 
     auto q_dtype = q.dtype();
 
@@ -426,7 +426,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentHIPStream().stream();
-    Launch_params<FMHA_dgrad_params> launch_params(dprops, stream, is_dropout, false);
+    LaunchParams<FmhaDgradParams> launch_params(dprops, stream, is_dropout, false);
 
     auto q_dtype = q.dtype();
 
@@ -552,7 +552,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
     }
 
-    run_fmha_dgrad_fp16_bf16_gfx90a(launch_params);
+    run_fmha_dgrad_fp16_bf16_gfx90a(launch_params.params);
 
     if(!q.is_contiguous()){
         dq_tmp.copy_(torch::cat(launch_params.params.qgrad_tensors, 0).contiguous(), true);

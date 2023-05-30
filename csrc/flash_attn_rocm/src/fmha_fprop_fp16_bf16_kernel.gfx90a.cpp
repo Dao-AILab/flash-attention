@@ -43,7 +43,7 @@ template<typename InputType,
          typename B1BlockTransfer, ck::index_t B1BlockTransferSrcScalarPerVector, 
          ck::index_t CShuffleNXdlPerWavePerShuffle, typename CShuffleBlockTransferClusterLengths, 
          MaskingSpecialization MaskingSpec>
-void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_params){
+void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_params){
     using F32 = float;
     using INT32 = int;
     using BF16 = ck::bhalf_t;
@@ -297,7 +297,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(Launch_params<FMHA_fprop_params> &launch_pa
 }
 
 
-void run_fmha_fp16_bf16_gfx90a(Launch_params<FMHA_fprop_params> &launch_params) {
+void run_fmha_fp16_bf16_gfx90a(LaunchParams<FmhaFpropParams> &launch_params) {
 
     //template<typename InputType, 
     //ck::index_t MPerBlock,    ck::index_t NPerBlock, ck::index_t KPerBlock,   ck::index_t Gemm1NPerBlock, ck::index_t Gemm1KPerBlock,

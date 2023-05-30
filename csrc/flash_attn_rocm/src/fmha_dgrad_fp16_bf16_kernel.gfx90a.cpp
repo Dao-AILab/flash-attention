@@ -30,12 +30,10 @@
 #include <numeric>
 
 template <ck::index_t... Is> using S = ck::Sequence<Is...>;
-using MaskingSpecialization =
-    ck::tensor_operation::device::MaskingSpecialization;
+using MaskingSpecialization = ck::tensor_operation::device::MaskingSpecialization;
 
-static constexpr auto MaskingSpec_default = MaskingSpecialization::MaskDisabled;
-static constexpr auto MaskingSpec_causal =
-    MaskingSpecialization::MaskOutUpperTriangle;
+static constexpr auto kMaskingSpecializationDefault = MaskingSpecialization::MaskDisabled;
+static constexpr auto kMaskingSpecializationCausal = MaskingSpecialization::MaskOutUpperTriangle;
 
 struct SimpleDeviceMem {
   SimpleDeviceMem() = delete;
@@ -48,27 +46,32 @@ struct SimpleDeviceMem {
   void *p_mem_;
 };
 
-template <typename InputType, typename OutputType, typename DropoutType, ck::index_t Version, ck::index_t CShuffleBlockTransferScalarPerVector_NPerBlock,
-          MaskingSpecialization MaskingSpec>
-void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
-    Launch_params<FMHA_dgrad_params> &launch_params) {
-  using F32 = float;
-  using INT32 = int;
-  using BF16 = ck::bhalf_t;
-  using FP16 = ck::half_t;
+template <typename InputType, 
+          typename OutputType, 
+          typename DropoutType, 
+          ck::index_t version, 
+          ck::index_t c_shuffle_block_transfer_scalar_per_vector_n_per_block,
+          MaskingSpecialization masking_specialization>
+void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(FmhaDgradParams &params) {
+  using Int32 = int;
+  using Int16 = unsigned short;
+  using Float32 = float;
+  using BFloat16 = ck::bhalf_t;
+  using Float16 = ck::half_t;
 
   using PassThrough = ck::tensor_operation::element_wise::PassThrough;
   using Scale = ck::tensor_operation::element_wise::Scale;
 
-  using QKVElementOp = PassThrough;
+  using QkvElementOp = PassThrough;
   using YElementOp = PassThrough;
 
   using InputDataType    = InputType;
   using OutputDataType   = OutputType;
   using GemmDataType     = InputType;
-  using AccDataType      = F32;
-  using ShuffleDataType  = F32;
-  using LSEDataType      = F32;
+  // using GemmDataType     = BFloat16;
+  using AccDataType      = Float32;
+  using ShuffleDataType  = Float32;
+  using LSEDataType      = Float32;
   using ZDataType        = DropoutType;
   using Acc0BiasDataType = ck::Tuple<>;
   using Acc1BiasDataType = ck::Tuple<>;
@@ -79,27 +82,26 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
   static constexpr ck::index_t NumDimK = 1;
   static constexpr ck::index_t NumDimO = 1;
 
-  static constexpr auto GemmSpec =
-      ck::tensor_operation::device::GemmSpecialization::MNKOPadding;
+  static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::MNKOPadding;
+  
+  static constexpr auto TensorSpecQ = ck::tensor_operation::device::TensorSpecialization::Default;
+  static constexpr auto TensorSpecK = ck::tensor_operation::device::TensorSpecialization::Default;
+  static constexpr auto TensorSpecV = ck::tensor_operation::device::TensorSpecialization::Default;
+  static constexpr auto TensorSpecY = ck::tensor_operation::device::TensorSpecialization::Default;
 
-  static constexpr auto TensorSpecQ =
-      ck::tensor_operation::device::TensorSpecialization::Default;
-  static constexpr auto TensorSpecK =
-      ck::tensor_operation::device::TensorSpecialization::Default;
-  static constexpr auto TensorSpecV =
-      ck::tensor_operation::device::TensorSpecialization::Default;
-  static constexpr auto TensorSpecY =
-      ck::tensor_operation::device::TensorSpecialization::Default;
-
-  static constexpr bool Deterministic = true;
+#if FLASH_ATTENENTION_INTERNAL_USE_DETERM
+  static constexpr bool is_deterministic = true;
+#else
+  static constexpr bool is_deterministic = false;
+#endif
 
   bool time_kernel = false;
 
   bool input_permute = true;
   bool output_permute = true;
 
-  float alpha = launch_params.params.scale_bmm1f;
-  auto seeds = unpack(launch_params.params.philox_args);
+  float alpha = params.scale_bmm1f;
+  auto seeds = unpack(params.philox_args);
 
   auto seed_   = std::get<0>(seeds);
   auto offset_ = std::get<1>(seeds);
@@ -107,34 +109,34 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
   //std::cout << "bwd seed is " << seed_ ;
   //std::cout << " , bwd offset is " << offset_ << std::endl;
 
-  auto a_element_op = QKVElementOp{};
-  auto b0_element_op = QKVElementOp{};
+  auto a_element_op = QkvElementOp{};
+  auto b0_element_op = QkvElementOp{};
   auto acc0_element_op = Scale{alpha};
-  auto b1_element_op = QKVElementOp{};
+  auto b1_element_op = QkvElementOp{};
   auto c_element_op = YElementOp{};
 
-  auto p_q = launch_params.params.q_ptr;
-  auto p_k = launch_params.params.k_ptr;
-  auto p_v = launch_params.params.v_ptr;
-  auto p_y = launch_params.params.y_ptr;
-  auto p_z = launch_params.params.z_ptr;
-  auto p_lse = launch_params.params.lse_ptr;
-  auto p_ygrad = launch_params.params.ygrad_ptr;
-  auto p_qgrad = launch_params.params.qgrad_ptr;
-  auto p_kgrad = launch_params.params.kgrad_ptr;
-  auto p_vgrad = launch_params.params.vgrad_ptr;
-  int batch_size = launch_params.params.b;
-  int num_heads = launch_params.params.h;
-  int head_dim = launch_params.params.d;
-  float dropout_ratio = launch_params.params.p_dropout;
+  auto p_q = params.q_ptr;
+  auto p_k = params.k_ptr;
+  auto p_v = params.v_ptr;
+  auto p_y = params.y_ptr;
+  auto p_z = params.z_ptr;
+  auto p_lse = params.lse_ptr;
+  auto p_ygrad = params.ygrad_ptr;
+  auto p_qgrad = params.qgrad_ptr;
+  auto p_kgrad = params.kgrad_ptr;
+  auto p_vgrad = params.vgrad_ptr;
+  int batch_size = params.b;
+  int num_heads = params.h;
+  int head_dim = params.d;
+  float dropout_ratio = params.p_dropout;
   // init the instance with parameters
   auto run_kernel = [&]<typename DeviceGemmInstance>(DeviceGemmInstance gemm) {
     std::vector<typename DeviceGemmInstance::ProblemDesc> problem_descs;
     for (size_t i = 0; i < batch_size; i++) {
-      int M = launch_params.params.host_seqlens_q[i + 1] -
-              launch_params.params.host_seqlens_q[i]; // seqlen Q
-      int N = launch_params.params.host_seqlens_k[i + 1] -
-              launch_params.params.host_seqlens_k[i]; // seqlen K
+      int M = params.host_seqlens_q[i + 1] -
+              params.host_seqlens_q[i]; // seqlen Q
+      int N = params.host_seqlens_k[i + 1] -
+              params.host_seqlens_k[i]; // seqlen K
       int K = head_dim;
       int O = head_dim;
       int G0 = 1; // G0 = batch_size
@@ -236,13 +238,13 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
     }
   };
 
-  if (Version == 1) {
+  if (version == 1) {
     using DeviceGemmInstance = ck::tensor_operation::device::
         DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V2<
             NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
             ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
-            AccDataType, ShuffleDataType, QKVElementOp, QKVElementOp, Scale,
-            QKVElementOp, YElementOp, GemmSpec, TensorSpecQ, TensorSpecK,
+            AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
+            QkvElementOp, YElementOp, GemmSpec, TensorSpecQ, TensorSpecK,
             TensorSpecV, TensorSpecY, 1, 256,
             128,         // MPerBlock
             128,         // NPerBlock
@@ -267,18 +269,18 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
             1, // CShuffleMXdlPerWavePerShuffle
             4, // CShuffleNXdlPerWavePerShuffle
             S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-            CShuffleBlockTransferScalarPerVector_NPerBlock,            // CShuffleBlockTransferScalarPerVector_NPerBlock
-            MaskingSpec,
-            Deterministic>; // MaskingSpecialization
+            c_shuffle_block_transfer_scalar_per_vector_n_per_block, // c_shuffle_block_transfer_scalar_per_vector_n_per_block
+            masking_specialization, // MaskingSpecializatio
+            is_deterministic>;
     auto gemm = DeviceGemmInstance{};
     run_kernel(gemm);
-  } else if (Version == 2) {
+  } else if (version == 2) {
     using DeviceGemmInstance = ck::tensor_operation::device::
         DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V1<
             NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
             ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
-            AccDataType, ShuffleDataType, QKVElementOp, QKVElementOp, Scale,
-            QKVElementOp, YElementOp, GemmSpec, TensorSpecQ, TensorSpecK,
+            AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
+          QkvElementOp, YElementOp, GemmSpec, TensorSpecQ, TensorSpecK,
             TensorSpecV, TensorSpecY, 1, 256,
             128,         // MPerBlock
             128,         // NPerBlock
@@ -302,11 +304,10 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
             S<0, 2, 1>, S<0, 2, 1>, 1, 4, 2, false,
             1, // CShuffleMXdlPerWavePerShuffle
             2, // CShuffleNXdlPerWavePerShuffle
-            S<1, 32, 1,
-              8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-            CShuffleBlockTransferScalarPerVector_NPerBlock,            // CShuffleBlockTransferScalarPerVector_NPerBlock
-            MaskingSpec,
-            Deterministic>; // MaskingSpecialization
+            S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
+            c_shuffle_block_transfer_scalar_per_vector_n_per_block, // c_shuffle_block_transfer_scalar_per_vector_n_per_block
+            masking_specialization, // MaskingSpecialization
+            is_deterministic>; 
     auto gemm = DeviceGemmInstance{};
     run_kernel(gemm);
   } else {
@@ -314,8 +315,8 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
         DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V1<
             NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
             ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
-            AccDataType, ShuffleDataType, QKVElementOp, QKVElementOp, Scale,
-            QKVElementOp, YElementOp, GemmSpec, TensorSpecQ, TensorSpecK,
+            AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
+          QkvElementOp, YElementOp, GemmSpec, TensorSpecQ, TensorSpecK,
             TensorSpecV, TensorSpecY, 1, 256,
             128,         // MPerBlock
             128,         // NPerBlock
@@ -339,70 +340,57 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(
             S<0, 2, 1>, S<0, 2, 1>, 1, 4, 2, false,
             1, // CShuffleMXdlPerWavePerShuffle
             1, // CShuffleNXdlPerWavePerShuffle
-            S<1, 64, 1,
-              4>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-            CShuffleBlockTransferScalarPerVector_NPerBlock,            // CShuffleBlockTransferScalarPerVector_NPerBlock
-            MaskingSpec,
-            Deterministic>; // MaskingSpecialization
+            S<1, 64, 1, 4>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
+            c_shuffle_block_transfer_scalar_per_vector_n_per_block, // c_shuffle_block_transfer_scalar_per_vector_n_per_block
+            masking_specialization, // MaskingSpecialization
+            is_deterministic>; 
     auto gemm = DeviceGemmInstance{};
     run_kernel(gemm);
   }
 }
 
-void run_fmha_dgrad_fp16_bf16_gfx90a(
-    Launch_params<FMHA_dgrad_params> &launch_params) {
-  
-  using F32 = float;
-  using BF16 = ck::bhalf_t;
-  using FP16 = ck::half_t;
+void run_fmha_dgrad_fp16_bf16_gfx90a(FmhaDgradParams &params) {
+  using Int32 = int;
+  using Int16 = unsigned short;
+  using Float32 = float;
+  using BFloat16 = ck::bhalf_t;
+  using Float16 = ck::half_t;
 
-  if (launch_params.params.is_bf16) {
-    if (launch_params.params.is_causal) {
-      if (launch_params.params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32 , int, 1, 4, MaskingSpec_causal>(
-            launch_params);
-      } else if (launch_params.params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32 , int, 2, 4, MaskingSpec_causal>(
-            launch_params);
+  if (params.is_bf16) {
+    if (params.is_causal) {
+      if (params.d > 64) {
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, 1, 4, kMaskingSpecializationCausal>(params);
+      } else if (params.d > 32) {
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, 2, 4, kMaskingSpecializationCausal>(params);
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32 , int, 3, 4, MaskingSpec_causal>(
-            launch_params);
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, 3, 4, kMaskingSpecializationCausal>(params);
       }
     } else {
-      if (launch_params.params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32, int, 1, 4, MaskingSpec_default>(
-            launch_params);
-      } else if (launch_params.params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32, int, 2, 4, MaskingSpec_default>(
-            launch_params);
+      if (params.d > 64) {
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, 1, 4, kMaskingSpecializationDefault>(params);
+      } else if (params.d > 32) {
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, 2, 4, kMaskingSpecializationDefault>(params);
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BF16, F32, int, 3, 4, MaskingSpec_default>(
-            launch_params);
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, 3, 4, kMaskingSpecializationDefault>(params);
       }
     }
   }
   else{
-    if (launch_params.params.is_causal) {
-      if (launch_params.params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, F32, unsigned short,1, 4, MaskingSpec_causal>(
-            launch_params);
-      } else if (launch_params.params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, F32, unsigned short,2, 4, MaskingSpec_causal>(
-            launch_params);
+    if (params.is_causal) {
+      if (params.d > 64) {
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16,1, 4, kMaskingSpecializationCausal>(params);
+      } else if (params.d > 32) {
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16,2, 4, kMaskingSpecializationCausal>(params);
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, F32, unsigned short,3, 4, MaskingSpec_causal>(
-            launch_params);
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16,3, 4, kMaskingSpecializationCausal>(params);
       }
     } else {
-      if (launch_params.params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, F32, unsigned short,1, 4, MaskingSpec_default>(
-            launch_params);
-      } else if (launch_params.params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, F32, unsigned short,2, 4, MaskingSpec_default>(
-            launch_params);
+      if (params.d > 64) {
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16,1, 4, kMaskingSpecializationDefault>(params);
+      } else if (params.d > 32) {
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16,2, 4, kMaskingSpecializationDefault>(params);
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<FP16, F32, unsigned short,3, 4, MaskingSpec_default>(
-            launch_params);
+        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16,3, 4, kMaskingSpecializationDefault>(params);
       }
     }
   }
