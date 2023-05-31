@@ -272,7 +272,11 @@ static inline __device__ uint32_t hmin2(uint32_t a, uint32_t b) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static inline __device__ uint32_t hmul2(const uint32_t a, const uint32_t b) {
+template<typename T=__half >
+static inline __device__ uint32_t hmul2(const uint32_t a, const uint32_t b);
+
+template<>
+inline __device__ uint32_t hmul2<__half>(const uint32_t a, const uint32_t b) {
     // uint32_t c;
     // asm volatile("mul.f16x2 %0, %1, %2;\n" : "=r"(c) : "r"(a), "r"(b));
     // return c;
@@ -280,6 +284,19 @@ static inline __device__ uint32_t hmul2(const uint32_t a, const uint32_t b) {
                              reinterpret_cast<const __half2 (&)>(b));
     return reinterpret_cast<uint32_t(&)>(result);
 }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+template<>
+inline __device__ uint32_t hmul2<__nv_bfloat16>(const uint32_t a, const uint32_t b) {
+    // uint32_t c;
+    // asm volatile("mul.f16x2 %0, %1, %2;\n" : "=r"(c) : "r"(a), "r"(b));
+    // return c;
+    __nv_bfloat162 result = __hmul2(reinterpret_cast<const __nv_bfloat162 (&)>(a),
+                             reinterpret_cast<const __nv_bfloat162 (&)>(b));
+    return reinterpret_cast<uint32_t(&)>(result);
+}
+#endif
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -292,25 +309,26 @@ static inline __device__ uint2 hmul4(uint2 a, uint2 b) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template<typename elem_type=__half >
 static inline __device__ uint4 hmul8(uint4 a, uint4 b) {
     uint4 c;
-    c.x = hmul2(a.x, b.x);
-    c.y = hmul2(a.y, b.y);
-    c.z = hmul2(a.z, b.z);
-    c.w = hmul2(a.w, b.w);
+    c.x = hmul2<elem_type>(a.x, b.x);
+    c.y = hmul2<elem_type>(a.y, b.y);
+    c.z = hmul2<elem_type>(a.z, b.z);
+    c.w = hmul2<elem_type>(a.w, b.w);
     return c;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template<typename elem_type=__half >
 static inline __device__ uint4 hmul8(uint32_t a, uint4 b) {
     uint4 c;
-    c.x = hmul2(a, b.x);
-    c.y = hmul2(a, b.y);
-    c.z = hmul2(a, b.z);
-    c.w = hmul2(a, b.w);
-    return c;
-}
+    c.x = hmul2<elem_type>(a, b.x);
+    c.y = hmul2<elem_type>(a, b.y);
+    c.z = hmul2<elem_type>(a, b.z);
+    c.w = hmul2<elem_type>(a, b.w);
+    return c; }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

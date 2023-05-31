@@ -80,13 +80,16 @@ void run_fmha_block_sm80(Launch_params<FMHA_fprop_params> &launch_params,
                              const bool configure) {
     FP16_SWITCH(launch_params.params.is_bf16, ([&] {
         if (launch_params.params.d == 16) {
-            using Kernel_traits = FMHA_kernel_traits<256, 16, 16, 1, 4, 0x08u>;
+            using Kernel_traits = FMHA_kernel_traits<256, 16, 16, 1, 4, 0x08u, elem_type>;
             run_fmha_block_sm80_loop_<Kernel_traits>(launch_params, configure);
         } else if (launch_params.params.d == 32) {
-            using Kernel_traits = FMHA_kernel_traits<256, 32, 16, 1, 4, 0x08u>;
+            using Kernel_traits = FMHA_kernel_traits<256, 32, 16, 1, 4, 0x08u, elem_type>;
             run_fmha_block_sm80_loop_<Kernel_traits>(launch_params, configure);
         } else if (launch_params.params.d == 64) {
-            using Kernel_traits = FMHA_kernel_traits<256, 64, 16, 1, 4, 0x08u>;
+            using Kernel_traits = FMHA_kernel_traits<256, 64, 16, 1, 4, 0x08u, elem_type>;
+            run_fmha_block_sm80_loop_<Kernel_traits>(launch_params, configure);
+        } else if (launch_params.params.d == 128) {
+            using Kernel_traits = FMHA_kernel_traits<256, 128, 16, 1, 4, 0x08u, elem_type>;
             run_fmha_block_sm80_loop_<Kernel_traits>(launch_params, configure);
         }
     }));
