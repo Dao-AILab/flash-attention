@@ -82,10 +82,13 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
     static constexpr auto TensorSpecB1 = ck::tensor_operation::device::TensorSpecialization::Default;
     static constexpr auto TensorSpecC  = ck::tensor_operation::device::TensorSpecialization::Default;
 
-    static constexpr bool Deterministic = true;
+    static constexpr bool deterministic = true;
+    static constexpr bool nondeterministic = false;
     
+    bool is_deterministic = params.is_deterministic;
+
     //init the instance with parameters
-    using DeviceGemmInstance =
+    using DeviceGemmInstance1 =
         ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle<
             NumDimG,
             NumDimM,
@@ -154,7 +157,78 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
             CShuffleBlockTransferClusterLengths,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
             8,                                    // CShuffleBlockTransferScalarPerVector_NPerBlock
             MaskingSpec,
-            Deterministic>;                       // MaskingSpecialization
+            deterministic>;                       // MaskingSpecialization
+
+    using DeviceGemmInstance2 =
+        ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle<
+            NumDimG,
+            NumDimM,
+            NumDimN,
+            NumDimK,
+            NumDimO,
+            ADataType,
+            B0DataType,
+            B1DataType,
+            CDataType,
+            GemmDataType,
+            ZDataType,
+            LSEDataType,
+            Acc0BiasDataType,
+            Acc1BiasDataType,
+            AccDataType,
+            CShuffleDataType,
+            AElementOp,
+            B0ElementOp,
+            Acc0ElementOp,
+            B1ElementOp,
+            CElementOp,
+            GemmSpec,
+            TensorSpecA,
+            TensorSpecB0,
+            TensorSpecB1,
+            TensorSpecC,
+            1,
+            256,
+            MPerBlock,         // MPerBlock
+            NPerBlock,         // NPerBlock
+            KPerBlock,         // KPerBlock
+            Gemm1NPerBlock,    // Gemm1NPerBlock
+            Gemm1KPerBlock,    // Gemm1KPerBlock
+            8,                 // AK1
+            8,                 // BK1
+            2,                 // B1K1
+            MPerXDL,           // MPerXDL
+            NPerXDL,           // NPerXDL
+            1,                 // MXdlPerWave
+            NXdlPerWave,       // NXdlPerWave
+            Gemm1NXdlPerWave,  // Gemm1NXdlPerWave
+            ABlockTransfer,    // ABlockTransfer
+            S<1, 0, 2>,
+            S<1, 0, 2>,
+            2,
+            8,
+            8,
+            ABlockLdsExtraM,   // ABlockLdsExtraM
+            BBlockTransfer,    // BBlockTransfer
+            S<1, 0, 2>,
+            S<1, 0, 2>,
+            2,
+            8,
+            8,
+            B0BlockLdsExtraN,  // B0BlockLdsExtraN
+            B1BlockTransfer,   // B1BlockTransfer
+            S<0, 2, 1>,
+            S<0, 2, 1>,
+            1,
+            B1BlockTransferSrcScalarPerVector,    //B1BlockTransferSrcScalarPerVector
+            2,
+            false,
+            1,                                    // CShuffleMXdlPerWavePerShuffle
+            CShuffleNXdlPerWavePerShuffle,        // CShuffleNXdlPerWavePerShuffle
+            CShuffleBlockTransferClusterLengths,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
+            8,                                    // CShuffleBlockTransferScalarPerVector_NPerBlock
+            MaskingSpec,
+            nondeterministic>;                       // MaskingSpecialization
         
     bool time_kernel    = false;
 
@@ -256,44 +330,83 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
                                  
     }
 
-    // do GEMM
-    auto gemm     = DeviceGemmInstance{};
-    auto invoker  = gemm.MakeInvoker();
-    auto argument = gemm.MakeArgument(p_a,
-                                      p_b0,
-                                      p_b1,
-                                      p_c,
-                                      p_z,
-                                      p_lse,
-                                      {},
-                                      {},
-                                      problem_descs,
-                                      a_element_op,
-                                      b0_element_op,
-                                      acc0_element_op,
-                                      b1_element_op,
-                                      c_element_op,
-                                      dropout_ratio,
-                                      seeds);
+    if (is_deterministic) {
+      // do GEMM
+      auto gemm     = DeviceGemmInstance1{};
+      auto invoker  = gemm.MakeInvoker();
+      auto argument = gemm.MakeArgument(p_a,
+                                        p_b0,
+                                        p_b1,
+                                        p_c,
+                                        p_z,
+                                        p_lse,
+                                        {},
+                                        {},
+                                        problem_descs,
+                                        a_element_op,
+                                        b0_element_op,
+                                        acc0_element_op,
+                                        b1_element_op,
+                                        c_element_op,
+                                        dropout_ratio,
+                                        seeds);
 
-    // specify workspace for problem_desc
-    SimpleDeviceMem problem_desc_workspace(gemm.GetWorkSpaceSize(&argument));
+      // specify workspace for problem_desc
+      SimpleDeviceMem problem_desc_workspace(gemm.GetWorkSpaceSize(&argument));
 
-    gemm.SetWorkSpacePointer(&argument, problem_desc_workspace.GetDeviceBuffer());
+      gemm.SetWorkSpacePointer(&argument, problem_desc_workspace.GetDeviceBuffer());
 
-    if(!gemm.IsSupportedArgument(argument))
-    {
-        std::cout << gemm.GetTypeString() << " does not support this problem" << std::endl;
+      if(!gemm.IsSupportedArgument(argument))
+      {
+          std::cout << gemm.GetTypeString() << " does not support this problem" << std::endl;
 
-        return;
+          return;
+      }
+
+      float ave_time = invoker.Run(argument, StreamConfig{nullptr, time_kernel});
+
+      if(time_kernel){
+          std::cout << "time elpase is " << ave_time <<" ms" << std::endl;
+      }
+    } else {
+      // do GEMM
+      auto gemm     = DeviceGemmInstance2{};
+      auto invoker  = gemm.MakeInvoker();
+      auto argument = gemm.MakeArgument(p_a,
+                                        p_b0,
+                                        p_b1,
+                                        p_c,
+                                        p_z,
+                                        p_lse,
+                                        {},
+                                        {},
+                                        problem_descs,
+                                        a_element_op,
+                                        b0_element_op,
+                                        acc0_element_op,
+                                        b1_element_op,
+                                        c_element_op,
+                                        dropout_ratio,
+                                        seeds);
+
+      // specify workspace for problem_desc
+      SimpleDeviceMem problem_desc_workspace(gemm.GetWorkSpaceSize(&argument));
+
+      gemm.SetWorkSpacePointer(&argument, problem_desc_workspace.GetDeviceBuffer());
+
+      if(!gemm.IsSupportedArgument(argument))
+      {
+          std::cout << gemm.GetTypeString() << " does not support this problem" << std::endl;
+
+          return;
+      }
+
+      float ave_time = invoker.Run(argument, StreamConfig{nullptr, time_kernel});
+
+      if(time_kernel){
+          std::cout << "time elpase is " << ave_time <<" ms" << std::endl;
+      }
     }
-
-    float ave_time = invoker.Run(argument, StreamConfig{nullptr, time_kernel});
-
-    if(time_kernel){
-        std::cout << "time elpase is " << ave_time <<" ms" << std::endl;
-    }
-
 }
 
 

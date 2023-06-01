@@ -469,38 +469,38 @@ void run_fmha_dgrad_fp16_bf16_gfx90a(FmhaDgradParams &params) {
     if (params.is_bf16) {
       if (params.is_causal) {
         if (params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 1, 4, kMaskingSpecializationCausal>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 1, 8, kMaskingSpecializationCausal>(params);
         } else if (params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 2, 4, kMaskingSpecializationCausal>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 2, 8, kMaskingSpecializationCausal>(params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 3, 4, kMaskingSpecializationCausal>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 3, 8, kMaskingSpecializationCausal>(params);
         }
       } else {
         if (params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 1, 4, kMaskingSpecializationDefault>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 1, 8, kMaskingSpecializationDefault>(params);
         } else if (params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 2, 4, kMaskingSpecializationDefault>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 2, 8, kMaskingSpecializationDefault>(params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 3, 4, kMaskingSpecializationDefault>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 3, 8, kMaskingSpecializationDefault>(params);
         }
       }
     } 
     else {
       if (params.is_causal) {
         if (params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 1, 4, kMaskingSpecializationCausal>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 1, 8, kMaskingSpecializationCausal>(params);
         } else if (params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 2, 4, kMaskingSpecializationCausal>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 2, 8, kMaskingSpecializationCausal>(params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 3, 4, kMaskingSpecializationCausal>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 3, 8, kMaskingSpecializationCausal>(params);
         }
       } else {
         if (params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 1, 4, kMaskingSpecializationDefault>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 1, 8, kMaskingSpecializationDefault>(params);
         } else if (params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 2, 4, kMaskingSpecializationDefault>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 2, 8, kMaskingSpecializationDefault>(params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 3, 4, kMaskingSpecializationDefault>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 3, 8, kMaskingSpecializationDefault>(params);
         }
       }
     }
