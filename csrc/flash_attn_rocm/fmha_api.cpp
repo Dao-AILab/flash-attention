@@ -146,7 +146,9 @@ void set_params_dgrad(FmhaDgradParams &params,
                       void *softmax_lse_d,
                       float p_dropout,
                       float softmax_scale,
-                      bool is_causal) {
+                      bool is_causal,
+                      bool is_deterministic,
+                      bool is_performance_mode) {
 
     DataType acc_type = kFloat32;
     DataType data_type = q.dtype() == at::kBFloat16 ? kBFloat16 : kFloat16;
@@ -269,6 +271,9 @@ void set_params_dgrad(FmhaDgradParams &params,
     params.p_dropout = p_dropout;
 
     params.is_causal = is_causal;
+
+    params.is_deterministic = is_determinisitc;
+    params.is_performance_mode = is_performance_mode;
 }
 
 std::vector<at::Tensor>
@@ -418,6 +423,8 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         const float softmax_scale,
         const bool zero_tensors,
         const bool is_causal,
+        const bool is_deterministic,
+        const bool is_performance_mode,
         const int num_splits,
         c10::optional<at::Generator> gen_
 ) {
@@ -543,7 +550,9 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      softmax_lse.data_ptr(),
                      p_dropout,
                      softmax_scale,
-                     is_causal);
+                     is_causal,
+                     is_deterministic,
+                     is_performance_mode);
     
     if( is_dropout ) {
         // See Note [Acquire lock when using random generators]

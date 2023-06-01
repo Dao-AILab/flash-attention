@@ -112,6 +112,7 @@ struct FmhaFpropParams : public QkvParams {
 
     bool is_bf16;
     bool is_causal;
+    bool is_performance_mode;
 
     std::vector<int> host_seqlens_q;
     std::vector<int> host_seqlens_k;
@@ -161,6 +162,8 @@ struct FmhaDgradParams : public FmhaFpropParams {
 
     // Random state.
     at::PhiloxCudaState philox_args;
+
+    bool is_deterministic;
 
     std::vector<int> host_seqlens_q;
     std::vector<int> host_seqlens_k;

@@ -48,7 +48,8 @@ struct SimpleDeviceMem {
 
 template <typename InputType, 
           typename OutputType, 
-          typename DropoutType, 
+          typename DropoutType,
+          typename GemmDataType,
           ck::index_t version, 
           ck::index_t c_shuffle_block_transfer_scalar_per_vector_n_per_block,
           MaskingSpecialization masking_specialization>
@@ -67,8 +68,6 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(FmhaDgradParams &params) {
 
   using InputDataType    = InputType;
   using OutputDataType   = OutputType;
-  using GemmDataType     = InputType;
-  // using GemmDataType     = BFloat16;
   using AccDataType      = Float32;
   using ShuffleDataType  = Float32;
   using LSEDataType      = Float32;
@@ -89,14 +88,11 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(FmhaDgradParams &params) {
   static constexpr auto TensorSpecV = ck::tensor_operation::device::TensorSpecialization::Default;
   static constexpr auto TensorSpecY = ck::tensor_operation::device::TensorSpecialization::Default;
 
-#if FLASH_ATTENENTION_INTERNAL_USE_DETERM
-  static constexpr bool is_deterministic = true;
-#else
-  static constexpr bool is_deterministic = false;
-#endif
+  static constexpr bool deterministic = true;
+  static constexpr bool nondeterministic = false;
 
+  bool is_deterministic = params.is_deterministic;
   bool time_kernel = false;
-
   bool input_permute = true;
   bool output_permute = true;
 
@@ -237,115 +233,228 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(FmhaDgradParams &params) {
       std::cout << "time elpase is " << ave_time << " ms" << std::endl;
     }
   };
-
-  if (version == 1) {
-    using DeviceGemmInstance = ck::tensor_operation::device::
+  // deterministic mode
+  if (is_deterministic) {
+    if (version == 1) {
+      using DeviceGemmInstance = ck::tensor_operation::device::
         DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V2<
-            NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
-            ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
-            AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
-            QkvElementOp, YElementOp, GemmSpec, TensorSpecQ, TensorSpecK,
-            TensorSpecV, TensorSpecY, 1, 256,
-            128,         // MPerBlock
-            128,         // NPerBlock
-            64,          // KPerBlock
-            128,         // Gemm1NPerBlock
-            32,          // Gemm1KPerBlock
-            8,           // AK1
-            8,           // BK1
-            2,           // B1K1
-            32,          // MPerXDL
-            32,          // NPerXDL
-            1,           // MXdlPerWave
-            4,           // NXdlPerWave
-            4,           // Gemm1NXdlPerWave
-            2,           // Gemm2NXdlPerWave
-            S<4, 64, 1>, // ABlockTransfer
-            S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
-            S<4, 64, 1>, // BBlockTransfer
-            S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
-            S<8, 32, 1>, // B1BlockTransfer
-            S<0, 2, 1>, S<0, 2, 1>, 1, 4, 2, false,
-            1, // CShuffleMXdlPerWavePerShuffle
-            4, // CShuffleNXdlPerWavePerShuffle
-            S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-            c_shuffle_block_transfer_scalar_per_vector_n_per_block, // c_shuffle_block_transfer_scalar_per_vector_n_per_block
-            masking_specialization, // MaskingSpecializatio
-            is_deterministic>;
-    auto gemm = DeviceGemmInstance{};
-    run_kernel(gemm);
-  } else if (version == 2) {
-    using DeviceGemmInstance = ck::tensor_operation::device::
-        DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V1<
-            NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
-            ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
-            AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
+          NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
+          ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
+          AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
           QkvElementOp, YElementOp, GemmSpec, TensorSpecQ, TensorSpecK,
-            TensorSpecV, TensorSpecY, 1, 256,
-            128,         // MPerBlock
-            128,         // NPerBlock
-            64,          // KPerBlock
-            64,          // Gemm1NPerBlock
-            32,          // Gemm1KPerBlock
-            8,           // AK1
-            8,           // BK1
-            2,           // B1K1
-            32,          // MPerXDL
-            32,          // NPerXDL
-            1,           // MXdlPerWave
-            4,           // NXdlPerWave
-            2,           // Gemm1NXdlPerWave
-            2,           // Gemm2NXdlPerWave
-            S<4, 64, 1>, // ABlockTransfer
-            S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
-            S<4, 64, 1>, // BBlockTransfer
-            S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
-            S<8, 32, 1>, // B1BlockTransfer
-            S<0, 2, 1>, S<0, 2, 1>, 1, 4, 2, false,
-            1, // CShuffleMXdlPerWavePerShuffle
-            2, // CShuffleNXdlPerWavePerShuffle
-            S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-            c_shuffle_block_transfer_scalar_per_vector_n_per_block, // c_shuffle_block_transfer_scalar_per_vector_n_per_block
-            masking_specialization, // MaskingSpecialization
-            is_deterministic>; 
-    auto gemm = DeviceGemmInstance{};
-    run_kernel(gemm);
+          TensorSpecV, TensorSpecY, 1, 256,
+          128,         // MPerBlock
+          128,         // NPerBlock
+          64,          // KPerBlock
+          128,         // Gemm1NPerBlock
+          32,          // Gemm1KPerBlock
+          8,           // AK1
+          8,           // BK1
+          2,           // B1K1
+          32,          // MPerXDL
+          32,          // NPerXDL
+          1,           // MXdlPerWave
+          4,           // NXdlPerWave
+          4,           // Gemm1NXdlPerWave
+          2,           // Gemm2NXdlPerWave
+          S<4, 64, 1>, // ABlockTransfer
+          S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+          S<4, 64, 1>, // BBlockTransfer
+          S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+          S<8, 32, 1>, // B1BlockTransfer
+          S<0, 2, 1>, S<0, 2, 1>, 1, 4, 2, false,
+          1, // CShuffleMXdlPerWavePerShuffle
+          4, // CShuffleNXdlPerWavePerShuffle
+          S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
+          c_shuffle_block_transfer_scalar_per_vector_n_per_block, // c_shuffle_block_transfer_scalar_per_vector_n_per_block
+          masking_specialization, // MaskingSpecialization
+          deterministic>;
+      auto gemm = DeviceGemmInstance{};
+      run_kernel(gemm);
+    } else if (version == 2) {
+      using DeviceGemmInstance = ck::tensor_operation::device::
+        DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V1<
+          NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
+          ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
+          AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
+          QkvElementOp, YElementOp, GemmSpec, TensorSpecQ, TensorSpecK,
+          TensorSpecV, TensorSpecY, 1, 256,
+          128,         // MPerBlock
+          128,         // NPerBlock
+          64,          // KPerBlock
+          64,          // Gemm1NPerBlock
+          32,          // Gemm1KPerBlock
+          8,           // AK1
+          8,           // BK1
+          2,           // B1K1
+          32,          // MPerXDL
+          32,          // NPerXDL
+          1,           // MXdlPerWave
+          4,           // NXdlPerWave
+          2,           // Gemm1NXdlPerWave
+          2,           // Gemm2NXdlPerWave
+          S<4, 64, 1>, // ABlockTransfer
+          S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+          S<4, 64, 1>, // BBlockTransfer
+          S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+          S<8, 32, 1>, // B1BlockTransfer
+          S<0, 2, 1>, S<0, 2, 1>, 1, 4, 2, false,
+          1, // CShuffleMXdlPerWavePerShuffle
+          2, // CShuffleNXdlPerWavePerShuffle
+          S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
+          c_shuffle_block_transfer_scalar_per_vector_n_per_block, // c_shuffle_block_transfer_scalar_per_vector_n_per_block
+          masking_specialization, // MaskingSpecialization
+          deterministic>; 
+      auto gemm = DeviceGemmInstance{};
+      run_kernel(gemm);
+    } else {
+      using DeviceGemmInstance = ck::tensor_operation::device::
+        DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V1<
+          NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
+          ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
+          AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
+          QkvElementOp, YElementOp, GemmSpec, TensorSpecQ, TensorSpecK,
+          TensorSpecV, TensorSpecY, 1, 256,
+          128,         // MPerBlock
+          128,         // NPerBlock
+          32,          // KPerBlock
+          32,          // Gemm1NPerBlock
+          32,          // Gemm1KPerBlock
+          8,           // AK1
+          8,           // BK1
+          2,           // B1K1
+          32,          // MPerXDL
+          32,          // NPerXDL
+          1,           // MXdlPerWave
+          4,           // NXdlPerWave
+          1,           // Gemm1NXdlPerWave
+          1,           // Gemm2NXdlPerWave
+          S<4, 64, 1>, // ABlockTransfer
+          S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+          S<4, 64, 1>, // BBlockTransfer
+          S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+          S<8, 32, 1>, // B1BlockTransfer
+          S<0, 2, 1>, S<0, 2, 1>, 1, 4, 2, false,
+          1, // CShuffleMXdlPerWavePerShuffle
+          1, // CShuffleNXdlPerWavePerShuffle
+          S<1, 64, 1, 4>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
+          c_shuffle_block_transfer_scalar_per_vector_n_per_block, // c_shuffle_block_transfer_scalar_per_vector_n_per_block
+          masking_specialization, // MaskingSpecialization
+          deterministic>; 
+      auto gemm = DeviceGemmInstance{};
+      run_kernel(gemm);
+    }
+  // non-deterministic mode
   } else {
-    using DeviceGemmInstance = ck::tensor_operation::device::
-        DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V1<
-            NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
-            ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
-            AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
+    if (version == 1) {
+      using DeviceGemmInstance = ck::tensor_operation::device::
+        DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V2<
+          NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
+          ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
+          AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
           QkvElementOp, YElementOp, GemmSpec, TensorSpecQ, TensorSpecK,
-            TensorSpecV, TensorSpecY, 1, 256,
-            128,         // MPerBlock
-            128,         // NPerBlock
-            32,          // KPerBlock
-            32,          // Gemm1NPerBlock
-            32,          // Gemm1KPerBlock
-            8,           // AK1
-            8,           // BK1
-            2,           // B1K1
-            32,          // MPerXDL
-            32,          // NPerXDL
-            1,           // MXdlPerWave
-            4,           // NXdlPerWave
-            1,           // Gemm1NXdlPerWave
-            1,           // Gemm2NXdlPerWave
-            S<4, 64, 1>, // ABlockTransfer
-            S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
-            S<4, 64, 1>, // BBlockTransfer
-            S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
-            S<8, 32, 1>, // B1BlockTransfer
-            S<0, 2, 1>, S<0, 2, 1>, 1, 4, 2, false,
-            1, // CShuffleMXdlPerWavePerShuffle
-            1, // CShuffleNXdlPerWavePerShuffle
-            S<1, 64, 1, 4>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-            c_shuffle_block_transfer_scalar_per_vector_n_per_block, // c_shuffle_block_transfer_scalar_per_vector_n_per_block
-            masking_specialization, // MaskingSpecialization
-            is_deterministic>; 
-    auto gemm = DeviceGemmInstance{};
-    run_kernel(gemm);
+          TensorSpecV, TensorSpecY, 1, 256,
+          128,         // MPerBlock
+          128,         // NPerBlock
+          64,          // KPerBlock
+          128,         // Gemm1NPerBlock
+          32,          // Gemm1KPerBlock
+          8,           // AK1
+          8,           // BK1
+          2,           // B1K1
+          32,          // MPerXDL
+          32,          // NPerXDL
+          1,           // MXdlPerWave
+          4,           // NXdlPerWave
+          4,           // Gemm1NXdlPerWave
+          2,           // Gemm2NXdlPerWave
+          S<4, 64, 1>, // ABlockTransfer
+          S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+          S<4, 64, 1>, // BBlockTransfer
+          S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+          S<8, 32, 1>, // B1BlockTransfer
+          S<0, 2, 1>, S<0, 2, 1>, 1, 4, 2, false,
+          1, // CShuffleMXdlPerWavePerShuffle
+          4, // CShuffleNXdlPerWavePerShuffle
+          S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
+          c_shuffle_block_transfer_scalar_per_vector_n_per_block, // c_shuffle_block_transfer_scalar_per_vector_n_per_block
+          masking_specialization, // MaskingSpecialization
+          nondeterministic>;
+      auto gemm = DeviceGemmInstance{};
+      run_kernel(gemm);
+    } else if (version == 2) {
+      using DeviceGemmInstance = ck::tensor_operation::device::
+        DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V1<
+          NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
+          ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
+          AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
+          QkvElementOp, YElementOp, GemmSpec, TensorSpecQ, TensorSpecK,
+          TensorSpecV, TensorSpecY, 1, 256,
+          128,         // MPerBlock
+          128,         // NPerBlock
+          64,          // KPerBlock
+          64,          // Gemm1NPerBlock
+          32,          // Gemm1KPerBlock
+          8,           // AK1
+          8,           // BK1
+          2,           // B1K1
+          32,          // MPerXDL
+          32,          // NPerXDL
+          1,           // MXdlPerWave
+          4,           // NXdlPerWave
+          2,           // Gemm1NXdlPerWave
+          2,           // Gemm2NXdlPerWave
+          S<4, 64, 1>, // ABlockTransfer
+          S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+          S<4, 64, 1>, // BBlockTransfer
+          S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+          S<8, 32, 1>, // B1BlockTransfer
+          S<0, 2, 1>, S<0, 2, 1>, 1, 4, 2, false,
+          1, // CShuffleMXdlPerWavePerShuffle
+          2, // CShuffleNXdlPerWavePerShuffle
+          S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
+          c_shuffle_block_transfer_scalar_per_vector_n_per_block, // c_shuffle_block_transfer_scalar_per_vector_n_per_block
+          masking_specialization, // MaskingSpecialization
+          nondeterministic>; 
+      auto gemm = DeviceGemmInstance{};
+      run_kernel(gemm);
+    } else {
+      using DeviceGemmInstance = ck::tensor_operation::device::
+        DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V1<
+          NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
+          ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
+          AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
+          QkvElementOp, YElementOp, GemmSpec, TensorSpecQ, TensorSpecK,
+          TensorSpecV, TensorSpecY, 1, 256,
+          128,         // MPerBlock
+          128,         // NPerBlock
+          32,          // KPerBlock
+          32,          // Gemm1NPerBlock
+          32,          // Gemm1KPerBlock
+          8,           // AK1
+          8,           // BK1
+          2,           // B1K1
+          32,          // MPerXDL
+          32,          // NPerXDL
+          1,           // MXdlPerWave
+          4,           // NXdlPerWave
+          1,           // Gemm1NXdlPerWave
+          1,           // Gemm2NXdlPerWave
+          S<4, 64, 1>, // ABlockTransfer
+          S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+          S<4, 64, 1>, // BBlockTransfer
+          S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+          S<8, 32, 1>, // B1BlockTransfer
+          S<0, 2, 1>, S<0, 2, 1>, 1, 4, 2, false,
+          1, // CShuffleMXdlPerWavePerShuffle
+          1, // CShuffleNXdlPerWavePerShuffle
+          S<1, 64, 1, 4>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
+          c_shuffle_block_transfer_scalar_per_vector_n_per_block, // c_shuffle_block_transfer_scalar_per_vector_n_per_block
+          masking_specialization, // MaskingSpecialization
+          nondeterministic>; 
+      auto gemm = DeviceGemmInstance{};
+      run_kernel(gemm);
+    }
   }
 }
 
@@ -353,44 +462,85 @@ void run_fmha_dgrad_fp16_bf16_gfx90a(FmhaDgradParams &params) {
   using Int32 = int;
   using Int16 = unsigned short;
   using Float32 = float;
-  using BFloat16 = ck::bhalf_t;
   using Float16 = ck::half_t;
+  using BFloat16 = ck::bhalf_t;
 
-  if (params.is_bf16) {
-    if (params.is_causal) {
-      if (params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, 1, 4, kMaskingSpecializationCausal>(params);
-      } else if (params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, 2, 4, kMaskingSpecializationCausal>(params);
+  if (params.is_performance_mode) {
+    if (params.is_bf16) {
+      if (params.is_causal) {
+        if (params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 1, 4, kMaskingSpecializationCausal>(params);
+        } else if (params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 2, 4, kMaskingSpecializationCausal>(params);
+        } else {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 3, 4, kMaskingSpecializationCausal>(params);
+        }
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, 3, 4, kMaskingSpecializationCausal>(params);
+        if (params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 1, 4, kMaskingSpecializationDefault>(params);
+        } else if (params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 2, 4, kMaskingSpecializationDefault>(params);
+        } else {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 3, 4, kMaskingSpecializationDefault>(params);
+        }
       }
-    } else {
-      if (params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, 1, 4, kMaskingSpecializationDefault>(params);
-      } else if (params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, 2, 4, kMaskingSpecializationDefault>(params);
+    } 
+    else {
+      if (params.is_causal) {
+        if (params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 1, 4, kMaskingSpecializationCausal>(params);
+        } else if (params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 2, 4, kMaskingSpecializationCausal>(params);
+        } else {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 3, 4, kMaskingSpecializationCausal>(params);
+        }
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, 3, 4, kMaskingSpecializationDefault>(params);
+        if (params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 1, 4, kMaskingSpecializationDefault>(params);
+        } else if (params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 2, 4, kMaskingSpecializationDefault>(params);
+        } else {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 3, 4, kMaskingSpecializationDefault>(params);
+        }
       }
     }
-  }
-  else{
-    if (params.is_causal) {
-      if (params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16,1, 4, kMaskingSpecializationCausal>(params);
-      } else if (params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16,2, 4, kMaskingSpecializationCausal>(params);
+  // non-performance mode
+  } else {
+    if (params.is_bf16) {
+      if (params.is_causal) {
+        if (params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 1, 4, kMaskingSpecializationCausal>(params);
+        } else if (params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 2, 4, kMaskingSpecializationCausal>(params);
+        } else {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 3, 4, kMaskingSpecializationCausal>(params);
+        }
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16,3, 4, kMaskingSpecializationCausal>(params);
+        if (params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 1, 4, kMaskingSpecializationDefault>(params);
+        } else if (params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 2, 4, kMaskingSpecializationDefault>(params);
+        } else {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 3, 4, kMaskingSpecializationDefault>(params);
+        }
       }
     } else {
-      if (params.d > 64) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16,1, 4, kMaskingSpecializationDefault>(params);
-      } else if (params.d > 32) {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16,2, 4, kMaskingSpecializationDefault>(params);
+      if (params.is_causal) {
+        if (params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 1, 4, kMaskingSpecializationCausal>(params);
+        } else if (params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 2, 4, kMaskingSpecializationCausal>(params);
+        } else {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 3, 4, kMaskingSpecializationCausal>(params);
+        }
       } else {
-        run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16,3, 4, kMaskingSpecializationDefault>(params);
+        if (params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 1, 4, kMaskingSpecializationDefault>(params);
+        } else if (params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 2, 4, kMaskingSpecializationDefault>(params);
+        } else {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 3, 4, kMaskingSpecializationDefault>(params);
+        }
       }
     }
   }
