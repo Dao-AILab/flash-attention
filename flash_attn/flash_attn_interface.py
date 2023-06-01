@@ -1,9 +1,16 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import flash_attn_cuda
 
+if os.environ.get('FLASH_ATTENTION_INTERNAL_DETERMINISTIC', False):
+    is_deterministic = True
+
+if os.environ.get('FLASH_ATTENTION_INTERNAL_PERFORMANCE_MODE', False):
+    is_performance_mode = True
 
 def _get_block_size(device, head_dim, is_dropout):
     assert head_dim % 8 == 0 and head_dim <= 128
@@ -247,7 +254,7 @@ class FlashAttnQKVPackedSplitFunc(torch.autograd.Function):
 
 
 def flash_attn_unpadded_qkvpacked_func(qkv, cu_seqlens, max_seqlen, dropout_p, softmax_scale=None,
-                                       causal=False, is_deterministic=False, is_performance_mode=False, return_attn_probs=False):
+                                       causal=False, is_deterministic=is_deterministic, is_performance_mode=is_performance_mode, return_attn_probs=False):
     """dropout_p should be set to 0.0 during evaluation
     Arguments:
         qkv: (total, 3, nheads, headdim), where total = total number of tokens in the batch.
@@ -275,8 +282,8 @@ def flash_attn_unpadded_qkvpacked_func(qkv, cu_seqlens, max_seqlen, dropout_p, s
 
 
 def flash_attn_unpadded_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                                      dropout_p, softmax_scale=None, causal=False, is_deterministic=False, is_performance_mode=False,
-                                      return_attn_probs=False):
+                                      dropout_p, softmax_scale=None, causal=False, 
+                                      is_deterministic=is_deterministic, is_performance_mode=is_performance_mode, return_attn_probs=False):
     """dropout_p should be set to 0.0 during evaluation
     Arguments:
         q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
@@ -309,7 +316,8 @@ def flash_attn_unpadded_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_k, max_seq
 
 
 def flash_attn_unpadded_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                             dropout_p, softmax_scale=None, causal=False, is_deterministic=False, is_performance_mode=False, return_attn_probs=False):
+                             dropout_p, softmax_scale=None, 
+                             causal=False, is_deterministic=is_deterministic, is_performance_mode=is_performance_mode, return_attn_probs=False):
     """dropout_p should be set to 0.0 during evaluation
     Arguments:
         q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
@@ -343,7 +351,7 @@ def flash_attn_unpadded_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
 
 def flash_attn_unpadded_qkvpacked_split_func(
         qkv, cu_seqlens, max_seqlen0, max_seqlen1, batch_size0, dropout_p, softmax_scale=None,
-        causal=False, is_deterministic=False, is_performance_mode=False, return_attn_probs=False):
+        causal=False, is_deterministic=is_deterministic, is_performance_mode=is_performance_mode, return_attn_probs=False):
     """
     Split attention into 2 kernels running on 2 separate streams for performance reason:
     e.g., if the batch has some sequences of length <= 128 and some > 128, it might be faster to
@@ -379,7 +387,7 @@ def flash_attn_unpadded_qkvpacked_split_func(
 
 
 def flash_attn_func(qkv, cu_seqlens, dropout_p, max_s, softmax_scale=None, causal=False, 
-        is_deterministic=False, is_performance_mode=False, return_attn_probs=False):
+        is_deterministic=is_deterministic, is_performance_mode=is_performance_mode, return_attn_probs=False):
     """For backward-compatibility only, will remove soon.
     dropout_p should be set to 0.0 during evaluation
     """
