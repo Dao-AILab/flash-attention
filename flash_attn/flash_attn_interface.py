@@ -29,7 +29,7 @@ def _flash_attn_forward(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
 
 
 def _flash_attn_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k,
-                         max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, causal, num_splits=0,
+                         max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, causal, is_deterministic, is_performance_mode, num_splits=0,
                          generator=None):
     """
     num_splits: whether to parallelize over the seqlen_k dimension (num_splits > 1) or
@@ -40,7 +40,7 @@ def _flash_attn_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens
     """
     _, _, _, softmax_d = flash_attn_cuda.bwd(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k,
-        max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, True, causal, num_splits, generator)
+        max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, True, causal, is_deterministic, is_performance_mode, num_splits, generator)
     # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
     #     breakpoint()
     return dq, dk, dv, softmax_d
@@ -49,7 +49,7 @@ def _flash_attn_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, qkv, cu_seqlens, max_seqlen, dropout_p, softmax_scale, causal, return_softmax):
+    def forward(ctx, qkv, cu_seqlens, max_seqlen, dropout_p, softmax_scale, causal, is_deterministic, is_performance_mode, return_softmax):
         # Save rng_state because the backward pass will regenerate the dropout mask
         rng_state = torch.cuda.get_rng_state() if dropout_p > 0 else None
         if softmax_scale is None:
@@ -64,6 +64,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         ctx.max_seqlen = max_seqlen
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.is_deterministic = deterministic
+        ctx.is_performance_mode = is_performance_mode
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -77,8 +79,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         _flash_attn_backward(
             dout, qkv[:, 0], qkv[:, 1], qkv[:, 2], out, softmax_lse,
             dqkv[:, 0], dqkv[:, 1], dqkv[:, 2], cu_seqlens, cu_seqlens,
-            ctx.max_seqlen, ctx.max_seqlen, ctx.dropout_p, ctx.softmax_scale, ctx.causal
-        )
+            ctx.max_seqlen, ctx.max_seqlen, ctx.dropout_p, ctx.softmax_scale, 
+            ctx.causal, ctx.is_deterministic, ctx.is_performance_mode)
         if rng_state is not None:
             torch.cuda.set_rng_state(cur_rng_state)
         return dqkv, None, None, None, None, None, None
@@ -88,7 +90,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, kv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p,
-                softmax_scale, causal, return_softmax):
+                softmax_scale, causal, is_deterministic, is_performance_mode, return_softmax):
         # Save rng_state because the backward pass will regenerate the dropout mask
         rng_state = torch.cuda.get_rng_state() if dropout_p > 0 else None
         if softmax_scale is None:
@@ -103,6 +105,8 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         ctx.max_seqlen_k = max_seqlen_k
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.is_deterministic = deterministic
+        ctx.is_performance_mode = is_performance_mode 
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -116,8 +120,8 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         _flash_attn_backward(
             dout, q, kv[:, 0], kv[:, 1], out, softmax_lse,
             dq, dkv[:, 0], dkv[:, 1], cu_seqlens_q, cu_seqlens_k,
-            ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.dropout_p, ctx.softmax_scale, ctx.causal
-        )
+            ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.dropout_p, ctx.softmax_scale, 
+            ctx.causal, ctx.is_deterministic, ctx.is_performance_mode)
         if rng_state is not None:
             torch.cuda.set_rng_state(cur_rng_state)
         return dq, dkv, None, None, None, None, None, None, None, None
@@ -127,7 +131,7 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p,
-                softmax_scale, causal, return_softmax):
+                softmax_scale, causal, is_deterministic, is_performance_mode, return_softmax):
         # Save rng_state because the backward pass will regenerate the dropout mask
         rng_state = torch.cuda.get_rng_state() if dropout_p > 0 else None
         if softmax_scale is None:
@@ -142,6 +146,8 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.max_seqlen_k = max_seqlen_k
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.is_deterministic = deterministic
+        ctx.is_performance_mode = is_performance_mode         
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -153,8 +159,8 @@ class FlashAttnFunc(torch.autograd.Function):
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
             dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k,
-            ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.dropout_p, ctx.softmax_scale, ctx.causal
-        )
+            ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.dropout_p, ctx.softmax_scale, 
+            ctx.causal, ctx.is_deterministic, ctx.is_performance_mode)
         if rng_state is not None:
             torch.cuda.set_rng_state(cur_rng_state)
         return dq, dk, dv, None, None, None, None, None, None, None, None
@@ -164,7 +170,7 @@ class FlashAttnQKVPackedSplitFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, qkv, cu_seqlens, max_seqlen0, max_seqlen1, batch_size0, dropout_p,
-                softmax_scale, causal, return_softmax):
+                softmax_scale, causal, is_deterministic, is_performance_mode, return_softmax):
         # Save rng_state because the backward pass will regenerate the dropout mask
         if dropout_p > 0:
             rng_state0 = torch.cuda.get_rng_state()
@@ -196,6 +202,8 @@ class FlashAttnQKVPackedSplitFunc(torch.autograd.Function):
         ctx.batch_size0 = batch_size0
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.is_deterministic = deterministic
+        ctx.is_performance_mode = is_performance_mode
         if not return_softmax:
             return out
         else:
@@ -223,16 +231,15 @@ class FlashAttnQKVPackedSplitFunc(torch.autograd.Function):
             dout, qkv[:, 0], qkv[:, 1], qkv[:, 2], out, softmax_lse0,
             dqkv[:, 0], dqkv[:, 1], dqkv[:, 2], cu_seqlens[:batch_size0 + 1],
             cu_seqlens[:batch_size0 + 1], ctx.max_seqlen0, ctx.max_seqlen0, ctx.dropout_p,
-            ctx.softmax_scale, ctx.causal
-        )
+            ctx.softmax_scale, ctx.causal, ctx.is_deterministic, ctx.is_performance_mode))
         s = torch.cuda.Stream()
         with torch.cuda.stream(s):
             _flash_attn_backward(
                 dout, qkv[:, 0], qkv[:, 1], qkv[:, 2], out, softmax_lse1,
                 dqkv[:, 0], dqkv[:, 1], dqkv[:, 2], cu_seqlens[batch_size0:],
                 cu_seqlens[batch_size0:], ctx.max_seqlen1, ctx.max_seqlen1, ctx.dropout_p,
-                ctx.softmax_scale, ctx.causal, generator=generator1
-            )
+                ctx.softmax_scale, ctx.causal, ctx.is_deterministic, ctx.is_performance_mode,
+                generator=generator1)
         torch.cuda.current_stream().wait_stream(s)
         if rng_state0 is not None:
             torch.cuda.set_rng_state(cur_rng_state)
@@ -240,7 +247,7 @@ class FlashAttnQKVPackedSplitFunc(torch.autograd.Function):
 
 
 def flash_attn_unpadded_qkvpacked_func(qkv, cu_seqlens, max_seqlen, dropout_p, softmax_scale=None,
-                                       causal=False, return_attn_probs=False):
+                                       causal=False, is_deterministic=False, is_performance_mode=False, return_attn_probs=False):
     """dropout_p should be set to 0.0 during evaluation
     Arguments:
         qkv: (total, 3, nheads, headdim), where total = total number of tokens in the batch.
@@ -264,11 +271,11 @@ def flash_attn_unpadded_qkvpacked_func(qkv, cu_seqlens, max_seqlen, dropout_p, s
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     return FlashAttnQKVPackedFunc.apply(qkv, cu_seqlens, max_seqlen, dropout_p, softmax_scale,
-                                        causal, return_attn_probs)
+                                        causal, is_deterministic, is_performance_mode, return_attn_probs)
 
 
 def flash_attn_unpadded_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                                      dropout_p, softmax_scale=None, causal=False,
+                                      dropout_p, softmax_scale=None, causal=False, is_deterministic=False, is_performance_mode=False,
                                       return_attn_probs=False):
     """dropout_p should be set to 0.0 during evaluation
     Arguments:
@@ -297,12 +304,12 @@ def flash_attn_unpadded_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_k, max_seq
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     return FlashAttnKVPackedFunc.apply(q, kv, cu_seqlens_q, cu_seqlens_k,
-                                       max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, causal,
+                                       max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, causal, is_deterministic, is_performance_mode,
                                        return_attn_probs)
 
 
 def flash_attn_unpadded_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                             dropout_p, softmax_scale=None, causal=False, return_attn_probs=False):
+                             dropout_p, softmax_scale=None, causal=False, is_deterministic=False, is_performance_mode=False, return_attn_probs=False):
     """dropout_p should be set to 0.0 during evaluation
     Arguments:
         q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
@@ -331,12 +338,12 @@ def flash_attn_unpadded_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     return FlashAttnFunc.apply(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                               dropout_p, softmax_scale, causal, return_attn_probs)
+                               dropout_p, softmax_scale, causal, is_deterministic, is_performance_mode, return_attn_probs)
 
 
 def flash_attn_unpadded_qkvpacked_split_func(
         qkv, cu_seqlens, max_seqlen0, max_seqlen1, batch_size0, dropout_p, softmax_scale=None,
-        causal=False, return_attn_probs=False):
+        causal=False, is_deterministic=False, is_performance_mode=False, return_attn_probs=False):
     """
     Split attention into 2 kernels running on 2 separate streams for performance reason:
     e.g., if the batch has some sequences of length <= 128 and some > 128, it might be faster to
@@ -368,13 +375,13 @@ def flash_attn_unpadded_qkvpacked_split_func(
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     return FlashAttnQKVPackedSplitFunc.apply(qkv, cu_seqlens, max_seqlen0, max_seqlen1, batch_size0,
-                                             dropout_p, softmax_scale, causal, return_attn_probs)
+                                             dropout_p, softmax_scale, causal, is_deterministic, is_performance_mode, return_attn_probs)
 
 
-def flash_attn_func(qkv, cu_seqlens, dropout_p, max_s, softmax_scale=None, causal=False,
-                     return_attn_probs=False):
+def flash_attn_func(qkv, cu_seqlens, dropout_p, max_s, softmax_scale=None, causal=False, 
+        is_deterministic=False, is_performance_mode=False, return_attn_probs=False):
     """For backward-compatibility only, will remove soon.
     dropout_p should be set to 0.0 during evaluation
     """
     return flash_attn_unpadded_qkvpacked_func(qkv, cu_seqlens, max_s, dropout_p, softmax_scale,
-                                              causal, return_attn_probs)
+                                              causal, is_deterministic, is_performance_mode, return_attn_probs)
