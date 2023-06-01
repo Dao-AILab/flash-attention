@@ -269,10 +269,8 @@ void set_params_dgrad(FmhaDgradParams &params,
 
     // Set this to probability of keeping an element to simplify things.
     params.p_dropout = p_dropout;
-
     params.is_causal = is_causal;
-
-    params.is_deterministic = is_determinisitc;
+    params.is_deterministic = is_deterministic;
     params.is_performance_mode = is_performance_mode;
 }
 
@@ -997,7 +995,9 @@ bool bwd_test(bool do_verification){
     const unsigned long long offset = 0;           
     float softmax_scale = 1/sqrt(d);  
     bool zero_tensors = true;    
-    bool is_causal = false;       
+    bool is_causal = false;     
+    bool is_deterministic = true;
+    bool is_performance_mode = true;  
     bool return_softmax = false;  
     int num_splits = 0;    
     c10::optional<at::Generator> gen_ = c10::nullopt;
@@ -1033,6 +1033,8 @@ bool bwd_test(bool do_verification){
             softmax_scale,
             zero_tensors,
             is_causal,
+	    is_deterministic,
+	    is_performance_mode,
             num_splits,
             gen_);
     using F16 = ck::half_t;
