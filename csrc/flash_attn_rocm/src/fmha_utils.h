@@ -17,9 +17,9 @@
 
 #include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
 #include "ck/tensor_operation/gpu/device/tensor_specialization.hpp"
-#include "ck/tensor_operation/gpu/device/impl/device_grouped_multihead_attention_backward_xdl_cshuffle.hpp"
+#include "ck/tensor_operation/gpu/device/impl/device_grouped_multihead_attention_backward_xdl_cshuffle_v1.hpp"
 #include "ck/tensor_operation/gpu/device/impl/device_grouped_multihead_attention_backward_xdl_cshuffle_v2.hpp"
-#include "ck/tensor_operation/gpu/device/impl/device_grouped_gemm_softmax_gemm_permute_train_xdl_cshuffle.hpp"
+#include "ck/tensor_operation/gpu/device/impl/device_grouped_multihead_attention_forward_xdl_cshuffle.hpp"
 #include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
 
 #include "ck/library/utility/check_err.hpp"
@@ -49,7 +49,7 @@
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-enum Data_type { DATA_TYPE_FP16, DATA_TYPE_BF16, DATA_TYPE_FP32, DATA_TYPE_INT32, DATA_TYPE_INT8 };
+enum DataType {kFloat16, kFloat32, kBFloat16, kInt32, kInt8};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -76,17 +76,17 @@ enum Data_type { DATA_TYPE_FP16, DATA_TYPE_BF16, DATA_TYPE_FP32, DATA_TYPE_INT32
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static inline size_t get_size_in_bytes( size_t n, Data_type dtype ) {
+static inline size_t get_size_in_bytes( size_t n, DataType dtype ) {
     switch( dtype ) {
-    case DATA_TYPE_FP32:
+    case kFloat32:
         return n * 4;
-    case DATA_TYPE_FP16:
+    case kFloat16:
         return n * 2;
-    case DATA_TYPE_BF16:
+    case kBFloat16:
         return n * 2;
-    case DATA_TYPE_INT32:
+    case kInt32:
         return n * 4;
-    case DATA_TYPE_INT8:
+    case kInt8:
         return n;
     default:
         assert( false );
