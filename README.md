@@ -160,54 +160,13 @@ Run the container using the following command:
 docker run -it --network host --ipc host --device /dev/dri --device /dev/kfd --cap-add SYS_PTRACE --group-add video --security-opt seccomp=unconfined [IMAGE NAME you like]
 ```
 
-There are two settings which either passes the unit tests or has better performance:
-### Performance Mode
-#### How to Build
-This is how the dockerfile builds flash-attention in default where the RTZ flag is enabled in the setup.py. 
-
-#### How to Run
-Flash-attention will use non-deterministic forward and backward by default, but you can change the environment variable in order to use deterministic:
-```sh
-export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=1
-```
-
-Then to run the benchmark against PyTorch standard attention: 
+Flash-attention in the dockerfile will have the best performance automatically. 
+To run the benchmark against PyTorch standard attention: 
 ```
 PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
 ```
 
-### Unit Test Mode
-#### How to build
-In order to pass unit tests, the unit test mode needs to be turned on.
-
-Firstly, rebuild flash-attention with RTZ disabled, by changing the compiling flag in the setup.py:
-```
--DFLASH_ATTENTION_INTERNAL_USE_RTZ=0
-```
-
-Then compile flash-attention from source which may take a while:
-```
-python setup.py install
-```
-
-Before running unit tests, the unit test mode and deterministic flags should be both turned on by setting the environment variables:
-```sh
-export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=1
-export FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE=1
-```
-
-Run the unit tests:
-```sh
-pytest tests/test_flash_attn.py
-```
-
-FlashAttention currently supports:
-1. MI200 GPUs (MI210, MI250).
-2. fp16 and bf16.
-3. Head dimensions that are multiples of 8, up to 128 (e.g., 8, 16, 24, ..., 128).
-
-### Status (Results on MI250):
-Benchmark results(deterministic off, unit test mode is off, RTZ):
+Benchmark results(MI250, deterministic off, unit test mode off, RTZ):
 ```
 PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
 FlashAttention - Forward pass
@@ -230,43 +189,40 @@ PyTorch Standard Attention - Forward + Backward pass
   1 measurement, 30 runs , 128 threads
 ```
 
-Unit tests results(deterministic is on, unit test mode is on, RTN):
-```
-collected 4961 items                                                                                                                                                           
+### Unit Test Mode
+#### How to build
+In order to pass unit tests, several changes are needed.
 
-tests/test_flash_attn.py ............................................................................................................................................... [  2%]
-........................................................................................................................................................................ [  6%]
-........................................................................................................................................................................ [  9%]
-........................................................................................................................................................................ [ 13%]
-........................................................................................................................................................................ [ 16%]
-........................................................................................................................................................................ [ 19%]
-........................................................................................................................................................................ [ 23%]
-........................................................................................................................................................................ [ 26%]
-........................................................................................................................................................................ [ 29%]
-.................................................................................................ssssssssssssssssssssssssssssssssssssssssssssssss....................... [ 33%]
-........................................................................................................................................................................ [ 36%]
-........................................................................................................................................................................ [ 40%]
-........................................................................................................................................................................ [ 43%]
-..ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 46%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 50%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 53%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 57%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 60%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 63%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 67%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 70%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 73%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 77%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 80%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 84%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 87%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 90%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 94%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 97%]
-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss                                                       [100%]
-
-================================================================ 2113 passed, 2848 skipped in 128.24s (0:02:08) ================================================================
+Firstly, build flash-attention from source with RTZ disabled, by changing the compiling flag in the setup.py:
 ```
+-DFLASH_ATTENTION_INTERNAL_USE_RTZ=0
+```
+
+Then compile flash-attention from source which may take a while:
+```
+python setup.py install
+```
+
+Before running unit tests, the unit test mode and deterministic flags should be both turned on by setting the environment variables:
+```sh
+export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=1
+export FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE=1
+```
+
+Run the unit tests:
+```sh
+pytest tests/test_flash_attn.py
+```
+
+Unit tests results(MI250, deterministic on, unit test mode on, RTN):
+```
+2113 passed, 2848 skipped in 128.24s (0:02:08)
+```
+
+FlashAttention currently supports:
+1. MI200 GPUs (MI210, MI250).
+2. fp16 and bf16.
+3. Head dimensions that are multiples of 8, up to 128 (e.g., 8, 16, 24, ..., 128).
 
 ## When you encounter issues
 
