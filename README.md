@@ -23,20 +23,37 @@ As Triton is a higher-level language than CUDA, it might be easier to understand
 and experiment with. The notations in the Triton implementation are also closer
 to what's used in our paper.
 
+## Beta release (0.2) for ROCm
 
-## Beta release (0.2).
-
-To install (requiring CUDA 11, NVCC, and an Turing or Ampere GPU):
+Build the Dockerfile:
 ```sh
-pip install flash-attn
+docker build -f Dockerfile.rocm .
 ```
 
-Alternatively you can compile from source:
+Run the container using the following command:
+```sh
+docker run -it --network host --ipc host --device /dev/dri --device /dev/kfd --cap-add SYS_PTRACE --group-add video --security-opt seccomp=unconfined <docker image>
 ```
+
+To use RTZ mode, change the compiling flag in setup.py:
+```sh
+-DFLASH_ATTENTION_INTERNAL_USE_RTZ=1
+```
+
+To compile flash-attention from source:
+```sh
 python setup.py install
 ```
 
-Interface: `src/flash_attention.py`
+To use deterministic forward and backward, change the environment variable:
+```sh
+export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=1
+```
+
+To enable performance mode (BF16 Gemm, FP16 Output data), change the environment variable:
+```sh
+export FLASH_ATTENTION_INTERNAL_PERFORMANCE_MODE=1
+```
 
 To run the benchmark against PyTorch standard attention: 
 ```

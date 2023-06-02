@@ -30,7 +30,8 @@ void set_params_fprop(FmhaFpropParams &params,
                       void *softmax_lse_d,
                       float p_dropout,
                       float softmax_scale,
-                      bool is_causal) {
+                      bool is_causal,
+                      bool is_deterministic) {
 
     DataType acc_type = kFloat32;
     DataType data_type = !(q.dtype() == at::kBFloat16) ? kFloat16 : kBFloat16;
@@ -120,8 +121,8 @@ void set_params_fprop(FmhaFpropParams &params,
 
     // Set this to probability of keeping an element to simplify things.
     params.p_dropout = p_dropout;
-
     params.is_causal = is_causal;
+    params.is_deterministic = is_deterministic;
 }
 
 void set_params_dgrad(FmhaDgradParams &params,
@@ -210,7 +211,8 @@ void set_params_dgrad(FmhaDgradParams &params,
             params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
             params.qgrad_ptr.push_back(reinterpret_cast<void*>(dq_ptr));
             q_ptr = q_ptr + temp_q_stride;
-            dq_ptr = dq_ptr + temp_q_stride * 2;
+            // dq_ptr = dq_ptr + temp_q_stride * 2;
+            dq_ptr = dq_ptr + temp_q_stride;
         }else{
             //std::cout << "q.is_not_contiguous()" << std::endl;
             auto q_each_tmp = q.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
@@ -225,7 +227,8 @@ void set_params_dgrad(FmhaDgradParams &params,
             params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr));
             params.kgrad_ptr.push_back(reinterpret_cast<void*>(dk_ptr));
             k_ptr = k_ptr + temp_k_stride;
-            dk_ptr = dk_ptr + temp_k_stride * 2;
+            // dk_ptr = dk_ptr + temp_k_stride * 2;
+            dk_ptr = dk_ptr + temp_k_stride;
         }else{
             //std::cout << "k.is_not_contiguous()" << std::endl;
             auto k_each_tmp = k.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
@@ -240,7 +243,8 @@ void set_params_dgrad(FmhaDgradParams &params,
             params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr)); 
             params.vgrad_ptr.push_back(reinterpret_cast<void*>(dv_ptr));
             v_ptr = v_ptr + temp_k_stride;   
-            dv_ptr = dv_ptr + temp_k_stride * 2;
+            // dv_ptr = dv_ptr + temp_k_stride * 2;
+            dv_ptr = dv_ptr + temp_k_stride;
         }else{
             //std::cout << "v.is_not_contiguous()" << std::endl;
             auto v_each_tmp = v.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
@@ -287,6 +291,7 @@ mha_fwd(const at::Tensor &q,
         const float softmax_scale,
         const bool zero_tensors,
         const bool is_causal,
+        const bool is_deterministic,
         const bool return_softmax, // in rocm ,this will return the random number matrix when doing dropout
         const int num_splits,      // num_splits is not used in rocm
         c10::optional<at::Generator> gen_) {
@@ -376,7 +381,8 @@ mha_fwd(const at::Tensor &q,
                      softmax_lse.data_ptr(),
                      p_dropout,
                      softmax_scale,
-                     is_causal);
+                     is_causal,
+                     is_deterministic);
 
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
@@ -638,6 +644,7 @@ bool fwd_test(bool do_verification){
     float softmax_scale = 0.125;
     bool zero_tensors = true;
     bool is_causal = false;
+    bool is_deterministic = true;
     bool return_softmax = true;
     int num_splits = 0;
 
@@ -656,6 +663,7 @@ bool fwd_test(bool do_verification){
             softmax_scale,
             zero_tensors,
             is_causal,
+            is_deterministic,
             return_softmax,
             num_splits,
             gen_);
@@ -1013,6 +1021,7 @@ bool bwd_test(bool do_verification){
                   softmax_scale,
                   zero_tensors,
                   is_causal,
+                  is_deterministic,
                   return_softmax,
                   num_splits,
                   gen_)[0];
@@ -1033,8 +1042,8 @@ bool bwd_test(bool do_verification){
             softmax_scale,
             zero_tensors,
             is_causal,
-	    is_deterministic,
-	    is_performance_mode,
+            is_deterministic,
+            is_performance_mode,
             num_splits,
             gen_);
     using F16 = ck::half_t;
