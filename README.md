@@ -193,6 +193,11 @@ FlashAttention currently supports:
 ### Status (Results on MI250):
 Benchmarks (Deterministic off, Performance mode on, RTZ mode):
 ```
+export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=0
+export FLASH_ATTENTION_INTERNAL_PERFORMANCE_MODE=1
+```
+
+```
 PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
 FlashAttention - Forward pass
   8.32 ms
@@ -215,7 +220,14 @@ PyTorch Standard Attention - Forward + Backward pass
 ```
 
 Unit Tests (Deterministic on, Performance mode off, RTN mode):
+```sh
+export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=1
+export FLASH_ATTENTION_INTERNAL_PERFORMANCE_MODE=0
 ```
+
+```
+pytest -q -s tests/test_flash_attn.py
+
 2113 passed, 2848 skipped
 ```
 
