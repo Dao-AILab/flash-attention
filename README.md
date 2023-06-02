@@ -160,29 +160,45 @@ Run the container using the following command:
 docker run -it --network host --ipc host --device /dev/dri --device /dev/kfd --cap-add SYS_PTRACE --group-add video --security-opt seccomp=unconfined [IMAGE NAME you like]
 ```
 
-To disable RTZ mode, change the compiling flag in setup.py:
-```
--DFLASH_ATTENTION_INTERNAL_USE_RTZ=0
-```
+There are two settings which either passes the unit tests or has better performance:
+### Performance Mode
+#### How to Build
+This is how the dockerfile builds flash-attention in default where the RTZ flag is enabled in the setup.py. 
 
-To compile flash-attention from source:
-```
-python setup.py install
-```
-
-To use deterministic forward and backward, change the environment variable:
+#### How to Run
+Flash-attention will use non-deterministic forward and backward by default, but you can change the environment variable in order to use deterministic:
 ```sh
 export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=1
 ```
 
-To enable performance mode (BF16 Gemm, FP16 Output data), change the environment variable:
-```sh
-export FLASH_ATTENTION_INTERNAL_PERFORMANCE_MODE=1
-```
-
-To run the benchmark against PyTorch standard attention: 
+Then to run the benchmark against PyTorch standard attention: 
 ```
 PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
+```
+
+### Unit Test Mode
+#### How to build
+In order to pass unit tests, the unit test mode needs to be turned on.
+
+Firstly, rebuild flash-attention with RTZ disabled, by changing the compiling flag in the setup.py:
+```
+-DFLASH_ATTENTION_INTERNAL_USE_RTZ=0
+```
+
+Then compile flash-attention from source which may take a while:
+```
+python setup.py install
+```
+
+Before running unit tests, the unit test mode and deterministic flags should be both turned on by setting the environment variables:
+```sh
+export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=1
+export FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE=1
+```
+
+Run the unit tests:
+```sh
+pytest tests/test_flash_attn.py
 ```
 
 FlashAttention currently supports:
@@ -191,12 +207,7 @@ FlashAttention currently supports:
 3. Head dimensions that are multiples of 8, up to 128 (e.g., 8, 16, 24, ..., 128).
 
 ### Status (Results on MI250):
-Benchmarks (Deterministic off, Performance mode on, RTZ mode):
-```sh
-export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=0
-export FLASH_ATTENTION_INTERNAL_PERFORMANCE_MODE=1
-```
-
+Benchmark results(deterministic off, unit test mode is off, RTZ):
 ```
 PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
 FlashAttention - Forward pass
@@ -219,15 +230,8 @@ PyTorch Standard Attention - Forward + Backward pass
   1 measurement, 30 runs , 128 threads
 ```
 
-Unit Tests (Deterministic on, Performance mode off, RTN mode):
-```sh
-export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=1
-export FLASH_ATTENTION_INTERNAL_PERFORMANCE_MODE=0
+Unit tests results(deterministic is on, unit test mode is on, RTN):
 ```
-
-```
-pytest tests/test_flash_attn.py
-
 collected 4961 items                                                                                                                                                           
 
 tests/test_flash_attn.py ............................................................................................................................................... [  2%]
