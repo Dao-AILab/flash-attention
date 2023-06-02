@@ -211,8 +211,8 @@ void set_params_dgrad(FmhaDgradParams &params,
             params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
             params.qgrad_ptr.push_back(reinterpret_cast<void*>(dq_ptr));
             q_ptr = q_ptr + temp_q_stride;
-            // dq_ptr = dq_ptr + temp_q_stride * 2;
-            dq_ptr = dq_ptr + temp_q_stride;
+            dq_ptr = dq_ptr + temp_q_stride * 2;
+            // dq_ptr = dq_ptr + temp_q_stride;
         }else{
             //std::cout << "q.is_not_contiguous()" << std::endl;
             auto q_each_tmp = q.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
@@ -227,8 +227,8 @@ void set_params_dgrad(FmhaDgradParams &params,
             params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr));
             params.kgrad_ptr.push_back(reinterpret_cast<void*>(dk_ptr));
             k_ptr = k_ptr + temp_k_stride;
-            // dk_ptr = dk_ptr + temp_k_stride * 2;
-            dk_ptr = dk_ptr + temp_k_stride;
+            dk_ptr = dk_ptr + temp_k_stride * 2;
+            // dk_ptr = dk_ptr + temp_k_stride;
         }else{
             //std::cout << "k.is_not_contiguous()" << std::endl;
             auto k_each_tmp = k.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
@@ -243,8 +243,8 @@ void set_params_dgrad(FmhaDgradParams &params,
             params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr)); 
             params.vgrad_ptr.push_back(reinterpret_cast<void*>(dv_ptr));
             v_ptr = v_ptr + temp_k_stride;   
-            // dv_ptr = dv_ptr + temp_k_stride * 2;
-            dv_ptr = dv_ptr + temp_k_stride;
+            dv_ptr = dv_ptr + temp_k_stride * 2;
+            // dv_ptr = dv_ptr + temp_k_stride;
         }else{
             //std::cout << "v.is_not_contiguous()" << std::endl;
             auto v_each_tmp = v.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();

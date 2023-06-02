@@ -23,37 +23,20 @@ As Triton is a higher-level language than CUDA, it might be easier to understand
 and experiment with. The notations in the Triton implementation are also closer
 to what's used in our paper.
 
-## Beta release (0.2) for ROCm
 
-Build the Dockerfile:
+## Beta release (0.2).
+
+To install (requiring CUDA 11, NVCC, and an Turing or Ampere GPU):
 ```sh
-docker build -f Dockerfile.rocm .
+pip install flash-attn
 ```
 
-Run the container using the following command:
-```sh
-docker run -it --network host --ipc host --device /dev/dri --device /dev/kfd --cap-add SYS_PTRACE --group-add video --security-opt seccomp=unconfined <docker image>
+Alternatively you can compile from source:
 ```
-
-To use RTZ mode, change the compiling flag in setup.py:
-```sh
--DFLASH_ATTENTION_INTERNAL_USE_RTZ=1
-```
-
-To compile flash-attention from source:
-```sh
 python setup.py install
 ```
 
-To use deterministic forward and backward, change the environment variable:
-```sh
-export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=1
-```
-
-To enable performance mode (BF16 Gemm, FP16 Output data), change the environment variable:
-```sh
-export FLASH_ATTENTION_INTERNAL_PERFORMANCE_MODE=1
-```
+Interface: `src/flash_attention.py`
 
 To run the benchmark against PyTorch standard attention: 
 ```
@@ -155,6 +138,87 @@ To run the tests:
 ```
 pytest -q -s tests/test_flash_attn.py
 ```
+
+## AMD GPU/ROCm support
+
+To install (requiring ROCm, and MI210 or MI250 GPU):
+You can compile from source:
+```
+Launch docker rocm/pytorch:rocm5.4_ubuntu20.04_py3.8_pytorch_1.12.1
+Enter flash_attention
+$patch /opt/conda/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py hipify_patch.patch
+$python setup.py install
+```
+
+Alternatively you can build the whole docker image with flash attention automatically.
+```
+docker build . -f Dockerfile.rocm -t [IMAGE NAME you like]
+```
+
+Run the container using the following command:
+```
+docker run -it --network host --ipc host --device /dev/dri --device /dev/kfd --cap-add SYS_PTRACE --group-add video --security-opt seccomp=unconfined [IMAGE NAME you like]
+```
+
+To disable RTZ mode, change the compiling flag in setup.py:
+```
+-DFLASH_ATTENTION_INTERNAL_USE_RTZ=0
+```
+
+To compile flash-attention from source:
+```
+python setup.py install
+```
+
+To use deterministic forward and backward, change the environment variable:
+```sh
+export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=1
+```
+
+To enable performance mode (BF16 Gemm, FP16 Output data), change the environment variable:
+```sh
+export FLASH_ATTENTION_INTERNAL_PERFORMANCE_MODE=1
+```
+
+To run the benchmark against PyTorch standard attention: 
+```
+PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
+```
+
+FlashAttention currently supports:
+1. MI200 GPUs (MI210, MI250).
+2. fp16 and bf16.
+3. Head dimensions that are multiples of 8, up to 128 (e.g., 8, 16, 24, ..., 128).
+
+### Status (Results on MI250):
+Benchmarks (Deterministic off, Performance mode on, RTZ mode):
+```
+PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
+FlashAttention - Forward pass
+  8.32 ms
+  1 measurement, 30 runs , 128 threads
+FlashAttention - Backward pass
+  40.24 ms
+  1 measurement, 30 runs , 128 threads
+FlashAttention - Forward + Backward pass
+  49.61 ms
+  1 measurement, 30 runs , 128 threads
+PyTorch Standard Attention - Forward pass
+  26.28 ms
+  1 measurement, 30 runs , 128 threads
+PyTorch Standard Attention - Backward pass
+  63.20 ms
+  1 measurement, 30 runs , 128 threads
+PyTorch Standard Attention - Forward + Backward pass
+  89.37 ms
+  1 measurement, 30 runs , 128 threads
+```
+
+Unit Tests (Deterministic on, Performance mode off, RTN mode):
+```
+2113 passed, 2848 skipped
+```
+
 ## When you encounter issues
 
 This alpha release of FlashAttention contains code written for a research
