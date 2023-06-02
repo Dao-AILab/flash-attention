@@ -5,9 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from flash_attn.ops.fused_dense import FusedMLP, ParallelFusedMLP
+    from flash_attn.ops.fused_dense import FusedMLP, ParallelFusedMLP, ColumnParallelLinear, RowParallelLinear
 except ImportError:
     FusedMLP, ParallelFusedMLP = None, None
+    ColumnParallelLinear, RowParallelLinear = None, None
 
 
 class Mlp(nn.Module):
@@ -43,7 +44,7 @@ class GatedMlp(nn.Module):
         self.return_residual = return_residual
         self.fc1 = nn.Linear(in_features, 2 * hidden_features, bias=bias1, **factory_kwargs)
         self.activation = activation
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias1, **factory_kwargs)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias2, **factory_kwargs)
 
     def forward(self, x):
         y = self.fc1(x)
@@ -54,3 +55,27 @@ class GatedMlp(nn.Module):
             y = y * self.activation(gate)
         y = self.fc2(y)
         return y if not self.return_residual else (y, x)
+
+
+class ParallelGatedMlp(GatedMlp):
+    """ Parallel GatedMlp """
+
+    def __init__(self, in_features, process_group, hidden_features=None, out_features=None, activation=F.sigmoid,
+                 bias1=True, bias2=True, multiple_of=256, return_residual=False,
+                 sequence_parallel=True, device=None, dtype=None):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__(in_features, hidden_features=hidden_features, out_features=out_features, activation=activation,
+                         bias1=bias1, bias2=bias2, multiple_of=multiple_of, return_residual=return_residual,
+                         device=device, dtype=dtype)
+        out_features = out_features or in_features
+        hidden_features = hidden_features or int(8 * in_features / 3)
+        hidden_features = (hidden_features + multiple_of - 1) // multiple_of * multiple_of
+
+        if ColumnParallelLinear is None or RowParallelLinear is None:
+            raise ImportError('fused_dense is not installed')
+        self.fc1 = ColumnParallelLinear(in_features, 2 * hidden_features, process_group,
+                                        bias=bias1,
+                                        sequence_parallel=sequence_parallel, **factory_kwargs)
+        self.fc2 = RowParallelLinear(hidden_features, out_features, process_group,
+                                     bias=bias2,
+                                     sequence_parallel=sequence_parallel, **factory_kwargs)
