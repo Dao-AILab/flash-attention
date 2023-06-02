@@ -138,6 +138,92 @@ To run the tests:
 ```
 pytest -q -s tests/test_flash_attn.py
 ```
+
+## AMD GPU/ROCm support
+
+To install (requiring ROCm, and MI210 or MI250 GPU):
+You can compile from source:
+```
+Launch docker rocm/pytorch:rocm5.4_ubuntu20.04_py3.8_pytorch_1.12.1
+Enter flash_attention
+$patch /opt/conda/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py hipify_patch.patch
+$python setup.py install
+```
+
+Alternatively you can build the whole docker image with flash attention automatically.
+```
+docker build . -f Dockerfile.rocm -t [IMAGE NAME you like]
+```
+
+Run the container using the following command:
+```
+docker run -it --network host --ipc host --device /dev/dri --device /dev/kfd --cap-add SYS_PTRACE --group-add video --security-opt seccomp=unconfined [IMAGE NAME you like]
+```
+
+Flash-attention in the dockerfile will have the best performance automatically. 
+To run the benchmark against PyTorch standard attention: 
+```
+PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
+```
+
+Benchmark results(MI250, deterministic off, unit test mode off, RTZ):
+```
+PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
+FlashAttention - Forward pass
+  8.32 ms
+  1 measurement, 30 runs , 128 threads
+FlashAttention - Backward pass
+  40.24 ms
+  1 measurement, 30 runs , 128 threads
+FlashAttention - Forward + Backward pass
+  49.61 ms
+  1 measurement, 30 runs , 128 threads
+PyTorch Standard Attention - Forward pass
+  26.28 ms
+  1 measurement, 30 runs , 128 threads
+PyTorch Standard Attention - Backward pass
+  63.20 ms
+  1 measurement, 30 runs , 128 threads
+PyTorch Standard Attention - Forward + Backward pass
+  89.37 ms
+  1 measurement, 30 runs , 128 threads
+```
+
+### Unit Test Mode
+#### How to build
+In order to pass unit tests, several changes are needed.
+
+Firstly, build flash-attention from source with RTZ disabled, by changing the compiling flag in the setup.py:
+```
+-DFLASH_ATTENTION_INTERNAL_USE_RTZ=0
+```
+
+Then compile flash-attention from source which may take a while:
+```
+python setup.py install
+```
+
+Before running unit tests, the unit test mode and deterministic flags should be both turned on by setting the environment variables:
+```sh
+export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=1
+export FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE=1
+```
+
+Run the unit tests:
+```sh
+pytest tests/test_flash_attn.py
+```
+
+Unit tests results(MI250, deterministic on, unit test mode on, RTN):
+```
+2113 passed, 2848 skipped in 128.24s (0:02:08)
+```
+
+FlashAttention currently supports:
+1. MI200 GPUs (MI210, MI250).
+2. fp16 and bf16.
+3. Head dimensions that are multiples of 8, up to 128 (e.g., 8, 16, 24, ..., 128).
+
 ## When you encounter issues
 
 This alpha release of FlashAttention contains code written for a research
