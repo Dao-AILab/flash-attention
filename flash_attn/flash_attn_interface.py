@@ -7,7 +7,8 @@ import torch.nn.functional as F
 import flash_attn_cuda
 
 IS_DETERMINISTIC = os.environ.get('FLASH_ATTENTION_INTERNAL_DETERMINISTIC', 'False') in ('1')
-IS_PERFORMANCE_MODE = os.environ.get('FLASH_ATTENTION_INTERNAL_PERFORMANCE_MODE', 'False') in ('1')
+IS_UNIT_TEST_MODE = os.environ.get('FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE', 'False') in ('1')
+IS_PERFORMANCE_MODE = not IS_UNIT_TEST_MODE
 
 print("Deterministic: {}".format(IS_DETERMINISTIC))
 print("Performance Mode: {}".format(IS_PERFORMANCE_MODE))
