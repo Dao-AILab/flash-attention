@@ -109,6 +109,7 @@ jobs:
 
       - name: Build wheel
         run: |
+          export FLASH_ATTENTION_FORCE_BUILD="TRUE"
           export FORCE_CUDA="1"
           export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
           export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
