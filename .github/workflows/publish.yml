@@ -68,8 +68,6 @@ jobs:
 
       - name: Install CUDA ${{ matrix.cuda-version }}
         if: ${{ matrix.cuda-version != 'cpu' }}
-        env:
-          OS_VERSION: ${{ runner.release }}
         run: |
           bash .github/workflows/cuda/cu${{ matrix.cuda-version }}-${{ runner.os }}.sh
         shell:
