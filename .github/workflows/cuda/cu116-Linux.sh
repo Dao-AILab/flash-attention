@@ -1,5 +1,7 @@
 #!/bin/bash
 
+echo $OS_VERSION
+
 # Strip the periods from the version number
 OS_VERSION=$(echo $OS_VERSION | tr -d .)
 OS=ubuntu${OS_VERSION}
