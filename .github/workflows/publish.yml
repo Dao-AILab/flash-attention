@@ -51,6 +51,12 @@ jobs:
               torch-version: '1.11.0'
             - cuda-version: '117'
               torch-version: '1.12.0'
+            # Torch only builds cuda 116 for 1.12.0+
+            - cuda-version: '116'
+              torch-version: '1.11.0'
+            # 1.13.0 drops support for cuda 11.3
+            - cuda-version: '113'
+              torch-version: '1.13.0'
 
     steps:
       - name: Checkout
@@ -122,6 +128,10 @@ jobs:
           wheel_name=$(ls dist/*whl | xargs -n 1 basename | sed "s/-/+$tmpname-/2")
           ls dist/*whl |xargs -I {} mv {} dist/${wheel_name}
           echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
+
+      - name: Log Built Wheels
+        run: |
+          ls dist
 
       - name: Upload Release Asset
         id: upload_release_asset 
