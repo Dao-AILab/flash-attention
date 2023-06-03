@@ -150,6 +150,8 @@ jobs:
           pip install ninja packaging setuptools wheel twine
 
       - name: Build core package
+        env:
+          FLASH_ATTENTION_SKIP_CUDA_BUILD: "TRUE"
         run: |
           python setup.py sdist --dist-dir=dist
 
