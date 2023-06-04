@@ -164,6 +164,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install ninja packaging setuptools wheel twine
+          pip install torch
 
       - name: Build core package
         env:
