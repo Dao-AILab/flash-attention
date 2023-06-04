@@ -1,8 +1,11 @@
-# This workflow will upload a Python Package to Release asset
+# This workflow will:
+# - Create a new Github release
+# - Build wheels for supported architectures
+# - Deploy the wheels to the Github release
+# - Release the static code to PyPi
 # For more information see: https://help.github.com/en/actions/language-and-framework-guides/using-python-with-github-actions#publishing-to-package-registries
 
-
-name: Python Package
+name: Build wheels and deploy
 
 on:
   create:

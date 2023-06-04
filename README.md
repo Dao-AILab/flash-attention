@@ -57,6 +57,14 @@ To install:
 pip install flash-attn
 ```
 
+If you see an error about `ModuleNotFoundError: No module named 'torch'`, it's likely because of pypi's installation isolation.
+
+To fix you can run:
+
+```sh
+pip install flash-attn --no-build-isolation
+```
+
 Alternatively you can compile from source:
 ```
 python setup.py install

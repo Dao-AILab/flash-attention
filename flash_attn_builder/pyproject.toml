@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "flash-attn-builder"
+version = "0.1.0"
+description = ""
+authors = ["Pierce Freeman <pierce@freeman.vc>"]
+readme = "README.md"
+packages = [{include = "flash_attn_builder"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

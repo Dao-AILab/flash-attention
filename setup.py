@@ -9,13 +9,15 @@ from packaging.version import parse, Version
 import platform
 
 from setuptools import setup, find_packages
-from setuptools.command.install import install
+from setuptools.command.build import build
 import subprocess
+from setuptools.command.bdist_egg import bdist_egg
 
 import urllib.request
 import urllib.error
 import torch
 from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
+from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 
 with open("README.md", "r", encoding="utf-8") as fh:
@@ -25,6 +27,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
+PACKAGE_NAME = "flash_attn_wheels"
 
 # @pierce - TODO: Update for proper release
 BASE_WHEEL_URL = "https://github.com/piercefreeman/flash-attention/releases/download/{tag_name}/{wheel_name}"
@@ -201,15 +204,17 @@ def get_package_version():
         return str(public_version)
 
 
-class CachedWheelsCommand(install):
-    """
-    Installer hook to scan for existing wheels that match the current platform environment.
-    Falls back to building from source if no wheel is found.
+class CachedWheelsCommand(_bdist_wheel):
+     """
+     The CachedWheelsCommand plugs into the default bdist wheel, which is ran by pip when it cannot
+     find an existing wheel (which is currently the case for all flash attention installs). We use
+     the environment parameters to detect whether there is already a pre-built version of a compatible
+     wheel available and short-circuits the standard full build pipeline.
 
-    """
-    def run(self):
+     """
+     def run(self):
         if FORCE_BUILD:
-            return install.run(self)
+            return build.run(self)
 
         raise_if_cuda_home_none("flash_attn")
 
@@ -223,7 +228,7 @@ class CachedWheelsCommand(install):
         torch_version = f"{torch_version_raw.major}.{torch_version_raw.minor}.{torch_version_raw.micro}"
 
         # Determine wheel URL based on CUDA version, torch version, python version and OS
-        wheel_filename = f'flash_attn-{flash_version}+cu{cuda_version}torch{torch_version}-{python_version}-{python_version}-{platform_name}.whl'
+        wheel_filename = f'{PACKAGE_NAME}-{flash_version}+cu{cuda_version}torch{torch_version}-{python_version}-{python_version}-{platform_name}.whl'
         wheel_url = BASE_WHEEL_URL.format(
             tag_name=f"v{flash_version}",
             wheel_name=wheel_filename
@@ -232,17 +237,28 @@ class CachedWheelsCommand(install):
         
         try:
             urllib.request.urlretrieve(wheel_url, wheel_filename)
-            os.system(f'pip install {wheel_filename}')
-            os.remove(wheel_filename)
+
+            # Make the archive
+            # Lifted from the root wheel processing command
+            # https://github.com/pypa/wheel/blob/cf71108ff9f6ffc36978069acb28824b44ae028e/src/wheel/bdist_wheel.py#LL381C9-L381C85
+            if not os.path.exists(self.dist_dir):
+                os.makedirs(self.dist_dir)
+
+            impl_tag, abi_tag, plat_tag = self.get_tag()
+            archive_basename = f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
+        
+            wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
+            print("Raw wheel path", wheel_path)
+            os.rename(wheel_filename, wheel_path)
         except urllib.error.HTTPError:
             print("Precompiled wheel not found. Building from source...")
             # If the wheel could not be downloaded, build from source
-            install.run(self)
+            super().run()
 
 
 setup(
     # @pierce - TODO: Revert for official release
-    name="flash_attn_wheels",
+    name=PACKAGE_NAME,
     version=get_package_version(),
     packages=find_packages(
         exclude=("build", "csrc", "include", "tests", "dist", "docs", "benchmarks", "flash_attn.egg-info",)
@@ -264,10 +280,10 @@ setup(
     ],
     ext_modules=ext_modules,
     cmdclass={
-        'install': CachedWheelsCommand,
+        'bdist_wheel': CachedWheelsCommand,
         "build_ext": BuildExtension
     } if ext_modules else {
-        'install': CachedWheelsCommand,
+        'bdist_wheel': CachedWheelsCommand,
     },
     python_requires=">=3.7",
     install_requires=[
