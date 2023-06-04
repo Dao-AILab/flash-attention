@@ -57,6 +57,10 @@ jobs:
             # 1.13.0 drops support for cuda 11.3
             - cuda-version: '113'
               torch-version: '1.13.0'
+            # Fails with "Validation Error" on artifact upload
+            - cuda-version: '117'
+              torch-version: '1.13.0'
+              os: ubuntu-20.04
 
     steps:
       - name: Checkout
@@ -144,32 +148,32 @@ jobs:
           asset_name: ${{env.wheel_name}}
           asset_content_type: application/*
 
-  # publish_package:
-  #   name: Publish package
-  #   needs: [build_wheels]
+  publish_package:
+    name: Publish package
+    needs: [build_wheels]
 
-  #   runs-on: ubuntu-latest
+    runs-on: ubuntu-latest
 
-  #   steps:
-  #     - uses: actions/checkout@v3
+    steps:
+      - uses: actions/checkout@v3
 
-  #     - uses: actions/setup-python@v4
-  #       with:
-  #         python-version: '3.10'
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-  #     - name: Install dependencies
-  #       run: |
-  #         pip install ninja packaging setuptools wheel twine
+      - name: Install dependencies
+        run: |
+          pip install ninja packaging setuptools wheel twine
 
-  #     - name: Build core package
-  #       env:
-  #         FLASH_ATTENTION_SKIP_CUDA_BUILD: "TRUE"
-  #       run: |
-  #         python setup.py sdist --dist-dir=dist
+      - name: Build core package
+        env:
+          FLASH_ATTENTION_SKIP_CUDA_BUILD: "TRUE"
+        run: |
+          python setup.py sdist --dist-dir=dist
 
-  #     - name: Deploy
-  #       env:
-  #         TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
-  #         TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-  #       run: |
-  #         python -m twine upload dist/*
+      - name: Deploy
+        env:
+          TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          python -m twine upload dist/*
