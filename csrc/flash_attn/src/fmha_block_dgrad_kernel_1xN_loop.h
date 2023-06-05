@@ -677,7 +677,9 @@ inline __device__ void compute_block_dq_dk_dv_1xN_one_iter(const Params &params,
             // if (Is_dropout) {
             //     dq_out[0] = fmha::fmul4(dq_out[0], params.rp_dropout);
             // }
-            dq_out[0] = fmha::fmul4(dq_out[0], params.scale_bmm1f);
+            for (int jj = 0; jj < Gmem_tile_dq::STGS_PER_LOOP; ++jj) {
+                dq_out[jj] = fmha::fmul4(dq_out[jj], params.scale_bmm1f);
+            }
             // Output the values.
             gmem_dq.template store<elem_type>(dq_out, 0);
         } else  {
