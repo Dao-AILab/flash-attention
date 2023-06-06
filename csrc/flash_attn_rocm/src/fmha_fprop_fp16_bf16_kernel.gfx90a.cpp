@@ -500,7 +500,7 @@ void run_fmha_fp16_bf16_gfx90a(LaunchParams<FmhaFpropParams> &launch_params) {
     FP16_SWITCH(launch_params.params.is_bf16, [&] {
         if(launch_params.params.is_causal){
             if(launch_params.params.d <= 32){
-                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 32, 32,
+                run_fmha_fp16_bf16_gfx90a_loop_<DataType,  128, 128, 32, 32, 32,
                                                             32,  32,  4,  1, 
                                                             S<4, 64, 1>, true, S<4, 64, 1>, true,
                                                             S<16, 16, 1>, 2, 
@@ -508,7 +508,7 @@ void run_fmha_fp16_bf16_gfx90a(LaunchParams<FmhaFpropParams> &launch_params) {
                                                             MaskingSpec_causal>(launch_params);
             }
             else if(launch_params.params.d <= 64){
-                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 64, 32,
+                run_fmha_fp16_bf16_gfx90a_loop_<DataType,  128, 128, 32, 64, 32,
                                                             32,  32,  4,  2,
                                                             S<4, 64, 1>, true, S<4, 64, 1>, true,
                                                             S<16, 16, 1>, 4, 
@@ -516,7 +516,7 @@ void run_fmha_fp16_bf16_gfx90a(LaunchParams<FmhaFpropParams> &launch_params) {
                                                             MaskingSpec_causal>(launch_params);
             }
             else if(launch_params.params.d <= 128){
-                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 128, 32,
+                run_fmha_fp16_bf16_gfx90a_loop_<DataType,  128, 128, 32, 128, 32,
                                                             32,  32,  4,  4, 
                                                             S<4, 64, 1>, true, S<4, 64, 1>, true,
                                                             S<8, 32, 1>, 4, 
@@ -527,7 +527,7 @@ void run_fmha_fp16_bf16_gfx90a(LaunchParams<FmhaFpropParams> &launch_params) {
         }
         else{
             if(launch_params.params.d <= 32){
-                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 32, 32,
+                run_fmha_fp16_bf16_gfx90a_loop_<DataType,  128, 128, 32, 32, 32,
                                                             32,  32,  4,  1, 
                                                             S<4, 64, 1>, true, S<4, 64, 1>, true,
                                                             S<16, 16, 1>, 2, 
@@ -535,7 +535,7 @@ void run_fmha_fp16_bf16_gfx90a(LaunchParams<FmhaFpropParams> &launch_params) {
                                                             MaskingSpec_default>(launch_params);
             }
             else if(launch_params.params.d <= 64){
-                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 64, 32,
+                run_fmha_fp16_bf16_gfx90a_loop_<DataType,  128, 128, 32, 64, 32,
                                                             32,  32,  4,  2, 
                                                             S<4, 64, 1>, true, S<4, 64, 1>, true,
                                                             S<16, 16, 1>, 4, 
@@ -543,7 +543,7 @@ void run_fmha_fp16_bf16_gfx90a(LaunchParams<FmhaFpropParams> &launch_params) {
                                                             MaskingSpec_default>(launch_params);
             }
             else if(launch_params.params.d <= 128){
-                run_fmha_fp16_bf16_gfx90a_loop_<elem_type,  128, 128, 32, 128, 32,
+                run_fmha_fp16_bf16_gfx90a_loop_<DataType,  128, 128, 32, 128, 32,
                                                             32,  32,  4,  4, 
                                                             S<4, 64, 1>, true, S<4, 64, 1>, true,
                                                             S<8, 32, 1>, 4, 
