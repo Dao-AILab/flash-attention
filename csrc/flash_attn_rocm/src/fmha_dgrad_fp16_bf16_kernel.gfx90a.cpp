@@ -35,6 +35,7 @@ using MaskingSpecialization = ck::tensor_operation::device::MaskingSpecializatio
 static constexpr auto kMaskingSpecializationDefault = MaskingSpecialization::MaskDisabled;
 static constexpr auto kMaskingSpecializationCausal = MaskingSpecialization::MaskOutUpperTriangle;
 
+
 struct SimpleDeviceMem {
   SimpleDeviceMem() = delete;
   SimpleDeviceMem(std::size_t mem_size) : p_mem_{} {
@@ -45,6 +46,7 @@ struct SimpleDeviceMem {
 
   void *p_mem_;
 };
+
 
 template <typename InputType, 
           typename OutputType,
@@ -459,23 +461,25 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaDgradParams> &launch
 }
 
 void run_fmha_dgrad_fp16_bf16_gfx90a(LaunchParams<FmhaDgradParams> &launch_params) {
+  using BFloat16 = ck::bhalf_t;
+
   if (launch_params.params.is_performance_mode) {
     FP16_SWITCH(launch_params.params.is_bf16, [&] {
       if (launch_params.params.is_causal) {
         if (launch_params.params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<DataType, DataType, DataType, DropOutType, 1, 8, kMaskingSpecializationCausal>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<DataType, DataType, BFloat16, DropOutType, 1, 4, kMaskingSpecializationCausal>(launch_params);
         } else if (launch_params.params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<DataType, DataType, DataType, DropOutType, 2, 8, kMaskingSpecializationCausal>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<DataType, DataType, BFloat16, DropOutType, 2, 4, kMaskingSpecializationCausal>(launch_params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<DataType, DataType, DataType, DropOutType, 3, 8, kMaskingSpecializationCausal>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<DataType, DataType, BFloat16, DropOutType, 3, 4, kMaskingSpecializationCausal>(launch_params);
         }
       } else {
         if (launch_params.params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<DataType, DataType, DataType, DropOutType, 1, 8, kMaskingSpecializationDefault>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<DataType, DataType, BFloat16, DropOutType, 1, 4, kMaskingSpecializationDefault>(launch_params);
         } else if (launch_params.params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<DataType, DataType, DataType, DropOutType, 2, 8, kMaskingSpecializationDefault>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<DataType, DataType, BFloat16, DropOutType, 2, 4, kMaskingSpecializationDefault>(launch_params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<DataType, DataType, DataType, DropOutType, 3, 8, kMaskingSpecializationDefault>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<DataType, DataType, BFloat16, DropOutType, 3, 4, kMaskingSpecializationDefault>(launch_params);
         }
       }
     }); 
