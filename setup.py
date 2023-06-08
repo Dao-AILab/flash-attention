@@ -9,9 +9,7 @@ from packaging.version import parse, Version
 import platform
 
 from setuptools import setup, find_packages
-from setuptools.command.build import build
 import subprocess
-from setuptools.command.bdist_egg import bdist_egg
 
 import urllib.request
 import urllib.error
@@ -214,7 +212,7 @@ class CachedWheelsCommand(_bdist_wheel):
      """
      def run(self):
         if FORCE_BUILD:
-            return build.run(self)
+            return super().run()
 
         raise_if_cuda_home_none("flash_attn")
 
