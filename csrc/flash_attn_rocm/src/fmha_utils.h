@@ -96,7 +96,7 @@ static inline size_t get_size_in_bytes( size_t n, DataType dtype ) {
 
 static std::tuple<uint64_t, uint64_t> unpack(at::PhiloxCudaState arg) {
   if (arg.captured_) {
-    return std::make_tuple(static_cast<int64_t>(*arg.seed_.ptr), static_cast<uint64_t>(*(arg.offset_.ptr) + arg.offset_intragraph_));
+    return std::make_tuple(static_cast<uint64_t>(*arg.seed_.ptr), static_cast<uint64_t>(*(arg.offset_.ptr) + arg.offset_intragraph_));
   } else {
     return std::make_tuple(arg.seed_.val, arg.offset_.val);
   }
