@@ -1,4 +1,4 @@
---- /opt/conda/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py	2022-11-10 05:54:06.000000000 +0000
+--- /opt/conda/envs/py_3.8/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py	2022-11-10 05:54:06.000000000 +0000
 +++ hipify_python.py	2023-01-16 15:57:25.000000000 +0000
 @@ -816,10 +816,15 @@
                      return m.group(0)
