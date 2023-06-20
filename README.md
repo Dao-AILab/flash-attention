@@ -144,9 +144,16 @@ pytest -q -s tests/test_flash_attn.py
 To install (requiring ROCm, and MI210 or MI250 GPU):
 You can compile from source:
 ```
+Launch docker rocm/pytorch:rocm5.4.2_ubuntu20.04_py3.8_pytorch_2.0.0_preview
+Enter flash_attention
+$patch /opt/conda/envs/py_3.8/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py hipify_patch.patch
+$python setup.py install
+```
+
+```
 Launch docker rocm/pytorch:rocm5.4_ubuntu20.04_py3.8_pytorch_1.12.1
 Enter flash_attention
-$patch /opt/conda/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py hipify_patch.patch
+$patch /opt/conda/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py hipify_patch_orig.patch
 $python setup.py install
 ```
 
