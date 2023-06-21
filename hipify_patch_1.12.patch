@@ -1,0 +1,22 @@
+--- /opt/conda/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py	2022-11-10 05:54:06.000000000 +0000
++++ hipify_python.py	2023-01-16 15:57:25.000000000 +0000
+@@ -816,10 +816,15 @@
+                     return m.group(0)
+                 # Hipify header file first if needed
+                 if header_filepath not in HIPIFY_FINAL_RESULT:
+-                    preprocess_file_and_save_result(output_directory,
+-                                                    header_filepath,
+-                                                    all_files, header_include_dirs, stats, hip_clang_launch,
+-                                                    is_pytorch_extension, clean_ctx, show_progress)
++                    #JCG added skip logic
++                     if "composable_kernel" in header_filepath:
++                         print("Force skipping hipification of CK file: " + header_filepath)
++                         HIPIFY_FINAL_RESULT[header_filepath] = {"hipified_path":header_filepath}
++                     else:
++                         preprocess_file_and_save_result(output_directory,
++                                                         header_filepath,
++                                                         all_files, header_include_dirs, stats, hip_clang_launch,
++                                                         is_pytorch_extension, clean_ctx, show_progress)
+                 hipified_header_filepath = HIPIFY_FINAL_RESULT[header_filepath]["hipified_path"]
+                 return templ.format(os.path.relpath(hipified_header_filepath if hipified_header_filepath is not None
+                                                     else header_filepath, header_dir))

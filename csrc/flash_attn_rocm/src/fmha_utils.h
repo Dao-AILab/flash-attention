@@ -35,6 +35,9 @@
 #define NEW_UNPACK (TORCH_VERSION_MAJOR * 10000 + TORCH_VERSION_MINOR * 100 + TORCH_VERSION_PATCH) > 11300
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#define NEW_UNPACK (TORCH_VERSION_MAJOR * 10000 + TORCH_VERSION_MINOR * 100 + TORCH_VERSION_PATCH) > 11300
+
+
 #define FMHA_CHECK_HIP( call )                                                                     \
     do {                                                                                           \
         hipError_t status_ = call;                                                                 \
@@ -108,4 +111,5 @@ static std::tuple<uint64_t, uint64_t> unpack(at::PhiloxCudaState arg) {
     #endif
   }
 }
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
