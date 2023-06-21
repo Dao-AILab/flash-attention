@@ -133,7 +133,7 @@ if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.
 
 # raise_if_cuda_home_none("flash_attn")
 # # Check, if CUDA11 is installed for compute capability 8.0
-cc_flag = ["-DBUILD_PYTHON_PACKAGE", "-DFLASH_ATTENTION_INTERNAL_USE_RTZ=1"]
+cc_flag = ["-DBUILD_PYTHON_PACKAGE", f"-DFLASH_ATTENTION_INTERNAL_USE_RTZ={os.environ.get('FLASH_ATTENTION_INTERNAL_USE_RTZ', 1)}"]
 # _, bare_metal_major, _ = get_cuda_bare_metal_version(CUDA_HOME)
 # if int(bare_metal_major) < 11:
 #     raise RuntimeError("FlashAttention is only supported on CUDA 11")
@@ -162,13 +162,14 @@ ext_modules.append(
             "csrc/flash_attn_rocm/composable_kernel/library/src/utility/host_tensor.cu"
         ],
         extra_compile_args={
-            "cxx": ["-O3", "-std=c++17"] + generator_flag,
+            "cxx": ["-O3", "-std=c++20"] + generator_flag,
             "nvcc":
                 [
                     "-O3",
-                    "-std=c++17",
+                    "-std=c++20",
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",
+
                 ]
                 + generator_flag
                 + cc_flag
