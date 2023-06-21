@@ -33,8 +33,8 @@ void set_params_fprop(FmhaFpropParams &params,
                       bool is_causal,
                       bool is_deterministic) {
 
-    DataType acc_type = kFloat32;
-    DataType data_type = !(q.dtype() == at::kBFloat16) ? kFloat16 : kBFloat16;
+    auto acc_type = torch::kFloat32;
+    auto data_type = q.dtype();
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -138,9 +138,9 @@ void set_params_dgrad(FmhaDgradParams &params,
                       const at::Tensor& v,
                       const at::Tensor& y,
                       const at::Tensor& ygrad,
-                      at::Tensor& dq,
-                      at::Tensor& dk,
-                      at::Tensor& dv,
+                      at::Tensor &dq,
+                      at::Tensor &dk,
+                      at::Tensor &dv,
                       const at::Tensor& cu_seqlens_q,
                       const at::Tensor& cu_seqlens_k,
                       void *s_d,
@@ -151,8 +151,8 @@ void set_params_dgrad(FmhaDgradParams &params,
                       bool is_deterministic,
                       bool is_performance_mode) {
 
-    DataType acc_type = kFloat32;
-    DataType data_type = q.dtype() == at::kBFloat16 ? kBFloat16 : kFloat16;
+    auto acc_type = torch::kFloat32;
+    auto data_type = q.dtype();
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -189,6 +189,7 @@ void set_params_dgrad(FmhaDgradParams &params,
     char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
     char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
     char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
+
     char* dq_ptr = reinterpret_cast<char*>(dq.data_ptr());
     char* dk_ptr = reinterpret_cast<char*>(dk.data_ptr());
     char* dv_ptr = reinterpret_cast<char*>(dv.data_ptr());
@@ -200,13 +201,15 @@ void set_params_dgrad(FmhaDgradParams &params,
     for (int i = 0; i < b; i++){
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
         int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, data_type);
+        int temp_dq_stride = get_size_in_bytes(d * h * temp_seqlen_q, dq.dtype());
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
         int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, data_type);
+        int temp_dk_stride = get_size_in_bytes(d * h * temp_seqlen_k, dk.dtype());
         if(q.is_contiguous()){
             params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
             params.qgrad_ptr.push_back(reinterpret_cast<void*>(dq_ptr));
             q_ptr = q_ptr + temp_q_stride;
-            dq_ptr = dq_ptr + temp_q_stride;
+            dq_ptr = dq_ptr + temp_dq_stride;
         }else{
             auto q_each_tmp = q.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
             auto qgrad_each_tmp = dq.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
@@ -219,7 +222,7 @@ void set_params_dgrad(FmhaDgradParams &params,
             params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr));
             params.kgrad_ptr.push_back(reinterpret_cast<void*>(dk_ptr));
             k_ptr = k_ptr + temp_k_stride;
-            dk_ptr = dk_ptr + temp_k_stride;
+            dk_ptr = dk_ptr + temp_dk_stride;
         }else{
             auto k_each_tmp = k.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
             auto kgrad_each_tmp = dk.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
@@ -232,7 +235,7 @@ void set_params_dgrad(FmhaDgradParams &params,
             params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr)); 
             params.vgrad_ptr.push_back(reinterpret_cast<void*>(dv_ptr));
             v_ptr = v_ptr + temp_k_stride;   
-            dv_ptr = dv_ptr + temp_k_stride;
+            dv_ptr = dv_ptr + temp_dk_stride;
         }else{
             auto v_each_tmp = v.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
             auto vgrad_each_tmp = dv.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
@@ -417,7 +420,6 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         const int num_splits,
         c10::optional<at::Generator> gen_
 ) {
-    //std::cout << "bwd begin()" << std::endl;
     auto dprops = at::cuda::getCurrentDeviceProperties();
 
     bool is_dropout = p_dropout > 0.0;
@@ -487,7 +489,6 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     // It's possible the softmax_lse_ from the fwd has a different length since blocksize_c could be different.
     // auto softmax_lse = softmax_lse_.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, max_seqlen_q)}).contiguous();
 
-
     at::Tensor softmax_d = at::empty(dq.sizes(), dq.options()).contiguous();
     // at::Tensor softmax_d;
 
@@ -500,44 +501,91 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
-    //std::cout << "bwd set_params_dgrad()" << std::endl;
-    set_params_dgrad(launch_params.params,
-                     batch_size,
-                     max_seqlen_q,
-                     max_seqlen_k,
-                     num_heads,
-                     head_size,
-                     q, k, v, out,
-                     dout, dq, dk, dv,
-                     cu_seqlens_q,
-                     cu_seqlens_k,
-                     nullptr,
-                     softmax_lse.data_ptr(),
-                     p_dropout,
-                     softmax_scale,
-                     is_causal,
-                     is_deterministic,
-                     is_performance_mode);
-    
-    if( is_dropout ) {
-        // See Note [Acquire lock when using random generators]
-        int64_t counter_offset = launch_params.params.b * launch_params.params.h * 32;
-        std::lock_guard<std::mutex> lock(gen->mutex_);
-        launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
-    }
 
-    run_fmha_dgrad_fp16_bf16_gfx90a(launch_params.params);
+    if(!is_performance_mode){
+        at::Tensor dq_tmp = at::empty(dq.sizes(), dq.options().dtype(at::kFloat)).contiguous();
+        at::Tensor dk_tmp = at::empty(dk.sizes(), dk.options().dtype(at::kFloat)).contiguous();
+        at::Tensor dv_tmp = at::empty(dv.sizes(), dv.options().dtype(at::kFloat)).contiguous();
+        dq_tmp.zero_();
+        dk_tmp.zero_();
+        dv_tmp.zero_();
+        set_params_dgrad(launch_params.params,
+                        batch_size,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        num_heads,
+                        head_size,
+                        q, k, v, out,
+                        dout, dq_tmp, dk_tmp, dv_tmp,
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        nullptr,
+                        softmax_lse.data_ptr(),
+                        p_dropout,
+                        softmax_scale,
+                        is_causal,
+                        is_deterministic,
+                        is_performance_mode);
+        
+        if( is_dropout ) {
+            // See Note [Acquire lock when using random generators]
+            int64_t counter_offset = launch_params.params.b * launch_params.params.h * 32;
+            std::lock_guard<std::mutex> lock(gen->mutex_);
+            launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
+        }
 
-    if(!q.is_contiguous()){
-        dq.copy_(torch::cat(launch_params.params.qgrad_tensors, 0), true);
-    }
-    if(!k.is_contiguous()){
-        dk.copy_(torch::cat(launch_params.params.kgrad_tensors, 0), true);
-    }
-    if(!v.is_contiguous()){
-        dv.copy_(torch::cat(launch_params.params.vgrad_tensors, 0), true);
-    }
+        run_fmha_dgrad_fp16_bf16_gfx90a(launch_params);
+        if(!q.is_contiguous()){
+            dq_tmp.copy_(torch::cat(launch_params.params.qgrad_tensors, 0).contiguous(), true);
+        }
+        if(!k.is_contiguous()){
+            dk_tmp.copy_(torch::cat(launch_params.params.kgrad_tensors, 0).contiguous(), true);
+        }
+        if(!v.is_contiguous()){
+            dv_tmp.copy_(torch::cat(launch_params.params.vgrad_tensors, 0).contiguous(), true);
+        }
 
+        dq.copy_(dq_tmp, true);
+        dk.copy_(dk_tmp, true);
+        dv.copy_(dv_tmp, true);
+    }else{
+        set_params_dgrad(launch_params.params,
+                         batch_size,
+                         max_seqlen_q,
+                         max_seqlen_k,
+                         num_heads,
+                         head_size,
+                         q, k, v, out,
+                         dout, dq, dk, dv,
+                         cu_seqlens_q,
+                         cu_seqlens_k,
+                         nullptr,
+                         softmax_lse.data_ptr(),
+                         p_dropout,
+                         softmax_scale,
+                         is_causal,
+                         is_deterministic,
+                         is_performance_mode);
+        
+        if( is_dropout ) {
+            // See Note [Acquire lock when using random generators]
+            int64_t counter_offset = launch_params.params.b * launch_params.params.h * 32;
+            std::lock_guard<std::mutex> lock(gen->mutex_);
+            launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
+        }
+
+        run_fmha_dgrad_fp16_bf16_gfx90a(launch_params);
+
+        if(!q.is_contiguous()){
+            dq.copy_(torch::cat(launch_params.params.qgrad_tensors, 0), true);
+        }
+        if(!k.is_contiguous()){
+            dk.copy_(torch::cat(launch_params.params.kgrad_tensors, 0), true);
+        }
+        if(!v.is_contiguous()){
+            dv.copy_(torch::cat(launch_params.params.vgrad_tensors, 0), true);
+        }
+    }
     return { dq, dk, dv, softmax_d };
 }
 

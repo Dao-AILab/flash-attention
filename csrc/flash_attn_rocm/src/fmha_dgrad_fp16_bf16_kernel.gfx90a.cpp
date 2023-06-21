@@ -53,7 +53,7 @@ template <typename InputType,
           ck::index_t version, 
           ck::index_t c_shuffle_block_transfer_scalar_per_vector_n_per_block,
           MaskingSpecialization masking_specialization>
-void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(FmhaDgradParams &params) {
+void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaDgradParams> &launch_params) {
   using Int32 = int;
   using Int16 = unsigned short;
   using Float32 = float;
@@ -91,13 +91,13 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(FmhaDgradParams &params) {
   static constexpr bool deterministic = true;
   static constexpr bool nondeterministic = false;
 
-  bool is_deterministic = params.is_deterministic;
+  bool is_deterministic = launch_params.params.is_deterministic;
   bool time_kernel = false;
   bool input_permute = true;
   bool output_permute = true;
 
-  float alpha = params.scale_bmm1f;
-  auto seeds = unpack(params.philox_args);
+  float alpha = launch_params.params.scale_bmm1f;
+  auto seeds = unpack(launch_params.params.philox_args);
 
   auto seed_   = std::get<0>(seeds);
   auto offset_ = std::get<1>(seeds);
@@ -111,28 +111,28 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(FmhaDgradParams &params) {
   auto b1_element_op = QkvElementOp{};
   auto c_element_op = YElementOp{};
 
-  auto p_q = params.q_ptr;
-  auto p_k = params.k_ptr;
-  auto p_v = params.v_ptr;
-  auto p_y = params.y_ptr;
-  auto p_z = params.z_ptr;
-  auto p_lse = params.lse_ptr;
-  auto p_ygrad = params.ygrad_ptr;
-  auto p_qgrad = params.qgrad_ptr;
-  auto p_kgrad = params.kgrad_ptr;
-  auto p_vgrad = params.vgrad_ptr;
-  int batch_size = params.b;
-  int num_heads = params.h;
-  int head_dim = params.d;
-  float dropout_ratio = params.p_dropout;
+  auto p_q = launch_params.params.q_ptr;
+  auto p_k = launch_params.params.k_ptr;
+  auto p_v = launch_params.params.v_ptr;
+  auto p_y = launch_params.params.y_ptr;
+  auto p_z = launch_params.params.z_ptr;
+  auto p_lse = launch_params.params.lse_ptr;
+  auto p_ygrad = launch_params.params.ygrad_ptr;
+  auto p_qgrad = launch_params.params.qgrad_ptr;
+  auto p_kgrad = launch_params.params.kgrad_ptr;
+  auto p_vgrad = launch_params.params.vgrad_ptr;
+  int batch_size = launch_params.params.b;
+  int num_heads = launch_params.params.h;
+  int head_dim = launch_params.params.d;
+  float dropout_ratio = launch_params.params.p_dropout;
   // init the instance with parameters
   auto run_kernel = [&]<typename DeviceGemmInstance>(DeviceGemmInstance gemm) {
     std::vector<typename DeviceGemmInstance::ProblemDesc> problem_descs;
     for (size_t i = 0; i < batch_size; i++) {
-      int M = params.host_seqlens_q[i + 1] -
-              params.host_seqlens_q[i]; // seqlen Q
-      int N = params.host_seqlens_k[i + 1] -
-              params.host_seqlens_k[i]; // seqlen K
+      int M = launch_params.params.host_seqlens_q[i + 1] -
+              launch_params.params.host_seqlens_q[i]; // seqlen Q
+      int N = launch_params.params.host_seqlens_k[i + 1] -
+              launch_params.params.host_seqlens_k[i]; // seqlen K
       int K = head_dim;
       int O = head_dim;
       int G0 = 1; // G0 = batch_size
@@ -227,7 +227,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(FmhaDgradParams &params) {
       return;
     }
 
-    float ave_time = invoker.Run(argument, StreamConfig{nullptr, time_kernel});
+    float ave_time = invoker.Run(argument, StreamConfig{launch_params.stream, time_kernel});
 
     if (time_kernel) {
       std::cout << "time elpase is " << ave_time << " ms" << std::endl;
@@ -458,88 +458,88 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(FmhaDgradParams &params) {
   }
 }
 
-void run_fmha_dgrad_fp16_bf16_gfx90a(FmhaDgradParams &params) {
+void run_fmha_dgrad_fp16_bf16_gfx90a(LaunchParams<FmhaDgradParams> &launch_params) {
   using Int32 = int;
   using Int16 = unsigned short;
   using Float32 = float;
   using Float16 = ck::half_t;
   using BFloat16 = ck::bhalf_t;
 
-  if (params.is_performance_mode) {
-    if (params.is_bf16) {
-      if (params.is_causal) {
-        if (params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 1, 8, kMaskingSpecializationCausal>(params);
-        } else if (params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 2, 8, kMaskingSpecializationCausal>(params);
+  if (launch_params.params.is_performance_mode) {
+    if (launch_params.params.is_bf16) {
+      if (launch_params.params.is_causal) {
+        if (launch_params.params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, BFloat16, Int32, BFloat16, 1, 8, kMaskingSpecializationCausal>(launch_params);
+        } else if (launch_params.params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, BFloat16, Int32, BFloat16, 2, 8, kMaskingSpecializationCausal>(launch_params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 3, 8, kMaskingSpecializationCausal>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, BFloat16, Int32, BFloat16, 3, 8, kMaskingSpecializationCausal>(launch_params);
         }
       } else {
-        if (params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 1, 8, kMaskingSpecializationDefault>(params);
-        } else if (params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 2, 8, kMaskingSpecializationDefault>(params);
+        if (launch_params.params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, BFloat16, Int32, BFloat16, 1, 8, kMaskingSpecializationDefault>(launch_params);
+        } else if (launch_params.params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, BFloat16, Int32, BFloat16, 2, 8, kMaskingSpecializationDefault>(launch_params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float16, Int32, BFloat16, 3, 8, kMaskingSpecializationDefault>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, BFloat16, Int32, BFloat16, 3, 8, kMaskingSpecializationDefault>(launch_params);
         }
       }
     } 
     else {
-      if (params.is_causal) {
-        if (params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 1, 8, kMaskingSpecializationCausal>(params);
-        } else if (params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 2, 8, kMaskingSpecializationCausal>(params);
+      if (launch_params.params.is_causal) {
+        if (launch_params.params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 1, 8, kMaskingSpecializationCausal>(launch_params);
+        } else if (launch_params.params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 2, 8, kMaskingSpecializationCausal>(launch_params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 3, 8, kMaskingSpecializationCausal>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 3, 8, kMaskingSpecializationCausal>(launch_params);
         }
       } else {
-        if (params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 1, 8, kMaskingSpecializationDefault>(params);
-        } else if (params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 2, 8, kMaskingSpecializationDefault>(params);
+        if (launch_params.params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 1, 8, kMaskingSpecializationDefault>(launch_params);
+        } else if (launch_params.params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 2, 8, kMaskingSpecializationDefault>(launch_params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 3, 8, kMaskingSpecializationDefault>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 3, 8, kMaskingSpecializationDefault>(launch_params);
         }
       }
     }
   // non-performance mode
   } else {
-    if (params.is_bf16) {
-      if (params.is_causal) {
-        if (params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 1, 4, kMaskingSpecializationCausal>(params);
-        } else if (params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 2, 4, kMaskingSpecializationCausal>(params);
+    if (launch_params.params.is_bf16) {
+      if (launch_params.params.is_causal) {
+        if (launch_params.params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 1, 4, kMaskingSpecializationCausal>(launch_params);
+        } else if (launch_params.params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 2, 4, kMaskingSpecializationCausal>(launch_params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 3, 4, kMaskingSpecializationCausal>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 3, 4, kMaskingSpecializationCausal>(launch_params);
         }
       } else {
-        if (params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 1, 4, kMaskingSpecializationDefault>(params);
-        } else if (params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 2, 4, kMaskingSpecializationDefault>(params);
+        if (launch_params.params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 1, 4, kMaskingSpecializationDefault>(launch_params);
+        } else if (launch_params.params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 2, 4, kMaskingSpecializationDefault>(launch_params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 3, 4, kMaskingSpecializationDefault>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 3, 4, kMaskingSpecializationDefault>(launch_params);
         }
       }
     } else {
-      if (params.is_causal) {
-        if (params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 1, 4, kMaskingSpecializationCausal>(params);
-        } else if (params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 2, 4, kMaskingSpecializationCausal>(params);
+      if (launch_params.params.is_causal) {
+        if (launch_params.params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 1, 4, kMaskingSpecializationCausal>(launch_params);
+        } else if (launch_params.params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 2, 4, kMaskingSpecializationCausal>(launch_params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 3, 4, kMaskingSpecializationCausal>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 3, 4, kMaskingSpecializationCausal>(launch_params);
         }
       } else {
-        if (params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 1, 4, kMaskingSpecializationDefault>(params);
-        } else if (params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 2, 4, kMaskingSpecializationDefault>(params);
+        if (launch_params.params.d > 64) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 1, 4, kMaskingSpecializationDefault>(launch_params);
+        } else if (launch_params.params.d > 32) {
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 2, 4, kMaskingSpecializationDefault>(launch_params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 3, 4, kMaskingSpecializationDefault>(params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float32, Int16, Float16, 3, 4, kMaskingSpecializationDefault>(launch_params);
         }
       }
     }

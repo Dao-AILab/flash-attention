@@ -32,7 +32,7 @@
 #include "ck/library/reference_tensor_operation/cpu/reference_softmax.hpp"
 #include "ck/library/reference_tensor_operation/cpu/reference_dropout.hpp"
 
-#define MIN_VERSION 11300
+#define NEW_UNPACK (TORCH_VERSION_MAJOR * 10000 + TORCH_VERSION_MINOR * 100 + TORCH_VERSION_PATCH) > 11300
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #define NEW_UNPACK (TORCH_VERSION_MAJOR * 10000 + TORCH_VERSION_MINOR * 100 + TORCH_VERSION_PATCH) > 11300
@@ -80,22 +80,19 @@ enum DataType {kFloat16, kFloat32, kBFloat16, kInt32, kInt8};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static inline size_t get_size_in_bytes( size_t n, DataType dtype ) {
-    switch( dtype ) {
-    case kFloat32:
+static inline size_t get_size_in_bytes( size_t n, auto dtype ) {
+    if(dtype == torch::kFloat32){
         return n * 4;
-    case kFloat16:
+    }else if(dtype == torch::kBFloat16){
         return n * 2;
-    case kBFloat16:
+    }else if(dtype == torch::kFloat16){
         return n * 2;
-    case kInt32:
+    }else if(dtype == torch::kInt32){
         return n * 4;
-    case kInt8:
+    }else if(dtype == torch::kInt8){
         return n;
-    default:
-        assert( false );
-        return 0;
     }
+    return 0;
 }
 
 

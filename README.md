@@ -198,16 +198,10 @@ PyTorch Standard Attention - Forward + Backward pass
 
 ### Unit Test Mode
 #### How to build
-In order to pass unit tests, several changes are needed.
 
-Firstly, build flash-attention from source with RTZ disabled, by changing the compiling flag in the setup.py:
+For passing unit tests compile flash-attention from source which may take a while:
 ```
--DFLASH_ATTENTION_INTERNAL_USE_RTZ=0
-```
-
-Then compile flash-attention from source which may take a while:
-```
-python setup.py install
+FLASH_ATTENTION_INTERNAL_USE_RTZ=0 python setup.py install
 ```
 
 Before running unit tests, the unit test mode and deterministic flags should be both turned on by setting the environment variables:
