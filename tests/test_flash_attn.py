@@ -21,10 +21,8 @@ from flash_attn.flash_attn_interface import flash_attn_func, flash_attn_unpadded
 from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_split_func
 from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
 
-try:
-    from flash_attn.flash_attn_triton import flash_attn_func
-except (ImportError, AttributeError):  # Older version of Triton doesn't have tl.constexpr
-    flash_attn_func = None
+
+flash_attn_func = None
 
 
 is_sm75 = False #torch.cuda.get_device_capability('cuda') == (7, 5)
