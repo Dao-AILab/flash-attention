@@ -15,5 +15,5 @@ RUN pip install ninja
 COPY ./ /workspace/flash-attention/
 RUN cd /workspace/flash-attention \
 	&& git submodule update --init \
-       	&& patch /opt/conda/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py hipify_patch_orig.patch \
+	&& patch /opt/conda/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py hipify_patch_1.12.patch \
        	&& python setup.py install
