@@ -177,13 +177,13 @@ Benchmark results(MI250, deterministic off, unit test mode off, RTZ):
 ```
 PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
 FlashAttention - Forward pass
-  8.32 ms
+  8.23 ms
   1 measurement, 30 runs , 128 threads
 FlashAttention - Backward pass
-  40.24 ms
+  29.06 ms
   1 measurement, 30 runs , 128 threads
 FlashAttention - Forward + Backward pass
-  49.61 ms
+  37.88 ms
   1 measurement, 30 runs , 128 threads
 PyTorch Standard Attention - Forward pass
   26.28 ms
