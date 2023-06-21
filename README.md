@@ -152,8 +152,9 @@ $python setup.py install
 
 ```
 Launch docker rocm/pytorch:rocm5.4_ubuntu20.04_py3.8_pytorch_1.12.1
+or any pytorch 1.13.1 docker
 Enter flash_attention
-$patch /opt/conda/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py hipify_patch_orig.patch
+$patch /opt/conda/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py hipify_patch_1.12.patch
 $python setup.py install
 ```
 
