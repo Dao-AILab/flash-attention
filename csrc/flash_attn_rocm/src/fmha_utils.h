@@ -32,7 +32,6 @@
 #include "ck/library/reference_tensor_operation/cpu/reference_softmax.hpp"
 #include "ck/library/reference_tensor_operation/cpu/reference_dropout.hpp"
 
-#define NEW_UNPACK (TORCH_VERSION_MAJOR * 10000 + TORCH_VERSION_MINOR * 100 + TORCH_VERSION_PATCH) > 11300
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #define NEW_UNPACK (TORCH_VERSION_MAJOR * 10000 + TORCH_VERSION_MINOR * 100 + TORCH_VERSION_PATCH) > 11300

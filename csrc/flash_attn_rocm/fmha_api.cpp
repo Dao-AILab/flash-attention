@@ -489,8 +489,8 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     // It's possible the softmax_lse_ from the fwd has a different length since blocksize_c could be different.
     // auto softmax_lse = softmax_lse_.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, max_seqlen_q)}).contiguous();
 
-    at::Tensor softmax_d = at::empty(dq.sizes(), dq.options()).contiguous();
-    // at::Tensor softmax_d;
+    // at::Tensor softmax_d = at::empty(dq.sizes(), dq.options()).contiguous();
+    at::Tensor softmax_d;
 
     if (zero_tensors) {
         dq.zero_();
