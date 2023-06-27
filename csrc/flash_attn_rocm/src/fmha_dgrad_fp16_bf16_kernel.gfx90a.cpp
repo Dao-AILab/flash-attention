@@ -480,19 +480,19 @@ void run_fmha_dgrad_fp16_bf16_gfx90a(LaunchParams<FmhaDgradParams> &launch_param
     else {
       if (launch_params.params.is_causal) {
         if (launch_params.params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 1, 8, kMaskingSpecializationCausal>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, Float16, 1, 8, kMaskingSpecializationCausal>(launch_params);
         } else if (launch_params.params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 2, 8, kMaskingSpecializationCausal>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, Float16, 2, 8, kMaskingSpecializationCausal>(launch_params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 3, 8, kMaskingSpecializationCausal>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, Float16, 3, 8, kMaskingSpecializationCausal>(launch_params);
         }
       } else {
         if (launch_params.params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 1, 8, kMaskingSpecializationDefault>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, Float16, 1, 8, kMaskingSpecializationDefault>(launch_params);
         } else if (launch_params.params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 2, 8, kMaskingSpecializationDefault>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, Float16, 2, 8, kMaskingSpecializationDefault>(launch_params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, BFloat16, 3, 8, kMaskingSpecializationDefault>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<Float16, Float16, Int16, Float16, 3, 8, kMaskingSpecializationDefault>(launch_params);
         }
       }
     }
@@ -501,19 +501,19 @@ void run_fmha_dgrad_fp16_bf16_gfx90a(LaunchParams<FmhaDgradParams> &launch_param
     if (launch_params.params.is_bf16) {
       if (launch_params.params.is_causal) {
         if (launch_params.params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int16, BFloat16, 1, 4, kMaskingSpecializationCausal>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 1, 4, kMaskingSpecializationCausal>(launch_params);
         } else if (launch_params.params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int16, BFloat16, 2, 4, kMaskingSpecializationCausal>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 2, 4, kMaskingSpecializationCausal>(launch_params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int16, BFloat16, 3, 4, kMaskingSpecializationCausal>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 3, 4, kMaskingSpecializationCausal>(launch_params);
         }
       } else {
         if (launch_params.params.d > 64) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int16, BFloat16, 1, 4, kMaskingSpecializationDefault>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 1, 4, kMaskingSpecializationDefault>(launch_params);
         } else if (launch_params.params.d > 32) {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int16, BFloat16, 2, 4, kMaskingSpecializationDefault>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 2, 4, kMaskingSpecializationDefault>(launch_params);
         } else {
-          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int16, BFloat16, 3, 4, kMaskingSpecializationDefault>(launch_params);
+          run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, Float32, Int32, BFloat16, 3, 4, kMaskingSpecializationDefault>(launch_params);
         }
       }
     } else {
