@@ -941,7 +941,8 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
     // The "beam-aware" batch idx
     const int bbi = bi / params.beam_width;
     // The head.
-    const int hi = blockIdx.x;
+    // const int hi = blockIdx.x;
+    const int hi = params.nnz_head_idx == nullptr ? blockIdx.x : params.nnz_head_idx[blockIdx.x];
     // Combine the batch and the head indices.
     const int bhi = bi * params.num_heads + hi;
     // Combine the "beam-aware" batch idx and the head indices.
@@ -1061,10 +1062,18 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
     const int padd_len = (params.total_padding_tokens == nullptr) ? 0 : params.total_padding_tokens[bi];
     if (params.rotary_embedding_dim > 0 && !params.neox_rotary_style) {
         if (handle_kv) {
-            apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, tlength - padd_len, params.rotary_base);
+            if (params.rotary_cos == nullptr) {
+                apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, tlength - padd_len, params.rotary_base);
+            } else {
+                apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, tlength - padd_len, params.rotary_cos, params.rotary_sin);
+            }
         }
         else {
-            apply_rotary_embedding(q, tidx, params.rotary_embedding_dim, tlength - padd_len, params.rotary_base);
+            if (params.rotary_cos == nullptr) {
+                apply_rotary_embedding(q, tidx, params.rotary_embedding_dim, tlength - padd_len, params.rotary_base);
+            } else {
+                apply_rotary_embedding(q, tidx, params.rotary_embedding_dim, tlength - padd_len, params.rotary_cos, params.rotary_sin);
+            }
         }
     }
     else if (params.rotary_embedding_dim > 0 && params.neox_rotary_style) {
@@ -1098,14 +1107,24 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
             if (handle_kv) {
                 mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
 
-                mmha::apply_rotary_embedding(
-                    q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim, tlength - padd_len, params.rotary_base);
+                if (params.rotary_cos == nullptr) {
+                    mmha::apply_rotary_embedding(
+                        q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim, tlength - padd_len, params.rotary_base);
+                } else {
+                    mmha::apply_rotary_embedding(
+                        q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim, tlength - padd_len, params.rotary_cos, params.rotary_sin);
+                }
 
                 mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
             }
             else {
-                mmha::apply_rotary_embedding(
-                    q, transpose_idx / tidx_factor, params.rotary_embedding_dim, tlength, params.rotary_base);
+                if (params.rotary_cos == nullptr) {
+                    mmha::apply_rotary_embedding(
+                        q, transpose_idx / tidx_factor, params.rotary_embedding_dim, tlength, params.rotary_base);
+                } else {
+                    mmha::apply_rotary_embedding(
+                        q, transpose_idx / tidx_factor, params.rotary_embedding_dim, tlength, params.rotary_cos, params.rotary_sin);
+                }
             }
             mmha::write_smem_transpose(q, q_smem, transpose_idx, smem_pitch);
         }

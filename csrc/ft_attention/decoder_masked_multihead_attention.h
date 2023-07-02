@@ -113,6 +113,12 @@ struct Multihead_attention_params_base {
     const float* qkv_scale_out       = nullptr;
     const float* attention_out_scale = nullptr;
     int          int8_mode           = 0;
+
+    const T *rotary_cos = nullptr;
+    const T *rotary_sin = nullptr;
+
+    const int *nnz_head_idx = nullptr;
+    int nnz_heads = 0;
 };
 
 template<typename T, bool CROSS_ATTENTION>

@@ -515,8 +515,13 @@ class MHA(nn.Module):
                     rotary_emb_base = self.rotary_emb.base if self.rotary_emb_dim > 0 else 0
                     context = ft_attention.single_query_attention(
                         *rearrange(qkv, 'b 1 three h d -> b three h d').unbind(dim=1),
-                        k_cache[batch_start:batch_end], v_cache[batch_start:batch_end],
-                        lengths_per_sample, inference_params.sequence_len_offset,
+                        k_cache[batch_start:batch_end],
+                        v_cache[batch_start:batch_end],
+                        lengths_per_sample,
+                        None,  # rotary_cos_
+                        None,  # rotary_sin_
+                        None,  # nnz_head_idx
+                        inference_params.sequence_len_offset,
                         self.rotary_emb_dim, rotary_emb_base,
                         # neox_rotary_style
                         (not self.rotary_emb.interleaved) if self.rotary_emb_dim > 0 else True
@@ -637,8 +642,13 @@ class ParallelMHA(nn.Module):
                 rotary_emb_base = self.rotary_emb.base if self.rotary_emb_dim > 0 else 0
                 context = ft_attention.single_query_attention(
                     *rearrange(qkv, 'b 1 three h d -> b three h d').unbind(dim=1),
-                    k_cache[batch_start:batch_end], v_cache[batch_start:batch_end],
-                    lengths_per_sample, inference_params.sequence_len_offset,
+                    k_cache[batch_start:batch_end],
+                    v_cache[batch_start:batch_end],
+                    lengths_per_sample,
+                    None,  # rotary_cos_
+                    None,  # rotary_sin_
+                    None,  # nnz_head_idx
+                    inference_params.sequence_len_offset,
                     self.rotary_emb_dim, rotary_emb_base,
                     # neox_rotary_style
                     (not self.rotary_emb.interleaved) if self.rotary_emb_dim > 0 else True

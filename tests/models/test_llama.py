@@ -267,10 +267,11 @@ def test_llama_generation(model_name):
     del model
 
     hf_error = (logits_hf - logits_ref).abs().max().item()
-    assert (logits_parallel - logits_ref).abs().max().item() < 2 * hf_error
 
     print(f'HF fp16 logits max diff: {hf_error}')
     print(f'Logits max diff: {(logits - logits_ref).abs().max().item() }')
-    assert (logits - logits_ref).abs().max().item() < 2 * hf_error
     print(f'Logits CG max diff: {(logits_cg - logits_ref).abs().max().item() }')
+
+    assert (logits_parallel - logits_ref).abs().max().item() < 2 * hf_error
+    assert (logits - logits_ref).abs().max().item() < 2 * hf_error
     assert torch.equal(logits_cg, logits)
