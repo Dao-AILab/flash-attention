@@ -160,16 +160,15 @@ torch::Tensor single_query_attention(const torch::Tensor q,
     if (rotary_cos_.has_value()) {
         auto rotary_cos = rotary_cos_.value();
         CHECK_DEVICE(rotary_cos);
-        int rotary_seqlen = rotary_cos.size(0);
-        rotary_embedding_dim = rotary_cos.size(1) * 2;
-        CHECK_SHAPE(rotary_cos, rotary_seqlen, rotary_embedding_dim / 2);
+        rotary_embedding_dim = rotary_cos.size(0) * 2;
+        CHECK_SHAPE(rotary_cos, rotary_embedding_dim / 2);
         CHECK_CONTIGUOUS(rotary_cos);
         TORCH_CHECK(rotary_cos.scalar_type() == input_type);
 
         TORCH_CHECK(rotary_sin_.has_value());
         auto rotary_sin = rotary_sin_.value();
         CHECK_DEVICE(rotary_sin);
-        CHECK_SHAPE(rotary_cos, rotary_seqlen, rotary_embedding_dim / 2);
+        CHECK_SHAPE(rotary_cos, rotary_embedding_dim / 2);
         CHECK_CONTIGUOUS(rotary_sin);
         TORCH_CHECK(rotary_sin.scalar_type() == input_type);
     }
