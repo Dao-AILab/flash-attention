@@ -237,7 +237,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaDgradParams> &launch
   if (is_deterministic) {
     if (version == 1) {
       using DeviceGemmInstance = ck::tensor_operation::device::
-        DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V2<
+        DeviceGroupedMultiheadAttentionBackward_Qloop_Xdl_CShuffle_V2<
           NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
           ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
           AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
@@ -273,7 +273,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaDgradParams> &launch
       run_kernel(gemm);
     } else if (version == 2) {
       using DeviceGemmInstance = ck::tensor_operation::device::
-        DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V1<
+        DeviceGroupedMultiheadAttentionBackward_Qloop_Xdl_CShuffle_V1<
           NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
           ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
           AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
@@ -307,7 +307,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaDgradParams> &launch
       run_kernel(gemm);
     } else {
       using DeviceGemmInstance = ck::tensor_operation::device::
-        DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V1<
+        DeviceGroupedMultiheadAttentionBackward_Qloop_Xdl_CShuffle_V1<
           NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
           ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
           AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
@@ -344,7 +344,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaDgradParams> &launch
   } else {
     if (version == 1) {
       using DeviceGemmInstance = ck::tensor_operation::device::
-        DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V2<
+        DeviceGroupedMultiheadAttentionBackward_Qloop_Xdl_CShuffle_V2<
           NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
           ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
           AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
@@ -380,7 +380,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaDgradParams> &launch
       run_kernel(gemm);
     } else if (version == 2) {
       using DeviceGemmInstance = ck::tensor_operation::device::
-        DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V1<
+        DeviceGroupedMultiheadAttentionBackward_Qloop_Xdl_CShuffle_V1<
           NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
           ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
           AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,
@@ -414,7 +414,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaDgradParams> &launch
       run_kernel(gemm);
     } else {
       using DeviceGemmInstance = ck::tensor_operation::device::
-        DeviceGroupedMultiheadAttentionBackward_Xdl_CShuffle_V1<
+        DeviceGroupedMultiheadAttentionBackward_Qloop_Xdl_CShuffle_V1<
           NumDimG, NumDimM, NumDimN, NumDimK, NumDimO, InputDataType, OutputDataType, GemmDataType,
           ZDataType, LSEDataType, Acc0BiasDataType, Acc1BiasDataType,
           AccDataType, ShuffleDataType, QkvElementOp, QkvElementOp, Scale,

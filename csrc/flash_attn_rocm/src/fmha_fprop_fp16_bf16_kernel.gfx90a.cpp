@@ -89,7 +89,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
 
     //init the instance with parameters
     using DeviceGemmInstance1 =
-        ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle<
+        ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle_V2<
             NumDimG,
             NumDimM,
             NumDimN,
@@ -160,7 +160,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
             deterministic>;                       // MaskingSpecialization
 
     using DeviceGemmInstance2 =
-        ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle<
+        ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle_V2<
             NumDimG,
             NumDimM,
             NumDimN,
