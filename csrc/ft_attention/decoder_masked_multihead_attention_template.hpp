@@ -1065,14 +1065,18 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
             if (params.rotary_cos == nullptr) {
                 apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, tlength - padd_len, params.rotary_base);
             } else {
-                apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, tlength - padd_len, params.rotary_cos, params.rotary_sin);
+                apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, tlength - padd_len,
+                                       params.rotary_cos + bi * params.rotary_embedding_dim / 2,
+                                       params.rotary_sin + bi * params.rotary_embedding_dim / 2);
             }
         }
         else {
             if (params.rotary_cos == nullptr) {
                 apply_rotary_embedding(q, tidx, params.rotary_embedding_dim, tlength - padd_len, params.rotary_base);
             } else {
-                apply_rotary_embedding(q, tidx, params.rotary_embedding_dim, tlength - padd_len, params.rotary_cos, params.rotary_sin);
+                apply_rotary_embedding(q, tidx, params.rotary_embedding_dim, tlength - padd_len,
+                                       params.rotary_cos + bi * params.rotary_embedding_dim / 2,
+                                       params.rotary_sin + bi * params.rotary_embedding_dim / 2);
             }
         }
     }
@@ -1112,7 +1116,9 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
                         q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim, tlength - padd_len, params.rotary_base);
                 } else {
                     mmha::apply_rotary_embedding(
-                        q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim, tlength - padd_len, params.rotary_cos, params.rotary_sin);
+                        q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim, tlength - padd_len,
+                        params.rotary_cos + bi * params.rotary_embedding_dim / 2,
+                        params.rotary_sin + bi * params.rotary_embedding_dim / 2);
                 }
 
                 mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
@@ -1123,7 +1129,9 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
                         q, transpose_idx / tidx_factor, params.rotary_embedding_dim, tlength, params.rotary_base);
                 } else {
                     mmha::apply_rotary_embedding(
-                        q, transpose_idx / tidx_factor, params.rotary_embedding_dim, tlength, params.rotary_cos, params.rotary_sin);
+                        q, transpose_idx / tidx_factor, params.rotary_embedding_dim, tlength,
+                        params.rotary_cos + bi * params.rotary_embedding_dim / 2,
+                        params.rotary_sin + bi * params.rotary_embedding_dim / 2);
                 }
             }
             mmha::write_smem_transpose(q, q_smem, transpose_idx, smem_pitch);
