@@ -31,8 +31,7 @@ void set_params_fprop(FmhaFpropParams &params,
                       float p_dropout,
                       float softmax_scale,
                       bool is_causal,
-                      bool is_deterministic,
-                      bool is_performance_mode) {
+                      bool is_deterministic) {
 
     DataType acc_type = kFloat32;
     DataType data_type = !(q.dtype() == at::kBFloat16) ? kFloat16 : kBFloat16;
@@ -124,7 +123,6 @@ void set_params_fprop(FmhaFpropParams &params,
     params.p_dropout = p_dropout;
     params.is_causal = is_causal;
     params.is_deterministic = is_deterministic;
-    params.is_performance_mode = is_performance_mode;
 }
 
 void set_params_dgrad(FmhaDgradParams &params,
@@ -294,7 +292,6 @@ mha_fwd(const at::Tensor &q,
         const bool zero_tensors,
         const bool is_causal,
         const bool is_deterministic,
-        const bool is_performance_mode,
         const bool return_softmax, // in rocm ,this will return the random number matrix when doing dropout
         const int num_splits,      // num_splits is not used in rocm
         c10::optional<at::Generator> gen_) {
@@ -385,8 +382,7 @@ mha_fwd(const at::Tensor &q,
                      p_dropout,
                      softmax_scale,
                      is_causal,
-                     is_deterministic,
-                     is_performance_mode);
+                     is_deterministic);
 
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
@@ -569,7 +565,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         launch_params.params.philox_args = gen->philox_cuda_state(counter_offset);
     }
 
-    run_fmha_dgrad_fp16_bf16_gfx90a(launch_params);
+    run_fmha_dgrad_fp16_bf16_gfx90a(launch_params.params);
 
     if(!q.is_contiguous()){
         dq_tmp.copy_(torch::cat(launch_params.params.qgrad_tensors, 0).contiguous(), true);
@@ -649,7 +645,6 @@ bool fwd_test(bool do_verification){
     bool zero_tensors = true;
     bool is_causal = false;
     bool is_deterministic = true;
-    bool is_performance_mode = true;
     bool return_softmax = true;
     int num_splits = 0;
 
@@ -669,7 +664,6 @@ bool fwd_test(bool do_verification){
             zero_tensors,
             is_causal,
             is_deterministic,
-            is_performance_mode,
             return_softmax,
             num_splits,
             gen_);
@@ -1028,7 +1022,6 @@ bool bwd_test(bool do_verification){
                   zero_tensors,
                   is_causal,
                   is_deterministic,
-                  is_performance_mode,
                   return_softmax,
                   num_splits,
                   gen_)[0];

@@ -26,12 +26,10 @@
 #define FP16_SWITCH(COND, ...)                                           \
     [&] {                                                                            \
         if (COND) {                                                                  \
-            using DataType = ck::bhalf_t; \
-            using DropOutType = int;   \
+            using elem_type = ck::bhalf_t;   \
             return __VA_ARGS__();                                                    \
         } else {                                                                     \
-            using DataType = ck::half_t; \
-            using DropOutType = unsigned short;   \
+            using elem_type = ck::half_t;   \
             return __VA_ARGS__();                                                    \
         }                                                                            \
     }()

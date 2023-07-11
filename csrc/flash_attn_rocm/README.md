@@ -32,16 +32,16 @@ to find your path.
 
 Way to build with docker file:
 
-Change the github username and token with that of yourself in line https://github.com/ROCmSoftwarePlatform/flash-attention/blob/flash_attention_for_rocm/csrc/flash_attn_rocm/Dockerfile#L19 firstly.
+Change the github username and tocken with that of yourself in line https://github.com/ROCmSoftwarePlatform/flash-attention_private/blob/41ddb2fb3884085ee5318d30f8e919944ee18745/csrc/flash_attn_rocm/Dockerfile#L11 firstly.
 
 Then
 ```
 sudo docker build -t flash_attention:rocm5.3.2 .
 ```
 
-If you want to test the performance, you can set the parameter “time_kernel” as true. And then the kernel will run 10 times and give out the average running time. You can find the parameter in this line: https://github.com/ROCmSoftwarePlatform/flash-attention/blob/fb47a607682a873a3e0b17ae220849cc11a34d8b/csrc/flash_attn_rocm/src/fmha_fprop_fp16_bf16_kernel.gfx90a.cpp#L142
+If you want to test the performance, you can set the parameter “time_kernel” as true. And then the kernel will run 10 times and give out the average running time. You can find the parameter in this line: https://github.com/ROCmSoftwarePlatform/flash-attention_private/blob/fb47a607682a873a3e0b17ae220849cc11a34d8b/csrc/flash_attn_rocm/src/fmha_fprop_fp16_bf16_kernel.gfx90a.cpp#L142
 
-If you want to verify the results, you can set the parameter “do_verification” in this line https://github.com/ROCmSoftwarePlatform/flash-attention/blob/fb47a607682a873a3e0b17ae220849cc11a34d8b/csrc/flash_attn_rocm/fmha_api.cpp#L271 . And then the code can do the same computation on cpu and compare with the results from device and show whether device results are right.
+If you want to verify the results, you can set the parameter “do_verification” in this line https://github.com/ROCmSoftwarePlatform/flash-attention_private/blob/fb47a607682a873a3e0b17ae220849cc11a34d8b/csrc/flash_attn_rocm/fmha_api.cpp#L271 . And then the code can do the same computation on cpu and compare with the results from device and show whether device results are right.
 
 
 

@@ -121,7 +121,7 @@ struct FmhaFpropParams : public QkvParams {
     int num_splits; // How many SMs per attention matrix.
 };
 
-struct FmhaDgradParams : public QkvParams {
+struct FmhaDgradParams : public FmhaFpropParams {
 
     // The O matrix (output).
     std::vector<const void*> y_ptr;
@@ -164,11 +164,6 @@ struct FmhaDgradParams : public QkvParams {
     // Random state.
     at::PhiloxCudaState philox_args;
 
-    bool is_bf16;
-    bool is_causal;
-    bool is_performance_mode;
-    bool is_deterministic;
-
     std::vector<int> host_seqlens_q;
     std::vector<int> host_seqlens_k;
 
@@ -210,7 +205,7 @@ struct LaunchParams{
 
 void run_fmha_fp16_bf16_gfx90a(LaunchParams<FmhaFpropParams> &launch_params);
 
-void run_fmha_dgrad_fp16_bf16_gfx90a(LaunchParams<FmhaDgradParams> &launch_params);
+void run_fmha_dgrad_fp16_bf16_gfx90a(FmhaDgradParams &params);
 
 //void run_fmha_block_fp16_gfx90a(Launch_params<FMHAfprop_params> &launch_params, const bool configure);
 
