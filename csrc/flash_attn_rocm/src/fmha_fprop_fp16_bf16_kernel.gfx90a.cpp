@@ -87,6 +87,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
     
     bool is_deterministic = launch_params.params.is_deterministic;
 
+#if USE_QLOOP
     //init the instance with parameters
     using DeviceGemmInstance1 =
         ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle_V2<
@@ -229,7 +230,153 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
             8,                                    // CShuffleBlockTransferScalarPerVector_NPerBlock
             MaskingSpec,
             nondeterministic>;                       // MaskingSpecialization
-        
+
+#else 
+    //init the instance with parameters
+    using DeviceGemmInstance1 =
+        ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle_V1<
+            NumDimG,
+            NumDimM,
+            NumDimN,
+            NumDimK,
+            NumDimO,
+            ADataType,
+            B0DataType,
+            B1DataType,
+            CDataType,
+            GemmDataType,
+            ZDataType,
+            LSEDataType,
+            Acc0BiasDataType,
+            Acc1BiasDataType,
+            AccDataType,
+            CShuffleDataType,
+            AElementOp,
+            B0ElementOp,
+            Acc0ElementOp,
+            B1ElementOp,
+            CElementOp,
+            GemmSpec,
+            TensorSpecA,
+            TensorSpecB0,
+            TensorSpecB1,
+            TensorSpecC,
+            1,
+            256,
+            MPerBlock,         // MPerBlock
+            NPerBlock,         // NPerBlock
+            KPerBlock,         // KPerBlock
+            Gemm1NPerBlock,    // Gemm1NPerBlock
+            Gemm1KPerBlock,    // Gemm1KPerBlock
+            8,                 // AK1
+            8,                 // BK1
+            2,                 // B1K1
+            MPerXDL,           // MPerXDL
+            NPerXDL,           // NPerXDL
+            1,                 // MXdlPerWave
+            NXdlPerWave,       // NXdlPerWave
+            Gemm1NXdlPerWave,  // Gemm1NXdlPerWave
+            ABlockTransfer,    // ABlockTransfer
+            S<1, 0, 2>,
+            S<1, 0, 2>,
+            2,
+            8,
+            8,
+            ABlockLdsExtraM,   // ABlockLdsExtraM
+            BBlockTransfer,    // BBlockTransfer
+            S<1, 0, 2>,
+            S<1, 0, 2>,
+            2,
+            8,
+            8,
+            B0BlockLdsExtraN,  // B0BlockLdsExtraN
+            B1BlockTransfer,   // B1BlockTransfer
+            S<0, 2, 1>,
+            S<0, 2, 1>,
+            1,
+            B1BlockTransferSrcScalarPerVector,    //B1BlockTransferSrcScalarPerVector
+            2,
+            false,
+            1,                                    // CShuffleMXdlPerWavePerShuffle
+            CShuffleNXdlPerWavePerShuffle,        // CShuffleNXdlPerWavePerShuffle
+            CShuffleBlockTransferClusterLengths,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
+            8,                                    // CShuffleBlockTransferScalarPerVector_NPerBlock
+            MaskingSpec,
+            deterministic>;                       // MaskingSpecialization
+
+    using DeviceGemmInstance2 =
+        ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle_V1<
+            NumDimG,
+            NumDimM,
+            NumDimN,
+            NumDimK,
+            NumDimO,
+            ADataType,
+            B0DataType,
+            B1DataType,
+            CDataType,
+            GemmDataType,
+            ZDataType,
+            LSEDataType,
+            Acc0BiasDataType,
+            Acc1BiasDataType,
+            AccDataType,
+            CShuffleDataType,
+            AElementOp,
+            B0ElementOp,
+            Acc0ElementOp,
+            B1ElementOp,
+            CElementOp,
+            GemmSpec,
+            TensorSpecA,
+            TensorSpecB0,
+            TensorSpecB1,
+            TensorSpecC,
+            1,
+            256,
+            MPerBlock,         // MPerBlock
+            NPerBlock,         // NPerBlock
+            KPerBlock,         // KPerBlock
+            Gemm1NPerBlock,    // Gemm1NPerBlock
+            Gemm1KPerBlock,    // Gemm1KPerBlock
+            8,                 // AK1
+            8,                 // BK1
+            2,                 // B1K1
+            MPerXDL,           // MPerXDL
+            NPerXDL,           // NPerXDL
+            1,                 // MXdlPerWave
+            NXdlPerWave,       // NXdlPerWave
+            Gemm1NXdlPerWave,  // Gemm1NXdlPerWave
+            ABlockTransfer,    // ABlockTransfer
+            S<1, 0, 2>,
+            S<1, 0, 2>,
+            2,
+            8,
+            8,
+            ABlockLdsExtraM,   // ABlockLdsExtraM
+            BBlockTransfer,    // BBlockTransfer
+            S<1, 0, 2>,
+            S<1, 0, 2>,
+            2,
+            8,
+            8,
+            B0BlockLdsExtraN,  // B0BlockLdsExtraN
+            B1BlockTransfer,   // B1BlockTransfer
+            S<0, 2, 1>,
+            S<0, 2, 1>,
+            1,
+            B1BlockTransferSrcScalarPerVector,    //B1BlockTransferSrcScalarPerVector
+            2,
+            false,
+            1,                                    // CShuffleMXdlPerWavePerShuffle
+            CShuffleNXdlPerWavePerShuffle,        // CShuffleNXdlPerWavePerShuffle
+            CShuffleBlockTransferClusterLengths,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
+            8,                                    // CShuffleBlockTransferScalarPerVector_NPerBlock
+            MaskingSpec,
+            nondeterministic>;                       // MaskingSpecialization
+
+#endif
+
     bool time_kernel    = false;
 
     bool input_permute = true;
