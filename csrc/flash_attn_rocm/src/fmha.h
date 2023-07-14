@@ -114,6 +114,7 @@ struct FmhaFpropParams : public QkvParams {
     bool is_causal;
     bool is_performance_mode;
     bool is_deterministic;
+    bool is_using_qloop;
 
     std::vector<int> host_seqlens_q;
     std::vector<int> host_seqlens_k;

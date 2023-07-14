@@ -92,6 +92,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaDgradParams> &launch
   static constexpr bool nondeterministic = false;
 
   bool is_deterministic = launch_params.params.is_deterministic;
+  bool is_using_qloop = launch_params.params.is_using_qloop;
   bool time_kernel = false;
   bool input_permute = true;
   bool output_permute = true;
@@ -234,7 +235,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaDgradParams> &launch
     }
   };
 
-#if USE_QLOOP //Qloop
+if (is_using_qloop){ //Qloop
   // deterministic mode
   if (is_deterministic) {
     if (version == 1) {
@@ -450,7 +451,8 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaDgradParams> &launch
       run_kernel(gemm);
     }
   }
-#else
+}
+else{
   // deterministic mode
   if (is_deterministic) {
     if (version == 1) {
@@ -674,7 +676,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaDgradParams> &launch
       run_kernel(gemm);
     }
   }
-#endif
+}
 
 }
 

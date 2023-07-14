@@ -86,10 +86,10 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
     static constexpr bool nondeterministic = false;
     
     bool is_deterministic = launch_params.params.is_deterministic;
+    bool is_using_qloop = launch_params.params.is_using_qloop;
 
-#if USE_QLOOP
     //init the instance with parameters
-    using DeviceGemmInstance1 =
+    using DeviceGemmQLoopInstance1 =
         ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle_V2<
             NumDimG,
             NumDimM,
@@ -160,7 +160,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
             MaskingSpec,
             deterministic>;                       // MaskingSpecialization
 
-    using DeviceGemmInstance2 =
+    using DeviceGemmQLoopInstance2 =
         ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle_V2<
             NumDimG,
             NumDimM,
@@ -231,9 +231,8 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
             MaskingSpec,
             nondeterministic>;                       // MaskingSpecialization
 
-#else 
     //init the instance with parameters
-    using DeviceGemmInstance1 =
+    using DeviceGemmKLoopInstance1 =
         ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle_V1<
             NumDimG,
             NumDimM,
@@ -304,7 +303,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
             MaskingSpec,
             deterministic>;                       // MaskingSpecialization
 
-    using DeviceGemmInstance2 =
+    using DeviceGemmKLoopInstance2 =
         ck::tensor_operation::device::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle_V1<
             NumDimG,
             NumDimM,
@@ -374,8 +373,6 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
             8,                                    // CShuffleBlockTransferScalarPerVector_NPerBlock
             MaskingSpec,
             nondeterministic>;                       // MaskingSpecialization
-
-#endif
 
     bool time_kernel    = false;
 
@@ -399,8 +396,9 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
     auto p_z = launch_params.params.s_ptr;
     auto p_lse = launch_params.params.softmax_lse_ptr;
 
+if(is_using_qloop){
     if (is_deterministic) {
-      std::vector<typename DeviceGemmInstance1::ProblemDesc> problem_descs;
+      std::vector<typename DeviceGemmQLoopInstance1::ProblemDesc> problem_descs;
 
       int batch_size = launch_params.params.b;
       int num_heads = launch_params.params.h;
@@ -479,7 +477,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
       }
 
       // do GEMM
-      auto gemm     = DeviceGemmInstance1{};
+      auto gemm     = DeviceGemmQLoopInstance1{};
       auto invoker  = gemm.MakeInvoker();
       auto argument = gemm.MakeArgument(p_a,
                                         p_b0,
@@ -516,7 +514,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
           std::cout << "time elpase is " << ave_time <<" ms" << std::endl;
       }
     } else {
-      std::vector<typename DeviceGemmInstance2::ProblemDesc> problem_descs;
+      std::vector<typename DeviceGemmQLoopInstance2::ProblemDesc> problem_descs;
 
       int batch_size = launch_params.params.b;
       int num_heads = launch_params.params.h;
@@ -594,7 +592,7 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
                                   
       }
       // do GEMM
-      auto gemm     = DeviceGemmInstance2{};
+      auto gemm     = DeviceGemmQLoopInstance2{};
       auto invoker  = gemm.MakeInvoker();
       auto argument = gemm.MakeArgument(p_a,
                                         p_b0,
@@ -631,6 +629,243 @@ void run_fmha_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaFpropParams> &launch_param
           std::cout << "time elpase is " << ave_time <<" ms" << std::endl;
       }
     }
+}
+
+else{
+    if (is_deterministic) {
+      std::vector<typename DeviceGemmKLoopInstance1::ProblemDesc> problem_descs;
+
+      int batch_size = launch_params.params.b;
+      int num_heads = launch_params.params.h;
+      int head_dim = launch_params.params.d;
+
+      float dropout_ratio = launch_params.params.p_dropout;
+
+      auto seeds = unpack(launch_params.params.philox_args);
+
+      auto seed_   = std::get<0>(seeds);
+      auto offset_ = std::get<1>(seeds);
+
+      //std::cout << "fwd seed is " << seed_ ;
+      //std::cout << " , fwd offset is " << offset_ << std::endl;
+
+      for(size_t i = 0; i < batch_size ; i++){
+          int M     = launch_params.params.host_seqlens_q[i + 1] - launch_params.params.host_seqlens_q[i]; //seqlen Q
+          int N     = launch_params.params.host_seqlens_k[i + 1] - launch_params.params.host_seqlens_k[i]; //seqlen K
+          int K     = head_dim;
+          int O     = head_dim;
+          int G0 = 1; // G0 = batch_size
+          int G1 = num_heads;
+          
+
+          std::vector<ck::index_t> a_gs_ms_ks_lengths{G0, G1, M, K};
+          std::vector<ck::index_t> a_gs_ms_ks_strides =
+              input_permute
+                  ? std::vector<ck::index_t>{M * G1 * K, K, G1 * K, 1} // A layout [G0, M, G1, K]
+                  : std::vector<ck::index_t>{G1 * M * K, M * K, K, 1}; // A layout [G0, G1, M, K]
+
+          std::vector<ck::index_t> b0_gs_ns_ks_lengths{G0, G1, N, K};
+          std::vector<ck::index_t> b0_gs_ns_ks_strides =
+              input_permute
+                  ? std::vector<ck::index_t>{N * G1 * K, K, G1 * K, 1} // B0 layout [G0, N, G1, K]
+                  : std::vector<ck::index_t>{G1 * N * K, N * K, K, 1}; // B0 layout [G0, G1, N, K]
+
+          std::vector<ck::index_t> b1_gs_os_ns_lengths{G0, G1, O, N};
+          std::vector<ck::index_t> b1_gs_os_ns_strides =
+              input_permute
+                  ? std::vector<ck::index_t>{N * G1 * O, O, 1, G1 * O} // B1 layout [G0, N, G1, O]
+                  : std::vector<ck::index_t>{G1 * N * O, N * O, 1, O}; // B1 layout [G0, G1, N, O]
+
+          std::vector<ck::index_t> c_gs_ms_os_lengths{G0, G1, M, O};
+          std::vector<ck::index_t> c_gs_ms_os_strides =
+              output_permute
+                  ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1} // C layout [G0, M, G1, O]
+                  : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // C layout [G0, G1, M, O]
+          
+          std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
+          std::vector<ck::index_t> z_gs_ms_ns_strides =
+              z_tensor_permute
+                  ? std::vector<ck::index_t>{M * G1 * N, N, G1 * N, 1} // Z layout [G0, M, G1, N]
+                  : std::vector<ck::index_t>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
+
+          std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
+          std::vector<ck::index_t> lse_gs_ms_strides =
+              std::vector<ck::index_t>{G1 * M, M, 1}; // LSE layout [G0, G1, M]
+
+          problem_descs.push_back({a_gs_ms_ks_lengths,
+                                  a_gs_ms_ks_strides,
+                                  b0_gs_ns_ks_lengths,
+                                  b0_gs_ns_ks_strides,
+                                  b1_gs_os_ns_lengths,
+                                  b1_gs_os_ns_strides,
+                                  c_gs_ms_os_lengths,
+                                  c_gs_ms_os_strides,
+                                  z_gs_ms_ns_lengths,
+                                  z_gs_ms_ns_strides,
+                                  lse_gs_ms_lengths,
+                                  lse_gs_ms_strides,
+                                  {},   // acc0_biases_gs_ms_ns_lengths
+                                  {},   // acc0_biases_gs_ms_ns_strides
+                                  {},   // acc1_biases_gs_ms_os_lengths
+                                  {}}); // acc1_biases_gs_ms_os_strides
+                                  
+      }
+
+      // do GEMM
+      auto gemm     = DeviceGemmKLoopInstance1{};
+      auto invoker  = gemm.MakeInvoker();
+      auto argument = gemm.MakeArgument(p_a,
+                                        p_b0,
+                                        p_b1,
+                                        p_c,
+                                        p_z,
+                                        p_lse,
+                                        {},
+                                        {},
+                                        problem_descs,
+                                        a_element_op,
+                                        b0_element_op,
+                                        acc0_element_op,
+                                        b1_element_op,
+                                        c_element_op,
+                                        dropout_ratio,
+                                        seeds);
+
+      // specify workspace for problem_desc
+      SimpleDeviceMem problem_desc_workspace(gemm.GetWorkSpaceSize(&argument));
+
+      gemm.SetWorkSpacePointer(&argument, problem_desc_workspace.GetDeviceBuffer());
+
+      if(!gemm.IsSupportedArgument(argument))
+      {
+          std::cout << gemm.GetTypeString() << " does not support this problem" << std::endl;
+
+          return;
+      }
+
+      float ave_time = invoker.Run(argument, StreamConfig{launch_params.stream, time_kernel});
+
+      if(time_kernel){
+          std::cout << "time elpase is " << ave_time <<" ms" << std::endl;
+      }
+    } else {
+      std::vector<typename DeviceGemmKLoopInstance2::ProblemDesc> problem_descs;
+
+      int batch_size = launch_params.params.b;
+      int num_heads = launch_params.params.h;
+      int head_dim = launch_params.params.d;
+
+      float dropout_ratio = launch_params.params.p_dropout;
+
+      auto seeds = unpack(launch_params.params.philox_args);
+
+      auto seed_   = std::get<0>(seeds);
+      auto offset_ = std::get<1>(seeds);
+
+      //std::cout << "fwd seed is " << seed_ ;
+      //std::cout << " , fwd offset is " << offset_ << std::endl;
+
+      for(size_t i = 0; i < batch_size ; i++){
+          int M     = launch_params.params.host_seqlens_q[i + 1] - launch_params.params.host_seqlens_q[i]; //seqlen Q
+          int N     = launch_params.params.host_seqlens_k[i + 1] - launch_params.params.host_seqlens_k[i]; //seqlen K
+          int K     = head_dim;
+          int O     = head_dim;
+          int G0 = 1; // G0 = batch_size
+          int G1 = num_heads;
+          
+
+          std::vector<ck::index_t> a_gs_ms_ks_lengths{G0, G1, M, K};
+          std::vector<ck::index_t> a_gs_ms_ks_strides =
+              input_permute
+                  ? std::vector<ck::index_t>{M * G1 * K, K, G1 * K, 1} // A layout [G0, M, G1, K]
+                  : std::vector<ck::index_t>{G1 * M * K, M * K, K, 1}; // A layout [G0, G1, M, K]
+
+          std::vector<ck::index_t> b0_gs_ns_ks_lengths{G0, G1, N, K};
+          std::vector<ck::index_t> b0_gs_ns_ks_strides =
+              input_permute
+                  ? std::vector<ck::index_t>{N * G1 * K, K, G1 * K, 1} // B0 layout [G0, N, G1, K]
+                  : std::vector<ck::index_t>{G1 * N * K, N * K, K, 1}; // B0 layout [G0, G1, N, K]
+
+          std::vector<ck::index_t> b1_gs_os_ns_lengths{G0, G1, O, N};
+          std::vector<ck::index_t> b1_gs_os_ns_strides =
+              input_permute
+                  ? std::vector<ck::index_t>{N * G1 * O, O, 1, G1 * O} // B1 layout [G0, N, G1, O]
+                  : std::vector<ck::index_t>{G1 * N * O, N * O, 1, O}; // B1 layout [G0, G1, N, O]
+
+          std::vector<ck::index_t> c_gs_ms_os_lengths{G0, G1, M, O};
+          std::vector<ck::index_t> c_gs_ms_os_strides =
+              output_permute
+                  ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1} // C layout [G0, M, G1, O]
+                  : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // C layout [G0, G1, M, O]
+          
+          std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
+          std::vector<ck::index_t> z_gs_ms_ns_strides =
+              z_tensor_permute
+                  ? std::vector<ck::index_t>{M * G1 * N, N, G1 * N, 1} // Z layout [G0, M, G1, N]
+                  : std::vector<ck::index_t>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
+
+          std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
+          std::vector<ck::index_t> lse_gs_ms_strides =
+              std::vector<ck::index_t>{G1 * M, M, 1}; // LSE layout [G0, G1, M]
+
+          problem_descs.push_back({a_gs_ms_ks_lengths,
+                                  a_gs_ms_ks_strides,
+                                  b0_gs_ns_ks_lengths,
+                                  b0_gs_ns_ks_strides,
+                                  b1_gs_os_ns_lengths,
+                                  b1_gs_os_ns_strides,
+                                  c_gs_ms_os_lengths,
+                                  c_gs_ms_os_strides,
+                                  z_gs_ms_ns_lengths,
+                                  z_gs_ms_ns_strides,
+                                  lse_gs_ms_lengths,
+                                  lse_gs_ms_strides,
+                                  {},   // acc0_biases_gs_ms_ns_lengths
+                                  {},   // acc0_biases_gs_ms_ns_strides
+                                  {},   // acc1_biases_gs_ms_os_lengths
+                                  {}}); // acc1_biases_gs_ms_os_strides
+                                  
+      }
+      // do GEMM
+      auto gemm     = DeviceGemmKLoopInstance2{};
+      auto invoker  = gemm.MakeInvoker();
+      auto argument = gemm.MakeArgument(p_a,
+                                        p_b0,
+                                        p_b1,
+                                        p_c,
+                                        p_z,
+                                        p_lse,
+                                        {},
+                                        {},
+                                        problem_descs,
+                                        a_element_op,
+                                        b0_element_op,
+                                        acc0_element_op,
+                                        b1_element_op,
+                                        c_element_op,
+                                        dropout_ratio,
+                                        seeds);
+
+      // specify workspace for problem_desc
+      SimpleDeviceMem problem_desc_workspace(gemm.GetWorkSpaceSize(&argument));
+
+      gemm.SetWorkSpacePointer(&argument, problem_desc_workspace.GetDeviceBuffer());
+
+      if(!gemm.IsSupportedArgument(argument))
+      {
+          std::cout << gemm.GetTypeString() << " does not support this problem" << std::endl;
+
+          return;
+      }
+
+      float ave_time = invoker.Run(argument, StreamConfig{launch_params.stream, time_kernel});
+
+      if(time_kernel){
+          std::cout << "time elpase is " << ave_time <<" ms" << std::endl;
+      }
+    }
+}
+
 }
 
 
