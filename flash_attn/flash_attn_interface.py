@@ -8,10 +8,12 @@ import flash_attn_cuda
 
 IS_DETERMINISTIC = os.environ.get('FLASH_ATTENTION_INTERNAL_DETERMINISTIC', 'False') in ('1')
 IS_UNIT_TEST_MODE = os.environ.get('FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE', 'False') in ('1')
+IS_USING_QLOOP = os.environ.get('FLASH_ATTENTION_INTERNAL_USE_QLOOP', 'False') in ('1')
 IS_PERFORMANCE_MODE = not IS_UNIT_TEST_MODE
 
 print("Deterministic: {}".format(IS_DETERMINISTIC))
 print("Performance Mode: {}".format(IS_PERFORMANCE_MODE))
+print("Using QLoop: {}".format(IS_USING_QLOOP))
 
 def _get_block_size(device, head_dim, is_dropout):
     assert head_dim % 8 == 0 and head_dim <= 128
@@ -28,7 +30,7 @@ def _flash_attn_forward(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
     """
     softmax_lse, *rest = flash_attn_cuda.fwd(
         q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p,
-        softmax_scale, False, causal, IS_DETERMINISTIC, return_softmax, num_splits, generator
+        softmax_scale, False, causal, IS_DETERMINISTIC, IS_USING_QLOOP, return_softmax, num_splits, generator
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
@@ -48,7 +50,7 @@ def _flash_attn_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens
     """
     _, _, _, softmax_d = flash_attn_cuda.bwd(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k,
-        max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, True, causal, IS_DETERMINISTIC, IS_PERFORMANCE_MODE, num_splits, generator)
+        max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, True, causal, IS_DETERMINISTIC, IS_PERFORMANCE_MODE, IS_USING_QLOOP, num_splits, generator)
     # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
     #     breakpoint()
     return dq, dk, dv, softmax_d
