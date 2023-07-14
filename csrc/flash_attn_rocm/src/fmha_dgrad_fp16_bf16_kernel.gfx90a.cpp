@@ -93,6 +93,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a_loop_(LaunchParams<FmhaDgradParams> &launch
 
   bool is_deterministic = launch_params.params.is_deterministic;
   bool is_using_qloop = launch_params.params.is_using_qloop;
+
   bool time_kernel = false;
   bool input_permute = true;
   bool output_permute = true;
@@ -704,6 +705,7 @@ void run_fmha_dgrad_fp16_bf16_gfx90a(LaunchParams<FmhaDgradParams> &launch_param
           run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, BFloat16, Int16, BFloat16, 2, 8, kMaskingSpecializationDefault>(launch_params);
         } else {
           run_fmha_dgrad_fp16_bf16_gfx90a_loop_<BFloat16, BFloat16, Int16, BFloat16, 3, 8, kMaskingSpecializationDefault>(launch_params);
+
         }
       }
     } 

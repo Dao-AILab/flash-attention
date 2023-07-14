@@ -534,6 +534,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                         is_deterministic,
                         is_performance_mode,
                         is_using_qloop);
+
         
         if( is_dropout ) {
             // See Note [Acquire lock when using random generators]
@@ -575,6 +576,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                          is_deterministic,
                          is_performance_mode,
                          is_using_qloop);
+
         
         if( is_dropout ) {
             // See Note [Acquire lock when using random generators]
