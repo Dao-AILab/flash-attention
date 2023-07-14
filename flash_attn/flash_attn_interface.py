@@ -8,7 +8,8 @@ import flash_attn_cuda
 
 IS_DETERMINISTIC = os.environ.get('FLASH_ATTENTION_INTERNAL_DETERMINISTIC', 'False') in ('1')
 IS_UNIT_TEST_MODE = os.environ.get('FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE', 'False') in ('1')
-IS_USING_QLOOP = os.environ.get('FLASH_ATTENTION_INTERNAL_USE_QLOOP', 'False') in ('1')
+IS_USING_KLOOP = os.environ.get('FLASH_ATTENTION_INTERNAL_USE_KLOOP', 'False') in ('1')
+IS_USING_QLOOP = not IS_USING_KLOOP
 IS_PERFORMANCE_MODE = not IS_UNIT_TEST_MODE
 
 print("Deterministic: {}".format(IS_DETERMINISTIC))
