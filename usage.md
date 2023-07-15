@@ -124,4 +124,4 @@ yields the fastest BERT training on cloud instances in MLPerf training 2.0 (June
 - [Jax](https://github.com/google/jax): an [implementation](https://github.com/lucidrains/flash-attention-jax)
   in Jax by [lucidrains](https://github.com/lucidrains/).
 
-- [Metal](https://developer.apple.com/metal/): an [implementation](https://github.com/philipturner/metal-flash-attention) in Metal by Philip Turner. This ports FlashAttention to mobile GPU architectures such as Apple silicon.
+- [Metal](https://developer.apple.com/metal): an [implementation](https://github.com/philipturner/metal-flash-attention) in Metal by Philip Turner. This ports FlashAttention to mobile GPU architectures such as Apple silicon.
