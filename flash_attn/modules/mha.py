@@ -10,14 +10,10 @@ import torch.nn.functional as F
 from einops import rearrange
 
 try:
-    from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
-    from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
+    from flash_attn import flash_attn_varlen_qkvpacked_func, flash_attn_varlen_kvpacked_func
+    from flash_attn import flash_attn_qkvpacked_func, flash_attn_kvpacked_func
 except ImportError:
-    flash_attn_unpadded_qkvpacked_func, flash_attn_unpadded_kvpacked_func = None, None
-
-try:
-    from flash_attn.ops.flash_attn_triton import flash_attn_qkvpacked_func, flash_attn_kvpacked_func
-except ImportError:
+    flash_attn_varlen_qkvpacked_func, flash_attn_varlen_kvpacked_func = None, None
     flash_attn_qkvpacked_func, flash_attn_kvpacked_func = None, None
 
 try:
@@ -46,17 +42,13 @@ class FlashSelfAttention(nn.Module):
         attention_dropout: The dropout rate to apply to the attention
                            (default: 0.0)
     """
-    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
-                 triton=False):
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
         super().__init__()
-        if attention_dropout != 0.0 or not triton:
-            assert flash_attn_unpadded_qkvpacked_func is not None, 'FlashAttention is not installed'
-        if attention_dropout == 0.0 and triton:
-            assert flash_attn_qkvpacked_func is not None, 'FlashAttention Triton is not installed'
+        assert flash_attn_varlen_qkvpacked_func is not None, 'FlashAttention is not installed'
+        assert flash_attn_qkvpacked_func is not None, 'FlashAttention is not installed'
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.drop = nn.Dropout(attention_dropout)
-        self.triton = triton
 
     def forward(self, qkv, causal=None, cu_seqlens=None, max_seqlen=None):
         """Implements the multihead softmax attention.
@@ -83,26 +75,13 @@ class FlashSelfAttention(nn.Module):
             assert cu_seqlens.dtype == torch.int32
             assert max_seqlen is not None
             assert isinstance(max_seqlen, int)
-            return flash_attn_unpadded_qkvpacked_func(
+            return flash_attn_varlen_qkvpacked_func(
                 qkv, cu_seqlens, max_seqlen, self.drop.p if self.training else 0.0,
                 softmax_scale=self.softmax_scale, causal=causal
             )
         else:
-            batch_size, seqlen = qkv.shape[0], qkv.shape[1]
-            # Triton version doesn't support dropout
-            if self.triton and (self.drop.p == 0 or not self.training):
-                output = flash_attn_qkvpacked_func(qkv, None, causal, self.softmax_scale)
-            else:
-                qkv = rearrange(qkv, 'b s ... -> (b s) ...')
-                max_seqlen = seqlen
-                cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32,
-                                        device=qkv.device)
-                output = flash_attn_unpadded_qkvpacked_func(
-                    qkv, cu_seqlens, max_seqlen, self.drop.p if self.training else 0.0,
-                    softmax_scale=self.softmax_scale, causal=causal
-                )
-                output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
-            return output
+            return flash_attn_qkvpacked_func(qkv, self.drop.p if self.training else 0.0,
+                                             softmax_scale=self.softmax_scale, causal=causal)
 
 
 class FlashCrossAttention(nn.Module):
@@ -115,17 +94,13 @@ class FlashCrossAttention(nn.Module):
         attention_dropout: The dropout rate to apply to the attention
                            (default: 0.0)
     """
-    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
-                 triton=False):
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
         super().__init__()
-        if attention_dropout != 0.0 or not triton:
-            assert flash_attn_unpadded_kvpacked_func is not None, 'FlashAttention is not installed'
-        if attention_dropout == 0.0 and triton:
-            assert flash_attn_kvpacked_func is not None, 'FlashAttention Triton is not installed'
+        assert flash_attn_varlen_kvpacked_func is not None, 'FlashAttention is not installed'
+        assert flash_attn_kvpacked_func is not None, 'FlashAttention is not installed'
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.drop = nn.Dropout(attention_dropout)
-        self.triton = triton
 
     def forward(self, q, kv, causal=None, cu_seqlens=None, max_seqlen=None,
                 cu_seqlens_k=None, max_seqlen_k=None):
@@ -133,7 +108,7 @@ class FlashCrossAttention(nn.Module):
         Arguments
         ---------
             q: The tensor containing the query. (B, Sq, H, D)
-            kv: The tensor containing the key and value. (B, Sk, 2, H, D)
+            kv: The tensor containing the key and value. (B, Sk, 2, H_k, D)
             causal: if passed, will override self.causal
             cu_seqlens: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
                 of the sequences in the batch, used to index into q.
@@ -154,7 +129,7 @@ class FlashCrossAttention(nn.Module):
             assert cu_seqlens_k.dtype == torch.int32
             assert max_seqlen_k is not None
             assert isinstance(max_seqlen, int)
-            return flash_attn_unpadded_kvpacked_func(
+            return flash_attn_varlen_kvpacked_func(
                 q, kv, cu_seqlens, cu_seqlens_k, max_seqlen, max_seqlen_k,
                 self.drop.p if self.training else 0.0,
                 softmax_scale=self.softmax_scale, causal=causal
@@ -162,23 +137,9 @@ class FlashCrossAttention(nn.Module):
         else:
             batch_size, seqlen_q = q.shape[0], q.shape[1]
             seqlen_k = kv.shape[1]
-            assert kv.shape[0] == batch_size and kv.shape[3] == q.shape[2] and kv.shape[4] == q.shape[3]
-            if self.triton and (self.drop.p == 0.0 or not self.training):  # Triton version doesn't support dropout
-                output = flash_attn_kvpacked_func(q, kv, None, causal, self.softmax_scale)
-            else:
-                q = rearrange(q, 'b s ... -> (b s) ...')
-                kv = rearrange(kv, 'b s ... -> (b s) ...')
-                cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q,
-                                            dtype=torch.int32, device=q.device)
-                cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k,
-                                            dtype=torch.int32, device=kv.device)
-                output = flash_attn_unpadded_kvpacked_func(
-                    q, kv, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
-                    self.drop.p if self.training else 0.0,
-                    softmax_scale=self.softmax_scale, causal=causal
-                )
-                output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
-            return output
+            assert kv.shape[0] == batch_size and kv.shape[4] == q.shape[3]
+            return flash_attn_kvpacked_func(q, kv, self.drop.p if self.training else 0.0,
+                                            causal=causal, softmax_scale=self.softmax_scale)
 
 
 class SelfAttention(nn.Module):

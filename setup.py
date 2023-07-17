@@ -111,28 +111,52 @@ cc_flag = []
 _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
 if bare_metal_version < Version("11.0"):
     raise RuntimeError("FlashAttention is only supported on CUDA 11 and above")
-cc_flag.append("-gencode")
-cc_flag.append("arch=compute_75,code=sm_75")
+# cc_flag.append("-gencode")
+# cc_flag.append("arch=compute_75,code=sm_75")
 cc_flag.append("-gencode")
 cc_flag.append("arch=compute_80,code=sm_80")
 if bare_metal_version >= Version("11.8"):
     cc_flag.append("-gencode")
     cc_flag.append("arch=compute_90,code=sm_90")
 
-subprocess.run(["git", "submodule", "update", "--init", "csrc/flash_attn/cutlass"])
+subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 ext_modules.append(
     CUDAExtension(
-        name="flash_attn_cuda",
+        name="flash_attn_2_cuda",
         sources=[
-            "csrc/flash_attn/fmha_api.cpp",
-            "csrc/flash_attn/src/fmha_fwd_hdim32.cu",
-            "csrc/flash_attn/src/fmha_fwd_hdim64.cu",
-            "csrc/flash_attn/src/fmha_fwd_hdim128.cu",
-            "csrc/flash_attn/src/fmha_bwd_hdim32.cu",
-            "csrc/flash_attn/src/fmha_bwd_hdim64.cu",
-            "csrc/flash_attn/src/fmha_bwd_hdim128.cu",
-            "csrc/flash_attn/src/fmha_block_fprop_fp16_kernel.sm80.cu",
-            "csrc/flash_attn/src/fmha_block_dgrad_fp16_kernel_loop.sm80.cu",
+            "csrc/flash_attn/flash_api.cpp",
+            "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim96_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim160_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim160_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim192_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim192_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim224_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim224_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim256_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_fwd_hdim256_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim32_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim32_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim64_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim64_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim96_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim96_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim128_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim128_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim160_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim160_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim192_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim192_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim224_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim224_bf16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim256_fp16_sm80.cu",
+            "csrc/flash_attn/src/flash_bwd_hdim256_bf16_sm80.cu",
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"] + generator_flag,
@@ -157,10 +181,11 @@ ext_modules.append(
         include_dirs=[
             Path(this_dir) / 'csrc' / 'flash_attn',
             Path(this_dir) / 'csrc' / 'flash_attn' / 'src',
-            Path(this_dir) / 'csrc' / 'flash_attn' / 'cutlass' / 'include',
+            Path(this_dir) / 'csrc' / 'cutlass' / 'include',
         ],
     )
 )
+
 
 def get_package_version():
     with open(Path(this_dir) / "flash_attn" / "__init__.py", "r") as f:
@@ -172,6 +197,7 @@ def get_package_version():
     else:
         return str(public_version)
 
+
 setup(
     name="flash_attn",
     version=get_package_version(),
@@ -179,11 +205,9 @@ setup(
         exclude=("build", "csrc", "include", "tests", "dist", "docs", "benchmarks", "flash_attn.egg-info",)
     ),
     author="Tri Dao",
-    author_email="trid@stanford.edu",
+    author_email="trid@cs.stanford.edu",
     description="Flash Attention: Fast and Memory-Efficient Exact Attention",
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    url="https://github.com/HazyResearch/flash-attention",
+    url="https://github.com/Dao-AILab/flash-attention",
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: BSD License",
