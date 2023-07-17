@@ -135,10 +135,11 @@ struct alignas(static_cast<int>(Base_::ALIGNMENT)) Fragment : public Base_ {
     }
 
     // Multiply by another fragment.
+    template <typename elem_type>
     inline __device__ void hmul(const Fragment &other) {
         #pragma unroll
         for( int ii = 0; ii < Base_::NUM_REGS; ++ii ) {
-            this->reg(ii) = fmha::hmul2(this->reg(ii), other.reg(ii));
+            this->reg(ii) = fmha::hmul2<elem_type>(this->reg(ii), other.reg(ii));
         }
     }
 
