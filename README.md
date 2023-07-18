@@ -54,6 +54,14 @@ Alternatively you can compile from source:
 python setup.py install
 ```
 
+If your machine has less than 96GB of RAM and lots of CPU cores, `ninja` might
+run too many parallel compilation jobs that could exhaust the amount of RAM. To
+limit the number of parallel compilation jobs, you can set the environment
+variable `MAX_JOBS`:
+```
+MAX_JOBS=4 pip install flash-attn --no-build-isolation
+```
+
 Interface: `src/flash_attention_interface.py`
 
 FlashAttention-2 currently supports:
