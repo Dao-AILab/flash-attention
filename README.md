@@ -42,7 +42,7 @@ To install:
 3. Make sure that `ninja` is installed and that it works correctly (e.g. `ninja
 --version` then `echo $?` should return exit code 0). If not (sometimes `ninja
 --version` then `echo $?` returns a nonzero exit code), uninstall then reinstall
-`ninja` (`pip uninstall -y ninja && pip install ninja`). Without `ninja`
+`ninja` (`pip uninstall -y ninja && pip install ninja`). Without `ninja`,
 compiling can take a very long time (2h) since it does not use multiple CPU
 cores. With `ninja` compiling takes 3-5 minutes on a 64-core machine.
 4. Then:
@@ -202,10 +202,10 @@ pytest -q -s tests/test_flash_attn.py
 ```
 ## When you encounter issues
 
-This new release of FlashAttention-2 have been tested on several GPT-style
+This new release of FlashAttention-2 has been tested on several GPT-style
 models, mostly on A100 GPUs.
 
-If you encounter any of bugs, please open a respective GitHub Issue!
+If you encounter bugs, please open a GitHub Issue!
 
 ## Citation
 If you use this codebase, or otherwise found our work valuable, please cite:

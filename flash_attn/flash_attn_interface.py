@@ -37,12 +37,8 @@ def _get_block_size(device, head_dim, is_dropout, is_causal):
 
 
 def _flash_attn_forward(q, k, v, dropout_p, softmax_scale, causal, return_softmax):
-    if q.stride(-1) != 1:
-        q = q.contiguous()
-    if k.stride(-1) != 1:
-        k = k.contiguous()
-    if v.stride(-1) != 1:
-        v = v.contiguous()
+    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, q, k, v, out_padded, softmax_lse, S_dmask = flash_attn_cuda.fwd(
         q, k, v, None, dropout_p, softmax_scale, causal, return_softmax, None
     )
@@ -51,12 +47,8 @@ def _flash_attn_forward(q, k, v, dropout_p, softmax_scale, causal, return_softma
 
 def _flash_attn_varlen_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                                dropout_p, softmax_scale, causal, return_softmax):
-    if q.stride(-1) != 1:
-        q = q.contiguous()
-    if k.stride(-1) != 1:
-        k = k.contiguous()
-    if v.stride(-1) != 1:
-        v = v.contiguous()
+    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, q, k, v, out_padded, softmax_lse, S_dmask = flash_attn_cuda.varlen_fwd(
         q, k, v, None, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p,
         softmax_scale, False, causal, return_softmax, None
@@ -68,6 +60,9 @@ def _flash_attn_varlen_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q
 
 def _flash_attn_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv,
                          dropout_p, softmax_scale, causal):
+    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+    # dq, dk, dv are allocated by us so they should already be contiguous
+    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     dq, dk, dv, softmax_d, = flash_attn_cuda.bwd(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, dropout_p, softmax_scale, causal, None
     )
@@ -77,6 +72,9 @@ def _flash_attn_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv,
 def _flash_attn_varlen_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv,
                                 cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                                 dropout_p, softmax_scale, causal):
+    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+    # dq, dk, dv are allocated by us so they should already be contiguous
+    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     dq, dk, dv, softmax_d, = flash_attn_cuda.varlen_bwd(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, False, causal, None
