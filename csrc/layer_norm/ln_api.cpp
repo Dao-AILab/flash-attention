@@ -132,7 +132,7 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
 
     TORCH_CHECK(x0.is_contiguous());
     // c10::IntArrayRef does not own the storage, so we need to construct a vector.
-    // Otherwise just constructing IntArrayRef({blah}) will cause unintialized memory because
+    // Otherwise just constructing IntArrayRef({blah}) will cause uninitialized memory because
     // blah is then deallocated.
     std::vector<int64_t> sizes_vec {!x0_subset_.has_value() ? x0.size(0) : x0_subset_.value().size(0), x0.size(1)};
     auto sizes = c10::IntArrayRef(sizes_vec);
@@ -331,7 +331,7 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
     TORCH_CHECK(hidden_size == cols);
 
     // c10::IntArrayRef does not own the storage, so we need to construct a vector.
-    // Otherwise just constructing IntArrayRef({blah}) will cause unintialized memory because
+    // Otherwise just constructing IntArrayRef({blah}) will cause uninitialized memory because
     // blah is then deallocated.
     std::vector<int64_t> x0_sizes_vec {!x0_subset_.has_value() ? rows : x0_numrows, cols};
     auto x0_sizes = c10::IntArrayRef(x0_sizes_vec);
