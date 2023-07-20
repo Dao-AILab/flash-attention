@@ -89,7 +89,7 @@ RUN pip install flash-attn==2.0.0.post1
 
 # Install CUDA extensions for cross-entropy, fused dense, layer norm
 RUN git clone https://github.com/HazyResearch/flash-attention \
-    && cd flash-attention && git checkout v2.0.0.post1 \
+    && cd flash-attention \
     && cd csrc/fused_softmax && pip install . && cd ../../ \
     && cd csrc/rotary && pip install . && cd ../../ \
     && cd csrc/xentropy && pip install . && cd ../../ \
