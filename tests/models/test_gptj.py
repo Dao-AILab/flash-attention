@@ -36,7 +36,7 @@ def test_gptj_optimized(model_name):
     dtype = torch.float16
     device = 'cuda'
     config = gptj_config_to_gpt2_config(GPTJConfig.from_pretrained(model_name))
-    config.use_flash_attn = False  # FlashAttention doesn't support hdim 256 yet
+    config.use_flash_attn = True  # FlashAttention-2 supports headdim 256
     config.fused_bias_fc = True
     config.fused_mlp = True
     config.fused_dropout_add_ln = True
@@ -93,7 +93,7 @@ def test_gptj_generation(model_name):
     dtype = torch.float16
     device = 'cuda'
     config = gptj_config_to_gpt2_config(GPTJConfig.from_pretrained(model_name))
-    config.use_flash_attn = False  # FlashAttention doesn't support hdim 256 yet
+    config.use_flash_attn = True  # FlashAttention-2 supports headdim 256
     config.fused_bias_fc = True
     config.fused_mlp = True
     config.fused_dropout_add_ln = True
