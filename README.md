@@ -94,6 +94,7 @@ Arguments:
     causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
 Return:
     out: (batch_size, seqlen, nheads, headdim).
+"""
 ```
 
 ```python
@@ -114,6 +115,7 @@ Arguments:
     causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
 Return:
     out: (batch_size, seqlen, nheads, headdim).
+"""
 ```
 
 To see how these functions are used in a multi-head attention layer (which
