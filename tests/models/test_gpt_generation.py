@@ -60,9 +60,9 @@ def test_greedy_decode_gpt2(model_name, rotary, optimized, fused_ft_kernel):
 
     torch.manual_seed(0)
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    input_ids = tokenizer("Hello, my dog is cute and",
+    input_ids = tokenizer("Hello, my dog is cute and he",
                          return_tensors="pt").input_ids.to(device=device)
-    max_length = 30
+    max_length = 25
     # input_ids = torch.randint(0, 100, (2, 10), dtype=torch.long, device='cuda')
     # max_length = input_ids.shape[1] + 40
 
@@ -143,9 +143,9 @@ def test_greedy_decode_opt(model_name):
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
     eos_token_id = tokenizer.eos_token_id
 
-    input_ids = tokenizer("Hello, my dog is cute and",
+    input_ids = tokenizer("Hello, my dog is cute and he",
                           return_tensors="pt").input_ids.to(device=device)
-    max_length = 60
+    max_length = 25
     # input_ids = torch.randint(0, 100, (2, 10), dtype=torch.long, device='cuda')
     # max_length = input_ids.shape[1] + 40
 

@@ -48,7 +48,6 @@ def test_gptj_optimized(model_name):
     torch.manual_seed(0)
     batch_size = 2
     max_seqlen = 256
-    seqlens = torch.randint(max_seqlen // 2, max_seqlen + 1, (batch_size,), device=device)
     input_ids = torch.randint(0, config.vocab_size, (batch_size, max_seqlen), dtype=torch.long,
                               device=device)
     with torch.no_grad():

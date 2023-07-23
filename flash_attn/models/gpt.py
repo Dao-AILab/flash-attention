@@ -88,7 +88,9 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
     parallel_kwargs = ({'process_group': process_group,
                         'sequence_parallel': getattr(config, 'sequence_parallel', True)}
                        if process_group is not None else {})
+    num_heads_kv = getattr(config, "n_head_kv", None)
     mixer_cls = partial(mha_cls, num_heads=config.num_attention_heads,
+                        num_heads_kv=num_heads_kv,
                         qkv_proj_bias=qkv_proj_bias, out_proj_bias=out_proj_bias,
                         dropout=config.attn_pdrop,
                         softmax_scale=softmax_scale, causal=True, layer_idx=layer_idx,
@@ -503,20 +505,37 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
     assert inner_dim % world_size == 0
 
     def shard_first_dim(state_dict, key):
-        x = state_dict[key]
-        dim = x.shape[0] // world_size
-        state_dict[key] = x[rank * dim:(rank + 1) * dim]
+        if key in state_dict:
+            x = state_dict[key]
+            dim = x.shape[0] // world_size
+            state_dict[key] = x[rank * dim:(rank + 1) * dim]
 
     def shard_last_dim(state_dict, key):
-        x = state_dict[key]
-        dim = x.shape[-1] // world_size
-        state_dict[key] = x[..., rank * dim:(rank + 1) * dim]
+        if key in state_dict:
+            x = state_dict[key]
+            dim = x.shape[-1] // world_size
+            state_dict[key] = x[..., rank * dim:(rank + 1) * dim]
 
     def shard_qkv_headdim(state_dict, key):
-        x = rearrange(state_dict[key], '(three d) ... -> three d ...', three=3)
-        dim = x.shape[1] // world_size
-        state_dict[key] = rearrange(x[:, rank * dim:(rank + 1) * dim],
-                                    'three d ... -> (three d) ...')
+        if key in state_dict:
+            n_head = config.n_head
+            n_head_kv = getattr(config, 'n_head_kv', n_head)
+            assert n_head % world_size == 0 and n_head_kv % world_size == 0
+            if n_head_kv == n_head:
+                x = rearrange(state_dict[key], '(three d) ... -> three d ...', three=3)
+                dim = x.shape[1] // world_size
+                state_dict[key] = rearrange(x[:, rank * dim:(rank + 1) * dim],
+                                            'three d ... -> (three d) ...')
+            else:
+                n_head_per_rank = n_head // world_size
+                n_head_kv_per_rank = n_head_kv // world_size
+                x = rearrange(state_dict[key], '(nheadqkv headdim) ... -> nheadqkv headdim ...',
+                              nheadqkv=n_head + 2 * n_head_kv)
+                state_dict[key] = rearrange(torch.cat([
+                    x[rank * n_head_per_rank:(rank + 1) * n_head_per_rank],
+                    x[n_head + rank * n_head_kv_per_rank:n_head + (rank + 1) * n_head_kv_per_rank],
+                    x[n_head + n_head_kv + rank * n_head_kv_per_rank:n_head + n_head_kv + (rank + 1) * n_head_kv_per_rank],
+                ], dim=0), "nheadqkv headdim ... -> (nheadqkv headdim) ...")
 
     shard_first_dim(state_dict, 'transformer.embeddings.word_embeddings.weight')
     if 'lm_head.weight' in state_dict:
@@ -528,12 +547,12 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
         shard_qkv_headdim(state_dict, f'transformer.layers.{i}.mixer.Wqkv.bias')
         shard_last_dim(state_dict, f'transformer.layers.{i}.mixer.out_proj.weight')
         if rank != 0:
-            state_dict.pop(f'transformer.layers.{i}.mixer.out_proj.bias')
+            state_dict.pop(f'transformer.layers.{i}.mixer.out_proj.bias', None)
         shard_first_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.weight')
         shard_first_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.bias')
         shard_last_dim(state_dict, f'transformer.layers.{i}.mlp.fc2.weight')
         if rank != 0:
-            state_dict.pop(f'transformer.layers.{i}.mlp.fc2.bias')
+            state_dict.pop(f'transformer.layers.{i}.mlp.fc2.bias', None)
     return state_dict
 
 
@@ -561,9 +580,23 @@ def combine_state_dicts_tp(state_dicts, config):
             state_dict[key] = torch.cat([s[key] for s in state_dicts], dim=dim)
 
     def combine_qkv_headdim(state_dicts, state_dict, key):
+        n_head = config.n_head
+        n_head_kv = getattr(config, 'n_head_kv', n_head)
+        assert n_head % world_size == 0 and n_head_kv % world_size == 0
+        n_head_per_rank = n_head // world_size
+        n_head_kv_per_rank = n_head_kv // world_size
         if key in state_dict:
-            xs = [rearrange(s[key], '(three d) ... -> three d ...', three=3) for s in state_dicts]
-            state_dict[key] = rearrange(torch.cat(xs, dim=1), 'three d ... -> (three d) ...')
+            if n_head_kv == n_head:
+                xs = [rearrange(s[key], '(three d) ... -> three d ...', three=3) for s in state_dicts]
+                state_dict[key] = rearrange(torch.cat(xs, dim=1), 'three d ... -> (three d) ...')
+            else:
+                xs = [rearrange(s[key], '(nheadqkv headdim) ... -> nheadqkv headdim ...',
+                                nheadqkv=n_head + 2 * n_head_kv) for s in state_dicts]
+                state_dict[key] = rearrange(torch.cat([
+                    torch.cat([x[:n_head_per_rank] for x in xs], dim=0),
+                    torch.cat([x[n_head_per_rank:n_head_per_rank + n_head_kv_per_rank] for x in xs], dim=0),
+                    torch.cat([x[-n_head_kv_per_rank:] for x in xs], dim=0),
+                ], dim=0), "nheadqkv headdim ... -> (nheadqkv headdim) ...")
 
     def combine_gated_mlp(state_dicts, state_dict, key):
         if key in state_dict:
