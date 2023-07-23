@@ -27,6 +27,7 @@ from flash_attn.utils.generation import GenerationMixin
 from flash_attn.models.opt import remap_state_dict_hf_opt
 from flash_attn.models.gptj import remap_state_dict_hf_gptj
 from flash_attn.models.gpt_neox import remap_state_dict_hf_gpt_neox
+from flash_attn.models.falcon import remap_state_dict_hf_falcon
 
 try:
     from flash_attn.ops.fused_dense import ColumnParallelLinear
@@ -241,6 +242,8 @@ class GPTPreTrainedModel(nn.Module):
             state_dict = remap_state_dict_hf_gptj(state_dict, config)
         elif model_name.startswith('EleutherAI/gpt-neox-'):
             state_dict = remap_state_dict_hf_gpt_neox(state_dict, config)
+        elif model_name.startswith('tiiuae/falcon-'):
+            state_dict = remap_state_dict_hf_falcon(state_dict, config)
         else:
             raise NotImplementedError(f'Model {model_name} not supported')
         if world_size > 1:
