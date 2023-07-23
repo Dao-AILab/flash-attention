@@ -863,3 +863,29 @@ def test_dropout_layer_norm_parallel_residual_prenorm_training(
         assert (weight1.grad - weight1_ref.grad).abs().max() <= 3 * (weight1_pt.grad - weight1_ref.grad).abs().max() + 3e-5
         if not is_rms_norm:
             assert (bias1.grad - bias1_ref.grad).abs().max() <= 2 * (bias1_pt.grad - bias1_ref.grad).abs().max() + 3e-5
+
+
+def test_dropout_layer_norm_randomness():
+    hidden_size = 256
+    dtype = torch.float32
+    dropout_p = 0.1
+    device = 'cuda'
+    # set seed
+    torch.random.manual_seed(0)
+    batch_size = 8
+    seqlen = 512
+    x0 = torch.randn(batch_size, seqlen, hidden_size, device=device, dtype=dtype, requires_grad=True)
+    res = torch.randn_like(x0, dtype=dtype, requires_grad=True)
+    model = DropoutAddLayerNorm(hidden_size, p=dropout_p, device=device, dtype=dtype)
+    torch.random.manual_seed(42)
+    _, dmask0 = dropout_add_layer_norm(x0, res, model.weight, model.bias, model.p,
+                                       model.eps, return_dropout_mask=True)
+    # Subsequent call should have a different dropout mask
+    _, dmask1 = dropout_add_layer_norm(x0, res, model.weight, model.bias, model.p,
+                                       model.eps, return_dropout_mask=True)
+    torch.random.manual_seed(42)
+    # Resetting the seed, should get the same dropout mask
+    _, dmask2 = dropout_add_layer_norm(x0, res, model.weight, model.bias, model.p,
+                                       model.eps, return_dropout_mask=True)
+    assert not torch.equal(dmask0, dmask1)
+    assert torch.equal(dmask0, dmask2)
