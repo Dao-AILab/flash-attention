@@ -237,7 +237,6 @@ class GPTPreTrainedModel(nn.Module):
             state_dict = remap_state_dict_hf_opt(state_dict, config)
         elif model_name.startswith('EleutherAI/gpt-j-'):
             state_dict = remap_state_dict_hf_gptj(state_dict, config)
-            strict = False  # We have rotary_emb.inf_freq buffers not in the GPT-J checkpoint
         elif model_name.startswith('EleutherAI/gpt-neox-'):
             state_dict = remap_state_dict_hf_gpt_neox(state_dict, config)
         else:
