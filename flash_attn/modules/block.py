@@ -288,6 +288,8 @@ class ParallelBlock(nn.Module):
             hidden_states2: the output of the previous MLP layer (if None, will use hidden_states1).
             residual.
         """
+        # TODO: Ideally we should only do the allgather / allreduce once for
+        # the Linear to MLP & Attention
         fused_add_norm_fn = (dropout_add_rms_norm_parallel_residual
                              if isinstance(self.norm1, RMSNorm)
                              else dropout_add_layer_norm_parallel_residual)
