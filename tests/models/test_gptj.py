@@ -20,10 +20,8 @@ def test_gptj_state_dict(model_name):
     pretrained_state_dict = remap_state_dict_hf_gptj(state_dict_from_pretrained(model_name), config)
     model = GPTLMHeadModel(config, device='meta')  # Without device='meta' init is very slow
     state_dict = model.state_dict()
-    rotary_inv_freq_keys = {f'transformer.layers.{l}.mixer.rotary_emb.inv_freq'
-                            for l in range(config.n_layer)}
-    assert state_dict.keys() == pretrained_state_dict.keys() | rotary_inv_freq_keys
-    for k in state_dict.keys() - rotary_inv_freq_keys:
+    assert state_dict.keys() == pretrained_state_dict.keys()
+    for k in state_dict.keys():
         assert state_dict[k].shape == pretrained_state_dict[k].shape
 
 
