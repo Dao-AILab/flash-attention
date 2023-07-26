@@ -8,7 +8,7 @@ from einops import rearrange, repeat
 
 from flash_attn.utils.benchmark import benchmark_all, benchmark_forward, benchmark_backward, benchmark_combined
 from flash_attn.bert_padding import unpad_input, pad_input
-from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
+from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
 
 
 def attention_ref(qkv, attn_mask, dropout_p, upcast=False, causal=False):
@@ -62,7 +62,7 @@ qkv_unpad = rearrange(Wqkv(x_unpad), 'nnz (t h d) -> nnz t h d', t=3,
                       h=nheads).detach().requires_grad_()
 qkv = rearrange(Wqkv(x), 'b s (t h d) -> b s t h d', t=3, h=nheads).detach().requires_grad_()
 
-fn = lambda qkv_unpad: flash_attn_unpadded_qkvpacked_func(
+fn = lambda qkv_unpad: flash_attn_varlen_qkvpacked_func(
     qkv_unpad, cu_seqlens, max_seqlen_in_batch, dropout_p, causal=causal
 )
 benchmark_all(fn, qkv_unpad, repeats=repeats, desc='FlashAttention')

@@ -119,7 +119,7 @@ class Block(nn.Module):
                 before applying the query projection. Useful for e.g., ViT where we only care
                 about the CLS token in the last layer.
         """
-        fused_add_norm_fn = (dropout_add_rms_norm if isinstance(self.norm1, RMSNorm)
+        fused_add_norm_fn = (dropout_add_rms_norm if RMSNorm and isinstance(self.norm1, RMSNorm)
                              else dropout_add_layer_norm)
         if self.prenorm:
             if not self.fused_dropout_add_ln:
@@ -276,6 +276,9 @@ class ParallelBlock(nn.Module):
                 for p in self.norm2.parameters():
                     p._shared_params = True
 
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+
     def forward(self, hidden_states1: Tensor, hidden_states2: Optional[Tensor] = None,
                 residual: Optional[Tensor] = None, mixer_kwargs=None):
         r"""Pass the input through the encoder layer.
@@ -285,6 +288,8 @@ class ParallelBlock(nn.Module):
             hidden_states2: the output of the previous MLP layer (if None, will use hidden_states1).
             residual.
         """
+        # TODO: Ideally we should only do the allgather / allreduce once for
+        # the Linear to MLP & Attention
         fused_add_norm_fn = (dropout_add_rms_norm_parallel_residual
                              if isinstance(self.norm1, RMSNorm)
                              else dropout_add_layer_norm_parallel_residual)

@@ -2,7 +2,7 @@
 
 # To run the huggingface implementation, we first need to convert the weights:
 # https://github.com/huggingface/transformers/pull/21955
-# python -m transformers.models.llama.convert_llama_weights_to_hf --input_dir $CHECKPOINT_DIR/llama --model_size 7B --output_dir $CHECKPOINT_DIR$/llama/7B-hf
+# python -m transformers.models.llama.convert_llama_weights_to_hf --input_dir $CHECKPOINT_DIR/llama --model_size 7B --output_dir $CHECKPOINT_DIR/llama/7B-hf
 # and repeat for 13B, 30B, 65B
 
 import os
@@ -32,10 +32,8 @@ def test_llama_state_dict(model_name):
     pretrained_state_dict = remap_state_dict_meta_llama(ckpt_state_dicts[0], config)
     model = GPTLMHeadModel(config, device='meta')  # Without device='meta' init is very slow
     state_dict = model.state_dict()
-    rotary_inv_freq_keys = {f'transformer.layers.{l}.mixer.rotary_emb.inv_freq'
-                            for l in range(config.n_layer)}
-    assert state_dict.keys() == pretrained_state_dict.keys() | rotary_inv_freq_keys
-    for k in state_dict.keys() - rotary_inv_freq_keys:
+    assert state_dict.keys() == pretrained_state_dict.keys()
+    for k in state_dict.keys():
         assert state_dict[k].shape == pretrained_state_dict[k].shape
 
 
@@ -185,7 +183,7 @@ def test_llama_parallel(model_name, world_size):
     assert (logits - logits_ref).abs().max().item() < 2 * (logits_hf - logits_ref).abs().max().item()
 
 
-@pytest.mark.parametrize('model_name', ["7B"])
+@pytest.mark.parametrize('model_name', ["7B", "13B"])
 def test_llama_generation(model_name):
     checkpoint_path = Path(os.environ.get('CHECKPOINT_DIR',
                                           current_dir.parent.parent / 'checkpoints')) / 'llama'
@@ -221,11 +219,12 @@ def test_llama_generation(model_name):
     print(f'Prompt processing + decoding time: {(time.time() - start) * 1000:.0f}ms')
     del model_hf
 
+    # Need auto here since the 13B fp32 model doesn't fit in memory on a A100 40GB
     model_ref = LlamaForCausalLM.from_pretrained(Path(checkpoint_path) / f'{model_name}-hf',
-                                                 device_map={"": device})
+                                                 device_map='auto')
     model_ref.eval()
     with torch.no_grad():
-        logits_ref = model_ref(out_hf.sequences).logits[:, (seqlen - 1):-1]
+        logits_ref = model_ref(out_hf.sequences).logits[:, (seqlen - 1):-1].to(device=device)
     del model_ref
 
     ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
@@ -267,10 +266,11 @@ def test_llama_generation(model_name):
     del model
 
     hf_error = (logits_hf - logits_ref).abs().max().item()
-    assert (logits_parallel - logits_ref).abs().max().item() < 2 * hf_error
 
     print(f'HF fp16 logits max diff: {hf_error}')
     print(f'Logits max diff: {(logits - logits_ref).abs().max().item() }')
-    assert (logits - logits_ref).abs().max().item() < 2 * hf_error
     print(f'Logits CG max diff: {(logits_cg - logits_ref).abs().max().item() }')
+
+    assert (logits_parallel - logits_ref).abs().max().item() < 2 * hf_error
+    assert (logits - logits_ref).abs().max().item() < 2 * hf_error
     assert torch.equal(logits_cg, logits)

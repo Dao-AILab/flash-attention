@@ -69,7 +69,9 @@ struct Multihead_attention_params_base {
     const int* cache_indir = nullptr;
 
     // Stride to handle the case when KQV is a single buffer
-    int stride = 0;
+    int stride_q = 0;
+    int stride_k = 0;
+    int stride_v = 0;
 
     // The batch size.
     int batch_size = 0;
@@ -79,11 +81,14 @@ struct Multihead_attention_params_base {
     int memory_max_len = 0;
     // The number of heads (H).
     int num_heads = 0;
+    int num_heads_kv = 0;
+    int num_heads_q_kv_ratio = 0;
     // The hidden dimension per head (Dh).
     int hidden_size_per_head = 0;
     // The per-head latent space reserved for rotary embeddings.
     int  rotary_embedding_dim = 0;
     bool neox_rotary_style    = false;
+    float rotary_base = 0.0f;
     // The maximum length of input sentences.
     int max_input_length = 0;
     // The current timestep. TODO(bhsueh) Check that do we only this param in cross attention?
@@ -112,6 +117,12 @@ struct Multihead_attention_params_base {
     const float* qkv_scale_out       = nullptr;
     const float* attention_out_scale = nullptr;
     int          int8_mode           = 0;
+
+    const T *rotary_cos = nullptr;
+    const T *rotary_sin = nullptr;
+
+    const int *nnz_head_idx = nullptr;
+    int nnz_heads = 0;
 };
 
 template<typename T, bool CROSS_ATTENTION>

@@ -99,7 +99,7 @@ def test_dropout_layer_norm_training(hidden_size, input_dtype, residual_dtype, w
             model_ref.bias.copy_(model_pt.bias)
     residual_in_fp32 = (not has_residual) and residual_dtype == torch.float32
     out, dmask = our_layer_norm_func(x0, res, model.weight, model.bias, model.p,
-                                     model.epsilon, rowscale=rowscale, layerscale=colscale,
+                                     model.eps, rowscale=rowscale, layerscale=colscale,
                                      residual_in_fp32=residual_in_fp32, return_dropout_mask=True)
     assert out.dtype == input_dtype
     print(f'Actual dropout fraction: {1 - dmask.float().mean().item()}')
@@ -251,7 +251,7 @@ def test_dropout_layer_norm_prenorm_training(hidden_size, input_dtype, residual_
             model_ref.bias.copy_(model_pt.bias)
     residual_in_fp32 = (not has_residual) and residual_dtype == torch.float32
     out, residual, dmask = our_layer_norm_func(x0, res, model.weight, model.bias, model.p,
-                                               model.epsilon, rowscale=rowscale,
+                                               model.eps, rowscale=rowscale,
                                                layerscale=colscale, prenorm=True,
                                                residual_in_fp32=residual_in_fp32,
                                                return_dropout_mask=True)
@@ -412,7 +412,7 @@ def test_dropout_layer_norm_subset_training(
 
     residual_in_fp32 = (not has_residual) and residual_dtype == torch.float32
     out, dmask = dropout_add_layer_norm_subset(
-        x0, res, model.weight, model.bias, model.p, model.epsilon, layerscale=colscale,
+        x0, res, model.weight, model.bias, model.p, model.eps, layerscale=colscale,
         x0_subset=x0_subset, out_subset=out_subset, rowscale_const=drop_path_scale,
         out_numrows = out_numrows, prenorm=False, residual_in_fp32=residual_in_fp32,
         return_dropout_mask=True)
@@ -532,7 +532,7 @@ def test_dropout_layer_norm_subset_prenorm_training(
 
     residual_in_fp32 = (not has_residual) and residual_dtype == torch.float32
     out, residual, dmask = dropout_add_layer_norm_subset(
-        x0, res, model.weight, model.bias, model.p, model.epsilon, layerscale=colscale,
+        x0, res, model.weight, model.bias, model.p, model.eps, layerscale=colscale,
         x0_subset=x0_subset, out_subset=out_subset, rowscale_const=drop_path_scale,
         out_numrows = out_numrows, prenorm=True, residual_in_fp32=residual_in_fp32,
         return_dropout_mask=True)
@@ -863,3 +863,29 @@ def test_dropout_layer_norm_parallel_residual_prenorm_training(
         assert (weight1.grad - weight1_ref.grad).abs().max() <= 3 * (weight1_pt.grad - weight1_ref.grad).abs().max() + 3e-5
         if not is_rms_norm:
             assert (bias1.grad - bias1_ref.grad).abs().max() <= 2 * (bias1_pt.grad - bias1_ref.grad).abs().max() + 3e-5
+
+
+def test_dropout_layer_norm_randomness():
+    hidden_size = 256
+    dtype = torch.float32
+    dropout_p = 0.1
+    device = 'cuda'
+    # set seed
+    torch.random.manual_seed(0)
+    batch_size = 8
+    seqlen = 512
+    x0 = torch.randn(batch_size, seqlen, hidden_size, device=device, dtype=dtype, requires_grad=True)
+    res = torch.randn_like(x0, dtype=dtype, requires_grad=True)
+    model = DropoutAddLayerNorm(hidden_size, p=dropout_p, device=device, dtype=dtype)
+    torch.random.manual_seed(42)
+    _, dmask0 = dropout_add_layer_norm(x0, res, model.weight, model.bias, model.p,
+                                       model.eps, return_dropout_mask=True)
+    # Subsequent call should have a different dropout mask
+    _, dmask1 = dropout_add_layer_norm(x0, res, model.weight, model.bias, model.p,
+                                       model.eps, return_dropout_mask=True)
+    torch.random.manual_seed(42)
+    # Resetting the seed, should get the same dropout mask
+    _, dmask2 = dropout_add_layer_norm(x0, res, model.weight, model.bias, model.p,
+                                       model.eps, return_dropout_mask=True)
+    assert not torch.equal(dmask0, dmask1)
+    assert torch.equal(dmask0, dmask2)

@@ -132,7 +132,7 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
 
     TORCH_CHECK(x0.is_contiguous());
     // c10::IntArrayRef does not own the storage, so we need to construct a vector.
-    // Otherwise just constructing IntArrayRef({blah}) will cause unintialized memory because
+    // Otherwise just constructing IntArrayRef({blah}) will cause uninitialized memory because
     // blah is then deallocated.
     std::vector<int64_t> sizes_vec {!x0_subset_.has_value() ? x0.size(0) : x0_subset_.value().size(0), x0.size(1)};
     auto sizes = c10::IntArrayRef(sizes_vec);
@@ -229,11 +229,6 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
     // Request the kernel launcher.
     auto launcher = get_fwd_launcher(wtype, itype, rtype, otype, ctype, round_multiple(hidden_size, multiple));
 
-    // Query the kernel-specific launch parameters.
-    launcher(launch_params, true);
-
-    at::Tensor workspace, barrier;
-
     // Set the kernel runtime parameters.
     layer_norm::FwdParams &params = launch_params.params;
     params.rows = rows;
@@ -251,6 +246,11 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
     params.inverse_cols = 1.f / float(params.cols);
     params.rowscale_const = rowscale_const;
     params.is_rms_norm = is_rms_norm;
+
+    // Query the kernel-specific launch parameters.
+    launcher(launch_params, true);
+
+    at::Tensor workspace, barrier;
 
     if (dropout_p > 0.f) {
         // number of times random will be generated per thread, to offset philox counter in thc random
@@ -331,7 +331,7 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
     TORCH_CHECK(hidden_size == cols);
 
     // c10::IntArrayRef does not own the storage, so we need to construct a vector.
-    // Otherwise just constructing IntArrayRef({blah}) will cause unintialized memory because
+    // Otherwise just constructing IntArrayRef({blah}) will cause uninitialized memory because
     // blah is then deallocated.
     std::vector<int64_t> x0_sizes_vec {!x0_subset_.has_value() ? rows : x0_numrows, cols};
     auto x0_sizes = c10::IntArrayRef(x0_sizes_vec);
@@ -594,11 +594,6 @@ std::vector<at::Tensor> dropout_add_ln_parallel_residual_fwd(
     // Request the kernel launcher.
     auto launcher = get_parallel_fwd_launcher(wtype, itype, rtype, otype, ctype, round_multiple(hidden_size, multiple));
 
-    // Query the kernel-specific launch parameters.
-    launcher(launch_params, true);
-
-    at::Tensor workspace, barrier;
-
     // Set the kernel runtime parameters.
     layer_norm::FwdParams &params = launch_params.params;
     params.rows = rows;
@@ -620,6 +615,11 @@ std::vector<at::Tensor> dropout_add_ln_parallel_residual_fwd(
     params.dropout_scale = 1.f / (1.f - dropout_p);
     params.inverse_cols = 1.f / float(params.cols);
     params.is_rms_norm = is_rms_norm;
+
+    // Query the kernel-specific launch parameters.
+    launcher(launch_params, true);
+
+    at::Tensor workspace, barrier;
 
     if (dropout_p > 0.f) {
         // number of times random will be generated per thread, to offset philox counter in thc random
