@@ -130,6 +130,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // The thread index.
     const int tidx = threadIdx.x;
+    // The block index.
+    const int bidx = gridDim.x * bidh + bidb;
 
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
@@ -309,8 +311,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     unsigned long long offset = std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + tidx % 32;
 
     // Save seed and offset for backward.
-    params.rng_state[0] = seed;
-    params.rng_state[1] = offset;
+    if (bidx == 0 && tidx == 0) {
+        params.rng_state[0] = seed;
+        params.rng_state[1] = offset;
+    }
 
     clear(acc_o);
 
