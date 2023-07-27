@@ -756,7 +756,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     }
 
     auto seed = params.rng_state[0];
-    auto offset = params.rng_state[1];
+    auto offset = params.rng_state[1] + (bidb * params.h + bidh) * 32 + tidx % 32;
 
     clear(acc_dv);
     clear(acc_dk);
@@ -1301,7 +1301,7 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
     for (int mi = 0; mi < size(dP_sum); ++mi) { dP_sum(mi) = sdPsum(get<0>(taccScS_row(mi))); }
 
     auto seed = params.rng_state[0];
-    auto offset = params.rng_state[1];
+    auto offset = params.rng_state[1] + (bidb * params.h + bidh) * 32 + tidx % 32;
 
     clear(acc_dq);
 

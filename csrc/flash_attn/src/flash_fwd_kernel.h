@@ -313,7 +313,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // Save seed and offset for backward.
     if (bidx == 0 && tidx == 0) {
         params.rng_state[0] = seed;
-        params.rng_state[1] = offset;
+        params.rng_state[1] = std::get<1>(seeds);
     }
 
     clear(acc_o);
