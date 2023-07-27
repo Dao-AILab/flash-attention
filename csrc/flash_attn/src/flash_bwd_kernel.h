@@ -755,9 +755,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         copy(smem_thr_copy_KV, tdPsV, tdPrV_copy_view);
     }
 
-    auto seeds = at::cuda::philox::unpack(params.philox_args);
-    unsigned long long seed = std::get<0>(seeds);
-    unsigned long long offset = std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + tidx % 32;
+    auto seed = params.rng_state[0];
+    auto offset = params.rng_state[1];
 
     clear(acc_dv);
     clear(acc_dk);
