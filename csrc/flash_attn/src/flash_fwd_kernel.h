@@ -308,6 +308,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     unsigned long long seed = std::get<0>(seeds);
     unsigned long long offset = std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + tidx % 32;
 
+    // Save seed and offset for backward.
+    params.rng_state[0] = seed;
+    params.rng_state[1] = offset;
+
     clear(acc_o);
 
     // For performance reason, we separate out two kinds of iterations:
