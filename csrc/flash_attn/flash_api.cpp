@@ -294,11 +294,16 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
                      softmax_scale,
                      is_causal);
 
+    // number of times random will be generated per thread, to offset philox counter in thc random
+    // state
+    // We use a custom RNG that increases the offset by batch_size * nheads * 32.
+    int64_t counter_offset = params.b * params.h * 32;
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
+    // Forward kernel will populate memory with the seed and offset.
+    params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
+
     if (p_dropout > 0.0)  {
-        // number of times random will be generated per thread, to offset philox counter in thc random
-        // state
-        // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-        int64_t counter_offset = params.b * params.h * 32;
         auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
             gen_, at::cuda::detail::getDefaultCUDAGenerator());
         // See Note [Acquire lock when using random generators]
@@ -315,7 +320,7 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
         if (out_.has_value()) { out_.value().copy_(out); }
     }
 
-    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p};
+    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
 }
 
 std::vector<at::Tensor>
@@ -448,11 +453,16 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
                      softmax_scale,
                      is_causal);
 
+    // number of times random will be generated per thread, to offset philox counter in thc random
+    // state
+    // We use a custom RNG that increases the offset by batch_size * nheads * 32.
+    int64_t counter_offset = params.b * params.h * 32;
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
+    // Forward kernel will populate memory with the seed and offset.
+    params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
+
     if (p_dropout > 0.0)  {
-        // number of times random will be generated per thread, to offset philox counter in thc random
-        // state
-        // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-        int64_t counter_offset = params.b * params.h * 32;
         auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
             gen_, at::cuda::detail::getDefaultCUDAGenerator());
         // See Note [Acquire lock when using random generators]
@@ -469,7 +479,7 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
         if (out_.has_value()) { out_.value().copy_(out); }
     }
 
-    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p};
+    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
 }
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {
@@ -507,7 +517,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         const float p_dropout,         // probability to drop
         const float softmax_scale,
         const bool is_causal,
-        c10::optional<at::Generator> gen_) {
+        c10::optional<at::Generator> gen_,
+        c10::optional<at::Tensor> &rng_state) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     // bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
@@ -669,10 +680,15 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = params.b * params.h * 32;
 
-    if (is_dropout) {
+    if ( rng_state.has_value() ) {
+        params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
+    } else if( is_dropout ) {
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         params.philox_args = gen->philox_cuda_state(counter_offset);
+        auto seeds = at::cuda::philox::unpack(params.philox_args);
+        params.rng_state[0] = std::get<0>(seeds);
+        params.rng_state[1] = std::get<1>(seeds);
     }
 
     launch(params, stream, /*configure=*/false);
@@ -709,7 +725,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const float softmax_scale,
                const bool zero_tensors,
                const bool is_causal,
-               c10::optional<at::Generator> gen_
+               c10::optional<at::Generator> gen_,
+               c10::optional<at::Tensor> &rng_state
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     // bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
@@ -881,10 +898,15 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = params.b * params.h * 32;
 
-    if (is_dropout) {
+    if ( rng_state.has_value() ) {
+        params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
+    } else if( is_dropout ) {
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         params.philox_args = gen->philox_cuda_state(counter_offset);
+        auto seeds = at::cuda::philox::unpack(params.philox_args);
+        params.rng_state[0] = std::get<0>(seeds);
+        params.rng_state[1] = std::get<1>(seeds);
     }
 
     launch(params, stream, /*configure=*/false);
