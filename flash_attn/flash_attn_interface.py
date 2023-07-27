@@ -39,45 +39,46 @@ def _get_block_size(device, head_dim, is_dropout, is_causal):
 def _flash_attn_forward(q, k, v, dropout_p, softmax_scale, causal, return_softmax):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse, S_dmask = flash_attn_cuda.fwd(
+    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_cuda.fwd(
         q, k, v, None, dropout_p, softmax_scale, causal, return_softmax, None
     )
-    return out, q, k, v, out_padded, softmax_lse, S_dmask
+    return out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state
 
 
 def _flash_attn_varlen_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                                dropout_p, softmax_scale, causal, return_softmax):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse, S_dmask = flash_attn_cuda.varlen_fwd(
+    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_cuda.varlen_fwd(
         q, k, v, None, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p,
         softmax_scale, False, causal, return_softmax, None
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
-    return out, q, k, v, out_padded, softmax_lse, S_dmask
+    return out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state
 
 
 def _flash_attn_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv,
-                         dropout_p, softmax_scale, causal):
+                         dropout_p, softmax_scale, causal, rng_state=None):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     dq, dk, dv, softmax_d, = flash_attn_cuda.bwd(
-        dout, q, k, v, out, softmax_lse, dq, dk, dv, dropout_p, softmax_scale, causal, None
+        dout, q, k, v, out, softmax_lse, dq, dk, dv, dropout_p,
+        softmax_scale, causal, None, rng_state
     )
     return dq, dk, dv, softmax_d
 
 
 def _flash_attn_varlen_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv,
                                 cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                                dropout_p, softmax_scale, causal):
+                                dropout_p, softmax_scale, causal, rng_state=None):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     dq, dk, dv, softmax_d, = flash_attn_cuda.varlen_bwd(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k,
-        max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, False, causal, None
+        max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, False, causal, None, rng_state
     )
     # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
     #     breakpoint()
@@ -88,11 +89,9 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, qkv, dropout_p, softmax_scale, causal, return_softmax):
-        # Save rng_state because the backward pass will regenerate the dropout mask
-        rng_state = torch.cuda.get_rng_state() if dropout_p > 0 else None
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse, S_dmask = _flash_attn_forward(
+        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2], dropout_p, softmax_scale,
             causal=causal, return_softmax=return_softmax and dropout_p > 0
         )
@@ -105,18 +104,13 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
-        if rng_state is not None:
-            cur_rng_state = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(rng_state)
         qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
         dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
         _flash_attn_backward(
             dout, q, k, v, out, softmax_lse, dqkv[:, :, 0], dqkv[:, :, 1], dqkv[:, :, 2],
-            ctx.dropout_p, ctx.softmax_scale, ctx.causal
+            ctx.dropout_p, ctx.softmax_scale, ctx.causal, rng_state=rng_state
         )
         dqkv = dqkv[..., :dout.shape[-1]]  # We could have padded the head dimension
-        if rng_state is not None:
-            torch.cuda.set_rng_state(cur_rng_state)
         return dqkv, None, None, None, None
 
 
@@ -124,11 +118,9 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, qkv, cu_seqlens, max_seqlen, dropout_p, softmax_scale, causal, return_softmax):
-        # Save rng_state because the backward pass will regenerate the dropout mask
-        rng_state = torch.cuda.get_rng_state() if dropout_p > 0 else None
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse, S_dmask = _flash_attn_varlen_forward(
+        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
             qkv[:, 0], qkv[:, 1], qkv[:, 2], cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
             dropout_p, softmax_scale, causal=causal, return_softmax=return_softmax and dropout_p > 0
         )
@@ -142,19 +134,14 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens, rng_state = ctx.saved_tensors
-        if rng_state is not None:
-            cur_rng_state = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(rng_state)
         qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
         dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
         _flash_attn_varlen_backward(
             dout, q, k, v, out, softmax_lse, dqkv[:, 0], dqkv[:, 1], dqkv[:, 2],
             cu_seqlens, cu_seqlens, ctx.max_seqlen, ctx.max_seqlen,
-            ctx.dropout_p, ctx.softmax_scale, ctx.causal
+            ctx.dropout_p, ctx.softmax_scale, ctx.causal, rng_state=rng_state
         )
         dqkv = dqkv[..., :dout.shape[-1]]  # We could have padded the head dimension
-        if rng_state is not None:
-            torch.cuda.set_rng_state(cur_rng_state)
         return dqkv, None, None, None, None, None, None
 
 
@@ -162,11 +149,9 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, kv, dropout_p, softmax_scale, causal, return_softmax):
-        # Save rng_state because the backward pass will regenerate the dropout mask
-        rng_state = torch.cuda.get_rng_state() if dropout_p > 0 else None
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse, S_dmask = _flash_attn_forward(
+        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q, kv[:, :, 0], kv[:, :, 1], dropout_p, softmax_scale, causal=causal,
             return_softmax=return_softmax and dropout_p > 0
         )
@@ -179,20 +164,16 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
-        if rng_state is not None:
-            cur_rng_state = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(rng_state)
         dq = torch.empty_like(q)
         kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
         dkv = torch.empty(kv_shape, dtype=k.dtype, device=k.device)
         _flash_attn_backward(
             dout, q, k, v, out, softmax_lse,
-            dq, dkv[:, :, 0], dkv[:, :, 1], ctx.dropout_p, ctx.softmax_scale, ctx.causal
+            dq, dkv[:, :, 0], dkv[:, :, 1], ctx.dropout_p, ctx.softmax_scale, ctx.causal,
+            rng_state=rng_state
         )
         dq = dq[..., :dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., :dout.shape[-1]]
-        if rng_state is not None:
-            torch.cuda.set_rng_state(cur_rng_state)
         return dq, dkv, None, None, None, None
 
 
@@ -201,11 +182,9 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, kv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p,
                 softmax_scale, causal, return_softmax):
-        # Save rng_state because the backward pass will regenerate the dropout mask
-        rng_state = torch.cuda.get_rng_state() if dropout_p > 0 else None
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse, S_dmask = _flash_attn_varlen_forward(
+        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
             q, kv[:, 0], kv[:, 1], cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
             dropout_p, softmax_scale, causal=causal, return_softmax=return_softmax and dropout_p > 0
         )
@@ -221,21 +200,16 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
-        if rng_state is not None:
-            cur_rng_state = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(rng_state)
         dq = torch.empty_like(q)
         kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
         dkv = torch.empty(kv_shape, dtype=k.dtype, device=k.device)
         _flash_attn_varlen_backward(
             dout, q, k, v, out, softmax_lse, dq, dkv[:, 0], dkv[:, 1],
             cu_seqlens_q, cu_seqlens_k, ctx.max_seqlen_q, ctx.max_seqlen_k,
-            ctx.dropout_p, ctx.softmax_scale, ctx.causal
+            ctx.dropout_p, ctx.softmax_scale, ctx.causal, rng_state=rng_state
         )
         dq = dq[..., :dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., :dout.shape[-1]]
-        if rng_state is not None:
-            torch.cuda.set_rng_state(cur_rng_state)
         return dq, dkv, None, None, None, None, None, None, None, None
 
 
@@ -243,11 +217,9 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, dropout_p, softmax_scale, causal, return_softmax):
-        # Save rng_state because the backward pass will regenerate the dropout mask
-        rng_state = torch.cuda.get_rng_state() if dropout_p > 0 else None
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse, S_dmask = _flash_attn_forward(
+        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q, k, v, dropout_p, softmax_scale, causal=causal,
             return_softmax=return_softmax and dropout_p > 0
         )
@@ -260,19 +232,15 @@ class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
-        if rng_state is not None:
-            cur_rng_state = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(rng_state)
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
             dout, q, k, v, out, softmax_lse,
-            dq, dk, dv, ctx.dropout_p, ctx.softmax_scale, ctx.causal
+            dq, dk, dv, ctx.dropout_p, ctx.softmax_scale, ctx.causal,
+            rng_state=rng_state
         )
         dq = dq[..., :dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., :dout.shape[-1]]
         dv = dv[..., :dout.shape[-1]]
-        if rng_state is not None:
-            torch.cuda.set_rng_state(cur_rng_state)
         return dq, dk, dv, None, None, None, None, None, None, None, None
 
 
@@ -281,11 +249,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p,
                 softmax_scale, causal, return_softmax):
-        # Save rng_state because the backward pass will regenerate the dropout mask
-        rng_state = torch.cuda.get_rng_state() if dropout_p > 0 else None
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse, S_dmask = _flash_attn_varlen_forward(
+        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
             q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
             dropout_p, softmax_scale, causal=causal, return_softmax=return_softmax and dropout_p > 0
         )
@@ -301,19 +267,15 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
-        if rng_state is not None:
-            cur_rng_state = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(rng_state)
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_varlen_backward(
             dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k,
-            ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.dropout_p, ctx.softmax_scale, ctx.causal
+            ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.dropout_p, ctx.softmax_scale, ctx.causal,
+            rng_state=rng_state
         )
         dq = dq[..., :dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., :dout.shape[-1]]
         dv = dv[..., :dout.shape[-1]]
-        if rng_state is not None:
-            torch.cuda.set_rng_state(cur_rng_state)
         return dq, dk, dv, None, None, None, None, None, None, None, None
 
 
