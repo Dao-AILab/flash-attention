@@ -1300,9 +1300,8 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
     #pragma unroll
     for (int mi = 0; mi < size(dP_sum); ++mi) { dP_sum(mi) = sdPsum(get<0>(taccScS_row(mi))); }
 
-    auto seeds = at::cuda::philox::unpack(params.philox_args);
-    unsigned long long seed = std::get<0>(seeds);
-    unsigned long long offset = std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + tidx % 32;
+    auto seed = params.rng_state[0];
+    auto offset = params.rng_state[1];
 
     clear(acc_dq);
 
