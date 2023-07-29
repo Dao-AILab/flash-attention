@@ -527,6 +527,15 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
             dim = x.shape[-1] // world_size
             state_dict[key] = x[..., rank * dim:(rank + 1) * dim]
 
+    def shard_gatedmlp_fc1_dim(state_dict, key):
+        if key in state_dict:
+            x = state_dict[key]
+            dim = x.shape[0] // world_size // 2
+            state_dict[key] = rearrange(
+                rearrange(x, "(two o) ... -> two o ...", two=2)[:, rank * dim:(rank + 1) * dim],
+                "two o ... -> (two o) ..."
+            )
+
     def shard_qkv_headdim(state_dict, key):
         if key in state_dict:
             n_head = config.n_head
@@ -559,8 +568,12 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
         shard_last_dim(state_dict, f'transformer.layers.{i}.mixer.out_proj.weight')
         if rank != 0:
             state_dict.pop(f'transformer.layers.{i}.mixer.out_proj.bias', None)
-        shard_first_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.weight')
-        shard_first_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.bias')
+        if config.activation_function in ["glu", "swiglu", "geglu"]:
+            shard_gatedmlp_fc1_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.weight')
+            shard_gatedmlp_fc1_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.bias')
+        else:
+            shard_first_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.weight')
+            shard_first_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.bias')
         shard_last_dim(state_dict, f'transformer.layers.{i}.mlp.fc2.weight')
         if rank != 0:
             state_dict.pop(f'transformer.layers.{i}.mlp.fc2.bias', None)

@@ -300,8 +300,6 @@ def test_falcon_parallel_generation(model_name, world_size):
     input_ids = torch.randint(0, config.vocab_size, (batch_size, seqlen), dtype=torch.long,
                               device=device)
 
-    torch.distributed.barrier()
-
     # Need this, otherwise when we capture the graph the process for GPU 1 would run on both
     # GPU0 and GPU1 and things would hang
     torch.cuda.set_device(device)
