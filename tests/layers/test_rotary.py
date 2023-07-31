@@ -112,3 +112,36 @@ def test_rotary_interleaved(rotary_emb_fraction, seqlen_offset):
     assert torch.allclose(k_pt.grad, qkv.grad[:, :, 1, :, :rotary_dim], rtol=rtol, atol=atol)
     assert torch.equal(qkv.grad[:, :, 0:2, :, rotary_dim:], g_og[:, :, 0:2, :, rotary_dim:])
     assert torch.equal(qkv.grad[:, :, 2], g_og[:, :, 2])
+
+
+@pytest.mark.parametrize('interleaved', [True, False])
+@pytest.mark.parametrize('cu_seqlens', [[0, 48, 128, 512], [0, 16, 64, 256, 2048]])
+@pytest.mark.parametrize('rotary_emb_fraction', [0.5, 1.0])
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16, torch.float32])
+def test_rotary_varlen(interleaved, cu_seqlens, rotary_emb_fraction, dtype):
+    device = 'cuda'
+    dtype = torch.float16
+    rtol, atol = (1e-3, 5e-3)
+    # set seed
+    torch.random.manual_seed(0)
+    max_seqlen = cu_seqlens[-1]
+    cu_seqlens = torch.tensor(cu_seqlens, device=device, dtype=torch.int)
+    nheads = 16
+    headdim = 128
+    rotary_dim = int(headdim * rotary_emb_fraction)
+    qkv = torch.randn(max_seqlen, 3, nheads, headdim, device=device, dtype=dtype,
+                      requires_grad=True)
+    qkv_og = qkv.clone().detach()  # Our implementation modifies qkv inplace
+    rotary = RotaryEmbedding(rotary_dim, interleaved=interleaved, device=device)
+    out = rotary(qkv, seqlen_offset=0, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+
+    out_segs = []
+    for i in range(1, len(cu_seqlens)):
+        start, end = cu_seqlens[i - 1], cu_seqlens[i]
+        out_segs.append(rotary(qkv[start:end].unsqueeze(0), seqlen_offset=0).squeeze(0))
+    out_segs = torch.cat(out_segs)
+
+    assert torch.equal(torch.tensor(out.shape), torch.tensor(qkv.shape))
+    assert torch.allclose(out_segs, out, rtol=rtol, atol=atol)
+    assert torch.equal(out[:, 0:2, :, rotary_dim:], qkv_og[:, 0:2, :, rotary_dim:])
+    assert torch.equal(out[:, 2], qkv_og[:, 2])

@@ -294,43 +294,70 @@ class RotaryEmbedding(torch.nn.Module):
                 self._cos_k_cached = (torch.cos(freqs) / scale).to(dtype)
                 self._sin_k_cached = (torch.sin(freqs) / scale).to(dtype)
 
+    def extract_cos_sin(self, cos_cached: torch.Tensor, sin_cached: torch.Tensor,
+                        seqlen_offset: int = 0, cu_seqlens: Optional[torch.Tensor] = None,
+                        max_seqlen: Optional[int] = None):
+        if cu_seqlens is None:
+            return cos_cached[seqlen_offset:], sin_cached[seqlen_offset:]
+        else:
+            assert seqlen_offset == 0
+            seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+            def concat(x):
+                return torch.cat([x[:seqlen] for seqlen in seqlens])
+            return concat(cos_cached), concat(sin_cached)
+
     def forward(self, qkv: torch.Tensor, kv: Optional[torch.Tensor] = None,
-                seqlen_offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+                seqlen_offset: int = 0, cu_seqlens: Optional[torch.Tensor] = None,
+                max_seqlen: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         qkv: (batch, seqlen, 3, nheads, headdim) if kv is none,
              else it's just q of shape (batch, seqlen, nheads, headdim)
         kv: (batch, seqlen, 2, nheads, headdim)
         seqlen_offset: can be used in generation where the qkv being passed in is only the last
         token in the batch.
+        cu_seqlens: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+            of the sequences in the batch, used to index into x. Only applicable when using
+            FlashAttention.
+        max_seqlen: int. Maximum sequence length in the batch.
         """
-        seqlen = qkv.shape[1]
+        if cu_seqlens is not None:
+            assert max_seqlen is not None
+            assert seqlen_offset == 0
+            # Add a fake batch dimension.
+            qkv = qkv.unsqueeze(0)
+            if kv is not None:
+                kv = kv.unsqueeze(0)
+        seqlen = qkv.shape[1] if max_seqlen is None else max_seqlen
         self._update_cos_sin_cache(seqlen + seqlen_offset, device=qkv.device, dtype=qkv.dtype)
         if kv is None:
+            cos, sin = self.extract_cos_sin(self._cos_cached, self._sin_cached,
+                                            seqlen_offset=seqlen_offset, cu_seqlens=cu_seqlens,
+                                            max_seqlen=max_seqlen)
             if self.scale is None:
-                return apply_rotary_emb_qkv_(
-                    qkv, self._cos_cached[seqlen_offset:], self._sin_cached[seqlen_offset:],
-                    None, None, self.interleaved
-                )
+                out = apply_rotary_emb_qkv_(qkv, cos, sin, None, None, self.interleaved)
             else:
-                return apply_rotary_emb_qkv_(
-                    qkv, self._cos_cached[seqlen_offset:], self._sin_cached[seqlen_offset:],
-                    self._cos_k_cached[seqlen_offset:], self._sin_k_cached[seqlen_offset:],
-                    self.interleaved
-                )
+                cos_k, sin_k = self.extract_cos_sin(self._cos_k_cached, self._sin_k_cached,
+                                                    seqlen_offset=seqlen_offset, cu_seqlens=cu_seqlens,
+                                                    max_seqlen=max_seqlen)
+                out = apply_rotary_emb_qkv_(qkv, cos, sin, cos_k, sin_k, self.interleaved)
+            if cu_seqlens is not None:
+                # Remove the fake batch dimension
+                out = out.squeeze(0)
+            return out
         else:
             q = qkv
-            q = apply_rotary_emb_func(
-                q, self._cos_cached[seqlen_offset:], self._sin_cached[seqlen_offset:],
-                self.interleaved, True
-            )
+            cos, sin = self.extract_cos_sin(self._cos_cached, self._sin_cached,
+                                            seqlen_offset=seqlen_offset, cu_seqlens=cu_seqlens,
+                                            max_seqlen=max_seqlen)
+            q = apply_rotary_emb_func(q, cos, sin, self.interleaved, True)
             if self.scale is None:
-                kv = apply_rotary_emb_kv_(
-                    kv, self._cos_cached[seqlen_offset:], self._sin_cached[seqlen_offset:],
-                    self.interleaved
-                )
+                kv = apply_rotary_emb_kv_(kv, cos, sin, self.interleaved)
             else:
-                kv = apply_rotary_emb_kv_(
-                    kv, self._cos_k_cached[seqlen_offset:], self._sin_k_cached[seqlen_offset:],
-                    self.interleaved
-                )
+                cos_k, sin_k = self.extract_cos_sin(self._cos_k_cached, self._sin_k_cached,
+                                                    seqlen_offset=seqlen_offset, cu_seqlens=cu_seqlens,
+                                                    max_seqlen=max_seqlen)
+                kv = apply_rotary_emb_kv_(kv, cos_k, sin_k, self.interleaved)
+            if cu_seqlens is not None:
+                q = q.squeeze(0)
+                kv = kv.squeeze(0)
             return q, kv

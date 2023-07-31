@@ -471,7 +471,6 @@ class MHA(nn.Module):
             assert key_padding_mask is None
             assert self.use_flash_attn
             assert not self.dwconv
-            assert self.rotary_emb_dim == 0
         if key_padding_mask is not None:
             assert cu_seqlens is None
             assert max_seqlen is None
@@ -497,7 +496,8 @@ class MHA(nn.Module):
             if (inference_params is None or inference_params.sequence_len_offset == 0
                 or not inference_params.fused_ft_kernel):
                 if self.rotary_emb_dim > 0:
-                    qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset)
+                    qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset,
+                                          cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
                 if inference_params is None:
                     if not self.checkpointing:
                         context = self.inner_attn(qkv, **kwargs)
@@ -542,7 +542,8 @@ class MHA(nn.Module):
             if (inference_params is None or inference_params.sequence_len_offset == 0
                 or not inference_params.fused_ft_kernel):
                 if self.rotary_emb_dim > 0:
-                    q, kv = self.rotary_emb(q, kv, seqlen_offset=seqlen_offset)
+                    q, kv = self.rotary_emb(q, kv, seqlen_offset=seqlen_offset,
+                                            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
                 if inference_params is None:
                     if not self.checkpointing:
                         context = self.inner_cross_attn(q, kv, **kwargs)
@@ -649,24 +650,38 @@ class ParallelMHA(nn.Module):
             rotary_emb_interleaved=self.rotary_emb.interleaved if self.rotary_emb_dim > 0 else False,
         )
 
-    def forward(self, x, seqlen=None, inference_params=None, **kwargs):
+    def forward(self, x, seqlen=None, inference_params=None, cu_seqlens=None, max_seqlen=None,
+                **kwargs):
         """
         Arguments:
             x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim) if seqlen=None.
                 If seqlen is not None, x is (batch * seqlen, hidden_dim). This is so that when we
                 split x during sequence parallel, we split the batch * seqlen dimension
                 (in case batch is small).
+            cu_seqlens: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+                of the sequences in the batch, used to index into x. Only applicable when using
+                FlashAttention.
+            max_seqlen: int. Maximum sequence length in the batch.
         """
+        if cu_seqlens is not None:
+            assert max_seqlen is not None
+            assert seqlen is None
+            assert self.use_flash_attn
+        if inference_params is not None:
+            assert cu_seqlens is None and max_seqlen is None
         qkv = self.Wqkv(x)
         if seqlen is not None:
             qkv = rearrange(qkv, "(b s) ... -> b s ...", s=seqlen)
+        kwargs = ({'cu_seqlens': cu_seqlens, 'max_seqlen': max_seqlen, **kwargs}
+                  if self.use_flash_attn else kwargs)
         seqlen_offset = 0 if inference_params is None else inference_params.sequence_len_offset
         if self.num_heads_kv == self.num_heads:
-            qkv = rearrange(qkv, 'b s (three h d) -> b s three h d', three=3, d=self.head_dim)
+            qkv = rearrange(qkv, '... (three h d) -> ... three h d', three=3, d=self.head_dim)
             if (inference_params is None or inference_params.sequence_len_offset == 0
                 or not inference_params.fused_ft_kernel):
                 if self.rotary_emb_dim > 0:
-                    qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset)
+                    qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset,
+                                          cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
                 if inference_params is None:
                     if not self.checkpointing:
                         context = self.inner_attn(qkv, **kwargs)
@@ -689,7 +704,8 @@ class ParallelMHA(nn.Module):
             if (inference_params is None or inference_params.sequence_len_offset == 0
                 or not inference_params.fused_ft_kernel):
                 if self.rotary_emb_dim > 0:
-                    q, kv = self.rotary_emb(q, kv, seqlen_offset=seqlen_offset)
+                    q, kv = self.rotary_emb(q, kv, seqlen_offset=seqlen_offset,
+                                            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
                 if inference_params is None:
                     if not self.checkpointing:
                         context = self.inner_cross_attn(q, kv, **kwargs)
@@ -704,7 +720,7 @@ class ParallelMHA(nn.Module):
                     context = self.inner_cross_attn(q, kv, causal=causal)
             else:
                 context = self._apply_rotary_single_query_attention(q, inference_params, kv=kv)
-        context = rearrange(context, 'b s h d -> b s (h d)')
+        context = rearrange(context, '... h d -> ... (h d)')
         if seqlen is not None:
             context = rearrange(context, 'b s d -> (b s) d')
         out = self.out_proj(context)
