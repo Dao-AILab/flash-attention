@@ -21,8 +21,9 @@ var/
 *.egg
 .vscode/c_cpp_properties.json
 .vscode/launch.json
-.vscode/settings.json
+.vscode/settings.
+
+# Generated files
 csrc/flash_attn_rocm/fmha_api.cu
+csrc/flash_attn_rocm/src/*.cu
 csrc/flash_attn_rocm/fmha_api.hip
-csrc/flash_attn_rocm/src/fmha_fprop_fp16_bf16_kernel.gfx90a.cu
-csrc/flash_attn_rocm/src/fmha_dgrad_fp16_bf16_kernel.gfx90a.cu

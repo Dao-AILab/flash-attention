@@ -7,6 +7,7 @@
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 # Adapted from https://github.com/NVIDIA/apex/blob/master/setup.py
+import glob
 import os
 import shutil
 from pathlib import Path
@@ -143,8 +144,10 @@ cc_flag = ["-DBUILD_PYTHON_PACKAGE", f"-DFLASH_ATTENTION_INTERNAL_USE_RTZ={os.en
 # cc_flag.append("arch=compute_80,code=sm_80")
 
 
-ck_sources = ["csrc/flash_attn_rocm/composable_kernel/library/src/utility/convolution_parameter.cpp", "csrc/flash_attn_rocm/composable_kernel/library/src/utility/device_memory.cpp", "csrc/flash_attn_rocm/composable_kernel/library/src/utility/host_tensor.cpp"]
-fmha_sources = ["csrc/flash_attn_rocm/fmha_api.cpp", "csrc/flash_attn_rocm/src/fmha_fprop_fp16_bf16_kernel.gfx90a.cpp", "csrc/flash_attn_rocm/src/fmha_dgrad_fp16_bf16_kernel.gfx90a.cpp"]
+ck_sources = ["csrc/flash_attn_rocm/composable_kernel/library/src/utility/convolution_parameter.cpp", 
+              "csrc/flash_attn_rocm/composable_kernel/library/src/utility/device_memory.cpp", 
+              "csrc/flash_attn_rocm/composable_kernel/library/src/utility/host_tensor.cpp"]
+fmha_sources = ["csrc/flash_attn_rocm/fmha_api.cpp"] + glob.glob("csrc/flash_attn_rocm/src/*.cpp")
 
 rename_cpp_cu(ck_sources)
 rename_cpp_cu(fmha_sources)
@@ -153,20 +156,18 @@ rename_cpp_cu(fmha_sources)
 ext_modules.append(
     CUDAExtension(
         name="flash_attn_cuda",
-        sources=[
-            "csrc/flash_attn_rocm/fmha_api.cu",
-            "csrc/flash_attn_rocm/src/fmha_fprop_fp16_bf16_kernel.gfx90a.cu",
-            "csrc/flash_attn_rocm/src/fmha_dgrad_fp16_bf16_kernel.gfx90a.cu",
-            "csrc/flash_attn_rocm/composable_kernel/library/src/utility/convolution_parameter.cu",
-            "csrc/flash_attn_rocm/composable_kernel/library/src/utility/device_memory.cu",
-            "csrc/flash_attn_rocm/composable_kernel/library/src/utility/host_tensor.cu"
-        ],
+        sources=["csrc/flash_attn_rocm/fmha_api.cu"] + glob.glob("csrc/flash_attn_rocm/src/*.cu") +
+                ["csrc/flash_attn_rocm/composable_kernel/library/src/utility/convolution_parameter.cu",
+                 "csrc/flash_attn_rocm/composable_kernel/library/src/utility/device_memory.cu",
+                 "csrc/flash_attn_rocm/composable_kernel/library/src/utility/host_tensor.cu"],
         extra_compile_args={
-            "cxx": ["-O3", "-std=c++20"] + generator_flag,
+            "cxx": ["-O3", "-std=c++20", "-DNDEBUG"] + generator_flag,
             "nvcc":
                 [
                     "-O3",
                     "-std=c++20",
+                    "--offload-arch=gfx90a",
+                    "-DNDEBUG",
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",
 

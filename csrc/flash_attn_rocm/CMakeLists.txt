@@ -131,6 +131,8 @@ find_package(HIP)
 
 set(CMAKE_CXX_COMPILER /opt/rocm/hip/bin/hipcc)
 set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_FLAGS "-ferror-limit=0")
+set(CMAKE_CXX_FLAGS "--offload-arch=gfx90a")
 
 list(APPEND CMAKE_PREFIX_PATH "/opt/conda/lib/python3.8/site-packages/torch/share/cmake")
 find_package(Torch REQUIRED)
