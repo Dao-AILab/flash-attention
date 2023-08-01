@@ -825,3 +825,97 @@ def test_flash_attn_race_condition(seqlen, d, dropout_p, causal, dtype):
             assert torch.equal(dqkv[:, :, 0], dqkv0[:, :, 0])
             assert torch.equal(dqkv[:, :, 1], dqkv0[:, :, 1])
             assert torch.equal(dqkv[:, :, 2], dqkv0[:, :, 2])
+
+
+@pytest.mark.parametrize('dtype', [torch.float16])
+@pytest.mark.parametrize('causal', [False, True])
+# @pytest.mark.parametrize('causal', [False])
+@pytest.mark.parametrize('d', [16, 32, 64])
+# @pytest.mark.parametrize('d', [16])
+@pytest.mark.parametrize('seqlen', [1, 2, 5, 17, 128])
+# @pytest.mark.parametrize('seqlen', [2])
+def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
+    """ We previously had a bug where not masking elements beyond seqlen_k caused NaN in dQ,
+    in the case where seqlen % 128 != 0.
+    """
+    device = 'cuda'
+    # set seed
+    torch.random.manual_seed(0)
+    batch_size = 2
+    nheads = 5
+    q = torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device="cuda") * 5
+    k, v = [torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device="cuda") * 3 for _ in range(2)]
+    q.requires_grad_(True)
+    k.requires_grad_(True)
+    v.requires_grad_(True)
+    out = flash_attn_func(q, k, v, causal=causal)
+    g = torch.randn_like(out)
+    out.backward(g)
+    q_pt = q.detach().clone().requires_grad_(True)
+    k_pt = k.detach().clone().requires_grad_(True)
+    v_pt = v.detach().clone().requires_grad_(True)
+    out_pt, _ = attention_ref(q_pt, k_pt, v_pt, causal=causal, upcast=False, reorder_ops=True)
+    out_pt.backward(g)
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    out_ref, attn_ref = attention_ref(q_ref, k_ref, v_ref, causal=causal)
+    out_ref.backward(g)
+    print(f'dQ max diff: {(q.grad - q_ref.grad).abs().max().item()}')
+    print(f'dK max diff: {(k.grad - k_ref.grad).abs().max().item()}')
+    print(f'dV max diff: {(v.grad - v_ref.grad).abs().max().item()}')
+    print(f'dQ Pytorch max diff: {(q_pt.grad - q_ref.grad).abs().max().item()}')
+    print(f'dK Pytorch max diff: {(k_pt.grad - k_ref.grad).abs().max().item()}')
+    print(f'dV Pytorch max diff: {(v_pt.grad - v_ref.grad).abs().max().item()}')
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+    assert (q.grad - q_ref.grad).abs().max().item() <= 5 * (q_pt.grad - q_ref.grad).abs().max().item() + 1e-3
+    assert (k.grad - k_ref.grad).abs().max().item() <= 5 * (k_pt.grad - k_ref.grad).abs().max().item() + 1e-3
+    assert (v.grad - v_ref.grad).abs().max().item() <= 5 * (v_pt.grad - v_ref.grad).abs().max().item() + 1e-3
+
+
+@pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
+# @pytest.mark.parametrize('dtype', [torch.bfloat16])
+@pytest.mark.parametrize('causal', [False, True])
+# @pytest.mark.parametrize('causal', [False])
+@pytest.mark.parametrize('d', [64, 128])
+# @pytest.mark.parametrize('d', [64])
+@pytest.mark.parametrize('seqlen', [97, 128, 200, 256])
+# @pytest.mark.parametrize('seqlen', [128])
+def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
+    """ We previously had a bug where we were using the wrong strides of dout, which shows up
+    when dout is not contiguous.
+    """
+    device = 'cuda'
+    # set seed
+    torch.random.manual_seed(0)
+    batch_size = 5
+    nheads = 2
+    q, k, v = [torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device="cuda",
+                           requires_grad=True)
+               for _ in range(3)]
+    out = rearrange(flash_attn_func(q, k, v, causal=causal), "b s ... -> s b ...")
+    # So g is not contiguous
+    g = torch.randn(seqlen, 2 * batch_size, nheads, d, dtype=dtype, device="cuda")[:, ::2]
+    out.backward(g)
+    q_pt = q.detach().clone().requires_grad_(True)
+    k_pt = k.detach().clone().requires_grad_(True)
+    v_pt = v.detach().clone().requires_grad_(True)
+    out_pt, attn_pt = attention_ref(q_pt, k_pt, v_pt, causal=causal, upcast=False, reorder_ops=True)
+    out_pt = rearrange(out_pt, "b s ... -> s b ...")
+    out_pt.backward(g)
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    out_ref, attn_ref = attention_ref(q_ref, k_ref, v_ref, causal=causal)
+    out_ref = rearrange(out_ref, "b s ... -> s b ...")
+    out_ref.backward(g)
+    print(f'dQ max diff: {(q.grad - q_ref.grad).abs().max().item()}')
+    print(f'dK max diff: {(k.grad - k_ref.grad).abs().max().item()}')
+    print(f'dV max diff: {(v.grad - v_ref.grad).abs().max().item()}')
+    print(f'dQ Pytorch max diff: {(q_pt.grad - q_ref.grad).abs().max().item()}')
+    print(f'dK Pytorch max diff: {(k_pt.grad - k_ref.grad).abs().max().item()}')
+    print(f'dV Pytorch max diff: {(v_pt.grad - v_ref.grad).abs().max().item()}')
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+    assert (q.grad - q_ref.grad).abs().max().item() <= 2 * (q_pt.grad - q_ref.grad).abs().max().item()
+    assert (k.grad - k_ref.grad).abs().max().item() <= 2 * (k_pt.grad - k_ref.grad).abs().max().item()
+    assert (v.grad - v_ref.grad).abs().max().item() <= 2 * (v_pt.grad - v_ref.grad).abs().max().item()
