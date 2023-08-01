@@ -101,7 +101,7 @@ Return:
 flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False):
 """dropout_p should be set to 0.0 during evaluation
 Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
-than Q. Note that the number of heads in KV must be divisible by the number of heads in Q.
+than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
 For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
 0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
 
@@ -131,7 +131,7 @@ These functions have been renamed:
 If the inputs have the same sequence lengths in the same batch, it is simpler
 and faster to use these functions:
 ```python
-flash_attn_qkvpacked_func(qkv, dropout_p, softmax_scale=None, causal=False)
+flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False)
 ```
 ```python
 flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False)
