@@ -638,7 +638,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     tdQgdQaccum.data() = tdQgdQaccum.data() + kBlockM * params.d_rounded;
 
     int m_block = m_block_max - 1;
-    int m_block_min = !Is_causal ? 0 : (n_block * kBlockN) / kBlockM;
+    int m_block_min = !Is_causal ? 0 : (n_block * kBlockN - int(binfo.actual_seqlen_k - binfo.actual_seqlen_q)) / kBlockM;
+    m_block_min = m_block_min < 0 ? 0 : m_block_min;
 
     // We might need to exit early and write 0 to dK and dV.
     // Otherwise we get wrong result for the case where we don't enter the for loop.
@@ -799,7 +800,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             // Putting this causal masking right after acc_s is *much* slower for some reason.
             if (m_block * kBlockM < (n_block + 1) * kBlockN) {
                 flash::apply_mask_causal(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                                         binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
+                                         binfo.actual_seqlen_q, binfo.actual_seqlen_k,
+                                         m_block * kBlockM + get<0>(taccScS_row(0)),
                                          // binfo.actual_seqlen_k, m_block * kBlockM + (tidx / 32) % AtomLayoutMS * 16 + (tidx % 32) / 4,
                                          AtomLayoutMS * 16);
             }
@@ -1333,7 +1335,7 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
         // the corresponding values of K would be 0, so the result would still be correct.
         if (Is_causal && m_block * kBlockM < (n_block + 1) * kBlockN) {
             flash::apply_mask_causal(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                                     binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
+                                     binfo.actual_seqlen_q, binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
                                      // binfo.actual_seqlen_k, m_block * kBlockM + (tidx / 32) % AtomLayoutMS * 16 + (tidx % 32) / 4,
                                      AtomLayoutMS * 16);
         }
