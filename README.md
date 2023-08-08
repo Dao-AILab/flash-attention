@@ -37,15 +37,16 @@ We recommend the
 container from Nvidia, which has all the required tools to install FlashAttention.
 
 To install:
-1. Make sure that PyTorch is installed.
-2. Make sure that `packaging` is installed (`pip install packaging`)
-3. Make sure that `ninja` is installed and that it works correctly (e.g. `ninja
+1. Make sure the Python-dev package is installed, e.g., on ubuntu `sudo apt install python3-dev`
+2. Make sure that PyTorch is installed.
+3. Make sure that `packaging` is installed (`pip install packaging`)
+4. Make sure that `ninja` is installed and that it works correctly (e.g. `ninja
 --version` then `echo $?` should return exit code 0). If not (sometimes `ninja
 --version` then `echo $?` returns a nonzero exit code), uninstall then reinstall
 `ninja` (`pip uninstall -y ninja && pip install ninja`). Without `ninja`,
 compiling can take a very long time (2h) since it does not use multiple CPU
 cores. With `ninja` compiling takes 3-5 minutes on a 64-core machine.
-4. Then:
+5. Then:
 ```sh
 pip install flash-attn --no-build-isolation
 ```
