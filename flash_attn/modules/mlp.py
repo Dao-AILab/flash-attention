@@ -22,8 +22,8 @@ class Mlp(nn.Module):
                  bias1=True, bias2=True, return_residual=False, device=None, dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features * 4
+        out_features = out_features if out_features is not None else in_features
+        hidden_features = hidden_features if hidden_features is not None else in_features * 4
         self.return_residual = return_residual
         self.fc1 = nn.Linear(in_features, hidden_features, bias=bias1, **factory_kwargs)
         self.activation = activation
@@ -45,8 +45,8 @@ class ParallelMLP(nn.Module):
         super().__init__()
         assert ColumnParallelLinear is not None, "Need to install fused_dense"
         assert RowParallelLinear is not None, "Need to install fused_dense"
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features * 4
+        out_features = out_features if out_features is not None else in_features
+        hidden_features = hidden_features if hidden_features is not None else in_features * 4
         self.fc1 = ColumnParallelLinear(in_features, hidden_features, process_group, bias=bias1,
                                         sequence_parallel=sequence_parallel, **factory_kwargs)
         self.activation = activation
@@ -67,8 +67,9 @@ class GatedMlp(nn.Module):
                  device=None, dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or int(8 * in_features / 3)
+        out_features = out_features if out_features is not None else in_features
+        hidden_features = (hidden_features if hidden_features is not None
+                           else int(8 * in_features / 3))
         hidden_features = (hidden_features + multiple_of - 1) // multiple_of * multiple_of
         self.return_residual = return_residual
         self.fc1 = nn.Linear(in_features, 2 * hidden_features, bias=bias1, **factory_kwargs)
@@ -94,8 +95,9 @@ class ParallelGatedMlp(nn.Module):
                  sequence_parallel=True, device=None, dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or int(8 * in_features / 3)
+        out_features = out_features if out_features is not None else in_features
+        hidden_features = (hidden_features if hidden_features is not None
+                           else int(8 * in_features / 3))
         hidden_features = (hidden_features + multiple_of - 1) // multiple_of * multiple_of
         if ColumnParallelLinear is None or RowParallelLinear is None:
             raise ImportError('fused_dense is not installed')
