@@ -15,28 +15,28 @@ on:
   push
 
 jobs:
-  setup_release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Get the tag version
-        id: extract_branch
-        run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
-        shell: bash
+  # setup_release:
+  #   name: Create Release
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Get the tag version
+  #       id: extract_branch
+  #       run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
+  #       shell: bash
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.extract_branch.outputs.branch }}
-          release_name: ${{ steps.extract_branch.outputs.branch }}
+  #     - name: Create Release
+  #       id: create_release
+  #       uses: actions/create-release@v1
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       with:
+  #         tag_name: ${{ steps.extract_branch.outputs.branch }}
+  #         release_name: ${{ steps.extract_branch.outputs.branch }}
 
   build_wheels:
     name: Build Wheel
     runs-on: ${{ matrix.os }}
-    needs: setup_release
+    #needs: setup_release
 
     strategy:
       fail-fast: false
