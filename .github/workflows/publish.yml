@@ -7,10 +7,12 @@
 
 name: Build wheels and deploy
 
+#on:
+#  create:
+#    tags:
+#      - '**'
 on:
-  create:
-    tags:
-      - '**'
+  push
 
 jobs:
   setup_release:
@@ -152,44 +154,44 @@ jobs:
         run: |
           ls dist
 
-      - name: Upload Release Asset
-        id: upload_release_asset 
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.get_current_release.outputs.upload_url }}
-          asset_path: ./dist/${{env.wheel_name}}
-          asset_name: ${{env.wheel_name}}
-          asset_content_type: application/*
+      # - name: Upload Release Asset
+      #   id: upload_release_asset 
+      #   uses: actions/upload-release-asset@v1
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #   with:
+      #     upload_url: ${{ steps.get_current_release.outputs.upload_url }}
+      #     asset_path: ./dist/${{env.wheel_name}}
+      #     asset_name: ${{env.wheel_name}}
+      #     asset_content_type: application/*
 
-  publish_package:
-    name: Publish package
-    needs: [build_wheels]
+  # publish_package:
+  #   name: Publish package
+  #   needs: [build_wheels]
 
-    runs-on: ubuntu-latest
+  #   runs-on: ubuntu-latest
 
-    steps:
-      - uses: actions/checkout@v3
+  #   steps:
+  #     - uses: actions/checkout@v3
 
-      - uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
+  #     - uses: actions/setup-python@v4
+  #       with:
+  #         python-version: '3.10'
 
-      - name: Install dependencies
-        run: |
-          pip install ninja packaging setuptools wheel twine
-          pip install torch
+  #     - name: Install dependencies
+  #       run: |
+  #         pip install ninja packaging setuptools wheel twine
+  #         pip install torch
 
-      - name: Build core package
-        env:
-          FLASH_ATTENTION_SKIP_CUDA_BUILD: "TRUE"
-        run: |
-          python setup.py sdist --dist-dir=dist
+  #     - name: Build core package
+  #       env:
+  #         FLASH_ATTENTION_SKIP_CUDA_BUILD: "TRUE"
+  #       run: |
+  #         python setup.py sdist --dist-dir=dist
 
-      - name: Deploy
-        env:
-          TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-        run: |
-          python -m twine upload dist/*
+  #     - name: Deploy
+  #       env:
+  #         TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
+  #         TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+  #       run: |
+  #         python -m twine upload dist/*
