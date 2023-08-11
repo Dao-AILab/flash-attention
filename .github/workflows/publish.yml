@@ -116,13 +116,24 @@ jobs:
       - name: Install PyTorch ${{ matrix.torch-version }}+cu${{ matrix.cuda-version }}
         run: |
           pip install numpy pyyaml scipy ipython mkl mkl-include ninja cython typing pandas typing-extensions dataclasses && conda clean -ya
-          pip install --no-index --no-cache-dir torch==${{ matrix.torch-version }} -f https://download.pytorch.org/whl/cu${{ matrix.cuda-version }}/torch_stable.html
+          pip install --no-cache-dir torch==${{ matrix.torch-version }}
           python --version
           python -c "import torch; print('PyTorch:', torch.__version__)"
           python -c "import torch; print('CUDA:', torch.version.cuda)"
           python -c "from torch.utils import cpp_extension; print (cpp_extension.CUDA_HOME)"
         shell:
           bash
+
+      # - name: Install PyTorch ${{ matrix.torch-version }}+cu${{ matrix.cuda-version }}
+      #   run: |
+      #     pip install numpy pyyaml scipy ipython mkl mkl-include ninja cython typing pandas typing-extensions dataclasses && conda clean -ya
+      #     pip install --no-index --no-cache-dir torch==${{ matrix.torch-version }} -f https://download.pytorch.org/whl/cu${{ matrix.cuda-version }}/torch_stable.html
+      #     python --version
+      #     python -c "import torch; print('PyTorch:', torch.__version__)"
+      #     python -c "import torch; print('CUDA:', torch.version.cuda)"
+      #     python -c "from torch.utils import cpp_extension; print (cpp_extension.CUDA_HOME)"
+      #   shell:
+      #     bash
       
       - name: Get the tag version
         id: extract_branch
