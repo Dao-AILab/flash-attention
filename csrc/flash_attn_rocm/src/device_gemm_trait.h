@@ -56,7 +56,7 @@ using S = ck::Sequence<Is...>;
 static constexpr bool kDeterministic = true;
 static constexpr bool kNonDeterministic = false;       
 static constexpr auto kMaskingSpecDefault = MaskingSpec::MaskDisabled;                                        
-static constexpr auto kMaskingSpecCausal = MaskingSpec::MaskOutUpperTriangle;
+static constexpr auto kMaskingSpecCausal = MaskingSpec::MaskUpperTriangleFromTopLeft;
 
 template <typename InputDataType_,
           MaskingSpec kMaskingSpec_,
