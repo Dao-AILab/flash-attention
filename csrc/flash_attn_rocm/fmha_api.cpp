@@ -21,8 +21,10 @@ void run_flash_fwd(LaunchParams<FlashFwdParams> &launch_params) {
     BF16_SWITCH(launch_params.params.is_bf16, [&] {
       BOOL_SWITCH(launch_params.params.is_causal, kIsCausal, [&] {
         BOOL_SWITCH(launch_params.params.is_using_qloop, kIsQLoop, [&] {
-          auto flash_fwd_runner_ptr = std::make_unique<fwd_device_gemm::FlashFwdRunner>(launch_params);
-          flash_fwd_runner_ptr->Run<kIsQLoop, kHeadDim, T, kIsCausal>();
+          BOOL_SWITCH(launch_params.params.is_mnko_padding, kIsPadding, [&] {
+              auto flash_fwd_runner_ptr = std::make_unique<fwd_device_gemm::FlashFwdRunner>(launch_params);
+              flash_fwd_runner_ptr->Run<kIsQLoop, kHeadDim, T, kIsCausal, kIsPadding>();
+          });
         });
       });
     });
@@ -79,6 +81,8 @@ void set_params_fprop(FlashFwdParams &params,
     params.seqlen_q = seqlen_q;   // seqlen q
     params.seqlen_k = seqlen_k;   // seqlen k
     params.d = d;                 // head_dim
+    params.is_mnko_padding = false;    // MNKOpadding
+
     if(cu_seqlens_q.device().type() == c10::kCUDA){
         params.host_seqlens_q = std::vector<int>(params.b+1);
         params.host_seqlens_k = std::vector<int>(params.b+1);

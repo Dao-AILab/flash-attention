@@ -54,11 +54,14 @@ template <ck::index_t... Is>
 using S = ck::Sequence<Is...>;
 
 static constexpr bool kDeterministic = true;
-static constexpr bool kNonDeterministic = false;       
+static constexpr bool kNonDeterministic = false;
+static constexpr auto kGemmSpecDefault = GemmSpec::Default;
+static constexpr auto kGemmSpecPadding = GemmSpec::MNKOPadding;
 static constexpr auto kMaskingSpecDefault = MaskingSpec::MaskDisabled;                                        
 static constexpr auto kMaskingSpecCausal = MaskingSpec::MaskOutUpperTriangle;
 
 template <typename InputDataType_,
+          GemmSpec kGemmSpec_,
           MaskingSpec kMaskingSpec_,
           bool kIsDeterministic_>
 struct Forward {
@@ -85,7 +88,7 @@ struct Forward {
   static constexpr Index kNumDimK = 1;
   static constexpr Index kNumDimO = 1;
 
-  static constexpr auto kGemmSpec = GemmSpec::MNKOPadding;
+  static constexpr auto kGemmSpec = kGemmSpec_;
 
   static constexpr auto kTensorSpecA  = TensorSpec::Default;
   static constexpr auto kTensorSpecB0 = TensorSpec::Default;

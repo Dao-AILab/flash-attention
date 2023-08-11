@@ -24,12 +24,25 @@
 #include "flash_fwd_runner_gfx90a.h"
 
 namespace fwd_device_gemm {
-// hdim 32, bf16, non-causal
+// hdim 32, bf16, non-causal, MNKO-padding
 template <>
-void FlashFwdRunner::Run<false, 32, device_gemm_trait::BFloat16, false>() {
+void FlashFwdRunner::Run<false, 32, device_gemm_trait::BFloat16, false, true>() {
   BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
     this->template run_<DeviceGemmKLoopHeadDim32,
                   device_gemm_trait::BFloat16, 
+                  device_gemm_trait::kGemmSpecPadding,
+                  device_gemm_trait::kMaskingSpecDefault,
+                  kIsDeterministic>();
+  });
+} // FlashFwdRunner::Run()
+
+// hdim 32, bf16, non-causal, MNKO-padding
+template <>
+void FlashFwdRunner::Run<false, 32, device_gemm_trait::BFloat16, false, false>() {
+  BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
+    this->template run_<DeviceGemmKLoopHeadDim32,
+                  device_gemm_trait::BFloat16, 
+                  device_gemm_trait::kGemmSpecPadding,
                   device_gemm_trait::kMaskingSpecDefault,
                   kIsDeterministic>();
   });
