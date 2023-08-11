@@ -40,9 +40,12 @@ jobs:
       fail-fast: false
       matrix:
           os: [ubuntu-20.04, ubuntu-22.04]
-          python-version: ['3.7', '3.8', '3.9', '3.10']
-          torch-version: ['1.11.0', '1.12.0', '1.13.0']
-          cuda-version: ['113', '116', '117']
+          #python-version: ['3.7', '3.8', '3.9', '3.10']
+          #torch-version: ['1.11.0', '1.12.0', '1.13.0', '2.0.1']
+          #cuda-version: ['113', '116', '117', '120']
+          python-version: ['3.10']
+          torch-version: ['2.0.1']
+          cuda-version: ['120']
           exclude:
             # Nvidia only supports 11.7+ for ubuntu-22.04
             - os: ubuntu-22.04
@@ -57,9 +60,18 @@ jobs:
             # Torch only builds cuda 116 for 1.12.0+
             - cuda-version: '116'
               torch-version: '1.11.0'
+            # Torch only builds cuda 120 for 2.0.1+
+            - cuda-version: '120'
+              torch-version: '1.11.0'
+            - cuda-version: '120'
+              torch-version: '1.12.0'
+            - cuda-version: '120'
+              torch-version: '1.13.0'
             # 1.13.0 drops support for cuda 11.3
             - cuda-version: '113'
               torch-version: '1.13.0'
+            - cuda-version: '113'
+              torch-version: '2.0.1'
             # Fails with "Validation Error" on artifact upload
             - cuda-version: '117'
               torch-version: '1.13.0'
