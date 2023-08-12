@@ -83,6 +83,19 @@ void set_params_fprop(FlashFwdParams &params,
     params.d = d;                 // head_dim
     params.is_mnko_padding = false;    // MNKOpadding
 
+    if(!params.is_mnko_padding && d <= 32){
+        params.is_mnko_padding = ((d % 32)==0 ? false : true);
+    }
+    else if(!params.is_mnko_padding && d <= 64){
+        params.is_mnko_padding = ((d % 64)==0 ? false : true);
+    }
+    else if(!!params.is_mnko_padding && d <= 128){
+        params.is_mnko_padding = ((d % 128)==0 ? false : true);
+    }
+    else{
+        std::cout << "Unsupported head dimension" << std::endl;
+    }
+
     if(cu_seqlens_q.device().type() == c10::kCUDA){
         params.host_seqlens_q = std::vector<int>(params.b+1);
         params.host_seqlens_k = std::vector<int>(params.b+1);
@@ -106,6 +119,17 @@ void set_params_fprop(FlashFwdParams &params,
         int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, data_type);
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
         int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, data_type);
+
+        if(!params.is_mnko_padding && d <= 32){
+            params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+        }
+        else if(!params.is_mnko_padding && d <= 64){
+            params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+        }
+        else if(!params.is_mnko_padding && d <= 128){
+            params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+        }
+
         if(q.is_contiguous()){
             params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
             q_ptr = q_ptr + temp_q_stride;
