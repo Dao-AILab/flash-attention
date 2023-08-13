@@ -7,116 +7,120 @@
 
 name: Build wheels and deploy
 
-#on:
-#  create:
-#    tags:
-#      - '**'
 on:
-  push
+  create:
+    tags:
+      - v*
 
 jobs:
-  # setup_release:
-  #   name: Create Release
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - name: Get the tag version
-  #       id: extract_branch
-  #       run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
-  #       shell: bash
 
-  #     - name: Create Release
-  #       id: create_release
-  #       uses: actions/create-release@v1
-  #       env:
-  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  #       with:
-  #         tag_name: ${{ steps.extract_branch.outputs.branch }}
-  #         release_name: ${{ steps.extract_branch.outputs.branch }}
+  setup_release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the tag version
+        id: extract_branch
+        run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
+        shell: bash
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.extract_branch.outputs.branch }}
+          release_name: ${{ steps.extract_branch.outputs.branch }}
 
   build_wheels:
     name: Build Wheel
+    needs: setup_release
     runs-on: ${{ matrix.os }}
-    #needs: setup_release
 
     strategy:
       fail-fast: false
       matrix:
-          os: [ubuntu-20.04, ubuntu-22.04]
-          #python-version: ['3.7', '3.8', '3.9', '3.10']
-          #torch-version: ['1.11.0', '1.12.0', '1.13.0', '2.0.1']
-          #cuda-version: ['113', '116', '117', '120']
-          python-version: ['3.10']
-          torch-version: ['2.0.1']
-          cuda-version: ['120']
+          # Using ubuntu-20.04 instead of 22.04 for more compatibility (glibc). Ideally we'd use the
+          # manylinux docker image, but I haven't figured out how to install CUDA on manylinux.
+          os: [ubuntu-20.04]
+          python-version: ['3.7', '3.8', '3.9', '3.10']
+          torch-version: ['1.12.1', '1.13.1', '2.0.1', '2.1.0.dev20230731']
+          cuda-version: ['11.6.2', '11.7.1', '11.8.0', '12.1.0']
+          # We need separate wheels that either uses C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI) or not.
+          # Pytorch wheels currently don't use it, but nvcr images have Pytorch compiled with C++11 ABI.
+          # Without this we get import error (undefined symbol: _ZN3c105ErrorC2ENS_14SourceLocationESs)
+          # when building without C++11 ABI and using it on nvcr images.
+          cxx11_abi: ['FALSE', 'TRUE']
           exclude:
-            # Nvidia only supports 11.7+ for ubuntu-22.04
-            - os: ubuntu-22.04
-              cuda-version: '116'
-            - os: ubuntu-22.04
-              cuda-version: '113'
-            # Torch only builds cuda 117 for 1.13.0+
-            - cuda-version: '117'
-              torch-version: '1.11.0'
-            - cuda-version: '117'
-              torch-version: '1.12.0'
-            # Torch only builds cuda 116 for 1.12.0+
-            - cuda-version: '116'
-              torch-version: '1.11.0'
-            # Torch only builds cuda 120 for 2.0.1+
-            - cuda-version: '120'
-              torch-version: '1.11.0'
-            - cuda-version: '120'
-              torch-version: '1.12.0'
-            - cuda-version: '120'
-              torch-version: '1.13.0'
-            # 1.13.0 drops support for cuda 11.3
-            - cuda-version: '113'
-              torch-version: '1.13.0'
-            - cuda-version: '113'
-              torch-version: '2.0.1'
-            # Fails with "Validation Error" on artifact upload
-            - cuda-version: '117'
-              torch-version: '1.13.0'
-              os: ubuntu-20.04
+            # Pytorch >= 2.0 only supports Python >= 3.8
+            - torch-version: '2.0.1'
+              python-version: '3.7'
+            - torch-version: '2.1.0.dev20230731'
+              python-version: '3.7'
+            # Pytorch <= 2.0 only supports CUDA <= 11.8
+            - torch-version: '1.12.1'
+              cuda-version: '12.1.0'
+            - torch-version: '1.13.1'
+              cuda-version: '12.1.0'
+            - torch-version: '2.0.1'
+              cuda-version: '12.1.0'
+            # Pytorch >= 2.1 only supports CUDA 12.1
+            - torch-version: '2.1.0.dev20230731'
+              cuda-version: '11.6.2'
+            - torch-version: '2.1.0.dev20230731'
+              cuda-version: '11.7.1'
+            - torch-version: '2.1.0.dev20230731'
+              cuda-version: '11.8.0'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v3
-      
+
       - name: Set up Python
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Set up Linux Env
+      - name: Set CUDA and PyTorch versions
+        run: |
+          echo "MATRIX_CUDA_VERSION=$(echo ${{ matrix.cuda-version }} | awk -F \. {'print $1 $2'})" >> $GITHUB_ENV
+          echo "MATRIX_TORCH_VERSION=$(echo ${{ matrix.torch-version }} | awk -F \. {'print $1 "." $2'})" >> $GITHUB_ENV
+
+      - name: Free up disk space
         if: ${{ runner.os == 'Linux' }}
         run: |
           sudo rm -rf /usr/share/dotnet
-          bash .github/workflows/env.sh
-          echo ${{ needs.create_release.outputs.upload_url }} 
-          echo ${{ needs.steps.extract_branch.outputs.upload_url }} 
-        shell:
-          bash
 
       - name: Install CUDA ${{ matrix.cuda-version }}
         if: ${{ matrix.cuda-version != 'cpu' }}
-        run: |
-          bash .github/workflows/cuda/cu${{ matrix.cuda-version }}-${{ runner.os }}.sh
-        shell:
-          bash
-
-      - name: Check GPU Env
-        if: ${{ matrix.cuda-version != 'cpu' }}
-        run: |
-          source .github/workflows/cuda/cu${{ matrix.cuda-version }}-${{ runner.os }}-env.sh
-          nvcc --version
-        shell:
-          bash
+        uses: Jimver/cuda-toolkit@v0.2.11
+        id: cuda-toolkit
+        with:
+          cuda: ${{ matrix.cuda-version }}
+          linux-local-args: '["--toolkit"]'
+          # default method is "local", and we're hitting some error with caching for CUDA 11.8 and 12.1
+          # method: ${{ (matrix.cuda-version == '11.8.0' || matrix.cuda-version == '12.1.0') && 'network' || 'local' }}
+          method: 'network'
+          # We need the cuda libraries (e.g. cuSparse, cuSolver) for compiling PyTorch extensions,
+          # not just nvcc
+          # sub-packages: '["nvcc"]'
 
       - name: Install PyTorch ${{ matrix.torch-version }}+cu${{ matrix.cuda-version }}
         run: |
-          pip install numpy pyyaml scipy ipython mkl mkl-include ninja cython typing pandas typing-extensions dataclasses && conda clean -ya
-          pip install --no-cache-dir torch==${{ matrix.torch-version }}
+          pip install --upgrade pip
+          # If we don't install before installing Pytorch, we get error for torch 2.0.1
+          # ERROR: Could not find a version that satisfies the requirement setuptools>=40.8.0 (from versions: none)
+          pip install lit
+          # We want to figure out the CUDA version to download pytorch
+          # e.g. we can have system CUDA version being 11.7 but if torch==1.12 then we need to download the wheel from cu116
+          # This code is ugly, maybe there's a better way to do this.
+          export TORCH_CUDA_VERSION=$(python -c "import os; minv = {'1.12': 113, '1.13': 116, '2.0': 117, '2.1': 121}[os.environ['MATRIX_TORCH_VERSION']]; maxv = {'1.12': 116, '1.13': 117, '2.0': 118, '2.1': 121}[os.environ['MATRIX_TORCH_VERSION']]; print(max(min(int(os.environ['MATRIX_CUDA_VERSION']), maxv), minv))")
+          if [[ ${{ matrix.torch-version }} == *"dev"* ]]; then
+            pip install --no-cache-dir --pre torch==${{ matrix.torch-version }} --index-url https://download.pytorch.org/whl/nightly/cu${TORCH_CUDA_VERSION}
+          else
+            pip install --no-cache-dir torch==${{ matrix.torch-version }} --index-url https://download.pytorch.org/whl/cu${TORCH_CUDA_VERSION}
+          fi
+          nvcc --version
           python --version
           python -c "import torch; print('PyTorch:', torch.__version__)"
           python -c "import torch; print('CUDA:', torch.version.cuda)"
@@ -124,17 +128,26 @@ jobs:
         shell:
           bash
 
-      # - name: Install PyTorch ${{ matrix.torch-version }}+cu${{ matrix.cuda-version }}
-      #   run: |
-      #     pip install numpy pyyaml scipy ipython mkl mkl-include ninja cython typing pandas typing-extensions dataclasses && conda clean -ya
-      #     pip install --no-index --no-cache-dir torch==${{ matrix.torch-version }} -f https://download.pytorch.org/whl/cu${{ matrix.cuda-version }}/torch_stable.html
-      #     python --version
-      #     python -c "import torch; print('PyTorch:', torch.__version__)"
-      #     python -c "import torch; print('CUDA:', torch.version.cuda)"
-      #     python -c "from torch.utils import cpp_extension; print (cpp_extension.CUDA_HOME)"
-      #   shell:
-      #     bash
-      
+      - name: Build wheel
+        run: |
+          # We want setuptools >= 49.6.0 otherwise we can't compile the extension if system CUDA version is 11.7 and pytorch cuda version is 11.6
+          # https://github.com/pytorch/pytorch/blob/664058fa83f1d8eede5d66418abff6e20bd76ca8/torch/utils/cpp_extension.py#L810
+          # However this still fails so I'm using a newer version of setuptools
+          pip install setuptools==68.0.0
+          pip install ninja packaging wheel
+          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+          export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+          # Limit MAX_JOBS otherwise the github runner goes OOM
+          MAX_JOBS=1 FLASH_ATTENTION_FORCE_BUILD="TRUE" FLASH_ATTENTION_FORCE_CXX11_ABI=${{ matrix.cxx11_abi}} python setup.py bdist_wheel --dist-dir=dist
+          tmpname=cu${MATRIX_CUDA_VERSION}torch${MATRIX_TORCH_VERSION}cxx11abi${{ matrix.cxx11_abi }}
+          wheel_name=$(ls dist/*whl | xargs -n 1 basename | sed "s/-/+$tmpname-/2")
+          ls dist/*whl |xargs -I {} mv {} dist/${wheel_name}
+          echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
+
+      - name: Log Built Wheels
+        run: |
+          ls dist
+
       - name: Get the tag version
         id: extract_branch
         run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
@@ -147,62 +160,45 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build wheel
+      - name: Upload Release Asset
+        id: upload_release_asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.get_current_release.outputs.upload_url }}
+          asset_path: ./dist/${{env.wheel_name}}
+          asset_name: ${{env.wheel_name}}
+          asset_content_type: application/*
+
+  publish_package:
+    name: Publish package
+    needs: [build_wheels]
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
         run: |
-          export FLASH_ATTENTION_FORCE_BUILD="TRUE"
-          export FORCE_CUDA="1"
-          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
-          export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
-          export CUDA_INSTALL_DIR=/usr/local/cuda-11.3$CUDA_INSTALL_DIR
-          pip install ninja packaging setuptools wheel
-          python setup.py bdist_wheel --dist-dir=dist
-          tmpname=cu${{ matrix.cuda-version }}torch${{ matrix.torch-version }}
-          wheel_name=$(ls dist/*whl | xargs -n 1 basename | sed "s/-/+$tmpname-/2")
-          ls dist/*whl |xargs -I {} mv {} dist/${wheel_name}
-          echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
+          pip install ninja packaging setuptools wheel twine
+          # We don't want to download anything CUDA-related here
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Log Built Wheels
+      - name: Build core package
+        env:
+          FLASH_ATTENTION_SKIP_CUDA_BUILD: "TRUE"
         run: |
-          ls dist
+          python setup.py sdist --dist-dir=dist
 
-      # - name: Upload Release Asset
-      #   id: upload_release_asset 
-      #   uses: actions/upload-release-asset@v1
-      #   env:
-      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      #   with:
-      #     upload_url: ${{ steps.get_current_release.outputs.upload_url }}
-      #     asset_path: ./dist/${{env.wheel_name}}
-      #     asset_name: ${{env.wheel_name}}
-      #     asset_content_type: application/*
-
-  # publish_package:
-  #   name: Publish package
-  #   needs: [build_wheels]
-
-  #   runs-on: ubuntu-latest
-
-  #   steps:
-  #     - uses: actions/checkout@v3
-
-  #     - uses: actions/setup-python@v4
-  #       with:
-  #         python-version: '3.10'
-
-  #     - name: Install dependencies
-  #       run: |
-  #         pip install ninja packaging setuptools wheel twine
-  #         pip install torch
-
-  #     - name: Build core package
-  #       env:
-  #         FLASH_ATTENTION_SKIP_CUDA_BUILD: "TRUE"
-  #       run: |
-  #         python setup.py sdist --dist-dir=dist
-
-  #     - name: Deploy
-  #       env:
-  #         TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
-  #         TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-  #       run: |
-  #         python -m twine upload dist/*
+      - name: Deploy
+        env:
+          TWINE_USERNAME: "__token__"
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          python -m twine upload dist/*

@@ -13,9 +13,10 @@ import subprocess
 
 import urllib.request
 import urllib.error
+from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+
 import torch
 from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
-from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 
 with open("README.md", "r", encoding="utf-8") as fh:
@@ -33,6 +34,8 @@ BASE_WHEEL_URL = "https://github.com/Dao-AILab/flash-attention/releases/download
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
 FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
+# For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
+FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 
 
 def get_platform():
@@ -101,25 +104,26 @@ if not torch.cuda.is_available():
     print(
         "\nWarning: Torch did not find available GPUs on this system.\n",
         "If your intention is to cross-compile, this is not an error.\n"
-        "By default, Apex will cross-compile for Pascal (compute capabilities 6.0, 6.1, 6.2),\n"
-        "Volta (compute capability 7.0), Turing (compute capability 7.5),\n"
-        "and, if the CUDA version is >= 11.0, Ampere (compute capability 8.0).\n"
+        "By default, FlashAttention will cross-compile for Ampere (compute capability 8.0, 8.6, "
+        "8.9), and, if the CUDA version is >= 11.8, Hopper (compute capability 9.0).\n"
         "If you wish to cross-compile for a single specific architecture,\n"
         'export TORCH_CUDA_ARCH_LIST="compute capability" before running setup.py.\n',
     )
     if os.environ.get("TORCH_CUDA_ARCH_LIST", None) is None and CUDA_HOME is not None:
         _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
         if bare_metal_version >= Version("11.8"):
-            os.environ["TORCH_CUDA_ARCH_LIST"] = "6.0;6.1;6.2;7.0;7.5;8.0;8.6;9.0"
-        elif bare_metal_version >= Version("11.1"):
-            os.environ["TORCH_CUDA_ARCH_LIST"] = "6.0;6.1;6.2;7.0;7.5;8.0;8.6"
-        elif bare_metal_version == Version("11.0"):
-            os.environ["TORCH_CUDA_ARCH_LIST"] = "6.0;6.1;6.2;7.0;7.5;8.0"
+            os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;8.6;9.0"
+        elif bare_metal_version >= Version("11.4"):
+            os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;8.6"
         else:
-            os.environ["TORCH_CUDA_ARCH_LIST"] = "6.0;6.1;6.2;7.0;7.5"
+            os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;8.6"
 
 cmdclass = {}
 ext_modules = []
+
+# We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
+# files included in the source distribution, in case the user compiles from source.
+subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 if not SKIP_CUDA_BUILD:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
@@ -137,8 +141,8 @@ if not SKIP_CUDA_BUILD:
     # Check, if CUDA11 is installed for compute capability 8.0
     cc_flag = []
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
-    if bare_metal_version < Version("11.0"):
-        raise RuntimeError("FlashAttention is only supported on CUDA 11 and above")
+    if bare_metal_version < Version("11.4"):
+        raise RuntimeError("FlashAttention is only supported on CUDA 11.4 and above")
     # cc_flag.append("-gencode")
     # cc_flag.append("arch=compute_75,code=sm_75")
     cc_flag.append("-gencode")
@@ -147,7 +151,11 @@ if not SKIP_CUDA_BUILD:
         cc_flag.append("-gencode")
         cc_flag.append("arch=compute_90,code=sm_90")
 
-    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
+    # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
+    # torch._C._GLIBCXX_USE_CXX11_ABI
+    # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
+    if FORCE_CXX11_ABI:
+        torch._C._GLIBCXX_USE_CXX11_ABI = True
     ext_modules.append(
         CUDAExtension(
             name="flash_attn_2_cuda",
@@ -213,6 +221,7 @@ if not SKIP_CUDA_BUILD:
                 Path(this_dir) / 'csrc' / 'cutlass' / 'include',
             ],
         )
+    )
 
 
 def get_package_version():
@@ -227,30 +236,33 @@ def get_package_version():
 
 
 class CachedWheelsCommand(_bdist_wheel):
-     """
-     The CachedWheelsCommand plugs into the default bdist wheel, which is ran by pip when it cannot
-     find an existing wheel (which is currently the case for all flash attention installs). We use
-     the environment parameters to detect whether there is already a pre-built version of a compatible
-     wheel available and short-circuits the standard full build pipeline.
-
-     """
-     def run(self):
+    """
+    The CachedWheelsCommand plugs into the default bdist wheel, which is ran by pip when it cannot
+    find an existing wheel (which is currently the case for all flash attention installs). We use
+    the environment parameters to detect whether there is already a pre-built version of a compatible
+    wheel available and short-circuits the standard full build pipeline.
+    """
+    def run(self):
         if FORCE_BUILD:
             return super().run()
 
         raise_if_cuda_home_none("flash_attn")
 
         # Determine the version numbers that will be used to determine the correct wheel
-        _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
+        # We're using the CUDA version used to build torch, not the one currently installed
+        # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
+        torch_cuda_version = parse(torch.version.cuda)
         torch_version_raw = parse(torch.__version__)
         python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
         platform_name = get_platform()
         flash_version = get_package_version()
-        cuda_version = f"{cuda_version_raw.major}{cuda_version_raw.minor}"
-        torch_version = f"{torch_version_raw.major}.{torch_version_raw.minor}.{torch_version_raw.micro}"
+        # cuda_version = f"{cuda_version_raw.major}{cuda_version_raw.minor}"
+        cuda_version = f"{torch_cuda_version.major}{torch_cuda_version.minor}"
+        torch_version = f"{torch_version_raw.major}.{torch_version_raw.minor}"
+        cxx11_abi = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper()
 
         # Determine wheel URL based on CUDA version, torch version, python version and OS
-        wheel_filename = f'{PACKAGE_NAME}-{flash_version}+cu{cuda_version}torch{torch_version}-{python_version}-{python_version}-{platform_name}.whl'
+        wheel_filename = f'{PACKAGE_NAME}-{flash_version}+cu{cuda_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl'
         wheel_url = BASE_WHEEL_URL.format(
             tag_name=f"v{flash_version}",
             wheel_name=wheel_filename
@@ -279,7 +291,6 @@ class CachedWheelsCommand(_bdist_wheel):
 
 
 setup(
-    # @pierce - TODO: Revert for official release
     name=PACKAGE_NAME,
     version=get_package_version(),
     packages=find_packages(
