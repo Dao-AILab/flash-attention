@@ -1,49 +1,83 @@
-# This workflow will upload a Python Package to Release asset
+# This workflow will:
+# - Create a new Github release
+# - Build wheels for supported architectures
+# - Deploy the wheels to the Github release
+# - Release the static code to PyPi
 # For more information see: https://help.github.com/en/actions/language-and-framework-guides/using-python-with-github-actions#publishing-to-package-registries
 
+name: Build wheels and deploy
 
-name: Python Package
-
+#on:
+#  create:
+#    tags:
+#      - '**'
 on:
-  create:
-    tags:
-      - '**'
+  push
 
 jobs:
-  release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Get the tag version
-        id: extract_branch
-        run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
-        shell: bash
+  # setup_release:
+  #   name: Create Release
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Get the tag version
+  #       id: extract_branch
+  #       run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
+  #       shell: bash
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.extract_branch.outputs.branch }}
-          release_name: ${{ steps.extract_branch.outputs.branch }}
-      
-  wheel:
+  #     - name: Create Release
+  #       id: create_release
+  #       uses: actions/create-release@v1
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       with:
+  #         tag_name: ${{ steps.extract_branch.outputs.branch }}
+  #         release_name: ${{ steps.extract_branch.outputs.branch }}
+
+  build_wheels:
     name: Build Wheel
     runs-on: ${{ matrix.os }}
-    needs: release
-    
+    #needs: setup_release
+
     strategy:
       fail-fast: false
       matrix:
-          # os: [ubuntu-20.04]
-          os: [ubuntu-18.04]
-          python-version: ['3.7', '3.8', '3.9', '3.10']
-          torch-version: [1.11.0, 1.12.0, 1.12.1]
-          cuda-version: ['113', '116']
+          os: [ubuntu-20.04, ubuntu-22.04]
+          #python-version: ['3.7', '3.8', '3.9', '3.10']
+          #torch-version: ['1.11.0', '1.12.0', '1.13.0', '2.0.1']
+          #cuda-version: ['113', '116', '117', '120']
+          python-version: ['3.10']
+          torch-version: ['2.0.1']
+          cuda-version: ['120']
           exclude:
-            - torch-version: 1.11.0
+            # Nvidia only supports 11.7+ for ubuntu-22.04
+            - os: ubuntu-22.04
               cuda-version: '116'
+            - os: ubuntu-22.04
+              cuda-version: '113'
+            # Torch only builds cuda 117 for 1.13.0+
+            - cuda-version: '117'
+              torch-version: '1.11.0'
+            - cuda-version: '117'
+              torch-version: '1.12.0'
+            # Torch only builds cuda 116 for 1.12.0+
+            - cuda-version: '116'
+              torch-version: '1.11.0'
+            # Torch only builds cuda 120 for 2.0.1+
+            - cuda-version: '120'
+              torch-version: '1.11.0'
+            - cuda-version: '120'
+              torch-version: '1.12.0'
+            - cuda-version: '120'
+              torch-version: '1.13.0'
+            # 1.13.0 drops support for cuda 11.3
+            - cuda-version: '113'
+              torch-version: '1.13.0'
+            - cuda-version: '113'
+              torch-version: '2.0.1'
+            # Fails with "Validation Error" on artifact upload
+            - cuda-version: '117'
+              torch-version: '1.13.0'
+              os: ubuntu-20.04
 
     steps:
       - name: Checkout
@@ -82,13 +116,24 @@ jobs:
       - name: Install PyTorch ${{ matrix.torch-version }}+cu${{ matrix.cuda-version }}
         run: |
           pip install numpy pyyaml scipy ipython mkl mkl-include ninja cython typing pandas typing-extensions dataclasses && conda clean -ya
-          pip install --no-index --no-cache-dir torch==${{ matrix.torch-version }} -f https://download.pytorch.org/whl/cu${{ matrix.cuda-version }}/torch_stable.html
+          pip install --no-cache-dir torch==${{ matrix.torch-version }}
           python --version
           python -c "import torch; print('PyTorch:', torch.__version__)"
           python -c "import torch; print('CUDA:', torch.version.cuda)"
           python -c "from torch.utils import cpp_extension; print (cpp_extension.CUDA_HOME)"
         shell:
           bash
+
+      # - name: Install PyTorch ${{ matrix.torch-version }}+cu${{ matrix.cuda-version }}
+      #   run: |
+      #     pip install numpy pyyaml scipy ipython mkl mkl-include ninja cython typing pandas typing-extensions dataclasses && conda clean -ya
+      #     pip install --no-index --no-cache-dir torch==${{ matrix.torch-version }} -f https://download.pytorch.org/whl/cu${{ matrix.cuda-version }}/torch_stable.html
+      #     python --version
+      #     python -c "import torch; print('PyTorch:', torch.__version__)"
+      #     python -c "import torch; print('CUDA:', torch.version.cuda)"
+      #     python -c "from torch.utils import cpp_extension; print (cpp_extension.CUDA_HOME)"
+      #   shell:
+      #     bash
       
       - name: Get the tag version
         id: extract_branch
@@ -104,24 +149,60 @@ jobs:
 
       - name: Build wheel
         run: |
+          export FLASH_ATTENTION_FORCE_BUILD="TRUE"
           export FORCE_CUDA="1"
           export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
           export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
           export CUDA_INSTALL_DIR=/usr/local/cuda-11.3$CUDA_INSTALL_DIR
-          pip install wheel
+          pip install ninja packaging setuptools wheel
           python setup.py bdist_wheel --dist-dir=dist
           tmpname=cu${{ matrix.cuda-version }}torch${{ matrix.torch-version }}
           wheel_name=$(ls dist/*whl | xargs -n 1 basename | sed "s/-/+$tmpname-/2")
-          ls dist/*whl |xargs -I {} mv {} ${wheel_name}
+          ls dist/*whl |xargs -I {} mv {} dist/${wheel_name}
           echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
-      
-      - name: Upload Release Asset
-        id: upload_release_asset 
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.get_current_release.outputs.upload_url }}
-          asset_path: ./${{env.wheel_name}}
-          asset_name: ${{env.wheel_name}}
-          asset_content_type: application/*
+
+      - name: Log Built Wheels
+        run: |
+          ls dist
+
+      # - name: Upload Release Asset
+      #   id: upload_release_asset 
+      #   uses: actions/upload-release-asset@v1
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #   with:
+      #     upload_url: ${{ steps.get_current_release.outputs.upload_url }}
+      #     asset_path: ./dist/${{env.wheel_name}}
+      #     asset_name: ${{env.wheel_name}}
+      #     asset_content_type: application/*
+
+  # publish_package:
+  #   name: Publish package
+  #   needs: [build_wheels]
+
+  #   runs-on: ubuntu-latest
+
+  #   steps:
+  #     - uses: actions/checkout@v3
+
+  #     - uses: actions/setup-python@v4
+  #       with:
+  #         python-version: '3.10'
+
+  #     - name: Install dependencies
+  #       run: |
+  #         pip install ninja packaging setuptools wheel twine
+  #         pip install torch
+
+  #     - name: Build core package
+  #       env:
+  #         FLASH_ATTENTION_SKIP_CUDA_BUILD: "TRUE"
+  #       run: |
+  #         python setup.py sdist --dist-dir=dist
+
+  #     - name: Deploy
+  #       env:
+  #         TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
+  #         TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+  #       run: |
+  #         python -m twine upload dist/*
