@@ -116,10 +116,10 @@ def remap_state_dict_hf_llama(state_dict, config):
 
     # MLP
     for l in range(config.n_layer):
-        w1 = state_dict.pop(f'model.layers.{l}.mlp.up_proj.weight')
-        w3 = state_dict.pop(f'model.layers.{l}.mlp.gate_proj.weight')
+        w1 = state_dict.pop(f'model.layers.{l}.mlp.gate_proj.weight')
+        w3 = state_dict.pop(f'model.layers.{l}.mlp.up_proj.weight')
         # Our ordering is different
-        state_dict[f'transformer.layers.{l}.mlp.fc1.weight'] = torch.cat([w1, w3], dim=0)
+        state_dict[f'transformer.layers.{l}.mlp.fc1.weight'] = torch.cat([w3, w1], dim=0)
 
     def key_mapping_mlp(key):
         return re.sub(r'^model.layers.(\d+).mlp.down_proj.',
