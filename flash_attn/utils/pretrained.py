@@ -40,7 +40,11 @@ def state_dict_from_pretrained(model_name, device=None, dtype=None):
     if resolved_archive_file is None:
         raise EnvironmentError(f"Model name {model_name} was not found.")
 
-    loader = partial(safe_load_file, device=device) if load_safe else partial(torch.load, map_location=mapped_device)
+    if load_safe:
+        loader = partial(safe_load_file, device=mapped_device)
+    else:
+        loader = partial(torch.load, map_location=mapped_device)
+
     if is_sharded:
         # resolved_archive_file becomes a list of files that point to the different
         # checkpoint shards in this case.
