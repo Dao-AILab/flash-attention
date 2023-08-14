@@ -49,6 +49,7 @@ def state_dict_from_pretrained(model_name, device=None, dtype=None):
         for sharded_file in resolved_archive_file:
             state_dict.update(torch.load(sharded_file, map_location=mapped_device))
     else:
+        # TODO: fix logic here.
         from safetensors.torch import load_file as safe_load_file
         # state_dict = torch.load(resolved_archive_file, map_location=device)
         state_dict = safe_load_file(resolved_archive_file, device=device)
