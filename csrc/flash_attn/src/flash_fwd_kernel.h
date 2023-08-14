@@ -152,6 +152,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
     if (params.max_past > 0) {
         n_block_min = std::max(n_block_min, ((m_block + 1) * kBlockM / kBlockN));
+        if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+            printf("m_block = %d, n_block_min = %d\n", m_block, n_block_min);
+        }
     }
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
@@ -469,6 +472,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 kNWarps * 16,
                 params.max_past
             );
+            if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+                printf("RAN FILTERING max_past %d n_block %d kBlockN %d m_block %d kBlockM %d\n", params.max_past, n_block, kBlockN, m_block, kBlockM);
+            }
         }
 
         softmax_rescale_o</*Is_first=*/false>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);

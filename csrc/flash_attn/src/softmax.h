@@ -157,7 +157,9 @@ inline __device__ void apply_mask_causal(Tensor<Engine, Layout> &tensor, const u
         for (int i = 0; i < size<0, 0>(tensor); ++i) {
             const uint32_t row_idx = row_idx_base + i * 8;
             const uint32_t col_idx_limit_high = std::min(max_seqlen_k, row_idx + 1);
-            const uint32_t col_idx_limit_low = uint32_t(std::max(0, int32_t(row_idx) - max_past));
+
+            const uint32_t col_idx_limit_low = max_past > 0 ? uint32_t(std::max(0, int32_t(row_idx) - max_past)) : 0;
+
             #pragma unroll
             for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                 const uint32_t col_idx_base = col_idx_offset + nj * 8;
@@ -194,7 +196,7 @@ inline __device__ void apply_mask_past(Tensor<Engine, Layout> &tensor, const uin
         #pragma unroll
         for (int i = 0; i < size<0, 0>(tensor); ++i) {
             const uint32_t row_idx = row_idx_base + i * 8;
-            const uint32_t col_idx_limit_low = uint32_t(std::max(0, int32_t(row_idx) - max_past));
+            const uint32_t col_idx_limit_low = max_past > 0 ? uint32_t(std::max(0, int32_t(row_idx) - max_past)) : 0;
             #pragma unroll
             for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                 const uint32_t col_idx_base = col_idx_offset + nj * 8;
