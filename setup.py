@@ -247,8 +247,6 @@ class CachedWheelsCommand(_bdist_wheel):
         if FORCE_BUILD:
             return super().run()
 
-        raise_if_cuda_home_none("flash_attn")
-
         # Determine the version numbers that will be used to determine the correct wheel
         # We're using the CUDA version used to build torch, not the one currently installed
         # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
