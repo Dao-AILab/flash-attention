@@ -89,7 +89,7 @@ void set_params_fprop(FlashFwdParams &params,
     else if(!params.is_mnko_padding && d <= 64){
         params.is_mnko_padding = ((d % 64)==0 ? false : true);
     }
-    else if(!!params.is_mnko_padding && d <= 128){
+    else if(!params.is_mnko_padding && d <= 128){
         params.is_mnko_padding = ((d % 128)==0 ? false : true);
     }
     else{
