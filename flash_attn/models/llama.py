@@ -86,7 +86,7 @@ def remap_state_dict_meta_llama(state_dict, config):
 
 
 def remap_state_dict_hf_llama(state_dict, config):
-    # embedding
+    # Embedding
     def key_mapping_emb(key):
         return re.sub(r'^model.embed_tokens.', 'transformer.embeddings.word_embeddings.', key)
 
@@ -100,7 +100,7 @@ def remap_state_dict_hf_llama(state_dict, config):
         word_embeddings, (0, 0, 0, vocab_size - word_embeddings.shape[0])
     )
 
-    # lm_head
+    # LM head
     if getattr(config, 'tie_word_embeddings'):
         state_dict['lm_head.weight'] = state_dict['transformer.embeddings.word_embeddings.weight']
     else:
