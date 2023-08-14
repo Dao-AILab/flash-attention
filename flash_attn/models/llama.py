@@ -136,12 +136,19 @@ def remap_state_dict_hf_llama(state_dict, config):
 
     state_dict = OrderedDict((key_mapping_ln(k), v) for k, v in state_dict.items())
 
+    def inv_permute(w):
+        return w.reshape(
+            config.n_head, 2, config.n_embd // config.n_head // 2, config.n_embd
+        ).transpose(1, 2).reshape(config.n_embd, config.n_embd)
+
     # Attention
     for l in range(config.n_layer):
         Wq = state_dict.pop(f'model.layers.{l}.self_attn.q_proj.weight')
         Wk = state_dict.pop(f'model.layers.{l}.self_attn.k_proj.weight')
         Wv = state_dict.pop(f'model.layers.{l}.self_attn.v_proj.weight')
-        state_dict[f'transformer.layers.{l}.mixer.Wqkv.weight'] = torch.cat([Wq, Wk, Wv], dim=0)
+        state_dict[f'transformer.layers.{l}.mixer.Wqkv.weight'] = torch.cat(
+            [inv_permute(Wq), inv_permute(Wk), Wv], dim=0
+        )
         # We don't store these
         state_dict.pop(f'model.layers.{l}.self_attn.rotary_emb.inv_freq', None)
 
