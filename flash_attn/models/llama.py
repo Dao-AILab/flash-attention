@@ -1,15 +1,15 @@
 # Copyright (c) 2023, Tri Dao.
 
-import math
 import json
+import math
+import os
 import re
-from pathlib import Path
-
 from collections import OrderedDict
+from pathlib import Path
+from typing import Union
 
 import torch
 import torch.nn.functional as F
-
 from transformers import GPT2Config, LlamaConfig
 
 
@@ -156,7 +156,7 @@ def remap_state_dict_hf_llama(state_dict, config):
     return state_dict
 
 
-def config_from_checkpoint(checkpoint_path: str, model_name: str) -> LlamaConfig:
+def config_from_checkpoint(checkpoint_path: Union[str, os.PathLike], model_name: str) -> LlamaConfig:
     """Load a LlamaConfig from a checkpoint path."""
     with open(Path(checkpoint_path) / model_name / 'params.json') as f:
         params = json.load(f)
@@ -167,7 +167,7 @@ def config_from_checkpoint(checkpoint_path: str, model_name: str) -> LlamaConfig
     return config
 
 
-def state_dicts_from_checkpoint(checkpoint_path: str, model_name: str) -> dict:
+def state_dicts_from_checkpoint(checkpoint_path: Union[str, os.PathLike], model_name: str) -> list[dict]:
     # Need to sort, otherwise we mess up the ordering and the weights are wrong
     return [torch.load(path, map_location='cpu')
             for path in sorted((Path(checkpoint_path) / model_name).glob('consolidated.*.pth'))]
