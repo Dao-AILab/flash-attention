@@ -2,7 +2,6 @@ import os
 from functools import partial
 
 import torch
-import transformers
 from safetensors.torch import load_file as safe_load_file
 from transformers.utils import WEIGHTS_NAME, WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, SAFE_WEIGHTS_INDEX_NAME
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
