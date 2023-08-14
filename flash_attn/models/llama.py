@@ -114,7 +114,18 @@ def remap_state_dict_hf_llama(state_dict, config):
             output_embeddings, (0, 0, 0, vocab_size - output_embeddings.shape[0])
         )
 
-    # TODO: Figure out MLP remap.
+    # MLP
+    for l in range(config.n_layer):
+        w1 = state_dict.pop(f'model.layers.{l}.mlp.up_proj.weight')
+        w3 = state_dict.pop(f'model.layers.{l}.mlp.gate_proj.weight')
+        # Our ordering is different
+        state_dict[f'transformer.layers.{l}.mlp.fc1.weight'] = torch.cat([w1, w3], dim=0)
+
+    def key_mapping_mlp(key):
+        return re.sub(r'^model.layers.(\d+).mlp.down_proj.',
+                      r'transformer.layers.\1.mlp.fc2.', key)
+
+    state_dict = OrderedDict((key_mapping_mlp(k), v) for k, v in state_dict.items())
 
     # LayerNorm
     def key_mapping_ln(key):
