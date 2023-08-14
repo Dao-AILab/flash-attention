@@ -33,10 +33,8 @@ def remap_state_dict_meta_llama(state_dict, config):
         state_dict['lm_head.weight'] = state_dict['transformer.embeddings.word_embeddings.weight']
     else:
         output_embeddings = state_dict.pop('output.weight')
-        # Need to recompute vocab_size since LLaMa shards the word embeddings and output embeddings
-        # differently.
         vocab_size = (math.ceil(output_embeddings.shape[0] / pad_vocab_size_multiple)
-                    * pad_vocab_size_multiple)
+                      * pad_vocab_size_multiple)
         # It's possible that vocab_size is padded to be a multiple of 8, for example.
         state_dict['lm_head.weight'] = F.pad(
             output_embeddings, (0, 0, 0, vocab_size - output_embeddings.shape[0])
