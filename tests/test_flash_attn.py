@@ -654,8 +654,9 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, dropout_p, causal, mha_type, d
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 @pytest.mark.parametrize('dropout_p', [0.0, 0.17])
 # @pytest.mark.parametrize('dropout_p', [0.0])
+@pytest.mark.parametrize('max_past', [0, 7, 32, 116, 221])
 def test_flash_attn_varlen_output(seqlen_q, seqlen_k, d, dropout_p, causal, mha_type, dtype,
-                                  kvpacked):
+                                  kvpacked, max_past):
     if max(seqlen_q, seqlen_k) >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
     device = 'cuda'
@@ -686,7 +687,7 @@ def test_flash_attn_varlen_output(seqlen_q, seqlen_k, d, dropout_p, causal, mha_
         )
         out_unpad, sm_lse, S_dmask = flash_attn_varlen_kvpacked_func(
             q_unpad, kv_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-            dropout_p, return_attn_probs=True, causal=causal
+            dropout_p, return_attn_probs=True, causal=causal, max_past=max_past
         )
     else:
         (q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, q, k, v,
@@ -695,7 +696,7 @@ def test_flash_attn_varlen_output(seqlen_q, seqlen_k, d, dropout_p, causal, mha_
         )
         out_unpad, sm_lse, S_dmask = flash_attn_varlen_func(
             q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-            dropout_p, return_attn_probs=True, causal=causal
+            dropout_p, return_attn_probs=True, causal=causal, max_past=max_past
         )
     out = output_pad_fn(out_unpad)
     if dropout_p > 0.0:
@@ -721,16 +722,16 @@ def test_flash_attn_varlen_output(seqlen_q, seqlen_k, d, dropout_p, causal, mha_
 
     if kvpacked:
         out_ref, attn_ref = attention_kvpacked_ref(q, kv, query_padding_mask, key_padding_mask,
-                                                dropout_p, dropout_mask, causal=causal)
+                                                dropout_p, dropout_mask, causal=causal, max_past=max_past)
         out_pt, attn_pt = attention_kvpacked_ref(q, kv, query_padding_mask, key_padding_mask,
                                                 dropout_p, dropout_mask,
-                                                causal=causal, upcast=False, reorder_ops=True)
+                                                causal=causal, max_past=max_past, upcast=False, reorder_ops=True)
     else:
         out_ref, attn_ref = attention_ref(q, k, v, query_padding_mask, key_padding_mask,
-                                          dropout_p, dropout_mask, causal=causal)
+                                          dropout_p, dropout_mask, causal=causal, max_past=max_past)
         out_pt, attn_pt = attention_ref(q, k, v, query_padding_mask, key_padding_mask,
                                         dropout_p, dropout_mask,
-                                        causal=causal, upcast=False, reorder_ops=True)
+                                        causal=causal, upcast=False, reorder_ops=True, , max_past=max_past)
 
     print(f'Output max diff: {(out - out_ref).abs().max().item()}')
     print(f'Output mean diff: {(out - out_ref).abs().mean().item()}')

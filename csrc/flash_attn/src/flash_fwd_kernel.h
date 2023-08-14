@@ -143,11 +143,15 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     if (m_block * kBlockM >= binfo.actual_seqlen_q || binfo.actual_seqlen_k == 0) return;
 
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
+    int n_block_min = 0;
     if (Is_causal) {
         n_block_max = std::min(n_block_max, cute::ceil_div((m_block + 1) * kBlockM, kBlockN));
         // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
         //     printf("m_block = %d, n_block_max = %d\n", m_block, n_block_max);
         // }
+    }
+    if (params.max_past > 0) {
+        n_block_min = std::max(n_block_min, ((m_block + 1) * kBlockM / kBlockN));
     }
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
@@ -372,11 +376,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             flash::apply_mask_causal(scores, n_block * kBlockN, binfo.actual_seqlen_k,
                                      // m_block * kBlockM + get<0>(idx_row(0)),
                                      m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-                                     kNWarps * 16);
+                                     kNWarps * 16,
+                                     params.max_past); // will mask "for free if needed"
+                                     // but params.max_past masking might be required in non-masking steps as well :| 
+
                                      // m_block * kBlockM + (tidx / 32) * 16, kNWarps * 16);
                                      // m_block * kBlockM + (tidx / 32) * (kBlockM / kNWarps), 16);
         }
-
         flash::cp_async_wait<0>();
         __syncthreads();
         if (n_block > 0) {
@@ -420,14 +426,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // if (cute::thread0()) { print(scores); }
 
         // This check is at the end of the loop since we always have at least 1 iteration
-        if (n_masking_steps > 1 && n_block <= 0) {
+        if (n_masking_steps > 1 && n_block <= n_block_min) {
             --n_block;
             break;
         }
     }
 
     // These are the iterations where we don't need masking on S
-    for (; n_block >= 0; --n_block) {
+    for (; n_block >= n_block_min; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
         flash::cp_async_wait<0>();
@@ -454,6 +460,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+
+        // could separate this to be the last one but whatever
+        if (params.max_past > 0 && n_block * kBlockN < (m_block + 1) * kBlockM - params.max_past) {
+            flash::apply_mask_past(
+                scores, n_block * kBlockN,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                kNWarps * 16,
+                params.max_past
+            );
+        }
+
         softmax_rescale_o</*Is_first=*/false>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
 
         Tensor rP = flash::convert_type<Element>(scores);

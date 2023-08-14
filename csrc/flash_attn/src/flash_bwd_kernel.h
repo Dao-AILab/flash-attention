@@ -801,7 +801,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 flash::apply_mask_causal(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                                          binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
                                          // binfo.actual_seqlen_k, m_block * kBlockM + (tidx / 32) % AtomLayoutMS * 16 + (tidx % 32) / 4,
-                                         AtomLayoutMS * 16);
+                                         AtomLayoutMS * 16, params.max_past);
             }
         }
         // if (cute::thread(32, 0)) { print(scores); }
@@ -1092,8 +1092,12 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
     if (m_block * kBlockM >= binfo.actual_seqlen_q || binfo.actual_seqlen_k == 0) return;
 
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
+    int n_block_min = 0;
     if (Is_causal) {
         n_block_max = std::min(n_block_max, cute::ceil_div((m_block + 1) * kBlockM, kBlockN));
+    }
+    if (params.max_past > 0) {
+        n_block_min = std::max(n_block_min, ((m_block + 1) * kBlockM / kBlockN));
     }
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
@@ -1318,7 +1322,7 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
 
     clear(acc_dq);
 
-    for (; n_block >= 0; --n_block) {
+    for (; n_block >= n_block_min; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M_SdP, MMA_N)
         clear(acc_s);
         flash::cp_async_wait<0>();
@@ -1335,7 +1339,15 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
             flash::apply_mask_causal(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                                      binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
                                      // binfo.actual_seqlen_k, m_block * kBlockM + (tidx / 32) % AtomLayoutMS * 16 + (tidx % 32) / 4,
-                                     AtomLayoutMS * 16);
+                                     AtomLayoutMS * 16, params.max_past);
+        }
+        if (params.max_past > 0 && n_block * kBlockN < (m_block + 1) * kBlockM - params.max_past) {
+            flash::apply_mask_past(
+                scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                m_block * kBlockM + get<0>(taccScS_row(0)),
+                AtomLayoutMS * 16,
+                params.max_past
+            );
         }
         // Compute the exponential value.
         flash::scale_apply_exp2</*scale_max=*/false>(scores, lse, params.scale_softmax_log2);
@@ -1389,7 +1401,7 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
         copy(smem_thr_copy_PdS, tdSadS, tdSsdS);
         __syncthreads();
 
-        if (n_block > 0) {
+        if (n_block > n_block_min) {
             // Double buffer for sK
             const int sK_offset = n_block % 2 == 0 ? size(sK) : -size(sK);
             tKsK.data() = tKsK.data() + sK_offset;
