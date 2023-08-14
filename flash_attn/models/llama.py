@@ -143,7 +143,7 @@ def remap_state_dict_hf_llama(state_dict, config):
         Wv = state_dict.pop(f'model.layers.{l}.self_attn.v_proj.weight')
         state_dict[f'transformer.layers.{l}.mixer.Wqkv.weight'] = torch.cat([Wq, Wk, Wv], dim=0)
         # We don't store these
-        state_dict.pop(f'transformer.layers.{l}.attention.inner_attention.rope.freqs', None)
+        state_dict.pop(f'model.layers.{l}.self_attn.rotary_emb.inv_freq', None)
 
     def key_mapping_attn(key):
         return re.sub(r'^model.layers.(\d+).self_attn.o_proj.',
