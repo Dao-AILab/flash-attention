@@ -120,7 +120,6 @@ inline __device__ void write_softmax_to_gmem(
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_N, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
-
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
@@ -151,9 +150,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // }
     }
     if (params.max_past > 0) {
-        n_block_min = std::max(n_block_min, ((m_block + 1) * kBlockM / kBlockN));
+        n_block_min = std::max(n_block_min, ((m_block * kBlockM - params.max_past) / kBlockN));
         if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-            printf("m_block = %d, n_block_min = %d\n", m_block, n_block_min);
+            printf("MAX PAST %d m_block = %d, n_block_min = %d // kBlockM %d // kBlockN %d \n", params.max_past, m_block, n_block_min, kBlockM, kBlockN);
         }
     }
 
@@ -434,7 +433,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             break;
         }
     }
-
     // These are the iterations where we don't need masking on S
     for (; n_block >= n_block_min; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -466,15 +464,16 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // could separate this to be the last one but whatever
         if (params.max_past > 0 && n_block * kBlockN < (m_block + 1) * kBlockM - params.max_past) {
+            printf("RAN FILTERING max_past %d n_block %d kBlockN %d m_block %d kBlockM %d\n", params.max_past, n_block, kBlockN, m_block, kBlockM);
             flash::apply_mask_past(
                 scores, n_block * kBlockN,
                 m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
                 kNWarps * 16,
                 params.max_past
             );
-            if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-                printf("RAN FILTERING max_past %d n_block %d kBlockN %d m_block %d kBlockM %d\n", params.max_past, n_block, kBlockN, m_block, kBlockM);
-            }
+            // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+
+            // }
         }
 
         softmax_rescale_o</*Is_first=*/false>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
@@ -598,7 +597,6 @@ inline __device__ void compute_attn(const Params &params) {
     // (within a warp). We use the subsequence to store the location of the 16 x 32 blocks within
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
-
     flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_even_N, Is_even_K, Return_softmax>(params, bidb, bidh, m_block);
 }
 

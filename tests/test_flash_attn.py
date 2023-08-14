@@ -226,6 +226,7 @@ def attention_ref(
         scores.masked_fill_(
             rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf")
         )
+
     if causal:
         causal_mask = torch.triu(
             torch.ones(seqlen_q, seqlen_k, dtype=torch.bool, device=q.device), 1
@@ -1016,11 +1017,11 @@ def test_flash_attn_output(
 
 
 # @pytest.mark.parametrize("kvpacked", [True, False])
-@pytest.mark.parametrize('kvpacked', [False])
+@pytest.mark.parametrize("kvpacked", [False])
 # @pytest.mark.parametrize(
 #     "dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16])
 # )
-@pytest.mark.parametrize('dtype', [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("causal", [False, True])
@@ -1043,15 +1044,15 @@ def test_flash_attn_output(
 #         (2048, 2048),
 #     ],
 # )
-@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128)])
+# @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128)])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(8, 8)])
 # @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 @pytest.mark.parametrize("dropout_p", [0.0])
 # @pytest.mark.parametrize("max_past", [0, 7, 32, 116, 221])
-@pytest.mark.parametrize("max_past", [0])
+@pytest.mark.parametrize("max_past", [3])
 def test_flash_attn_varlen_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, mha_type, dtype, kvpacked, max_past
 ):
-    print(max_past)
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
@@ -1067,6 +1068,13 @@ def test_flash_attn_varlen_output(
     q = torch.randn(
         batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True
     )
+    # q = torch.full(
+    #     (batch_size, seqlen_q, nheads, d),
+    #     1,
+    #     device=device,
+    #     dtype=dtype,
+    #     requires_grad=True,
+    # )
     if kvpacked:
         kv = torch.randn(
             batch_size,
@@ -1088,6 +1096,13 @@ def test_flash_attn_varlen_output(
             dtype=dtype,
             requires_grad=True,
         )
+        # k = torch.full(
+        #     (batch_size, seqlen_k, nheads_k, d),
+        #     1,
+        #     device=device,
+        #     dtype=dtype,
+        #     requires_grad=True,
+        # )
         v = torch.randn(
             batch_size,
             seqlen_k,
@@ -1097,6 +1112,9 @@ def test_flash_attn_varlen_output(
             dtype=dtype,
             requires_grad=True,
         )
+        # v = torch.Tensor([[float(i == j) for j in range(d)] for i in range(seqlen_k)])[
+        #     None, :, None, :
+        # ].to(device=device, dtype=dtype)
 
     query_padding_mask = generate_random_padding_mask(
         seqlen_q, batch_size, device, mode="random"
@@ -1119,9 +1137,7 @@ def test_flash_attn_varlen_output(
             output_pad_fn,
             dq_pad_fn,
             dkv_pad_fn,
-        ) = generate_qkv(
-            q, *kv.unbind(dim=2), query_padding_mask, key_padding_mask, kvpacked=True
-        )
+        ) = generate_qkv(q, *kv.unbind(dim=2), None, None, kvpacked=True)
         out_unpad, sm_lse, S_dmask = flash_attn_varlen_kvpacked_func(
             q_unpad,
             kv_unpad,
@@ -1149,7 +1165,7 @@ def test_flash_attn_varlen_output(
             output_pad_fn,
             dq_pad_fn,
             dk_pad_fn,
-        ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+        ) = generate_qkv(q, k, v, None, None, kvpacked=False)
         out_unpad, sm_lse, S_dmask = flash_attn_varlen_func(
             q_unpad,
             k_unpad,
@@ -1164,11 +1180,12 @@ def test_flash_attn_varlen_output(
             max_past=max_past,
         )
     out = output_pad_fn(out_unpad)
+
     if dropout_p > 0.0:
         S_dmask_converted = convert_flash_attn_S_to_softmax(
             S_dmask,
-            query_padding_mask,
-            key_padding_mask,
+            None,
+            None,
             d,
             dropout_p > 0.0,
             causal=causal,
@@ -1186,13 +1203,13 @@ def test_flash_attn_varlen_output(
             q,
             k_rep,
             v_rep,
-            query_padding_mask,
-            key_padding_mask,
+            None,
+            None,
             dropout_p > 0.0,
             causal=causal,
         )
         dropout_fraction = get_dropout_fraction(
-            dropout_mask, query_padding_mask, key_padding_mask, causal=causal
+            dropout_mask, None, None, causal=causal
         ).item()
         print(f"Actual dropout fraction: {dropout_fraction}")
     else:
@@ -1202,8 +1219,8 @@ def test_flash_attn_varlen_output(
         out_ref, attn_ref = attention_kvpacked_ref(
             q,
             kv,
-            query_padding_mask,
-            key_padding_mask,
+            None,
+            None,
             dropout_p,
             dropout_mask,
             causal=causal,
@@ -1212,8 +1229,8 @@ def test_flash_attn_varlen_output(
         out_pt, attn_pt = attention_kvpacked_ref(
             q,
             kv,
-            query_padding_mask,
-            key_padding_mask,
+            None,
+            None,
             dropout_p,
             dropout_mask,
             causal=causal,
@@ -1226,8 +1243,8 @@ def test_flash_attn_varlen_output(
             q,
             k,
             v,
-            query_padding_mask,
-            key_padding_mask,
+            None,
+            None,
             dropout_p,
             dropout_mask,
             causal=causal,
@@ -1237,8 +1254,8 @@ def test_flash_attn_varlen_output(
             q,
             k,
             v,
-            query_padding_mask,
-            key_padding_mask,
+            None,
+            None,
             dropout_p,
             dropout_mask,
             causal=causal,
@@ -1508,3 +1525,7 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
     assert (v.grad - v_ref.grad).abs().max().item() <= 2 * (
         v_pt.grad - v_ref.grad
     ).abs().max().item()
+
+
+if __name__ == "__main__":
+    test_flash_attn_varlen_output(37, 37, 32, 0, True, "mha", torch.bfloat16, False, 6)

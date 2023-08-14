@@ -1097,7 +1097,7 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
         n_block_max = std::min(n_block_max, cute::ceil_div((m_block + 1) * kBlockM, kBlockN));
     }
     if (params.max_past > 0) {
-        n_block_min = std::max(n_block_min, ((m_block + 1) * kBlockM / kBlockN));
+        n_block_min = std::max(n_block_min, ((m_block * kBlockM - params.max_past) / kBlockN));
     }
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one

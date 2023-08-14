@@ -157,25 +157,17 @@ inline __device__ void apply_mask_causal(Tensor<Engine, Layout> &tensor, const u
         for (int i = 0; i < size<0, 0>(tensor); ++i) {
             const uint32_t row_idx = row_idx_base + i * 8;
             const uint32_t col_idx_limit_high = std::min(max_seqlen_k, row_idx + 1);
-
-            const uint32_t col_idx_limit_low = max_past > 0 ? uint32_t(std::max(0, int32_t(row_idx) - max_past)) : 0;
-
             #pragma unroll
             for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                 const uint32_t col_idx_base = col_idx_offset + nj * 8;
                 #pragma unroll
                 for (int j = 0; j < size<1, 0>(tensor); ++j) {
                     const uint32_t col_idx = col_idx_base + j;
-                    if (col_idx >= col_idx_limit_high || col_idx < col_idx_limit_low) {
+                    if (col_idx >= col_idx_limit_high || col_idx + max_past <= row_idx) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
                 }
             }
-            // if (cute::thread0()) {
-            //     printf("mi = %d, i = %d, row_idx = %d, max_seqlen_k = %d\n", mi, i, row_idx, max_seqlen_k);
-            //     print(tensor(make_coord(i, mi), _));
-            //     // print(tensor(_, j + nj * size<1, 0>(tensor)));
-            // }
         }
     }
 }
@@ -196,14 +188,13 @@ inline __device__ void apply_mask_past(Tensor<Engine, Layout> &tensor, const uin
         #pragma unroll
         for (int i = 0; i < size<0, 0>(tensor); ++i) {
             const uint32_t row_idx = row_idx_base + i * 8;
-            const uint32_t col_idx_limit_low = max_past > 0 ? uint32_t(std::max(0, int32_t(row_idx) - max_past)) : 0;
             #pragma unroll
             for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                 const uint32_t col_idx_base = col_idx_offset + nj * 8;
                 #pragma unroll
                 for (int j = 0; j < size<1, 0>(tensor); ++j) {
                     const uint32_t col_idx = col_idx_base + j;
-                    if (col_idx < col_idx_limit_low) {
+                    if (col_idx + max_past <= row_idx) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
                 }
