@@ -74,6 +74,8 @@ def remap_state_dict_meta_llama(state_dict, config):
                       r'transformer.layers.\1.mixer.out_proj.', key)
     state_dict = OrderedDict((key_mapping_attn(k), v) for k, v in state_dict.items())
 
+    state_dict.pop("transformer.rope.freqs", None)
+
     return state_dict
 
 
