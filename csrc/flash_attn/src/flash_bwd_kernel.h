@@ -804,6 +804,15 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                                          AtomLayoutMS * 16, params.max_past);
             }
         }
+
+        if (params.max_past > 0 && n_block * kBlockN < (m_block + 1) * kBlockM - params.max_past) {
+            flash::apply_mask_past(
+                scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                m_block * kBlockM + get<0>(taccScS_row(0)),
+                AtomLayoutMS * 16,
+                params.max_past
+            );
+        }
         // if (cute::thread(32, 0)) { print(scores); }
         // Compute the exponential value.
         flash::scale_apply_exp2</*scale_max=*/false>(scores, lse, params.scale_softmax_log2);

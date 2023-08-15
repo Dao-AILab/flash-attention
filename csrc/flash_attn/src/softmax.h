@@ -163,7 +163,7 @@ inline __device__ void apply_mask_causal(Tensor<Engine, Layout> &tensor, const u
                 #pragma unroll
                 for (int j = 0; j < size<1, 0>(tensor); ++j) {
                     const uint32_t col_idx = col_idx_base + j;
-                    if (col_idx >= col_idx_limit_high || col_idx + max_past <= row_idx) {
+                    if (col_idx >= col_idx_limit_high || (max_past > 0 && col_idx + max_past <= row_idx)) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
                 }

@@ -240,6 +240,10 @@ def attention_ref(
         )
         scores.masked_fill_(past_mask, float("-inf"))
 
+    print("MAASK")
+    for x in scores[0, 0]:
+        print(" ".join([str(xx) for xx in x.tolist()]))
+
     attention = torch.softmax(scores, dim=-1)
     dropout_scaling = 1.0 / (1 - dropout_p)
     # attention_drop = attention.masked_fill(~dropout_mask, 0.0) * dropout_scaling
@@ -1026,30 +1030,30 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("causal", [True])
-# @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
+@pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192, 224, 256])
-@pytest.mark.parametrize("d", [64])
-# @pytest.mark.parametrize(
-#     "seqlen_q,seqlen_k",
-#     [
-#         (113, 203),
-#         (128, 217),
-#         (113, 211),
-#         (108, 256),
-#         (256, 512),
-#         (512, 256),
-#         (1024, 1024),
-#         (1023, 1024),
-#         (1024, 1023),
-#         (2048, 2048),
-#     ],
-# )
+# @pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
+    ],
+)
 # @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128)])
-@pytest.mark.parametrize("seqlen_q,seqlen_k", [(8, 8)])
+# @pytest.mark.parametrize("seqlen_q,seqlen_k", [(8, 8)])
 # @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 @pytest.mark.parametrize("dropout_p", [0.0])
-# @pytest.mark.parametrize("max_past", [0, 7, 32, 116, 221])
-@pytest.mark.parametrize("max_past", [3])
+@pytest.mark.parametrize("max_past", [0, 7, 32, 116, 221])
+# @pytest.mark.parametrize("max_past", [3])
 def test_flash_attn_varlen_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, mha_type, dtype, kvpacked, max_past
 ):
@@ -1061,20 +1065,26 @@ def test_flash_attn_varlen_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 16
-    nheads = 9
+    debug = True
+    if not debug:
+        batch_size = 16
+        nheads = 9
+    else:
+        batch_size = 1
+        nheads = 1
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
     q = torch.randn(
         batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True
     )
-    # q = torch.full(
-    #     (batch_size, seqlen_q, nheads, d),
-    #     1,
-    #     device=device,
-    #     dtype=dtype,
-    #     requires_grad=True,
-    # )
+    if debug:
+        q = torch.full(
+            (batch_size, seqlen_q, nheads, d),
+            1,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
     if kvpacked:
         kv = torch.randn(
             batch_size,
@@ -1096,13 +1106,14 @@ def test_flash_attn_varlen_output(
             dtype=dtype,
             requires_grad=True,
         )
-        # k = torch.full(
-        #     (batch_size, seqlen_k, nheads_k, d),
-        #     1,
-        #     device=device,
-        #     dtype=dtype,
-        #     requires_grad=True,
-        # )
+        if debug:
+            k = torch.full(
+                (batch_size, seqlen_k, nheads_k, d),
+                1,
+                device=device,
+                dtype=dtype,
+                requires_grad=True,
+            )
         v = torch.randn(
             batch_size,
             seqlen_k,
@@ -1112,9 +1123,11 @@ def test_flash_attn_varlen_output(
             dtype=dtype,
             requires_grad=True,
         )
-        # v = torch.Tensor([[float(i == j) for j in range(d)] for i in range(seqlen_k)])[
-        #     None, :, None, :
-        # ].to(device=device, dtype=dtype)
+        if debug:
+            v = torch.Tensor(
+                [[float(i == j) for j in range(d)] for i in range(seqlen_k)]
+            )[None, :, None, :].to(device=device, dtype=dtype)
+        # print(v.shape, batch_size, seqlen_k, nheads_k, d)
 
     query_padding_mask = generate_random_padding_mask(
         seqlen_q, batch_size, device, mode="random"
@@ -1272,7 +1285,8 @@ def test_flash_attn_varlen_output(
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
-    g = torch.randn_like(out)
+    # g = torch.randn_like(out)
+    g = torch.ones(out.shape, device=out.device, dtype=out.dtype)
     if d <= MAX_HEADDIM_SM8x or (is_sm80 or is_sm90):
         if kvpacked:
             (
@@ -1321,6 +1335,20 @@ def test_flash_attn_varlen_output(
         print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
         print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+
+    for x in out_ref[0, :64, 0, :64]:
+        print(x.sum().item())
+        print(" ".join([str(xx) for xx in x.tolist()]))
+    # print(torch.linalg.norm(out_ref).item())
+
+    # print(dv.shape)
+    # for x in dv[0, :64, 0, :32]:
+    #     print(" ".join([str(xx) for xx in x.tolist()]))
+    # print(x.sum().item())
+    # print("---------------------------")
+    # for x in dv_ref[0, :64, 0, :32]:
+    #     # print(x.sum().item())
+    #     print(" ".join([str(xx) for xx in x.tolist()]))
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
@@ -1528,4 +1556,4 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
 
 
 if __name__ == "__main__":
-    test_flash_attn_varlen_output(37, 37, 32, 0, True, "mha", torch.bfloat16, False, 6)
+    test_flash_attn_varlen_output(32, 16, 128, 0, True, "mha", torch.bfloat16, False, 0)
