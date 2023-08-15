@@ -9,8 +9,6 @@ import os
 import time
 from pathlib import Path
 
-import transformers
-
 current_dir = Path(__file__).parent.absolute()
 
 import torch
