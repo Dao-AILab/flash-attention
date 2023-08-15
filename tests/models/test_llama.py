@@ -8,6 +8,7 @@
 import os
 import time
 from pathlib import Path
+
 current_dir = Path(__file__).parent.absolute()
 
 import torch
@@ -15,15 +16,26 @@ import pytest
 
 from einops import rearrange
 
-from transformers import LlamaConfig, LlamaTokenizer
+from transformers import LlamaTokenizer
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 from flash_attn.models.gpt import GPTLMHeadModel, combine_state_dicts_tp, shard_state_dict_tp
-from flash_attn.models.llama import remap_state_dict_meta_llama, llama_config_to_gpt2_config
+from flash_attn.models.llama import remap_state_dict_meta_llama, llama_config_to_gpt2_config, remap_state_dict_hf_llama
 from flash_attn.models.llama import config_from_checkpoint, state_dicts_from_checkpoint
 from flash_attn.utils.distributed import all_gather_raw
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 from flash_attn.utils.generation import update_graph_cache
+
+
+def _pretrained_state_dict_from_checkpoint(checkpoint_path, model_name, config, checkpoint_format):
+    if checkpoint_format == "meta":
+        ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
+        pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
+        pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
+    else:
+        pretrained_state_dict = state_dict_from_pretrained(Path(checkpoint_path) / f'{model_name}-hf')
+        pretrained_state_dict = remap_state_dict_hf_llama(pretrained_state_dict, config)
+    return pretrained_state_dict
 
 
 @pytest.mark.parametrize('model_name', ["7B"])
@@ -41,8 +53,8 @@ def test_llama_state_dict(model_name):
 
 
 @pytest.mark.parametrize('model_name', ["7B", "13B"])
-# @pytest.mark.parametrize('model_name', ["7B"])
-def test_llama_optimized(model_name):
+@pytest.mark.parametrize('checkpoint_format', ["meta", "hf"])
+def test_llama_optimized(model_name, checkpoint_format):
     """Check that our implementation of LLaMa (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
     forward pass in fp16, when compared to the HF forward pass in fp32.
@@ -52,16 +64,17 @@ def test_llama_optimized(model_name):
 
     dtype = torch.float16
     device = 'cuda'
-    config = llama_config_to_gpt2_config(config_from_checkpoint(checkpoint_path, model_name))
+    config = config_from_checkpoint(checkpoint_path, model_name, checkpoint_format)
+    config = llama_config_to_gpt2_config(config)
     config.use_flash_attn = True
     config.fused_bias_fc = True
     config.fused_mlp = False  # We don't have fused GatedMLP yet
     config.fused_dropout_add_ln = True
     config.residual_in_fp32 = True
 
-    ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
-    pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
-    pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
+    pretrained_state_dict = _pretrained_state_dict_from_checkpoint(
+        checkpoint_path, model_name, config, checkpoint_format
+    )
     model = GPTLMHeadModel(config, device=device, dtype=dtype)
     model.load_state_dict(pretrained_state_dict)
     model.eval()
@@ -111,7 +124,8 @@ def test_llama_optimized(model_name):
 # torchrun --no_python --nproc_per_node=2 pytest -q -s tests/models/test_llama.py -k "parallel"
 @pytest.mark.parametrize('world_size', [2])
 @pytest.mark.parametrize('model_name', ["13B"])
-def test_llama_parallel(model_name, world_size):
+@pytest.mark.parametrize('checkpoint_format', ["meta", "hf"])
+def test_llama_parallel(model_name, world_size, checkpoint_format):
     """Check that our implementation of LLaMa (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
     forward pass in fp16, when compared to the HF forward pass in fp32.
@@ -122,7 +136,8 @@ def test_llama_parallel(model_name, world_size):
                                           current_dir.parent.parent / 'checkpoints')) / 'llama'
 
     dtype = torch.float16
-    config = llama_config_to_gpt2_config(config_from_checkpoint(checkpoint_path, model_name))
+    config = config_from_checkpoint(checkpoint_path, model_name, checkpoint_format)
+    config = llama_config_to_gpt2_config(config)
     config.use_flash_attn = True
     config.fused_bias_fc = True
     config.fused_mlp = False  # We don't have fused GatedMLP yet
@@ -137,10 +152,9 @@ def test_llama_parallel(model_name, world_size):
     rank = parallel_state.get_tensor_model_parallel_rank()
     process_group = parallel_state.get_tensor_model_parallel_group()
 
-    ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
-    pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
-    pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
-
+    pretrained_state_dict = _pretrained_state_dict_from_checkpoint(
+        checkpoint_path, model_name, config, checkpoint_format
+    )
     model = GPTLMHeadModel(config, process_group=process_group, device=device, dtype=dtype)
     model.load_state_dict(shard_state_dict_tp(pretrained_state_dict, config, world_size, rank))
     model.eval()
@@ -196,13 +210,15 @@ def test_llama_parallel(model_name, world_size):
 
 # @pytest.mark.parametrize('model_name', ["7B", "13B"])
 @pytest.mark.parametrize('model_name', ["7B"])
-def test_llama_generation(model_name):
+@pytest.mark.parametrize('checkpoint_format', ["meta", "hf"])
+def test_llama_generation(model_name, checkpoint_format):
     checkpoint_path = Path(os.environ.get('CHECKPOINT_DIR',
                                           current_dir.parent.parent / 'checkpoints')) / 'llama'
 
     dtype = torch.float16
     device = 'cuda'
-    config = llama_config_to_gpt2_config(config_from_checkpoint(checkpoint_path, model_name))
+    config = config_from_checkpoint(checkpoint_path, model_name, checkpoint_format)
+    config = llama_config_to_gpt2_config(config)
     config.use_flash_attn = True
     config.fused_bias_fc = True
     config.fused_mlp = False  # We don't have fused GatedMLP yet
@@ -239,9 +255,10 @@ def test_llama_generation(model_name):
         logits_ref = model_ref(out_hf.sequences).logits[:, (seqlen - 1):-1].to(device=device)
     del model_ref
 
-    ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
-    pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
-    pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
+
+    pretrained_state_dict = _pretrained_state_dict_from_checkpoint(
+        checkpoint_path, model_name, config, checkpoint_format
+    )
     model = GPTLMHeadModel(config, device=device, dtype=dtype)
     model.load_state_dict(pretrained_state_dict)
     model.eval()
@@ -291,7 +308,8 @@ def test_llama_generation(model_name):
 # torchrun --no_python --nproc_per_node=2 pytest -q -s tests/models/test_llama.py -k "llama_parallel_generation"
 @pytest.mark.parametrize('world_size', [2])
 @pytest.mark.parametrize('model_name', ["13B"])
-def test_llama_parallel_generation(model_name, world_size):
+@pytest.mark.parametrize('checkpoint_format', ["meta", "hf"])
+def test_llama_parallel_generation(model_name, world_size, checkpoint_format):
     """Check that our implementation matches the HF implementation:
     the scores in fp16 should be around the same as the HF scores in fp16, when compared to
     the HF scores in fp32.
@@ -302,7 +320,8 @@ def test_llama_parallel_generation(model_name, world_size):
                                           current_dir.parent.parent / 'checkpoints')) / 'llama'
 
     dtype = torch.float16
-    config = llama_config_to_gpt2_config(config_from_checkpoint(checkpoint_path, model_name))
+    config = config_from_checkpoint(checkpoint_path, model_name, checkpoint_format)
+    config = llama_config_to_gpt2_config(config)
     config.use_flash_attn = False
     config.fused_bias_fc = True
     config.fused_mlp = False  # We don't have fused GatedMLP yet
@@ -331,10 +350,9 @@ def test_llama_parallel_generation(model_name, world_size):
     # GPU0 and GPU1 and things would hang
     torch.cuda.set_device(device)
 
-    ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
-    pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
-    pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
-
+    pretrained_state_dict = _pretrained_state_dict_from_checkpoint(
+        checkpoint_path, model_name, config, checkpoint_format
+    )
     model = GPTLMHeadModel(config, process_group=process_group, device=device, dtype=dtype)
     model.load_state_dict(shard_state_dict_tp(pretrained_state_dict, config, world_size, rank))
     model.eval()
