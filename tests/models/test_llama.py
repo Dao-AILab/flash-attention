@@ -124,7 +124,8 @@ def test_llama_optimized(model_name, checkpoint_format):
 # torchrun --no_python --nproc_per_node=2 pytest -q -s tests/models/test_llama.py -k "parallel"
 @pytest.mark.parametrize('world_size', [2])
 @pytest.mark.parametrize('model_name', ["13B"])
-def test_llama_parallel(model_name, world_size):
+@pytest.mark.parametrize('checkpoint_format', ["meta", "huggingface"])
+def test_llama_parallel(model_name, world_size, checkpoint_format):
     """Check that our implementation of LLaMa (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
     forward pass in fp16, when compared to the HF forward pass in fp32.
@@ -135,7 +136,11 @@ def test_llama_parallel(model_name, world_size):
                                           current_dir.parent.parent / 'checkpoints')) / 'llama'
 
     dtype = torch.float16
-    config = llama_config_to_gpt2_config(config_from_checkpoint(checkpoint_path, model_name))
+    if checkpoint_format == "meta":
+        config = config_from_checkpoint(checkpoint_path, model_name)
+    else:
+        config = transformers.AutoConfig.from_pretrained(Path(checkpoint_path) / f'{model_name}-hf' / "config.json")
+    config = llama_config_to_gpt2_config(config)
     config.use_flash_attn = True
     config.fused_bias_fc = True
     config.fused_mlp = False  # We don't have fused GatedMLP yet
@@ -150,9 +155,15 @@ def test_llama_parallel(model_name, world_size):
     rank = parallel_state.get_tensor_model_parallel_rank()
     process_group = parallel_state.get_tensor_model_parallel_group()
 
-    ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
-    pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
-    pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
+    if checkpoint_format == "meta":
+        ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
+        pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
+        pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
+    else:
+        pretrained_state_dict = state_dict_from_pretrained(
+            Path(checkpoint_path) / f'{model_name}-hf', device=device, dtype=dtype
+        )
+        pretrained_state_dict = remap_state_dict_hf_llama(pretrained_state_dict, config)
 
     model = GPTLMHeadModel(config, process_group=process_group, device=device, dtype=dtype)
     model.load_state_dict(shard_state_dict_tp(pretrained_state_dict, config, world_size, rank))
