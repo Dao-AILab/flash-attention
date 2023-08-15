@@ -467,9 +467,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 kNWarps * 16,
                 params.max_past
             );
+            softmax_rescale_o</*Is_first=*/false, true>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
+        } else {
+            softmax_rescale_o</*Is_first=*/false, false>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
         }
 
-        softmax_rescale_o</*Is_first=*/false>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
+
 
         Tensor rP = flash::convert_type<Element>(scores);
         // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
