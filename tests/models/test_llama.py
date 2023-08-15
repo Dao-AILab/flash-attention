@@ -29,6 +29,17 @@ from flash_attn.utils.pretrained import state_dict_from_pretrained
 from flash_attn.utils.generation import update_graph_cache
 
 
+def _pretrained_state_dict_from_checkpoint(checkpoint_path, model_name, config, checkpoint_format):
+    if checkpoint_format == "meta":
+        ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
+        pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
+        pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
+    else:
+        pretrained_state_dict = state_dict_from_pretrained(Path(checkpoint_path) / f'{model_name}-hf')
+        pretrained_state_dict = remap_state_dict_hf_llama(pretrained_state_dict, config)
+    return pretrained_state_dict
+
+
 @pytest.mark.parametrize('model_name', ["7B"])
 def test_llama_state_dict(model_name):
     checkpoint_path = Path(os.environ.get('CHECKPOINT_DIR',
@@ -63,15 +74,9 @@ def test_llama_optimized(model_name, checkpoint_format):
     config.fused_dropout_add_ln = True
     config.residual_in_fp32 = True
 
-    if checkpoint_format == "meta":
-        ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
-        pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
-        pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
-    else:
-        pretrained_state_dict = state_dict_from_pretrained(
-            Path(checkpoint_path) / f'{model_name}-hf', device=device, dtype=dtype
-        )
-        pretrained_state_dict = remap_state_dict_hf_llama(pretrained_state_dict, config)
+    pretrained_state_dict = _pretrained_state_dict_from_checkpoint(
+        checkpoint_path, model_name, config, checkpoint_format
+    )
     model = GPTLMHeadModel(config, device=device, dtype=dtype)
     model.load_state_dict(pretrained_state_dict)
     model.eval()
@@ -149,16 +154,9 @@ def test_llama_parallel(model_name, world_size, checkpoint_format):
     rank = parallel_state.get_tensor_model_parallel_rank()
     process_group = parallel_state.get_tensor_model_parallel_group()
 
-    if checkpoint_format == "meta":
-        ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
-        pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
-        pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
-    else:
-        pretrained_state_dict = state_dict_from_pretrained(
-            Path(checkpoint_path) / f'{model_name}-hf', device=device, dtype=dtype
-        )
-        pretrained_state_dict = remap_state_dict_hf_llama(pretrained_state_dict, config)
-
+    pretrained_state_dict = _pretrained_state_dict_from_checkpoint(
+        checkpoint_path, model_name, config, checkpoint_format
+    )
     model = GPTLMHeadModel(config, process_group=process_group, device=device, dtype=dtype)
     model.load_state_dict(shard_state_dict_tp(pretrained_state_dict, config, world_size, rank))
     model.eval()
@@ -259,9 +257,10 @@ def test_llama_generation(model_name, checkpoint_format):
         logits_ref = model_ref(out_hf.sequences).logits[:, (seqlen - 1):-1].to(device=device)
     del model_ref
 
-    ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
-    pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
-    pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
+
+    pretrained_state_dict = _pretrained_state_dict_from_checkpoint(
+        checkpoint_path, model_name, config, checkpoint_format
+    )
     model = GPTLMHeadModel(config, device=device, dtype=dtype)
     model.load_state_dict(pretrained_state_dict)
     model.eval()
@@ -353,10 +352,9 @@ def test_llama_parallel_generation(model_name, world_size, checkpoint_format):
     # GPU0 and GPU1 and things would hang
     torch.cuda.set_device(device)
 
-    ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
-    pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
-    pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
-
+    pretrained_state_dict = _pretrained_state_dict_from_checkpoint(
+        checkpoint_path, model_name, config, checkpoint_format
+    )
     model = GPTLMHeadModel(config, process_group=process_group, device=device, dtype=dtype)
     model.load_state_dict(shard_state_dict_tp(pretrained_state_dict, config, world_size, rank))
     model.eval()
