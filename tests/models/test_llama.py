@@ -44,7 +44,7 @@ def test_llama_state_dict(model_name):
 
 
 @pytest.mark.parametrize('model_name', ["7B", "13B"])
-@pytest.mark.parametrize('checkpoint_format', ["meta", "huggingface"])
+@pytest.mark.parametrize('checkpoint_format', ["meta", "hf"])
 def test_llama_optimized(model_name, checkpoint_format):
     """Check that our implementation of LLaMa (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
@@ -55,10 +55,7 @@ def test_llama_optimized(model_name, checkpoint_format):
 
     dtype = torch.float16
     device = 'cuda'
-    if checkpoint_format == "meta":
-        config = config_from_checkpoint(checkpoint_path, model_name)
-    else:
-        config = transformers.AutoConfig.from_pretrained(Path(checkpoint_path) / f'{model_name}-hf' / "config.json")
+    config = config_from_checkpoint(checkpoint_path, model_name, checkpoint_format)
     config = llama_config_to_gpt2_config(config)
     config.use_flash_attn = True
     config.fused_bias_fc = True
@@ -124,7 +121,7 @@ def test_llama_optimized(model_name, checkpoint_format):
 # torchrun --no_python --nproc_per_node=2 pytest -q -s tests/models/test_llama.py -k "parallel"
 @pytest.mark.parametrize('world_size', [2])
 @pytest.mark.parametrize('model_name', ["13B"])
-@pytest.mark.parametrize('checkpoint_format', ["meta", "huggingface"])
+@pytest.mark.parametrize('checkpoint_format', ["meta", "hf"])
 def test_llama_parallel(model_name, world_size, checkpoint_format):
     """Check that our implementation of LLaMa (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
@@ -136,10 +133,7 @@ def test_llama_parallel(model_name, world_size, checkpoint_format):
                                           current_dir.parent.parent / 'checkpoints')) / 'llama'
 
     dtype = torch.float16
-    if checkpoint_format == "meta":
-        config = config_from_checkpoint(checkpoint_path, model_name)
-    else:
-        config = transformers.AutoConfig.from_pretrained(Path(checkpoint_path) / f'{model_name}-hf' / "config.json")
+    config = config_from_checkpoint(checkpoint_path, model_name, checkpoint_format)
     config = llama_config_to_gpt2_config(config)
     config.use_flash_attn = True
     config.fused_bias_fc = True
@@ -220,13 +214,15 @@ def test_llama_parallel(model_name, world_size, checkpoint_format):
 
 # @pytest.mark.parametrize('model_name', ["7B", "13B"])
 @pytest.mark.parametrize('model_name', ["7B"])
-def test_llama_generation(model_name):
+@pytest.mark.parametrize('checkpoint_format', ["meta", "hf"])
+def test_llama_generation(model_name, checkpoint_format):
     checkpoint_path = Path(os.environ.get('CHECKPOINT_DIR',
                                           current_dir.parent.parent / 'checkpoints')) / 'llama'
 
     dtype = torch.float16
     device = 'cuda'
-    config = llama_config_to_gpt2_config(config_from_checkpoint(checkpoint_path, model_name))
+    config = config_from_checkpoint(checkpoint_path, model_name, checkpoint_format)
+    config = llama_config_to_gpt2_config(config)
     config.use_flash_attn = True
     config.fused_bias_fc = True
     config.fused_mlp = False  # We don't have fused GatedMLP yet
@@ -315,7 +311,8 @@ def test_llama_generation(model_name):
 # torchrun --no_python --nproc_per_node=2 pytest -q -s tests/models/test_llama.py -k "llama_parallel_generation"
 @pytest.mark.parametrize('world_size', [2])
 @pytest.mark.parametrize('model_name', ["13B"])
-def test_llama_parallel_generation(model_name, world_size):
+@pytest.mark.parametrize('checkpoint_format', ["meta", "hf"])
+def test_llama_parallel_generation(model_name, world_size, checkpoint_format):
     """Check that our implementation matches the HF implementation:
     the scores in fp16 should be around the same as the HF scores in fp16, when compared to
     the HF scores in fp32.
@@ -326,7 +323,8 @@ def test_llama_parallel_generation(model_name, world_size):
                                           current_dir.parent.parent / 'checkpoints')) / 'llama'
 
     dtype = torch.float16
-    config = llama_config_to_gpt2_config(config_from_checkpoint(checkpoint_path, model_name))
+    config = config_from_checkpoint(checkpoint_path, model_name, checkpoint_format)
+    config = llama_config_to_gpt2_config(config)
     config.use_flash_attn = False
     config.fused_bias_fc = True
     config.fused_mlp = False  # We don't have fused GatedMLP yet

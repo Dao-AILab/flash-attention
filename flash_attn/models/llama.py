@@ -156,7 +156,7 @@ def remap_state_dict_hf_llama(state_dict, config):
     return state_dict
 
 
-def config_from_checkpoint(checkpoint_path: Union[str, os.PathLike], model_name: str) -> LlamaConfig:
+def config_from_meta_checkpoint(checkpoint_path: Union[str, os.PathLike], model_name: str) -> LlamaConfig:
     """Load a LlamaConfig from a checkpoint path."""
     with open(Path(checkpoint_path) / model_name / 'params.json') as f:
         params = json.load(f)
@@ -165,6 +165,19 @@ def config_from_checkpoint(checkpoint_path: Union[str, os.PathLike], model_name:
                          num_hidden_layers=params['n_layers'],
                          rms_norm_eps=params['norm_eps'])
     return config
+
+
+def config_from_hf_checkpoint(checkpoint_path: Union[str, os.PathLike], model_name: str) -> LlamaConfig:
+    return LlamaConfig.from_pretrained(Path(checkpoint_path) / f'{model_name}-hf' / "config.json")
+
+
+def config_from_checkpoint(
+    checkpoint_path: Union[str, os.PathLike], model_name: str, checkpoint_format="meta"
+) -> LlamaConfig:
+    if checkpoint_format == "meta":
+        return config_from_meta_checkpoint(checkpoint_path, model_name)
+    else:
+        return config_from_hf_checkpoint(checkpoint_path, model_name)
 
 
 def state_dicts_from_checkpoint(checkpoint_path: Union[str, os.PathLike], model_name: str) -> list[dict]:
