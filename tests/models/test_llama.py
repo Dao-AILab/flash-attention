@@ -44,8 +44,8 @@ def test_llama_state_dict(model_name):
 
 
 @pytest.mark.parametrize('model_name', ["7B", "13B"])
-@pytest.mark.parametrize('checkpoint_format', ["meta"])  # Add 'huggingface' to test with huggingface checkpoint.
-def test_llama_optimized(model_name, checkpoint_format="meta"):
+@pytest.mark.parametrize('checkpoint_format', ["meta", "huggingface"])
+def test_llama_optimized(model_name, checkpoint_format):
     """Check that our implementation of LLaMa (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
     forward pass in fp16, when compared to the HF forward pass in fp32.
@@ -58,7 +58,7 @@ def test_llama_optimized(model_name, checkpoint_format="meta"):
     if checkpoint_format == "meta":
         config = config_from_checkpoint(checkpoint_path, model_name)
     else:
-        config = transformers.AutoConfig.from_pretrained(Path(checkpoint_path) / model_name / "config.json")
+        config = transformers.AutoConfig.from_pretrained(Path(checkpoint_path) / f'{model_name}-hf' / "config.json")
     config = llama_config_to_gpt2_config(config)
     config.use_flash_attn = True
     config.fused_bias_fc = True
@@ -72,7 +72,7 @@ def test_llama_optimized(model_name, checkpoint_format="meta"):
         pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
     else:
         pretrained_state_dict = state_dict_from_pretrained(
-            Path(checkpoint_path) / model_name, device=device, dtype=dtype
+            Path(checkpoint_path) / f'{model_name}-hf', device=device, dtype=dtype
         )
         pretrained_state_dict = remap_state_dict_hf_llama(pretrained_state_dict, config)
     model = GPTLMHeadModel(config, device=device, dtype=dtype)
