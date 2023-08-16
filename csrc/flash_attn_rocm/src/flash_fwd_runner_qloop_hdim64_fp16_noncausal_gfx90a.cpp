@@ -43,7 +43,7 @@ void FlashFwdRunner::Run<true, 64, device_gemm_trait::Float16, false, false>() {
     this->template run_<DeviceGemmQLoopHeadDim64,
                   device_gemm_trait::Float16, 
                   device_gemm_trait::kGemmSpecDefault,
-                  device_gemm_trait::kMaskingSpecCausal,
+                  device_gemm_trait::kMaskingSpecDefault,
                   kIsDeterministic>();
   });
 } // FlashFwdRunner::Run()
