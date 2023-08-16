@@ -43,7 +43,7 @@ jobs:
           # Using ubuntu-20.04 instead of 22.04 for more compatibility (glibc). Ideally we'd use the
           # manylinux docker image, but I haven't figured out how to install CUDA on manylinux.
           os: [ubuntu-20.04]
-          python-version: ['3.7', '3.8', '3.9', '3.10']
+          python-version: ['3.7', '3.8', '3.9', '3.10', '3.11']
           torch-version: ['1.12.1', '1.13.1', '2.0.1', '2.1.0.dev20230731']
           cuda-version: ['11.6.2', '11.7.1', '11.8.0', '12.1.0']
           # We need separate wheels that either uses C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI) or not.
@@ -52,6 +52,9 @@ jobs:
           # when building without C++11 ABI and using it on nvcr images.
           cxx11_abi: ['FALSE', 'TRUE']
           exclude:
+            # Pytorch <= 1.12 does not support Python 3.11
+            - torch-version: '1.12'
+              python-version: '3.11'
             # Pytorch >= 2.0 only supports Python >= 3.8
             - torch-version: '2.0.1'
               python-version: '3.7'

@@ -924,3 +924,36 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
     assert (q.grad - q_ref.grad).abs().max().item() <= 2 * (q_pt.grad - q_ref.grad).abs().max().item()
     assert (k.grad - k_ref.grad).abs().max().item() <= 2 * (k_pt.grad - k_ref.grad).abs().max().item()
     assert (v.grad - v_ref.grad).abs().max().item() <= 2 * (v_pt.grad - v_ref.grad).abs().max().item()
+
+
+@pytest.mark.parametrize('dtype', [torch.float16])
+@pytest.mark.parametrize('causal', [False, True])
+# @pytest.mark.parametrize('causal', [False])
+@pytest.mark.parametrize('d', [16, 32, 64])
+# @pytest.mark.parametrize('d', [16])
+def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
+    """ We previously had a bug where not masking elements beyond seqlen_k caused NaN in dQ,
+    in the case where seqlen % 128 != 0 or varlen.
+    """
+    device = 'cuda'
+    # set seed
+    torch.random.manual_seed(0)
+    nheads = 5
+    q_cuseqlen = torch.tensor([0, 76, 110, 256], device=device, dtype=torch.int32)
+    k_cuseqlen = torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int32)
+    Mq = 256
+    Mk = 3
+
+    q = torch.randn([Mq, nheads, d], dtype=dtype, device=device) * 3
+    k, v = [torch.randn([Mk, nheads, d], dtype=dtype, device=device) * 3 for _ in range(2)]
+    q.requires_grad_(True)
+    k.requires_grad_(True)
+    v.requires_grad_(True)
+
+    out = flash_attn_varlen_func(q, k, v, q_cuseqlen, k_cuseqlen, Mq, Mk, causal=causal)
+    g = torch.randn_like(out)
+    out.backward(g)
+
+    assert not q.grad.isnan().any()
+    assert not k.grad.isnan().any()
+    assert not v.grad.isnan().any()
