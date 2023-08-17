@@ -777,6 +777,7 @@ class ParallelMHA(nn.Module):
             process_group,
             bias=out_proj_bias,
             sequence_parallel=sequence_parallel,
+            multiple_of=self.head_dim,
             **factory_kwargs,
         )
 
