@@ -40,7 +40,7 @@ class FlashFwdRunner {
       is_performance_mode_(launch_params.params.is_performance_mode) {}
  
   template <bool kIsQLoop, int kHeadDim, typename T, bool kIsCausal, bool kIsPadding>
-  void Run();
+  void Run(bool is_dropout);
  
  private:
   template <template <typename> typename DeviceGemmTemplate,
