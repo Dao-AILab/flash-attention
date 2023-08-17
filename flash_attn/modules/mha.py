@@ -733,29 +733,21 @@ class ParallelMHA(nn.Module):
         ), "num_heads must be divisible by num_heads_kv"
 
         if num_heads_each_rank is None:
-            assert (
-                self.num_heads % self.world_size == 0
-            ), "num_heads must be divisible by world_size"
+            assert self.num_heads % self.world_size == 0, "num_heads must be divisible by world_size"
             self.num_heads_per_rank = num_heads // self.world_size
         else:
-            assert (
-                len(num_heads_each_rank) == self.world_size
-            ), "num_heads_each_rank should be a sequence of numbers of length world_size"
-            assert (
-                sum(num_heads_each_rank) == self.num_heads
-            ), "sum of num_heads_each_rank should be equal to num_heads"
+            assert len(num_heads_each_rank) == self.world_size, "num_heads_each_rank should be a of length world_size"
+            assert sum(num_heads_each_rank) == self.num_heads, "sum of num_heads_each_rank should be equal to num_heads"
             rank = torch.distributed.get_rank(process_group)
             self.num_heads_per_rank = num_heads_each_rank[rank]
 
         if num_heads_kv_each_rank is None:
-            assert (
-                self.num_heads_kv % self.world_size == 0
-            ), "num_heads_kv must be divisible by world_size"
+            assert self.num_heads_kv % self.world_size == 0, "num_heads_kv must be divisible by world_size"
             self.num_heads_kv_per_rank = self.num_heads_kv // self.world_size
         else:
             assert (
                 len(num_heads_kv_each_rank) == self.world_size
-            ), "num_heads_kv_each_rank should be a sequence of numbers of length world_size"
+            ), "num_heads_kv_each_rank should be of length world_size"
             assert (
                 sum(num_heads_kv_each_rank) == self.num_heads_kv
             ), "sum of num_heads_kv_each_rank should be equal to num_heads_kv"
