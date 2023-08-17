@@ -94,6 +94,8 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
         {
             "process_group": process_group,
             "sequence_parallel": getattr(config, "sequence_parallel", True),
+            "num_heads_each_rank": getattr(config, "num_heads_each_rank", None),
+            "num_heads_kv_each_rank": getattr(config, "num_heads_kv_each_rank", None),
         }
         if process_group is not None
         else {}
