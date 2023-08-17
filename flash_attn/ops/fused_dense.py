@@ -226,7 +226,7 @@ class RowParallelLinear(nn.Linear):
         local_multiple = div + int(torch.distributed.get_rank(process_group) < mod)
         # Only rank 0 will have bias
         super().__init__(
-            in_features // world_size,
+            local_multiple * multiple_of,
             out_features,
             bias=bias and rank == 0,
             device=device,
