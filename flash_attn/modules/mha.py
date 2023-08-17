@@ -2,7 +2,6 @@
 
 import math
 from functools import partial
-from typing import Sequence, Optional
 
 import torch
 import torch.nn as nn
@@ -721,6 +720,7 @@ class ParallelMHA(nn.Module):
         self.checkpointing = checkpointing
         self.process_group = process_group
         self.world_size = process_group.size()
+        self.local_rank = torch.distributed.get_rank(process_group)
 
         self.num_heads = num_heads
         assert self.embed_dim % self.num_heads == 0, "embed_dim must be divisible by num_heads"
@@ -734,7 +734,8 @@ class ParallelMHA(nn.Module):
             """Get the size for the current process based on a (potentially uneven) split across all ranks."""
             div = size // self.world_size
             mod = size % self.world_size
-            return div + int(torch.distributed.get_rank(process_group) < mod)
+            local_size = div + int(self.local_rank < mod)
+            return local_size
 
         self.num_heads_per_rank = _get_local_size(self.num_heads)
         self.num_heads_kv_per_rank = _get_local_size(self.num_heads_kv)
