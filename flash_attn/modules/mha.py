@@ -2,10 +2,10 @@
 
 import math
 from functools import partial
+from typing import Sequence, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange, repeat
 
 try:
@@ -695,6 +695,8 @@ class ParallelMHA(nn.Module):
         num_heads,
         process_group,
         num_heads_kv=None,
+        num_heads_each_rank: Optional[Sequence[int]] = None,
+        num_heads_kv_each_rank: Optional[Sequence[int]] = None,
         qkv_proj_bias=True,
         out_proj_bias=True,
         dropout=0.0,
@@ -723,19 +725,45 @@ class ParallelMHA(nn.Module):
         self.world_size = process_group.size() if process_group is not None else 1
 
         self.num_heads = num_heads
+        assert self.embed_dim % self.num_heads == 0, "embed_dim must be divisible by num_heads"
+
         self.num_heads_kv = num_heads_kv if num_heads_kv is not None else num_heads
-        self.num_heads_per_rank = num_heads // self.world_size
-        self.num_heads_kv_per_rank = self.num_heads_kv // self.world_size
         assert (
             self.num_heads % self.num_heads_kv == 0
         ), "num_heads must be divisible by num_heads_kv"
-        assert self.embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
-        assert (
-            self.num_heads_kv % self.world_size == 0
-        ), "num_heads_kv must be divisible by world_size"
+
+        if num_heads_each_rank is None:
+            assert (
+                self.num_heads % self.world_size == 0
+            ), "num_heads must be divisible by world_size"
+            self.num_heads_per_rank = num_heads // self.world_size
+        else:
+            assert (
+                len(num_heads_each_rank) == self.world_size
+            ), "num_heads_each_rank should be a sequence of numbers of length world_size"
+            assert (
+                sum(num_heads_each_rank) == self.num_heads
+            ), "sum of num_heads_each_rank should be equal to num_heads"
+            rank = torch.distributed.get_rank(process_group)
+            self.num_heads_per_rank = num_heads_each_rank[rank]
+
+        if num_heads_kv_each_rank is None:
+            assert (
+                self.num_heads_kv % self.world_size == 0
+            ), "num_heads_kv must be divisible by world_size"
+            self.num_heads_kv_per_rank = self.num_heads_kv // self.world_size
+        else:
+            assert (
+                len(num_heads_kv_each_rank) == self.world_size
+            ), "num_heads_kv_each_rank should be a sequence of numbers of length world_size"
+            assert (
+                sum(num_heads_kv_each_rank) == self.num_heads_kv
+            ), "sum of num_heads_kv_each_rank should be equal to num_heads_kv"
+            rank = torch.distributed.get_rank(process_group)
+            self.num_heads_kv_per_rank = num_heads_kv_each_rank[rank]
+
         self.head_dim = self.embed_dim // num_heads
         qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
-        kv_dim = 2 * self.head_dim * self.num_heads_kv
 
         if self.rotary_emb_dim > 0:
             assert RotaryEmbedding is not None, "rotary_emb is not installed"
