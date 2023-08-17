@@ -730,15 +730,15 @@ class ParallelMHA(nn.Module):
             self.num_heads % self.num_heads_kv == 0
         ), "num_heads must be divisible by num_heads_kv"
 
-        def _get_local_size(size: int) -> int:
+        def _get_local_size(size: int, local_rank: int) -> int:
             """Get the size for the current process based on a (potentially uneven) split across all ranks."""
             div = size // self.world_size
             mod = size % self.world_size
-            local_size = div + int(self.local_rank < mod)
+            local_size = div + int(local_rank < mod)
             return local_size
 
-        self.num_heads_per_rank = _get_local_size(self.num_heads)
-        self.num_heads_kv_per_rank = _get_local_size(self.num_heads_kv)
+        self.num_heads_per_rank = _get_local_size(self.num_heads, self.local_rank)
+        self.num_heads_kv_per_rank = _get_local_size(self.num_heads_kv, self.local_rank)
         self.head_dim = self.embed_dim // num_heads
         qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
 
