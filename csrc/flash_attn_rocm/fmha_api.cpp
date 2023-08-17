@@ -23,7 +23,7 @@ void run_flash_fwd(LaunchParams<FlashFwdParams> &launch_params) {
         BOOL_SWITCH(launch_params.params.is_using_qloop, kIsQLoop, [&] {
           BOOL_SWITCH(launch_params.params.is_mnko_padding, kIsPadding, [&] {
               auto flash_fwd_runner_ptr = std::make_unique<fwd_device_gemm::FlashFwdRunner>(launch_params);
-              flash_fwd_runner_ptr->Run<kIsQLoop, kHeadDim, T, kIsCausal, kIsPadding>();
+              flash_fwd_runner_ptr->Run<kIsQLoop, kHeadDim, T, kIsCausal, kIsPadding>(launch_params.is_dropout_);
           });
         });
       });
@@ -124,7 +124,12 @@ void set_params_fprop(FlashFwdParams &params,
             params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
         }
         else if(!params.is_mnko_padding && d <= 64){
-            params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+            if(p_dropout > 0.0){
+                params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+            }
+            else{
+                params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 256)==0 ? false : true);
+            }
         }
         else if(!params.is_mnko_padding && d <= 128){
             params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);

@@ -26,7 +26,7 @@
 namespace fwd_device_gemm {
 // hdim 64, fp16, non-causal
 template <>
-void FlashFwdRunner::Run<false, 64, device_gemm_trait::Float16, false, true>() {
+void FlashFwdRunner::Run<false, 64, device_gemm_trait::Float16, false, true>(bool is_dropout) {
   BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
     this->template run_<DeviceGemmKLoopHeadDim64,
                   device_gemm_trait::Float16, 
@@ -38,7 +38,7 @@ void FlashFwdRunner::Run<false, 64, device_gemm_trait::Float16, false, true>() {
 
 // hdim 64, fp16, non-causal
 template <>
-void FlashFwdRunner::Run<false, 64, device_gemm_trait::Float16, false, false>() {
+void FlashFwdRunner::Run<false, 64, device_gemm_trait::Float16, false, false>(bool is_dropout) {
   BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
     this->template run_<DeviceGemmKLoopHeadDim64,
                   device_gemm_trait::Float16, 
