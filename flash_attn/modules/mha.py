@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 from einops import rearrange, repeat
 
+from flash_attn.utils.distributed import get_dim_for_local_rank
+
 try:
     from flash_attn import (
         flash_attn_kvpacked_func,
@@ -730,15 +732,8 @@ class ParallelMHA(nn.Module):
             self.num_heads % self.num_heads_kv == 0
         ), "num_heads must be divisible by num_heads_kv"
 
-        def _get_local_size(size: int, local_rank: int) -> int:
-            """Get the size for the current process based on a (potentially uneven) split across all ranks."""
-            div = size // self.world_size
-            mod = size % self.world_size
-            local_size = div + int(local_rank < mod)
-            return local_size
-
-        self.num_heads_per_rank = _get_local_size(self.num_heads, self.local_rank)
-        self.num_heads_kv_per_rank = _get_local_size(self.num_heads_kv, self.local_rank)
+        self.num_heads_per_rank = get_dim_for_local_rank(self.num_heads, self.world_size, self.local_rank)
+        self.num_heads_kv_per_rank = get_dim_for_local_rank(self.num_heads, self.world_size, self.local_rank)
         self.head_dim = self.embed_dim // num_heads
         qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
 
