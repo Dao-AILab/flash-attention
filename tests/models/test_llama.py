@@ -255,7 +255,6 @@ def test_llama_generation(model_name, checkpoint_format):
         logits_ref = model_ref(out_hf.sequences).logits[:, (seqlen - 1):-1].to(device=device)
     del model_ref
 
-
     pretrained_state_dict = _pretrained_state_dict_from_checkpoint(
         checkpoint_path, model_name, config, checkpoint_format
     )
@@ -297,8 +296,8 @@ def test_llama_generation(model_name, checkpoint_format):
     hf_error = (logits_hf - logits_ref).abs().max().item()
 
     print(f'HF fp16 logits max diff: {hf_error}')
-    print(f'Logits max diff: {(logits - logits_ref).abs().max().item() }')
-    print(f'Logits CG max diff: {(logits_cg - logits_ref).abs().max().item() }')
+    print(f'Logits max diff: {(logits - logits_ref).abs().max().item()}')
+    print(f'Logits CG max diff: {(logits_cg - logits_ref).abs().max().item()}')
 
     assert (logits_parallel - logits_ref).abs().max().item() < 2 * hf_error
     assert (logits - logits_ref).abs().max().item() < 2 * hf_error
@@ -410,9 +409,9 @@ def test_llama_parallel_generation(model_name, world_size, checkpoint_format):
 
         hf_error = (logits_hf - logits_ref).abs().max().item()
         print(f'HF fp16 logits max diff: {hf_error}')
-        print(f'Logits max diff: {(logits - logits_ref).abs().max().item() }')
+        print(f'Logits max diff: {(logits - logits_ref).abs().max().item()}')
         assert (logits - logits_ref).abs().max().item() < 2 * hf_error
-        print(f'Logits CG max diff: {(logits_cg - logits_ref).abs().max().item() }')
+        print(f'Logits CG max diff: {(logits_cg - logits_ref).abs().max().item()}')
         assert torch.equal(logits_cg, logits)
 
 
@@ -505,3 +504,6 @@ def test_llama_parallel_uneven_num_heads(world_size):
         print(f'HF fp16 max diff: {(logits_hf - logits_ref).abs().max().item()}')
         print(f'HF fp16 mean diff: {(logits_hf - logits_ref).abs().mean().item()}')
         assert (logits - logits_ref).abs().max().item() < 2 * (logits_hf - logits_ref).abs().max().item()
+
+        import shutil
+        shutil.rmtree(checkpoint_path / f'{model_name}-hf')
