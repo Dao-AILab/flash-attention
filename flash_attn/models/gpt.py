@@ -695,11 +695,11 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
     def shard_last_dim(state_dict, key, multiple_of=1):
         if key in state_dict:
             x = state_dict[key]
-            size_each_rank = [
-                get_dim_for_local_rank(x.size(-1), this_rank, multiple_of)
-                for this_rank in range(world_size)
+            dim_each_rank = [
+                get_dim_for_local_rank(x.size(-1), world_size, local_rank, multiple_of)
+                for local_rank in range(world_size)
             ]
-            beg, end = tuple(sum(size_each_rank[:pos]) for pos in (rank, rank + 1))
+            beg, end = tuple(sum(dim_each_rank[:pos]) for pos in (rank, rank + 1))
             state_dict[key] = x[..., beg:end]
 
     def shard_gatedmlp_fc1_dim(state_dict, key):
@@ -720,15 +720,17 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
                 get_dim_for_local_rank(n_head_kv, world_size, local_rank) for local_rank in range(world_size)
             ]
 
-            beg = sum(n_head_each_rank[:rank]) * head_dim
-            end = sum(n_head_each_rank[: rank + 1]) * head_dim
+            beg_n_head = sum(n_head_each_rank[:rank])
+            end_n_head = sum(n_head_each_rank[: rank + 1])
 
-            beg_kv = sum(n_head_kv_each_rank[:rank]) * head_dim
-            end_kv = sum(n_head_kv_each_rank[: rank + 1]) * head_dim
+            beg_n_head_kv = sum(n_head_kv_each_rank[:rank])
+            end_n_head_kv = sum(n_head_kv_each_rank[: rank + 1])
 
             if n_head_kv == n_head:
                 x = rearrange(state_dict[key], "(three d) ... -> three d ...", three=3)
-                state_dict[key] = rearrange(x[:, beg:end], "three d ... -> (three d) ...")
+                state_dict[key] = rearrange(
+                    x[:, beg_n_head * head_dim : end_n_head * head_dim], "three d ... -> (three d) ..."
+                )
             else:
                 x = rearrange(
                     state_dict[key],
@@ -738,9 +740,9 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
                 state_dict[key] = rearrange(
                     torch.cat(
                         [
-                            x[beg:end],
-                            x[n_head + beg_kv: n_head + end_kv],
-                            x[n_head + n_head_kv + beg_kv: n_head + n_head_kv + end_kv],
+                            x[beg_n_head:end_n_head],
+                            x[n_head + beg_n_head_kv: n_head + end_n_head_kv],
+                            x[n_head + n_head_kv + beg_n_head_kv: n_head + n_head_kv + end_n_head_kv],
                         ],
                         dim=0,
                     ),
