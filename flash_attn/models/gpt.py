@@ -717,8 +717,10 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
             embed_dim = config.hidden_size
             head_dim = embed_dim // n_head
 
-            n_head_each_rank = [_get_local_size(n_head, this_rank) for this_rank in range(world_size)]
-            n_head_kv_each_rank = [_get_local_size(n_head_kv, this_rank) for this_rank in range(world_size)]
+            n_head_each_rank, n_head_kv_each_rank = tuple(
+                tuple(_get_local_size(size, this_rank) for this_rank in range(world_size))
+                for size in (n_head, n_head_kv)
+            )
 
             beg, end = tuple(sum(n_head_each_rank[:pos]) * head_dim for pos in (rank, rank + 1))
             beg_kv, end_kv = tuple(sum(n_head_kv_each_rank[:pos]) * head_dim for pos in (rank, rank + 1))
