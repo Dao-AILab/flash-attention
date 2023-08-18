@@ -785,8 +785,10 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
 
 
 def combine_state_dicts_tp(state_dicts, config):
-    """Convert the state_dict of a standard GPT model to the state_dict of a GPT model
-    with tensor parallel.
+    """Convert the state_dict of a GPT model with tensor parallel to the state_dict of a
+    standard GPT model.
+
+    This function is meant to be the "reverse" of shard_state_dict_tp.
     """
     world_size = len(state_dicts)
     keys = state_dicts[0].keys()
