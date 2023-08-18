@@ -62,7 +62,6 @@ try:
 except ImportError:
     FusedDenseSqreluDense = None
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -681,12 +680,19 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
     inner_dim = config.n_inner if config.n_inner is not None else 4 * config.hidden_size
     assert inner_dim % world_size == 0
 
-    def _get_local_size(size: int, local_rank: int) -> int:
+    n_head = config.n_head
+    n_head_kv = getattr(config, "n_head_kv", n_head)
+
+    embed_dim = config.hidden_size
+    head_dim = embed_dim // n_head
+
+    def _get_local_size(size: int, local_rank: int, multiple_of=1) -> int:
         """Get the size for the current process based on a (potentially uneven) split across all ranks."""
-        div = size // world_size
-        mod = size % world_size
-        local_size = div + int(local_rank < mod)
-        return local_size
+        multiple = size // multiple_of
+        div = multiple // world_size
+        mod = multiple % world_size
+        local_multiple = div + int(local_rank < mod)
+        return local_multiple * multiple_of
 
     def shard_first_dim(state_dict, key):
         if key in state_dict:
@@ -694,11 +700,15 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
             dim = x.shape[0] // world_size
             state_dict[key] = x[rank * dim : (rank + 1) * dim]
 
-    def shard_last_dim(state_dict, key):
+    def shard_last_dim(state_dict, key, multiple_of=1):
         if key in state_dict:
             x = state_dict[key]
-            dim = x.shape[-1] // world_size
-            state_dict[key] = x[..., rank * dim : (rank + 1) * dim]
+            size_each_rank = [
+                _get_local_size(x.size(-1), this_rank, multiple_of)
+                for this_rank in range(world_size)
+            ]
+            beg, end = tuple(sum(size_each_rank[:pos] for pos in (rank, rank + 1)))
+            state_dict[key] = x[..., beg:end]
 
     def shard_gatedmlp_fc1_dim(state_dict, key):
         if key in state_dict:
@@ -711,23 +721,19 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
 
     def shard_qkv_headdim(state_dict, key):
         if key in state_dict:
-            n_head = config.n_head
-            n_head_kv = getattr(config, "n_head_kv", n_head)
-
-            embed_dim = config.hidden_size
-            head_dim = embed_dim // n_head
-
             n_head_each_rank, n_head_kv_each_rank = tuple(
                 tuple(_get_local_size(size, this_rank) for this_rank in range(world_size))
                 for size in (n_head, n_head_kv)
             )
 
             beg, end = tuple(sum(n_head_each_rank[:pos]) * head_dim for pos in (rank, rank + 1))
-            beg_kv, end_kv = tuple(sum(n_head_kv_each_rank[:pos]) * head_dim for pos in (rank, rank + 1))
+            beg_kv, end_kv = tuple(
+                sum(n_head_kv_each_rank[:pos]) * head_dim for pos in (rank, rank + 1)
+            )
 
             if n_head_kv == n_head:
                 x = rearrange(state_dict[key], "(three d) ... -> three d ...", three=3)
-                state_dict[key] = rearrange(x[:, beg : end], "three d ... -> (three d) ...")
+                state_dict[key] = rearrange(x[:, beg:end], "three d ... -> (three d) ...")
             else:
                 x = rearrange(
                     state_dict[key],
@@ -737,7 +743,7 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
                 state_dict[key] = rearrange(
                     torch.cat(
                         [
-                            x[beg: end],
+                            x[beg:end],
                             x[n_head + beg_kv : n_head + end_kv],
                             x[n_head + n_head_kv + beg_kv : n_head + n_head_kv + end_kv],
                         ],
@@ -752,12 +758,11 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
     if "transformer.embeddings.position_embeddings.weight" in state_dict:
         shard_last_dim(state_dict, "transformer.embeddings.position_embeddings.weight")
     for i in range(config.num_hidden_layers):
-        # TODO: FIX!!!
         shard_qkv_headdim(state_dict, f"transformer.layers.{i}.mixer.Wqkv.weight")
-        # TODO: FIX!!!
         shard_qkv_headdim(state_dict, f"transformer.layers.{i}.mixer.Wqkv.bias")
-        # TODO: FIX!!!
-        shard_last_dim(state_dict, f"transformer.layers.{i}.mixer.out_proj.weight")
+        shard_last_dim(
+            state_dict, f"transformer.layers.{i}.mixer.out_proj.weight", multiple_of=head_dim
+        )
         if rank != 0:
             state_dict.pop(f"transformer.layers.{i}.mixer.out_proj.bias", None)
         if config.activation_function in ["glu", "swiglu", "geglu"]:
@@ -928,6 +933,7 @@ def remap_state_dict_megatron(state_dict, config):
         return key
 
     state_dict = OrderedDict((key_mapping_transformer(k), v) for k, v in state_dict.items())
+
     # Word embedding and position embedding
     def key_mapping_pos_emb(key):
         return re.sub(r"^wpe.", "transformer.embeddings.position_embeddings.", key)
