@@ -185,8 +185,91 @@ def remap_state_dict_hf_llama(state_dict, config):
 
 
 def inv_remap_state_dict_hf_llama(state_dict, config):
-    """Convert the state_dict in standard GPT format to Hugging Face format."""
-    pass
+    """Convert the state_dict in standard GPT format to Hugging Face format.
+
+    This function is meant to be the inverse of remap_state_dict_hf_llama, up to a
+    multiplier pad in the embedding and lm_head. That is if the original embedding
+    isn't a multiple of pad_vocab_size_multiple, then
+    inv_remap_state_dict_hf_llama(remap_state_dict_hf_llama(state_dict)) != state_dict.
+    """
+
+    # Embedding
+    def key_mapping_emb(key):
+        return re.sub(r"^transformer.embeddings.word_embeddings.", "model.embed_tokens.", key)
+
+    state_dict = OrderedDict((key_mapping_emb(k), v) for k, v in state_dict.items())
+    word_embeddings = state_dict.pop("model.embed_tokens.weight")
+    pad_vocab_size_multiple = getattr(config, "pad_vocab_size_multiple", 1)
+    vocab_size = (
+        math.ceil(word_embeddings.shape[0] / pad_vocab_size_multiple) * pad_vocab_size_multiple
+    )
+    state_dict["model.embed_tokens.weight"] = F.pad(
+        word_embeddings, (0, 0, 0, vocab_size - word_embeddings.shape[0])
+    )
+
+    # LM head
+    if getattr(config, "tie_word_embeddings"):
+        state_dict["lm_head.weight"] = state_dict["model.embed_tokens.weight"]
+    else:
+        output_embeddings = state_dict.pop("lm_head.weight")
+        # Need to recompute vocab_size since LLaMa shards the word embeddings and output embeddings
+        # differently.
+        vocab_size = (
+            math.ceil(output_embeddings.shape[0] / pad_vocab_size_multiple)
+            * pad_vocab_size_multiple
+        )
+        # It's possible that vocab_size is padded to be a multiple of 8, for example.
+        state_dict["lm_head.weight"] = F.pad(
+            output_embeddings, (0, 0, 0, vocab_size - output_embeddings.shape[0])
+        )
+
+    # MLP
+    for l in range(config.n_layer):
+        w3, w1 = torch.chunk(
+            state_dict.pop(f"transformer.layers.{l}.mlp.fc1.weight"), chunks=2, dim=0
+        )
+        state_dict[f"model.layers.{l}.mlp.gate_proj.weight"] = w1
+        state_dict[f"model.layers.{l}.mlp.up_proj.weight"] = w3
+
+    def key_mapping_mlp(key):
+        return re.sub(r"^transformer.layers.(\d+).mlp.fc2.", r"model.layers.\1.mlp.down_proj.", key)
+
+    state_dict = OrderedDict((key_mapping_mlp(k), v) for k, v in state_dict.items())
+
+    # LayerNorm
+    def key_mapping_ln(key):
+        key = re.sub(r"^transformer.ln_f.", r"model.norm.", key)
+        key = re.sub(r"^transformer.layers.(\d+).norm1.", r"model.layers.\1.input_layernorm.", key)
+        key = re.sub(
+            r"^transformer.layers.(\d+).norm2.", r"model.layers.\1.post_attention_layernorm.", key
+        )
+        return key
+
+    state_dict = OrderedDict((key_mapping_ln(k), v) for k, v in state_dict.items())
+
+    def permute(w):
+        return (
+            w.view(config.n_head, config.n_embd // config.n_head // 2, 2, config.n_embd)
+            .transpose(1, 2)
+            .reshape(config.n_embd, config.n_embd)
+        )
+
+    # Attention
+    for l in range(config.n_layer):
+        # TODO: This doesn't work for GQA or MQA.
+        Wqkv = state_dict.pop(f"transformer.layers.{l}.mixer.Wqkv.weight")
+        Wq, Wk, Wv = torch.chunk(Wqkv, chunks=3, dim=0)
+        state_dict[f"model.layers.{l}.self_attn.q_proj.weight"] = permute(Wq)
+        state_dict[f"model.layers.{l}.self_attn.k_proj.weight"] = permute(Wk)
+        state_dict[f"model.layers.{l}.self_attn.v_proj.weight"] = Wv
+
+    def key_mapping_attn(key):
+        return re.sub(
+            r"^transformer.layers.(\d+).mixer.out_proj.", r"model.layers.\1.self_attn.o_proj.", key
+        )
+
+    state_dict = OrderedDict((key_mapping_attn(k), v) for k, v in state_dict.items())
+    return state_dict
 
 
 def config_from_meta_checkpoint(
