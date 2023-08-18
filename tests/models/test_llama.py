@@ -416,6 +416,7 @@ def test_llama_parallel_generation(model_name, world_size, checkpoint_format):
         assert torch.equal(logits_cg, logits)
 
 
+@torch.no_grad()
 @pytest.mark.parametrize('world_size', [2])
 def test_llama_parallel_uneven_num_heads(world_size):
     from apex.transformer import parallel_state
@@ -438,6 +439,7 @@ def test_llama_parallel_uneven_num_heads(world_size):
         intermediate_size=256 * num_attention_heads * 4,
         num_hidden_layers=4,
         num_attention_heads=num_attention_heads,
+        initializer_range=0.5,  # Set crazy init range so we don't have near zero weights implying a vacuous test.
     )
     config = llama_config_to_gpt2_config(llama_config)
     config.use_flash_attn = True
@@ -466,6 +468,7 @@ def test_llama_parallel_uneven_num_heads(world_size):
     model.load_state_dict(shard_state_dict_tp(pretrained_state_dict, config, world_size, rank))
     model.eval()
 
+    # TODO: Avoid duplicate code. Modularize the comparison of two forward pass diffs.
     out = model.transformer(input_ids)
     out, _ = all_gather_raw(out, process_group=process_group)
     out = rearrange(out, "(b s) d -> b s d", b=batch_size)
@@ -479,18 +482,16 @@ def test_llama_parallel_uneven_num_heads(world_size):
             Path(checkpoint_path) / f'{model_name}-hf', device_map="auto"
         )
         model_ref.eval()
-        with torch.no_grad():
-            out_ref = model_ref.model(input_ids).last_hidden_state.to(device=device)
-            logits_ref = model_ref(input_ids).logits.to(device=device)
+        out_ref = model_ref.model(input_ids).last_hidden_state.to(device=device)
+        logits_ref = model_ref(input_ids).logits.to(device=device)
         del model_ref
 
         model_hf = LlamaForCausalLM.from_pretrained(
             Path(checkpoint_path) / f'{model_name}-hf', torch_dtype=dtype, device_map="auto"
         )
         model_hf.eval()
-        with torch.no_grad():
-            out_hf = model_hf.model(input_ids).last_hidden_state.to(device=device)
-            logits_hf = model_hf(input_ids).logits.to(device=device)
+        out_hf = model_hf.model(input_ids).last_hidden_state.to(device=device)
+        logits_hf = model_hf(input_ids).logits.to(device=device)
         del model_hf
 
         print(f'Output max diff: {(out - out_ref).abs().max().item()}')
