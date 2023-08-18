@@ -27,7 +27,7 @@ from flash_attn.modules.mlp import (
     ParallelMLP,
 )
 from flash_attn.ops.activations import sqrelu_fwd
-from flash_attn.utils.distributed import all_gather_raw, sync_shared_params
+from flash_attn.utils.distributed import all_gather_raw, sync_shared_params, get_dim_for_local_rank
 from flash_attn.utils.generation import GenerationMixin
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 from transformers import GPT2Config
@@ -61,7 +61,6 @@ try:
     from flash_attn.ops.triton.mlp import FusedDenseSqreluDense
 except ImportError:
     FusedDenseSqreluDense = None
-
 
 logger = logging.getLogger(__name__)
 
@@ -681,41 +680,58 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
     inner_dim = config.n_inner if config.n_inner is not None else 4 * config.hidden_size
     assert inner_dim % world_size == 0
 
+    n_head = config.n_head
+    n_head_kv = getattr(config, "n_head_kv", n_head)
+
+    embed_dim = config.hidden_size
+    head_dim = embed_dim // n_head
+
     def shard_first_dim(state_dict, key):
         if key in state_dict:
             x = state_dict[key]
             dim = x.shape[0] // world_size
-            state_dict[key] = x[rank * dim : (rank + 1) * dim]
+            state_dict[key] = x[rank * dim: (rank + 1) * dim]
 
-    def shard_last_dim(state_dict, key):
+    def shard_last_dim(state_dict, key, multiple_of=1):
         if key in state_dict:
             x = state_dict[key]
-            dim = x.shape[-1] // world_size
-            state_dict[key] = x[..., rank * dim : (rank + 1) * dim]
+            dim_each_rank = [
+                get_dim_for_local_rank(x.size(-1), world_size, local_rank, multiple_of)
+                for local_rank in range(world_size)
+            ]
+            beg, end = tuple(sum(dim_each_rank[:pos]) for pos in (rank, rank + 1))
+            state_dict[key] = x[..., beg:end]
 
     def shard_gatedmlp_fc1_dim(state_dict, key):
         if key in state_dict:
             x = state_dict[key]
             dim = x.shape[0] // world_size // 2
             state_dict[key] = rearrange(
-                rearrange(x, "(two o) ... -> two o ...", two=2)[:, rank * dim : (rank + 1) * dim],
+                rearrange(x, "(two o) ... -> two o ...", two=2)[:, rank * dim: (rank + 1) * dim],
                 "two o ... -> (two o) ...",
             )
 
     def shard_qkv_headdim(state_dict, key):
         if key in state_dict:
-            n_head = config.n_head
-            n_head_kv = getattr(config, "n_head_kv", n_head)
-            assert n_head % world_size == 0 and n_head_kv % world_size == 0
+            n_head_each_rank = [
+                get_dim_for_local_rank(n_head, world_size, local_rank) for local_rank in range(world_size)
+            ]
+            n_head_kv_each_rank = [
+                get_dim_for_local_rank(n_head_kv, world_size, local_rank) for local_rank in range(world_size)
+            ]
+
+            beg_n_head = sum(n_head_each_rank[:rank])
+            end_n_head = sum(n_head_each_rank[: rank + 1])
+
+            beg_n_head_kv = sum(n_head_kv_each_rank[:rank])
+            end_n_head_kv = sum(n_head_kv_each_rank[: rank + 1])
+
             if n_head_kv == n_head:
                 x = rearrange(state_dict[key], "(three d) ... -> three d ...", three=3)
-                dim = x.shape[1] // world_size
                 state_dict[key] = rearrange(
-                    x[:, rank * dim : (rank + 1) * dim], "three d ... -> (three d) ..."
+                    x[:, beg_n_head * head_dim : end_n_head * head_dim], "three d ... -> (three d) ..."
                 )
             else:
-                n_head_per_rank = n_head // world_size
-                n_head_kv_per_rank = n_head_kv // world_size
                 x = rearrange(
                     state_dict[key],
                     "(nheadqkv headdim) ... -> nheadqkv headdim ...",
@@ -724,19 +740,9 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
                 state_dict[key] = rearrange(
                     torch.cat(
                         [
-                            x[rank * n_head_per_rank : (rank + 1) * n_head_per_rank],
-                            x[
-                                n_head
-                                + rank * n_head_kv_per_rank : n_head
-                                + (rank + 1) * n_head_kv_per_rank
-                            ],
-                            x[
-                                n_head
-                                + n_head_kv
-                                + rank * n_head_kv_per_rank : n_head
-                                + n_head_kv
-                                + (rank + 1) * n_head_kv_per_rank
-                            ],
+                            x[beg_n_head:end_n_head],
+                            x[n_head + beg_n_head_kv: n_head + end_n_head_kv],
+                            x[n_head + n_head_kv + beg_n_head_kv: n_head + n_head_kv + end_n_head_kv],
                         ],
                         dim=0,
                     ),
@@ -751,7 +757,9 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
     for i in range(config.num_hidden_layers):
         shard_qkv_headdim(state_dict, f"transformer.layers.{i}.mixer.Wqkv.weight")
         shard_qkv_headdim(state_dict, f"transformer.layers.{i}.mixer.Wqkv.bias")
-        shard_last_dim(state_dict, f"transformer.layers.{i}.mixer.out_proj.weight")
+        shard_last_dim(
+            state_dict, f"transformer.layers.{i}.mixer.out_proj.weight", multiple_of=head_dim
+        )
         if rank != 0:
             state_dict.pop(f"transformer.layers.{i}.mixer.out_proj.bias", None)
         if config.activation_function in ["glu", "swiglu", "geglu"]:
@@ -816,7 +824,7 @@ def combine_state_dicts_tp(state_dicts, config):
                             torch.cat([x[:n_head_per_rank] for x in xs], dim=0),
                             torch.cat(
                                 [
-                                    x[n_head_per_rank : n_head_per_rank + n_head_kv_per_rank]
+                                    x[n_head_per_rank: n_head_per_rank + n_head_kv_per_rank]
                                     for x in xs
                                 ],
                                 dim=0,
@@ -922,6 +930,7 @@ def remap_state_dict_megatron(state_dict, config):
         return key
 
     state_dict = OrderedDict((key_mapping_transformer(k), v) for k, v in state_dict.items())
+
     # Word embedding and position embedding
     def key_mapping_pos_emb(key):
         return re.sub(r"^wpe.", "transformer.embeddings.position_embeddings.", key)

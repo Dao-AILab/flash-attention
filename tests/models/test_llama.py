@@ -16,7 +16,7 @@ import pytest
 
 from einops import rearrange
 
-from transformers import LlamaTokenizer
+from transformers import LlamaTokenizer, LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 from flash_attn.models.gpt import GPTLMHeadModel, combine_state_dicts_tp, shard_state_dict_tp
@@ -255,7 +255,6 @@ def test_llama_generation(model_name, checkpoint_format):
         logits_ref = model_ref(out_hf.sequences).logits[:, (seqlen - 1):-1].to(device=device)
     del model_ref
 
-
     pretrained_state_dict = _pretrained_state_dict_from_checkpoint(
         checkpoint_path, model_name, config, checkpoint_format
     )
@@ -297,8 +296,8 @@ def test_llama_generation(model_name, checkpoint_format):
     hf_error = (logits_hf - logits_ref).abs().max().item()
 
     print(f'HF fp16 logits max diff: {hf_error}')
-    print(f'Logits max diff: {(logits - logits_ref).abs().max().item() }')
-    print(f'Logits CG max diff: {(logits_cg - logits_ref).abs().max().item() }')
+    print(f'Logits max diff: {(logits - logits_ref).abs().max().item()}')
+    print(f'Logits CG max diff: {(logits_cg - logits_ref).abs().max().item()}')
 
     assert (logits_parallel - logits_ref).abs().max().item() < 2 * hf_error
     assert (logits - logits_ref).abs().max().item() < 2 * hf_error
@@ -410,7 +409,101 @@ def test_llama_parallel_generation(model_name, world_size, checkpoint_format):
 
         hf_error = (logits_hf - logits_ref).abs().max().item()
         print(f'HF fp16 logits max diff: {hf_error}')
-        print(f'Logits max diff: {(logits - logits_ref).abs().max().item() }')
+        print(f'Logits max diff: {(logits - logits_ref).abs().max().item()}')
         assert (logits - logits_ref).abs().max().item() < 2 * hf_error
-        print(f'Logits CG max diff: {(logits_cg - logits_ref).abs().max().item() }')
+        print(f'Logits CG max diff: {(logits_cg - logits_ref).abs().max().item()}')
         assert torch.equal(logits_cg, logits)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize('world_size', [2])
+def test_llama_parallel_uneven_num_heads(world_size):
+    from apex.transformer import parallel_state
+
+    checkpoint_path = Path(os.environ.get('CHECKPOINT_DIR', current_dir.parent.parent / 'checkpoints')) / 'llama'
+    num_attention_heads = world_size + 1
+    model_name = f'teeny-{num_attention_heads}-heads'
+
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend='nccl', init_method='env://')
+    device = f'cuda:{torch.distributed.get_rank()}'
+    assert world_size <= torch.distributed.get_world_size()
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size_=world_size)
+    rank = parallel_state.get_tensor_model_parallel_rank()
+    process_group = parallel_state.get_tensor_model_parallel_group()
+
+    dtype = torch.float16
+    llama_config = LlamaConfig(
+        hidden_size=256 * num_attention_heads,  # ParallelGatedMlp hidden_features must be divisible by 256
+        intermediate_size=256 * num_attention_heads * 4,
+        num_hidden_layers=4,
+        num_attention_heads=num_attention_heads,
+        initializer_range=0.5,  # Set crazy init range so we don't have near zero weights implying a vacuous test.
+    )
+    config = llama_config_to_gpt2_config(llama_config)
+    config.use_flash_attn = True
+    config.fused_bias_fc = True
+    config.fused_mlp = False  # We don't have fused GatedMLP yet
+    config.fused_dropout_add_ln = True
+    config.residual_in_fp32 = True
+
+    torch.manual_seed(0)
+    batch_size = 2
+    max_seqlen = 256
+    seqlens = torch.randint(max_seqlen // 2, max_seqlen + 1, (batch_size,), device=device)
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, max_seqlen), dtype=torch.long,
+                              device=device)
+
+    # Create a shared test model.
+    if rank == 0:
+        LlamaForCausalLM(config=llama_config).save_pretrained(checkpoint_path / f"{model_name}-hf")
+    torch.distributed.barrier()
+
+    # Run the standard forward pass test.
+    pretrained_state_dict = _pretrained_state_dict_from_checkpoint(
+        checkpoint_path, model_name, config, checkpoint_format="hf"
+    )
+    model = GPTLMHeadModel(config, process_group=process_group, device=device, dtype=dtype)
+    model.load_state_dict(shard_state_dict_tp(pretrained_state_dict, config, world_size, rank))
+    model.eval()
+
+    # TODO: Avoid duplicate code. Modularize the comparison of two forward pass diffs.
+    out = model.transformer(input_ids)
+    out, _ = all_gather_raw(out, process_group=process_group)
+    out = rearrange(out, "(b s) d -> b s d", b=batch_size)
+    logits = model(input_ids).logits
+    logits = rearrange(logits, "(b s) d -> b s d", b=batch_size)
+    logits, _ = all_gather_raw(logits, process_group)
+    logits = rearrange(logits, '(n b) ... d -> b ... (n d)', b=batch_size)
+
+    if rank == 0:
+        model_ref = LlamaForCausalLM.from_pretrained(
+            Path(checkpoint_path) / f'{model_name}-hf', device_map="auto"
+        )
+        model_ref.eval()
+        out_ref = model_ref.model(input_ids).last_hidden_state.to(device=device)
+        logits_ref = model_ref(input_ids).logits.to(device=device)
+        del model_ref
+
+        model_hf = LlamaForCausalLM.from_pretrained(
+            Path(checkpoint_path) / f'{model_name}-hf', torch_dtype=dtype, device_map="auto"
+        )
+        model_hf.eval()
+        out_hf = model_hf.model(input_ids).last_hidden_state.to(device=device)
+        logits_hf = model_hf(input_ids).logits.to(device=device)
+        del model_hf
+
+        print(f'Output max diff: {(out - out_ref).abs().max().item()}')
+        print(f'Output mean diff: {(out - out_ref).abs().mean().item()}')
+        print(f'HF fp16 max diff: {(out_hf - out_ref).abs().max().item()}')
+        print(f'HF fp16 mean diff: {(out_hf - out_ref).abs().mean().item()}')
+        assert (out - out_ref).abs().max().item() < 2 * (out_hf - out_ref).abs().max().item()
+
+        print(f'Logits max diff: {(logits - logits_ref).abs().max().item()}')
+        print(f'Logits mean diff: {(logits - logits_ref).abs().mean().item()}')
+        print(f'HF fp16 max diff: {(logits_hf - logits_ref).abs().max().item()}')
+        print(f'HF fp16 mean diff: {(logits_hf - logits_ref).abs().mean().item()}')
+        assert (logits - logits_ref).abs().max().item() < 2 * (logits_hf - logits_ref).abs().max().item()
+
+        import shutil
+        shutil.rmtree(checkpoint_path / f'{model_name}-hf')

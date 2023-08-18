@@ -125,3 +125,15 @@ def allreduce_sequence_parallel_grad(model: torch.nn.Module, process_group: Proc
             torch.distributed.all_reduce(coalesced, group=process_group)
             for buf, synced in zip(grads, torch._utils._unflatten_dense_tensors(coalesced, grads)):
                 buf.copy_(synced)
+
+
+def get_dim_for_local_rank(dim: int, world_size: int, local_rank: int, multiple_of: int = 1) -> int:
+    """Get the dim for the local rank derived from splitting dim on world_size processes.
+
+    The split may not be even across the world_size processes.
+    """
+    multiple = dim // multiple_of
+    div = multiple // world_size
+    mod = multiple % world_size
+    local_multiple = div + int(local_rank < mod)
+    return local_multiple * multiple_of

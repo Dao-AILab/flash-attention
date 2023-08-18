@@ -5,8 +5,9 @@ from functools import partial
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange, repeat
+
+from flash_attn.utils.distributed import get_dim_for_local_rank
 
 try:
     from flash_attn import (
@@ -720,22 +721,21 @@ class ParallelMHA(nn.Module):
         self.use_flash_attn = use_flash_attn
         self.checkpointing = checkpointing
         self.process_group = process_group
-        self.world_size = process_group.size() if process_group is not None else 1
+        self.world_size = process_group.size()
+        self.local_rank = torch.distributed.get_rank(process_group)
 
         self.num_heads = num_heads
+        assert self.embed_dim % self.num_heads == 0, "embed_dim must be divisible by num_heads"
+
         self.num_heads_kv = num_heads_kv if num_heads_kv is not None else num_heads
-        self.num_heads_per_rank = num_heads // self.world_size
-        self.num_heads_kv_per_rank = self.num_heads_kv // self.world_size
         assert (
             self.num_heads % self.num_heads_kv == 0
         ), "num_heads must be divisible by num_heads_kv"
-        assert self.embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
-        assert (
-            self.num_heads_kv % self.world_size == 0
-        ), "num_heads_kv must be divisible by world_size"
+
+        self.num_heads_per_rank = get_dim_for_local_rank(self.num_heads, self.world_size, self.local_rank)
+        self.num_heads_kv_per_rank = get_dim_for_local_rank(self.num_heads, self.world_size, self.local_rank)
         self.head_dim = self.embed_dim // num_heads
         qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
-        kv_dim = 2 * self.head_dim * self.num_heads_kv
 
         if self.rotary_emb_dim > 0:
             assert RotaryEmbedding is not None, "rotary_emb is not installed"
@@ -755,6 +755,7 @@ class ParallelMHA(nn.Module):
             process_group,
             bias=qkv_proj_bias,
             sequence_parallel=sequence_parallel,
+            multiple_of=self.head_dim * 3,
             **factory_kwargs,
         )
         inner_attn_cls = FlashSelfAttention if use_flash_attn else SelfAttention
@@ -771,6 +772,7 @@ class ParallelMHA(nn.Module):
             process_group,
             bias=out_proj_bias,
             sequence_parallel=sequence_parallel,
+            multiple_of=self.head_dim,
             **factory_kwargs,
         )
 
