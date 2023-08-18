@@ -36,13 +36,13 @@ void FlashFwdRunner::Run<false, 32, device_gemm_trait::Float16, false, true>(boo
   });
 } // FlashFwdRunner::Run()
 
-// hdim 32, fp16, non-causal, MNKO-padding
+// hdim 32, fp16, non-causal, non-padding
 template <>
 void FlashFwdRunner::Run<false, 32, device_gemm_trait::Float16, false, false>(bool is_dropout) {
   BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
     this->template run_<DeviceGemmKLoopHeadDim32,
                   device_gemm_trait::Float16, 
-                  device_gemm_trait::kGemmSpecPadding,
+                  device_gemm_trait::kGemmSpecDefault,
                   device_gemm_trait::kMaskingSpecDefault,
                   kIsDeterministic>();
   });

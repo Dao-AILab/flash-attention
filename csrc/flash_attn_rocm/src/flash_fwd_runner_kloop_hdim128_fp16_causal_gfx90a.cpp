@@ -24,7 +24,7 @@
 #include "flash_fwd_runner_gfx90a.h"
 
 namespace fwd_device_gemm {
-// hdim 128, fp16, causal
+// hdim 128, fp16, causal, MNKO-padding
 template <>
 void FlashFwdRunner::Run<false, 128, device_gemm_trait::Float16, true, true>(bool is_dropout) {
   BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
@@ -36,13 +36,13 @@ void FlashFwdRunner::Run<false, 128, device_gemm_trait::Float16, true, true>(boo
   });
 } // FlashFwdRunner::Run()
 
-// hdim 128, fp16, causal
+// hdim 128, fp16, causal, non-padding
 template <>
 void FlashFwdRunner::Run<false, 128, device_gemm_trait::Float16, true, false>(bool is_dropout) {
   BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
     this->template run_<DeviceGemmKLoopHeadDim128,
                   device_gemm_trait::Float16, 
-                  device_gemm_trait::kGemmSpecPadding,
+                  device_gemm_trait::kGemmSpecDefault,
                   device_gemm_trait::kMaskingSpecCausal,
                   kIsDeterministic>();
   });
