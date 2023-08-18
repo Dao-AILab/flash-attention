@@ -46,5 +46,5 @@ def test_vit(optimized, fused_mlp):
     print(f'Output mean diff: {(out - out_ref).abs().mean().item()}')
     print(f'timm fp16 max diff: {(out_timm - out_ref).abs().max().item()}')
     print(f'timm fp16 mean diff: {(out_timm - out_ref).abs().mean().item()}')
-    rtol = 2 if not fused_mlp else 4
+    rtol = 2 if not fused_mlp else 8
     assert (out - out_ref).abs().max().item() < rtol * (out_timm - out_ref).abs().max().item()

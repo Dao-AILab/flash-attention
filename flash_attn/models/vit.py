@@ -31,7 +31,7 @@ except ImportError:
 
 def create_mixer_cls(num_heads, qkv_bias, attn_drop, use_flash_attn, fused_bias_fc,
                      cross_attn=False):
-    mixer_cls = partial(MHA, num_heads=num_heads, cross_attn=cross_attn, bias=qkv_bias,
+    mixer_cls = partial(MHA, num_heads=num_heads, cross_attn=cross_attn, qkv_proj_bias=qkv_bias,
                         dropout=attn_drop, fused_bias_fc=fused_bias_fc,
                         use_flash_attn=use_flash_attn)
     return mixer_cls
