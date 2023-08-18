@@ -254,11 +254,21 @@ def inv_remap_state_dict_hf_llama(state_dict, config):
             .reshape(config.n_embd, config.n_embd)
         )
 
+    n_head = config.n_head
+    n_head_kv = getattr(config, "n_head_kv", n_head)
+
+    embed_dim = config.hidden_size
+    head_dim = embed_dim // n_head
+
+    q_dim = n_head * head_dim
+    k_dim = v_dim = n_head_kv * head_dim
+
     # Attention
     for l in range(config.n_layer):
-        # TODO: This doesn't work for GQA or MQA.
         Wqkv = state_dict.pop(f"transformer.layers.{l}.mixer.Wqkv.weight")
-        Wq, Wk, Wv = torch.chunk(Wqkv, chunks=3, dim=0)
+        Wq = Wqkv[:q_dim]
+        Wk = Wqkv[q_dim : q_dim + k_dim]
+        Wv = Wqkv[q_dim + k_dim : q_dim + k_dim + v_dim]
         state_dict[f"model.layers.{l}.self_attn.q_proj.weight"] = permute(Wq)
         state_dict[f"model.layers.{l}.self_attn.k_proj.weight"] = permute(Wk)
         state_dict[f"model.layers.{l}.self_attn.v_proj.weight"] = Wv
