@@ -91,17 +91,20 @@ struct Flash_fwd_kernel_traits : public Base {
         SmemLayoutAtomQ{},
         Shape<Int<kBlockN>, Int<kHeadDim>>{}));
 
+    // This has to be kBlockN and not 8, otherwise we get wrong results for d=128
+    using SmemLayoutAtomVtransposedNoSwizzle = Layout<Shape<Int<kBlockKSmem>, Int<kBlockN>>,
+                                                      Stride<_1, Int<kBlockKSmem>>>;
     using SmemLayoutAtomVtransposed = decltype(
-        composition(Swizzle<kSwizzle, 3, 3>{},
-                    // This has to be kBlockN and not 8, otherwise we get wrong results for d=128
-                    Layout<Shape<Int<kBlockKSmem>, Int<kBlockN>>,
-                           Stride<_1, Int<kBlockKSmem>>>{}));
+        composition(Swizzle<kSwizzle, 3, 3>{}, SmemLayoutAtomVtransposedNoSwizzle{}));
     using SmemLayoutVtransposed = decltype(tile_to_shape(
         SmemLayoutAtomVtransposed{},
         Shape<Int<kHeadDim>, Int<kBlockN>>{}));
     // Maybe the VtransposeNoSwizzle just needs to have the right shape
     // And the strides don't matter?
-    using SmemLayoutVtransposedNoSwizzle = decltype(SmemLayoutVtransposed{}.layout_fn());
+    using SmemLayoutVtransposedNoSwizzle = decltype(tile_to_shape(
+        SmemLayoutAtomVtransposedNoSwizzle{},
+        Shape<Int<kHeadDim>, Int<kBlockN>>{}));
+    // using SmemLayoutVtransposedNoSwizzle = decltype(SmemLayoutVtransposed{}.layout_fn());
 
     using SmemLayoutAtomO = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},
@@ -223,16 +226,19 @@ struct Flash_bwd_kernel_traits : public Base {
         SmemLayoutAtomKV{},
         make_shape(Int<kBlockN>{}, Int<kHeadDim>{})));
 
+    using SmemLayoutAtomKtransposedNoSwizzle = Layout<Shape<Int<kBlockKSmem>, Int<kBlockN>>,
+                                                      Stride<_1, Int<kBlockKSmem>>>;
     using SmemLayoutAtomKtransposed = decltype(
-        composition(Swizzle<kSwizzle, 3, 3>{},
-                    Layout<Shape<Int<kBlockKSmem>, Int<kBlockN>>,
-                           Stride<_1, Int<kBlockKSmem>>>{}));
+        composition(Swizzle<kSwizzle, 3, 3>{}, SmemLayoutAtomKtransposedNoSwizzle{}));
     using SmemLayoutKtransposed = decltype(tile_to_shape(
         SmemLayoutAtomKtransposed{},
         make_shape(Int<kHeadDim>{}, Int<kBlockN>{})));
     // Maybe the KtransposeNoSwizzle just needs to have the right shape
     // And the strides don't matter?
-    using SmemLayoutKtransposedNoSwizzle = decltype(SmemLayoutKtransposed{}.layout_fn());
+    using SmemLayoutKtransposedNoSwizzle = decltype(tile_to_shape(
+        SmemLayoutAtomKtransposedNoSwizzle{},
+        make_shape(Int<kHeadDim>{}, Int<kBlockN>{})));
+    // using SmemLayoutKtransposedNoSwizzle = decltype(SmemLayoutKtransposed{}.layout_fn());
 
     // TODO: generalize to other values of kBlockN
     // TODO: what should be the Swizzle here? 3 is faster than 1, and 1 is faster than 2
@@ -250,24 +256,30 @@ struct Flash_bwd_kernel_traits : public Base {
     using SmemLayoutPdS = decltype(tile_to_shape(
         SmemLayoutAtomPdS{},
         make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
+    using SmemLayoutAtomPdStransposedNoSwizzle = Layout<Shape<Int<kPBlockN>, Int<kBlockM>>,
+                                                        Stride<_1, Int<kPBlockN>>>;
     using SmemLayoutAtomPdStransposed = decltype(
-        composition(Swizzle<kSwizzlePdS, 3, 3>{},
-                    Layout<Shape<Int<kPBlockN>, Int<kBlockM>>,
-                           Stride<_1, Int<kPBlockN>>>{}));
+        composition(Swizzle<kSwizzlePdS, 3, 3>{}, SmemLayoutAtomPdStransposedNoSwizzle{}));
     using SmemLayoutPdStransposed = decltype(tile_to_shape(
         SmemLayoutAtomPdStransposed{},
         make_shape(Int<kBlockN>{}, Int<kBlockM>{})));
-    using SmemLayoutPdStransposedNoSwizzle = decltype(SmemLayoutPdStransposed{}.layout_fn());
+    using SmemLayoutPdStransposedNoSwizzle = decltype(tile_to_shape(
+        SmemLayoutAtomPdStransposedNoSwizzle{},
+        make_shape(Int<kBlockN>{}, Int<kBlockM>{})));
+    // using SmemLayoutPdStransposedNoSwizzle = decltype(SmemLayoutPdStransposed{}.layout_fn());
     using SmemCopyAtomPdS = Copy_Atom<DefaultCopy, elem_type>;
 
+    using SmemLayoutAtomQdOtransposedNoSwizzle = Layout<Shape<Int<kBlockKSmem>, Int<kBlockM>>,
+                                                        Stride<_1, Int<kBlockKSmem>>>;
     using SmemLayoutAtomQdOtransposed = decltype(
-        composition(Swizzle<kSwizzle, 3, 3>{},
-                    Layout<Shape<Int<kBlockKSmem>, Int<kBlockM>>,
-                           Stride<_1, Int<kBlockKSmem>>>{}));
+        composition(Swizzle<kSwizzle, 3, 3>{}, SmemLayoutAtomQdOtransposedNoSwizzle{}));
     using SmemLayoutQdOtransposed = decltype(tile_to_shape(
         SmemLayoutAtomQdOtransposed{},
         make_shape(Int<kHeadDim>{}, Int<kBlockM>{})));
-    using SmemLayoutQdOtransposedNoSwizzle = decltype(SmemLayoutQdOtransposed{}.layout_fn());
+    using SmemLayoutQdOtransposedNoSwizzle = decltype(tile_to_shape(
+        SmemLayoutAtomQdOtransposedNoSwizzle{},
+        make_shape(Int<kHeadDim>{}, Int<kBlockM>{})));
+    // using SmemLayoutQdOtransposedNoSwizzle = decltype(SmemLayoutQdOtransposed{}.layout_fn());
 
     using SmemLayoutAtomdKV = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},
