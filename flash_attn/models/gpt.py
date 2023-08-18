@@ -720,14 +720,13 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
             n_head_each_rank = [_get_local_size(n_head, this_rank) for this_rank in range(world_size)]
             n_head_kv_each_rank = [_get_local_size(n_head_kv, this_rank) for this_rank in range(world_size)]
 
+            beg, end = tuple(sum(n_head_each_rank[:pos]) * head_dim for pos in (rank, rank + 1))
+            beg_kv, end_kv = tuple(sum(n_head_kv_each_rank[:pos]) * head_dim for pos in (rank, rank + 1))
+
             if n_head_kv == n_head:
                 x = rearrange(state_dict[key], "(three d) ... -> three d ...", three=3)
-                beg = sum(n_head_each_rank[:rank]) * head_dim
-                end = sum(n_head_each_rank[: rank + 1]) * head_dim
                 state_dict[key] = rearrange(x[:, beg : end], "three d ... -> (three d) ...")
             else:
-                n_head_per_rank = n_head // world_size
-                n_head_kv_per_rank = n_head_kv // world_size
                 x = rearrange(
                     state_dict[key],
                     "(nheadqkv headdim) ... -> nheadqkv headdim ...",
@@ -736,19 +735,9 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
                 state_dict[key] = rearrange(
                     torch.cat(
                         [
-                            x[rank * n_head_per_rank : (rank + 1) * n_head_per_rank],
-                            x[
-                                n_head
-                                + rank * n_head_kv_per_rank : n_head
-                                + (rank + 1) * n_head_kv_per_rank
-                            ],
-                            x[
-                                n_head
-                                + n_head_kv
-                                + rank * n_head_kv_per_rank : n_head
-                                + n_head_kv
-                                + (rank + 1) * n_head_kv_per_rank
-                            ],
+                            x[beg: end],
+                            x[n_head + beg_kv : n_head + end_kv],
+                            x[n_head + n_head_kv + beg_kv : n_head + n_head_kv + end_kv],
                         ],
                         dim=0,
                     ),
