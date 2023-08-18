@@ -420,9 +420,8 @@ def test_llama_parallel_generation(model_name, world_size, checkpoint_format):
 def test_llama_parallel_uneven_num_heads(world_size):
     from apex.transformer import parallel_state
 
+    checkpoint_path = Path(os.environ.get('CHECKPOINT_DIR', current_dir.parent.parent / 'checkpoints')) / 'llama'
     num_attention_heads = world_size + 1
-    checkpoint_path = Path(os.environ.get('CHECKPOINT_DIR',
-                                          current_dir.parent.parent / 'checkpoints')) / 'llama'
     model_name = f'teeny-{num_attention_heads}-heads'
 
     if not torch.distributed.is_initialized():
@@ -454,8 +453,53 @@ def test_llama_parallel_uneven_num_heads(world_size):
     input_ids = torch.randint(0, config.vocab_size, (batch_size, max_seqlen), dtype=torch.long,
                               device=device)
 
-    # Create test model copy.
+    # Create a shared test model.
     if rank == 0:
-        LlamaForCausalLM(config=config).save_pretrained(checkpoint_path / model_name)
+        LlamaForCausalLM(config=llama_config).save_pretrained(checkpoint_path / f"{model_name}-hf")
 
-    # TODO: Run the fp16 comparison test.
+    # Run the standard forward pass test.
+    pretrained_state_dict = _pretrained_state_dict_from_checkpoint(
+        checkpoint_path, model_name, config, checkpoint_format="hf"
+    )
+    model = GPTLMHeadModel(config, process_group=process_group, device=device, dtype=dtype)
+    model.load_state_dict(shard_state_dict_tp(pretrained_state_dict, config, world_size, rank))
+    model.eval()
+
+    out = model.transformer(input_ids)
+    out, _ = all_gather_raw(out, process_group=process_group)
+    out = rearrange(out, "(b s) d -> b s d", b=batch_size)
+    logits = model(input_ids).logits
+    logits = rearrange(logits, "(b s) d -> b s d", b=batch_size)
+    logits, _ = all_gather_raw(logits, process_group)
+    logits = rearrange(logits, '(n b) ... d -> b ... (n d)', b=batch_size)
+
+    if rank == 0:
+        model_ref = LlamaForCausalLM.from_pretrained(
+            Path(checkpoint_path) / f'{model_name}-hf', device_map="auto"
+        )
+        model_ref.eval()
+        with torch.no_grad():
+            out_ref = model_ref.model(input_ids).last_hidden_state.to(device=device)
+            logits_ref = model_ref(input_ids).logits.to(device=device)
+        del model_ref
+
+        model_hf = LlamaForCausalLM.from_pretrained(
+            Path(checkpoint_path) / f'{model_name}-hf', torch_dtype=dtype, device_map="auto"
+        )
+        model_hf.eval()
+        with torch.no_grad():
+            out_hf = model_hf.model(input_ids).last_hidden_state.to(device=device)
+            logits_hf = model_hf(input_ids).logits.to(device=device)
+        del model_hf
+
+        print(f'Output max diff: {(out - out_ref).abs().max().item()}')
+        print(f'Output mean diff: {(out - out_ref).abs().mean().item()}')
+        print(f'HF fp16 max diff: {(out_hf - out_ref).abs().max().item()}')
+        print(f'HF fp16 mean diff: {(out_hf - out_ref).abs().mean().item()}')
+        assert (out - out_ref).abs().max().item() < 2 * (out_hf - out_ref).abs().max().item()
+
+        print(f'Logits max diff: {(logits - logits_ref).abs().max().item()}')
+        print(f'Logits mean diff: {(logits - logits_ref).abs().mean().item()}')
+        print(f'HF fp16 max diff: {(logits_hf - logits_ref).abs().max().item()}')
+        print(f'HF fp16 mean diff: {(logits_hf - logits_ref).abs().mean().item()}')
+        assert (logits - logits_ref).abs().max().item() < 2 * (logits_hf - logits_ref).abs().max().item()
