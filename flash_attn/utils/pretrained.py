@@ -3,13 +3,18 @@ from functools import partial
 
 import torch
 from safetensors.torch import load_file as safe_load_file
-from transformers.utils import WEIGHTS_NAME, WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, SAFE_WEIGHTS_INDEX_NAME
+from transformers.utils import (
+    SAFE_WEIGHTS_INDEX_NAME,
+    SAFE_WEIGHTS_NAME,
+    WEIGHTS_INDEX_NAME,
+    WEIGHTS_NAME,
+)
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 
 
 def state_dict_from_pretrained(model_name, device=None, dtype=None):
     # If not fp32, then we don't want to load directly to the GPU
-    mapped_device = 'cpu' if dtype not in [torch.float32, None] else device
+    mapped_device = "cpu" if dtype not in [torch.float32, None] else device
     is_sharded = False
     load_safe = False
     resolved_archive_file = None
@@ -20,19 +25,23 @@ def state_dict_from_pretrained(model_name, device=None, dtype=None):
     safe_weights_index_path = os.path.join(model_name, SAFE_WEIGHTS_INDEX_NAME)
 
     if os.path.isfile(weights_path):
-        resolved_archive_file = cached_file(model_name, WEIGHTS_NAME,
-                                            _raise_exceptions_for_missing_entries=False)
+        resolved_archive_file = cached_file(
+            model_name, WEIGHTS_NAME, _raise_exceptions_for_missing_entries=False
+        )
     elif os.path.isfile(weights_index_path):
-        resolved_archive_file = cached_file(model_name, WEIGHTS_INDEX_NAME,
-                                            _raise_exceptions_for_missing_entries=False)
+        resolved_archive_file = cached_file(
+            model_name, WEIGHTS_INDEX_NAME, _raise_exceptions_for_missing_entries=False
+        )
         is_sharded = True
     elif os.path.isfile(safe_weights_path):
-        resolved_archive_file = cached_file(model_name, SAFE_WEIGHTS_NAME,
-                                            _raise_exceptions_for_missing_entries=False)
+        resolved_archive_file = cached_file(
+            model_name, SAFE_WEIGHTS_NAME, _raise_exceptions_for_missing_entries=False
+        )
         load_safe = True
     elif os.path.isfile(safe_weights_index_path):
-        resolved_archive_file = cached_file(model_name, SAFE_WEIGHTS_INDEX_NAME,
-                                            _raise_exceptions_for_missing_entries=False)
+        resolved_archive_file = cached_file(
+            model_name, SAFE_WEIGHTS_INDEX_NAME, _raise_exceptions_for_missing_entries=False
+        )
         is_sharded = True
         load_safe = True
 

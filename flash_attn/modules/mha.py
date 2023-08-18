@@ -732,8 +732,12 @@ class ParallelMHA(nn.Module):
             self.num_heads % self.num_heads_kv == 0
         ), "num_heads must be divisible by num_heads_kv"
 
-        self.num_heads_per_rank = get_dim_for_local_rank(self.num_heads, self.world_size, self.local_rank)
-        self.num_heads_kv_per_rank = get_dim_for_local_rank(self.num_heads, self.world_size, self.local_rank)
+        self.num_heads_per_rank = get_dim_for_local_rank(
+            self.num_heads, self.world_size, self.local_rank
+        )
+        self.num_heads_kv_per_rank = get_dim_for_local_rank(
+            self.num_heads, self.world_size, self.local_rank
+        )
         self.head_dim = self.embed_dim // num_heads
         qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
 

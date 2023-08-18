@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from transformers import GPT2Config
+
 from flash_attn.models.falcon import remap_state_dict_hf_falcon
 from flash_attn.models.gpt_neox import remap_state_dict_hf_gpt_neox
 from flash_attn.models.gptj import remap_state_dict_hf_gptj
@@ -27,10 +29,9 @@ from flash_attn.modules.mlp import (
     ParallelMLP,
 )
 from flash_attn.ops.activations import sqrelu_fwd
-from flash_attn.utils.distributed import all_gather_raw, sync_shared_params, get_dim_for_local_rank
+from flash_attn.utils.distributed import all_gather_raw, get_dim_for_local_rank, sync_shared_params
 from flash_attn.utils.generation import GenerationMixin
 from flash_attn.utils.pretrained import state_dict_from_pretrained
-from transformers import GPT2Config
 
 try:
     from flash_attn.ops.fused_dense import ColumnParallelLinear
@@ -690,7 +691,7 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
         if key in state_dict:
             x = state_dict[key]
             dim = x.shape[0] // world_size
-            state_dict[key] = x[rank * dim: (rank + 1) * dim]
+            state_dict[key] = x[rank * dim : (rank + 1) * dim]
 
     def shard_last_dim(state_dict, key, multiple_of=1):
         if key in state_dict:
@@ -707,17 +708,19 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
             x = state_dict[key]
             dim = x.shape[0] // world_size // 2
             state_dict[key] = rearrange(
-                rearrange(x, "(two o) ... -> two o ...", two=2)[:, rank * dim: (rank + 1) * dim],
+                rearrange(x, "(two o) ... -> two o ...", two=2)[:, rank * dim : (rank + 1) * dim],
                 "two o ... -> (two o) ...",
             )
 
     def shard_qkv_headdim(state_dict, key):
         if key in state_dict:
             n_head_each_rank = [
-                get_dim_for_local_rank(n_head, world_size, local_rank) for local_rank in range(world_size)
+                get_dim_for_local_rank(n_head, world_size, local_rank)
+                for local_rank in range(world_size)
             ]
             n_head_kv_each_rank = [
-                get_dim_for_local_rank(n_head_kv, world_size, local_rank) for local_rank in range(world_size)
+                get_dim_for_local_rank(n_head_kv, world_size, local_rank)
+                for local_rank in range(world_size)
             ]
 
             beg_n_head = sum(n_head_each_rank[:rank])
@@ -729,7 +732,8 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
             if n_head_kv == n_head:
                 x = rearrange(state_dict[key], "(three d) ... -> three d ...", three=3)
                 state_dict[key] = rearrange(
-                    x[:, beg_n_head * head_dim : end_n_head * head_dim], "three d ... -> (three d) ..."
+                    x[:, beg_n_head * head_dim : end_n_head * head_dim],
+                    "three d ... -> (three d) ...",
                 )
             else:
                 x = rearrange(
@@ -741,8 +745,14 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
                     torch.cat(
                         [
                             x[beg_n_head:end_n_head],
-                            x[n_head + beg_n_head_kv: n_head + end_n_head_kv],
-                            x[n_head + n_head_kv + beg_n_head_kv: n_head + n_head_kv + end_n_head_kv],
+                            x[n_head + beg_n_head_kv : n_head + end_n_head_kv],
+                            x[
+                                n_head
+                                + n_head_kv
+                                + beg_n_head_kv : n_head
+                                + n_head_kv
+                                + end_n_head_kv
+                            ],
                         ],
                         dim=0,
                     ),
@@ -824,7 +834,7 @@ def combine_state_dicts_tp(state_dicts, config):
                             torch.cat([x[:n_head_per_rank] for x in xs], dim=0),
                             torch.cat(
                                 [
-                                    x[n_head_per_rank: n_head_per_rank + n_head_kv_per_rank]
+                                    x[n_head_per_rank : n_head_per_rank + n_head_kv_per_rank]
                                     for x in xs
                                 ],
                                 dim=0,

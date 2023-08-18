@@ -17,10 +17,12 @@ if "reduce_scatter_tensor" not in dir(torch.distributed):
 # Raw operation, does not support autograd, but does support async
 def all_gather_raw(input_: Tensor, process_group: ProcessGroup, async_op: bool = False):
     world_size = torch.distributed.get_world_size(process_group)
-    output = torch.empty(world_size * input_.shape[0], *input_.shape[1:],
-                         dtype=input_.dtype, device=input_.device)
-    handle = torch.distributed.all_gather_into_tensor(output, input_.contiguous(),
-                                                      group=process_group, async_op=async_op)
+    output = torch.empty(
+        world_size * input_.shape[0], *input_.shape[1:], dtype=input_.dtype, device=input_.device
+    )
+    handle = torch.distributed.all_gather_into_tensor(
+        output, input_.contiguous(), group=process_group, async_op=async_op
+    )
     return output, handle
 
 
@@ -28,11 +30,12 @@ def all_gather_raw(input_: Tensor, process_group: ProcessGroup, async_op: bool =
 def reduce_scatter_raw(input_: Tensor, process_group: ProcessGroup, async_op: bool = False):
     world_size = torch.distributed.get_world_size(process_group)
     assert input_.shape[0] % world_size == 0
-    output = torch.empty(input_.shape[0] // world_size, *input_.shape[1:],
-                         dtype=input_.dtype, device=input_.device)
-    handle = torch.distributed.reduce_scatter_tensor(output, input_.contiguous(),
-                                                     group=process_group,
-                                                     async_op=async_op)
+    output = torch.empty(
+        input_.shape[0] // world_size, *input_.shape[1:], dtype=input_.dtype, device=input_.device
+    )
+    handle = torch.distributed.reduce_scatter_tensor(
+        output, input_.contiguous(), group=process_group, async_op=async_op
+    )
     return output, handle
 
 
@@ -102,8 +105,9 @@ all_reduce = AllReduceFunc.apply
 def sync_shared_params(model: torch.nn.Module, process_group: ProcessGroup):
     # We want to iterate over parameters with _shared_params=True in the same order,
     # as different ranks might have different number of parameters (e.g., only rank 0 has bias).
-    pamams_shared = {name: p for name, p in model.named_parameters()
-                     if getattr(p, '_shared_params', False)}
+    pamams_shared = {
+        name: p for name, p in model.named_parameters() if getattr(p, "_shared_params", False)
+    }
     for _, p in sorted(pamams_shared.items()):
         with torch.no_grad():
             # Broadcast needs src to be global rank, not group rank
@@ -116,8 +120,9 @@ def sync_shared_params(model: torch.nn.Module, process_group: ProcessGroup):
 def allreduce_sequence_parallel_grad(model: torch.nn.Module, process_group: ProcessGroup):
     # We want to iterate over parameters with _sequence_parallel=True in the same order,
     # as different ranks might have different number of parameters (e.g., only rank 0 has bias).
-    params_seqparallel = {name: p for name, p in model.named_parameters()
-                          if getattr(p, '_sequence_parallel', False)}
+    params_seqparallel = {
+        name: p for name, p in model.named_parameters() if getattr(p, "_sequence_parallel", False)
+    }
     grads = [p.grad for _, p in sorted(params_seqparallel.items())]
     if grads:
         with torch.no_grad():
