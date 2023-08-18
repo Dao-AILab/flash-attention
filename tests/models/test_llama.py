@@ -16,7 +16,7 @@ import pytest
 
 from einops import rearrange
 
-from transformers import LlamaTokenizer
+from transformers import LlamaTokenizer, LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 from flash_attn.models.gpt import GPTLMHeadModel, combine_state_dicts_tp, shard_state_dict_tp
@@ -414,3 +414,48 @@ def test_llama_parallel_generation(model_name, world_size, checkpoint_format):
         assert (logits - logits_ref).abs().max().item() < 2 * hf_error
         print(f'Logits CG max diff: {(logits_cg - logits_ref).abs().max().item() }')
         assert torch.equal(logits_cg, logits)
+
+
+@pytest.mark.parametrize('world_size', [2])
+def test_llama_parallel_uneven_num_heads(world_size):
+    from apex.transformer import parallel_state
+
+    num_attention_heads = world_size + 1
+    checkpoint_path = Path(os.environ.get('CHECKPOINT_DIR',
+                                          current_dir.parent.parent / 'checkpoints')) / 'llama'
+    model_name = f'teeny-{num_attention_heads}-heads'
+
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend='nccl', init_method='env://')
+    device = f'cuda:{torch.distributed.get_rank()}'
+    assert world_size <= torch.distributed.get_world_size()
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size_=world_size)
+    rank = parallel_state.get_tensor_model_parallel_rank()
+    process_group = parallel_state.get_tensor_model_parallel_group()
+
+    dtype = torch.float16
+    llama_config = LlamaConfig(
+        hidden_size=256 * num_attention_heads,  # ParallelGatedMlp hidden_features must be divisible by 256
+        intermediate_size=256 * num_attention_heads * 4,
+        num_hidden_layers=4,
+        num_attention_heads=num_attention_heads,
+    )
+    config = llama_config_to_gpt2_config(llama_config)
+    config.use_flash_attn = True
+    config.fused_bias_fc = True
+    config.fused_mlp = False  # We don't have fused GatedMLP yet
+    config.fused_dropout_add_ln = True
+    config.residual_in_fp32 = True
+
+    torch.manual_seed(0)
+    batch_size = 2
+    max_seqlen = 256
+    seqlens = torch.randint(max_seqlen // 2, max_seqlen + 1, (batch_size,), device=device)
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, max_seqlen), dtype=torch.long,
+                              device=device)
+
+    # Create test model copy.
+    if rank == 0:
+        LlamaForCausalLM(config=config).save_pretrained(checkpoint_path / model_name)
+
+    # TODO: Run the fp16 comparison test.
