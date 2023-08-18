@@ -320,4 +320,7 @@ setup(
         "packaging",
         "ninja",
     ],
+    extras_require={
+        "dev": ["black==22.10.0", "isort==5.12.0"]
+    }
 )
