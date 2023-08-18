@@ -98,6 +98,7 @@ def remap_state_dict_meta_llama(state_dict, config):
 
 
 def remap_state_dict_hf_llama(state_dict, config):
+    """Convert the state_dict in Hugging Face format to standard GPT format."""
     # Embedding
     def key_mapping_emb(key):
         return re.sub(r"^model.embed_tokens.", "transformer.embeddings.word_embeddings.", key)
@@ -181,6 +182,11 @@ def remap_state_dict_hf_llama(state_dict, config):
 
     state_dict = OrderedDict((key_mapping_attn(k), v) for k, v in state_dict.items())
     return state_dict
+
+
+def inv_remap_state_dict_hf_llama(state_dict, config):
+    """Convert the state_dict in standard GPT format to Hugging Face format."""
+    pass
 
 
 def config_from_meta_checkpoint(
