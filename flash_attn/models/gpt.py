@@ -681,6 +681,13 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
     inner_dim = config.n_inner if config.n_inner is not None else 4 * config.hidden_size
     assert inner_dim % world_size == 0
 
+    def _get_local_size(size: int, local_rank: int) -> int:
+        """Get the size for the current process based on a (potentially uneven) split across all ranks."""
+        div = size // world_size
+        mod = size % world_size
+        local_size = div + int(local_rank < mod)
+        return local_size
+
     def shard_first_dim(state_dict, key):
         if key in state_dict:
             x = state_dict[key]
@@ -706,13 +713,18 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
         if key in state_dict:
             n_head = config.n_head
             n_head_kv = getattr(config, "n_head_kv", n_head)
-            assert n_head % world_size == 0 and n_head_kv % world_size == 0
+
+            embed_dim = config.hidden_size
+            head_dim = embed_dim // n_head
+
+            n_head_each_rank = [_get_local_size(n_head, this_rank) for this_rank in range(world_size)]
+            n_head_kv_each_rank = [_get_local_size(n_head_kv, this_rank) for this_rank in range(world_size)]
+
             if n_head_kv == n_head:
                 x = rearrange(state_dict[key], "(three d) ... -> three d ...", three=3)
-                dim = x.shape[1] // world_size
-                state_dict[key] = rearrange(
-                    x[:, rank * dim : (rank + 1) * dim], "three d ... -> (three d) ..."
-                )
+                beg = sum(n_head_each_rank[:rank]) * head_dim
+                end = sum(n_head_each_rank[: rank + 1]) * head_dim
+                state_dict[key] = rearrange(x[:, beg : end], "three d ... -> (three d) ...")
             else:
                 n_head_per_rank = n_head // world_size
                 n_head_kv_per_rank = n_head_kv // world_size
@@ -749,8 +761,11 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
     if "transformer.embeddings.position_embeddings.weight" in state_dict:
         shard_last_dim(state_dict, "transformer.embeddings.position_embeddings.weight")
     for i in range(config.num_hidden_layers):
+        # TODO: FIX!!!
         shard_qkv_headdim(state_dict, f"transformer.layers.{i}.mixer.Wqkv.weight")
+        # TODO: FIX!!!
         shard_qkv_headdim(state_dict, f"transformer.layers.{i}.mixer.Wqkv.bias")
+        # TODO: FIX!!!
         shard_last_dim(state_dict, f"transformer.layers.{i}.mixer.out_proj.weight")
         if rank != 0:
             state_dict.pop(f"transformer.layers.{i}.mixer.out_proj.bias", None)
