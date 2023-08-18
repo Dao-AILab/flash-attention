@@ -456,6 +456,7 @@ def test_llama_parallel_uneven_num_heads(world_size):
     # Create a shared test model.
     if rank == 0:
         LlamaForCausalLM(config=llama_config).save_pretrained(checkpoint_path / f"{model_name}-hf")
+    torch.distributed.barrier()
 
     # Run the standard forward pass test.
     pretrained_state_dict = _pretrained_state_dict_from_checkpoint(
