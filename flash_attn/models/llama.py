@@ -285,6 +285,7 @@ def inv_remap_state_dict_hf_llama(
         state_dict[f"model.layers.{l}.self_attn.q_proj.weight"] = permute(Wq)
         state_dict[f"model.layers.{l}.self_attn.k_proj.weight"] = permute(Wk)
         state_dict[f"model.layers.{l}.self_attn.v_proj.weight"] = Wv
+        state_dict.pop(f"transformer.layers.{l}.attention.inner_attention.rope.freqs", None)
 
     def key_mapping_attn(key):
         return re.sub(
