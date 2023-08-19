@@ -16,6 +16,11 @@ from transformers import GPT2Config, LlamaConfig
 def remap_state_dict_meta_llama(
     state_dict: dict[str, torch.Tensor], config: GPT2Config
 ) -> dict[str, torch.Tensor]:
+    """Convert the state_dict in Meta format to standard GPT format.
+
+    This function modifies state_dict in place.
+    """
+
     def key_mapping_layers(key):
         return f"transformer.{key}" if not key.startswith("output.") else key
 
@@ -102,7 +107,10 @@ def remap_state_dict_meta_llama(
 def remap_state_dict_hf_llama(
     state_dict: dict[str, torch.Tensor], config: GPT2Config
 ) -> dict[str, torch.Tensor]:
-    """Convert the state_dict in Hugging Face format to standard GPT format."""
+    """Convert the state_dict in Hugging Face format to standard GPT format.
+
+    This function modifies state_dict in place.
+    """
     # Embedding
     def key_mapping_emb(key):
         return re.sub(r"^model.embed_tokens.", "transformer.embeddings.word_embeddings.", key)
@@ -197,6 +205,8 @@ def inv_remap_state_dict_hf_llama(
     multiplier pad in the embedding and lm_head. That is if the original embedding
     isn't a multiple of pad_vocab_size_multiple, then
     inv_remap_state_dict_hf_llama(remap_state_dict_hf_llama(state_dict)) != state_dict.
+
+    This function modifies state_dict in place.
     """
 
     # Embedding
