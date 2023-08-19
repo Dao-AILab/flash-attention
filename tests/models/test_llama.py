@@ -11,26 +11,25 @@ from pathlib import Path
 
 current_dir = Path(__file__).parent.absolute()
 
-import torch
-import pytest
 import shutil
 
+import pytest
+import torch
 from einops import rearrange
-
-from transformers import LlamaTokenizer, LlamaConfig
-from transformers.models.llama.modeling_llama import LlamaForCausalLM
-
 from flash_attn.models.gpt import GPTLMHeadModel, combine_state_dicts_tp, shard_state_dict_tp
 from flash_attn.models.llama import (
-    remap_state_dict_meta_llama,
+    config_from_checkpoint,
+    inv_remap_state_dict_hf_llama,
     llama_config_to_gpt2_config,
     remap_state_dict_hf_llama,
-    inv_remap_state_dict_hf_llama,
+    remap_state_dict_meta_llama,
+    state_dicts_from_checkpoint,
 )
-from flash_attn.models.llama import config_from_checkpoint, state_dicts_from_checkpoint
 from flash_attn.utils.distributed import all_gather_raw
-from flash_attn.utils.pretrained import state_dict_from_pretrained
 from flash_attn.utils.generation import update_graph_cache
+from flash_attn.utils.pretrained import state_dict_from_pretrained
+from transformers import LlamaConfig, LlamaTokenizer
+from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 
 def _pretrained_state_dict_from_checkpoint(checkpoint_path, model_name, config, checkpoint_format):

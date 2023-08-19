@@ -1,21 +1,21 @@
 import math
 
+import pytest
 import torch
 import torch.nn.functional as F
-import pytest
-
 from einops import rearrange
-
 from flash_attn.layers.rotary import apply_rotary_emb_func, apply_rotary_emb_torch
 
+is_sm8x = torch.cuda.get_device_capability("cuda") >= (8, 0)
 
-is_sm8x = torch.cuda.get_device_capability('cuda') >= (8, 0)
 
-@pytest.mark.parametrize('dtype', ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16]))
+@pytest.mark.parametrize(
+    "dtype", ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16])
+)
 # @pytest.mark.parametrize('dtype', ([torch.float16]))
-@pytest.mark.parametrize('rotary_fraction', [1.0, 0.5])
+@pytest.mark.parametrize("rotary_fraction", [1.0, 0.5])
 # @pytest.mark.parametrize('rotary_fraction', [0.5])
-@pytest.mark.parametrize('inplace', [False, True])
+@pytest.mark.parametrize("inplace", [False, True])
 # @pytest.mark.parametrize('inplace', [False])
 def test_rotary_single_tensor(inplace, rotary_fraction, dtype):
     rtol = 1e-3
@@ -23,12 +23,13 @@ def test_rotary_single_tensor(inplace, rotary_fraction, dtype):
     nheads = 4
     seqlen = 217
     headdim = 128
-    x = torch.randn(batch_size, seqlen, nheads, headdim, dtype=dtype, device='cuda',
-                    requires_grad=True)
+    x = torch.randn(
+        batch_size, seqlen, nheads, headdim, dtype=dtype, device="cuda", requires_grad=True
+    )
     x_pt = x.detach().clone().requires_grad_()
     rotary_dim = int(rotary_fraction * headdim)
     assert rotary_dim % 2 == 0
-    angle = torch.randn(seqlen, rotary_dim // 2, device='cuda')
+    angle = torch.randn(seqlen, rotary_dim // 2, device="cuda")
     cos = torch.cos(angle).to(dtype=dtype)
     sin = torch.sin(angle).to(dtype=dtype)
     out = apply_rotary_emb_func(x, cos, sin, inplace)
