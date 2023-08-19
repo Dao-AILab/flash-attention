@@ -13,7 +13,9 @@ import torch.nn.functional as F
 from transformers import GPT2Config, LlamaConfig
 
 
-def remap_state_dict_meta_llama(state_dict, config):
+def remap_state_dict_meta_llama(
+    state_dict: dict[str, torch.Tensor], config: GPT2Config
+) -> dict[str, torch.Tensor]:
     def key_mapping_layers(key):
         return f"transformer.{key}" if not key.startswith("output.") else key
 
@@ -97,7 +99,9 @@ def remap_state_dict_meta_llama(state_dict, config):
     return state_dict
 
 
-def remap_state_dict_hf_llama(state_dict, config):
+def remap_state_dict_hf_llama(
+    state_dict: dict[str, torch.Tensor], config: GPT2Config
+) -> dict[str, torch.Tensor]:
     """Convert the state_dict in Hugging Face format to standard GPT format."""
     # Embedding
     def key_mapping_emb(key):
@@ -184,7 +188,9 @@ def remap_state_dict_hf_llama(state_dict, config):
     return state_dict
 
 
-def inv_remap_state_dict_hf_llama(state_dict, config):
+def inv_remap_state_dict_hf_llama(
+    state_dict: dict[str, torch.Tensor], config: GPT2Config
+) -> dict[str, torch.Tensor]:
     """Convert the state_dict in standard GPT format to Hugging Face format.
 
     This function is meant to be the inverse of remap_state_dict_hf_llama, up to a
@@ -212,13 +218,10 @@ def inv_remap_state_dict_hf_llama(state_dict, config):
         state_dict["lm_head.weight"] = state_dict["model.embed_tokens.weight"]
     else:
         output_embeddings = state_dict.pop("lm_head.weight")
-        # Need to recompute vocab_size since LLaMa shards the word embeddings and output embeddings
-        # differently.
         vocab_size = (
             math.ceil(output_embeddings.shape[0] / pad_vocab_size_multiple)
             * pad_vocab_size_multiple
         )
-        # It's possible that vocab_size is padded to be a multiple of 8, for example.
         state_dict["lm_head.weight"] = F.pad(
             output_embeddings, (0, 0, 0, vocab_size - output_embeddings.shape[0])
         )
