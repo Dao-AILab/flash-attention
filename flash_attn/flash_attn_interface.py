@@ -1,7 +1,11 @@
-import flash_attn_2_cuda as flash_attn_cuda
 import torch
 import torch.nn as nn
 from einops import rearrange
+
+# isort: off
+# We need to import the CUDA kernels after importing torch
+import flash_attn_2_cuda as flash_attn_cuda
+# isort: on
 
 
 def _get_block_size(device, head_dim, is_dropout, is_causal):
