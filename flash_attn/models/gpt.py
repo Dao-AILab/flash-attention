@@ -670,6 +670,8 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
 def shard_state_dict_tp(state_dict, config, world_size, rank):
     """Convert the state_dict of a standard GPT model to the state_dict of a GPT model
     with tensor parallel.
+
+    This function modifies state_dict in place.
     """
     pad_vocab_size_multiple = getattr(config, "pad_vocab_size_multiple", 1)
     vocab_size = math.ceil(config.vocab_size / pad_vocab_size_multiple) * pad_vocab_size_multiple
