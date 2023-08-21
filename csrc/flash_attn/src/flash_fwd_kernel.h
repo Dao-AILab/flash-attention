@@ -118,7 +118,7 @@ inline __device__ void write_softmax_to_gmem(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_N, bool Is_even_K, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -130,8 +130,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // The thread index.
     const int tidx = threadIdx.x;
-    // The global block index.
-    const int block_id = blockIdx.x + blockIdx.y * gridDim.x + gridDim.x * gridDim.y * blockIdx.z;
 
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
@@ -139,16 +137,60 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     constexpr int kNWarps = Kernel_traits::kNWarps;
     constexpr int MMA_M = kBlockM / decltype(size<0>(typename Kernel_traits::TiledMma::TiledShape_MNK{}))::value;
 
-    const BlockInfo</*Varlen=*/!Is_even_N> binfo(params, bidb);
+    const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q || binfo.actual_seqlen_k == 0) return;
 
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
     if (Is_causal) {
-        n_block_max = std::min(n_block_max, cute::ceil_div(
-                        (m_block + 1) * kBlockM + int(binfo.actual_seqlen_k - binfo.actual_seqlen_q), kBlockN));
+        n_block_max = std::min(n_block_max,
+                               cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q, kBlockN));
         // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
         //     printf("m_block = %d, n_block_max = %d\n", m_block, n_block_max);
         // }
+        // We exit early and write 0 to gO and gLSE.
+        // Otherwise we might read OOB elements from gK and gV.
+        if (n_block_max <= 0) {
+            // Save seed and offset for backward. If we don't have this here, the 0-th thread block might
+            // exit early and no one saves the rng state.
+            if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
+                auto seeds = at::cuda::philox::unpack(params.philox_args);
+                params.rng_state[0] = std::get<0>(seeds);
+                params.rng_state[1] = std::get<1>(seeds);
+            }
+            const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
+                + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
+            const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
+            Tensor gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.o_ptr) + row_offset_o),
+                                    Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                    make_stride(params.o_row_stride, _1{}));
+            Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
+                                      Shape<Int<kBlockM>>{}, Stride<_1>{});
+
+            typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+            auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+            Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+            Tensor tOrO = make_tensor<Element>(shape(tOgO));
+            clear(tOrO);
+            // Construct identity layout for sO
+            Tensor cO = make_identity_tensor(make_shape(size<0>(gO), size<1>(gO)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+            // Repeat the partitioning with identity layouts
+            Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+            Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+            if (!Is_even_K) {
+                #pragma unroll
+                for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
+            }
+            // Clear_OOB_K must be false since we don't want to write zeros to gmem
+            flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+            );
+            #pragma unroll
+            for (int m = 0; m < size<1>(tOgO); ++m) {
+                const int row = get<0>(tOcO(0, m, 0));
+                if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSE(row) = INFINITY; }
+            }
+            return;
+        }
     }
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
@@ -275,8 +317,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     Tensor tQrQ = make_fragment_like(tQgQ);
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
-    flash::copy</*Is_even_MN=*/false, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
-                                                 binfo.actual_seqlen_q - m_block * kBlockM);
+    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
+                                       binfo.actual_seqlen_q - m_block * kBlockM);
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
 
     // // Copy rmem to smem
@@ -298,8 +340,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    flash::copy<Is_even_N, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
-                                      binfo.actual_seqlen_k - n_block * kBlockN);
+    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
+                                       binfo.actual_seqlen_k - n_block * kBlockN);
     cute::cp_async_fence();
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z < 2) { print(tKgK); }
     // __syncthreads();
@@ -317,7 +359,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     unsigned long long offset = std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + tidx % 32;
 
     // Save seed and offset for backward.
-    if (block_id == 0 && tidx == 0) {
+    if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
         params.rng_state[0] = seed;
         params.rng_state[1] = std::get<1>(seeds);
     }
@@ -330,7 +372,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // We also need masking on S if it's causal, for the last ceil_div(kBlockM, kBlockN) blocks.
     // We will have at least 1 "masking" iteration.
 
-    constexpr int n_masking_steps = Is_causal ? cute::ceil_div(kBlockM, kBlockN) : 1;
+    // If not even_N, then seqlen_k might end in the middle of a block. In that case we need to
+    // mask 2 blocks (e.g. when kBlockM == kBlockN), not just 1.
+    constexpr int n_masking_steps = !Is_causal
+        ? 1
+        : (Is_even_MN ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -344,7 +390,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
         } else {
             // Clear the smem tiles to account for predicated off loads
-            flash::copy<Is_even_N, Is_even_K, /*Clear_OOB_MN=*/true>(
+            flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
                 gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
             );
         }
@@ -363,7 +409,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // for rows outside actual_seqlen_k. So those rows could have Inf / NaN, and the matmul
         // can produce Inf / NaN.
         if (!Is_causal) {
-            if (!Is_even_N) { flash::apply_mask(scores, binfo.actual_seqlen_k - n_block * kBlockN); }
+            if (!Is_even_MN) { flash::apply_mask(scores, binfo.actual_seqlen_k - n_block * kBlockN); }
         } else {
             // Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});    // (BLK_M,BLK_N) -> (blk_m,blk_n)
             // Tensor taccScS = thr_mma.partition_C(caccS);                           // (MMA,MMA_M,MMA_N)
@@ -376,9 +422,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             // Idk why it's get<1> and not get<0> of the stride.
             // if (cute::thread0()) { print(idx_row.layout()); print(stride<1>(idx_row)); printf("stride = %d \n", get<1>(stride<1>(idx_row))); }
             // I can't get the stride from idx_row
-            flash::apply_mask_causal(scores, n_block * kBlockN, binfo.actual_seqlen_q, binfo.actual_seqlen_k,
+            flash::apply_mask_causal(scores, n_block * kBlockN, binfo.actual_seqlen_k,
                                      // m_block * kBlockM + get<0>(idx_row(0)),
                                      m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                                     binfo.actual_seqlen_q,
                                      kNWarps * 16);
                                      // m_block * kBlockM + (tidx / 32) * 16, kNWarps * 16);
                                      // m_block * kBlockM + (tidx / 32) * (kBlockM / kNWarps), 16);
@@ -405,8 +452,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-        uint32_t block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
-        uint32_t block_col_idx = n_block * (kBlockN / 32);
+        int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
+        int block_col_idx = n_block * (kBlockN / 32);
         if (Return_softmax) {
             Tensor tOrP_copy = make_fragment_like(tOrP);
             cute::copy(tOrP, tOrP_copy);
@@ -468,8 +515,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-        uint32_t block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
-        uint32_t block_col_idx = n_block * (kBlockN / 32);
+        int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
+        int block_col_idx = n_block * (kBlockN / 32);
         if (Return_softmax) {
             Tensor tOrP_copy = make_fragment_like(tOrP);
             cute::copy(tOrP, tOrP_copy);
@@ -563,14 +610,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
     }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    flash::copy</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+    flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
     );
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_N, bool Is_even_K, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -586,7 +633,7 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_even_N, Is_even_K, Return_softmax>(params, bidb, bidh, m_block);
+    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, Return_softmax>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
