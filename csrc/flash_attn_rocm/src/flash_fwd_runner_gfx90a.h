@@ -39,17 +39,19 @@ class FlashFwdRunner {
       is_deterministic_(launch_params.params.is_deterministic),
       is_performance_mode_(launch_params.params.is_performance_mode) {}
  
-  template <bool kIsQLoop, int kHeadDim, typename T, bool kIsCausal>
-  void Run();
+  template <bool kIsQLoop, int kHeadDim, typename T, bool kIsCausal, bool kIsPadding>
+  void Run(bool is_dropout);
  
  private:
   template <template <typename> typename DeviceGemmTemplate,
             typename T, 
+            device_gemm_trait::GemmSpec kGemmSpec,
             device_gemm_trait::MaskingSpec kMaskingSpec, 
             bool kIsDeterministic>
   void run_() {
     // input, output, gemm, dropout, cshuffle, masking specialization, deterministic
     using DeviceGemmTraits = device_gemm_trait::Forward<T,
+                                                        kGemmSpec,
                                                         kMaskingSpec, 
                                                         kIsDeterministic>;
     using DeviceGemmInstance = DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>;

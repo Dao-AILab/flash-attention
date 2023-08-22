@@ -115,6 +115,7 @@ struct FlashFwdParams : public QkvParams {
   bool is_performance_mode;
   bool is_deterministic;
   bool is_using_qloop;
+  bool is_mnko_padding;
 };
 
 struct FlashBwdParams : public FlashFwdParams {

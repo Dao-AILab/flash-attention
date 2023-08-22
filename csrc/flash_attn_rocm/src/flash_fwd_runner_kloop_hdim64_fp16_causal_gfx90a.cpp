@@ -26,10 +26,23 @@
 namespace fwd_device_gemm {
 // hdim 64, fp16, causal
 template <>
-void FlashFwdRunner::Run<false, 64, device_gemm_trait::Float16, true>() {
+void FlashFwdRunner::Run<false, 64, device_gemm_trait::Float16, true, true>(bool is_dropout) {
   BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
     this->template run_<DeviceGemmKLoopHeadDim64,
                   device_gemm_trait::Float16, 
+                  device_gemm_trait::kGemmSpecPadding,
+                  device_gemm_trait::kMaskingSpecCausal,
+                  kIsDeterministic>();
+  });
+} // FlashFwdRunner::Run()
+
+// hdim 64, fp16, causal, non-padding
+template <>
+void FlashFwdRunner::Run<false, 64, device_gemm_trait::Float16, true, false>(bool is_dropout) {
+  BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
+    this->template run_<DeviceGemmKLoopHeadDim64,
+                  device_gemm_trait::Float16, 
+                  device_gemm_trait::kGemmSpecDefault,
                   device_gemm_trait::kMaskingSpecCausal,
                   kIsDeterministic>();
   });
