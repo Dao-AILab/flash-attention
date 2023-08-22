@@ -1,4 +1,4 @@
-__version__ = "2.0.8"
+__version__ = "2.0.9"
 
 from flash_attn.flash_attn_interface import (
     flash_attn_func,
