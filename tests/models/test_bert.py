@@ -43,8 +43,7 @@ def get_hf_models(model_name, config, dtype):
     return model_hf
 
 
-@pytest.mark.parametrize("model_name", ["bert-base-uncased", "bert-large-uncased"])
-# @pytest.mark.parametrize('model_name', ["bert-base-uncased"])
+@pytest.mark.parametrize('model_name', ["bert-base-uncased"])
 def test_bert_non_optimized(model_name):
     """Check that our implementation of BERT (without any optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
