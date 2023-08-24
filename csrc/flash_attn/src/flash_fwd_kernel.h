@@ -396,7 +396,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             cute::cp_async_fence();
         }
 
-        flash::apply_alibi(scores, n_block * kBlockN, bidh, params.scale_softmax);
+        flash::apply_alibi(scores, n_block * kBlockN, bidh, params.h, params.scale_softmax);
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
         masking_step == 0
@@ -466,7 +466,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
-        flash::apply_alibi(scores, n_block * kBlockN, bidh, params.scale_softmax);
+        flash::apply_alibi(scores, n_block * kBlockN, bidh, params.h, params.scale_softmax);
         
         softmax_rescale_o</*Is_first=*/false>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
 
