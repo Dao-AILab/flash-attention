@@ -111,6 +111,7 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
         rotary_emb_scale_base=rotary_emb_scale_base,
         rotary_emb_interleaved=rotary_emb_interleaved,
         use_flash_attn=use_flash_attn,
+        checkpointing=getattr(config, "gradient_checkpointing", False),
         **serial_kwargs,
         **parallel_kwargs,
         **factory_kwargs,
