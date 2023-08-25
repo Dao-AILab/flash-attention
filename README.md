@@ -141,26 +141,28 @@ flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False)
 If seqlen_q != seqlen_k and causal=True, the causal mask is aligned to the
 bottom right corner of the attention matrix, instead of the top-left corner.
 
-For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
-v2.0:
-    1 0 0 0 0
-    1 1 0 0 0
-v2.1:
-    1 1 1 1 0
-    1 1 1 1 1
-If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
-v2.0:
-    1 0
-    1 1
-    1 1
-    1 1
-    1 1
-v2.1:
-    0 0
-    0 0
-    0 0
-    1 0
-    1 1
+For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 =
+masked out) is:  
+v2.0:  
+    1 0 0 0 0  
+    1 1 0 0 0  
+v2.1:  
+    1 1 1 1 0  
+    1 1 1 1 1  
+
+If seqlen_q = 5 and seqlen_k = 2, the causal mask is:  
+v2.0:  
+    1 0  
+    1 1  
+    1 1  
+    1 1  
+    1 1  
+v2.1:  
+    0 0  
+    0 0  
+    0 0  
+    1 0  
+    1 1  
 If the row of the mask is all zero, the output will be zero.
 
 ## Performance
