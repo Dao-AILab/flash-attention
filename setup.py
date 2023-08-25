@@ -184,6 +184,7 @@ if not SKIP_CUDA_BUILD:
                         "-U__CUDA_NO_HALF_CONVERSIONS__",
                         "-U__CUDA_NO_HALF2_OPERATORS__",
                         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                        "-D__STDC_FORMAT_MACROS", # workaround for https://github.com/NVIDIA/cutlass/issues/1066
                         "--expt-relaxed-constexpr",
                         "--expt-extended-lambda",
                         "--use_fast_math",
