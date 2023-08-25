@@ -574,6 +574,7 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.process_group = process_group
         self.transformer = GPTModel(config, process_group=process_group, **factory_kwargs)
+        self.device = torch.device(device)
         self.tie_word_embeddings = getattr(config, "tie_word_embeddings", True)
         lm_head_bias = getattr(config, "lm_head_bias", False)
         pad_vocab_size_multiple = getattr(config, "pad_vocab_size_multiple", 1)
@@ -621,7 +622,7 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
             batch_size, max_seqlen, dtype=dtype, **kwargs
         )
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, last_token_only=False):
+    def forward(self, input_ids, position_ids=None, inference_params=None, last_token_only=False, **kwargs):
         """
         inference_params: for generation. Adapted from Megatron-LM (and Apex)
         https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
