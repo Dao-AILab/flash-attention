@@ -11,9 +11,8 @@ RUN cd /workspace/triton/python \
 # git clone flash-attention and checkout branch benchmark_openai_triton_amd
 RUN git clone -b benchmark_openai_triton_amd https://github.com/zhanglx13/flash-attention.git
 
-# install gitpython
 RUN pip install gitpython
-# install bc
 RUN apt install bc
+RUN pip install einops
 
 ENV PYTHONPATH "/workspace/flash-attention"
