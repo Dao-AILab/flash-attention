@@ -9,7 +9,7 @@ RUN cd /workspace/triton/python \
     && pip install -e .
 
 # git clone flash-attention and checkout branch benchmark_openai_triton_amd
-RUN git clone -b benchmark_openai_triton_amd https://github.com/Dao-AILab/flash-attention.git
+RUN git clone -b benchmark_openai_triton_amd https://github.com/zhanglx/flash-attention.git
 
 # install gitpython
 RUN pip install gitpython
