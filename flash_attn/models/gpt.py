@@ -621,18 +621,17 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
             batch_size, max_seqlen, dtype=dtype, **kwargs
         )
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, last_token_only=False):
+    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0):
         """
         inference_params: for generation. Adapted from Megatron-LM (and Apex)
         https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
-        last_token_only: whether to return the logit for the last token only,
-            of shape (batch_size, vocab_size)
+        num_last_tokens: if > 0, only return the logits for the last n tokens
         """
         hidden_states = self.transformer(
             input_ids, position_ids=position_ids, inference_params=inference_params
         )
-        if last_token_only:
-            hidden_states = hidden_states[:, -1]
+        if num_last_tokens > 0:
+            hidden_states = hidden_states[:, -num_last_tokens:]
         if self.project_out is not None:
             hidden_states = self.project_out(hidden_states)
         lm_logits = self.lm_head(hidden_states)

@@ -355,8 +355,6 @@ def test_gpt2_multiple_token_generation(model_name, optimized):
         config.fused_dropout_add_ln = True
     # fused_ft_kernel currently doesn't work with multiple tokens at a time
 
-    # if not rotary, we load the weight from HF but ignore the position embeddings.
-    # The model would be nonsense but it doesn't matter for the test.
     model = GPTLMHeadModel.from_pretrained(model_name, config, device=device, dtype=dtype)
     model.eval()
 
