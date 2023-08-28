@@ -368,11 +368,79 @@ def test_gpt2_multiple_token_generation(model_name, optimized):
     logits_10 = model(input_ids[:, :10], inference_params=inference_params).logits
     inference_params.sequence_len_offset += 10
     position_ids = torch.arange(10, 14, dtype=torch.long, device=device)
-    logits_1014 = model(input_ids[:, 10:14], position_ids=position_ids, inference_params=inference_params).logits
+    logits_1014 = model(
+        input_ids[:, 10:14], position_ids=position_ids, inference_params=inference_params
+    ).logits
     inference_params.sequence_len_offset += 4
     position_ids = torch.arange(14, 20, dtype=torch.long, device=device)
-    logits_1420 = model(input_ids[:, 14:20], position_ids=position_ids, inference_params=inference_params).logits
+    logits_1420 = model(
+        input_ids[:, 14:20], position_ids=position_ids, inference_params=inference_params
+    ).logits
     logits = torch.cat([logits_10, logits_1014, logits_1420], dim=1)
     print(f"Logits max diff: {(logits - logits_ref).abs().max().item()}")
     print(f"Logits mean diff: {(logits - logits_ref).abs().mean().item()}")
     assert torch.allclose(logits, logits_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("fused_ft_kernel, cg", [(False, False), (True, False), (True, True)])
+# @pytest.mark.parametrize("fused_ft_kernel, cg", [(True, True)])
+# @pytest.mark.parametrize("optimized", [False, True])
+@pytest.mark.parametrize("optimized", [True])
+# @pytest.mark.parametrize("model_name", ["gpt2-medium"])
+@pytest.mark.parametrize("model_name", ["gpt2-xl"])
+def test_gpt2_speculative_decoding(model_name, optimized, fused_ft_kernel, cg):
+    dtype = torch.float16
+    device = "cuda"
+    rtol, atol = 3e-3, 3e-1
+    config = GPT2Config.from_pretrained(model_name)
+    config.residual_in_fp32 = True
+    if optimized:
+        config.use_flash_attn = True
+        config.fused_bias_fc = True
+        config.fused_mlp = True
+        config.fused_dropout_add_ln = True
+    config_draft = GPT2Config.from_pretrained("gpt2")
+    config_draft.residual_in_fp32 = True
+    if optimized:
+        config_draft.use_flash_attn = True
+        config_draft.fused_bias_fc = True
+        config_draft.fused_mlp = True
+        config_draft.fused_dropout_add_ln = True
+
+    model = GPTLMHeadModel.from_pretrained(model_name, config, device=device, dtype=dtype)
+    model.eval()
+    model_draft = GPTLMHeadModel.from_pretrained("gpt2", config_draft, device=device, dtype=dtype)
+    model_draft.eval()
+
+    torch.manual_seed(0)
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    input_ids = tokenizer("Hello, my dog is cute and he", return_tensors="pt").input_ids.to(
+        device=device
+    )
+    max_length = 100
+
+    from flash_attn.utils.generation import decode_speculative
+
+    torch.manual_seed(42)
+    out = decode_speculative(
+        input_ids,
+        model,
+        model_draft,
+        max_length=max_length,
+        top_k=5,
+        fused_ft_kernel=fused_ft_kernel,
+        cg=cg,
+        speculative_lookahead=4,
+        timing=True,
+    )
+    print(tokenizer.batch_decode(out.sequences))
+    out_og = model.generate(
+        input_ids,
+        max_length=max_length,
+        top_k=5,
+        fused_ft_kernel=fused_ft_kernel,
+        cg=False,
+        timing=True,
+        return_dict_in_generate=True,
+    )
+    print(tokenizer.batch_decode(out_og.sequences))
