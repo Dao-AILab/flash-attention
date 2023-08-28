@@ -31,9 +31,7 @@
     size_t smem_sz = mmha::smem_size_in_bytes<T, DO_CROSS_ATTENTION>(params, THDS_PER_VALUE, THDS_PER_BLOCK);          \
     auto kernel = mmha::masked_multihead_attention_kernel<T, Dh, Dh_MAX, THDS_PER_KEY, THDS_PER_VALUE,                 \
                                                           THDS_PER_BLOCK, DO_CROSS_ATTENTION>;                         \
-    if (smem_sz >= 48 * 1024) {                                                                                        \
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_sz);                            \
-    }                                                                                                                  \
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_sz);                                \
     dim3 grid(params.nnz_head_idx == nullptr ? params.num_heads : params.nnz_heads, params.batch_size);                \
     kernel<<<grid, THDS_PER_BLOCK, smem_sz, stream>>>(params)
 
