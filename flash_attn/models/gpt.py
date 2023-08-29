@@ -578,7 +578,6 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.process_group = process_group
         self.transformer = GPTModel(config, process_group=process_group, **factory_kwargs)
-        self.device = torch.device(device)
         self.tie_word_embeddings = getattr(config, "tie_word_embeddings", True)
         lm_head_bias = getattr(config, "lm_head_bias", False)
         pad_vocab_size_multiple = getattr(config, "pad_vocab_size_multiple", 1)
