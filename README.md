@@ -255,7 +255,7 @@ If you use this codebase, or otherwise found our work valuable, please cite:
   year={2022}
 }
 @article{dao2023flashattention2,
-  title={Flash{A}ttention-2: Faster Attention with Better Parallelism and Work Partitioning,
+  title={Flash{A}ttention-2: Faster Attention with Better Parallelism and Work Partitioning},
   author={Dao, Tri},
   year={2023}
 }
