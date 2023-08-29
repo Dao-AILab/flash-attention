@@ -124,46 +124,50 @@ def unpad_input(hidden_states, attention_mask):
 
 def unpad_input_for_concatenated_sequences(hidden_states, attention_mask_in_length):
     """
+    Supports concatenating short samples in one sequence. The attention_mask_in_length is utilized to mask other short samples. It helps efficient training of variant lengths-based samples (e.g., the supervised fine-tuning task in large language model).
+    The motivation for this function is explained [here](https://github.com/Dao-AILab/flash-attention/issues/432#issuecomment-1668822286).
+    
+    For example, if batch = 3 and seqlen = 6, the attention_mask_in_length is:
+        ```
+        [
+          [2, 3, 0, 0, 0, 0],
+          [3, 2, 0, 0, 0, 0],
+          [6, 0, 0, 0, 0, 0]
+        ]
+        ```
+    , which refers to the 3D-attention mask:
+        ```
+        [
+          [
+            [1, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0],
+            [0, 0, 1, 1, 0, 0],
+            [0, 0, 1, 1, 1, 0],
+            [0, 0, 0, 0, 0, 1]
+          ],
+          [
+            [1, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 1, 1, 0],
+            [0, 0, 0, 0, 0, 1]
+          ],
+          [
+            [1, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1]
+          ]
+        ]
+        ```.
+
     Arguments:
         hidden_states: (batch, seqlen, ...)
         attention_mask_in_length: (batch, seqlen), int, a nonzero number (e.g., 1, 2, 3, etc.) means length of concatenated sequence in b-th batch, and 0 means none.
-                For example, if batch=3 and seqlen=6,
-                ```
-                [
-                  [2, 3, 0, 0, 0, 0],
-                  [3, 2, 0, 0, 0, 0],
-                  [6, 0, 0, 0, 0, 0]
-                ]
-                ```
-                refers to the 3D-attention mask,
-                ```
-                [
-                  [
-                    [1, 0, 0, 0, 0, 0],
-                    [1, 1, 0, 0, 0, 0],
-                    [0, 0, 1, 0, 0, 0],
-                    [0, 0, 1, 1, 0, 0],
-                    [0, 0, 1, 1, 1, 0],
-                    [0, 0, 0, 0, 0, 1]
-                  ],
-                  [
-                    [1, 0, 0, 0, 0, 0],
-                    [1, 1, 0, 0, 0, 0],
-                    [1, 1, 1, 0, 0, 0],
-                    [0, 0, 0, 1, 0, 0],
-                    [0, 0, 0, 1, 1, 0],
-                    [0, 0, 0, 0, 0, 1]
-                  ],
-                  [
-                    [1, 0, 0, 0, 0, 0],
-                    [1, 1, 0, 0, 0, 0],
-                    [1, 1, 1, 0, 0, 0],
-                    [1, 1, 1, 1, 0, 0],
-                    [1, 1, 1, 1, 1, 0],
-                    [1, 1, 1, 1, 1, 1]
-                  ]
-                ]
-                ```.
     Return:
         hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
         cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
