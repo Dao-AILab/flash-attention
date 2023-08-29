@@ -15,6 +15,17 @@ __global__ void flash_fwd_kernel(Flash_fwd_params params) {
     flash::compute_attn<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, Return_softmax>(params);
 }
 
+template<typename Kernel_traits, bool Is_causal, bool Is_even_MN, bool Is_even_K>
+__global__ void flash_fwd_splitkv_kernel(Flash_fwd_params params) {
+    flash::compute_attn_splitkv<Kernel_traits, Is_causal, Is_even_MN, Is_even_K>(params);
+}
+
+template<typename Kernel_traits, int Log_max_splits, bool Is_even_K>
+__global__ void flash_fwd_splitkv_combine_kernel(Flash_fwd_params params) {
+    static_assert(Log_max_splits >= 1);
+    flash::combine_attn_seqk_parallel<Kernel_traits, Log_max_splits, Is_even_K>(params);
+}
+
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
@@ -35,19 +46,78 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 // Will only return softmax if dropout, to reduce compilation time.
                 auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal, IsEvenMNConst, IsEvenKConst, ReturnSoftmaxConst && Is_dropout>;
                 // auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal, IsEvenMNConst, true, ReturnSoftmaxConst && Is_dropout>;
-                if (smem_size >= 48 * 1024) {
+                if constexpr(smem_size >= 48 * 1024) {
                     C10_CUDA_CHECK(cudaFuncSetAttribute(
                         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                 }
-                int ctas_per_sm;
-                cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                    &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
+                // int ctas_per_sm;
+                // cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                //     &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
                 // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
                 kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             });
         });
     });
+}
+
+template<typename Kernel_traits>
+void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr size_t smem_size = Kernel_traits::kSmemSize;
+    const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+    dim3 grid(num_m_block, params.num_splits, params.b * params.h);
+    const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
+    const bool is_even_K = params.d == Kernel_traits::kHeadDim;
+    // TODO: do we want to guarantee that seqlen_q <= seqlen_k? That would simplify the kernel a bit.
+    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
+            BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
+                auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, IsEvenMNConst, IsEvenKConst>;
+                // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, IsEvenKConst>;
+                if constexpr(smem_size >= 48 * 1024) {
+                    C10_CUDA_CHECK(cudaFuncSetAttribute(
+                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                }
+                kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+            });
+        });
+    });
+    dim3 grid_combine((params.b * params.h * params.seqlen_q + 16 - 1) / 16);
+    BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
+        if (params.num_splits <= 2) {
+            flash_fwd_splitkv_combine_kernel<Kernel_traits, 1, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+        } else if (params.num_splits <= 4) {
+            flash_fwd_splitkv_combine_kernel<Kernel_traits, 2, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+        } else if (params.num_splits <= 8) {
+            flash_fwd_splitkv_combine_kernel<Kernel_traits, 3, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+        } else if (params.num_splits <= 16) {
+            flash_fwd_splitkv_combine_kernel<Kernel_traits, 4, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+        } else if (params.num_splits <= 32) {
+            flash_fwd_splitkv_combine_kernel<Kernel_traits, 5, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+        } else if (params.num_splits <= 64) {
+            flash_fwd_splitkv_combine_kernel<Kernel_traits, 6, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+        // } else if (params.num_splits <= 128) {
+        //     flash_fwd_splitkv_combine_kernel<Kernel_traits, 7, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    });
+}
+
+template<typename T, int Headdim>
+void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    bool is_sm8x = dprops->major == 8 && dprops->minor > 0;
+    constexpr int kBlockM = 64;  // Fixed for all head dimensions
+    if (!is_sm8x) {   // A100, H100
+        // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,
+        // and for headdim 192 with block size 64 x 128.
+        constexpr int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 160 ? 128 : 64);
+        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>>(params, stream);
+    } else {  // Only 99KB of smem, so we have to set kBlockN smaller for Headdim 160 and above
+        constexpr int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
+        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>>(params, stream);
+    }
 }
 
 template<typename T>

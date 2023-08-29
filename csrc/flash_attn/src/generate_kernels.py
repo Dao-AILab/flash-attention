@@ -16,14 +16,21 @@ DTYPE_MAP = {
 
 SM = [80]  # Sm80 kernels support up to
 HEAD_DIMENSIONS = [32, 64, 96, 128, 160, 192, 224, 256]
-KERNEL_IMPL_TEMPLATE_FWD = """
+KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_launch_template.h"
+
 template<>
 void run_mha_fwd_<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t stream) {{
     run_mha_fwd_hdim{HEAD_DIM}<{DTYPE}>(params, stream);
 }}
 """
 
-KERNEL_IMPL_TEMPLATE_BWD = """
+KERNEL_IMPL_TEMPLATE_FWD_SPLIT = """#include "flash_fwd_launch_template.h"
+
+template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t stream);
+"""
+
+KERNEL_IMPL_TEMPLATE_BWD = """#include "flash_bwd_launch_template.h"
+
 template<>
 void run_mha_bwd_<{DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {{
     run_mha_bwd_hdim{HEAD_DIM}<{DTYPE}>(params, stream, configure);
@@ -44,8 +51,12 @@ class Kernel:
             return KERNEL_IMPL_TEMPLATE_FWD.format(
                 DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
             )
-        else:
+        elif self.direction == "bwd":
             return KERNEL_IMPL_TEMPLATE_BWD.format(
+                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
+            )
+        else:
+            return KERNEL_IMPL_TEMPLATE_FWD_SPLIT.format(
                 DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
             )
 
@@ -56,7 +67,7 @@ class Kernel:
 
 def get_all_kernels() -> List[Kernel]:
     for dtype, head_dim, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SM):
-        for direction in ["fwd", "bwd"]:
+        for direction in ["fwd", "bwd", "fwd_split"]:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, direction=direction)
 
 
@@ -65,8 +76,7 @@ def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:
 // Splitting the different head dimensions to different files to speed up compilation.
 // This file is auto-generated. See "generate_kernels.py"\n
 """
-    include = f'#include "flash_{kernel.direction}_launch_template.h"\n'
-    (autogen_dir / kernel.filename).write_text(prelude + include + kernel.template)
+    (autogen_dir / kernel.filename).write_text(prelude + kernel.template)
 
 
 def main(output_dir: Optional[str]) -> None:
