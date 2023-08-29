@@ -134,7 +134,7 @@ if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.
 
 # raise_if_cuda_home_none("flash_attn")
 # # Check, if CUDA11 is installed for compute capability 8.0
-cc_flag = ["-DBUILD_PYTHON_PACKAGE", f"-DFLASH_ATTENTION_INTERNAL_USE_RTN={os.environ.get('FLASH_ATTENTION_INTERNAL_USE_RTN', 1)}"]
+cc_flag = ["-DBUILD_PYTHON_PACKAGE", f"-DFLASH_ATTENTION_INTERNAL_USE_RTN={os.environ.get('FLASH_ATTENTION_INTERNAL_USE_RTN', 0)}"]
 # _, bare_metal_major, _ = get_cuda_bare_metal_version(CUDA_HOME)
 # if int(bare_metal_major) < 11:
 #     raise RuntimeError("FlashAttention is only supported on CUDA 11")
