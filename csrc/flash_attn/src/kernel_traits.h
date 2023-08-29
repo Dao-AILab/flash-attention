@@ -113,7 +113,8 @@ struct Flash_fwd_kernel_traits : public Base {
     using SmemLayoutO = decltype(tile_to_shape(
         SmemLayoutAtomO{},
         Shape<Int<kBlockM>, Int<kHeadDim>>{}));
-    using SmemCopyAtomO = Copy_Atom<DefaultCopy, elem_type>;
+    using SmemCopyAtomO = Copy_Atom<DefaultCopy, Element>;
+    using SmemCopyAtomOaccum = Copy_Atom<DefaultCopy, ElementAccum>;
 
     static constexpr int kSmemQCount = size(SmemLayoutQ{});
     static constexpr int kSmemKVCount = size(SmemLayoutKV{}) * 2;
@@ -158,6 +159,17 @@ struct Flash_fwd_kernel_traits : public Base {
                         GmemLayoutAtomP{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
 
+    using GmemLayoutAtomOaccum = std::conditional_t<
+        kBlockKSmem == 32,
+        Layout<Shape <_16, _8>,  // Thread layout, 8 threads per row
+               Stride< _8, _1>>,
+        Layout<Shape <_8, _16>,  // Thread layout, 16 threads per row
+               Stride< _16, _1>>
+    >;
+    using GmemTiledCopyOaccum = decltype(
+        make_tiled_copy(Copy_Atom<DefaultCopy, ElementAccum>{},
+                        GmemLayoutAtomOaccum{},
+                        Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
 };
 
 // Is_V_in_regs is an option to reduce smem usage, but will increase register pressue.

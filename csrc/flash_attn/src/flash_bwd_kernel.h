@@ -659,46 +659,14 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     tdQgdQaccum.data() = tdQgdQaccum.data() + kBlockM * params.d_rounded;
 
     int m_block = m_block_max - 1;
-    int m_block_min = !Is_causal ? 0 : (n_block * kBlockN - int(binfo.actual_seqlen_k - binfo.actual_seqlen_q)) / kBlockM;
-    m_block_min = m_block_min < 0 ? 0 : m_block_min;
-
-    // We might need to exit early and write 0 to dK and dV.
-    // Otherwise we get wrong result for the case where we don't enter the for loop.
-    // And we might read OOB elements from gQ and gdO.
-    // TODO: what if we're not parallelizing, do we need to compute dot_do_o?
-    if (Is_causal && m_block < m_block_min) {
-        const index_t row_offset_dk = binfo.k_offset(params.dk_batch_stride, params.dk_row_stride, bidb)
-          + n_block * kBlockN * params.dk_row_stride + bidh * params.dk_head_stride;
-        const index_t row_offset_dv = binfo.k_offset(params.dv_batch_stride, params.dv_row_stride, bidb)
-          + n_block * kBlockN * params.dv_row_stride + bidh * params.dv_head_stride;
-        Tensor gdK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.dk_ptr) + row_offset_dk),
-                                 Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                                 make_stride(params.dk_row_stride, _1{}));
-        Tensor gdV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.dv_ptr) + row_offset_dv),
-                                 Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                                 make_stride(params.dv_row_stride, _1{}));
-        typename Kernel_traits::GmemTiledCopydKV gmem_tiled_copy_dKV;
-        auto gmem_thr_copy_dKV = gmem_tiled_copy_dKV.get_thread_slice(tidx);
-        Tensor tdKgdK = gmem_thr_copy_dKV.partition_D(gdK);
-        Tensor tdVgdV = gmem_thr_copy_dKV.partition_D(gdV);
-        Tensor tdKrdK = make_tensor<Element>(shape(tdKgdK));
-        Tensor tdVrdV = make_tensor<Element>(shape(tdVgdV));
-        clear(tdKrdK);
-        clear(tdVrdV);
-        Tensor cdKV = make_identity_tensor(make_shape(size<0>(gdK), size<1>(gdK)));    // (BLK_N,BLK_K) -> (blk_n,blk_k)
-        Tensor tdKVcdKV = gmem_thr_copy_dKV.partition_D(cdKV);
-        Tensor tdKVpdKV = make_tensor<bool>(make_shape(size<2>(tdKgdK)));
-        #pragma unroll
-        for (int k = 0; k < size(tdKVpdKV); ++k) { tdKVpdKV(k) = get<1>(tdKVcdKV(0, 0, k)) < params.d; }
-        // Clear_OOB_K must be false since we don't want to write zeros to gmem
-        flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-            gmem_tiled_copy_dKV, tdKrdK, tdKgdK, tdKVcdKV, tdKVpdKV, binfo.actual_seqlen_k - n_block * kBlockN
-        );
-        flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-            gmem_tiled_copy_dKV, tdVrdV, tdVgdV, tdKVcdKV, tdKVpdKV, binfo.actual_seqlen_k - n_block * kBlockN
-        );
-        return;
-    }
+    int m_block_min = !Is_causal ? 0 : std::max(0, (n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k) / kBlockM);
+    // We're guaranteed that m_block_min <= m_block:
+    // We checked earlier that n_block * kBlockN < actual_seqlen_k, so in the causal case,
+    // n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k < actual_seqlen_q.
+    // So m_block_min <= (actual_seqlen_q - 1) / kBlockM.
+    // Recall that m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM) = (actual_seqlen_q + kBlockM - 1) / kBlockM.
+    // So m_block_m - 1 = (actual_seqlen_q - 1) / kBlockM.
+    // We conclude that m_block_min <= m_block, so we will always have at least 1 iteration of the for loop.
 
     if (Double_buffer && m_block % 2 == 1) {  // Double buffer for sQ
         tQsQ.data() = tQsQ.data() + size(sQ);
@@ -743,7 +711,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor lse = make_tensor<ElementAccum>(Shape<Int<decltype(size(taccScS_row))::value>>{});
     #pragma unroll
     for (int mi = 0; mi < size(lse); ++mi) {
-        // Using uint32_t row makes it 10us slower on d=128, not sure why.
         const int row = get<0>(taccScS_row(mi));
         lse(mi) = Is_even_MN || row < binfo.actual_seqlen_q - m_block * kBlockM ? gLSE(row) : 0;
     }
@@ -824,11 +791,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             // TD [2023-08-16]: We need the 2nd condition because if seqlen_q is long and seqlen_k is short
             // (e.g., 256 and 2), the 2nd block of seqlen_q (from 128 to 255), we're not doing causal masking.
             // But we still want to mask out elements beyond actual_seqlen_k.
-            if (m_block * kBlockM < (n_block + 1) * kBlockN
+            if (m_block * kBlockM < (n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k
                 || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k)) {
                 flash::apply_mask_causal(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                                         binfo.actual_seqlen_q, binfo.actual_seqlen_k,
-                                         m_block * kBlockM + get<0>(taccScS_row(0)),
+                                         binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
+                                         binfo.actual_seqlen_q,
                                          // binfo.actual_seqlen_k, m_block * kBlockM + (tidx / 32) % AtomLayoutMS * 16 + (tidx % 32) / 4,
                                          AtomLayoutMS * 16);
             }
@@ -837,11 +804,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // Compute the exponential value.
         flash::scale_apply_exp2</*scale_max=*/false>(scores, lse, params.scale_softmax_log2);
         if (Is_dropout) {
-            uint32_t warp_id = tidx / 32;
-            uint32_t block_row_idx = m_block * (kBlockM / 16) + warp_id % AtomLayoutMS;
+            int warp_id = tidx / 32;
+            int block_row_idx = m_block * (kBlockM / 16) + warp_id % AtomLayoutMS;
             // Need col to be multiples of 32, since we're doing dropout with block of 16 x 32
             static_assert(MMA_N_SdP % 2 == 0);
-            uint32_t block_col_idx = n_block * (kBlockN / 32) + (warp_id / AtomLayoutMS) * (MMA_N_SdP / 2);
+            int block_col_idx = n_block * (kBlockN / 32) + (warp_id / AtomLayoutMS) * (MMA_N_SdP / 2);
             Tensor scores_dropped = make_tensor(scores.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMmaSdP>(scores.layout()));
             flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
                 scores_dropped, params.p_dropout_in_uint8_t, seed, offset,
@@ -1341,7 +1308,6 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
     Tensor lse = make_tensor<ElementAccum>(Shape<Int<decltype(size(taccScS_row))::value>>{});
     #pragma unroll
     for (int mi = 0; mi < size(lse); ++mi) {
-        // Using uint32_t row makes it 10us slower on d=128, not sure why.
         const int row = get<0>(taccScS_row(mi));
         lse(mi) = row < binfo.actual_seqlen_q - m_block * kBlockM ? gLSE(row) : 0;
     }
@@ -1379,18 +1345,19 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
         // the corresponding values of K would be 0, so the result would still be correct.
         if (Is_causal && m_block * kBlockM < (n_block + 1) * kBlockN) {
             flash::apply_mask_causal(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                                     binfo.actual_seqlen_q, binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
+                                     binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
                                      // binfo.actual_seqlen_k, m_block * kBlockM + (tidx / 32) % AtomLayoutMS * 16 + (tidx % 32) / 4,
+                                     binfo.actual_seqlen_q,
                                      AtomLayoutMS * 16);
         }
         // Compute the exponential value.
         flash::scale_apply_exp2</*scale_max=*/false>(scores, lse, params.scale_softmax_log2);
         if (Is_dropout) {
-            uint32_t warp_id = tidx / 32;
-            uint32_t block_row_idx = m_block * (kBlockM / 16) + warp_id % AtomLayoutMS;
+            int warp_id = tidx / 32;
+            int block_row_idx = m_block * (kBlockM / 16) + warp_id % AtomLayoutMS;
             // Need col to be multiples of 32, since we're doing dropout with block of 16 x 32
             static_assert(MMA_N_SdP % 2 == 0);
-            uint32_t block_col_idx = n_block * (kBlockN / 32) + (warp_id / AtomLayoutMS) * (MMA_N_SdP / 2);
+            int block_col_idx = n_block * (kBlockN / 32) + (warp_id / AtomLayoutMS) * (MMA_N_SdP / 2);
             Tensor scores_dropped = make_tensor(scores.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMmaSdP>(scores.layout()));
             flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
                 scores_dropped, params.p_dropout_in_uint8_t, seed, offset,

@@ -15,12 +15,7 @@ from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
 
 # from triton.ops.flash_attention import attention as attention_triton
 
-try:
-    from fav2 import flash_attn_qkvpacked_func as fav2_qkvpacked_func
-    from fav2 import flash_attn_kvpacked_func as fav2_kvpacked_func
-except ImportError:
-    fav2_qkvpacked_func = None
-    fav2_kvpacked_func = None
+from flash_attn import flash_attn_qkvpacked_func, flash_attn_kvpacked_func
 
 try:
     from flash_attn.fused_softmax import scaled_upper_triang_masked_softmax
@@ -80,8 +75,8 @@ def attention_megatron(qkv):
 
 torch.manual_seed(0)
 repeats = 30
-batch_size = 2
-seqlen = 8192
+batch_size = 8
+seqlen = 2048
 nheads = 12
 headdim = 128
 # nheads = 24
@@ -90,8 +85,8 @@ headdim = 128
 # seqlen = 512
 # nheads = 8
 # headdim = 128
-dropout_p = 0.1
-causal = False
+dropout_p = 0.0
+causal = True
 dtype = torch.float16
 device = 'cuda'
 
@@ -100,19 +95,19 @@ qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, device=device, dtype=d
 cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32,
                           device=qkv.device)
 
-# qkv_unpad = rearrange(qkv, 'b s ... -> (b s) ...').detach().requires_grad_(True)
+qkv_unpad = rearrange(qkv, 'b s ... -> (b s) ...').detach().requires_grad_(True)
 # benchmark_all(flash_attn_varlen_qkvpacked_func, qkv_unpad,
 #               cu_seqlens, seqlen, dropout_p, causal=causal, repeats=repeats, desc='FlashAttention')
 # pytorch_profiler(flash_attn_varlen_qkvpacked_func, qkv_unpad,
 #                  cu_seqlens, seqlen, dropout_p, causal=causal, backward=True)
-# if fav2_qkvpacked_func is not None:
-    # benchmark_all(fav2_qkvpacked_func, qkv, dropout_p, causal=causal, repeats=repeats, desc='Fav2')
-    # pytorch_profiler(fav2_qkvpacked_func, qkv, dropout_p, causal=causal, backward=True)
+benchmark_forward(flash_attn_qkvpacked_func, qkv, dropout_p, causal=causal, repeats=repeats, desc='Fav2')
+pytorch_profiler(flash_attn_qkvpacked_func, qkv, dropout_p, causal=causal, backward=False)
 
 # for dropout_p in [0.1, 0.0]:
 #     for causal in [False, True]:
 #         print(f"### {dropout_p = }, {causal = } ###")
 #         pytorch_profiler(fav2_qkvpacked_func, qkv, dropout_p, causal=causal, backward=True)
+
 
 # nheads_k = 2
 # q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype, requires_grad=True)
@@ -151,6 +146,7 @@ cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch
 flops = 4 * batch_size * seqlen ** 2 * nheads * headdim
 ideal_a100_time = flops / 312 / 1e9
 print(f"Ideal A100 fwd time: {ideal_a100_time:.3f}ms, bwd time: {ideal_a100_time * 2.5:.3f}ms")
+exit(0)
 
 
 def time_fwd_bwd(func, *args, **kwargs):

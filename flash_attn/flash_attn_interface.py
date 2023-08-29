@@ -528,6 +528,18 @@ def flash_attn_kvpacked_func(
     For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
     0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
 
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+
     Arguments:
         q: (batch_size, seqlen, nheads, headdim)
         kv: (batch_size, seqlen, 2, nheads_k, headdim)
@@ -558,6 +570,18 @@ def flash_attn_func(
     than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
     For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
     0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
 
     Arguments:
         q: (batch_size, seqlen, nheads, headdim)
@@ -645,6 +669,18 @@ def flash_attn_varlen_kvpacked_func(
     For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
     0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
 
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+
     Arguments:
         q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
         kv: (total_k, 2, nheads_k, headdim), where total_k = total number of key tokens in the batch.
@@ -702,6 +738,18 @@ def flash_attn_varlen_func(
     than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
     For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
     0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
 
     Arguments:
         q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.

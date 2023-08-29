@@ -12,7 +12,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from transformers import GPT2Config
+from transformers.utils import ModelOutput
+from transformers.modeling_utils import ModuleUtilsMixin
+from transformers.integrations import PeftAdapterMixin
 
+from flash_attn.losses.cross_entropy import CrossEntropyLoss
 from flash_attn.models.falcon import remap_state_dict_hf_falcon
 from flash_attn.models.gpt_neox import remap_state_dict_hf_gpt_neox
 from flash_attn.models.gptj import remap_state_dict_hf_gptj
@@ -622,18 +626,17 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
             batch_size, max_seqlen, dtype=dtype, **kwargs
         )
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, last_token_only=False, **kwargs):
+    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0):
         """
         inference_params: for generation. Adapted from Megatron-LM (and Apex)
         https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
-        last_token_only: whether to return the logit for the last token only,
-            of shape (batch_size, vocab_size)
+        num_last_tokens: if > 0, only return the logits for the last n tokens
         """
         hidden_states = self.transformer(
             input_ids, position_ids=position_ids, inference_params=inference_params
         )
-        if last_token_only:
-            hidden_states = hidden_states[:, -1]
+        if num_last_tokens > 0:
+            hidden_states = hidden_states[:, -num_last_tokens:]
         if self.project_out is not None:
             hidden_states = self.project_out(hidden_states)
         lm_logits = self.lm_head(hidden_states)
@@ -669,6 +672,40 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
             state_dict[f"transformer.layers.0.norm1.weight"] = ln_weight
             state_dict[f"transformer.layers.0.norm1.bias"] = ln_bias
         return super().load_state_dict(state_dict, strict=strict)
+
+
+class GPTLMHeadModelHFCompat(GPTLMHeadModel, ModuleUtilsMixin, PeftAdapterMixin):
+    def forward(
+        self,
+        input_ids,
+        position_ids=None,
+        inference_params=None,
+        num_last_tokens=0,
+        labels=None,
+        **kwargs,
+    ):
+        out = super().forward(
+            input_ids,
+            position_ids=position_ids,
+            inference_params=inference_params,
+            num_last_tokens=num_last_tokens,
+        )
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = lm_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(shift_logits, shift_labels)
+        return ModelOutput(
+            logits=out.logits,
+            loss=loss,
+        )
 
 
 def shard_state_dict_tp(state_dict, config, world_size, rank):
