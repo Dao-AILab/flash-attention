@@ -178,9 +178,55 @@ void set_params_dgrad(Flash_bwd_params &params,
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     FP16_SWITCH(!params.is_bf16, [&] {
         FWD_HEADDIM_SWITCH(params.d, [&] {
-            run_mha_fwd_<elem_type, kHeadDim>(params, stream);
+            if (params.num_splits <= 1) {  // If we don't set it num_splits == 0
+                run_mha_fwd_<elem_type, kHeadDim>(params, stream);
+            } else {
+                run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim>(params, stream);
+            }
         });
     });
+}
+
+// Find the number of splits that maximizes the occupancy. For example, if we have
+// batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
+// better than having 3 splits (efficiency = 0.67). However, we also don't want too many
+// splits as that would incur more HBM reads/writes.
+// So we find the best efficiency, then find the smallest number of splits that gets 85%
+// of the best efficiency.
+inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
+    // If we have enough to almost fill the SMs, then just use 1 split
+    if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
+    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
+    float max_efficiency = 0.f;
+    std::vector<float> efficiency;
+    efficiency.reserve(max_splits);
+    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
+    // Some splits are not eligible. For example, if we have 64 blocks and choose 11 splits,
+    // we'll have 6 * 10 + 4 blocks. If we choose 12 splits, we'll have 6 * 11 + (-2) blocks
+    // (i.e. it's 11 splits anyway).
+    // So we check if the number of blocks per split is the same as the previous num_splits.
+    auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
+        return num_splits == 1 || ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1);
+    };
+    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+        if (!is_split_eligible(num_splits)) {
+            efficiency.push_back(0.f);
+        } else {
+            float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
+            float eff = n_waves / ceil(n_waves);
+            // printf("num_splits = %d, eff = %f\n", num_splits, eff);
+            if (eff > max_efficiency) { max_efficiency = eff; }
+            efficiency.push_back(eff);
+        }
+    }
+    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+        if (!is_split_eligible(num_splits)) { continue; }
+        if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
+            // printf("num_splits chosen = %d\n", num_splits);
+            return num_splits;
+        }
+    }
+    return 1;
 }
 
 std::vector<at::Tensor>
@@ -293,6 +339,25 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
                      p_dropout,
                      softmax_scale,
                      is_causal);
+
+    // This needs to match with run_mha_fwd_splitkv_dispatch
+    const int block_n = is_sm90 || is_sm8x
+        ? (head_size <= 64 ? 256 : (head_size <= 160 ? 128 : 64))
+        : (head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64));
+    const int num_n_blocks = (seqlen_k + block_n - 1) / block_n;
+    // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
+    // In any case we don't expect seqlen_q to be larger than 64 for inference.
+    const int num_m_blocks = (seqlen_q + 64 - 1) / 64;
+    params.num_splits = 1;
+    if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
+        params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, dprops->multiProcessorCount, num_n_blocks, 64);
+        if (params.num_splits > 1) {
+            at::Tensor softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+            at::Tensor out_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
+            params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+            params.oaccum_ptr = out_accum.data_ptr();
+        }
+    }
 
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state

@@ -32,8 +32,8 @@ struct BlockInfo {
 
     const int sum_s_q;
     const int sum_s_k;
-    const uint32_t actual_seqlen_q;
-    const uint32_t actual_seqlen_k;
+    const int actual_seqlen_q;
+    const int actual_seqlen_k;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

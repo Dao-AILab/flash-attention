@@ -2,80 +2,100 @@
 
 import math
 import re
-
 from collections import OrderedDict
 
 import torch
 import torch.nn.functional as F
-
 from einops import rearrange
-
 from transformers import GPT2Config, GPTNeoXConfig
 
 
 def remap_state_dict_hf_gpt_neox(state_dict, config):
     def key_mapping_layers(key):
-        return re.sub(r'^gpt_neox.', 'transformer.', key)
+        return re.sub(r"^gpt_neox.", "transformer.", key)
+
     state_dict = OrderedDict((key_mapping_layers(k), v) for k, v in state_dict.items())
     # Word embedding
     def key_mapping_emb(key):
-        return re.sub(r'^transformer.embed_in.', 'transformer.embeddings.word_embeddings.', key)
+        return re.sub(r"^transformer.embed_in.", "transformer.embeddings.word_embeddings.", key)
+
     state_dict = OrderedDict((key_mapping_emb(k), v) for k, v in state_dict.items())
-    word_embeddings = state_dict.pop('transformer.embeddings.word_embeddings.weight')
+    word_embeddings = state_dict.pop("transformer.embeddings.word_embeddings.weight")
     # It's possible that vocab_size is padded to be a multiple of 8, for example.
-    pad_vocab_size_multiple = getattr(config, 'pad_vocab_size_multiple', 1)
-    vocab_size = (math.ceil(config.vocab_size / pad_vocab_size_multiple) * pad_vocab_size_multiple)
-    state_dict['transformer.embeddings.word_embeddings.weight'] = F.pad(
+    pad_vocab_size_multiple = getattr(config, "pad_vocab_size_multiple", 1)
+    vocab_size = math.ceil(config.vocab_size / pad_vocab_size_multiple) * pad_vocab_size_multiple
+    state_dict["transformer.embeddings.word_embeddings.weight"] = F.pad(
         word_embeddings, (0, 0, 0, vocab_size - word_embeddings.shape[0])
     )
-    if getattr(config, 'tie_word_embeddings'):
-        state_dict['lm_head.weight'] = state_dict['transformer.embeddings.word_embeddings.weight']
+    if getattr(config, "tie_word_embeddings"):
+        state_dict["lm_head.weight"] = state_dict["transformer.embeddings.word_embeddings.weight"]
     else:
-        output_embeddings = state_dict.pop('embed_out.weight')
+        output_embeddings = state_dict.pop("embed_out.weight")
         # It's possible that vocab_size is padded to be a multiple of 8, for example.
-        state_dict['lm_head.weight'] = F.pad(
+        state_dict["lm_head.weight"] = F.pad(
             output_embeddings, (0, 0, 0, vocab_size - output_embeddings.shape[0])
         )
 
     # LayerNorm
     def key_mapping_ln(key):
-        key = re.sub(r'^transformer.final_layer_norm.', r'transformer.ln_f.', key)
-        key = re.sub(r'^transformer.layers.(\d+).input_layernorm.', r'transformer.layers.\1.norm1.', key)
-        key = re.sub(r'^transformer.layers.(\d+).post_attention_layernorm.', r'transformer.layers.\1.norm2.', key)
+        key = re.sub(r"^transformer.final_layer_norm.", r"transformer.ln_f.", key)
+        key = re.sub(
+            r"^transformer.layers.(\d+).input_layernorm.", r"transformer.layers.\1.norm1.", key
+        )
+        key = re.sub(
+            r"^transformer.layers.(\d+).post_attention_layernorm.",
+            r"transformer.layers.\1.norm2.",
+            key,
+        )
         return key
+
     state_dict = OrderedDict((key_mapping_ln(k), v) for k, v in state_dict.items())
 
     # MLP
     def key_mapping_mlp(key):
-        key = re.sub(r'^transformer.layers.(\d+).mlp.dense_h_to_4h.', r'transformer.layers.\1.mlp.fc1.', key)
-        key = re.sub(r'^transformer.layers.(\d+).mlp.dense_4h_to_h.', r'transformer.layers.\1.mlp.fc2.', key)
+        key = re.sub(
+            r"^transformer.layers.(\d+).mlp.dense_h_to_4h.", r"transformer.layers.\1.mlp.fc1.", key
+        )
+        key = re.sub(
+            r"^transformer.layers.(\d+).mlp.dense_4h_to_h.", r"transformer.layers.\1.mlp.fc2.", key
+        )
         return key
+
     state_dict = OrderedDict((key_mapping_mlp(k), v) for k, v in state_dict.items())
 
     # Attention
     for l in range(config.n_layer):
         # We don't store these biases
-        state_dict.pop(f'transformer.layers.{l}.attention.bias')
-        state_dict.pop(f'transformer.layers.{l}.attention.masked_bias')
+        state_dict.pop(f"transformer.layers.{l}.attention.bias")
+        state_dict.pop(f"transformer.layers.{l}.attention.masked_bias")
         # GPT-NeoX stores Wqkv as ((nheads 3 headdim), hidden_dim)
         # while we store Wqkv as ((3 nheads headdim), hidden_dim)
         headdim = config.hidden_size // config.num_attention_heads
-        Wqkv = state_dict.pop(f'transformer.layers.{l}.attention.query_key_value.weight')
-        state_dict[f'transformer.layers.{l}.mixer.Wqkv.weight'] = rearrange(
-            Wqkv, '(nheads three headdim) ... -> (three nheads headdim) ...',
-            three=3, headdim=headdim
+        Wqkv = state_dict.pop(f"transformer.layers.{l}.attention.query_key_value.weight")
+        state_dict[f"transformer.layers.{l}.mixer.Wqkv.weight"] = rearrange(
+            Wqkv,
+            "(nheads three headdim) ... -> (three nheads headdim) ...",
+            three=3,
+            headdim=headdim,
         )
-        bqkv = state_dict.pop(f'transformer.layers.{l}.attention.query_key_value.bias')
-        state_dict[f'transformer.layers.{l}.mixer.Wqkv.bias'] = rearrange(
-            bqkv, '(nheads three headdim) -> (three nheads headdim)',
-            three=3, headdim=headdim
+        bqkv = state_dict.pop(f"transformer.layers.{l}.attention.query_key_value.bias")
+        state_dict[f"transformer.layers.{l}.mixer.Wqkv.bias"] = rearrange(
+            bqkv, "(nheads three headdim) -> (three nheads headdim)", three=3, headdim=headdim
         )
+
     def key_mapping_attn(key):
-        key = re.sub(r'^transformer.layers.(\d+).attention.dense.',
-                     r'transformer.layers.\1.mixer.out_proj.', key)
-        key = re.sub(r'^transformer.layers.(\d+).attention.rotary_emb.',
-                     r'transformer.layers.\1.mixer.rotary_emb.', key)
+        key = re.sub(
+            r"^transformer.layers.(\d+).attention.dense.",
+            r"transformer.layers.\1.mixer.out_proj.",
+            key,
+        )
+        key = re.sub(
+            r"^transformer.layers.(\d+).attention.rotary_emb.",
+            r"transformer.layers.\1.mixer.rotary_emb.",
+            key,
+        )
         return key
+
     state_dict = OrderedDict((key_mapping_attn(k), v) for k, v in state_dict.items())
 
     return state_dict
