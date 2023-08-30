@@ -3,7 +3,7 @@ import re
 import pytest
 import torch
 from einops import rearrange
-from flash_attn.models.gpt import GPTLMHeadModel, remap_state_dict_hf_gpt2
+from flash_attn.models.gpt import GPTLMHeadModel, remap_state_dict_hf_gpt2, shard_state_dict_tp, combine_state_dicts_tp
 from flash_attn.utils.generation import InferenceParams
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 from transformers import GPT2Config, GPT2Tokenizer
@@ -444,3 +444,29 @@ def test_gpt2_speculative_decoding(model_name, optimized, fused_ft_kernel, cg):
         return_dict_in_generate=True,
     )
     print(tokenizer.batch_decode(out_og.sequences))
+
+
+@pytest.mark.parametrize("n_heads_q_kv", [
+    (8, 8), # Regular attention
+    (8, 4), # GQA
+    (8, 2), # MQA
+])
+def test_gpt2_shard_unshard(n_heads_q_kv):
+    world_size = 2
+
+    config = GPT2Config.from_pretrained("gpt2")
+    config.vocab_size = 1024
+    config.n_head, config.n_head_kv = n_heads_q_kv
+    model = GPTLMHeadModel(config, device="cuda", dtype=torch.float16)
+    state_dict = model.state_dict()
+    shards = [
+        # NOTE: Shallow copy as `state_dict` is modified in-place
+        shard_state_dict_tp(dict(state_dict), config, world_size, rank)
+        for rank in range(world_size)
+    ]
+    state_dict2 = combine_state_dicts_tp(shards, config)
+    assert state_dict2.keys() == state_dict.keys()
+    for k in state_dict.keys():
+        ref = state_dict[k]
+        new = state_dict[k]
+        assert torch.allclose(ref, new, atol=0.0, rtol=0.0)

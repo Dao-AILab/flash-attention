@@ -735,7 +735,7 @@ class ParallelMHA(nn.Module):
             self.num_heads, self.world_size, self.local_rank
         )
         self.num_heads_kv_per_rank = get_dim_for_local_rank(
-            self.num_heads, self.world_size, self.local_rank
+            self.num_heads_kv, self.world_size, self.local_rank
         )
         self.head_dim = self.embed_dim // num_heads
         qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
@@ -758,7 +758,7 @@ class ParallelMHA(nn.Module):
             process_group,
             bias=qkv_proj_bias,
             sequence_parallel=sequence_parallel,
-            multiple_of=self.head_dim * 3,
+            multiple_of=self.head_dim * (self.num_heads_per_rank + 2 * self.num_heads_kv_per_rank),
             **factory_kwargs,
         )
         inner_attn_cls = FlashSelfAttention if use_flash_attn else SelfAttention
