@@ -397,7 +397,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         if (Is_alibi) {
-            flash::apply_alibi(scores, n_block * kBlockN, bidh, params.h, params.scale_softmax);
+            flash::apply_alibi(scores, n_block * kBlockN, bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
         }
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
@@ -469,7 +469,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (Is_alibi) {
-            flash::apply_alibi(scores, n_block * kBlockN, bidh, params.h, params.scale_softmax);
+            flash::apply_alibi(scores, n_block * kBlockN, bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
         }
         
         softmax_rescale_o</*Is_first=*/false>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);

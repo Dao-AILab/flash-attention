@@ -837,7 +837,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         if (Is_alibi) {
             flash::apply_alibi(scores, 
                                n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16, 
-                               bidh, params.h, params.scale_softmax);
+                               bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
         }
 
         // if (cute::thread(32, 0)) { print(scores); }
@@ -1394,7 +1394,7 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
         if (Is_alibi) {
             flash::apply_alibi(scores, 
                                n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16, 
-                               bidh, params.h, params.scale_softmax);
+                               bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
         }
 
         // Compute the exponential value.
