@@ -96,6 +96,10 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool is_bf16;
     bool is_causal;
+
+    bool is_alibi;
+    float alibi_start;
+    float alibi_ratio;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
