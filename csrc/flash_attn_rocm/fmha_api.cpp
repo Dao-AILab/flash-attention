@@ -114,6 +114,22 @@ void set_params_fprop(FlashFwdParams &params,
     char* lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
     char* s_ptr = reinterpret_cast<char*>(s_d);
 
+    if(q.is_contiguous() && k.is_contiguous() && v.is_contiguous()){  
+        params.q_stride_multiplier = 1;
+        params.kv_stride_multiplier = 1;
+    }
+    else if(q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()){
+        params.q_stride_multiplier = 1;
+        params.kv_stride_multiplier = 2;
+    }
+    else if(!q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()){
+        params.q_stride_multiplier = 3;
+        params.kv_stride_multiplier = 3;
+    }
+    else{
+        std::cout<< "Wrong matrix inputs." <<std::endl;
+    }
+
     for (int i = 0; i < b; i++){
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
         int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, data_type);
@@ -135,32 +151,15 @@ void set_params_fprop(FlashFwdParams &params,
             params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
         }
 
-        if(q.is_contiguous()){
-            params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
-            q_ptr = q_ptr + temp_q_stride;
-        }else{
-            auto q_each_tmp = q.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
-            params.q_tensors.push_back(q_each_tmp);
-            params.q_ptr.push_back(reinterpret_cast<void*>(q_each_tmp.data_ptr()));          
-        }
-        if(k.is_contiguous()){
-            params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr));
-            k_ptr = k_ptr + temp_k_stride;
-        }else{
-            auto k_each_tmp = k.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-            params.k_tensors.push_back(k_each_tmp);
-            params.k_ptr.push_back(reinterpret_cast<void*>(k_each_tmp.data_ptr()));
-        }
+        params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
+        q_ptr = q_ptr + temp_q_stride * params.q_stride_multiplier;
 
-        if(v.is_contiguous()){
-            params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr));     
-            v_ptr = v_ptr + temp_k_stride;
-        }else{
-            auto v_each_tmp = v.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-            params.v_tensors.push_back(v_each_tmp);
-            params.v_ptr.push_back(reinterpret_cast<void*>(v_each_tmp.data_ptr()));
-        }
-        
+        params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr));
+        k_ptr = k_ptr + temp_k_stride * params.kv_stride_multiplier;
+
+        params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr));     
+        v_ptr = v_ptr + temp_k_stride * params.kv_stride_multiplier;
+
         params.o_ptr.push_back(reinterpret_cast<void*>(out_ptr));
         out_ptr = out_ptr + temp_q_stride;
 
@@ -250,6 +249,28 @@ void set_params_dgrad(FlashBwdParams &params,
     char* y_ptr = reinterpret_cast<char*>(y.data_ptr());
     char* lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
     char* ygrad_ptr = reinterpret_cast<char*>(ygrad.data_ptr());
+
+    if(is_performance_mode){
+        if(q.is_contiguous() && k.is_contiguous() && v.is_contiguous()){  
+            params.q_stride_multiplier = 1;
+            params.kv_stride_multiplier = 1;
+        }
+        else if(q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()){
+            params.q_stride_multiplier = 1;
+            params.kv_stride_multiplier = 2;
+        }   
+        else if(!q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()){
+            params.q_stride_multiplier = 3;
+            params.kv_stride_multiplier = 3;
+        }
+        else{
+            std::cout<< "Wrong matrix inputs." <<std::endl;
+        }
+    }
+    else{
+        params.q_stride_multiplier = 1;
+        params.kv_stride_multiplier = 1;
+    }
     
     for (int i = 0; i < b; i++){
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
@@ -258,44 +279,65 @@ void set_params_dgrad(FlashBwdParams &params,
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
         int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, data_type);
         int temp_dk_stride = get_size_in_bytes(d * h * temp_seqlen_k, dk.dtype());
-        if(q.is_contiguous()){
+        if(is_performance_mode){
             params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
-            params.qgrad_ptr.push_back(reinterpret_cast<void*>(dq_ptr));
-            q_ptr = q_ptr + temp_q_stride;
-            dq_ptr = dq_ptr + temp_dq_stride;
-        }else{
-            auto q_each_tmp = q.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
-            auto qgrad_each_tmp = dq.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
-            params.q_tensors.push_back(q_each_tmp);
-            params.qgrad_tensors.push_back(qgrad_each_tmp);
-            params.q_ptr.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
-            params.qgrad_ptr.push_back(reinterpret_cast<void*>(qgrad_each_tmp.data_ptr()));
-        }
-        if(k.is_contiguous()){
+            q_ptr = q_ptr + temp_q_stride * params.q_stride_multiplier;
+
             params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr));
+            k_ptr = k_ptr + temp_k_stride * params.kv_stride_multiplier;
+
+            params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr));     
+            v_ptr = v_ptr + temp_k_stride * params.kv_stride_multiplier;
+
+            params.qgrad_ptr.push_back(reinterpret_cast<void*>(dq_ptr));
+            dq_ptr = dq_ptr + temp_dq_stride * params.q_stride_multiplier;
+
             params.kgrad_ptr.push_back(reinterpret_cast<void*>(dk_ptr));
-            k_ptr = k_ptr + temp_k_stride;
-            dk_ptr = dk_ptr + temp_dk_stride;
-        }else{
-            auto k_each_tmp = k.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-            auto kgrad_each_tmp = dk.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-            params.k_tensors.push_back(k_each_tmp);
-            params.kgrad_tensors.push_back(kgrad_each_tmp);
-            params.k_ptr.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
-            params.kgrad_ptr.push_back(reinterpret_cast<void*>(kgrad_each_tmp.data_ptr()));
-        }
-        if(v.is_contiguous()){
-            params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr)); 
+            dk_ptr = dk_ptr + temp_dk_stride * params.kv_stride_multiplier;
+
             params.vgrad_ptr.push_back(reinterpret_cast<void*>(dv_ptr));
-            v_ptr = v_ptr + temp_k_stride;   
-            dv_ptr = dv_ptr + temp_dk_stride;
-        }else{
-            auto v_each_tmp = v.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-            auto vgrad_each_tmp = dv.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-            params.v_tensors.push_back(v_each_tmp);
-            params.vgrad_tensors.push_back(vgrad_each_tmp);
-            params.v_ptr.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
-            params.vgrad_ptr.push_back(reinterpret_cast<void*>(vgrad_each_tmp.data_ptr()));
+            dv_ptr = dv_ptr + temp_dk_stride * params.kv_stride_multiplier;
+        }
+        else{
+            if(q.is_contiguous()){
+                params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
+                params.qgrad_ptr.push_back(reinterpret_cast<void*>(dq_ptr));
+                q_ptr = q_ptr + temp_q_stride;
+                dq_ptr = dq_ptr + temp_dq_stride;
+            }else{
+                auto q_each_tmp = q.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
+                auto qgrad_each_tmp = dq.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
+                params.q_tensors.push_back(q_each_tmp);
+                params.qgrad_tensors.push_back(qgrad_each_tmp);
+                params.q_ptr.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
+                params.qgrad_ptr.push_back(reinterpret_cast<void*>(qgrad_each_tmp.data_ptr()));
+            }
+            if(k.is_contiguous()){
+                params.k_ptr.push_back(reinterpret_cast<void*>(k_ptr));
+                params.kgrad_ptr.push_back(reinterpret_cast<void*>(dk_ptr));
+                k_ptr = k_ptr + temp_k_stride;
+                dk_ptr = dk_ptr + temp_dk_stride;
+            }else{
+                auto k_each_tmp = k.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
+                auto kgrad_each_tmp = dk.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
+                params.k_tensors.push_back(k_each_tmp);
+                params.kgrad_tensors.push_back(kgrad_each_tmp);
+                params.k_ptr.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
+                params.kgrad_ptr.push_back(reinterpret_cast<void*>(kgrad_each_tmp.data_ptr()));
+            }
+            if(v.is_contiguous()){
+                params.v_ptr.push_back(reinterpret_cast<void*>(v_ptr)); 
+                params.vgrad_ptr.push_back(reinterpret_cast<void*>(dv_ptr));
+                v_ptr = v_ptr + temp_k_stride;   
+                dv_ptr = dv_ptr + temp_dk_stride;
+            }else{
+                auto v_each_tmp = v.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
+                auto vgrad_each_tmp = dv.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
+                params.v_tensors.push_back(v_each_tmp);
+                params.vgrad_tensors.push_back(vgrad_each_tmp);
+                params.v_ptr.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
+                params.vgrad_ptr.push_back(reinterpret_cast<void*>(vgrad_each_tmp.data_ptr()));
+            }
         }
 
         params.z_ptr.push_back(nullptr);
@@ -535,44 +577,62 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     at::Tensor dk_tmp;
     at::Tensor dv_tmp;
 
-    if(is_performance_mode){
-        dq_tmp = dq;
-        dk_tmp = dk;
-        dv_tmp = dv;
-    }else{
+    if (zero_tensors) {
+        dq.zero_();
+        dk.zero_();
+        dv.zero_();
+        // softmax_d.zero_();
+    }
+
+    if(!is_performance_mode){
         dq_tmp = dq.to(torch::kFloat32);
         dk_tmp = dk.to(torch::kFloat32);
         dv_tmp = dv.to(torch::kFloat32);
-    }
-    
-    if (zero_tensors) {
-        dq_tmp.zero_();
-        dk_tmp.zero_();
-        dv_tmp.zero_();
-        // softmax_d.zero_();
     }
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
-    set_params_dgrad(launch_params.params,
-                     batch_size,
-                     max_seqlen_q,
-                     max_seqlen_k,
-                     num_heads,
-                     head_size,
-                     q, k, v, out,
-                     dout, dq_tmp, dk_tmp, dv_tmp,
-                     cu_seqlens_q,
-                     cu_seqlens_k,
-                     nullptr,
-                     softmax_lse.data_ptr(),
-                     p_dropout,
-                     softmax_scale,
-                     is_causal,
-                     is_deterministic,
-                     is_performance_mode,
-                     is_using_qloop);
+    if(is_performance_mode){
+        set_params_dgrad(launch_params.params,
+                         batch_size,
+                         max_seqlen_q,
+                         max_seqlen_k,
+                         num_heads,
+                         head_size,
+                         q, k, v, out,
+                         dout, dq, dk, dv,
+                         cu_seqlens_q,
+                         cu_seqlens_k,
+                         nullptr,
+                         softmax_lse.data_ptr(),
+                         p_dropout,
+                         softmax_scale,
+                         is_causal,
+                         is_deterministic,
+                         is_performance_mode,
+                         is_using_qloop);
+    }
+    else{
+        set_params_dgrad(launch_params.params,
+                         batch_size,
+                         max_seqlen_q,
+                         max_seqlen_k,
+                         num_heads,
+                         head_size,
+                         q, k, v, out,
+                         dout, dq_tmp, dk_tmp, dv_tmp,
+                         cu_seqlens_q,
+                         cu_seqlens_k,
+                         nullptr,
+                         softmax_lse.data_ptr(),
+                         p_dropout,
+                         softmax_scale,
+                         is_causal,
+                         is_deterministic,
+                         is_performance_mode,
+                         is_using_qloop);
+    }
         
     if( is_dropout ) {
         // See Note [Acquire lock when using random generators]
@@ -583,24 +643,27 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     run_flash_bwd(launch_params);
 
-    if(!q.is_contiguous()){
-        dq_tmp.copy_(torch::cat(launch_params.params.qgrad_tensors, 0).contiguous(), true);
+    if(!is_performance_mode){
+        if(!q.is_contiguous()){
+            dq_tmp.copy_(torch::cat(launch_params.params.qgrad_tensors, 0).contiguous(), true);
+        }
+        if(dq.data_ptr() != dq_tmp.data_ptr()){
+            dq.copy_(dq_tmp, true);
+        }
+        if(!k.is_contiguous()){
+            dk_tmp.copy_(torch::cat(launch_params.params.kgrad_tensors, 0).contiguous(), true);
+        }
+        if(dk.data_ptr() != dk_tmp.data_ptr()){
+            dk.copy_(dk_tmp, true);
+        }
+        if(!v.is_contiguous()){
+            dv_tmp.copy_(torch::cat(launch_params.params.vgrad_tensors, 0).contiguous(), true);
+        }
+        if(dv.data_ptr() != dv_tmp.data_ptr()){
+            dv.copy_(dv_tmp, true);
+        }
     }
-    if(dq.data_ptr() != dq_tmp.data_ptr()){
-        dq.copy_(dq_tmp, true);
-    }
-    if(!k.is_contiguous()){
-        dk_tmp.copy_(torch::cat(launch_params.params.kgrad_tensors, 0).contiguous(), true);
-    }
-    if(dk.data_ptr() != dk_tmp.data_ptr()){
-        dk.copy_(dk_tmp, true);
-    }
-    if(!v.is_contiguous()){
-        dv_tmp.copy_(torch::cat(launch_params.params.vgrad_tensors, 0).contiguous(), true);
-    }
-    if(dv.data_ptr() != dv_tmp.data_ptr()){
-        dv.copy_(dv_tmp, true);
-    }
+
     return { dq, dk, dv, softmax_d };
 }
 

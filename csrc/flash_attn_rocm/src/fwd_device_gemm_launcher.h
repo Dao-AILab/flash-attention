@@ -92,19 +92,19 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
     std::vector<ck::index_t> a_gs_ms_ks_lengths{G0, G1, M, K};
     std::vector<ck::index_t> a_gs_ms_ks_strides =
         input_permute
-            ? std::vector<ck::index_t>{M * G1 * K, K, G1 * K, 1} // A layout [G0, M, G1, K]
+            ? std::vector<ck::index_t>{M * G1 * K * params.q_stride_multiplier, K, G1 * K * params.q_stride_multiplier, 1} // A layout [G0, M, G1, K]
             : std::vector<ck::index_t>{G1 * M * K, M * K, K, 1}; // A layout [G0, G1, M, K]
 
     std::vector<ck::index_t> b0_gs_ns_ks_lengths{G0, G1, N, K};
     std::vector<ck::index_t> b0_gs_ns_ks_strides =
         input_permute
-            ? std::vector<ck::index_t>{N * G1 * K, K, G1 * K, 1} // B0 layout [G0, N, G1, K]
+            ? std::vector<ck::index_t>{N * G1 * K * params.kv_stride_multiplier, K, G1 * K * params.kv_stride_multiplier, 1} // B0 layout [G0, N, G1, K]
             : std::vector<ck::index_t>{G1 * N * K, N * K, K, 1}; // B0 layout [G0, G1, N, K]
 
     std::vector<ck::index_t> b1_gs_os_ns_lengths{G0, G1, O, N};
     std::vector<ck::index_t> b1_gs_os_ns_strides =
         input_permute
-            ? std::vector<ck::index_t>{N * G1 * O, O, 1, G1 * O} // B1 layout [G0, N, G1, O]
+            ? std::vector<ck::index_t>{N * G1 * O * params.kv_stride_multiplier, O, 1, G1 * O * params.kv_stride_multiplier} // B1 layout [G0, N, G1, O]
             : std::vector<ck::index_t>{G1 * N * O, N * O, 1, O}; // B1 layout [G0, G1, N, O]
 
     std::vector<ck::index_t> c_gs_ms_os_lengths{G0, G1, M, O};

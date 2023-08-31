@@ -89,34 +89,30 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
     std::vector<ck::index_t> q_gs_ms_ks_lengths{G0, G1, M, K};
     std::vector<ck::index_t> q_gs_ms_ks_strides =
         input_permute
-            ? std::vector<ck::index_t>{M * G1 * K, K, G1 * K, 1}
+            ? std::vector<ck::index_t>{M * G1 * K * params.q_stride_multiplier, K, G1 * K * params.q_stride_multiplier, 1}
             // Q layout [G0, M, G1, K]
-            : std::vector<ck::index_t>{G1 * M * K, M * K, K,
-                                      1}; // Q layout [G0, G1, M, K]
+            : std::vector<ck::index_t>{G1 * M * K, M * K, K, 1}; // Q layout [G0, G1, M, K]
 
     std::vector<ck::index_t> k_gs_ns_ks_lengths{G0, G1, N, K};
     std::vector<ck::index_t> k_gs_ns_ks_strides =
         input_permute
-            ? std::vector<ck::index_t>{N * G1 * K, K, G1 * K, 1}
+            ? std::vector<ck::index_t>{N * G1 * K * params.kv_stride_multiplier, K, G1 * K * params.kv_stride_multiplier, 1}
             // K layout [G0, N, G1, K]
-            : std::vector<ck::index_t>{G1 * N * K, N * K, K,
-                                      1}; // K layout [G0, G1, N, K]
+            : std::vector<ck::index_t>{G1 * N * K, N * K, K, 1}; // K layout [G0, G1, N, K]
 
     std::vector<ck::index_t> v_gs_os_ns_lengths{G0, G1, O, N};
     std::vector<ck::index_t> v_gs_os_ns_strides =
         input_permute
-            ? std::vector<ck::index_t>{N * G1 * O, O, 1, G1 * O}
+            ? std::vector<ck::index_t>{N * G1 * O * params.kv_stride_multiplier, O, 1, G1 * O * params.kv_stride_multiplier}
             // V layout [G0, N, G1, O]
-            : std::vector<ck::index_t>{G1 * N * O, N * O, 1,
-                                      O}; // V layout [G0, G1, N, O]
+            : std::vector<ck::index_t>{G1 * N * O, N * O, 1, O}; // V layout [G0, G1, N, O]
 
     std::vector<ck::index_t> y_gs_ms_os_lengths{G0, G1, M, O};
     std::vector<ck::index_t> y_gs_ms_os_strides =
         output_permute
             ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1}
             // Y layout [G0, M, G1, O]
-            : std::vector<ck::index_t>{G1 * M * O, M * O, O,
-                                      1}; // Y layout [G0, G1, M, O]
+            : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // Y layout [G0, G1, M, O]
 
     std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
     std::vector<ck::index_t> z_gs_ms_ns_strides = 
