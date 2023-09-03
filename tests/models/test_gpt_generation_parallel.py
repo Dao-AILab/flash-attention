@@ -131,6 +131,8 @@ def test_tensor_parallel(model_name, rotary, fused_ft_kernel, world_size):
         )
         print(out_cg.sequences)
 
+    parallel_state.destroy_model_parallel()
+
     if not rotary:
         out_hf = model_hf.generate(
             input_ids=input_ids,
@@ -171,5 +173,3 @@ def test_tensor_parallel(model_name, rotary, fused_ft_kernel, world_size):
         ).abs().max().item() < 3 * (
             torch.stack(out_hf.scores, 1) - torch.stack(out_ref.scores, 1)
         ).abs().max().item()
-
-    parallel_state.destroy_model_parallel()
