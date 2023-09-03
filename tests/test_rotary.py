@@ -20,7 +20,7 @@ is_sm8x = torch.cuda.get_device_capability("cuda") >= (8, 0)
 @pytest.mark.parametrize("rotary_fraction", [1.0, 0.5])
 # @pytest.mark.parametrize('rotary_fraction', [1.0])
 @pytest.mark.parametrize("interleaved", [False, True])
-# @pytest.mark.parametrize('interleaved', [False])
+# @pytest.mark.parametrize('interleaved', [True])
 @pytest.mark.parametrize("inplace", [False, True])
 # @pytest.mark.parametrize('inplace', [False])
 def test_rotary_emb_func(inplace, interleaved, rotary_fraction, seqlen_offsets_type, dtype):
