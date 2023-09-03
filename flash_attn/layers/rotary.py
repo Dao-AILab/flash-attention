@@ -402,10 +402,10 @@ class RotaryEmbedding(torch.nn.Module):
         Apply rotary embedding *inplace* to qkv and / or kv.
         """
         seqlen = qkv.shape[1]
-        if isinstance(seqlen_offset, int):
-            self._update_cos_sin_cache(seqlen + seqlen_offset, device=qkv.device, dtype=qkv.dtype)
-        elif max_seqlen is not None:
+        if max_seqlen is not None:
             self._update_cos_sin_cache(max_seqlen, device=qkv.device, dtype=qkv.dtype)
+        elif isinstance(seqlen_offset, int):
+            self._update_cos_sin_cache(seqlen + seqlen_offset, device=qkv.device, dtype=qkv.dtype)
         if kv is None:
             if self.scale is None:
                 return apply_rotary_emb_qkv_(
