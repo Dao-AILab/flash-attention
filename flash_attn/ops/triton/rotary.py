@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Optional, Union
 
 import torch
 
@@ -21,6 +21,7 @@ def rotary_kernel(
     X,
     COS,
     SIN,
+    CU_SEQLENS,
     SEQLEN_OFFSETS,  # this could be int or a pointer
     # Matrix dimensions
     seqlen,
@@ -40,6 +41,7 @@ def rotary_kernel(
     # Meta-parameters
     BLOCK_K: tl.constexpr,
     IS_SEQLEN_OFFSETS_TENSOR: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     CONJUGATE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -49,9 +51,17 @@ def rotary_kernel(
     pid_head = tl.program_id(axis=2)
     rotary_dim_half = rotary_dim // 2
 
-    X = X + pid_batch * stride_x_batch + pid_head * stride_x_nheads
-    OUT = OUT + pid_batch * stride_out_batch + pid_head * stride_out_nheads
+    if not IS_VARLEN:
+        X = X + pid_batch * stride_x_batch + pid_head * stride_x_nheads
+        OUT = OUT + pid_batch * stride_out_batch + pid_head * stride_out_nheads
+    else:
+        start_idx = tl.load(CU_SEQLENS + pid_batch)
+        seqlen = tl.load(CU_SEQLENS + pid_batch + 1) - start_idx
+        X = X + start_idx * stride_x_seqlen + pid_head * stride_x_nheads
+        OUT = OUT + start_idx * stride_out_seqlen + pid_head * stride_out_nheads
 
+    if pid_m * BLOCK_M >= seqlen:
+        return
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     if not IS_SEQLEN_OFFSETS_TENSOR:
         rm_cs = rm + SEQLEN_OFFSETS
@@ -134,20 +144,33 @@ def apply_rotary(
     cos: torch.Tensor,
     sin: torch.Tensor,
     seqlen_offsets: Union[int, torch.Tensor] = 0,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    max_seqlen: Optional[int] = None,
     interleaved=False,
     inplace=False,
     conjugate=False,
 ) -> torch.Tensor:
     """
     Arguments:
-        x: (batch, seqlen, nheads, headdim)
+        x: (batch, seqlen, nheads, headdim) if cu_seqlens is None
+            else (total_seqlen, nheads, headdim).
         cos: (seqlen_ro, rotary_dim / 2)
         sin: (seqlen_ro, rotary_dim / 2)
         seqlen_offsets: integer or integer tensor of size (batch,)
+        cu_seqlens: (batch + 1,) or None
+        max_seqlen: int
     Returns:
         y: (batch, seqlen, nheads, headdim)
     """
-    batch, seqlen, nheads, headdim = x.shape
+    is_varlen = cu_seqlens is not None
+    if not is_varlen:
+        batch, seqlen, nheads, headdim = x.shape
+    else:
+        assert max_seqlen is not None, "If cu_seqlens is passed in, then max_seqlen must be passed"
+        total_seqlen, nheads, headdim = x.shape
+        batch_p_1 = cu_seqlens.shape[0]
+        batch = batch_p_1 - 1
+        seqlen = max_seqlen
     seqlen_ro, rotary_dim = cos.shape
     assert sin.shape == cos.shape
     rotary_dim *= 2
@@ -187,22 +210,24 @@ def apply_rotary(
         x,
         cos,
         sin,
+        cu_seqlens,
         seqlen_offsets,
         seqlen,  # shapes
         nheads,
         rotary_dim,
         seqlen_ro,
         seqlen // 128,  # key for triton cache (limit number of compilations)
-        output.stride(0),  # strides
-        output.stride(1),
-        output.stride(2),
-        output.stride(3),
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        x.stride(3),
+        output.stride(0) if not is_varlen else 0,  # batch_strides if not varlen else 0
+        output.stride(-3),  # seqlen_stride or total_seqlen_stride
+        output.stride(-2),  # nheads_stride
+        output.stride(-1),  # headdim_stride
+        x.stride(0) if not is_varlen else 0,  # batch_strides if not varlen else 0
+        x.stride(-3),  # seqlen stride or total_seqlen_stride
+        x.stride(-2),  # nheads stride
+        x.stride(-1),  # headdim stride
         BLOCK_K,
         isinstance(seqlen_offsets, torch.Tensor),
+        is_varlen,
         interleaved,
         conjugate,
         BLOCK_M,

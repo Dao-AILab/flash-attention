@@ -42,27 +42,37 @@ class ApplyRotaryEmb(torch.autograd.Function):
         interleaved=False,
         inplace=False,
         seqlen_offsets: Union[int, torch.Tensor] = 0,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ):
         out = apply_rotary(
-            x, cos, sin, seqlen_offsets=seqlen_offsets, interleaved=interleaved, inplace=inplace
+            x,
+            cos,
+            sin,
+            seqlen_offsets=seqlen_offsets,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            interleaved=interleaved,
+            inplace=inplace,
         )
         if isinstance(seqlen_offsets, int):
-            ctx.save_for_backward(cos, sin)  # Can't save int with save_for_backward
+            ctx.save_for_backward(cos, sin, cu_seqlens)  # Can't save int with save_for_backward
             ctx.seqlen_offsets = seqlen_offsets
         else:
-            ctx.save_for_backward(cos, sin, seqlen_offsets)
+            ctx.save_for_backward(cos, sin, cu_seqlens, seqlen_offsets)
             ctx.seqlen_offsets = None
         ctx.interleaved = interleaved
         ctx.inplace = inplace
+        ctx.max_seqlen = max_seqlen
         return out if not inplace else x
 
     @staticmethod
     def backward(ctx, do):
         seqlen_offsets = ctx.seqlen_offsets
         if seqlen_offsets is None:
-            cos, sin, seqlen_offsets = ctx.saved_tensors
+            cos, sin, cu_seqlens, seqlen_offsets = ctx.saved_tensors
         else:
-            cos, sin = ctx.saved_tensors
+            cos, sin, cu_seqlens = ctx.saved_tensors
         # TD [2023-09-02]: For some reason Triton (2.0.0.post1) errors with
         # "[CUDA]: invalid device context", and cloning makes it work. Idk why. Triton 2.1.0 works.
         if not ctx.interleaved and not ctx.inplace:
@@ -72,31 +82,46 @@ class ApplyRotaryEmb(torch.autograd.Function):
             cos,
             sin,
             seqlen_offsets=seqlen_offsets,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=ctx.max_seqlen,
             interleaved=ctx.interleaved,
             inplace=ctx.inplace,
             conjugate=True,
         )
-        return dx, None, None, None, None, None
+        return dx, None, None, None, None, None, None, None
 
 
 def apply_rotary_emb(
-    x, cos, sin, interleaved=False, inplace=False, seqlen_offsets: Union[int, torch.Tensor] = 0
+    x,
+    cos,
+    sin,
+    interleaved=False,
+    inplace=False,
+    seqlen_offsets: Union[int, torch.Tensor] = 0,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    max_seqlen: Optional[int] = None,
 ):
     """
     Arguments:
-        x: (batch_size, seqlen, nheads, headdim)
+        x: (batch_size, seqlen, nheads, headdim) if cu_seqlens is None
+            else (total_seqlen, nheads, headdim)
         cos, sin: (seqlen_rotary, rotary_dim / 2)
         interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead
             of 1st half and 2nd half (GPT-NeoX style).
         inplace: if True, apply rotary embedding in-place.
         seqlen_offsets: (batch_size,) or int. Each sequence in x is shifted by this amount.
             Most commonly used in inference when we have KV cache.
+        cu_seqlens: (batch + 1,) or None
+        max_seqlen: int
     Return:
-        out: (batch_size, seqlen, nheads, headdim)
+        out: (batch_size, seqlen, nheads, headdim) if cu_seqlens is None
+            else (total_seqlen, nheads, headdim)
     rotary_dim must be <= headdim
     Apply rotary embedding to the first rotary_dim of x.
     """
-    return ApplyRotaryEmb.apply(x, cos, sin, interleaved, inplace, seqlen_offsets)
+    return ApplyRotaryEmb.apply(
+        x, cos, sin, interleaved, inplace, seqlen_offsets, cu_seqlens, max_seqlen
+    )
 
 
 # For backward compatibility
