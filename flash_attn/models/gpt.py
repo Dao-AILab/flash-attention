@@ -633,7 +633,8 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         hidden_states = self.transformer(
             input_ids, position_ids=position_ids, inference_params=inference_params
         )
-        assert hidden_states.ndim == 3, "sequence_parallel is not supported in generation mode"
+        if inference_params is not None:
+            assert hidden_states.ndim == 3, "sequence_parallel is not supported in generation mode"
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         if self.project_out is not None:

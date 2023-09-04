@@ -146,6 +146,7 @@ def test_falcon_parallel_forward(model_name, world_size):
         logits, _ = all_gather_raw(logits, process_group)
         logits = rearrange(logits, "(n b) ... d -> b ... (n d)", b=batch_size)
     del model
+    parallel_state.destroy_model_parallel()
 
     if rank == 0:
         model_hf = AutoModelForCausalLM.from_pretrained(

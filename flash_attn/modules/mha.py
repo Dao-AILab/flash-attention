@@ -607,7 +607,7 @@ class MHA(nn.Module):
         )
         seqlen_offset = 0 if inference_params is None else inference_params.sequence_len_offset
         rotary_max_seqlen = (
-            inference_params.max_sequene_len if inference_params is not None else None
+            inference_params.max_sequence_len if inference_params is not None else None
         )
         if not self.cross_attn and self.num_heads_kv == self.num_heads:
             assert x_kv is None and mixer_subset is None
@@ -859,7 +859,7 @@ class ParallelMHA(nn.Module):
             qkv = rearrange(qkv, "(b s) ... -> b s ...", s=seqlen)
         seqlen_offset = 0 if inference_params is None else inference_params.sequence_len_offset
         rotary_max_seqlen = (
-            inference_params.max_sequene_len if inference_params is not None else None
+            inference_params.max_sequence_len if inference_params is not None else None
         )
         if self.num_heads_kv == self.num_heads:
             qkv = rearrange(qkv, "b s (three h d) -> b s three h d", three=3, d=self.head_dim)
