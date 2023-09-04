@@ -151,7 +151,7 @@ jobs:
           export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
           export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
           # Currently for this setting the runner goes OOM if we pass --threads 4 to nvcc
-          if [[ ${MATRIX_CUDA_VERSION} =~ "12." && ${MATRIX_TORCH_VERSION} == "2.1" ]]; then
+          if [[ ( ${MATRIX_CUDA_VERSION} == "121" || ${MATRIX_CUDA_VERSION} == "122" ) && ${MATRIX_TORCH_VERSION} == "2.1" ]]; then
             export FLASH_ATTENTION_FORCE_SINGLE_THREAD="TRUE"
           fi
           # Limit MAX_JOBS otherwise the github runner goes OOM
