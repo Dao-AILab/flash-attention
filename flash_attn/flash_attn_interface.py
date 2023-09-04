@@ -5,6 +5,7 @@ from einops import rearrange
 # isort: off
 # We need to import the CUDA kernels after importing torch
 import flash_attn_2_cuda as flash_attn_cuda
+
 # isort: on
 
 
@@ -790,3 +791,74 @@ def flash_attn_varlen_func(
         causal,
         return_attn_probs,
     )
+
+
+def flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    k=None,
+    v=None,
+    cache_seqlens=None,
+    softmax_scale=None,
+    causal=False,
+    num_splits=0,
+):
+    """
+    If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
+    k and v. This is useful for incremental decoding: you can pass in the cached keys/values from
+    the previous step, and update them with the new keys/values from the current step, and do
+    attention with the updated cache, all in 1 kernel.
+
+    If you pass in k / v, you must make sure that the cache is large enough to hold the new values.
+    For example, the KV cache could be pre-allocated with the max sequence length, and you can use
+    cache_seqlens to keep track of the current sequence lengths of each sequence in the batch.
+
+    Does not support backward pass.
+
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
+    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
+    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
+    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        k_cache: (batch_size, seqlen_cache, nheads_k, headdim)
+        v_cache: (batch_size, seqlen_cache, nheads_k, headdim)
+        k [optional]: (batch_size, seqlen, nheads_k, headdim). If not None, we concatenate k with
+            k_cache, starting at the indices specified by cache_seqlens.
+        v [optional]: (batch_size, seqlen, nheads_k, headdim). Similar to k.
+        cache_seqlens: (batch_size,), dtype torch.int32. The sequence lengths of the KV cache.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        num_splits: int. If > 1, split the key/value into this many chunks along the sequence.
+           If num_splits == 1, we don't split the key/value. If num_splits == 0, we use a heuristic
+           to automatically determine the number of splits.
+           Don't change this unless you know what you are doing.
+
+    Return:
+        out: (batch_size, seqlen, nheads, headdim).
+    """
+    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+    assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    maybe_contiguous = lambda x: x.contiguous() if x is not None and x.stride(-1) != 1 else x
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    out, softmax_lse = flash_attn_cuda.fwd_kvcache(
+        q, k_cache, v_cache, k, v, cache_seqlens, None, softmax_scale, causal, num_splits
+    )
+    return out

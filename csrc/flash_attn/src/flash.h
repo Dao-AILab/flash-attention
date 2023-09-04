@@ -80,6 +80,18 @@ struct Flash_fwd_params : public Qkv_params {
 
     int *__restrict__ blockmask;
 
+    // The K_new and V_new matrices.
+    void * __restrict__ knew_ptr;
+    void * __restrict__ vnew_ptr;
+
+    // The stride between rows of the Q, K and V matrices.
+    index_t knew_batch_stride;
+    index_t vnew_batch_stride;
+    index_t knew_row_stride;
+    index_t vnew_row_stride;
+    index_t knew_head_stride;
+    index_t vnew_head_stride;
+
     // The dropout probability (probability of keeping an activation).
     float p_dropout;
     // uint32_t p_dropout_in_uint;
@@ -98,6 +110,10 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool is_bf16;
     bool is_causal;
+
+    // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
+    // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.
+    bool is_seqlens_k_cumulative;
 
     int num_splits;  // For split-KV version
 };

@@ -348,8 +348,14 @@ def decode_speculative(
     )
 
     def sample_tokens(
-        input_ids, model, inference_params, sample_fn, num_tokens=1, cg=False, decoding=True,
-        last_token_logits=False
+        input_ids,
+        model,
+        inference_params,
+        sample_fn,
+        num_tokens=1,
+        cg=False,
+        decoding=True,
+        last_token_logits=False,
     ):
         """Sample `num_tokens` tokens from the model, given the previous logits.
         Also return the logits of the sampled tokens.
@@ -374,12 +380,18 @@ def decode_speculative(
         sequences = []
         if decoding:
             assert seqlen == 1
-            position_ids = torch.full(
-                (batch_size, 1),
-                inference_params.sequence_len_offset,
-                dtype=torch.long,
-                device=input_ids.device,
+            position_ids = repeat(
+                torch.arange(seqlen, dtype=torch.long, device=input_ids.device)
+                + inference_params.sequence_len_offset,
+                "s -> b s",
+                b=batch_size,
             )
+            # position_ids = torch.full(
+            #     (batch_size, 1),
+            #     inference_params.sequence_len_offset,
+            #     dtype=torch.long,
+            #     device=input_ids.device,
+            # )
         else:
             position_ids = None
         logits = logits_postprocess_fn(
@@ -399,7 +411,11 @@ def decode_speculative(
                 )
                 logits = logits_postprocess_fn(
                     logits_forward_fn(
-                        model, rearrange(next_token, "b -> b 1"), position_ids, inference_params, cg=cg
+                        model,
+                        rearrange(next_token, "b -> b 1"),
+                        position_ids,
+                        inference_params,
+                        cg=cg,
                     )
                 )
                 inference_params.sequence_len_offset += 1
@@ -420,7 +436,7 @@ def decode_speculative(
         sample_fn=sample_fn,
         last_token_logits=True,
         inference_params=inference_params_draft,
-        cg=cg
+        cg=cg,
     )
 
     if debug:
