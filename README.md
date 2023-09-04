@@ -29,7 +29,7 @@ Please cite and credit FlashAttention if you use it.
 ## Installation and features
 
 Requirements:
-- CUDA 11.4 and above.
+- CUDA 11.6 and above.
 - PyTorch 1.12 and above.
 
 We recommend the

@@ -12,7 +12,7 @@ from flash_attn import (
     flash_attn_varlen_kvpacked_func,
     flash_attn_varlen_qkvpacked_func,
 )
-from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
+from flash_attn.bert_padding import pad_input, unpad_input
 from flash_attn.flash_attn_interface import _get_block_size
 
 MAX_HEADDIM_SM8x = 192
@@ -1376,7 +1376,7 @@ def test_flash_attn_varlen_causal(seqlen_q, seqlen_k, swap_sq_sk, d, dtype):
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize("d", [128])
+# @pytest.mark.parametrize("d", [64])
 @pytest.mark.parametrize("swap_sq_sk", [False, True])
 # @pytest.mark.parametrize("swap_sq_sk", [False])
 @pytest.mark.parametrize(
@@ -1384,6 +1384,7 @@ def test_flash_attn_varlen_causal(seqlen_q, seqlen_k, swap_sq_sk, d, dtype):
     [
         (3, 1024),
         (1, 339),
+        (64, 800),
         (3, 799),
         (64, 2048),
         (16, 20000),
@@ -1394,11 +1395,6 @@ def test_flash_attn_varlen_causal(seqlen_q, seqlen_k, swap_sq_sk, d, dtype):
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_flash_attn_splitkv(seqlen_q, seqlen_k, swap_sq_sk, d, causal, dtype):
-    if (
-        max(seqlen_q, seqlen_k) >= 2048
-        and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
-    ):
-        pytest.skip()  # Reference implementation OOM
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
     device = "cuda"
