@@ -289,7 +289,7 @@ def test_baichuan_generation(model_name):
         fused_ft_kernel=True,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
         teacher_outputs=out_hf.sequences,
     )
     torch.cuda.synchronize()
@@ -310,7 +310,7 @@ def test_baichuan_generation(model_name):
         cg=True,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
         teacher_outputs=out_hf.sequences,
     )
     torch.cuda.synchronize()
@@ -400,7 +400,7 @@ def test_baichuan_parallel_generation(model_name, world_size):
         # teacher_outputs=out_hf.sequences,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
     )
 
     # Capture graph outside the timing loop
@@ -419,7 +419,7 @@ def test_baichuan_parallel_generation(model_name, world_size):
         # teacher_outputs=out_hf.sequences,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
     )
     del model
     parallel_state.destroy_model_parallel()

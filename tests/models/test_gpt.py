@@ -200,7 +200,7 @@ def test_gpt2_generation(model_name, rotary, optimized, fused_ft_kernel):
         fused_ft_kernel=fused_ft_kernel,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
     )
     print(out.sequences)
     print(tokenizer.batch_decode(out.sequences.tolist()))
@@ -212,7 +212,7 @@ def test_gpt2_generation(model_name, rotary, optimized, fused_ft_kernel):
             cg=True,
             return_dict_in_generate=True,
             output_scores=True,
-            timing=True,
+            enable_timing=True,
         )
         print(out_cg.sequences)
 
@@ -267,7 +267,7 @@ def get_logits(model, input_ids, max_length, teacher_outputs=None, **kwargs):
         teacher_outputs=teacher_outputs,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
         **kwargs,
     )
     return torch.stack(out.scores, dim=1)
@@ -431,7 +431,7 @@ def test_gpt2_speculative_decoding(model_name, optimized, fused_ft_kernel, cg):
         fused_ft_kernel=fused_ft_kernel,
         cg=cg,
         speculative_lookahead=4,
-        timing=True,
+        enable_timing=True,
     )
     print(tokenizer.batch_decode(out.sequences))
     out_og = model.generate(
@@ -440,7 +440,7 @@ def test_gpt2_speculative_decoding(model_name, optimized, fused_ft_kernel, cg):
         top_k=5,
         fused_ft_kernel=fused_ft_kernel,
         cg=False,
-        timing=True,
+        enable_timing=True,
         return_dict_in_generate=True,
     )
     print(tokenizer.batch_decode(out_og.sequences))

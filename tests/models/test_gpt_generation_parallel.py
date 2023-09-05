@@ -114,7 +114,7 @@ def test_tensor_parallel(model_name, rotary, fused_ft_kernel, world_size):
         fused_ft_kernel=fused_ft_kernel,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
     )
     print(out.sequences)
     if fused_ft_kernel:
@@ -127,7 +127,7 @@ def test_tensor_parallel(model_name, rotary, fused_ft_kernel, world_size):
             cg=True,
             return_dict_in_generate=True,
             output_scores=True,
-            timing=True,
+            enable_timing=True,
         )
         print(out_cg.sequences)
 

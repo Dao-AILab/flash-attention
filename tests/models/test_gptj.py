@@ -144,7 +144,7 @@ def test_gptj_generation(model_name):
         # eos_token_id=eos_token_id, fused_ft_kernel=False,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
         teacher_outputs=out_hf.sequences,
     )
     torch.cuda.synchronize()
@@ -163,7 +163,7 @@ def test_gptj_generation(model_name):
         cg=True,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
         teacher_outputs=out_hf.sequences,
     )
     torch.cuda.synchronize()

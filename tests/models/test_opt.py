@@ -158,7 +158,7 @@ def test_opt_generation(model_name):
         fused_ft_kernel=fused_ft_kernel,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
     )
     torch.cuda.synchronize()
     print(f"Prompt processing + decoding time: {(time.time() - start) * 1000:.0f}ms")
@@ -179,7 +179,7 @@ def test_opt_generation(model_name):
             cg=True,
             return_dict_in_generate=True,
             output_scores=True,
-            timing=True,
+            enable_timing=True,
         )
         torch.cuda.synchronize()
         print(f"Prompt processing + decoding time: {(time.time() - start) * 1000:.0f}ms")
