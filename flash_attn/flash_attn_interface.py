@@ -1,6 +1,7 @@
+from typing import Optional, Union
+
 import torch
 import torch.nn as nn
-from einops import rearrange
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
@@ -799,7 +800,7 @@ def flash_attn_with_kvcache(
     v_cache,
     k=None,
     v=None,
-    cache_seqlens=None,
+    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
     softmax_scale=None,
     causal=False,
     num_splits=0,
@@ -840,7 +841,8 @@ def flash_attn_with_kvcache(
         k [optional]: (batch_size, seqlen, nheads_k, headdim). If not None, we concatenate k with
             k_cache, starting at the indices specified by cache_seqlens.
         v [optional]: (batch_size, seqlen, nheads_k, headdim). Similar to k.
-        cache_seqlens: (batch_size,), dtype torch.int32. The sequence lengths of the KV cache.
+        cache_seqlens: int, or (batch_size,), dtype torch.int32. The sequence lengths of the
+            KV cache.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
@@ -858,6 +860,10 @@ def flash_attn_with_kvcache(
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+    if cache_seqlens is not None and isinstance(cache_seqlens, int):
+        cache_seqlens = torch.full(
+            (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+        )
     out, softmax_lse = flash_attn_cuda.fwd_kvcache(
         q, k_cache, v_cache, k, v, cache_seqlens, None, softmax_scale, causal, num_splits
     )
