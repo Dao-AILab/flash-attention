@@ -447,8 +447,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (n_block * kBlockN >= binfo.actual_seqlen_k || binfo.actual_seqlen_q == 0) return;
-
     int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
+    if (params.max_past > 0){
+        m_block_max = cute::ceil_div(cute::max((n_block + 1) * kBlockN + params.max_past, binfo.actual_seqlen_q), kBlockM);
+    }
 
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
         + (m_block_max - 1) * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
