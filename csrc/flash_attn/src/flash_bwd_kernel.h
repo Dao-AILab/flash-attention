@@ -1563,7 +1563,6 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
     if (params.max_past > 0) {
         n_block_min = std::max(n_block_min, ((bidb * Kernel_traits::kBlockM - params.max_past) / Kernel_traits::kBlockN));
     }
-    printf("%d (%d) %d %d\n", bidb, Kernel_traits::kBlockM, Kernel_traits::kBlockN, n_block_min, params.max_past);
 
     if (n_block_max == 1) {
         compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, true, true>(params, bidb, bidh, 0);
