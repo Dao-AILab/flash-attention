@@ -1557,15 +1557,20 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
     const int tidx = threadIdx.x;
 
     const int n_block_max = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
+    int n_block_min = 0;
+    if (params.max_past > 0) {
+        n_block_min = std::max(n_block_min, ((bidb * Kernel_traits::kBlockM - params.max_past) / Kernel_traits::kBlockN));
+    }
+
     if (n_block_max == 1) {
         compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, true, true>(params, bidb, bidh, 0);
     } else {
         // Iterating backward from n_block_max - 1 to 0 might save 1 register
         compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, true, false>(params, bidb, bidh, n_block_max - 1);
-        for (int n_block = n_block_max - 2; n_block > 0; n_block--) {
+        for (int n_block = n_block_max - 2; n_block > n_block_min; n_block--) {
             compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, false, false>(params, bidb, bidh, n_block);
         }
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, false, true>(params, bidb, bidh, 0);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, false, true>(params, bidb, bidh, n_block_min);
     }
 }
 
