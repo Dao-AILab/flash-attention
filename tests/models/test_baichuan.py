@@ -148,9 +148,6 @@ def test_baichuan_parallel_forward(model_name, world_size):
     rank = parallel_state.get_tensor_model_parallel_rank()
     process_group = parallel_state.get_tensor_model_parallel_group()
 
-    # Need this, otherwise the Triton kernel seems to launched from the wrong device.
-    torch.cuda.set_device(device)
-
     pretrained_state_dict = remap_state_dict_hf_baichuan(
         state_dict_from_pretrained(model_name), config
     )
