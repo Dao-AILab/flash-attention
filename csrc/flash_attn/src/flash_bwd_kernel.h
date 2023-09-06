@@ -447,8 +447,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (n_block * kBlockN >= binfo.actual_seqlen_k || binfo.actual_seqlen_q == 0) return;
-
     int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
+    if (params.max_past > 0){
+        m_block_max = cute::ceil_div(cute::min((n_block + 1) * kBlockN + params.max_past, binfo.actual_seqlen_q), kBlockM);
+    }
 
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
         + (m_block_max - 1) * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
@@ -1557,15 +1559,20 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
     const int tidx = threadIdx.x;
 
     const int n_block_max = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
+    int n_block_min = 0;
+    if (params.max_past > 0) {
+        n_block_min = std::max(n_block_min, ((bidb * Kernel_traits::kBlockM - params.max_past) / Kernel_traits::kBlockN));
+    }
+
     if (n_block_max == 1) {
         compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, true, true>(params, bidb, bidh, 0);
     } else {
         // Iterating backward from n_block_max - 1 to 0 might save 1 register
         compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, true, false>(params, bidb, bidh, n_block_max - 1);
-        for (int n_block = n_block_max - 2; n_block > 0; n_block--) {
+        for (int n_block = n_block_max - 2; n_block > n_block_min; n_block--) {
             compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, false, false>(params, bidb, bidh, n_block);
         }
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, false, true>(params, bidb, bidh, 0);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, false, true>(params, bidb, bidh, n_block_min);
     }
 }
 
