@@ -135,7 +135,7 @@ def test_gpt2_optimized(model_name):
 
 
 @pytest.mark.parametrize("fused_ft_kernel", [False, True])
-# @pytest.mark.parametrize('fused_ft_kernel', [False])
+# @pytest.mark.parametrize('fused_ft_kernel', [True])
 @pytest.mark.parametrize("optimized", [False, True])
 # @pytest.mark.parametrize('optimized', [True])
 @pytest.mark.parametrize("rotary", [False, True])
@@ -209,7 +209,7 @@ def test_gpt2_generation(model_name, rotary, optimized, fused_ft_kernel):
     )
     print(out.sequences)
     print(tokenizer.batch_decode(out.sequences.tolist()))
-    if fused_ft_kernel or config.use_flash_attn:
+    if fused_ft_kernel or getattr(config, "use_flash_attn", False):
         out_cg = model.generate(
             input_ids=input_ids,
             max_length=max_length,
@@ -220,6 +220,7 @@ def test_gpt2_generation(model_name, rotary, optimized, fused_ft_kernel):
             enable_timing=True,
         )
         print(out_cg.sequences)
+        assert torch.equal(torch.stack(out.scores, dim=1), torch.stack(out_cg.scores, dim=1))
 
     if not rotary:
         out_hf = model_hf.generate(
@@ -282,6 +283,7 @@ def get_logits(model, input_ids, max_length, teacher_outputs=None, **kwargs):
 @pytest.mark.parametrize("rotary", [None, "interleaved", "block"])
 # @pytest.mark.parametrize('rotary', [None])
 @pytest.mark.parametrize("fused_ft_kernel", [False, True])
+# @pytest.mark.parametrize("fused_ft_kernel", [False])
 @pytest.mark.parametrize("model_name", ["gpt2"])
 def test_gpt2_generation_cg(model_name, fused_ft_kernel, rotary, seqlen, maxlen):
     """Check that decoding with CUDA graph is the same as decoding without CUDA graph."""

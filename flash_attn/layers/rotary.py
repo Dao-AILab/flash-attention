@@ -146,7 +146,8 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
             # Call 1 kernel instead of 2 kernels
             # We need qkv to be contiguous so that when we reshape to combine (3, nheads)
             # dimensions, we get the same tensor
-            qk = rearrange(qkv[:, :, :2], "b s t h d -> b s (t h) d")
+            # qk = rearrange(qkv[:, :, :2], "b s t h d -> b s (t h) d")
+            qk = qkv[:, :, :2].reshape(batch, seqlen, -1, headdim)
             apply_rotary(
                 qk, cos, sin, seqlen_offsets=seqlen_offsets, interleaved=interleaved, inplace=True
             )
