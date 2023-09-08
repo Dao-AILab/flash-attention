@@ -11,22 +11,41 @@ This is a Triton implementation of the Flash Attention algorithm
 
 import pytest
 import torch
-
 import triton
 import triton.language as tl
 
 
 @triton.jit
 def _fwd_kernel(
-    Q, K, V, sm_scale,
-    TMP, L, M,  # NOTE: TMP is a scratchpad buffer to workaround a compiler bug
+    Q,
+    K,
+    V,
+    sm_scale,
+    TMP,
+    L,
+    M,  # NOTE: TMP is a scratchpad buffer to workaround a compiler bug
     Out,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vk, stride_vn,
-    stride_oz, stride_oh, stride_om, stride_on,
-    Z, H, N_CTX,
-    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vk,
+    stride_vn,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_on,
+    Z,
+    H,
+    N_CTX,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     start_m = tl.program_id(0)
@@ -100,9 +119,13 @@ def _fwd_kernel(
 
 @triton.jit
 def _bwd_preprocess(
-    Out, DO, L,
-    NewDO, Delta,
-    BLOCK_M: tl.constexpr, D_HEAD: tl.constexpr,
+    Out,
+    DO,
+    L,
+    NewDO,
+    Delta,
+    BLOCK_M: tl.constexpr,
+    D_HEAD: tl.constexpr,
 ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_n = tl.arange(0, D_HEAD)
@@ -120,16 +143,36 @@ def _bwd_preprocess(
 
 @triton.jit
 def _bwd_kernel(
-    Q, K, V, sm_scale, Out, DO,
-    DQ, DK, DV,
-    L, M,
+    Q,
+    K,
+    V,
+    sm_scale,
+    Out,
+    DO,
+    DQ,
+    DK,
+    DV,
+    L,
+    M,
     D,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vk, stride_vn,
-    Z, H, N_CTX,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vk,
+    stride_vn,
+    Z,
+    H,
+    N_CTX,
     num_block,
-    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     off_hz = tl.program_id(0)
@@ -203,7 +246,6 @@ def _bwd_kernel(
 
 
 class _attention(torch.autograd.Function):
-
     @staticmethod
     def forward(ctx, q, k, v, sm_scale):
         BLOCK = 128
@@ -213,22 +255,45 @@ class _attention(torch.autograd.Function):
         assert Lk in {16, 32, 64, 128}
         o = torch.empty_like(q)
         grid = (triton.cdiv(q.shape[2], BLOCK), q.shape[0] * q.shape[1])
-        tmp = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        tmp = torch.empty(
+            (q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32
+        )
         L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         m = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         num_warps = 4 if Lk <= 64 else 8
 
         _fwd_kernel[grid](
-            q, k, v, sm_scale,
-            tmp, L, m,
+            q,
+            k,
+            v,
+            sm_scale,
+            tmp,
+            L,
+            m,
             o,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            q.shape[0], q.shape[1], q.shape[2],
-            BLOCK_M=BLOCK, BLOCK_N=BLOCK,
-            BLOCK_DMODEL=Lk, num_warps=num_warps,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            o.stride(0),
+            o.stride(1),
+            o.stride(2),
+            o.stride(3),
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            BLOCK_M=BLOCK,
+            BLOCK_N=BLOCK,
+            BLOCK_DMODEL=Lk,
+            num_warps=num_warps,
             num_stages=1,
         )
         ctx.save_for_backward(q, k, v, o, L, m)
@@ -247,27 +312,51 @@ class _attention(torch.autograd.Function):
         dv = torch.empty_like(v)
         do_scaled = torch.empty_like(do)
         delta = torch.empty_like(l)
-        _bwd_preprocess[(ctx.grid[0] * ctx.grid[1], )](
-            o, do, l,
-            do_scaled, delta,
-            BLOCK_M=ctx.BLOCK, D_HEAD=ctx.BLOCK_DMODEL,
+        _bwd_preprocess[(ctx.grid[0] * ctx.grid[1],)](
+            o,
+            do,
+            l,
+            do_scaled,
+            delta,
+            BLOCK_M=ctx.BLOCK,
+            D_HEAD=ctx.BLOCK_DMODEL,
         )
 
         # NOTE: kernel currently buggy for other values of `num_warps`
         num_warps = 8
         _bwd_kernel[(ctx.grid[1],)](
-            q, k, v, ctx.sm_scale,
-            o, do_scaled,
-            dq, dk, dv,
-            l, m,
+            q,
+            k,
+            v,
+            ctx.sm_scale,
+            o,
+            do_scaled,
+            dq,
+            dk,
+            dv,
+            l,
+            m,
             delta,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            q.shape[0], q.shape[1], q.shape[2],
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
             ctx.grid[0],
-            BLOCK_M=ctx.BLOCK, BLOCK_N=ctx.BLOCK,
-            BLOCK_DMODEL=ctx.BLOCK_DMODEL, num_warps=num_warps,
+            BLOCK_M=ctx.BLOCK,
+            BLOCK_N=ctx.BLOCK,
+            BLOCK_DMODEL=ctx.BLOCK_DMODEL,
+            num_warps=num_warps,
             num_stages=1,
         )
         return dq.to(q.dtype), dk, dv, None
