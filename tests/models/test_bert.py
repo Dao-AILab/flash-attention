@@ -5,11 +5,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from flash_attn.models.bert import BertForPreTraining, BertModel, remap_state_dict
-from flash_attn.utils.pretrained import state_dict_from_pretrained
 from transformers import BertConfig
-from transformers.models.bert.modeling_bert import BertForPreTraining as BertForPreTrainingHF
+from transformers.models.bert.modeling_bert import \
+    BertForPreTraining as BertForPreTrainingHF
 from transformers.models.bert.modeling_bert import BertModel as BertModelHF
+
+from flash_attn.models.bert import (BertForPreTraining, BertModel,
+                                    inv_remap_state_dict, remap_state_dict)
+from flash_attn.utils.pretrained import state_dict_from_pretrained
 
 
 @pytest.mark.parametrize("model_name", ["bert-base-uncased", "bert-large-uncased"])
@@ -43,7 +46,7 @@ def get_hf_models(model_name, config, dtype):
     return model_hf
 
 
-@pytest.mark.parametrize('model_name', ["bert-base-uncased"])
+@pytest.mark.parametrize("model_name", ["bert-base-uncased"])
 def test_bert_non_optimized(model_name):
     """Check that our implementation of BERT (without any optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
@@ -297,3 +300,22 @@ def test_bert_dense_seq_output(model_name, has_key_padding_mask, last_layer_subs
     ).abs().max().item()
     # The loss calculation from HF is wrong: it doesn't ignore the labels that are 0.
     # assert (out.loss - out_ref.loss).abs().max().item() < 2 * (out_hf.loss - out_ref.loss).abs().max().item()
+
+
+@pytest.mark.parametrize("model_name", ["bert-base-uncased", "bert-large-uncased"])
+def test_inv_remap_state_dict(model_name: str):
+    """
+    Verify that we can convert a HF BERT model to flash_attn and back.
+    """
+
+    state_dict = state_dict_from_pretrained(model_name)
+    config = BertConfig.from_pretrained(model_name)
+
+    flash_state_dict = remap_state_dict(state_dict, config)
+    recovered_state_dict = inv_remap_state_dict(flash_state_dict, config)
+
+    assert set(state_dict.keys()) == set(recovered_state_dict.keys())
+
+    for k in state_dict.keys():
+        assert state_dict[k].shape == recovered_state_dict[k].shape
+        torch.testing.assert_close(state_dict[k], recovered_state_dict[k], rtol=1e-6, atol=1e-6)
