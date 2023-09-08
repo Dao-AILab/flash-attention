@@ -473,7 +473,8 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             softmax_scale,
             causal=causal,
             max_past=max_past,
-            return_softmax=return_softmax and dropout_p > 0,
+            return_softmax=return_softmax and dropout_p > 0
+        )
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
