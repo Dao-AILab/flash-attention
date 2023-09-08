@@ -118,7 +118,6 @@ def decode(
     batch_size, seqlen_og = input_ids.shape
     teacher_output_len = teacher_outputs.shape[1] if teacher_outputs is not None else 0
     if cg:
-        assert fused_ft_kernel
         if not hasattr(model, "_decoding_cache"):
             model._decoding_cache = None
         model._decoding_cache = update_graph_cache(
@@ -128,11 +127,13 @@ def decode(
             seqlen_og,
             max_length,
             tensor_parallel=tensor_parallel,
+            fused_ft_kernel=fused_ft_kernel,
         )
         inference_params = model._decoding_cache.inference_params
         inference_params.max_sequence_len = max_length
         inference_params.max_batch_size = batch_size
         inference_params.sequence_len_offset = 0
+        inference_params.lengths_per_sample.zero_()
     else:
         inference_params = InferenceParams(
             max_sequence_len=max_length, max_batch_size=batch_size, fused_ft_kernel=fused_ft_kernel
@@ -167,7 +168,8 @@ def decode(
             token = sample(logits, top_k=top_k, top_p=top_p, temperature=temperature)
         else:
             token = teacher_outputs[:, inference_params.sequence_len_offset]
-        return rearrange(token, "b -> b 1")
+        # return rearrange(token, "b -> b 1")
+        return token.unsqueeze(1)
 
     def should_stop(current_token, inference_params):
         if inference_params.sequence_len_offset == 0:
@@ -197,9 +199,7 @@ def decode(
         torch.cuda.synchronize()
         print(f"Prompt processing + decoding time: {(start.elapsed_time(end)):.0f}ms")
     output_cls = GreedySearchDecoderOnlyOutput if top_k == 1 else SampleDecoderOnlyOutput
-    return output_cls(
-        sequences=torch.cat(sequences, dim=1), scores=tuple(scores)
-    )
+    return output_cls(sequences=torch.cat(sequences, dim=1), scores=tuple(scores))
 
 
 def sample_speculative(logits, logits_draft, tokens_draft, top_k=1, top_p=0.0, temperature=1.0):
@@ -298,7 +298,6 @@ def decode_speculative(
     assert batch_size == 1, "Speculative decoding implementation only supports batch_size=1"
     assert eos_token_id is None, "Speculative decoding implementation doesn't support eos_token_id"
     if cg:
-        assert fused_ft_kernel
         if not hasattr(model_draft, "_decoding_cache"):
             model_draft._decoding_cache = None
         model_draft._decoding_cache = update_graph_cache(
@@ -308,6 +307,7 @@ def decode_speculative(
             seqlen_og,
             max_length,
             tensor_parallel=tensor_parallel,
+            fused_ft_kernel=fused_ft_kernel,
         )
         inference_params_draft = model_draft._decoding_cache.inference_params
         inference_params_draft.max_sequence_len = max_length
@@ -606,12 +606,14 @@ def allocate_inference_cache(
     layers: Union[int, Sequence],
     device,
     dtype=torch.float16,
+    fused_ft_kernel=False,
 ):
     assert dtype in [torch.float16, torch.bfloat16, torch.float32]
     packsize = 4 if dtype == torch.float32 else 8
     assert headdim % packsize == 0
     k_cache_shape = (max_batch_size, nheads, headdim // packsize, max_seqlen, packsize)
     v_cache_shape = (max_batch_size, nheads, max_seqlen, headdim)
+    kv_cache_shape = (max_batch_size, max_seqlen, 2, nheads, headdim)
     if isinstance(layers, int):
         layers = range(layers)
     return {
@@ -619,6 +621,8 @@ def allocate_inference_cache(
             torch.empty(k_cache_shape, device=device, dtype=dtype),
             torch.empty(v_cache_shape, device=device, dtype=dtype),
         )
+        if fused_ft_kernel
+        else torch.empty(kv_cache_sahpe, device=device, dtype=dtype)
         for i in layers
     }
 
@@ -651,7 +655,15 @@ class DecodingCGCache:
 
 @torch.inference_mode()
 def update_graph_cache(
-    model, cache, batch_size, seqlen_og, max_seqlen, tensor_parallel=1, dtype=None, n_warmups=2
+    model,
+    cache,
+    batch_size,
+    seqlen_og,
+    max_seqlen,
+    tensor_parallel=1,
+    dtype=None,
+    n_warmups=2,
+    fused_ft_kernel=False,
 ):
     if cache is None:
         cache = DecodingCGCache()
@@ -671,7 +683,9 @@ def update_graph_cache(
         cache.device, cache.dtype = device, dtype
         cache.max_batch_size, cache.max_seqlen = batch_size, max_seqlen
         if hasattr(model, "allocate_inference_cache"):
-            inf_cache = model.allocate_inference_cache(batch_size, max_seqlen, dtype)
+            inf_cache = model.allocate_inference_cache(
+                batch_size, max_seqlen, dtype, fused_ft_kernel=fused_ft_kernel
+            )
         else:
             headdim = getattr(
                 model.config,
@@ -686,6 +700,7 @@ def update_graph_cache(
                 model.config.num_hidden_layers,
                 device,
                 dtype,
+                fused_ft_kernel=fused_ft_kernel,
             )
         lengths_per_sample = torch.full((batch_size,), seqlen_og, dtype=torch.int32, device=device)
         cache.inference_params = InferenceParams(
@@ -693,7 +708,7 @@ def update_graph_cache(
             max_batch_size=batch_size,
             sequence_len_offset=seqlen_og,
             key_value_memory_dict=inf_cache,
-            fused_ft_kernel=True,
+            fused_ft_kernel=fused_ft_kernel,
             lengths_per_sample=lengths_per_sample,
         )
         cache.mempool = torch.cuda.graphs.graph_pool_handle()
