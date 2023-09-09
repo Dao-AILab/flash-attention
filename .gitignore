@@ -22,3 +22,6 @@ var/
 
 # IDE-related
 .idea/
+
+# Dev
+venv
