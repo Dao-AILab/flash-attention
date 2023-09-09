@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import GPT2Config
 
+from flash_attn.models.bigcode import remap_state_dict_hf_bigcode
 from flash_attn.models.falcon import remap_state_dict_hf_falcon
 from flash_attn.models.gpt_neox import remap_state_dict_hf_gpt_neox
 from flash_attn.models.gptj import remap_state_dict_hf_gptj
@@ -21,12 +22,16 @@ from flash_attn.models.opt import remap_state_dict_hf_opt
 from flash_attn.modules.block import Block, ParallelBlock
 from flash_attn.modules.embedding import GPT2Embeddings, ParallelGPT2Embeddings
 from flash_attn.modules.mha import MHA, ParallelMHA
-from flash_attn.modules.mlp import (FusedMLP, GatedMlp, Mlp, ParallelFusedMLP,
-                                    ParallelGatedMlp, ParallelMLP)
+from flash_attn.modules.mlp import (
+    FusedMLP,
+    GatedMlp,
+    Mlp,
+    ParallelFusedMLP,
+    ParallelGatedMlp,
+    ParallelMLP,
+)
 from flash_attn.ops.activations import sqrelu_fwd
-from flash_attn.utils.distributed import (all_gather_raw,
-                                          get_dim_for_local_rank,
-                                          sync_shared_params)
+from flash_attn.utils.distributed import all_gather_raw, get_dim_for_local_rank, sync_shared_params
 from flash_attn.utils.generation import GenerationMixin
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 
@@ -41,8 +46,7 @@ except ImportError:
     dropout_add_layer_norm = None
 
 try:
-    from flash_attn.ops.layer_norm import \
-        dropout_add_layer_norm_parallel_residual
+    from flash_attn.ops.layer_norm import dropout_add_layer_norm_parallel_residual
 except ImportError:
     dropout_add_layer_norm_parallel_residual = None
 
@@ -129,6 +133,7 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
             "gelu_new",
             "gelu_fast",
             "gelu_approx",
+            "gelu_pytorch_tanh",
             "relu",
             "sqrelu",
         ]
@@ -144,6 +149,7 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
             "gelu_new",
             "gelu_fast",
             "gelu_approx",
+            "gelu_pytorch_tanh",
             "relu",
             "sqrelu",
             "glu",
@@ -182,7 +188,8 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
             else:
                 approximate = (
                     "tanh"
-                    if config.activation_function in ["gelu_new", "gelu_fast", "gelu_approx"]
+                    if config.activation_function
+                    in ["gelu_new", "gelu_fast", "gelu_approx", "gelu_pytorch_tanh"]
                     else "none"
                 )
                 activation = partial(F.gelu, approximate=approximate)
@@ -215,7 +222,8 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
                 raise ImportError("fused_dense is not installed")
             activation = (
                 "gelu_approx"
-                if config.activation_function in ["gelu_new", "gelu_fast", "gelu_approx"]
+                if config.activation_function
+                in ["gelu_new", "gelu_fast", "gelu_approx", "gelu_pytorch_tanh"]
                 else config.activation_function
             )
             mlp_cls = FusedMLP if process_group is None else ParallelFusedMLP
@@ -352,6 +360,8 @@ class GPTPreTrainedModel(nn.Module):
             state_dict = remap_state_dict_hf_falcon(state_dict, config)
         elif model_name.startswith("meta-llama/Llama-"):
             state_dict = remap_state_dict_hf_llama(state_dict, config)
+        elif model_name.startswith("bigcode/") or model_name.startswith("WizardLM/"):
+            state_dict = remap_state_dict_hf_bigcode(state_dict, config)
         else:
             raise NotImplementedError(f"Model {model_name} not supported")
         if world_size > 1:
@@ -394,6 +404,7 @@ class GPTModel(GPTPreTrainedModel):
             "gelu_new",
             "gelu_fast",
             "gelu_approx",
+            "gelu_pytorch_tanh",
             "relu",
             "sqrelu",
             "glu",
@@ -628,7 +639,9 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
-        assert input_ids.ndim == 2, f"Expected `input_ids` to have shape [b, slen], but got shape {input_ids.shape}"
+        assert (
+            input_ids.ndim == 2
+        ), f"Expected `input_ids` to have shape [b, slen], but got shape {input_ids.shape}"
         b, slen = input_ids.shape
         hidden_states = self.transformer(
             input_ids, position_ids=position_ids, inference_params=inference_params
@@ -845,11 +858,11 @@ def combine_state_dicts_tp(state_dicts: list[dict[str, torch.Tensor]], config: G
                         nheadqkv=rank_n_head + 2 * rank_n_head_kv,
                         headdim=headdim,
                     )
-                    for s, rank_n_head, rank_n_head_kv in zip(state_dicts, n_head_each_rank, n_head_kv_each_rank)
+                    for s, rank_n_head, rank_n_head_kv in zip(
+                        state_dicts, n_head_each_rank, n_head_kv_each_rank
+                    )
                 ]
-                wq = torch.cat(
-                    [x[: n_head_each_rank[rank]] for rank, x in enumerate(xs)], dim=0
-                )
+                wq = torch.cat([x[: n_head_each_rank[rank]] for rank, x in enumerate(xs)], dim=0)
                 wk = torch.cat(
                     [
                         x[

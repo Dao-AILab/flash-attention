@@ -6,12 +6,15 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from transformers import BertConfig
-from transformers.models.bert.modeling_bert import \
-    BertForPreTraining as BertForPreTrainingHF
+from transformers.models.bert.modeling_bert import BertForPreTraining as BertForPreTrainingHF
 from transformers.models.bert.modeling_bert import BertModel as BertModelHF
 
-from flash_attn.models.bert import (BertForPreTraining, BertModel,
-                                    inv_remap_state_dict, remap_state_dict)
+from flash_attn.models.bert import (
+    BertForPreTraining,
+    BertModel,
+    inv_remap_state_dict,
+    remap_state_dict,
+)
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 
 
@@ -102,7 +105,7 @@ def test_bert_optimized(model_name):
     dtype = torch.float16
     config = BertConfig.from_pretrained(model_name)
     # Our implementation of fused_mlp assumes the activation is
-    # nn.GELU(approximate='tanh'). Huggingface calls it "gelu_new" or "gelu_fast".
+    # nn.GELU(approximate='tanh'). Huggingface calls it "gelu_new", "gelu_fast", or "gelu_pytorch_tanh".
     # If you just want "gelu", disable fused_mlp.
     config.hidden_act = "gelu_new"
     config.use_flash_attn = True
@@ -209,7 +212,7 @@ def test_bert_dense_seq_output(model_name, has_key_padding_mask, last_layer_subs
     dtype = torch.float16
     config = BertConfig.from_pretrained(model_name)
     # Our implementation of fused_mlp assumes the activation is
-    # nn.GELU(approximate='tanh'). Huggingface calls it "gelu_new" or "gelu_fast".
+    # nn.GELU(approximate='tanh'). Huggingface calls it "gelu_new", "gelu_fast", or "gelu_pytorch_tanh".
     # If you just want "gelu", disable fused_mlp.
     config.hidden_act = "gelu_new"
     config.use_flash_attn = True
