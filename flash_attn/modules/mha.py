@@ -659,8 +659,7 @@ class MHA(nn.Module):
                 qkv = rearrange(
                     self.dwconv_qkv(rearrange(qkv, "b s d -> b d s"))[..., :-2], "b d s -> b s d"
                 ).contiguous()
-            # qkv = rearrange(qkv, "... (three h d) -> ... three h d", three=3, d=self.head_dim)
-            qkv = qkv.reshape(batch, seqlen, 3, self.num_heads, self.head_dim)
+            qkv = rearrange(qkv, "... (three h d) -> ... three h d", three=3, d=self.head_dim)
             if (
                 inference_params is None
                 or inference_params.sequence_len_offset == 0
@@ -700,10 +699,8 @@ class MHA(nn.Module):
                     qkv, x = self.Wqkv(x)
                 q = qkv[..., : self.num_heads * self.head_dim]
                 kv = qkv[..., self.num_heads * self.head_dim :]
-            # q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
-            q = q.reshape(batch, seqlen, -1, self.head_dim)
-            # kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
-            kv = kv.reshape(batch, seqlen, 2, -1, self.head_dim)
+            q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
+            kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
             if self.dwconv:
                 q = rearrange(
                     self.dwconv_q(rearrange(q, "b s d -> b d s"))[..., :-2], "b d s -> b s d"
@@ -731,8 +728,7 @@ class MHA(nn.Module):
                     context = self._update_kvcache_attention(q, kv, inference_params)
             else:
                 context = self._apply_rotary_single_query_attention(q, inference_params, kv=kv)
-        # out = self.out_proj(rearrange(context, "... h d -> ... (h d)"))
-        out = self.out_proj(context.reshape(batch, seqlen, -1))
+        out = self.out_proj(rearrange(context, "... h d -> ... (h d)"))
         return out if not self.return_residual else (out, x)
 
 

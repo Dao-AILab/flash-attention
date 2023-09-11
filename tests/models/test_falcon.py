@@ -253,7 +253,9 @@ def test_falcon_generation(model_name):
 
     # Capture graph outside the timing loop
     batch_size, seqlen_og = input_ids.shape
-    model._decoding_cache = update_graph_cache(model, None, batch_size, seqlen_og, max_length)
+    model._decoding_cache = update_graph_cache(
+        model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=True
+    )
     print("With CUDA graph")
     torch.cuda.synchronize()
     start = time.time()
@@ -356,7 +358,9 @@ def test_falcon_parallel_generation(model_name, world_size):
 
     # Capture graph outside the timing loop
     batch_size, seqlen_og = input_ids.shape
-    model._decoding_cache = update_graph_cache(model, None, batch_size, seqlen_og, max_length)
+    model._decoding_cache = update_graph_cache(
+        model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=True
+    )
     print("With CUDA graph")
     out_cg = model.generate(
         input_ids=input_ids,

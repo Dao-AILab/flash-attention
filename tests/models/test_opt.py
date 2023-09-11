@@ -168,7 +168,9 @@ def test_opt_generation(model_name):
     if fused_ft_kernel:
         # Capture graph outside the timing loop
         batch_size, seqlen_og = input_ids.shape
-        model._decoding_cache = update_graph_cache(model, None, batch_size, seqlen_og, max_length)
+        model._decoding_cache = update_graph_cache(
+            model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=True
+        )
         print("With CUDA graph")
         torch.cuda.synchronize()
         start = time.time()

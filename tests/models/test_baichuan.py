@@ -404,7 +404,7 @@ def test_baichuan_parallel_generation(model_name, world_size):
     # Capture graph outside the timing loop
     batch_size, seqlen_og = input_ids.shape
     model._decoding_cache = update_graph_cache(
-        model, None, batch_size, seqlen_og, max_length
+        model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=False
     )
     print("With CUDA graph")
     out_cg = model.generate(
