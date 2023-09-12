@@ -13,8 +13,7 @@
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #endif
 
-#include <ATen/cuda/CUDAGraphsUtils.cuh>
-
+#include <ATen/cuda/CUDAGraphsUtils.cuh> // For at::cuda::philox::unpack
 
 constexpr int TOTAL_DIM = 0;
 constexpr int H_DIM = 1;

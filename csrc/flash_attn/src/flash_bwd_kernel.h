@@ -5,18 +5,15 @@
 #pragma once
 
 #include <cute/algorithm/copy.hpp>
-#include <cute/algorithm/gemm.hpp>
 
 #include <cutlass/cutlass.h>
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
-#include <cutlass/numeric_conversion.h>
 
 #include "block_info.h"
 #include "kernel_traits.h"
 #include "utils.h"
 #include "softmax.h"
-#include "philox.cuh"
 
 namespace flash {
 

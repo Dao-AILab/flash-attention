@@ -2,7 +2,9 @@
  * Copyright (c) 2023, Tri Dao.
  ******************************************************************************/
 
-#include <torch/extension.h>
+// Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
+#include <torch/python.h>
+#include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 

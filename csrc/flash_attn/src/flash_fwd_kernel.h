@@ -4,67 +4,20 @@
 
 #pragma once
 
-#include <cmath>
 #include <cute/algorithm/copy.hpp>
-#include <cute/algorithm/gemm.hpp>
 
 #include <cutlass/cutlass.h>
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
-#include <cutlass/numeric_conversion.h>
 
 #include "block_info.h"
 #include "kernel_traits.h"
 #include "utils.h"
 #include "softmax.h"
-#include "philox.cuh"
 
 namespace flash {
 
 using namespace cute;
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <int MMA_M,
-          class... Args,
-          class TiledMMA>
-CUTE_HOST_DEVICE
-auto
-make_tiled_copy_A_warpcontiguousM(Copy_Atom<Args...> const& copy_atom,
-                                 TiledMMA           const& tiled_mma) {
-    using TileShape_MNK = typename TiledMMA::TiledShape_MNK;
-    using AtomShape_MNK = typename TiledMMA::AtomShape_MNK;
-    constexpr int AtomShape_M = decltype(size<0>(AtomShape_MNK{}))::value;
-    constexpr int kNWarps = decltype(size<0>(TileShape_MNK{}))::value / AtomShape_M;
-    constexpr int MMAStride_M = MMA_M * AtomShape_M;
-    auto t = make_tile(Layout<Shape<Int<AtomShape_M>, Int<kNWarps>>,
-                              Stride<_1, Int<MMAStride_M>> >{},
-                       make_layout(size<2>(TileShape_MNK{})));
-    // if (cute::thread0()) {printf("make_tiled_copy_A_warpcontiguousM "); print(t); printf("\n");  }
-    return make_tiled_copy_impl(copy_atom, tiled_mma.get_layoutA_TV(), t);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <int MMA_M,
-          class... Args,
-          class TiledMMA>
-CUTE_HOST_DEVICE
-auto
-make_tiled_copy_C_warpcontiguousM(Copy_Atom<Args...> const& copy_atom,
-                                 TiledMMA           const& tiled_mma) {
-    using TileShape_MNK = typename TiledMMA::TiledShape_MNK;
-    using AtomShape_MNK = typename TiledMMA::AtomShape_MNK;
-    constexpr int AtomShape_M = decltype(size<0>(AtomShape_MNK{}))::value;
-    constexpr int kNWarps = decltype(size<0>(TileShape_MNK{}))::value / AtomShape_M;
-    constexpr int MMAStride_M = MMA_M * AtomShape_M;
-    auto t = make_tile(Layout<Shape<Int<AtomShape_M>, Int<kNWarps>>,
-                              Stride<_1, Int<MMAStride_M>> >{},
-                       // TODO: Shouldn't this be size<1>?
-                       make_layout(size<2>(TileShape_MNK{})));
-    // if (cute::thread0()) {printf("make_tiled_copy_C_warpcontiguousM "); print(t); printf("\n");  }
-    return make_tiled_copy_impl(copy_atom, tiled_mma.get_layoutC_TV(), t);
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -256,7 +209,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
-    // auto smem_thr_copy_Q = make_tiled_copy_A_warpcontiguousM<MMA_M>(typename Kernel_traits::SmemCopyAtom{}, tiled_mma).get_thread_slice(tidx);
     // if (cute::thread0()) {smem_thr_copy_Q.print_all();}
     Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
     // if (cute::thread0()) {print(tSsQ.layout()); printf("\n");}
@@ -558,7 +510,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // Partition sO to match the accumulator partitioning
     auto smem_tiled_copy_O = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
-    // auto smem_thr_copy_O = make_tiled_copy_C_warpcontiguousM<MMA_M>(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma).get_thread_slice(tidx);
     Tensor taccOrO = smem_thr_copy_O.retile_S(rO);        // ((Atom,AtomNum), MMA_M, MMA_N)
     Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
