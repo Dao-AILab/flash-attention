@@ -1,12 +1,10 @@
-# Adapted on https://github.com/ELS-RD/kernl/blob/main/src/kernl/implementations/linear_layer.py
+# Adapted from https://github.com/ELS-RD/kernl/blob/main/src/kernl/implementations/linear_layer.py
 # and https://github.com/openai/triton/blob/master/python/triton/ops/matmul.py
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
-from torch.autograd.function import FunctionCtx
-from torch.cuda.amp import custom_fwd
 from triton.ops.matmul_perf_model import early_config_prune, estimate_matmul_time
 
 from flash_attn.ops.triton.k_activations import (

@@ -15,10 +15,12 @@ try:
         flash_attn_qkvpacked_func,
         flash_attn_varlen_kvpacked_func,
         flash_attn_varlen_qkvpacked_func,
+        flash_attn_with_kvcache,
     )
 except ImportError:
     flash_attn_varlen_qkvpacked_func, flash_attn_varlen_kvpacked_func = None, None
     flash_attn_qkvpacked_func, flash_attn_kvpacked_func = None, None
+    flash_attn_with_kvcache = None
 
 try:
     from flash_attn.ops.fused_dense import ColumnParallelLinear, FusedDense, RowParallelLinear
@@ -271,13 +273,18 @@ class CrossAttention(nn.Module):
             # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
             scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
         if causal:
-            # "triu_tril_cuda_template" not implemented for 'BFloat16'
-            # So we have to construct the mask in float
-            causal_mask = torch.triu(
-                torch.full((seqlen_q, seqlen_k), -10000.0, device=scores.device), 1
+            # causal mask needs to take into account the difference between seqlen_q and seqlen_k
+            row_idx = rearrange(
+                torch.arange(seqlen_q, device=q.device, dtype=torch.long), "s -> s 1"
             )
-            # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
-            scores = scores + causal_mask.to(dtype=scores.dtype)
+            col_idx = torch.arange(seqlen_k, device=kv.device, dtype=torch.long)
+            sk = (
+                seqlen_k
+                if key_padding_mask is None
+                else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
+            )
+            causal_mask = col_idx > row_idx + sk - seqlen_q
+            scores = scores.masked_fill(causal_mask, -10000.0)
         attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
         attention_drop = self.drop(attention)
         output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
@@ -551,6 +558,35 @@ class MHA(nn.Module):
             else False,
         )
 
+    def _update_kvcache_attention(self, q, kv, inference_params):
+        """Write kv to inference_params, then do attention """
+        if (
+            inference_params.sequence_len_offset == 0
+            or flash_attn_with_kvcache is None
+            or not self.use_flash_attn
+        ):
+            # TODO: this only uses sequence_len_offset and not lengths_per_sample.
+            kv = self._update_kv_cache(kv, inference_params)
+            return self.inner_cross_attn(q, kv)
+        else:
+            batch = q.shape[0]
+            kv_cache = inference_params.key_value_memory_dict[self.layer_idx][:batch]
+            cache_seqlens = (
+                inference_params.lengths_per_sample[:batch]
+                if inference_params.lengths_per_sample is not None
+                else inference_params.sequence_len_offset
+            )
+            return flash_attn_with_kvcache(
+                q,
+                kv_cache[:, :, 0],
+                kv_cache[:, :, 1],
+                kv[:, :, 0],
+                kv[:, :, 1],
+                cache_seqlens=cache_seqlens,
+                softmax_scale=self.inner_cross_attn.softmax_scale,
+                causal=self.inner_cross_attn.causal,
+            )
+
     def forward(
         self,
         x,
@@ -600,7 +636,19 @@ class MHA(nn.Module):
             if self.use_flash_attn
             else {"key_padding_mask": key_padding_mask, **kwargs}
         )
-        seqlen_offset = 0 if inference_params is None else inference_params.sequence_len_offset
+        seqlen_offset = (
+            0
+            if inference_params is None
+            else (
+                inference_params.lengths_per_sample
+                if inference_params.lengths_per_sample is not None
+                else inference_params.sequence_len_offset
+            )
+        )
+        rotary_max_seqlen = (
+            inference_params.max_sequence_len if inference_params is not None else None
+        )
+        batch, seqlen = x.shape[:2]
         if not self.cross_attn and self.num_heads_kv == self.num_heads:
             assert x_kv is None and mixer_subset is None
             if not self.return_residual:
@@ -618,19 +666,18 @@ class MHA(nn.Module):
                 or not inference_params.fused_ft_kernel
             ):
                 if self.rotary_emb_dim > 0:
-                    qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset)
+                    qkv = self.rotary_emb(
+                        qkv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
+                    )
                 if inference_params is None:
                     if not self.checkpointing:
                         context = self.inner_attn(qkv, **kwargs)
                     else:
                         context = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv, **kwargs)
                 else:
-                    q = qkv[:, :, 0]
-                    kv = self._update_kv_cache(qkv[:, :, 1:], inference_params)
-                    # If we're processing the prompt, causal=None (use self.causal).
-                    # If we're decoding, then causal=False.
-                    causal = None if inference_params.sequence_len_offset == 0 else False
-                    context = self.inner_cross_attn(q, kv, causal=causal)
+                    context = self._update_kvcache_attention(
+                        qkv[:, :, 0], qkv[:, :, 1:], inference_params
+                    )
             else:
                 context = self._apply_rotary_single_query_attention(qkv, inference_params)
         else:
@@ -667,7 +714,9 @@ class MHA(nn.Module):
                 or not inference_params.fused_ft_kernel
             ):
                 if self.rotary_emb_dim > 0:
-                    q, kv = self.rotary_emb(q, kv, seqlen_offset=seqlen_offset)
+                    q, kv = self.rotary_emb(
+                        q, kv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
+                    )
                 if inference_params is None:
                     if not self.checkpointing:
                         context = self.inner_cross_attn(q, kv, **kwargs)
@@ -676,11 +725,7 @@ class MHA(nn.Module):
                             self.inner_cross_attn, q, kv, **kwargs
                         )
                 else:
-                    kv = self._update_kv_cache(kv, inference_params)
-                    # If we're processing the prompt, causal=None (use self.causal).
-                    # If we're decoding, then causal=False.
-                    causal = None if inference_params.sequence_len_offset == 0 else False
-                    context = self.inner_cross_attn(q, kv, causal=causal)
+                    context = self._update_kvcache_attention(q, kv, inference_params)
             else:
                 context = self._apply_rotary_single_query_attention(q, inference_params, kv=kv)
         out = self.out_proj(rearrange(context, "... h d -> ... (h d)"))
@@ -736,7 +781,7 @@ class ParallelMHA(nn.Module):
             self.num_heads, self.world_size, self.local_rank
         )
         self.num_heads_kv_per_rank = get_dim_for_local_rank(
-            self.num_heads, self.world_size, self.local_rank
+            self.num_heads_kv, self.world_size, self.local_rank
         )
         self.head_dim = self.embed_dim // num_heads
         qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
@@ -759,7 +804,7 @@ class ParallelMHA(nn.Module):
             process_group,
             bias=qkv_proj_bias,
             sequence_parallel=sequence_parallel,
-            multiple_of=self.head_dim * 3,
+            multiple_of=self.head_dim * (self.num_heads_per_rank + 2 * self.num_heads_kv_per_rank),
             **factory_kwargs,
         )
         inner_attn_cls = FlashSelfAttention if use_flash_attn else SelfAttention
@@ -840,6 +885,36 @@ class ParallelMHA(nn.Module):
             else False,
         )
 
+    def _update_kvcache_attention(self, q, kv, inference_params):
+        """Write kv to inference_params, then do attention """
+        if (
+            inference_params.sequence_len_offset == 0
+            or flash_attn_with_kvcache is None
+            or not self.use_flash_attn
+        ):
+            # TODO: this only uses sequence_len_offset and not lengths_per_sample.
+            kv = self._update_kv_cache(kv, inference_params)
+            return self.inner_cross_attn(q, kv)
+        else:
+            batch = q.shape[0]
+            kv_cache = inference_params.key_value_memory_dict[self.layer_idx][:batch]
+            cache_seqlens = (
+                inference_params.lengths_per_sample[:batch]
+                if inference_params.lengths_per_sample is not None
+                else inference_params.sequence_len_offset
+            )
+            context = flash_attn_with_kvcache(
+                q,
+                kv_cache[:, :, 0],
+                kv_cache[:, :, 1],
+                kv[:, :, 0],
+                kv[:, :, 1],
+                cache_seqlens=cache_seqlens,
+                softmax_scale=self.inner_cross_attn.softmax_scale,
+                causal=self.inner_cross_attn.causal,
+            )
+            return context
+
     def forward(self, x, seqlen=None, inference_params=None, **kwargs):
         """
         Arguments:
@@ -851,7 +926,18 @@ class ParallelMHA(nn.Module):
         qkv = self.Wqkv(x)
         if seqlen is not None:
             qkv = rearrange(qkv, "(b s) ... -> b s ...", s=seqlen)
-        seqlen_offset = 0 if inference_params is None else inference_params.sequence_len_offset
+        seqlen_offset = (
+            0
+            if inference_params is None
+            else (
+                inference_params.lengths_per_sample
+                if inference_params.lengths_per_sample is not None
+                else inference_params.sequence_len_offset
+            )
+        )
+        rotary_max_seqlen = (
+            inference_params.max_sequence_len if inference_params is not None else None
+        )
         if self.num_heads_kv == self.num_heads:
             qkv = rearrange(qkv, "b s (three h d) -> b s three h d", three=3, d=self.head_dim)
             if (
@@ -860,19 +946,18 @@ class ParallelMHA(nn.Module):
                 or not inference_params.fused_ft_kernel
             ):
                 if self.rotary_emb_dim > 0:
-                    qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset)
+                    qkv = self.rotary_emb(
+                        qkv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
+                    )
                 if inference_params is None:
                     if not self.checkpointing:
                         context = self.inner_attn(qkv, **kwargs)
                     else:
                         context = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv, **kwargs)
                 else:
-                    q = qkv[:, :, 0]
-                    kv = _update_kv_cache(qkv[:, :, 1:], inference_params, self.layer_idx)
-                    # If we're processing the prompt, causal=None (use self.causal).
-                    # If we're decoding, then causal=False.
-                    causal = None if inference_params.sequence_len_offset == 0 else False
-                    context = self.inner_cross_attn(q, kv, causal=causal)
+                    context = self._update_kvcache_attention(
+                        qkv[:, :, 0], qkv[:, :, 1:], inference_params
+                    )
             else:
                 context = self._apply_rotary_single_query_attention(qkv, inference_params)
         else:
@@ -893,7 +978,9 @@ class ParallelMHA(nn.Module):
                 or not inference_params.fused_ft_kernel
             ):
                 if self.rotary_emb_dim > 0:
-                    q, kv = self.rotary_emb(q, kv, seqlen_offset=seqlen_offset)
+                    q, kv = self.rotary_emb(
+                        q, kv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
+                    )
                 if inference_params is None:
                     if not self.checkpointing:
                         context = self.inner_cross_attn(q, kv, **kwargs)
@@ -902,11 +989,7 @@ class ParallelMHA(nn.Module):
                             self.inner_cross_attn, q, kv, **kwargs
                         )
                 else:
-                    kv = self._update_kv_cache(kv, inference_params)
-                    # If we're processing the prompt, causal=None (use self.causal).
-                    # If we're decoding, then causal=False.
-                    causal = None if inference_params.sequence_len_offset == 0 else False
-                    context = self.inner_cross_attn(q, kv, causal=causal)
+                    context = self._update_kvcache_attention(q, kv, inference_params)
             else:
                 context = self._apply_rotary_single_query_attention(q, inference_params, kv=kv)
         context = rearrange(context, "b s h d -> b s (h d)")

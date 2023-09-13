@@ -13,19 +13,25 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import GPT2Config
 
+from flash_attn.models.bigcode import remap_state_dict_hf_bigcode
 from flash_attn.models.falcon import remap_state_dict_hf_falcon
 from flash_attn.models.gpt_neox import remap_state_dict_hf_gpt_neox
 from flash_attn.models.gptj import remap_state_dict_hf_gptj
+from flash_attn.models.llama import remap_state_dict_hf_llama
 from flash_attn.models.opt import remap_state_dict_hf_opt
 from flash_attn.modules.block import Block, ParallelBlock
 from flash_attn.modules.embedding import GPT2Embeddings, ParallelGPT2Embeddings
 from flash_attn.modules.mha import MHA, ParallelMHA
-from flash_attn.modules.mlp import (FusedMLP, GatedMlp, Mlp, ParallelFusedMLP,
-                                    ParallelGatedMlp, ParallelMLP)
+from flash_attn.modules.mlp import (
+    FusedMLP,
+    GatedMlp,
+    Mlp,
+    ParallelFusedMLP,
+    ParallelGatedMlp,
+    ParallelMLP,
+)
 from flash_attn.ops.activations import sqrelu_fwd
-from flash_attn.utils.distributed import (all_gather_raw,
-                                          get_dim_for_local_rank,
-                                          sync_shared_params)
+from flash_attn.utils.distributed import all_gather_raw, get_dim_for_local_rank, sync_shared_params
 from flash_attn.utils.generation import GenerationMixin
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 
@@ -40,8 +46,7 @@ except ImportError:
     dropout_add_layer_norm = None
 
 try:
-    from flash_attn.ops.layer_norm import \
-        dropout_add_layer_norm_parallel_residual
+    from flash_attn.ops.layer_norm import dropout_add_layer_norm_parallel_residual
 except ImportError:
     dropout_add_layer_norm_parallel_residual = None
 
@@ -128,6 +133,7 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
             "gelu_new",
             "gelu_fast",
             "gelu_approx",
+            "gelu_pytorch_tanh",
             "relu",
             "sqrelu",
         ]
@@ -143,6 +149,7 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
             "gelu_new",
             "gelu_fast",
             "gelu_approx",
+            "gelu_pytorch_tanh",
             "relu",
             "sqrelu",
             "glu",
@@ -181,7 +188,8 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
             else:
                 approximate = (
                     "tanh"
-                    if config.activation_function in ["gelu_new", "gelu_fast", "gelu_approx"]
+                    if config.activation_function
+                    in ["gelu_new", "gelu_fast", "gelu_approx", "gelu_pytorch_tanh"]
                     else "none"
                 )
                 activation = partial(F.gelu, approximate=approximate)
@@ -214,7 +222,8 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
                 raise ImportError("fused_dense is not installed")
             activation = (
                 "gelu_approx"
-                if config.activation_function in ["gelu_new", "gelu_fast", "gelu_approx"]
+                if config.activation_function
+                in ["gelu_new", "gelu_fast", "gelu_approx", "gelu_pytorch_tanh"]
                 else config.activation_function
             )
             mlp_cls = FusedMLP if process_group is None else ParallelFusedMLP
@@ -349,6 +358,10 @@ class GPTPreTrainedModel(nn.Module):
             state_dict = remap_state_dict_hf_gpt_neox(state_dict, config)
         elif model_name.startswith("tiiuae/falcon-"):
             state_dict = remap_state_dict_hf_falcon(state_dict, config)
+        elif model_name.startswith("meta-llama/Llama-"):
+            state_dict = remap_state_dict_hf_llama(state_dict, config)
+        elif model_name.startswith("bigcode/") or model_name.startswith("WizardLM/"):
+            state_dict = remap_state_dict_hf_bigcode(state_dict, config)
         else:
             raise NotImplementedError(f"Model {model_name} not supported")
         if world_size > 1:
@@ -391,6 +404,7 @@ class GPTModel(GPTPreTrainedModel):
             "gelu_new",
             "gelu_fast",
             "gelu_approx",
+            "gelu_pytorch_tanh",
             "relu",
             "sqrelu",
             "glu",
@@ -618,25 +632,31 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
             batch_size, max_seqlen, dtype=dtype, **kwargs
         )
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, last_token_only=False):
+    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0):
         """
+        input_ids: (batch, seqlen) int tensor
         inference_params: for generation. Adapted from Megatron-LM (and Apex)
         https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
-        last_token_only: whether to return the logit for the last token only,
-            of shape (batch_size, vocab_size)
+        num_last_tokens: if > 0, only return the logits for the last n tokens
         """
+        assert (
+            input_ids.ndim == 2
+        ), f"Expected `input_ids` to have shape [b, slen], but got shape {input_ids.shape}"
+        b, slen = input_ids.shape
         hidden_states = self.transformer(
             input_ids, position_ids=position_ids, inference_params=inference_params
         )
-        if last_token_only:
-            hidden_states = hidden_states[:, -1]
+        if inference_params is not None:
+            assert hidden_states.ndim == 3, "sequence_parallel is not supported in generation mode"
+        if num_last_tokens > 0:
+            hidden_states = hidden_states[:, -num_last_tokens:]
         if self.project_out is not None:
             hidden_states = self.project_out(hidden_states)
         lm_logits = self.lm_head(hidden_states)
         # During inference, we want the full logit for sampling
         if isinstance(self.lm_head, ColumnParallelLinear) and inference_params is not None:
             lm_logits, _ = all_gather_raw(lm_logits, self.lm_head.process_group)
-            lm_logits = rearrange(lm_logits, "(n b) ... d -> b ... (n d)", b=hidden_states.shape[0])
+            lm_logits = rearrange(lm_logits, "(n b) ... d -> b ... (n d)", b=b)
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
         return CausalLMOutput(logits=lm_logits)
 
@@ -800,6 +820,8 @@ def combine_state_dicts_tp(state_dicts: list[dict[str, torch.Tensor]], config: G
     assert config.hidden_size % world_size == 0
     inner_dim = config.n_inner if config.n_inner is not None else 4 * config.hidden_size
     assert inner_dim % world_size == 0
+    assert config.hidden_size % config.n_head == 0
+    headdim = config.hidden_size // config.n_head
 
     # Sometimes the word embeddings are sharded on the 0th dim, sometimes on the 1st dim.
     # vocab_size // world_size coordinates are nonzero.
@@ -821,14 +843,6 @@ def combine_state_dicts_tp(state_dicts: list[dict[str, torch.Tensor]], config: G
                 ]
                 state_dict[key] = rearrange(torch.cat(xs, dim=1), "three d ... -> (three d) ...")
             else:
-                xs = [
-                    rearrange(
-                        s[key],
-                        "(nheadqkv headdim) ... -> nheadqkv headdim ...",
-                        nheadqkv=n_head + 2 * n_head_kv,
-                    )
-                    for s in state_dicts
-                ]
                 n_head_each_rank = [
                     get_dim_for_local_rank(n_head, world_size, local_rank)
                     for local_rank in range(world_size)
@@ -837,32 +851,41 @@ def combine_state_dicts_tp(state_dicts: list[dict[str, torch.Tensor]], config: G
                     get_dim_for_local_rank(n_head_kv, world_size, local_rank)
                     for local_rank in range(world_size)
                 ]
+                xs = [
+                    rearrange(
+                        s[key],
+                        "(nheadqkv headdim) ... -> nheadqkv headdim ...",
+                        nheadqkv=rank_n_head + 2 * rank_n_head_kv,
+                        headdim=headdim,
+                    )
+                    for s, rank_n_head, rank_n_head_kv in zip(
+                        state_dicts, n_head_each_rank, n_head_kv_each_rank
+                    )
+                ]
+                wq = torch.cat([x[: n_head_each_rank[rank]] for rank, x in enumerate(xs)], dim=0)
+                wk = torch.cat(
+                    [
+                        x[
+                            n_head_each_rank[rank] : n_head_each_rank[rank]
+                            + n_head_kv_each_rank[rank]
+                        ]
+                        for rank, x in enumerate(xs)
+                    ],
+                    dim=0,
+                )
+                wv = torch.cat(
+                    [
+                        x[n_head_each_rank[rank] + n_head_kv_each_rank[rank] :]
+                        for rank, x in enumerate(xs)
+                    ],
+                    dim=0,
+                )
+                wqkv = torch.cat(
+                    [wq, wk, wv],
+                    dim=0,
+                )
                 state_dict[key] = rearrange(
-                    torch.cat(
-                        [
-                            torch.cat(
-                                [x[: n_head_each_rank[rank]] for rank, x in enumerate(xs)], dim=0
-                            ),
-                            torch.cat(
-                                [
-                                    x[
-                                        n_head_each_rank[rank] : n_head_each_rank[rank]
-                                        + n_head_kv_each_rank[rank]
-                                    ]
-                                    for rank, x in enumerate(xs)
-                                ],
-                                dim=0,
-                            ),
-                            torch.cat(
-                                [
-                                    x[n_head_each_rank[rank] + n_head_kv_each_rank[rank] :]
-                                    for rank, x in enumerate(xs)
-                                ],
-                                dim=0,
-                            ),
-                        ],
-                        dim=0,
-                    ),
+                    wqkv,
                     "nheadqkv headdim ... -> (nheadqkv headdim) ...",
                 )
 

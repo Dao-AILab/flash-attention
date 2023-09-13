@@ -68,6 +68,8 @@ def remap_state_dict_hf_gpt_neox(state_dict, config):
         # We don't store these biases
         state_dict.pop(f"transformer.layers.{l}.attention.bias")
         state_dict.pop(f"transformer.layers.{l}.attention.masked_bias")
+        # We don't store these
+        state_dict.pop(f"transformer.layers.{l}.attention.rotary_emb.inv_freq", None)
         # GPT-NeoX stores Wqkv as ((nheads 3 headdim), hidden_dim)
         # while we store Wqkv as ((3 nheads headdim), hidden_dim)
         headdim = config.hidden_size // config.num_attention_heads
@@ -87,11 +89,6 @@ def remap_state_dict_hf_gpt_neox(state_dict, config):
         key = re.sub(
             r"^transformer.layers.(\d+).attention.dense.",
             r"transformer.layers.\1.mixer.out_proj.",
-            key,
-        )
-        key = re.sub(
-            r"^transformer.layers.(\d+).attention.rotary_emb.",
-            r"transformer.layers.\1.mixer.rotary_emb.",
             key,
         )
         return key

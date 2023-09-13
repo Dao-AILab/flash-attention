@@ -146,6 +146,7 @@ def test_falcon_parallel_forward(model_name, world_size):
         logits, _ = all_gather_raw(logits, process_group)
         logits = rearrange(logits, "(n b) ... d -> b ... (n d)", b=batch_size)
     del model
+    parallel_state.destroy_model_parallel()
 
     if rank == 0:
         model_hf = AutoModelForCausalLM.from_pretrained(
@@ -244,7 +245,7 @@ def test_falcon_generation(model_name):
         fused_ft_kernel=True,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
         teacher_outputs=out_hf.sequences,
     )
     torch.cuda.synchronize()
@@ -252,7 +253,9 @@ def test_falcon_generation(model_name):
 
     # Capture graph outside the timing loop
     batch_size, seqlen_og = input_ids.shape
-    model._decoding_cache = update_graph_cache(model, None, batch_size, seqlen_og, max_length)
+    model._decoding_cache = update_graph_cache(
+        model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=True
+    )
     print("With CUDA graph")
     torch.cuda.synchronize()
     start = time.time()
@@ -263,7 +266,7 @@ def test_falcon_generation(model_name):
         cg=True,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
         teacher_outputs=out_hf.sequences,
     )
     torch.cuda.synchronize()
@@ -350,12 +353,14 @@ def test_falcon_parallel_generation(model_name, world_size):
         # teacher_outputs=out_hf.sequences,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
     )
 
     # Capture graph outside the timing loop
     batch_size, seqlen_og = input_ids.shape
-    model._decoding_cache = update_graph_cache(model, None, batch_size, seqlen_og, max_length)
+    model._decoding_cache = update_graph_cache(
+        model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=True
+    )
     print("With CUDA graph")
     out_cg = model.generate(
         input_ids=input_ids,
@@ -367,7 +372,7 @@ def test_falcon_parallel_generation(model_name, world_size):
         # teacher_outputs=out_hf.sequences,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
     )
     del model
     parallel_state.destroy_model_parallel()

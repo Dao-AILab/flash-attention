@@ -114,7 +114,7 @@ def test_tensor_parallel(model_name, rotary, fused_ft_kernel, world_size):
         fused_ft_kernel=fused_ft_kernel,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
     )
     print(out.sequences)
     if fused_ft_kernel:
@@ -127,9 +127,11 @@ def test_tensor_parallel(model_name, rotary, fused_ft_kernel, world_size):
             cg=True,
             return_dict_in_generate=True,
             output_scores=True,
-            timing=True,
+            enable_timing=True,
         )
         print(out_cg.sequences)
+
+    parallel_state.destroy_model_parallel()
 
     if not rotary:
         out_hf = model_hf.generate(
@@ -171,5 +173,3 @@ def test_tensor_parallel(model_name, rotary, fused_ft_kernel, world_size):
         ).abs().max().item() < 3 * (
             torch.stack(out_hf.scores, 1) - torch.stack(out_ref.scores, 1)
         ).abs().max().item()
-
-    parallel_state.destroy_model_parallel()

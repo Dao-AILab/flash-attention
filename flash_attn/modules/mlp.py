@@ -1,9 +1,15 @@
-# Copyright (c) 2022, Tri Dao.
+# Copyright (c) 2023, Tri Dao.
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed import ProcessGroup
+
+
+try:
+    from flash_attn.ops.activations import swiglu
+except ImportError:
+    swiglu = None
 
 try:
     from flash_attn.ops.fused_dense import ColumnParallelLinear, RowParallelLinear
@@ -120,6 +126,9 @@ class GatedMlp(nn.Module):
         y = self.fc1(x)
         if self.activation == F.sigmoid:  # Special case for GLU
             y = F.glu(y, dim=-1)
+        elif self.activation == F.silu and swiglu is not None:  # Special case for SwiGLU
+            y, gate = y.chunk(2, dim=-1)
+            y = swiglu(gate, y)
         else:
             y, gate = y.chunk(2, dim=-1)
             y = y * self.activation(gate)
