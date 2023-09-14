@@ -1144,7 +1144,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      softmax_lse.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
-                     is_causal);
+                     is_causal,
+                     false,
+                     0.0f,
+                     0.0f);
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {
