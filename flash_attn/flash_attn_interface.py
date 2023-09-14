@@ -838,9 +838,9 @@ def flash_attn_with_kvcache(
         q: (batch_size, seqlen, nheads, headdim)
         k_cache: (batch_size, seqlen_cache, nheads_k, headdim)
         v_cache: (batch_size, seqlen_cache, nheads_k, headdim)
-        k [optional]: (batch_size, seqlen, nheads_k, headdim). If not None, we concatenate k with
-            k_cache, starting at the indices specified by cache_seqlens.
-        v [optional]: (batch_size, seqlen, nheads_k, headdim). Similar to k.
+        k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
+            k with k_cache, starting at the indices specified by cache_seqlens.
+        v [optional]: (batch_size, seqlen_new, nheads_k, headdim). Similar to k.
         cache_seqlens: int, or (batch_size,), dtype torch.int32. The sequence lengths of the
             KV cache.
         softmax_scale: float. The scaling of QK^T before applying softmax.

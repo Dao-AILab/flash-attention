@@ -18,11 +18,16 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import BertConfig, PretrainedConfig
 from transformers.models.bert.modeling_bert import (
-    BaseModelOutputWithPoolingAndCrossAttentions, BertForPreTrainingOutput)
+    BaseModelOutputWithPoolingAndCrossAttentions,
+    BertForPreTrainingOutput,
+)
 
-from flash_attn.bert_padding import (index_first_axis,
-                                     index_first_axis_residual, pad_input,
-                                     unpad_input)
+from flash_attn.bert_padding import (
+    index_first_axis,
+    index_first_axis_residual,
+    pad_input,
+    unpad_input,
+)
 from flash_attn.modules.block import Block
 from flash_attn.modules.embedding import BertEmbeddings
 from flash_attn.modules.mha import MHA
@@ -75,11 +80,15 @@ def create_mlp_cls(config, layer_idx=None, return_residual=False):
     inner_dim = config.intermediate_size
     fused_mlp = getattr(config, "fused_mlp", False)
     if fused_mlp:
-        assert config.hidden_act in ["gelu_new", "gelu_fast"], (
+        assert config.hidden_act in ["gelu_new", "gelu_fast", "gelu_pytorch_tanh"], (
             "fused_mlp only " "supports approximate gelu"
         )
     if not fused_mlp:
-        approximate = "tanh" if config.hidden_act in ["gelu_new", "gelu_fast"] else "none"
+        approximate = (
+            "tanh"
+            if config.hidden_act in ["gelu_new", "gelu_fast", "gelu_pytorch_tanh"]
+            else "none"
+        )
         mlp_cls = partial(
             Mlp,
             hidden_features=inner_dim,
@@ -232,7 +241,11 @@ class BertPredictionHeadTransform(nn.Module):
             raise ImportError("dropout_add_layer_norm is not installed")
         linear_cls = nn.Linear if not fused_bias_fc else FusedDense
         self.dense = linear_cls(config.hidden_size, config.hidden_size)
-        approximate = "tanh" if config.hidden_act in ["gelu_new", "gelu_fast"] else "none"
+        approximate = (
+            "tanh"
+            if config.hidden_act in ["gelu_new", "gelu_fast", "gelu_pytorch_tanh"]
+            else "none"
+        )
         self.transform_act_fn = nn.GELU(approximate=approximate)
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
@@ -334,7 +347,7 @@ class BertModel(BertPreTrainedModel):
         self.fused_dropout_add_ln = getattr(config, "fused_dropout_add_ln", False)
         if self.fused_dropout_add_ln and layer_norm is None:
             raise ImportError("dropout_add_layer_norm is not installed")
-        assert config.hidden_act in ["gelu", "gelu_new", "gelu_fast"]
+        assert config.hidden_act in ["gelu", "gelu_new", "gelu_fast", "gelu_pytorch_tanh"]
 
         self.embeddings = BertEmbeddings(
             config.hidden_size,

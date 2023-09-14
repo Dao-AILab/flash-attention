@@ -1,37 +1,38 @@
-# Copyright (c) 2023, Tri Dao.
-
 import time
 
 import pytest
 import torch
-from flash_attn.models.gpt import GPTLMHeadModel
-from flash_attn.models.gptj import gptj_config_to_gpt2_config, remap_state_dict_hf_gptj
+from transformers import AutoTokenizer, GPTBigCodeConfig
+from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeForCausalLM
+
+from flash_attn.models.bigcode import bigcode_config_to_gpt2_config, inv_remap_state_dict_hf_bigcode
+from flash_attn.models.gpt import GPTLMHeadModel, remap_state_dict_hf_bigcode
 from flash_attn.utils.generation import update_graph_cache
 from flash_attn.utils.pretrained import state_dict_from_pretrained
-from transformers import AutoTokenizer, GPTJConfig
-from transformers.models.gptj.modeling_gptj import GPTJForCausalLM
 
 
-@pytest.mark.parametrize("model_name", ["EleutherAI/gpt-j-6B"])
-def test_gptj_state_dict(model_name):
-    config = gptj_config_to_gpt2_config(GPTJConfig.from_pretrained(model_name))
-    pretrained_state_dict = remap_state_dict_hf_gptj(state_dict_from_pretrained(model_name), config)
-    model = GPTLMHeadModel(config, device="meta")  # Without device='meta' init is very slow
+@pytest.mark.parametrize("model_name", ["bigcode/starcoderbase-1b", "WizardLM/WizardCoder-1B-V1.0"])
+def test_bigcode_state_dict(model_name):
+    config = bigcode_config_to_gpt2_config(GPTBigCodeConfig.from_pretrained(model_name))
+    pretrained_state_dict = remap_state_dict_hf_bigcode(
+        state_dict_from_pretrained(model_name), config
+    )
+    model = GPTLMHeadModel(config, device="meta")
     state_dict = model.state_dict()
     assert state_dict.keys() == pretrained_state_dict.keys()
     for k in state_dict.keys():
         assert state_dict[k].shape == pretrained_state_dict[k].shape
 
 
-@pytest.mark.parametrize("model_name", ["EleutherAI/gpt-j-6B"])
-def test_gptj_optimized(model_name):
-    """Check that our implementation of GPT-J (with all optimizations enabled) matches the
+@pytest.mark.parametrize("model_name", ["bigcode/starcoderbase-1b", "WizardLM/WizardCoder-1B-V1.0"])
+def test_bigcode_optimized(model_name):
+    """Check that our implementation of BigCode (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
     forward pass in fp16, when compared to the HF forward pass in fp32.
     """
     dtype = torch.float16
     device = "cuda"
-    config = gptj_config_to_gpt2_config(GPTJConfig.from_pretrained(model_name))
+    config = bigcode_config_to_gpt2_config(GPTBigCodeConfig.from_pretrained(model_name))
     config.use_flash_attn = True  # FlashAttention-2 supports headdim 256
     config.fused_bias_fc = True
     config.fused_mlp = True
@@ -53,14 +54,14 @@ def test_gptj_optimized(model_name):
     del model
 
     # Without device_map, the model is loaded on the CPU, which is very slow
-    model_ref = GPTJForCausalLM.from_pretrained(model_name, device_map={"": device})
+    model_ref = GPTBigCodeForCausalLM.from_pretrained(model_name, device_map={"": device})
     model_ref.eval()
     with torch.no_grad():
         out_ref = model_ref.transformer(input_ids).last_hidden_state
         logits_ref = model_ref(input_ids).logits
     del model_ref
 
-    model_hf = GPTJForCausalLM.from_pretrained(
+    model_hf = GPTBigCodeForCausalLM.from_pretrained(
         model_name, torch_dtype=dtype, device_map={"": device}
     )
     model_hf.eval()
@@ -83,16 +84,15 @@ def test_gptj_optimized(model_name):
     ).abs().max().item()
 
 
-@pytest.mark.parametrize("fused_ft_kernel", [False, True])
-@pytest.mark.parametrize("model_name", ["EleutherAI/gpt-j-6B"])
-def test_gptj_generation(model_name, fused_ft_kernel):
-    """Check that our implementation of GPT-J (with all optimizations enabled) matches the
+@pytest.mark.parametrize("model_name", ["bigcode/starcoderbase-1b", "WizardLM/WizardCoder-1B-V1.0"])
+def test_bigcode_generation(model_name):
+    """Check that our implementation of BigCode (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
     forward pass in fp16, when compared to the HF forward pass in fp32.
     """
     dtype = torch.float16
     device = "cuda"
-    config = gptj_config_to_gpt2_config(GPTJConfig.from_pretrained(model_name))
+    config = bigcode_config_to_gpt2_config(GPTBigCodeConfig.from_pretrained(model_name))
     config.use_flash_attn = True  # FlashAttention-2 supports headdim 256
     config.fused_bias_fc = True
     config.fused_mlp = True
@@ -111,7 +111,7 @@ def test_gptj_generation(model_name, fused_ft_kernel):
         0, config.vocab_size, (batch_size, seqlen), dtype=torch.long, device=device
     )
 
-    model_hf = GPTJForCausalLM.from_pretrained(
+    model_hf = GPTBigCodeForCausalLM.from_pretrained(
         model_name, torch_dtype=dtype, device_map={"": device}
     )
     model_hf.eval()
@@ -125,7 +125,7 @@ def test_gptj_generation(model_name, fused_ft_kernel):
     print(f"Prompt processing + decoding time: {(time.time() - start) * 1000:.0f}ms")
     del model_hf
 
-    model_ref = GPTJForCausalLM.from_pretrained(model_name, device_map={"": device})
+    model_ref = GPTBigCodeForCausalLM.from_pretrained(model_name, device_map={"": device})
     model_ref.eval()
     with torch.no_grad():
         logits_ref = model_ref(out_hf.sequences).logits[:, (seqlen - 1) : -1]
@@ -141,7 +141,7 @@ def test_gptj_generation(model_name, fused_ft_kernel):
         input_ids=input_ids,
         max_length=max_length,
         eos_token_id=eos_token_id,
-        fused_ft_kernel=fused_ft_kernel,
+        fused_ft_kernel=True,
         return_dict_in_generate=True,
         output_scores=True,
         enable_timing=True,
@@ -152,16 +152,14 @@ def test_gptj_generation(model_name, fused_ft_kernel):
 
     # Capture graph outside the timing loop
     batch_size, seqlen_og = input_ids.shape
-    model._decoding_cache = update_graph_cache(
-        model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=fused_ft_kernel
-    )
+    model._decoding_cache = update_graph_cache(model, None, batch_size, seqlen_og, max_length)
     print("With CUDA graph")
     torch.cuda.synchronize()
     start = time.time()
     out_cg = model.generate(
         input_ids=input_ids,
         max_length=max_length,
-        fused_ft_kernel=fused_ft_kernel,
+        fused_ft_kernel=True,
         cg=True,
         return_dict_in_generate=True,
         output_scores=True,
@@ -186,4 +184,23 @@ def test_gptj_generation(model_name, fused_ft_kernel):
     print(f"Logits max diff: {(logits - logits_ref).abs().max().item() }")
     assert (logits - logits_ref).abs().max().item() < 2 * hf_error
     print(f"Logits CG max diff: {(logits_cg - logits_ref).abs().max().item() }")
-    assert torch.equal(logits_cg, logits)
+    assert (logits_cg - logits_ref).abs().max().item() < 2 * hf_error
+
+
+@pytest.mark.parametrize("model_name", ["bigcode/starcoderbase-1b", "WizardLM/WizardCoder-1B-V1.0"])
+def test_inv_remap_state_dict(model_name: str):
+    """
+    Verify that we can convert a HF BigCode model to flash_attn and back.
+    """
+
+    state_dict = state_dict_from_pretrained(model_name)
+    config = GPTBigCodeConfig.from_pretrained(model_name)
+
+    flash_state_dict = remap_state_dict_hf_bigcode(state_dict, config)
+    recovered_state_dict = inv_remap_state_dict_hf_bigcode(flash_state_dict, config)
+
+    assert set(state_dict.keys()) == set(recovered_state_dict.keys())
+
+    for k in state_dict.keys():
+        assert state_dict[k].shape == recovered_state_dict[k].shape
+        torch.testing.assert_close(state_dict[k], recovered_state_dict[k], rtol=1e-6, atol=1e-6)
