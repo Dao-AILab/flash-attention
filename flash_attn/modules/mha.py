@@ -661,7 +661,7 @@ class MHA(nn.Module):
                 qkv = rearrange(
                     self.dwconv_qkv(rearrange(qkv, "b s d -> b d s"))[..., :-2], "b d s -> b s d"
                 ).contiguous()
-            # qkv = rearrange(qkv, "... (three h d) -> ... three h d", three=3, d=self.head_dim)
+
             # qkv = qkv.reshape(batch, seqlen, 3, self.num_heads, self.head_dim)
             qkv = rearrange(qkv, "... (three h d) -> ... three h d", three=3, d=self.head_dim)
             if (
