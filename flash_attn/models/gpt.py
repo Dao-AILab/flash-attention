@@ -519,7 +519,7 @@ class GPTModel(GPTPreTrainedModel):
             if self.process_group is not None and self.sequence_parallel
             else {}
         )
-        batch_size, seq_len = input_ids.shape
+        batch_size, seq_len = input_ids.shape[0], input_ids.shape[1]
         hidden_states = self.embeddings(input_ids, position_ids=position_ids, **embedding_kwargs)
 
         if not self.parallel_block:
