@@ -1,0 +1,11 @@
+defaults:
+  - default.yaml
+
+gpu_stats_monitor:
+  _target_: pytorch_lightning.callbacks.GPUStatsMonitor
+  # [2021-08-13] TD: I just want the intra_step_size but it'll error if I
+  # don't have memory_utilization and gpu_utilization.
+  # Maybe I should write a callback with just the intra_step_size.
+  memory_utilization: True
+  gpu_utilization: True
+  intra_step_time: True

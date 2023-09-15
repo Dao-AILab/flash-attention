@@ -1,0 +1,15 @@
+_target_: src.datamodules.language_modeling_hf.LMDataModule
+dataset_name: openwebtext
+dataset_config_name: null
+tokenizer_name: gpt2
+cache_dir: ${oc.env:DATA_DIR,${data_dir}}/openwebtext/cache
+max_length: 1024
+val_ratio: 0.0005
+val_split_seed: 2357
+add_eos: True
+batch_size: 8  # per GPU
+batch_size_eval: ${eval:${.batch_size} * 2}
+num_workers: 32  # For preprocessing only
+shuffle: True
+pin_memory: True
+__train_len: ${div_up:9035582198, ${.max_length}}

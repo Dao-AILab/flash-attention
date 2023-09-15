@@ -1,0 +1,5 @@
+params_log:
+  _target_: src.callbacks.params_log.ParamsLog
+  total_params_log: True
+  trainable_params_log: True
+  non_trainable_params_log: True

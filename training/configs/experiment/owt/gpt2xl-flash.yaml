@@ -1,0 +1,21 @@
+# @package _global_
+defaults:
+  - /experiment/owt/gpt2l-flash.yaml
+  - override /model/gpt2model: gpt2-xlarge
+
+# Can enable mlp_checkpoint_lvl to fit to A100 40GB
+# model:
+#   config:
+#     # mlp_checkpoint_lvl: ${eval:"[1] * 18 + [2] * 18"}
+#     mlp_checkpoint_lvl: 1
+
+datamodule:
+  batch_size: ${eval:"2 if ${train.gpu_mem} < 24 else (4 if ${train.gpu_mem} < 40 else (8 if ${train.gpu_mem} < 80 else 16))"}
+  # With adamw-zero optimizer, on A100 40GB:
+  # checkpoint_lvl=1, batch size = 4: mem 37GB, 4650ms / batch of 512 (285ms * 15 + 375ms * 1)
+  # checkpoint_lvl=1, batch size = 8: mem 46GB, 4330ms / batch of 512 (530ms * 7 + 620ms * 1)
+  # checkpoint_lvl=2, batch size = 8: mem 41GB, 4570ms / batch of 512 (560ms * 7 + 650ms * 1)
+  # With adamw-apex-distributed optimizer:
+  # checkpoint_lvl=1, batch size = 8: mem 41.5GB, 4500ms / batch of 512 (550ms * 7 + 650ms * 1)
+  # checkpoint_lvl=1 for 24 layers and checkpoint_lvl=2 for 24 layers,
+  # batch size = 8: mem 39GB, 4640ms / batch of 512 (565ms * 7 + 675ms * 1)

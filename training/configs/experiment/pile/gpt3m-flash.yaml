@@ -1,0 +1,16 @@
+# @package _global_
+defaults:
+  - /experiment/pile/gpt3s-flash.yaml
+  - override /model/gpt2model: gpt2-medium
+
+# Can enable mlp_checkpoint_lvl to fit batch_size 16 to A100 40GB
+# model:
+#   config:
+#     mlp_checkpoint_lvl: 1
+
+datamodule:
+  batch_size: ${eval:"4 if ${train.gpu_mem} < 24 else (8 if ${train.gpu_mem} < 40 else (16 if ${train.gpu_mem} < 80 else 32))"}
+
+train:
+  optimizer:
+    lr: 3.0e-4

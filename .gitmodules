@@ -1,5 +1,5 @@
-[submodule "csrc/flash_attn/cutlass"]
-	path = csrc/flash_attn/cutlass
+[submodule "csrc/cutlass"]
+	path = csrc/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
 [submodule "csrc/flash_attn_rocm/composable_kernel"]
 	path = csrc/flash_attn_rocm/composable_kernel

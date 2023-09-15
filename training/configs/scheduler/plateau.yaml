@@ -1,0 +1,9 @@
+# @package _global_
+train:
+  scheduler_interval: epoch
+  scheduler_monitor: ???
+  scheduler:
+    _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+    factor: 0.2  # Decay factor when ReduceLROnPlateau is used
+    patience: 20
+    min_lr: 0.0  # Minimum learning rate during annealing

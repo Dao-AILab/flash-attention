@@ -1,0 +1,17 @@
+# @package _global_
+
+# run in experiment mode with:
+# `python run.py mode=exp name=experiment_name`
+
+experiment_mode: True
+
+# allows for custom naming of the experiment
+name: ???
+
+hydra:
+  # sets output paths for all file logs to `logs/experiment/name'
+  run:
+    dir: ${oc.env:RESULT_DIR,${work_dir}/logs}/experiments/${name}
+  sweep:
+    dir: ${oc.env:RESULT_DIR,${work_dir}/logs}/experiments/${name}
+    subdir: ${hydra.job.num}

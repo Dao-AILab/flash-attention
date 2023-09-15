@@ -28,7 +28,7 @@
 #include <iostream>
 #include <numeric>
 
-#include "launch_params.h"
+#include "params.h"
 #include "bwd_device_gemm_template.h"
 
 namespace bwd_device_gemm {

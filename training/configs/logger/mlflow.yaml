@@ -1,0 +1,10 @@
+# https://mlflow.org
+
+mlflow:
+  _target_: pytorch_lightning.loggers.mlflow.MLFlowLogger
+  experiment_name: ${name}
+  tracking_uri: null
+  tags: null
+  save_dir: ./mlruns
+  prefix: ""
+  artifact_location: null

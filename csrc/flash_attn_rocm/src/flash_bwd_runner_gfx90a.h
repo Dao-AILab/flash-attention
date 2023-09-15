@@ -23,35 +23,26 @@
 
 #pragma once
 
-#include <cstdlib>
-#include <initializer_list>
-#include <iostream>
-#include <numeric>
-
 #include "bwd_device_gemm_launcher.h"
-
-#include "static_switch.h"
 
 namespace bwd_device_gemm {
 class FlashBwdRunner {
  public:
   // constructor
-  explicit FlashBwdRunner(LaunchParams<FlashBwdParams> &launch_params)
-    : params_(launch_params.params),
-      stream_(launch_params.stream_),
-      is_deterministic_(launch_params.params.is_deterministic),
-      is_performance_mode_(launch_params.params.is_performance_mode) {}
+  FlashBwdRunner(bool is_unit_test_mode, bool is_deterministic)
+    : is_unti_test_mode_(is_unit_test_mode),
+      is_deterministic_(is_deterministic) {}
 
   template <bool kIsQLoop, int kHeadDim, typename T, bool kIsCausal>
-  void Run();
+  void Run(FlashBwdParams &params, hipStream_t &stream);
 
  private:
   template <template <typename> typename DeviceGemmTemplate,
             typename T,
             device_gemm_trait::MaskingSpec kMaskingSpec, 
             bool kIsDeterministic>
-  void run_() {
-    if (is_performance_mode_) {
+  void run_(FlashBwdParams &params, hipStream_t &stream) {
+    if (!is_unit_test_mode_) {
       // benchmark mode
       // input, output, gemm, dropout, cshuffle, masking specialization, deterministic
       using DeviceGemmTraits = device_gemm_trait::Backward<T, 
@@ -80,9 +71,7 @@ class FlashBwdRunner {
     }
   }
 
-  FlashBwdParams &params_;
-  hipStream_t &stream_;
+  const bool is_unit_test_mode_;
   const bool is_deterministic_;
-  const bool is_performance_mode_;
 }; // class FlashBwdRunner
 } // namespace bwd_device_gemm

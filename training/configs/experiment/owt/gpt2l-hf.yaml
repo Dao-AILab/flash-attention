@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - /experiment/owt/gpt2m-hf.yaml
+  - override /model/gpt2model: gpt2-large
+  - override /optimizer: adamw-zero
+
+datamodule:
+  batch_size: 2
+
+trainer:
+  strategy:
+    _target_: src.utils.ddp_zero1.DDPStrategyZero1
+    find_unused_parameters: False
+    gradient_as_bucket_view: True
