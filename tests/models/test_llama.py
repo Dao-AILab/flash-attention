@@ -139,7 +139,7 @@ def test_llama_optimized(model_name, checkpoint_format):
 
 @pytest.mark.parametrize("model_name", ["PY007/TinyLlama-1.1B-step-50K-105b"])
 def test_mqa_optimized(model_name):
-    """Check that our implementation of BigCode (with all optimizations enabled) matches the
+    """Check that our implementation of Llama with MQA/GQA (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
     forward pass in fp16, when compared to the HF forward pass in fp32.
     """

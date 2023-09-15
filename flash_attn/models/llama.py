@@ -297,7 +297,7 @@ def inv_remap_state_dict_hf_llama(
         return (
             w.view(first_dim or config.n_head, -1, 2, config.n_embd)
             .transpose(1, 2)
-            .reshape(config.n_embd, config.n_embd)
+            .reshape(-1, config.n_embd)
         )
 
     n_head = config.n_head
