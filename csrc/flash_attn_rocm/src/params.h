@@ -10,12 +10,7 @@
 
 #include <vector>
 
-#include <ATen/ATen.h>
-#include <torch/extension.h>
-#include <ATen/hip/HIPContext.h>
 #include <ATen/hip/HIPGeneratorImpl.h>
-// #include <c10/hip/HIPGuard.h>
-// #include <c10/core/DeviceType.h>
 
 #include "utils.h"
 
@@ -27,20 +22,24 @@ struct QkvParams {
   using index_t = uint32_t;
   
   // The QKV matrices.
-  std::vector<const void*> q_ptr; //changed to ck input type
-  std::vector<const void*> k_ptr;
-  std::vector<const void*> v_ptr;
+  std::vector<const void*> q_ptrs; //changed to ck input type
+  std::vector<const void*> k_ptrs;
+  std::vector<const void*> v_ptrs;
+
+  std::vector<at::Tensor> q_tensors;
+  std::vector<at::Tensor> k_tensors;
+  std::vector<at::Tensor> v_tensors;
 
   // The stride between rows of the Q, K and V matrices.
-  index_t q_batch_stride;
-  index_t k_batch_stride;
-  index_t v_batch_stride;
-  index_t q_row_stride;
-  index_t k_row_stride;
-  index_t v_row_stride;
-  index_t q_head_stride;
-  index_t k_head_stride;
-  index_t v_head_stride;
+  // index_t q_batch_stride;
+  // index_t k_batch_stride;
+  // index_t v_batch_stride;
+  // index_t q_row_stride;
+  // index_t k_row_stride;
+  // index_t v_row_stride;
+  // index_t q_head_stride;
+  // index_t k_head_stride;
+  // index_t v_head_stride;
 
   // The number of heads.
   int h, h_k;
@@ -52,18 +51,18 @@ struct QkvParams {
 namespace fwd_device_gemm {
 struct FlashFwdParams : public QkvParams {
   // The O matrix (output).
-  std::vector<void*> o_ptr;
+  std::vector<void*> out_ptrs;
   
   // The stride between rows of O.
-  index_t o_batch_stride;
-  index_t o_row_stride;
-  index_t o_head_stride;
+  // index_t o_batch_stride;
+  // index_t o_row_stride;
+  // index_t o_head_stride;
 
   // The pointer to the P matrix.
-  std::vector<void*> p_ptr;
+  std::vector<void*> p_ptrs;
 
   // The pointer to the softmax sum.
-  std::vector<void*> softmax_lse_ptr;
+  std::vector<void*> softmax_lse_ptrs;
 
   // The dimensions.
   int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded;
@@ -76,40 +75,48 @@ struct FlashFwdParams : public QkvParams {
   int * __restrict__ cu_seqlens_q;
   int * __restrict__ cu_seqlens_k;
 
-  int *__restrict__ blockmask;
+  std::vector<int> host_seqlens_q;
+  std::vector<int> host_seqlens_k;
+
+  int q_stride_multiplier;
+  int kv_stride_multiplier;
+
+  // int *__restrict__ blockmask;
 
   // The dropout probability (probability of keeping an activation).
   float p_dropout;
-  uint8_t p_dropout_in_uint8_t;
+  // uint8_t p_dropout_in_uint8_t;
 
   // Scale factor of 1 / (1 - p_dropout).
-  float rp_dropout;
-  float scale_softmax_rp_dropout;
+  // float rp_dropout;
+  // float scale_softmax_rp_dropout;
 
   // Random state.
   at::PhiloxCudaState philox_args;
 
   bool is_bf16;
   bool is_causal;
-  // bool is_performance_mode;
-  // bool is_deterministic;
-  // bool is_using_qloop;
+  bool is_mnko_padding;
 };
 } // namespace fwd_device_gemm
 
 namespace bwd_device_gemm {
 struct FlashBwdParams : public fwd_device_gemm::FlashFwdParams {
-
   // The dO and dQKV matrices.
-  std::vector<const void*> do_ptr;
-  std::vector<void*> dq_ptr;
-  std::vector<void*> dk_ptr;
-  std::vector<void*> dv_ptr;
+  std::vector<void*> z_ptrs;
+  std::vector<const void*> dout_ptrs;
+  std::vector<void*> dq_ptrs;
+  std::vector<void*> dk_ptrs;
+  std::vector<void*> dv_ptrs;
+
+  std::vector<at::Tensor> dq_tensors;
+  std::vector<at::Tensor> dk_tensors;
+  std::vector<at::Tensor> dv_tensors;
 
   // To accumulate dQ
-  std::vector<void*> dq_accum_ptr;
-  std::vector<void*> dk_accum_ptr;
-  std::vector<void*> dv_accum_ptr;
+  // std::vector<void*> dq_accum_ptrs;
+  // std::vector<void*> dk_accum_ptrs;
+  // std::vector<void*> dv_accum_ptrs;
 
   // // To accumulate dK and dV in case we're splitting the bwd along seqlen_q
   // dimension void *__restrict__ dk_accum_ptr; void *__restrict__
@@ -118,21 +125,21 @@ struct FlashBwdParams : public fwd_device_gemm::FlashFwdParams {
   // The stride between rows of the dO, dQ, dK and dV matrices.
   // TD [2022-04-16]: We're using 32-bit indexing to save registers.
   // The code probably won't work for arrays larger than 2GB.
-  index_t do_batch_stride;
-  index_t do_row_stride;
-  index_t do_head_stride;
-  index_t dq_batch_stride;
-  index_t dk_batch_stride;
-  index_t dv_batch_stride;
-  index_t dq_row_stride;
-  index_t dk_row_stride;
-  index_t dv_row_stride;
-  index_t dq_head_stride;
-  index_t dk_head_stride;
-  index_t dv_head_stride;
+  // index_t do_batch_stride;
+  // index_t do_row_stride;
+  // index_t do_head_stride;
+  // index_t dq_batch_stride;
+  // index_t dk_batch_stride;
+  // index_t dv_batch_stride;
+  // index_t dq_row_stride;
+  // index_t dk_row_stride;
+  // index_t dv_row_stride;
+  // index_t dq_head_stride;
+  // index_t dk_head_stride;
+  // index_t dv_head_stride;
 
   // The pointer to the softmax d sum.
-  std::vector<void*> dsoftmax_sum;
+  // std::vector<void*> dsoftmax_sum_ptrs;
 };
 } // namespace bwd_device_gemm
 

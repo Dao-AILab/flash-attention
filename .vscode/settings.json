@@ -1,0 +1,10 @@
+{
+    "cmake.sourceDirectory": "/workspaces/flash-attention/csrc/flash_attn_rocm",
+    "files.associations": {
+        "deque": "cpp",
+        "string": "cpp",
+        "vector": "cpp",
+        "random": "cpp",
+        "optional": "cpp"
+    }
+}
