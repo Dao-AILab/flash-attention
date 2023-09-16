@@ -352,9 +352,16 @@ class GPTPreTrainedModel(nn.Module):
             state_dict = remap_state_dict_hf_gpt2(state_dict, config)
         elif model_name.startswith("facebook/opt"):
             state_dict = remap_state_dict_hf_opt(state_dict, config)
-        elif model_name.startswith("EleutherAI/gpt-j-"):
+        elif (
+            model_name.startswith("EleutherAI/gpt-j-")
+            or model_name.startswith("togethercomputer/GPT-JT-")
+        ):
             state_dict = remap_state_dict_hf_gptj(state_dict, config)
-        elif model_name.startswith("EleutherAI/gpt-neox-"):
+        elif (
+            model_name.startswith("EleutherAI/gpt-neox-")
+            or model_name.startswith("EleutherAI/pythia-")
+            or model_name.startswith("togethercomputer/RedPajama-INCITE-")
+        ):
             state_dict = remap_state_dict_hf_gpt_neox(state_dict, config)
         elif model_name.startswith("tiiuae/falcon-"):
             state_dict = remap_state_dict_hf_falcon(state_dict, config)
