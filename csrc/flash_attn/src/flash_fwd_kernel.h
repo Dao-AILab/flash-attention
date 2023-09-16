@@ -744,10 +744,36 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // Prologue
 
+    // Copy from Knew to K, optionally apply rotary embedding.
+    typename Kernel_traits::GmemTiledCopyRotcossin gmem_tiled_copy_rotary;
+    auto gmem_thr_copy_rotary = gmem_tiled_copy_rotary.get_thread_slice(tidx);
+    typename Kernel_traits::GmemTiledCopyRotcossinCont gmem_tiled_copy_rotary_cont;
+    auto gmem_thr_copy_rotary_cont = gmem_tiled_copy_rotary_cont.get_thread_slice(tidx);
     if constexpr (Append_KV) {
         // Even if we have MQA / GQA, all threadblocks responsible for the same KV head are writing to
         // gmem. Technically it's a race condition, but they all write the same content anyway, and it's safe.
         // We want to do this so that all threadblocks can proceed right after they finish writing the KV cache.
+        const index_t row_offset_cossin = ((n_block_max - 1) * kBlockN) * (params.rotary_dim / 2);
+        Tensor gCos = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
+                                  Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                  make_stride(params.rotary_dim / 2, _1{}));
+        Tensor gSin = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
+                                  Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                  make_stride(params.rotary_dim / 2, _1{}));
+        Tensor gCosCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
+                                      Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                      make_stride(params.rotary_dim / 2, _1{}));
+        Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
+                                      Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                      make_stride(params.rotary_dim / 2, _1{}));
+        Tensor tRgCos = gmem_thr_copy_rotary.partition_S(gCos);
+        Tensor tRgSin = gmem_thr_copy_rotary.partition_S(gSin);
+        Tensor tRgCosCont = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
+        Tensor tRgSinCont = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
+        // if (cute::thread(0, 0)) { printf("rotary_cos_ptr = %p, gCos.data() = %p, tRgCos.data() = %p, rotary_dim = %d\n", params.rotary_cos_ptr, gCos.data(), tRgCos.data(), params.rotary_dim); }
+        // if (cute::thread(8, 0)) { print_tensor(gCos); }
+        // if (cute::thread(0, 0)) { print_tensor(tRgCos); }
+
         const index_t row_offset_knew = binfo.k_offset(params.knew_batch_stride, params.knew_row_stride, bidb)
             + ((n_block_max - 1) * kBlockN) * params.knew_row_stride + (bidh / params.h_h_k_ratio) * params.knew_head_stride;
         const index_t row_offset_vnew = binfo.k_offset(params.vnew_batch_stride, params.vnew_row_stride, bidb)
@@ -770,16 +796,38 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         const int n_block_copy_min = std::max(n_block_min, binfo.seqlen_k_cache / kBlockN);
         for (int n_block = n_block_max - 1; n_block >= n_block_copy_min; n_block--) {
             flash::copy_w_min_idx<Is_even_K>(
-                tKgKnew, tKgK, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN, binfo.seqlen_k_cache - n_block * kBlockN
-            );
-            flash::copy_w_min_idx<Is_even_K>(
                 tVgVnew, tVgV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN, binfo.seqlen_k_cache - n_block * kBlockN
             );
-            tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
-            tKgKnew.data() = tKgKnew.data() + (-int(kBlockN * params.knew_row_stride));
             tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
             tVgVnew.data() = tVgVnew.data() + (-int(kBlockN * params.vnew_row_stride));
+            if (params.rotary_dim == 0) {
+                flash::copy_w_min_idx<Is_even_K>(
+                    tKgKnew, tKgK, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN, binfo.seqlen_k_cache - n_block * kBlockN
+                );
+            } else {
+                if (params.is_rotary_interleaved) {
+                    // Don't clear OOB_K because we're writing to global memory
+                    flash::copy_rotary_interleaved<Is_even_K, /*Clear_OOB_K=*/false>(
+                        tKgKnew, tKgK, tRgCos, tRgSin, tKVcKV, binfo.actual_seqlen_k - n_block * kBlockN,
+                        binfo.seqlen_k_cache - n_block * kBlockN, params.d, params.rotary_dim
+                    );
+                    tRgCos.data() = tRgCos.data() + (-int(kBlockN * params.rotary_dim / 2));
+                    tRgSin.data() = tRgSin.data() + (-int(kBlockN * params.rotary_dim / 2));
+                } else {
+                    // Don't clear OOB_K because we're writing to global memory
+                    flash::copy_rotary_contiguous<Is_even_K, /*Clear_OOB_K=*/false>(
+                        tKgKnew, tKgK, tRgCosCont, tRgSinCont, tKVcKV, binfo.actual_seqlen_k - n_block * kBlockN,
+                        binfo.seqlen_k_cache - n_block * kBlockN, params.d, params.rotary_dim
+                    );
+                    tRgCosCont.data() = tRgCosCont.data() + (-int(kBlockN * params.rotary_dim / 2));
+                    tRgSinCont.data() = tRgSinCont.data() + (-int(kBlockN * params.rotary_dim / 2));
+
+                }
+            }
+            tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            tKgKnew.data() = tKgKnew.data() + (-int(kBlockN * params.knew_row_stride));
         }
+        // Need this before we can read in K again, so that we'll see the updated K values.
         __syncthreads();
         if (n_block_max > n_block_copy_min) {
             tKgK.data() = tKgK.data() + (n_block_max - n_block_copy_min) * kBlockN * params.k_row_stride;
@@ -787,10 +835,44 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
     }
 
+    // Read Q from gmem to smem, optionally apply rotary embedding.
     Tensor tQrQ = make_fragment_like(tQgQ);
-    // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
-    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
-                                       binfo.actual_seqlen_q - m_block * kBlockM);
+    if (!Append_KV || params.rotary_dim == 0) {
+        // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
+        flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
+                                           binfo.actual_seqlen_q - m_block * kBlockM);
+    } else {
+        const index_t row_offset_cossin = (binfo.seqlen_k_cache + (Is_causal ? m_block * kBlockM : 0)) * (params.rotary_dim / 2);
+        // If not causal, all the queries get the same the cos/sin, taken at location seqlen_k_cache.
+        // We do this by setting the row stride of gCos / gSin to 0.
+        Tensor gCos = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
+                                  Shape<Int<kBlockM>, Int<kHeadDim / 2>>{},
+                                  make_stride(Is_causal ? params.rotary_dim / 2 : 0, _1{}));
+        Tensor gSin = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
+                                  Shape<Int<kBlockM>, Int<kHeadDim / 2>>{},
+                                  make_stride(Is_causal ? params.rotary_dim / 2 : 0, _1{}));
+        Tensor gCosCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
+                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                  make_stride(Is_causal ? params.rotary_dim / 2 : 0, _1{}));
+        Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
+                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                  make_stride(Is_causal ? params.rotary_dim / 2 : 0, _1{}));
+        Tensor tRgCos = gmem_thr_copy_rotary.partition_S(gCos);
+        Tensor tRgSin = gmem_thr_copy_rotary.partition_S(gSin);
+        Tensor tRgCosCont = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
+        Tensor tRgSinCont = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
+        if (params.is_rotary_interleaved) {
+            flash::copy_rotary_interleaved<Is_even_K>(
+                tQgQ, tQsQ, tRgCos, tRgSin, tQcQ, binfo.actual_seqlen_q - m_block * kBlockM,
+                0, params.d, params.rotary_dim
+            );
+        } else {
+            flash::copy_rotary_contiguous<Is_even_K>(
+                tQgQ, tQsQ, tRgCosCont, tRgSinCont, tQcQ, binfo.actual_seqlen_q - m_block * kBlockM,
+                0, params.d, params.rotary_dim
+            );
+        }
+    }
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.

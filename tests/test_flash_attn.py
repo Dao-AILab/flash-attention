@@ -15,6 +15,7 @@ from flash_attn import (
 )
 from flash_attn.bert_padding import pad_input, unpad_input
 from flash_attn.flash_attn_interface import _get_block_size
+from flash_attn.layers.rotary import apply_rotary_emb
 
 MAX_HEADDIM_SM8x = 192
 
@@ -1497,12 +1498,16 @@ def test_flash_attn_splitkv(seqlen_q, seqlen_k, swap_sq_sk, d, causal, dtype):
 @pytest.mark.parametrize("new_kv", [False, True])
 # @pytest.mark.parametrize("new_kv", [True])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
+# @pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
+# @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
+@pytest.mark.parametrize("rotary_interleaved", [False, True])
+# @pytest.mark.parametrize("rotary_interleaved", [False])
+@pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
+# @pytest.mark.parametrize("rotary_fraction", [1.0])
 @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
-# @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [64])
 @pytest.mark.parametrize(
@@ -1523,15 +1528,29 @@ def test_flash_attn_splitkv(seqlen_q, seqlen_k, swap_sq_sk, d, causal, dtype):
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_flash_attn_kvcache(
-    seqlen_q, seqlen_k, d, seqlen_new_eq_seqlen_q, causal, new_kv, mha_type, num_splits, dtype
+    seqlen_q,
+    seqlen_k,
+    d,
+    rotary_fraction,
+    rotary_interleaved,
+    seqlen_new_eq_seqlen_q,
+    causal,
+    new_kv,
+    mha_type,
+    num_splits,
+    dtype,
 ):
     if seqlen_q > seqlen_k and new_kv:
+        pytest.skip()
+    if not new_kv and rotary_fraction > 0.0:
         pytest.skip()
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
     batch_size = 2
     nheads = 6
+    # rotary_dim must be a multiple of 16, and must be <= d
+    rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
@@ -1545,12 +1564,42 @@ def test_flash_attn_kvcache(
     v_cache = torch.randn(batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype)
     cache_seqlens = torch.randint(
         0,
-        (seqlen_k - seqlen_new + 1) if new_kv else (seqlen_k + 1),
+        # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
+        (seqlen_k - (seqlen_q if causal and rotary_dim > 1 else seqlen_new) + 1)
+        if new_kv
+        else (seqlen_k + 1),
         (batch_size,),
         dtype=torch.int32,
         device=device,
     )
     # cache_seqlens = torch.tensor([64], dtype=torch.int32, device=device)
+    if rotary_dim > 0:
+        angle = torch.rand(seqlen_k, rotary_dim // 2, device=device) * 2 * math.pi
+        cos = torch.cos(angle).to(dtype=dtype)
+        sin = torch.sin(angle).to(dtype=dtype)
+        if causal:
+            q_ro = apply_rotary_emb(
+                q, cos, sin, seqlen_offsets=cache_seqlens, interleaved=rotary_interleaved
+            )
+        else:
+            q_ro = rearrange(
+                apply_rotary_emb(
+                    rearrange(q, "b s h d -> b 1 (s h) d"),
+                    cos,
+                    sin,
+                    seqlen_offsets=cache_seqlens,
+                    interleaved=rotary_interleaved,
+                ),
+                "b 1 (s h) d -> b s h d",
+                s=seqlen_q,
+            )
+        # q_ro = q
+        k_ro = apply_rotary_emb(
+            k, cos, sin, seqlen_offsets=cache_seqlens, interleaved=rotary_interleaved
+        )
+    else:
+        cos, sin = None, None
+        q_ro, k_ro = q, k
     # k_cache[:, 64:] = -1
     k_cache_ref = k_cache.clone()
     v_cache_ref = v_cache.clone()
@@ -1560,12 +1609,22 @@ def test_flash_attn_kvcache(
         update_mask = torch.logical_and(
             cache_seqlens_expanded <= arange, arange < cache_seqlens_expanded + seqlen_new
         )
-        k_cache_ref[update_mask] = rearrange(k, "b s ... -> (b s) ...")
+        k_cache_ref[update_mask] = rearrange(k_ro, "b s ... -> (b s) ...")
         v_cache_ref[update_mask] = rearrange(v, "b s ... -> (b s) ...")
     k_cache_rep = repeat(k_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
     v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
     out = flash_attn_with_kvcache(
-        q, k_cache, v_cache, k, v, cache_seqlens, causal=causal, num_splits=num_splits
+        q,
+        k_cache,
+        v_cache,
+        k,
+        v,
+        cos,
+        sin,
+        cache_seqlens,
+        causal=causal,
+        rotary_interleaved=rotary_interleaved,
+        num_splits=num_splits,
     )
     # out = flash_attn_with_kvcache(q, k_cache, v_cache, cache_seqlens=cache_seqlens, causal=causal)
     # out = flash_attn_with_kvcache(q, k_cache, v_cache, causal=causal)
@@ -1577,10 +1636,10 @@ def test_flash_attn_kvcache(
     # probs = torch.softmax(qk, dim=-1)
     key_padding_mask = arange < cache_seqlens_expanded + (seqlen_new if new_kv else 0)
     out_ref, _ = attention_ref(
-        q, k_cache_rep, v_cache_rep, None, key_padding_mask, 0.0, None, causal=causal
+        q_ro, k_cache_rep, v_cache_rep, None, key_padding_mask, 0.0, None, causal=causal
     )
     out_pt, _ = attention_ref(
-        q,
+        q_ro,
         k_cache_rep,
         v_cache_rep,
         None,
@@ -1598,10 +1657,10 @@ def test_flash_attn_kvcache(
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
-    assert (out - out_ref).abs().max().item() <= 3 * (out_pt - out_ref).abs().max().item() + 1e-5
     if new_kv:
-        assert torch.equal(k_cache, k_cache_ref)
+        assert torch.allclose(k_cache, k_cache_ref, rtol=1e-3, atol=1e-3)
         assert torch.equal(v_cache, v_cache_ref)
+    assert (out - out_ref).abs().max().item() <= 3 * (out_pt - out_ref).abs().max().item() + 1e-5
 
 
 # @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))

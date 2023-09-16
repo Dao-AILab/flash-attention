@@ -67,7 +67,7 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ softmax_lseaccum_ptr;
 
     // The dimensions.
-    int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded;
+    int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;
 
     // The scaling factors for the kernel.
     float scale_softmax;
@@ -91,6 +91,10 @@ struct Flash_fwd_params : public Qkv_params {
     index_t knew_head_stride;
     index_t vnew_head_stride;
 
+    // The cos and sin matrices for rotary embedding.
+    void * __restrict__ rotary_cos_ptr;
+    void * __restrict__ rotary_sin_ptr;
+
     // The dropout probability (probability of keeping an activation).
     float p_dropout;
     // uint32_t p_dropout_in_uint;
@@ -113,6 +117,8 @@ struct Flash_fwd_params : public Qkv_params {
     // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
     // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.
     bool is_seqlens_k_cumulative;
+
+    bool is_rotary_interleaved;
 
     int num_splits;  // For split-KV version
 };

@@ -280,7 +280,7 @@ def get_logits(model, input_ids, max_length, teacher_outputs=None, **kwargs):
 
 @pytest.mark.parametrize("seqlen,maxlen", [(10, 20), (30, 150), (3000, 3400), (14000, 15000)])
 # @pytest.mark.parametrize('seqlen,maxlen', [(10, 20)])
-@pytest.mark.parametrize("rotary", [None, "interleaved", "block"])
+@pytest.mark.parametrize("rotary", [None, "interleaved", "contiguous"])
 # @pytest.mark.parametrize('rotary', [None])
 @pytest.mark.parametrize("fused_ft_kernel", [False, True])
 # @pytest.mark.parametrize("fused_ft_kernel", [False])
