@@ -26,7 +26,7 @@
 namespace fwd_device_gemm {
 // hdim 64, bf16, non-causal, MNKO-padding
 template <>
-void FlashFwdRunner::Run<true, 64, device_gemm_trait::BFloat16, false, true>(bool is_dropout) {
+void FlashFwdRunner::Run<64, device_gemm_trait::BFloat16, false, true>(bool is_dropout) {
   if(is_dropout){
     BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
       this->template run_<DeviceGemmQLoopHeadDim64,
@@ -49,7 +49,7 @@ void FlashFwdRunner::Run<true, 64, device_gemm_trait::BFloat16, false, true>(boo
 
 // hdim 64, bf16, non-causal, non-padding
 template <>
-void FlashFwdRunner::Run<true, 64, device_gemm_trait::BFloat16, false, false>(bool is_dropout) {
+void FlashFwdRunner::Run<64, device_gemm_trait::BFloat16, false, false>(bool is_dropout) {
   if(is_dropout){
     BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
       this->template run_<DeviceGemmQLoopHeadDim64,

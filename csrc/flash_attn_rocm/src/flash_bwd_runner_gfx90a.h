@@ -42,7 +42,7 @@ class FlashBwdRunner {
       is_deterministic_(launch_params.params.is_deterministic),
       is_performance_mode_(launch_params.params.is_performance_mode) {}
 
-  template <bool kIsQLoop, int kHeadDim, typename T, bool kIsCausal>
+  template <int kHeadDim, typename T, bool kIsCausal>
   void Run();
 
  private:

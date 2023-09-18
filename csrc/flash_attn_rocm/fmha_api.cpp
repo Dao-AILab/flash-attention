@@ -20,11 +20,9 @@ void run_flash_fwd(LaunchParams<FlashFwdParams> &launch_params) {
   HEADDIM_SWITCH(launch_params.params.d, [&] {
     BF16_SWITCH(launch_params.params.is_bf16, [&] {
       BOOL_SWITCH(launch_params.params.is_causal, kIsCausal, [&] {
-        BOOL_SWITCH(launch_params.params.is_using_qloop, kIsQLoop, [&] {
-          BOOL_SWITCH(launch_params.params.is_mnko_padding, kIsPadding, [&] {
-              auto flash_fwd_runner_ptr = std::make_unique<fwd_device_gemm::FlashFwdRunner>(launch_params);
-              flash_fwd_runner_ptr->Run<kIsQLoop, kHeadDim, T, kIsCausal, kIsPadding>(launch_params.is_dropout_);
-          });
+        BOOL_SWITCH(launch_params.params.is_mnko_padding, kIsPadding, [&] {
+            auto flash_fwd_runner_ptr = std::make_unique<fwd_device_gemm::FlashFwdRunner>(launch_params);
+            flash_fwd_runner_ptr->Run<kHeadDim, T, kIsCausal, kIsPadding>(launch_params.is_dropout_);
         });
       });
     });
@@ -35,10 +33,8 @@ void run_flash_bwd(LaunchParams<FlashBwdParams> &launch_params) {
   HEADDIM_SWITCH(launch_params.params.d, [&] {
     BF16_SWITCH(launch_params.params.is_bf16, [&] {
       BOOL_SWITCH(launch_params.params.is_causal, kIsCausal, [&] {
-        BOOL_SWITCH(launch_params.params.is_using_qloop, kIsQLoop, [&] {
-          auto flash_bwd_runner_ptr = std::make_unique<bwd_device_gemm::FlashBwdRunner>(launch_params);
-          flash_bwd_runner_ptr->Run<kIsQLoop, kHeadDim, T, kIsCausal>();
-        });
+        auto flash_bwd_runner_ptr = std::make_unique<bwd_device_gemm::FlashBwdRunner>(launch_params);
+        flash_bwd_runner_ptr->Run<kHeadDim, T, kIsCausal>();
       });
     });
   });
