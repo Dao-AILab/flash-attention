@@ -377,7 +377,7 @@ def get_dropout_mask(S_dmask, dropout_p, cu_seqlens_q, cu_seqlens_k, batch_size,
                 #    #for m in range(current_seqlen_k):
                 #    #    index_for_S_dmask = j * current_seqlen_q * current_seqlen_k + k* current_seqlen_k + m
                 #    #    S_dmask_converted[i][j][k][m] = S_dmask_each[index_for_S_dmask]
-        dropout_mask_t = S_dmask_converted <= ((1 - dropout_p) * 65535)
+        dropout_mask_t = S_dmask_converted <= ((1 - dropout_p) * 255)
         dropout_mask = dropout_mask_t.contiguous()
     return dropout_mask
 
