@@ -87,7 +87,7 @@ RUN pip install git+https://github.com/mlcommons/logging.git@2.1.0
 # Install FlashAttention
 RUN pip install flash-attn==2.2.3.post2
 
-# Install CUDA extensions for cross-entropy, fused dense, layer norm
+# Install CUDA extensions for fused dense, layer norm
 RUN git clone https://github.com/HazyResearch/flash-attention \
     && cd flash-attention && git checkout v2.2.3.post2 \
     && cd csrc/layer_norm && pip install . && cd ../../ \

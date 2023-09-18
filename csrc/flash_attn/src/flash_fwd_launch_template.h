@@ -44,7 +44,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
             BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
                 // Will only return softmax if dropout, to reduce compilation time.
-                auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal, IsEvenMNConst, IsEvenKConst, ReturnSoftmaxConst && Is_dropout>;
+                // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
+                auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal, IsEvenMNConst && IsEvenKConst, IsEvenKConst, ReturnSoftmaxConst && Is_dropout>;
                 // auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal, IsEvenMNConst, true, ReturnSoftmaxConst && Is_dropout>;
                 if (smem_size >= 48 * 1024) {
                     C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -76,7 +77,8 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 BOOL_SWITCH(params.num_splits > 1, Split, [&] {
                     BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV, [&] {
                         // If Append_KV, then we must have seqlen_offsets, which means cu_seqlens_k != nullptr.
-                        auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, IsEvenMNConst && !Append_KV, IsEvenKConst, Split, Append_KV>;
+                        // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
+                        auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, IsEvenMNConst && !Append_KV && IsEvenKConst, IsEvenKConst, Split, Append_KV>;
                         // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, true, Split, Append_KV>;
                         // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, IsEvenKConst>;
                         if (smem_size >= 48 * 1024) {
