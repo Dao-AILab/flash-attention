@@ -48,7 +48,6 @@ struct QkvParams {
   int h_h_k_ratio; // precompute h / h_k,
 };
 
-namespace fwd_device_gemm {
 struct FlashFwdParams : public QkvParams {
   // The O matrix (output).
   std::vector<void*> out_ptrs;
@@ -94,14 +93,15 @@ struct FlashFwdParams : public QkvParams {
   // Random state.
   at::PhiloxCudaState philox_args;
 
+  // Pointer to the RNG seed (idx 0) and offset (idx 1).
+  uint64_t * rng_state;
+
   bool is_bf16;
   bool is_causal;
   bool is_mnko_padding;
 };
-} // namespace fwd_device_gemm
 
-namespace bwd_device_gemm {
-struct FlashBwdParams : public fwd_device_gemm::FlashFwdParams {
+struct FlashBwdParams : public FlashFwdParams {
   // The dO and dQKV matrices.
   std::vector<void*> z_ptrs;
   std::vector<const void*> dout_ptrs;
@@ -141,7 +141,6 @@ struct FlashBwdParams : public fwd_device_gemm::FlashFwdParams {
   // The pointer to the softmax d sum.
   // std::vector<void*> dsoftmax_sum_ptrs;
 };
-} // namespace bwd_device_gemm
 
 // template<typename KernelParams>
 // struct LaunchParams{

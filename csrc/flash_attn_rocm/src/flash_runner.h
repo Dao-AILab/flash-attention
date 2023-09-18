@@ -24,20 +24,12 @@
 #pragma once
 
 #include <memory>
-#include <map>
 #include <cstdlib>
 
-namespace fwd_device_gemm 
-{ 
+namespace fwd_device_gemm { class FlashFwdRunner; }
+namespace bwd_device_gemm { class FlashBwdRunner; }
 class FlashFwdParams;
-class FlashFwdRunner; 
-}
-
-namespace bwd_device_gemm 
-{
 class FlashBwdParams; 
-class FlashBwdRunner;
-}
 
 class FlashRunner {
  public:
