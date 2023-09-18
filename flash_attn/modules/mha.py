@@ -559,7 +559,7 @@ class MHA(nn.Module):
         )
 
     def _update_kvcache_attention(self, q, kv, inference_params):
-        """Write kv to inference_params, then do attention """
+        """Write kv to inference_params, then do attention"""
         if (
             inference_params.sequence_len_offset == 0
             or flash_attn_with_kvcache is None
@@ -621,7 +621,9 @@ class MHA(nn.Module):
             assert key_padding_mask is None
             assert self.use_flash_attn
             assert not self.dwconv
-            assert self.rotary_emb_dim == 0
+            assert (
+                self.rotary_emb_dim == 0
+            ), "Rotary embeddings are not supported when using variable length inputs with a key padding mask"
         if key_padding_mask is not None:
             assert cu_seqlens is None
             assert max_seqlen is None
@@ -659,6 +661,8 @@ class MHA(nn.Module):
                 qkv = rearrange(
                     self.dwconv_qkv(rearrange(qkv, "b s d -> b d s"))[..., :-2], "b d s -> b s d"
                 ).contiguous()
+
+            # qkv = qkv.reshape(batch, seqlen, 3, self.num_heads, self.head_dim)
             qkv = rearrange(qkv, "... (three h d) -> ... three h d", three=3, d=self.head_dim)
             if (
                 inference_params is None
@@ -886,7 +890,7 @@ class ParallelMHA(nn.Module):
         )
 
     def _update_kvcache_attention(self, q, kv, inference_params):
-        """Write kv to inference_params, then do attention """
+        """Write kv to inference_params, then do attention"""
         if (
             inference_params.sequence_len_offset == 0
             or flash_attn_with_kvcache is None

@@ -3,16 +3,17 @@ import re
 import pytest
 import torch
 from einops import rearrange
+from transformers import GPT2Config, GPT2Tokenizer
+from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel as GPT2LMHeadModelHF
+
 from flash_attn.models.gpt import (
     GPTLMHeadModel,
+    combine_state_dicts_tp,
     remap_state_dict_hf_gpt2,
     shard_state_dict_tp,
-    combine_state_dicts_tp,
 )
 from flash_attn.utils.generation import InferenceParams
 from flash_attn.utils.pretrained import state_dict_from_pretrained
-from transformers import GPT2Config, GPT2Tokenizer
-from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel as GPT2LMHeadModelHF
 
 
 @pytest.mark.parametrize("model_name", ["gpt2", "gpt2-medium"])
@@ -51,12 +52,22 @@ def test_gpt2_non_optimized(model_name):
     batch_size = 4
     max_seqlen = 512
     seqlens = torch.randint(max_seqlen // 2, max_seqlen + 1, (batch_size,), device="cuda")
+    # force one sequence to be the max length so that we can the key padding mask
+    seqlens[0] = max_seqlen
     input_ids = torch.randint(
         0, config.vocab_size, (batch_size, max_seqlen), dtype=torch.long, device="cuda"
     )
-    out = model.transformer(input_ids)
-    out_hf = model_hf.transformer(input_ids).last_hidden_state
-    out_ref = model_ref.transformer(input_ids).last_hidden_state
+    key_padding_mask = torch.zeros_like(input_ids).bool()
+    for i, sl in enumerate(seqlens):
+        key_padding_mask[i, :sl] = True
+    # undefined behavior for tokens outside the key padding mask
+    out = model.transformer(input_ids, key_padding_mask=key_padding_mask)[key_padding_mask]
+    out_hf = model_hf.transformer(input_ids, attention_mask=key_padding_mask).last_hidden_state[
+        key_padding_mask
+    ]
+    out_ref = model_ref.transformer(input_ids, attention_mask=key_padding_mask).last_hidden_state[
+        key_padding_mask
+    ]
 
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -64,9 +75,9 @@ def test_gpt2_non_optimized(model_name):
     print(f"HF fp16 mean diff: {(out_hf - out_ref).abs().mean().item()}")
     assert (out - out_ref).abs().max().item() < 3 * (out_hf - out_ref).abs().max().item()
 
-    logits = model(input_ids).logits
-    logits_hf = model_hf(input_ids).logits
-    logits_ref = model_ref(input_ids).logits
+    logits = model(input_ids, key_padding_mask=key_padding_mask).logits[key_padding_mask]
+    logits_hf = model_hf(input_ids, attention_mask=key_padding_mask).logits[key_padding_mask]
+    logits_ref = model_ref(input_ids, attention_mask=key_padding_mask).logits[key_padding_mask]
 
     print(f"Logits max diff: {(logits - logits_ref).abs().max().item()}")
     print(f"Logits mean diff: {(logits - logits_ref).abs().mean().item()}")
@@ -78,7 +89,6 @@ def test_gpt2_non_optimized(model_name):
 
 
 @pytest.mark.parametrize("model_name", ["gpt2", "gpt2-medium"])
-# @pytest.mark.parametrize('model_name', ["gpt2"])
 def test_gpt2_optimized(model_name):
     """Check that our implementation of GPT2 (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
@@ -108,12 +118,22 @@ def test_gpt2_optimized(model_name):
     batch_size = 4
     max_seqlen = 512
     seqlens = torch.randint(max_seqlen // 2, max_seqlen + 1, (batch_size,), device="cuda")
+    # force one sequence to be the max length so that we can the key padding mask
+    seqlens[0] = max_seqlen
     input_ids = torch.randint(
         0, vocab_size_og, (batch_size, max_seqlen), dtype=torch.long, device="cuda"
     )
-    out = model.transformer(input_ids)
-    out_hf = model_hf.transformer(input_ids).last_hidden_state
-    out_ref = model_ref.transformer(input_ids).last_hidden_state
+    key_padding_mask = torch.zeros_like(input_ids).bool()
+    for i, sl in enumerate(seqlens):
+        key_padding_mask[i, :sl] = True
+    # undefined behavior for tokens outside the key padding mask
+    out = model.transformer(input_ids, key_padding_mask=key_padding_mask)[key_padding_mask]
+    out_hf = model_hf.transformer(input_ids, attention_mask=key_padding_mask).last_hidden_state[
+        key_padding_mask
+    ]
+    out_ref = model_ref.transformer(input_ids, attention_mask=key_padding_mask).last_hidden_state[
+        key_padding_mask
+    ]
 
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -121,9 +141,11 @@ def test_gpt2_optimized(model_name):
     print(f"HF fp16 mean diff: {(out_hf - out_ref).abs().mean().item()}")
     assert (out - out_ref).abs().max().item() < 3 * (out_hf - out_ref).abs().max().item()
 
-    logits = model(input_ids).logits[..., :vocab_size_og]
-    logits_hf = model_hf(input_ids).logits
-    logits_ref = model_ref(input_ids).logits
+    logits = model(input_ids, key_padding_mask=key_padding_mask).logits[..., :vocab_size_og][
+        key_padding_mask
+    ]
+    logits_hf = model_hf(input_ids, attention_mask=key_padding_mask).logits[key_padding_mask]
+    logits_ref = model_ref(input_ids, attention_mask=key_padding_mask).logits[key_padding_mask]
 
     print(f"Logits max diff: {(logits - logits_ref).abs().max().item()}")
     print(f"Logits mean diff: {(logits - logits_ref).abs().mean().item()}")

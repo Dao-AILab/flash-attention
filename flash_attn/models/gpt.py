@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import GPT2Config
 
+from flash_attn.bert_padding import pad_input, unpad_input
 from flash_attn.models.bigcode import remap_state_dict_hf_bigcode
 from flash_attn.models.falcon import remap_state_dict_hf_falcon
 from flash_attn.models.gpt_neox import remap_state_dict_hf_gpt_neox
@@ -501,7 +502,22 @@ class GPTModel(GPTPreTrainedModel):
             for i, layer in enumerate(self.layers)
         }
 
-    def forward(self, input_ids, position_ids=None, inference_params=None):
+    def forward(
+        self,
+        input_ids,
+        position_ids=None,
+        key_padding_mask=None,
+        inference_params=None,
+    ):
+        """
+        Arguments:
+            input_ids: (batch, seqlen)
+            position_ids: (batch, seqlen)
+            key_padding_mask: boolean mask, True means to keep, False means to mask out. Also known as attention_mask.
+                (batch, seqlen).
+            inference_params: for generation. Adapted from Megatron-LM (and Apex)
+            https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
+        """
         # If using Tensor Parallel with sequence parallel, we combine the batch and the seqlen
         # dimensions so that we can split on it easily, in case of small batch size.
         # Only the attention layers need to know the seqlen.
@@ -510,8 +526,10 @@ class GPTModel(GPTPreTrainedModel):
             if self.process_group is not None and self.sequence_parallel
             else {}
         )
+        batch_size, seq_len = input_ids.shape[0], input_ids.shape[1]
         hidden_states = self.embeddings(input_ids, position_ids=position_ids, **embedding_kwargs)
-        if self.parallel_block:
+
+        if not self.parallel_block:
             hidden_states2 = None
         residual = None
         mixer_kwargs = (
@@ -521,6 +539,21 @@ class GPTModel(GPTPreTrainedModel):
         )
         if inference_params is not None:
             mixer_kwargs["inference_params"] = inference_params
+
+        use_flash_attn = getattr(self.config, "use_flash_attn", False)
+
+        # the flash attention kernel takes in cumulative sequence lengths instead of a mask
+        if use_flash_attn and key_padding_mask is not None:
+            hidden_states, unpad_indices, cu_seqlens, max_seqlen = unpad_input(
+                hidden_states, key_padding_mask
+            )
+            mixer_kwargs["cu_seqlens"] = cu_seqlens
+            mixer_kwargs["max_seqlen"] = max_seqlen
+        # if not using flash attention, we pass in the key_padding_mask
+        else:
+            mixer_kwargs["key_padding_mask"] = key_padding_mask
+            unpad_indices = None
+
         for layer in self.layers:
             if self.prenorm:
                 if not self.parallel_block:
@@ -533,6 +566,16 @@ class GPTModel(GPTPreTrainedModel):
                     )
             else:
                 hidden_states = layer(hidden_states, mixer_kwargs=mixer_kwargs)
+
+        # if using flash attention with a key padding mask, we pad the hidden states and the residuals back to the original shape
+        if use_flash_attn and key_padding_mask is not None:
+            hidden_states = pad_input(hidden_states, unpad_indices, batch_size, seq_len)
+            residual = pad_input(residual, unpad_indices, batch_size, seq_len)
+
+            if hidden_states2 is not None:
+                hidden_states2 = pad_input(hidden_states2, unpad_indices, batch_size, seq_len)
+                residual = pad_input(residual, unpad_indices, batch_size, seq_len)
+
         if self.prenorm:
             if not self.fused_dropout_add_ln:
                 dropped = self.drop_f(hidden_states)
@@ -583,6 +626,7 @@ class GPTModel(GPTPreTrainedModel):
                         prenorm=False,
                         residual_in_fp32=self.residual_in_fp32,
                     )
+
         return hidden_states
 
 
@@ -639,9 +683,18 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
             batch_size, max_seqlen, dtype=dtype, **kwargs
         )
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0):
+    def forward(
+        self,
+        input_ids,
+        position_ids=None,
+        key_padding_mask=None,
+        inference_params=None,
+        num_last_tokens=0,
+    ):
         """
         input_ids: (batch, seqlen) int tensor
+        key_padding_mask: boolean mask, True means to keep, False means to mask out. Also known as attention_mask.
+                (batch, seqlen).
         inference_params: for generation. Adapted from Megatron-LM (and Apex)
         https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
         num_last_tokens: if > 0, only return the logits for the last n tokens
@@ -651,7 +704,10 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         ), f"Expected `input_ids` to have shape [b, slen], but got shape {input_ids.shape}"
         b, slen = input_ids.shape
         hidden_states = self.transformer(
-            input_ids, position_ids=position_ids, inference_params=inference_params
+            input_ids,
+            position_ids=position_ids,
+            key_padding_mask=key_padding_mask,
+            inference_params=inference_params,
         )
         if inference_params is not None:
             assert hidden_states.ndim == 3, "sequence_parallel is not supported in generation mode"
