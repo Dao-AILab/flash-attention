@@ -158,7 +158,7 @@ inline __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor, const ui
         #pragma unroll
         for (int i = 0; i < size<0, 0>(tensor); ++i) {
             const int row_idx = row_idx_base + i * 8;
-            const int col_idx_limit_high = causal ? std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q) : std::numeric_limits<int>::max();
+            const int col_idx_limit_high = causal ? std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q) : 1 << 31;
             #pragma unroll
             for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                 const int col_idx_base = col_idx_offset + nj * 8;

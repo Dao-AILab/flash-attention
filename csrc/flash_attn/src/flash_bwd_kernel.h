@@ -792,9 +792,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k)) {
                 flash::apply_mask_local(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                                          binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
-                                         binfo.actual_seqlen_q,
+                                         AtomLayoutMS * 16, binfo.actual_seqlen_q,
                                          // binfo.actual_seqlen_k, m_block * kBlockM + (tidx / 32) % AtomLayoutMS * 16 + (tidx % 32) / 4,
-                                         AtomLayoutMS * 16, params.max_past, true);
+                                         params.max_past, true);
             }
         }
 
