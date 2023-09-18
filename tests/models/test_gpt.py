@@ -134,14 +134,12 @@ def test_gpt2_optimized(model_name):
     ).abs().max().item()
 
 
-@pytest.mark.parametrize("fused_ft_kernel", [False, True])
-# @pytest.mark.parametrize('fused_ft_kernel', [True])
 @pytest.mark.parametrize("optimized", [False, True])
 # @pytest.mark.parametrize('optimized', [True])
 @pytest.mark.parametrize("rotary", [False, True])
 # @pytest.mark.parametrize('rotary', [False])
 @pytest.mark.parametrize("model_name", ["gpt2"])
-def test_gpt2_generation(model_name, rotary, optimized, fused_ft_kernel):
+def test_gpt2_generation(model_name, rotary, optimized):
     """Check that our implementation of GPT2 generation matches the HF implementation:
     the scores in fp16 should be around the same as the HF scores in fp16, when compared to
     the HF scores in fp32.
@@ -202,18 +200,16 @@ def test_gpt2_generation(model_name, rotary, optimized, fused_ft_kernel):
     out = model.generate(
         input_ids=input_ids,
         max_length=max_length,
-        fused_ft_kernel=fused_ft_kernel,
         return_dict_in_generate=True,
         output_scores=True,
         enable_timing=True,
     )
     print(out.sequences)
     print(tokenizer.batch_decode(out.sequences.tolist()))
-    if fused_ft_kernel or getattr(config, "use_flash_attn", False):
+    if getattr(config, "use_flash_attn", False):
         out_cg = model.generate(
             input_ids=input_ids,
             max_length=max_length,
-            fused_ft_kernel=fused_ft_kernel,
             cg=True,
             return_dict_in_generate=True,
             output_scores=True,
@@ -282,10 +278,8 @@ def get_logits(model, input_ids, max_length, teacher_outputs=None, **kwargs):
 # @pytest.mark.parametrize('seqlen,maxlen', [(10, 20)])
 @pytest.mark.parametrize("rotary", [None, "interleaved", "contiguous"])
 # @pytest.mark.parametrize('rotary', [None])
-@pytest.mark.parametrize("fused_ft_kernel", [False, True])
-# @pytest.mark.parametrize("fused_ft_kernel", [False])
 @pytest.mark.parametrize("model_name", ["gpt2"])
-def test_gpt2_generation_cg(model_name, fused_ft_kernel, rotary, seqlen, maxlen):
+def test_gpt2_generation_cg(model_name, rotary, seqlen, maxlen):
     """Check that decoding with CUDA graph is the same as decoding without CUDA graph."""
     dtype = torch.float16
     device = "cuda"
@@ -315,17 +309,8 @@ def test_gpt2_generation_cg(model_name, fused_ft_kernel, rotary, seqlen, maxlen)
         0, config.vocab_size, (batch_size, maxlen), dtype=torch.long, device=device
     )
 
-    logits = get_logits(
-        model, input_ids, maxlen, teacher_outputs=teacher_outputs, fused_ft_kernel=fused_ft_kernel
-    )
-    logits_cg = get_logits(
-        model,
-        input_ids,
-        maxlen,
-        teacher_outputs=teacher_outputs,
-        fused_ft_kernel=fused_ft_kernel,
-        cg=True,
-    )
+    logits = get_logits(model, input_ids, maxlen, teacher_outputs=teacher_outputs)
+    logits_cg = get_logits(model, input_ids, maxlen, teacher_outputs=teacher_outputs, cg=True)
     assert torch.equal(logits, logits_cg)
 
     # Try increasing batch size and seqlen, then decrease them to see if it's still correct
@@ -369,7 +354,6 @@ def test_gpt2_multiple_token_generation(model_name, optimized):
         config.fused_bias_fc = True
         config.fused_mlp = True
         config.fused_dropout_add_ln = True
-    # fused_ft_kernel currently doesn't work with multiple tokens at a time
 
     model = GPTLMHeadModel.from_pretrained(model_name, config, device=device, dtype=dtype)
     model.eval()
@@ -398,13 +382,12 @@ def test_gpt2_multiple_token_generation(model_name, optimized):
     assert torch.allclose(logits, logits_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("fused_ft_kernel, cg", [(False, False), (True, False), (True, True)])
-# @pytest.mark.parametrize("fused_ft_kernel, cg", [(True, True)])
+@pytest.mark.parametrize("cg", [False, True])
 # @pytest.mark.parametrize("optimized", [False, True])
 @pytest.mark.parametrize("optimized", [True])
 # @pytest.mark.parametrize("model_name", ["gpt2-medium"])
 @pytest.mark.parametrize("model_name", ["gpt2-xl"])
-def test_gpt2_speculative_decoding(model_name, optimized, fused_ft_kernel, cg):
+def test_gpt2_speculative_decoding(model_name, optimized, cg):
     dtype = torch.float16
     device = "cuda"
     rtol, atol = 3e-3, 3e-1
@@ -444,7 +427,6 @@ def test_gpt2_speculative_decoding(model_name, optimized, fused_ft_kernel, cg):
         model_draft,
         max_length=max_length,
         top_k=5,
-        fused_ft_kernel=fused_ft_kernel,
         cg=cg,
         speculative_lookahead=4,
         enable_timing=True,
@@ -454,7 +436,6 @@ def test_gpt2_speculative_decoding(model_name, optimized, fused_ft_kernel, cg):
         input_ids,
         max_length=max_length,
         top_k=5,
-        fused_ft_kernel=fused_ft_kernel,
         cg=False,
         enable_timing=True,
         return_dict_in_generate=True,

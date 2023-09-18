@@ -32,11 +32,6 @@ try:
 except ImportError:
     RotaryEmbedding = None
 
-try:
-    import ft_attention
-except ImportError:
-    ft_attention = None
-
 
 class FlashSelfAttention(nn.Module):
     """Implement the scaled dot product attention with softmax.
@@ -314,14 +309,7 @@ def _update_kv_cache(kv, inference_params, layer_idx):
         )
         inference_params.key_value_memory_dict[layer_idx] = kv_cache
     else:
-        if not inference_params.fused_ft_kernel:
-            kv_cache = inference_params.key_value_memory_dict[layer_idx]
-        else:
-            # For FT, k_cache has shape (b, h, headdim / packsize, s, packsize)
-            # where packsize = 4 if fp32, 8 if fp16 or bf16.
-            # v_cache has shape (b, h, s, headdim)
-            k_cache, v_cache = inference_params.key_value_memory_dict[layer_idx]
-            kv_cache = None
+        kv_cache = inference_params.key_value_memory_dict[layer_idx]
     # Adjust key and value for inference
     batch_start = inference_params.batch_size_offset
     batch_end = batch_start + kv.shape[0]
@@ -329,79 +317,9 @@ def _update_kv_cache(kv, inference_params, layer_idx):
     sequence_end = sequence_start + kv.shape[1]
     assert batch_end <= (kv_cache.shape[0] if kv_cache is not None else v_cache.shape[0])
     assert sequence_end <= (kv_cache.shape[1] if kv_cache is not None else v_cache.shape[2])
-    # Copy key and values.
-    if not inference_params.fused_ft_kernel:
-        assert kv_cache is not None
-        kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
-        kv = kv_cache[batch_start:batch_end, :sequence_end, ...]
-        return kv
-    else:
-        assert inference_params.sequence_len_offset == 0
-        # FT kernel requires different layouts for the k_cache and v_cache.
-        assert kv.dtype in [torch.float16, torch.bfloat16, torch.float32]
-        packsize = 4 if kv.dtype == torch.float32 else 8
-        if kv_cache is not None:
-            kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
-            k_cache = rearrange(
-                kv_cache[:, :, 0], "b s h (d packsize) -> b h d s packsize", packsize=packsize
-            ).contiguous()
-            v_cache = rearrange(kv_cache[:, :, 1], "b s h d -> b h s d").contiguous()
-            inference_params.key_value_memory_dict[layer_idx] = (k_cache, v_cache)
-        else:
-            k_cache[batch_start:batch_end, :, :, :sequence_end, :] = rearrange(
-                kv[:, :, 0], "b s h (d packsize) -> b h d s packsize", packsize=packsize
-            )
-            v_cache[batch_start:batch_end, :, :sequence_end, :] = rearrange(
-                kv[:, :, 1], "b s h d -> b h s d"
-            )
-        return kv
-
-
-def _apply_rotary_single_query_attention(
-    qkv,
-    inference_params,
-    layer_idx,
-    rotary_emb_dim,
-    rotary_emb_base,
-    kv=None,
-    rotary_emb_interleaved=False,
-):
-    """
-    qkv: (batch_size, 1, 3, nheads, head_dim) if kv is None else it's just
-            q of shape (batch_size, 1, nheads, head_dim)
-    kv: (batch_size, 1, 2, nheads_kv, head_dim)
-    """
-    assert inference_params.fused_ft_kernel
-    assert ft_attention is not None
-    if kv is None:
-        q, k, v = rearrange(qkv, "b 1 three h d -> b three h d").unbind(dim=1)
-    else:
-        q = rearrange(qkv, "b 1 h d -> b h d")
-        k, v = rearrange(kv, "b 1 two h d -> b two h d").unbind(dim=1)
-    batch_start = inference_params.batch_size_offset
-    batch_end = batch_start + q.shape[0]
-    k_cache, v_cache = inference_params.key_value_memory_dict[layer_idx]
-    lengths_per_sample = (
-        inference_params.lengths_per_sample[batch_start:batch_end]
-        if inference_params.lengths_per_sample is not None
-        else None
-    )
-    context = ft_attention.single_query_attention(
-        q,
-        k,
-        v,
-        k_cache[batch_start:batch_end],
-        v_cache[batch_start:batch_end],
-        lengths_per_sample,
-        None,  # rotary_cos_
-        None,  # rotary_sin_
-        None,  # nnz_head_idx
-        inference_params.sequence_len_offset,
-        rotary_emb_dim,
-        rotary_emb_base,
-        not rotary_emb_interleaved,  # neox_rotary_style
-    )
-    return rearrange(context, "b h d -> b 1 h d")
+    assert kv_cache is not None
+    kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
+    return kv_cache[batch_start:batch_end, :sequence_end, ...]
 
 
 class MHA(nn.Module):
@@ -502,36 +420,18 @@ class MHA(nn.Module):
         )
         self.out_proj = linear_cls(embed_dim, embed_dim, bias=out_proj_bias, **factory_kwargs)
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, fused_ft_kernel=True):
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         dtype = self.out_proj.weight.dtype if dtype is None else dtype
         device = self.out_proj.weight.device
-        if not fused_ft_kernel:
-            return torch.empty(
-                batch_size,
-                max_seqlen,
-                2,
-                self.num_heads_kv,
-                self.head_dim,
-                dtype=dtype,
-                device=device,
-            )
-        else:
-            assert dtype in [torch.float16, torch.bfloat16, torch.float32]
-            packsize = 4 if dtype == torch.float32 else 8
-            assert self.head_dim % packsize == 0
-            k_cache = torch.empty(
-                batch_size,
-                self.num_heads_kv,
-                self.head_dim // packsize,
-                max_seqlen,
-                packsize,
-                dtype=dtype,
-                device=device,
-            )
-            v_cache = torch.empty(
-                batch_size, self.num_heads_kv, max_seqlen, self.head_dim, dtype=dtype, device=device
-            )
-            return k_cache, v_cache
+        return torch.empty(
+            batch_size,
+            max_seqlen,
+            2,
+            self.num_heads_kv,
+            self.head_dim,
+            dtype=dtype,
+            device=device,
+        )
 
     def _update_kv_cache(self, kv, inference_params):
         """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
@@ -539,27 +439,46 @@ class MHA(nn.Module):
         assert self.layer_idx is not None, "Generation requires layer_idx in the constructor"
         return _update_kv_cache(kv, inference_params, self.layer_idx)
 
-    def _apply_rotary_single_query_attention(self, qkv, inference_params, kv=None):
+    def _apply_rotary_update_kvcache_attention(self, q, kv, inference_params):
         """
-        qkv: (batch_size, 1, 3, nheads, head_dim) if kv is None else it's just
-              q of shape (batch_size, 1, nheads, head_dim)
-        kv: (batch_size, 1, 2, nheads_kv, head_dim)
+        Fast path that combine 3 steps: apply rotary to Q and K, update kv cache, and apply attention.
+        q: (batch_size, seqlen_q, nheads, head_dim)
+        kv: (batch_size, seqlen_k, 2, nheads_kv, head_dim)
         """
-        rotary_emb_base = self.rotary_emb.base if self.rotary_emb_dim > 0 else 0
-        return _apply_rotary_single_query_attention(
-            qkv,
-            inference_params,
-            self.layer_idx,
-            self.rotary_emb_dim,
-            rotary_emb_base,
-            kv=kv,
-            rotary_emb_interleaved=self.rotary_emb.interleaved
-            if self.rotary_emb_dim > 0
-            else False,
+        assert inference_params is not None and inference_params.sequence_len_offset > 0
+        assert self.use_flash_attn
+        if self.rotary_emb_dim > 0:
+            assert self.rotary_emb.scale is None, "This code path does not support xPos"
+            self.rotary_emb._update_cos_sin_cache(
+                inference_params.max_sequence_len, device=q.device, dtype=q.dtype
+            )
+            rotary_cos, rotary_sin = self.rotary_emb._cos_cached, self.rotary_emb._sin_cached
+        else:
+            rotary_cos, rotary_sin = None, None
+        batch = q.shape[0]
+        kv_cache = inference_params.key_value_memory_dict[self.layer_idx][:batch]
+        cache_seqlens = (
+            inference_params.lengths_per_sample[:batch]
+            if inference_params.lengths_per_sample is not None
+            else inference_params.sequence_len_offset
         )
+        context = flash_attn_with_kvcache(
+            q,
+            kv_cache[:, :, 0],
+            kv_cache[:, :, 1],
+            kv[:, :, 0],
+            kv[:, :, 1],
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=self.inner_cross_attn.softmax_scale,
+            causal=self.inner_cross_attn.causal,
+            rotary_interleaved=self.rotary_emb.interleaved if self.rotary_emb_dim > 0 else False,
+        )
+        return context
 
     def _update_kvcache_attention(self, q, kv, inference_params):
-        """Write kv to inference_params, then do attention """
+        """Write kv to inference_params, then do attention"""
         if (
             inference_params.sequence_len_offset == 0
             or flash_attn_with_kvcache is None
@@ -663,7 +582,8 @@ class MHA(nn.Module):
             if (
                 inference_params is None
                 or inference_params.sequence_len_offset == 0
-                or not inference_params.fused_ft_kernel
+                or (self.rotary_emb_dim == 0 or self.rotary_emb_dim % 16 != 0)
+                or not self.use_flash_attn
             ):
                 if self.rotary_emb_dim > 0:
                     qkv = self.rotary_emb(
@@ -679,7 +599,9 @@ class MHA(nn.Module):
                         qkv[:, :, 0], qkv[:, :, 1:], inference_params
                     )
             else:
-                context = self._apply_rotary_single_query_attention(qkv, inference_params)
+                context = self._apply_rotary_update_kvcache_attention(
+                    qkv[:, :, 0], qkv[:, :, 1:], inference_params
+                )
         else:
             if self.cross_attn:
                 if not self.return_residual:
@@ -711,7 +633,8 @@ class MHA(nn.Module):
             if (
                 inference_params is None
                 or inference_params.sequence_len_offset == 0
-                or not inference_params.fused_ft_kernel
+                or (self.rotary_emb_dim == 0 or self.rotary_emb_dim % 16 != 0)
+                or not self.use_flash_attn
             ):
                 if self.rotary_emb_dim > 0:
                     q, kv = self.rotary_emb(
@@ -727,7 +650,7 @@ class MHA(nn.Module):
                 else:
                     context = self._update_kvcache_attention(q, kv, inference_params)
             else:
-                context = self._apply_rotary_single_query_attention(q, inference_params, kv=kv)
+                context = self._apply_rotary_update_kvcache_attention(q, kv, inference_params)
         out = self.out_proj(rearrange(context, "... h d -> ... (h d)"))
         return out if not self.return_residual else (out, x)
 
@@ -825,73 +748,65 @@ class ParallelMHA(nn.Module):
             **factory_kwargs,
         )
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, fused_ft_kernel=True):
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         dtype = self.out_proj.weight.dtype if dtype is None else dtype
         device = self.out_proj.weight.device
-        if not fused_ft_kernel:
-            return torch.empty(
-                batch_size,
-                max_seqlen,
-                2,
-                self.num_heads_kv_per_rank,
-                self.head_dim,
-                dtype=dtype,
-                device=device,
-            )
-        else:
-            assert dtype in [torch.float16, torch.bfloat16, torch.float32]
-            packsize = 4 if dtype == torch.float32 else 8
-            assert self.head_dim % packsize == 0
-            k_cache = torch.empty(
-                batch_size,
-                self.num_heads_kv_per_rank,
-                self.head_dim // packsize,
-                max_seqlen,
-                packsize,
-                dtype=dtype,
-                device=device,
-            )
-            v_cache = torch.empty(
-                batch_size,
-                self.num_heads_kv_per_rank,
-                max_seqlen,
-                self.head_dim,
-                dtype=dtype,
-                device=device,
-            )
-            return k_cache, v_cache
+        return torch.empty(
+            batch_size,
+            max_seqlen,
+            2,
+            self.num_heads_kv_per_rank,
+            self.head_dim,
+            dtype=dtype,
+            device=device,
+        )
 
     def _update_kv_cache(self, kv, inference_params):
         """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
         assert self.layer_idx is not None, "Generation requires layer_idx in the constructor"
         return _update_kv_cache(kv, inference_params, self.layer_idx)
 
-    def _apply_rotary_single_query_attention(self, qkv, inference_params, kv=None):
+    def _apply_rotary_update_kvcache_attention(self, q, kv, inference_params):
         """
-        qkv: (batch_size, 1, 3, nheads, head_dim) if kv is None else it's just
-              q of shape (batch_size, 1, nheads, head_dim)
-        kv: (batch_size, 1, 2, nheads_kv, head_dim)
+        Fast path that combine 3 steps: apply rotary to Q and K, update kv cache, and apply attention.
+        q: (batch_size, seqlen_q, nheads, head_dim)
+        kv: (batch_size, seqlen_k, 2, nheads_kv, head_dim)
         """
-        rotary_emb_base = self.rotary_emb.base if self.rotary_emb_dim > 0 else 0
-        return _apply_rotary_single_query_attention(
-            qkv,
-            inference_params,
-            self.layer_idx,
-            self.rotary_emb_dim,
-            rotary_emb_base,
-            kv=kv,
-            rotary_emb_interleaved=self.rotary_emb.interleaved
-            if self.rotary_emb_dim > 0
-            else False,
+        assert inference_params is not None and inference_params.sequence_len_offset > 0
+        assert self.use_flash_attn
+        if self.rotary_emb_dim > 0:
+            assert self.rotary_emb.scale is None, "This code path does not support xPos"
+            self.rotary_emb._update_cos_sin_cache(
+                inference_params.max_sequence_len, device=q.device, dtype=q.dtype
+            )
+            rotary_cos, rotary_sin = self.rotary_emb._cos_cached, self.rotary_emb._sin_cached
+        else:
+            rotary_cos, rotary_sin = None, None
+        batch = q.shape[0]
+        kv_cache = inference_params.key_value_memory_dict[self.layer_idx][:batch]
+        cache_seqlens = (
+            inference_params.lengths_per_sample[:batch]
+            if inference_params.lengths_per_sample is not None
+            else inference_params.sequence_len_offset
         )
+        context = flash_attn_with_kvcache(
+            q,
+            kv_cache[:, :, 0],
+            kv_cache[:, :, 1],
+            kv[:, :, 0],
+            kv[:, :, 1],
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=self.inner_cross_attn.softmax_scale,
+            causal=self.inner_cross_attn.causal,
+            rotary_interleaved=self.rotary_emb.interleaved if self.rotary_emb_dim > 0 else False,
+        )
+        return context
 
     def _update_kvcache_attention(self, q, kv, inference_params):
-        """Write kv to inference_params, then do attention """
-        if (
-            inference_params.sequence_len_offset == 0
-            or flash_attn_with_kvcache is None
-            or not self.use_flash_attn
-        ):
+        """Write kv to inference_params, then do attention"""
+        if inference_params.sequence_len_offset == 0 or not self.use_flash_attn:
             # TODO: this only uses sequence_len_offset and not lengths_per_sample.
             kv = self._update_kv_cache(kv, inference_params)
             return self.inner_cross_attn(q, kv)
@@ -943,7 +858,8 @@ class ParallelMHA(nn.Module):
             if (
                 inference_params is None
                 or inference_params.sequence_len_offset == 0
-                or not inference_params.fused_ft_kernel
+                or (self.rotary_emb_dim == 0 or self.rotary_emb_dim % 16 != 0)
+                or not self.use_flash_attn
             ):
                 if self.rotary_emb_dim > 0:
                     qkv = self.rotary_emb(
@@ -959,7 +875,9 @@ class ParallelMHA(nn.Module):
                         qkv[:, :, 0], qkv[:, :, 1:], inference_params
                     )
             else:
-                context = self._apply_rotary_single_query_attention(qkv, inference_params)
+                context = self._apply_rotary_update_kvcache_attention(
+                    qkv[:, :, 0], qkv[:, :, 1:], inference_params
+                )
         else:
             q = rearrange(
                 qkv[..., : self.num_heads_per_rank * self.head_dim],
@@ -975,7 +893,8 @@ class ParallelMHA(nn.Module):
             if (
                 inference_params is None
                 or inference_params.sequence_len_offset == 0
-                or not inference_params.fused_ft_kernel
+                or (self.rotary_emb_dim == 0 or self.rotary_emb_dim % 16 != 0)
+                or not self.use_flash_attn
             ):
                 if self.rotary_emb_dim > 0:
                     q, kv = self.rotary_emb(
@@ -991,7 +910,7 @@ class ParallelMHA(nn.Module):
                 else:
                     context = self._update_kvcache_attention(q, kv, inference_params)
             else:
-                context = self._apply_rotary_single_query_attention(q, inference_params, kv=kv)
+                context = self._apply_rotary_update_kvcache_attention(q, kv, inference_params)
         context = rearrange(context, "b s h d -> b s (h d)")
         if seqlen is not None:
             context = rearrange(context, "b s d -> (b s) d")

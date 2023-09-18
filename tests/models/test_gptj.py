@@ -83,9 +83,8 @@ def test_gptj_optimized(model_name):
     ).abs().max().item()
 
 
-@pytest.mark.parametrize("fused_ft_kernel", [False, True])
 @pytest.mark.parametrize("model_name", ["EleutherAI/gpt-j-6B"])
-def test_gptj_generation(model_name, fused_ft_kernel):
+def test_gptj_generation(model_name):
     """Check that our implementation of GPT-J (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
     forward pass in fp16, when compared to the HF forward pass in fp32.
@@ -141,7 +140,6 @@ def test_gptj_generation(model_name, fused_ft_kernel):
         input_ids=input_ids,
         max_length=max_length,
         eos_token_id=eos_token_id,
-        fused_ft_kernel=fused_ft_kernel,
         return_dict_in_generate=True,
         output_scores=True,
         enable_timing=True,
@@ -152,16 +150,13 @@ def test_gptj_generation(model_name, fused_ft_kernel):
 
     # Capture graph outside the timing loop
     batch_size, seqlen_og = input_ids.shape
-    model._decoding_cache = update_graph_cache(
-        model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=fused_ft_kernel
-    )
+    model._decoding_cache = update_graph_cache(model, None, batch_size, seqlen_og, max_length)
     print("With CUDA graph")
     torch.cuda.synchronize()
     start = time.time()
     out_cg = model.generate(
         input_ids=input_ids,
         max_length=max_length,
-        fused_ft_kernel=fused_ft_kernel,
         cg=True,
         return_dict_in_generate=True,
         output_scores=True,

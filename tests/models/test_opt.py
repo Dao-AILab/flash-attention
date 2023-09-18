@@ -107,7 +107,6 @@ def test_opt_generation(model_name):
     dtype = torch.float16
     device = "cuda"
     rtol, atol = 3e-3, 3e-1
-    fused_ft_kernel = True
     config = opt_config_to_gpt2_config(OPTConfig.from_pretrained(model_name))
     # Only prenorm supports residual_in_fp32
     config.residual_in_fp32 = getattr(config, "prenorm", True)
@@ -155,7 +154,6 @@ def test_opt_generation(model_name):
         input_ids=input_ids,
         max_length=max_length,
         eos_token_id=eos_token_id,
-        fused_ft_kernel=fused_ft_kernel,
         return_dict_in_generate=True,
         output_scores=True,
         enable_timing=True,
@@ -165,19 +163,16 @@ def test_opt_generation(model_name):
     if verbose:
         print(out.sequences)
     print(tokenizer.batch_decode(out.sequences.tolist()))
-    if fused_ft_kernel:
+    if getattr(config, "use_flash_attn", False):
         # Capture graph outside the timing loop
         batch_size, seqlen_og = input_ids.shape
-        model._decoding_cache = update_graph_cache(
-            model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=True
-        )
+        model._decoding_cache = update_graph_cache(model, None, batch_size, seqlen_og, max_length)
         print("With CUDA graph")
         torch.cuda.synchronize()
         start = time.time()
         out_cg = model.generate(
             input_ids=input_ids,
             max_length=max_length,
-            fused_ft_kernel=fused_ft_kernel,
             cg=True,
             return_dict_in_generate=True,
             output_scores=True,

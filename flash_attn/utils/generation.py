@@ -25,7 +25,6 @@ class InferenceParams:
     sequence_len_offset: int = 0
     batch_size_offset: int = 0
     key_value_memory_dict: dict = field(default_factory=dict)
-    fused_ft_kernel: bool = False
     lengths_per_sample: Optional[Tensor] = None
 
 
@@ -96,7 +95,6 @@ def decode(
     teacher_outputs=None,
     vocab_size=None,
     tensor_parallel=1,
-    fused_ft_kernel=False,
     cg=False,
     enable_timing=False,
 ):
@@ -127,7 +125,6 @@ def decode(
             seqlen_og,
             max_length,
             tensor_parallel=tensor_parallel,
-            fused_ft_kernel=fused_ft_kernel,
         )
         inference_params = model._decoding_cache.inference_params
         inference_params.max_sequence_len = max_length
@@ -135,9 +132,7 @@ def decode(
         inference_params.sequence_len_offset = 0
         inference_params.lengths_per_sample.zero_()
     else:
-        inference_params = InferenceParams(
-            max_sequence_len=max_length, max_batch_size=batch_size, fused_ft_kernel=fused_ft_kernel
-        )
+        inference_params = InferenceParams(max_sequence_len=max_length, max_batch_size=batch_size)
 
     def get_logits(input_ids, inference_params):
         decoding = inference_params.sequence_len_offset > 0
@@ -273,7 +268,6 @@ def decode_speculative(
     eos_token_id=None,
     vocab_size=None,
     tensor_parallel=1,
-    fused_ft_kernel=False,
     cg=False,
     enable_timing=False,
     debug=False,
@@ -307,23 +301,17 @@ def decode_speculative(
             seqlen_og,
             max_length,
             tensor_parallel=tensor_parallel,
-            fused_ft_kernel=fused_ft_kernel,
         )
         inference_params_draft = model_draft._decoding_cache.inference_params
         inference_params_draft.max_sequence_len = max_length
         inference_params_draft.max_batch_size = batch_size
         inference_params_draft.sequence_len_offset = 0
-        # fused_ft_kernel doesn't support passing in multiple tokens at once
-        inference_params = InferenceParams(
-            max_sequence_len=max_length, max_batch_size=batch_size, fused_ft_kernel=False
-        )
+        inference_params = InferenceParams(max_sequence_len=max_length, max_batch_size=batch_size)
     else:
         inference_params_draft = InferenceParams(
-            max_sequence_len=max_length, max_batch_size=batch_size, fused_ft_kernel=fused_ft_kernel
+            max_sequence_len=max_length, max_batch_size=batch_size
         )
-        inference_params = InferenceParams(
-            max_sequence_len=max_length, max_batch_size=batch_size, fused_ft_kernel=False
-        )
+        inference_params = InferenceParams(max_sequence_len=max_length, max_batch_size=batch_size)
 
     def logits_forward_fn(model, input_ids, position_ids, inference_params, cg=False):
         if not cg:
@@ -606,7 +594,6 @@ def allocate_inference_cache(
     layers: Union[int, Sequence],
     device,
     dtype=torch.float16,
-    fused_ft_kernel=False,
 ):
     assert dtype in [torch.float16, torch.bfloat16, torch.float32]
     packsize = 4 if dtype == torch.float32 else 8
@@ -616,15 +603,7 @@ def allocate_inference_cache(
     kv_cache_shape = (max_batch_size, max_seqlen, 2, nheads, headdim)
     if isinstance(layers, int):
         layers = range(layers)
-    return {
-        i: (
-            torch.empty(k_cache_shape, device=device, dtype=dtype),
-            torch.empty(v_cache_shape, device=device, dtype=dtype),
-        )
-        if fused_ft_kernel
-        else torch.empty(kv_cache_sahpe, device=device, dtype=dtype)
-        for i in layers
-    }
+    return {i: torch.empty(kv_cache_shape, device=device, dtype=dtype) for i in layers}
 
 
 def seqlen_to_seqlen_type(seqlen: int) -> int:
@@ -633,12 +612,12 @@ def seqlen_to_seqlen_type(seqlen: int) -> int:
     Arguments:
         seqlen: int
     """
-    return 0 if seqlen < 32 else (1 if seqlen < 2048 else 2)
+    return 0
 
 
 def seqlen_type_to_max_seqlen(seqlen_type: int) -> int:
-    assert seqlen_type in [0, 1, 2]
-    return 32 if seqlen_type == 0 else (2048 if seqlen_type == 1 else 2**32)
+    assert seqlen_type in [0]
+    return 2**32
 
 
 @dataclass
@@ -663,7 +642,6 @@ def update_graph_cache(
     tensor_parallel=1,
     dtype=None,
     n_warmups=2,
-    fused_ft_kernel=False,
 ):
     if cache is None:
         cache = DecodingCGCache()
@@ -683,9 +661,7 @@ def update_graph_cache(
         cache.device, cache.dtype = device, dtype
         cache.max_batch_size, cache.max_seqlen = batch_size, max_seqlen
         if hasattr(model, "allocate_inference_cache"):
-            inf_cache = model.allocate_inference_cache(
-                batch_size, max_seqlen, dtype, fused_ft_kernel=fused_ft_kernel
-            )
+            inf_cache = model.allocate_inference_cache(batch_size, max_seqlen, dtype)
         else:
             headdim = getattr(
                 model.config,
@@ -700,7 +676,6 @@ def update_graph_cache(
                 model.config.num_hidden_layers,
                 device,
                 dtype,
-                fused_ft_kernel=fused_ft_kernel,
             )
         lengths_per_sample = torch.full((batch_size,), seqlen_og, dtype=torch.int32, device=device)
         cache.inference_params = InferenceParams(
@@ -708,7 +683,6 @@ def update_graph_cache(
             max_batch_size=batch_size,
             sequence_len_offset=seqlen_og,
             key_value_memory_dict=inf_cache,
-            fused_ft_kernel=fused_ft_kernel,
             lengths_per_sample=lengths_per_sample,
         )
         cache.mempool = torch.cuda.graphs.graph_pool_handle()

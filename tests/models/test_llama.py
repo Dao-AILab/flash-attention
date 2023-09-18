@@ -292,7 +292,6 @@ def test_llama_generation(model_name, checkpoint_format):
         input_ids=input_ids,
         max_length=max_length,
         eos_token_id=eos_token_id,
-        fused_ft_kernel=True,
         return_dict_in_generate=True,
         output_scores=True,
         enable_timing=True,
@@ -303,16 +302,13 @@ def test_llama_generation(model_name, checkpoint_format):
 
     # Capture graph outside the timing loop
     batch_size, seqlen_og = input_ids.shape
-    model._decoding_cache = update_graph_cache(
-        model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=True
-    )
+    model._decoding_cache = update_graph_cache(model, None, batch_size, seqlen_og, max_length)
     print("With CUDA graph")
     torch.cuda.synchronize()
     start = time.time()
     out_cg = model.generate(
         input_ids=input_ids,
         max_length=max_length,
-        fused_ft_kernel=True,
         cg=True,
         return_dict_in_generate=True,
         output_scores=True,
@@ -401,7 +397,6 @@ def test_llama_parallel_generation(model_name, world_size, checkpoint_format):
         max_length=max_length,
         tensor_parallel=world_size,
         vocab_size=config.vocab_size,
-        fused_ft_kernel=True,
         # teacher_outputs=out_hf.sequences,
         return_dict_in_generate=True,
         output_scores=True,
@@ -410,16 +405,13 @@ def test_llama_parallel_generation(model_name, world_size, checkpoint_format):
 
     # Capture graph outside the timing loop
     batch_size, seqlen_og = input_ids.shape
-    model._decoding_cache = update_graph_cache(
-        model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=True
-    )
+    model._decoding_cache = update_graph_cache(model, None, batch_size, seqlen_og, max_length)
     print("With CUDA graph")
     out_cg = model.generate(
         input_ids=input_ids,
         max_length=max_length,
         tensor_parallel=world_size,
         vocab_size=config.vocab_size,
-        fused_ft_kernel=True,
         cg=True,
         # teacher_outputs=out_hf.sequences,
         return_dict_in_generate=True,
