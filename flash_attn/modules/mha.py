@@ -300,7 +300,7 @@ def _update_kv_cache(kv, inference_params, layer_idx):
     if layer_idx not in inference_params.key_value_memory_dict:
         kv_cache = torch.empty(
             inference_params.max_batch_size,
-            inference_params.max_sequence_len,
+            inference_params.max_seqlen,
             2,
             num_heads,
             head_dim,
@@ -313,7 +313,7 @@ def _update_kv_cache(kv, inference_params, layer_idx):
     # Adjust key and value for inference
     batch_start = inference_params.batch_size_offset
     batch_end = batch_start + kv.shape[0]
-    sequence_start = inference_params.sequence_len_offset
+    sequence_start = inference_params.seqlen_offset
     sequence_end = sequence_start + kv.shape[1]
     assert batch_end <= (kv_cache.shape[0] if kv_cache is not None else v_cache.shape[0])
     assert sequence_end <= (kv_cache.shape[1] if kv_cache is not None else v_cache.shape[2])
@@ -445,12 +445,12 @@ class MHA(nn.Module):
         q: (batch_size, seqlen_q, nheads, head_dim)
         kv: (batch_size, seqlen_k, 2, nheads_kv, head_dim)
         """
-        assert inference_params is not None and inference_params.sequence_len_offset > 0
+        assert inference_params is not None and inference_params.seqlen_offset > 0
         assert self.use_flash_attn
         if self.rotary_emb_dim > 0:
             assert self.rotary_emb.scale is None, "This code path does not support xPos"
             self.rotary_emb._update_cos_sin_cache(
-                inference_params.max_sequence_len, device=q.device, dtype=q.dtype
+                inference_params.max_seqlen, device=q.device, dtype=q.dtype
             )
             rotary_cos, rotary_sin = self.rotary_emb._cos_cached, self.rotary_emb._sin_cached
         else:
@@ -460,7 +460,7 @@ class MHA(nn.Module):
         cache_seqlens = (
             inference_params.lengths_per_sample[:batch]
             if inference_params.lengths_per_sample is not None
-            else inference_params.sequence_len_offset
+            else inference_params.seqlen_offset
         )
         context = flash_attn_with_kvcache(
             q,
@@ -480,11 +480,11 @@ class MHA(nn.Module):
     def _update_kvcache_attention(self, q, kv, inference_params):
         """Write kv to inference_params, then do attention"""
         if (
-            inference_params.sequence_len_offset == 0
+            inference_params.seqlen_offset == 0
             or flash_attn_with_kvcache is None
             or not self.use_flash_attn
         ):
-            # TODO: this only uses sequence_len_offset and not lengths_per_sample.
+            # TODO: this only uses seqlen_offset and not lengths_per_sample.
             kv = self._update_kv_cache(kv, inference_params)
             return self.inner_cross_attn(q, kv)
         else:
@@ -493,7 +493,7 @@ class MHA(nn.Module):
             cache_seqlens = (
                 inference_params.lengths_per_sample[:batch]
                 if inference_params.lengths_per_sample is not None
-                else inference_params.sequence_len_offset
+                else inference_params.seqlen_offset
             )
             return flash_attn_with_kvcache(
                 q,
@@ -561,12 +561,10 @@ class MHA(nn.Module):
             else (
                 inference_params.lengths_per_sample
                 if inference_params.lengths_per_sample is not None
-                else inference_params.sequence_len_offset
+                else inference_params.seqlen_offset
             )
         )
-        rotary_max_seqlen = (
-            inference_params.max_sequence_len if inference_params is not None else None
-        )
+        rotary_max_seqlen = inference_params.max_seqlen if inference_params is not None else None
         batch, seqlen = x.shape[:2]
         if not self.cross_attn and self.num_heads_kv == self.num_heads:
             assert x_kv is None and mixer_subset is None
@@ -581,7 +579,7 @@ class MHA(nn.Module):
             qkv = rearrange(qkv, "... (three h d) -> ... three h d", three=3, d=self.head_dim)
             if (
                 inference_params is None
-                or inference_params.sequence_len_offset == 0
+                or inference_params.seqlen_offset == 0
                 or (self.rotary_emb_dim == 0 or self.rotary_emb_dim % 16 != 0)
                 or not self.use_flash_attn
             ):
@@ -632,7 +630,7 @@ class MHA(nn.Module):
                 ).contiguous()
             if (
                 inference_params is None
-                or inference_params.sequence_len_offset == 0
+                or inference_params.seqlen_offset == 0
                 or (self.rotary_emb_dim == 0 or self.rotary_emb_dim % 16 != 0)
                 or not self.use_flash_attn
             ):
@@ -772,12 +770,12 @@ class ParallelMHA(nn.Module):
         q: (batch_size, seqlen_q, nheads, head_dim)
         kv: (batch_size, seqlen_k, 2, nheads_kv, head_dim)
         """
-        assert inference_params is not None and inference_params.sequence_len_offset > 0
+        assert inference_params is not None and inference_params.seqlen_offset > 0
         assert self.use_flash_attn
         if self.rotary_emb_dim > 0:
             assert self.rotary_emb.scale is None, "This code path does not support xPos"
             self.rotary_emb._update_cos_sin_cache(
-                inference_params.max_sequence_len, device=q.device, dtype=q.dtype
+                inference_params.max_seqlen, device=q.device, dtype=q.dtype
             )
             rotary_cos, rotary_sin = self.rotary_emb._cos_cached, self.rotary_emb._sin_cached
         else:
@@ -787,7 +785,7 @@ class ParallelMHA(nn.Module):
         cache_seqlens = (
             inference_params.lengths_per_sample[:batch]
             if inference_params.lengths_per_sample is not None
-            else inference_params.sequence_len_offset
+            else inference_params.seqlen_offset
         )
         context = flash_attn_with_kvcache(
             q,
@@ -806,8 +804,8 @@ class ParallelMHA(nn.Module):
 
     def _update_kvcache_attention(self, q, kv, inference_params):
         """Write kv to inference_params, then do attention"""
-        if inference_params.sequence_len_offset == 0 or not self.use_flash_attn:
-            # TODO: this only uses sequence_len_offset and not lengths_per_sample.
+        if inference_params.seqlen_offset == 0 or not self.use_flash_attn:
+            # TODO: this only uses seqlen_offset and not lengths_per_sample.
             kv = self._update_kv_cache(kv, inference_params)
             return self.inner_cross_attn(q, kv)
         else:
@@ -816,7 +814,7 @@ class ParallelMHA(nn.Module):
             cache_seqlens = (
                 inference_params.lengths_per_sample[:batch]
                 if inference_params.lengths_per_sample is not None
-                else inference_params.sequence_len_offset
+                else inference_params.seqlen_offset
             )
             context = flash_attn_with_kvcache(
                 q,
@@ -847,17 +845,15 @@ class ParallelMHA(nn.Module):
             else (
                 inference_params.lengths_per_sample
                 if inference_params.lengths_per_sample is not None
-                else inference_params.sequence_len_offset
+                else inference_params.seqlen_offset
             )
         )
-        rotary_max_seqlen = (
-            inference_params.max_sequence_len if inference_params is not None else None
-        )
+        rotary_max_seqlen = inference_params.max_seqlen if inference_params is not None else None
         if self.num_heads_kv == self.num_heads:
             qkv = rearrange(qkv, "b s (three h d) -> b s three h d", three=3, d=self.head_dim)
             if (
                 inference_params is None
-                or inference_params.sequence_len_offset == 0
+                or inference_params.seqlen_offset == 0
                 or (self.rotary_emb_dim == 0 or self.rotary_emb_dim % 16 != 0)
                 or not self.use_flash_attn
             ):
@@ -892,7 +888,7 @@ class ParallelMHA(nn.Module):
             )
             if (
                 inference_params is None
-                or inference_params.sequence_len_offset == 0
+                or inference_params.seqlen_offset == 0
                 or (self.rotary_emb_dim == 0 or self.rotary_emb_dim % 16 != 0)
                 or not self.use_flash_attn
             ):

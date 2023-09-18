@@ -364,14 +364,14 @@ def test_gpt2_multiple_token_generation(model_name, optimized):
     logits_ref = model(input_ids).logits
 
     # Run 10 tokens, then pass in another 4, then another 6, to see if we get the same logits
-    inference_params = InferenceParams(max_sequence_len=20, max_batch_size=1)
+    inference_params = InferenceParams(max_seqlen=20, max_batch_size=1)
     logits_10 = model(input_ids[:, :10], inference_params=inference_params).logits
-    inference_params.sequence_len_offset += 10
+    inference_params.seqlen_offset += 10
     position_ids = torch.arange(10, 14, dtype=torch.long, device=device)
     logits_1014 = model(
         input_ids[:, 10:14], position_ids=position_ids, inference_params=inference_params
     ).logits
-    inference_params.sequence_len_offset += 4
+    inference_params.seqlen_offset += 4
     position_ids = torch.arange(14, 20, dtype=torch.long, device=device)
     logits_1420 = model(
         input_ids[:, 14:20], position_ids=position_ids, inference_params=inference_params
