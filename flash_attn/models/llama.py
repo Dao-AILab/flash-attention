@@ -15,7 +15,7 @@ from transformers import GPT2Config, LlamaConfig
 
 
 def remap_state_dict_meta_llama(
-    state_dict: dict[str, torch.Tensor], config: GPT2Config, multi_query: bool = False
+    state_dict: dict[str, torch.Tensor], config: GPT2Config
 ) -> dict[str, torch.Tensor]:
     """Convert the state_dict in Meta format to standard GPT format.
 
