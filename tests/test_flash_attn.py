@@ -908,6 +908,7 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, dropout_p, causal, mha_type, d
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
+        (1, 147),
         (113, 203),
         (128, 217),
         (113, 211),
