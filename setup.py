@@ -222,7 +222,7 @@ else:
   # subprocess.run(["git", "submodule", "update", "--init", "csrc/flash_attn_rocm/composable_kernel"])
   ext_modules.append(
       CUDAExtension(
-          name="flash_attn_cuda",
+          name="flash_attn_2_cuda",
           sources=["csrc/flash_attn_rocm/flash_api.cu"] + glob.glob("csrc/flash_attn_rocm/src/*.cu") +
                   ["csrc/flash_attn_rocm/composable_kernel/library/src/utility/convolution_parameter.cu",
                   "csrc/flash_attn_rocm/composable_kernel/library/src/utility/device_memory.cu",
