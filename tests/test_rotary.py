@@ -216,6 +216,7 @@ def test_rotary_emb_varlen_func(inplace, interleaved, rotary_fraction, seqlen_of
     lengths = torch.randint(max(1, seqlen - 20), seqlen + 1, (batch_size, 1), device=device)
     padding_mask = rearrange(torch.arange(seqlen, device=device), "s -> 1 s") < lengths
     x_unpad, indices, cu_seqlens, max_seqlen = unpad_input(x, padding_mask)
+    
     x_unpad_clone = x_unpad.clone()
     x_unpad = x_unpad.requires_grad_()
     cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
@@ -252,3 +253,130 @@ def test_rotary_emb_varlen_func(inplace, interleaved, rotary_fraction, seqlen_of
     assert torch.allclose(out, out_pt, rtol=rtol, atol=2 * atol)
     atol = ((x_pt.grad + 0.3 - 0.3) - x_pt.grad).abs().max().item()
     assert torch.allclose(x_grad, x_pt.grad, rtol=rtol, atol=2 * atol)
+
+@pytest.mark.parametrize(
+    "dtype", ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16])
+)
+# @pytest.mark.parametrize("dtype", ([torch.float16]))
+@pytest.mark.parametrize("seqlen_offsets_type", [0, int, torch.Tensor])
+# @pytest.mark.parametrize("seqlen_offsets_type", [0])
+@pytest.mark.parametrize("rotary_fraction", [1.0, 0.5])
+# @pytest.mark.parametrize("rotary_fraction", [1.0])
+@pytest.mark.parametrize("interleaved", [False, True])
+# @pytest.mark.parametrize("interleaved", [True])
+def test_rotary_emb_qkv_varlen_func(interleaved, rotary_fraction, seqlen_offsets_type, dtype):
+    rtol = 1e-3
+    batch_size = 32
+    nheads = 4
+    seqlen = 512
+    headdim = 128
+    device = "cuda"
+    rotary_dim = int(rotary_fraction * headdim)
+    torch.manual_seed(42)
+    qkv = torch.randn(
+        batch_size, seqlen, 3, nheads, headdim, dtype=dtype, device=device
+    )
+    qkv_pt = qkv.detach().clone().requires_grad_()
+
+    lengths = torch.randint(max(1, seqlen - 20), seqlen + 1, (batch_size, 1), device=device)
+    padding_mask = rearrange(torch.arange(seqlen, device=device), "s -> 1 s") < lengths 
+    qkv_unpad, indices, cu_seqlens, max_seqlen = unpad_input(qkv, padding_mask)
+    qkv_unpad = qkv_unpad.requires_grad_()
+
+    cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
+    seqlen_offsets = generate_seqlen_offsets(seqlen_offsets_type, batch_size, seqlen, device)
+    
+    out_unpad = apply_rotary_emb_qkv_(
+        qkv_unpad,
+        cos,
+        sin,
+        seqlen_offsets=seqlen_offsets,
+        interleaved=interleaved,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+    )
+    out = pad_input(out_unpad, indices, batch_size, seqlen)
+
+    cos_pt, sin_pt = index_cos_sin(cos, sin, seqlen_offsets, seqlen)
+    q_pt = apply_rotary_emb_torch(
+        qkv_pt[:, :, 0].float(), cos_pt.float(), sin_pt.float(), interleaved=interleaved
+    ).to(dtype=dtype)
+    k_pt = apply_rotary_emb_torch(
+        qkv_pt[:, :, 1].float(), cos_pt.float(), sin_pt.float(), interleaved=interleaved
+    ).to(dtype=dtype)
+    out_pt = torch.stack([q_pt, k_pt, qkv_pt[:, :, 2]], dim=2)
+    out_pt = out_pt.masked_fill(rearrange(~padding_mask, "b s -> b s 1 1 1"), 0.0)
+    print(f"Output max diff: {(out - out_pt).abs().max().item()}") 
+
+    g = torch.randn_like(out)
+    g_pt = g.clone()  # If inplace=True, we might modify the gradient inplace
+    out.backward(g)
+    out_pt.backward(g_pt)
+    qkv_grad = pad_input(qkv_unpad.grad, indices, batch_size, seqlen)
+    print(f"Grad max diff: {(qkv_grad - qkv_pt.grad).abs().max().item()}")
+
+    # Numerical error if we just do any arithmetic
+    atol = ((out_pt + 0.3 - 0.3) - out_pt).abs().max().item()
+    assert torch.allclose(out, out_pt, rtol=rtol, atol=2 * atol)
+    atol = ((qkv_pt.grad + 0.3 - 0.3) - qkv_pt.grad).abs().max().item()
+    assert torch.allclose(qkv_grad, qkv_pt.grad, rtol=rtol, atol=2 * atol)
+
+@pytest.mark.parametrize(
+    "dtype", ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16])
+)
+# @pytest.mark.parametrize("dtype", ([torch.float16]))
+@pytest.mark.parametrize("seqlen_offsets_type", [0, int, torch.Tensor])
+# @pytest.mark.parametrize("seqlen_offsets_type", [0])
+@pytest.mark.parametrize("rotary_fraction", [1.0, 0.5])
+# @pytest.mark.parametrize("rotary_fraction", [1.0])
+@pytest.mark.parametrize("interleaved", [False, True])
+# @pytest.mark.parametrize("interleaved", [True])
+def test_rotary_emb_kv_varlen_func(interleaved, rotary_fraction, seqlen_offsets_type, dtype):
+    rtol = 1e-3
+    batch_size = 32
+    nheads = 4
+    seqlen = 217
+    headdim = 128
+    device = "cuda"
+    rotary_dim = int(rotary_fraction * headdim)
+    torch.manual_seed(42)
+    kv = torch.randn(
+        batch_size, seqlen, 2, nheads, headdim, dtype=dtype, device=device
+    )    
+    kv_pt = kv.detach().clone().requires_grad_()
+    lengths = torch.randint(max(1, seqlen - 20), seqlen + 1, (batch_size, 1), device=device)
+    padding_mask = rearrange(torch.arange(seqlen, device=device), "s -> 1 s") < lengths
+    kv_unpad, indices, cu_seqlens, max_seqlen = unpad_input(kv, padding_mask)
+    kv_unpad = kv_unpad.requires_grad_()
+    cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
+    seqlen_offsets = generate_seqlen_offsets(seqlen_offsets_type, batch_size, seqlen, device)
+    out_unpad = apply_rotary_emb_kv_(
+        kv_unpad,
+        cos,
+        sin,
+        seqlen_offsets=seqlen_offsets,
+        interleaved=interleaved,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+    )
+    out = pad_input(out_unpad, indices, batch_size, seqlen)
+    cos_pt, sin_pt = index_cos_sin(cos, sin, seqlen_offsets, seqlen)
+    k_pt = apply_rotary_emb_torch(
+        kv_pt[:, :, 0].float(), cos_pt.float(), sin_pt.float(), interleaved=interleaved
+    ).to(dtype=dtype)
+    out_pt = torch.stack([k_pt, kv_pt[:, :, 1]], dim=2)
+    out_pt = out_pt.masked_fill(rearrange(~padding_mask, "b s -> b s 1 1 1"), 0.0)
+    print(f"Output max diff: {(out - out_pt).abs().max().item()}")
+
+    g = torch.randn_like(out)
+    g_pt = g.clone()  # If inplace=True, we might modify the gradient inplace
+    out.backward(g)
+    out_pt.backward(g_pt)
+    kv_grad = pad_input(kv_unpad.grad, indices, batch_size, seqlen)
+    print(f"Grad max diff: {(kv_grad - kv_pt.grad).abs().max().item()}")
+
+    # Numerical error if we just do any arithmetic
+    atol = ((out_pt + 0.3 - 0.3) - out_pt).abs().max().item()
+    assert torch.allclose(out, out_pt, rtol=rtol, atol=2 * atol)
+    atol = ((kv_pt.grad + 0.3 - 0.3) - kv_pt.grad).abs().max().item()
+    assert torch.allclose(kv_grad, kv_pt.grad, rtol=rtol, atol=2 * atol)
