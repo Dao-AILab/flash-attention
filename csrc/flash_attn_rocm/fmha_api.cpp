@@ -267,7 +267,9 @@ void set_params_dgrad(FlashBwdParams &params,
         params.q_stride_multiplier = 1;
         params.kv_stride_multiplier = 1;
     }
-    
+
+    auto opts = q.options();
+
     for (int i = 0; i < b; i++){
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
         int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, data_type);
@@ -275,6 +277,12 @@ void set_params_dgrad(FlashBwdParams &params,
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
         int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, data_type);
         int temp_dk_stride = get_size_in_bytes(d * h * temp_seqlen_k, dk.dtype());
+
+        at::Tensor d_tensor;
+        d_tensor = at::empty({1, static_cast<long>(h), temp_seqlen_q}, opts.dtype(at::kFloat));
+        params.d_tensors.push_back(d_tensor);
+        params.d_ptr.push_back(reinterpret_cast<void*>(d_tensor.data_ptr()));
+
         if(is_performance_mode){
             params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
             q_ptr = q_ptr + temp_q_stride * params.q_stride_multiplier;

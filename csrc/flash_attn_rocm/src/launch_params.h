@@ -125,11 +125,13 @@ struct FlashBwdParams : public FlashFwdParams {
   std::vector<const void*> y_ptr;
   std::vector<void*> z_ptr;
   std::vector<const void*> lse_ptr;
+  std::vector<void*> d_ptr;
   std::vector<const void*> ygrad_ptr;
   std::vector<void*> qgrad_ptr;
   std::vector<void*> kgrad_ptr;
   std::vector<void*> vgrad_ptr;
 
+  std::vector<at::Tensor> d_tensors;
   std::vector<at::Tensor> qgrad_tensors;
   std::vector<at::Tensor> kgrad_tensors;
   std::vector<at::Tensor> vgrad_tensors;

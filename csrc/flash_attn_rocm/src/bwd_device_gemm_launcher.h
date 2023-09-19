@@ -45,22 +45,6 @@ class DeviceGemmInstanceLauncher {
   std::unique_ptr<DeviceGemmTemplate<DeviceGemmTraits>> device_gemm_instance_ptr_;
 }; // class BwdDeviceGemmInstanceLauncher
 
-struct SimpleDeviceMem2
-{
-    SimpleDeviceMem2() = delete;
-
-    SimpleDeviceMem2(std::size_t mem_size) : p_mem_{}
-    {
-        (void)hipMalloc(static_cast<void**>(&p_mem_), mem_size);
-    }
-
-    void* GetDeviceBuffer() { return p_mem_; }
-
-    ~SimpleDeviceMem2() {}
-
-    void* p_mem_;
-};
-
 template <template <typename> typename DeviceGemmTemplate, typename DeviceGemmTraits>
 void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(FlashBwdParams &params, hipStream_t &stream) {
   bool time_kernel = false;
@@ -82,7 +66,7 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
   auto p_y = params.y_ptr;
   auto p_z = params.z_ptr;
   auto p_lse = params.lse_ptr;
-  std::vector<void*> p_d;
+  auto p_d = params.d_ptr;
   auto p_ygrad = params.ygrad_ptr;
   auto p_qgrad = params.qgrad_ptr;
   auto p_kgrad = params.kgrad_ptr;
@@ -91,8 +75,6 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
   int num_heads = params.h;
   int head_dim = params.d;
   float dropout_ratio = params.p_dropout;
-
-  std::vector<SimpleDeviceMem2> d_tensors;
 
   using DeviceGemmTemplateInstance = DeviceGemmTemplate<DeviceGemmTraits>;
   std::vector<typename DeviceGemmTemplateInstance::ProblemDesc> problem_descs;
@@ -148,10 +130,6 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
     //                       LSE
     std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
     std::vector<ck::index_t> lse_gs_ms_strides{G1 * M, M, 1}; // LSE layout [G0, G1, M]
-    
-    SimpleDeviceMem2 d_tensor(sizeof(float)*G0*G1*M);
-    d_tensors.push_back(d_tensor);
-    p_d.push_back(d_tensor.GetDeviceBuffer());
 
     problem_descs.push_back({
         q_gs_ms_ks_lengths,
