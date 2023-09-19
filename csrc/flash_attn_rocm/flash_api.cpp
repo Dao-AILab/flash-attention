@@ -10,10 +10,21 @@
 #include <c10/hip/HIPGuard.h>
 
 #include "flash_runner.h"
+#include "params.h"
 
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 
-auto flash_runner = std::make_unique<FlashRunner>();
+// get environment variables for internal usage
+inline bool get_env_(const char* env_var) {
+  char* res = std::getenv(env_var);
+  if (res[0] == '0' || res == NULL) { return false; }
+  else { return true; }
+}
+
+bool IS_UNIT_TEST_MODE = get_env_("FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE");
+bool IS_DETERMINISITC = get_env_("FLASH_ATTENTION_INTERNAL_DETERMINISTIC");
+
+auto flash_runner = std::make_unique<FlashRunner>(IS_UNIT_TEST_MODE, IS_DETERMINISITC);
 
 void set_params_fprop(FlashFwdParams &params,
                       // sizes
@@ -68,15 +79,15 @@ void set_params_fprop(FlashFwdParams &params,
     params.cu_seqlens_q = static_cast<int*>(cu_seqlens_q_d);
     params.cu_seqlens_k = static_cast<int*>(cu_seqlens_k_d);
 
-    if(cu_seqlens_q.device().type() == c10::kCUDA) {
+    // if(params.cu_seqlens_q->is_cuda()) {
         params.host_seqlens_q = std::vector<int>(params.b+1);
         params.host_seqlens_k = std::vector<int>(params.b+1);
-        FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_q.data(), cu_seqlens_q.data_ptr(), (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
-        FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_k.data(), cu_seqlens_k.data_ptr(), (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
-    } else {
-        params.host_seqlens_q = std::vector<int>(static_cast<int*>(cu_seqlens_q.data_ptr()), static_cast<int*>(cu_seqlens_q.data_ptr())+params.b+1);
-        params.host_seqlens_k = std::vector<int>(static_cast<int*>(cu_seqlens_k.data_ptr()), static_cast<int*>(cu_seqlens_k.data_ptr())+params.b+1);
-    }
+        FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_q.data(), cu_seqlens_q_d, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
+        FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_k.data(), cu_seqlens_k_d, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
+    // } else {
+        // params.host_seqlens_q = std::vector<int>(static_cast<int*>(cu_seqlens_q_d), static_cast<int*>(cu_seqlens_q_d)+params.b+1);
+        // params.host_seqlens_k = std::vector<int>(static_cast<int*>(cu_seqlens_k_d), static_cast<int*>(cu_seqlens_k_d)+params.b+1);
+    // }
 
     // P = softmax(QK^T)
     char* p_ptr = reinterpret_cast<char*>(p_d);
@@ -156,7 +167,7 @@ void set_params_fprop(FlashFwdParams &params,
         params.v_ptrs.push_back(reinterpret_cast<void*>(v_ptr));     
         v_ptr = v_ptr + temp_k_stride * params.kv_stride_multiplier;
 
-        params.o_ptrs.push_back(reinterpret_cast<void*>(out_ptr));
+        params.out_ptrs.push_back(reinterpret_cast<void*>(out_ptr));
         out_ptr = out_ptr + temp_q_stride;
 
         params.softmax_lse_ptrs.push_back(reinterpret_cast<void*>(softmax_lse_ptr));
@@ -220,8 +231,7 @@ void set_params_dgrad(FlashBwdParams &params,
                       void *dsoftmax_sum_d,
                       float p_dropout,
                       float softmax_scale,
-                      bool is_causal,
-                      bool is_unit_test_mode) {
+                      bool is_causal) {
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
                      q, k, v, out,
@@ -249,7 +259,7 @@ void set_params_dgrad(FlashBwdParams &params,
     // params.dk_head_stride = dk.stride(-2);
     // params.dv_head_stride = dv.stride(-2);
 
-    if(is_unit_test_mode) {
+    if(IS_UNIT_TEST_MODE) {
         params.q_stride_multiplier = 1;
         params.kv_stride_multiplier = 1;
     }
@@ -269,7 +279,7 @@ void set_params_dgrad(FlashBwdParams &params,
         int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, q.dtype());
         int temp_dk_stride = get_size_in_bytes(d * h * temp_seqlen_k, dk.dtype());
 
-        if(!is_unit_test_mode) {
+        if(!IS_UNIT_TEST_MODE) {
             params.dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));
             dq_ptr = dq_ptr + temp_dq_stride * params.q_stride_multiplier;
 
@@ -321,7 +331,7 @@ void set_params_dgrad(FlashBwdParams &params,
             }
         }
 
-        params.do_ptrs.push_back(reinterpret_cast<const void*>(dout_ptr));
+        params.dout_ptrs.push_back(reinterpret_cast<const void*>(dout_ptr));
         dout_ptr += temp_q_stride;
 
         params.z_ptrs.push_back(nullptr);
@@ -418,7 +428,7 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
 
     auto opts = q.options();
 
-    auto softmax_lse = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+    auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     at::Tensor p;
     // Only return softmax if there's dropout to reduce compilation time
     if (return_softmax) {
@@ -460,7 +470,7 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
     }
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
-    flash_runner_ptr->RunFwd(params, stream);
+    flash_runner->RunFwd(params, stream);
 
     at::Tensor out_padded = out;
     if (head_size_og % 8 != 0) {
@@ -614,7 +624,7 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
     }
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
-    flash_runner_ptr->RunFwd(params, stream);
+    flash_runner->RunFwd(params, stream);
 
     at::Tensor out_padded = out;
     if (head_size_og % 8 != 0) {
@@ -726,7 +736,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         dv = torch::empty_like(k);
     }
 
-    if(is_unit_test_mode) {
+    if(IS_UNIT_TEST_MODE) {
         dq = dq.to(torch::kFloat32);
         dk = dk.to(torch::kFloat32);
         dv = dv.to(torch::kFloat32);
@@ -800,13 +810,13 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         params.philox_args = gen->philox_cuda_state(counter_offset);
-        auto seeds = at::cuda::philox::unpack(params.philox_args);
+        auto seeds = unpack(params.philox_args);
         params.rng_state[0] = std::get<0>(seeds);
         params.rng_state[1] = std::get<1>(seeds);
     }
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
-    flash_runner_ptr->RunBwd(params, stream);
+    flash_runner->RunBwd(params, stream);
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
@@ -935,7 +945,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         dv = torch::empty_like(k);
     }
 
-    if(is_unit_test_mode) {
+    if(IS_UNIT_TEST_MODE) {
         dq = dq.to(torch::kFloat32);
         dk = dk.to(torch::kFloat32);
         dv = dv.to(torch::kFloat32);
@@ -1011,13 +1021,13 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         params.philox_args = gen->philox_cuda_state(counter_offset);
-        auto seeds = at::cuda::philox::unpack(params.philox_args);
+        auto seeds = unpack(params.philox_args);
         params.rng_state[0] = std::get<0>(seeds);
         params.rng_state[1] = std::get<1>(seeds);
     }
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
-    flash_runner_ptr->RunBwd(params, stream);
+    flash_runner->RunBwd(params, stream);
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {

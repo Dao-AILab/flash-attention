@@ -36,6 +36,11 @@ def _get_block_size(device, head_dim, is_dropout, is_causal):
         return (128, 64) if is_sm80 else (64, 64)
 
 
+def _get_block_size_rocm(device, head_dim, is_dropout):
+    assert head_dim % 8 == 0 and head_dim <= 128
+    return 256 if head_dim <= 64 else 128
+
+
 def _flash_attn_forward(q, k, v, dropout_p, softmax_scale, causal, return_softmax):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]

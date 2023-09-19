@@ -23,13 +23,8 @@
 
 #pragma once
 
-#include <cstdlib>
-#include <initializer_list>
-#include <iostream>
-#include <numeric>
-
-#include "params.h"
 #include "bwd_device_gemm_template.h"
+#include "params.h"
 
 namespace bwd_device_gemm {
 template <template <typename> typename DeviceGemmTemplate, typename DeviceGemmTraits>
@@ -51,7 +46,7 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
   bool input_permute = true;
   bool output_permute = true;
 
-  float alpha = params.scale_bmm1f;
+  float alpha = params.scale_softmax;
   auto seeds = unpack(params.philox_args);
 
   auto a_element_op     = device_gemm_trait::AElementOp{};
@@ -60,16 +55,16 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
   auto b1_element_op    = device_gemm_trait::B1ElementOp{};
   auto c_element_op     = device_gemm_trait::CElementOp{};
 
-  auto p_q = params.q_ptr;
-  auto p_k = params.k_ptr;
-  auto p_v = params.v_ptr;
-  auto p_y = params.y_ptr;
-  auto p_z = params.z_ptr;
-  auto p_lse = params.lse_ptr;
-  auto p_ygrad = params.ygrad_ptr;
-  auto p_qgrad = params.qgrad_ptr;
-  auto p_kgrad = params.kgrad_ptr;
-  auto p_vgrad = params.vgrad_ptr;
+  auto p_q = params.q_ptrs;
+  auto p_k = params.k_ptrs;
+  auto p_v = params.v_ptrs;
+  auto p_y = params.out_ptrs;
+  auto p_z = params.z_ptrs;
+  auto p_lse = params.softmax_lse_ptrs;
+  auto p_ygrad = params.dout_ptrs;
+  auto p_qgrad = params.dq_ptrs;
+  auto p_kgrad = params.dk_ptrs;
+  auto p_vgrad = params.dv_ptrs;
   int batch_size = params.b;
   int num_heads = params.h;
   int head_dim = params.d;

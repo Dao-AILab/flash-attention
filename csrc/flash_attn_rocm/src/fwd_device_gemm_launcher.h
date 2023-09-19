@@ -23,10 +23,8 @@
 
 #pragma once
 
-#include <iostream>
-
-#include "launch_params.h"
 #include "fwd_device_gemm_template.h"
+#include "params.h"
 
 namespace fwd_device_gemm {
 template <template <typename> typename DeviceGemmTemplate, typename DeviceGemmTraits>
@@ -49,7 +47,7 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
   bool output_permute = true;
   bool z_tensor_permute = false;
 
-  float alpha = params.scale_bmm1f;
+  float alpha = params.scale_softmax;
 
   auto a_element_op     = device_gemm_trait::AElementOp{};
   auto b0_element_op    = device_gemm_trait::B0ElementOp{};
@@ -57,12 +55,12 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
   auto b1_element_op    = device_gemm_trait::B1ElementOp{};
   auto c_element_op     = device_gemm_trait::CElementOp{};
 
-  auto p_a = params.q_ptr;
-  auto p_b0 = params.k_ptr;
-  auto p_b1 = params.v_ptr;
-  auto p_c = params.o_ptr;
-  auto p_z = params.s_ptr;
-  auto p_lse = params.softmax_lse_ptr;
+  auto p_a = params.q_ptrs;
+  auto p_b0 = params.k_ptrs;
+  auto p_b1 = params.v_ptrs;
+  auto p_c = params.out_ptrs;
+  auto p_z = params.p_ptrs;
+  auto p_lse = params.softmax_lse_ptrs;
 
   std::vector<typename DeviceGemmTemplate<DeviceGemmTraits>::ProblemDesc> problem_descs;
 

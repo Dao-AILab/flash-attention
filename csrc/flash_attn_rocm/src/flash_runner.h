@@ -26,31 +26,19 @@
 #include <memory>
 #include <cstdlib>
 
-namespace fwd_device_gemm { class FlashFwdRunner; }
-namespace bwd_device_gemm { class FlashBwdRunner; }
-class FlashFwdParams;
-class FlashBwdParams; 
+#include "flash_fwd_runner_gfx90a.h"
+#include "flash_bwd_runner_gfx90a.h"
+#include "params.h"
 
 class FlashRunner {
  public:
   // constructor
-  explicit FlashRunner::FlashRunner()
-    : pimpl_fwd_runner_(std::make_unique<fwd_device_gemm::FlashFwdRunner>(get_env_("FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE"), 
-                                                                          get_env_("FLASH_ATTENTION_INTERNAL_DETERMINISTIC"))),
-      pimpl_bwd_runner_(std::make_unique<bwd_device_gemm::FlashBwdRunner>(get_env_("FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE"), 
-                                                                          get_env_("FLASH_ATTENTION_INTERNAL_DETERMINISTIC"))) {}
+  explicit FlashRunner(bool is_unit_test_mode, bool is_deterministic);
 
-  void RunFwd(fwd_device_gemm::FlashFwdParams &params, hipStream_t &stream);
-  void RunBwd(bwd_device_gemm::FlashBwdParams &params, hipStream_t &stream);
+  void RunFwd(FlashFwdParams &params, hipStream_t &stream);
+  void RunBwd(FlashBwdParams &params, hipStream_t &stream);
 
  private:
-  // get environment variables for internal usage
-  int get_env_(std::string env_var) {
-    char* res = std::getenv(env_var);
-    if (res == '0' || res == NULL) { return false; }
-    else { return true; }
-  }
-   
   std::unique_ptr<fwd_device_gemm::FlashFwdRunner> pimpl_fwd_runner_;
   std::unique_ptr<bwd_device_gemm::FlashBwdRunner> pimpl_bwd_runner_;
 }; // class FlashRunner

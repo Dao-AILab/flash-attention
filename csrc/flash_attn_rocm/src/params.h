@@ -104,10 +104,13 @@ struct FlashFwdParams : public QkvParams {
 struct FlashBwdParams : public FlashFwdParams {
   // The dO and dQKV matrices.
   std::vector<void*> z_ptrs;
+  std::vector<const void*> out_ptrs;
   std::vector<const void*> dout_ptrs;
   std::vector<void*> dq_ptrs;
   std::vector<void*> dk_ptrs;
   std::vector<void*> dv_ptrs;
+
+  std::vector<const void*> softmax_lse_ptrs;
 
   std::vector<at::Tensor> dq_tensors;
   std::vector<at::Tensor> dk_tensors;
@@ -141,30 +144,3 @@ struct FlashBwdParams : public FlashFwdParams {
   // The pointer to the softmax d sum.
   // std::vector<void*> dsoftmax_sum_ptrs;
 };
-
-// template<typename KernelParams>
-// struct LaunchParams{
-//   LaunchParams(hipDeviceProp_t *props,
-//                hipStream_t stream,
-//                bool is_dropout,
-//                bool return_softmax)
-//       : elts_per_thread_(0),
-//         props_(props), 
-//         stream_(stream), 
-//         is_dropout_(is_dropout), 
-//         return_softmax_(return_softmax) {}
-
-//   size_t elts_per_thread_;
-//   hipDeviceProp_t * props_;
-//   hipStream_t stream_;
-  
-//   bool is_dropout_;
-//   bool return_softmax_;
-
-//   KernelParams params;
-//   int num_full_heads;
-//   int num_main_groups;
-//   int heads_last_wave;
-//   int main_steps;
-//   int rest_steps;
-// };

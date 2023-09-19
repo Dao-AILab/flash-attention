@@ -234,6 +234,7 @@ else:
                       "-O3",
                       "-std=c++20",
                       "-DNDEBUG",
+                      "-ferror-limit=0",
                       "-DBUILD_PYTHON_PACKAGE", 
                       "-U__CUDA_NO_HALF_OPERATORS__",
                       "-U__CUDA_NO_HALF_CONVERSIONS__",
@@ -279,11 +280,9 @@ setup(
         exclude=("build", "csrc", "include", "tests", "dist", "docs", "benchmarks", "flash_attn.egg-info",)
     ),
     author="Tri Dao",
-    author_email="trid@stanford.edu",
+    author_email="trid@cs.stanford.edu",
     description="Flash Attention: Fast and Memory-Efficient Exact Attention",
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    url="https://github.com/HazyResearch/flash-attention",
+    url="https://github.com/Dao-AILab/flash-attention",
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: BSD License",

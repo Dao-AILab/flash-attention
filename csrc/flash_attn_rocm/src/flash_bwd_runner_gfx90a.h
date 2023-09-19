@@ -25,12 +25,14 @@
 
 #include "bwd_device_gemm_launcher.h"
 
+#include "static_switch.h"
+
 namespace bwd_device_gemm {
 class FlashBwdRunner {
  public:
   // constructor
-  FlashBwdRunner(bool is_unit_test_mode, bool is_deterministic)
-    : is_unti_test_mode_(is_unit_test_mode),
+  explicit FlashBwdRunner(bool is_unit_test_mode, bool is_deterministic)
+    : is_unit_test_mode_(is_unit_test_mode),
       is_deterministic_(is_deterministic) {}
 
   template <bool kIsQLoop, int kHeadDim, typename T, bool kIsCausal>
@@ -54,7 +56,7 @@ class FlashBwdRunner {
                                                            kIsDeterministic>;
       using DeviceGemmInstance = DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>;
       auto device_gemm_instance_ptr = std::make_unique<DeviceGemmInstance>();
-      device_gemm_instance_ptr->Launch(params_, stream_);
+      device_gemm_instance_ptr->Launch(params, stream);
     } else { 
       // unit test mode
       // input, output, gemm, dropout, cshuffle, masking specialization, deterministic
@@ -67,7 +69,7 @@ class FlashBwdRunner {
                                                            kIsDeterministic>;
       using DeviceGemmInstance = DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>;
       auto device_gemm_instance_ptr = std::make_unique<DeviceGemmInstance>();
-      device_gemm_instance_ptr->Launch(params_, stream_);
+      device_gemm_instance_ptr->Launch(params, stream);
     }
   }
 

@@ -25,12 +25,14 @@
 
 #include "fwd_device_gemm_launcher.h"
 
+#include "static_switch.h"
+
 namespace fwd_device_gemm {
 class FlashFwdRunner {
  public:
   // constructor
-  FlashFwdRunner(bool is_unit_test_mode, bool is_deterministic)
-    : is_unti_test_mode_(is_unit_test_mode),
+  explicit FlashFwdRunner(bool is_unit_test_mode, bool is_deterministic)
+    : is_unit_test_mode_(is_unit_test_mode),
       is_deterministic_(is_deterministic) {}
  
   template <bool kIsQLoop, int kHeadDim, typename T, bool kIsCausal>
@@ -48,7 +50,7 @@ class FlashFwdRunner {
                                                         kIsDeterministic>;
     using DeviceGemmInstance = DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>;
     auto device_gemm_instance_ptr = std::make_unique<DeviceGemmInstance>();
-    device_gemm_instance_ptr->Launch(params_, stream_);
+    device_gemm_instance_ptr->Launch(params, stream);
   }
 
   const bool is_unit_test_mode_;

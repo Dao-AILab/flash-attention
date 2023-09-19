@@ -23,13 +23,14 @@
 
 #include "flash_runner.h"
 
-#include "flash_fwd_runner_gfx90a.h"
-#include "flash_bwd_runner_gfx90a.h"
-#include "params.h"
-
 #include "static_switch.h"
 
-FlashRunner::RunFwd(fwd_device_gemm::FlashFwdParams &params, hipStream_t &stream) {
+// constructor
+FlashRunner::FlashRunner(bool is_unit_test_mode, bool is_deterministic)
+  : pimpl_fwd_runner_(std::make_unique<FlashFwdRunner>(is_unit_test_mode, is_deterministic)),
+    pimpl_bwd_runner_(std::make_unique<FlashBwdRunner>(is_unit_test_mode, is_deterministic)) {}
+
+void FlashRunner::RunFwd(FlashFwdParams &params, hipStream_t &stream) {
   HEADDIM_SWITCH(params.d, [&] {
     BF16_SWITCH(params.is_bf16, [&] {
       BOOL_SWITCH(params.is_causal, kIsCausal, [&] {
@@ -41,7 +42,7 @@ FlashRunner::RunFwd(fwd_device_gemm::FlashFwdParams &params, hipStream_t &stream
   });
 }
 
-FlashRunner::RunBwd(bwd_device_gemm::FlashBwdParams &params, hipStream_t &stream) {
+void FlashRunner::RunBwd(FlashBwdParams &params, hipStream_t &stream) {
   HEADDIM_SWITCH(params.d, [&] {
     BF16_SWITCH(params.is_bf16, [&] {
       BOOL_SWITCH(params.is_causal, kIsCausal, [&] {
