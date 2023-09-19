@@ -17,7 +17,8 @@
 // get environment variables for internal usage
 inline bool get_env_(const char* env_var) {
   char* res = std::getenv(env_var);
-  if (res[0] == '0' || res == NULL) { return false; }
+  if (res == NULL) { return false; }
+  else if (res[0] == '0') { return false; }
   else { return true; }
 }
 
