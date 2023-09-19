@@ -15,12 +15,10 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel as GPT2LMHead
 
 # @pytest.mark.parametrize('world_size', [1, 2, 4, 8])
 @pytest.mark.parametrize("world_size", [2])
-# @pytest.mark.parametrize('fused_ft_kernel', [False, True])
-@pytest.mark.parametrize("fused_ft_kernel", [True])
-# @pytest.mark.parametrize('rotary', [False, True])
-@pytest.mark.parametrize("rotary", [False])
+@pytest.mark.parametrize('rotary', [False, True])
+# @pytest.mark.parametrize("rotary", [False])
 @pytest.mark.parametrize("model_name", ["gpt2"])
-def test_tensor_parallel(model_name, rotary, fused_ft_kernel, world_size):
+def test_tensor_parallel(model_name, rotary, world_size):
     """Check that our implementation of GPT2 generation matches the HF implementation:
     the scores in fp16 should be around the same as the HF scores in fp16, when compared to
     the HF scores in fp32.
@@ -111,25 +109,25 @@ def test_tensor_parallel(model_name, rotary, fused_ft_kernel, world_size):
         max_length=max_length,
         tensor_parallel=world_size,
         vocab_size=config.vocab_size,
-        fused_ft_kernel=fused_ft_kernel,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
     )
     print(out.sequences)
-    if fused_ft_kernel:
+    if getattr(config, "use_flash_attn", False):
         out_cg = model.generate(
             input_ids=input_ids,
             max_length=max_length,
             tensor_parallel=world_size,
             vocab_size=config.vocab_size,
-            fused_ft_kernel=fused_ft_kernel,
             cg=True,
             return_dict_in_generate=True,
             output_scores=True,
-            timing=True,
+            enable_timing=True,
         )
         print(out_cg.sequences)
+
+    parallel_state.destroy_model_parallel()
 
     if not rotary:
         out_hf = model_hf.generate(
@@ -171,5 +169,3 @@ def test_tensor_parallel(model_name, rotary, fused_ft_kernel, world_size):
         ).abs().max().item() < 3 * (
             torch.stack(out_hf.scores, 1) - torch.stack(out_ref.scores, 1)
         ).abs().max().item()
-
-    parallel_state.destroy_model_parallel()

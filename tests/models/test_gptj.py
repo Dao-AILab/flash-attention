@@ -23,7 +23,7 @@ def test_gptj_state_dict(model_name):
         assert state_dict[k].shape == pretrained_state_dict[k].shape
 
 
-@pytest.mark.parametrize("model_name", ["EleutherAI/gpt-j-6B"])
+@pytest.mark.parametrize("model_name", ["EleutherAI/gpt-j-6B", "togethercomputer/GPT-JT-6B-v1"])
 def test_gptj_optimized(model_name):
     """Check that our implementation of GPT-J (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
@@ -140,11 +140,9 @@ def test_gptj_generation(model_name):
         input_ids=input_ids,
         max_length=max_length,
         eos_token_id=eos_token_id,
-        fused_ft_kernel=True,
-        # eos_token_id=eos_token_id, fused_ft_kernel=False,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
         teacher_outputs=out_hf.sequences,
     )
     torch.cuda.synchronize()
@@ -159,11 +157,10 @@ def test_gptj_generation(model_name):
     out_cg = model.generate(
         input_ids=input_ids,
         max_length=max_length,
-        fused_ft_kernel=True,
         cg=True,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
         teacher_outputs=out_hf.sequences,
     )
     torch.cuda.synchronize()

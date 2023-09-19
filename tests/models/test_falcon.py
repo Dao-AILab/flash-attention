@@ -146,6 +146,7 @@ def test_falcon_parallel_forward(model_name, world_size):
         logits, _ = all_gather_raw(logits, process_group)
         logits = rearrange(logits, "(n b) ... d -> b ... (n d)", b=batch_size)
     del model
+    parallel_state.destroy_model_parallel()
 
     if rank == 0:
         model_hf = AutoModelForCausalLM.from_pretrained(
@@ -241,10 +242,9 @@ def test_falcon_generation(model_name):
         input_ids=input_ids,
         max_length=max_length,
         eos_token_id=eos_token_id,
-        fused_ft_kernel=True,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
         teacher_outputs=out_hf.sequences,
     )
     torch.cuda.synchronize()
@@ -259,11 +259,10 @@ def test_falcon_generation(model_name):
     out_cg = model.generate(
         input_ids=input_ids,
         max_length=max_length,
-        fused_ft_kernel=True,
         cg=True,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
         teacher_outputs=out_hf.sequences,
     )
     torch.cuda.synchronize()
@@ -346,11 +345,10 @@ def test_falcon_parallel_generation(model_name, world_size):
         max_length=max_length,
         tensor_parallel=world_size,
         vocab_size=config.vocab_size,
-        fused_ft_kernel=True,
         # teacher_outputs=out_hf.sequences,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
     )
 
     # Capture graph outside the timing loop
@@ -362,12 +360,11 @@ def test_falcon_parallel_generation(model_name, world_size):
         max_length=max_length,
         tensor_parallel=world_size,
         vocab_size=config.vocab_size,
-        fused_ft_kernel=True,
         cg=True,
         # teacher_outputs=out_hf.sequences,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
     )
     del model
     parallel_state.destroy_model_parallel()

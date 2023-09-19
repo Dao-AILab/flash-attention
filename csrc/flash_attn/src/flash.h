@@ -13,8 +13,7 @@
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #endif
 
-#include <ATen/cuda/CUDAGraphsUtils.cuh>
-
+#include <ATen/cuda/CUDAGraphsUtils.cuh> // For at::cuda::philox::unpack
 
 constexpr int TOTAL_DIM = 0;
 constexpr int H_DIM = 1;
@@ -53,6 +52,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     // The O matrix (output).
     void * __restrict__ o_ptr;
+    void * __restrict__ oaccum_ptr;
 
     // The stride between rows of O.
     index_t o_batch_stride;
@@ -64,9 +64,10 @@ struct Flash_fwd_params : public Qkv_params {
 
     // The pointer to the softmax sum.
     void * __restrict__ softmax_lse_ptr;
+    void * __restrict__ softmax_lseaccum_ptr;
 
     // The dimensions.
-    int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded;
+    int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;
 
     // The scaling factors for the kernel.
     float scale_softmax;
@@ -77,6 +78,22 @@ struct Flash_fwd_params : public Qkv_params {
     int * __restrict__ cu_seqlens_k;
 
     int *__restrict__ blockmask;
+
+    // The K_new and V_new matrices.
+    void * __restrict__ knew_ptr;
+    void * __restrict__ vnew_ptr;
+
+    // The stride between rows of the Q, K and V matrices.
+    index_t knew_batch_stride;
+    index_t vnew_batch_stride;
+    index_t knew_row_stride;
+    index_t vnew_row_stride;
+    index_t knew_head_stride;
+    index_t vnew_head_stride;
+
+    // The cos and sin matrices for rotary embedding.
+    void * __restrict__ rotary_cos_ptr;
+    void * __restrict__ rotary_sin_ptr;
 
     // The dropout probability (probability of keeping an activation).
     float p_dropout;
@@ -96,6 +113,14 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool is_bf16;
     bool is_causal;
+
+    // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
+    // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.
+    bool is_seqlens_k_cumulative;
+
+    bool is_rotary_interleaved;
+
+    int num_splits;  // For split-KV version
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -140,5 +165,6 @@ struct Flash_bwd_params : public Flash_fwd_params {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename T, int Headdim> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim> void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
 
 template<typename T, int Headdim> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream, const bool configure);

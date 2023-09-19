@@ -292,10 +292,9 @@ def test_llama_generation(model_name, checkpoint_format):
         input_ids=input_ids,
         max_length=max_length,
         eos_token_id=eos_token_id,
-        fused_ft_kernel=True,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
         teacher_outputs=out_hf.sequences,
     )
     torch.cuda.synchronize()
@@ -310,11 +309,10 @@ def test_llama_generation(model_name, checkpoint_format):
     out_cg = model.generate(
         input_ids=input_ids,
         max_length=max_length,
-        fused_ft_kernel=True,
         cg=True,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
         teacher_outputs=out_hf.sequences,
     )
     torch.cuda.synchronize()
@@ -399,11 +397,10 @@ def test_llama_parallel_generation(model_name, world_size, checkpoint_format):
         max_length=max_length,
         tensor_parallel=world_size,
         vocab_size=config.vocab_size,
-        fused_ft_kernel=True,
         # teacher_outputs=out_hf.sequences,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
     )
 
     # Capture graph outside the timing loop
@@ -415,12 +412,11 @@ def test_llama_parallel_generation(model_name, world_size, checkpoint_format):
         max_length=max_length,
         tensor_parallel=world_size,
         vocab_size=config.vocab_size,
-        fused_ft_kernel=True,
         cg=True,
         # teacher_outputs=out_hf.sequences,
         return_dict_in_generate=True,
         output_scores=True,
-        timing=True,
+        enable_timing=True,
     )
     del model
     parallel_state.destroy_model_parallel()

@@ -10,12 +10,13 @@ import re
 from collections import OrderedDict
 from collections.abc import Sequence
 from functools import partial
+from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from transformers import BertConfig
+from transformers import BertConfig, PretrainedConfig
 from transformers.models.bert.modeling_bert import (
     BaseModelOutputWithPoolingAndCrossAttentions,
     BertForPreTrainingOutput,
@@ -79,11 +80,15 @@ def create_mlp_cls(config, layer_idx=None, return_residual=False):
     inner_dim = config.intermediate_size
     fused_mlp = getattr(config, "fused_mlp", False)
     if fused_mlp:
-        assert config.hidden_act in ["gelu_new", "gelu_fast"], (
+        assert config.hidden_act in ["gelu_new", "gelu_fast", "gelu_pytorch_tanh"], (
             "fused_mlp only " "supports approximate gelu"
         )
     if not fused_mlp:
-        approximate = "tanh" if config.hidden_act in ["gelu_new", "gelu_fast"] else "none"
+        approximate = (
+            "tanh"
+            if config.hidden_act in ["gelu_new", "gelu_fast", "gelu_pytorch_tanh"]
+            else "none"
+        )
         mlp_cls = partial(
             Mlp,
             hidden_features=inner_dim,
@@ -236,7 +241,11 @@ class BertPredictionHeadTransform(nn.Module):
             raise ImportError("dropout_add_layer_norm is not installed")
         linear_cls = nn.Linear if not fused_bias_fc else FusedDense
         self.dense = linear_cls(config.hidden_size, config.hidden_size)
-        approximate = "tanh" if config.hidden_act in ["gelu_new", "gelu_fast"] else "none"
+        approximate = (
+            "tanh"
+            if config.hidden_act in ["gelu_new", "gelu_fast", "gelu_pytorch_tanh"]
+            else "none"
+        )
         self.transform_act_fn = nn.GELU(approximate=approximate)
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
@@ -338,7 +347,7 @@ class BertModel(BertPreTrainedModel):
         self.fused_dropout_add_ln = getattr(config, "fused_dropout_add_ln", False)
         if self.fused_dropout_add_ln and layer_norm is None:
             raise ImportError("dropout_add_layer_norm is not installed")
-        assert config.hidden_act in ["gelu", "gelu_new", "gelu_fast"]
+        assert config.hidden_act in ["gelu", "gelu_new", "gelu_fast", "gelu_pytorch_tanh"]
 
         self.embeddings = BertEmbeddings(
             config.hidden_size,
@@ -511,7 +520,11 @@ class BertForPreTraining(BertPreTrainedModel):
         )
 
 
-def remap_state_dict(state_dict, config):
+def remap_state_dict(state_dict, config: PretrainedConfig):
+    """
+    Map the state_dict of a Huggingface BERT model to be flash_attn compatible.
+    """
+
     # LayerNorm
     def key_mapping_ln_gamma_beta(key):
         key = re.sub(r"LayerNorm.gamma$", "LayerNorm.weight", key)
@@ -616,5 +629,135 @@ def remap_state_dict(state_dict, config):
         state_dict["cls.predictions.decoder.bias"] = F.pad(
             decoder_bias, (0, config.vocab_size - decoder_bias.shape[0]), value=-100.0
         )
+
+    return state_dict
+
+
+def inv_remap_state_dict(state_dict, config: PretrainedConfig):
+    """
+    Map the state_dict of a flash_attn model to be Huggingface BERT compatible.
+
+    This function is meant to be the inverse of remap_state_dict.
+    """
+    # Word embedding
+    pad_vocab_size_multiple = getattr(config, "pad_vocab_size_multiple", 1)
+    if pad_vocab_size_multiple > 1:
+        word_embeddings = state_dict["bert.embeddings.word_embeddings.weight"]
+        decoder_weight = state_dict["cls.predictions.decoder.weight"]
+        decoder_bias = state_dict["cls.predictions.decoder.bias"]
+        # unpad embeddings
+        state_dict["bert.embeddings.word_embeddings.weight"] = word_embeddings[
+            : config.orig_vocab_size, :
+        ]
+        state_dict["cls.predictions.decoder.weight"] = decoder_weight[: config.orig_vocab_size, :]
+        state_dict["cls.predictions.decoder.bias"] = decoder_bias[: config.orig_vocab_size]
+
+    for d in range(config.num_hidden_layers):
+        last_layer_subset = getattr(config, "last_layer_subset", False)
+        if not last_layer_subset or d != (config.num_hidden_layers - 1):
+            Wqkv_weights = state_dict.pop(f"bert.encoder.layers.{d}.mixer.Wqkv.weight")
+            Wqkv_biases = state_dict.pop(f"bert.encoder.layers.{d}.mixer.Wqkv.bias")
+            state_dict[f"bert.encoder.layers.{d}.attention.self.query.weight"] = Wqkv_weights[
+                : Wqkv_weights.shape[0] // 3, :
+            ]
+            state_dict[f"bert.encoder.layers.{d}.attention.self.key.weight"] = Wqkv_weights[
+                Wqkv_weights.shape[0] // 3 : 2 * Wqkv_weights.shape[0] // 3, :
+            ]
+            state_dict[f"bert.encoder.layers.{d}.attention.self.value.weight"] = Wqkv_weights[
+                2 * Wqkv_weights.shape[0] // 3 :, :
+            ]
+            state_dict[f"bert.encoder.layers.{d}.attention.self.query.bias"] = Wqkv_biases[
+                : Wqkv_biases.shape[0] // 3
+            ]
+            state_dict[f"bert.encoder.layers.{d}.attention.self.key.bias"] = Wqkv_biases[
+                Wqkv_biases.shape[0] // 3 : 2 * Wqkv_biases.shape[0] // 3
+            ]
+            state_dict[f"bert.encoder.layers.{d}.attention.self.value.bias"] = Wqkv_biases[
+                2 * Wqkv_biases.shape[0] // 3 :
+            ]
+        else:
+            Wq_weight = state_dict.pop(f"bert.encoder.layers.{d}.mixer.Wq.weight")
+            Wkv_weights = state_dict.pop(f"bert.encoder.layers.{d}.mixer.Wkv.weight")
+            Wq_bias = state_dict.pop(f"bert.encoder.layers.{d}.mixer.Wq.bias")
+            Wkv_biases = state_dict.pop(f"bert.encoder.layers.{d}.mixer.Wkv.bias")
+            state_dict[f"bert.encoder.layers.{d}.attention.self.query.weight"] = Wq_weight
+            state_dict[f"bert.encoder.layers.{d}.attention.self.key.weight"] = Wkv_weights[
+                : Wkv_weights.shape[0] // 2, :
+            ]
+            state_dict[f"bert.encoder.layers.{d}.attention.self.value.weight"] = Wkv_weights[
+                Wkv_weights.shape[0] // 2 :, :
+            ]
+            state_dict[f"bert.encoder.layers.{d}.attention.self.query.bias"] = Wq_bias
+            state_dict[f"bert.encoder.layers.{d}.attention.self.key.bias"] = Wkv_biases[
+                : Wkv_biases.shape[0] // 2
+            ]
+            state_dict[f"bert.encoder.layers.{d}.attention.self.value.bias"] = Wkv_biases[
+                Wkv_biases.shape[0] // 2 :
+            ]
+
+    def inv_key_mapping_ln(key):
+        key = re.sub(r"bert.emb_ln.", "bert.embeddings.LayerNorm.", key)
+        key = re.sub(
+            r"bert.encoder.layers.(\d+).norm1.(weight|bias)",
+            r"bert.encoder.layers.\1.attention.output.LayerNorm.\2",
+            key,
+        )
+        key = re.sub(
+            r"bert.encoder.layers.(\d+).norm2.(weight|bias)",
+            r"bert.encoder.layers.\1.output.LayerNorm.\2",
+            key,
+        )
+        key = re.sub(
+            r"cls.predictions.transform.layer_norm.(weight|bias)",
+            r"cls.predictions.transform.LayerNorm.\1",
+            key,
+        )
+        return key
+
+    def inv_key_mapping_ln_gamma_beta(key):
+        key = re.sub(r"LayerNorm.weight$", "LayerNorm.gamma", key)
+        key = re.sub(r"LayerNorm.bias$", "LayerNorm.beta", key)
+        return key
+
+    def inv_key_mapping_layers(key):
+        return re.sub(r"bert.encoder.layers.", "bert.encoder.layer.", key)
+
+    def inv_key_mapping_mlp(key):
+        key = re.sub(
+            r"bert.encoder.layer.(\d+).mlp.fc1.(weight|bias)",
+            r"bert.encoder.layer.\1.intermediate.dense.\2",
+            key,
+        )
+        key = re.sub(
+            r"bert.encoder.layer.(\d+).mlp.fc2.(weight|bias)",
+            r"bert.encoder.layer.\1.output.dense.\2",
+            key,
+        )
+        return key
+
+    def inv_key_mapping_attn(key):
+        return re.sub(
+            r"bert.encoder.layer.(\d+).mixer.out_proj.(weight|bias)",
+            r"bert.encoder.layer.\1.attention.output.dense.\2",
+            key,
+        )
+
+    def inv_key_mapping_decoder_bias(key):
+        return re.sub(r"cls.predictions.decoder.bias", "cls.predictions.bias", key)
+
+    state_dict = OrderedDict((inv_key_mapping_ln(key), value) for key, value in state_dict.items())
+    state_dict = OrderedDict(
+        (inv_key_mapping_ln_gamma_beta(key), value) for key, value in state_dict.items()
+    )
+    state_dict = OrderedDict(
+        (inv_key_mapping_layers(key), value) for key, value in state_dict.items()
+    )
+    state_dict = OrderedDict((inv_key_mapping_mlp(key), value) for key, value in state_dict.items())
+    state_dict = OrderedDict(
+        (inv_key_mapping_attn(key), value) for key, value in state_dict.items()
+    )
+    state_dict = OrderedDict(
+        (inv_key_mapping_decoder_bias(key), value) for key, value in state_dict.items()
+    )
 
     return state_dict
