@@ -5,6 +5,9 @@
 // 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
 // 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
 
+#include <cstring>
+
+
 #include <torch/extension.h>
 #include <ATen/hip/HIPContext.h>
 #include <c10/hip/HIPGuard.h>
@@ -16,10 +19,11 @@
 
 // get environment variables for internal usage
 inline bool get_env_(const char* env_var) {
-  char* res = std::getenv(env_var);
-  if (res == NULL) { return false; }
-  else if (res[0] == '0') { return false; }
-  else { return true; }
+  if (char* value = std::getenv(env_var)) { 
+    if (strcmp(value, "0") == 0) { return false; }
+    return true;
+  }
+  return false;
 }
 
 bool IS_UNIT_TEST_MODE = get_env_("FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE");
@@ -109,28 +113,28 @@ void set_params_fprop(FlashFwdParams &params,
     params.d_rounded = d_rounded;
     params.is_mnko_padding = false;    // MNKOpadding
 
-    if(!params.is_mnko_padding && d <= 32){
+    if(!params.is_mnko_padding && d <= 32) {
         params.is_mnko_padding = ((d % 32)==0 ? false : true);
     }
-    else if(!params.is_mnko_padding && d <= 64){
+    else if(!params.is_mnko_padding && d <= 64) {
         params.is_mnko_padding = ((d % 64)==0 ? false : true);
     }
-    else if(!params.is_mnko_padding && d <= 128){
+    else if(!params.is_mnko_padding && d <= 128) {
         params.is_mnko_padding = ((d % 128)==0 ? false : true);
     }
     else{
         std::cout << "Unsupported head dimension" << std::endl;
     }
 
-    if(q.is_contiguous() && k.is_contiguous() && v.is_contiguous()){  
+    if(q.is_contiguous() && k.is_contiguous() && v.is_contiguous()) {  
         params.q_stride_multiplier = 1;
         params.kv_stride_multiplier = 1;
     }
-    else if(q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()){
+    else if(q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()) {
         params.q_stride_multiplier = 1;
         params.kv_stride_multiplier = 2;
     }
-    else if(!q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()){
+    else if(!q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()) {
         params.q_stride_multiplier = 3;
         params.kv_stride_multiplier = 3;
     }
@@ -138,24 +142,24 @@ void set_params_fprop(FlashFwdParams &params,
         std::cout<< "Wrong matrix inputs." <<std::endl;
     }
 
-    for (int i = 0; i < params.b; i++){
+    for (int i = 0; i < params.b; i++) {
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
         int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, q.dtype());
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
         int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, q.dtype());
 
-        if(!params.is_mnko_padding && d <= 32){
+        if(!params.is_mnko_padding && d <= 32) {
             params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
         }
-        else if(!params.is_mnko_padding && d <= 64){
-            if(p_dropout > 0.0){
+        else if(!params.is_mnko_padding && d <= 64) {
+            if(p_dropout > 0.0) {
                 params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
             }
             else{
                 params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 256)==0 ? false : true);
             }
         }
-        else if(!params.is_mnko_padding && d <= 128){
+        else if(!params.is_mnko_padding && d <= 128) {
             params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
         }
 
@@ -479,7 +483,7 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
         if (out_.has_value()) { out_.value().copy_(out); }
     }
 
-    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
+    return { out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state };
 }
 
 std::vector<at::Tensor>
@@ -633,7 +637,7 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
         if (out_.has_value()) { out_.value().copy_(out); }
     }
 
-    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
+    return { out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state };
 }
 
 std::vector<at::Tensor>
@@ -805,9 +809,9 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = params.b * params.h * 32;
         
-    if ( rng_state.has_value() ) {
+    if (rng_state.has_value()) {
         params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
-    } else if( is_dropout ) {
+    } else if(is_dropout) {
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         params.philox_args = gen->philox_cuda_state(counter_offset);
@@ -983,7 +987,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         dv_expanded = dv;
     }
     
-    if( zero_tensors ) {
+    if(zero_tensors) {
         dq.zero_();
         dk_expanded.zero_();
         dv_expanded.zero_();
@@ -1016,9 +1020,9 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = params.b * params.h * 32;
 
-    if ( rng_state.has_value() ) {
+    if (rng_state.has_value()) {
         params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
-    } else if( is_dropout ) {
+    } else if(is_dropout) {
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         params.philox_args = gen->philox_cuda_state(counter_offset);
