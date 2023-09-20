@@ -830,7 +830,9 @@ class ParallelMHA(nn.Module):
             )
             return context
 
-    def forward(self, x, seqlen=None, inference_params=None, cu_seqlens=None, max_seqlen=None, **kwargs):
+    def forward(
+        self, x, seqlen=None, inference_params=None, cu_seqlens=None, max_seqlen=None, **kwargs
+    ):
         """
         Arguments:
             x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim) if seqlen=None and cu_seqlens=None.
@@ -852,8 +854,11 @@ class ParallelMHA(nn.Module):
         qkv = self.Wqkv(x)
         if seqlen is not None:
             qkv = rearrange(qkv, "(b s) ... -> b s ...", s=seqlen)
-        kwargs = ({'cu_seqlens': cu_seqlens, 'max_seqlen': max_seqlen, **kwargs}
-                  if self.use_flash_attn else kwargs)
+        kwargs = (
+            {"cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen, **kwargs}
+            if self.use_flash_attn
+            else kwargs
+        )
         seqlen_offset = (
             0
             if inference_params is None
@@ -876,7 +881,8 @@ class ParallelMHA(nn.Module):
             ):
                 if self.rotary_emb_dim > 0:
                     qkv = self.rotary_emb(
-                        qkv, seqlen_offset=seqlen_offset,
+                        qkv,
+                        seqlen_offset=seqlen_offset,
                         cu_seqlens=cu_seqlens,
                         max_seqlen=rotary_max_seqlen,
                     )
@@ -913,7 +919,9 @@ class ParallelMHA(nn.Module):
             ):
                 if self.rotary_emb_dim > 0:
                     q, kv = self.rotary_emb(
-                        q, kv, seqlen_offset=seqlen_offset, 
+                        q,
+                        kv,
+                        seqlen_offset=seqlen_offset,
                         cu_seqlens=cu_seqlens,
                         max_seqlen=rotary_max_seqlen,
                     )
