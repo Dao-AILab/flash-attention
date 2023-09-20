@@ -33,8 +33,10 @@ void run_flash_bwd(LaunchParams<FlashBwdParams> &launch_params) {
   HEADDIM_SWITCH(launch_params.params.d, [&] {
     BF16_SWITCH(launch_params.params.is_bf16, [&] {
       BOOL_SWITCH(launch_params.params.is_causal, kIsCausal, [&] {
-        auto flash_bwd_runner_ptr = std::make_unique<bwd_device_gemm::FlashBwdRunner>(launch_params);
-        flash_bwd_runner_ptr->Run<kHeadDim, T, kIsCausal, true>();
+        BOOL_SWITCH(launch_params.params.is_mnko_padding, kIsPadding, [&] {
+            auto flash_bwd_runner_ptr = std::make_unique<bwd_device_gemm::FlashBwdRunner>(launch_params);
+            flash_bwd_runner_ptr->Run<kHeadDim, T, kIsCausal, kIsPadding>();
+        });
       });
     });
   });
@@ -268,6 +270,21 @@ void set_params_dgrad(FlashBwdParams &params,
         params.kv_stride_multiplier = 1;
     }
 
+    params.is_mnko_padding = false;    // MNKOpadding
+
+    if(!params.is_mnko_padding && d <= 32){
+        params.is_mnko_padding = ((d % 32)==0 ? false : true);
+    }
+    else if(!params.is_mnko_padding && d <= 64){
+        params.is_mnko_padding = ((d % 64)==0 ? false : true);
+    }
+    else if(!params.is_mnko_padding && d <= 128){
+        params.is_mnko_padding = ((d % 128)==0 ? false : true);
+    }
+    else{
+        std::cout << "Unsupported head dimension" << std::endl;
+    }
+
     auto opts = q.options();
 
     for (int i = 0; i < b; i++){
@@ -277,6 +294,16 @@ void set_params_dgrad(FlashBwdParams &params,
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
         int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, data_type);
         int temp_dk_stride = get_size_in_bytes(d * h * temp_seqlen_k, dk.dtype());
+
+        if(!params.is_mnko_padding && d <= 32){
+            params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+        }
+        else if(!params.is_mnko_padding && d <= 64){
+            params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+        }
+        else if(!params.is_mnko_padding && d <= 128){
+            params.is_mnko_padding = ((temp_seqlen_q % 64)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+        }
 
         at::Tensor d_tensor;
         d_tensor = at::empty({1, static_cast<long>(h), temp_seqlen_q}, opts.dtype(at::kFloat));

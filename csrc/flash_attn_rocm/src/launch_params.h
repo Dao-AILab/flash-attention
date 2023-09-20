@@ -171,6 +171,8 @@ struct FlashBwdParams : public FlashFwdParams {
   int kv_stride_multiplier;
 
   int num_splits; // How many SMs per attention matrix.
+
+  bool is_mnko_padding;
 };
 
 
