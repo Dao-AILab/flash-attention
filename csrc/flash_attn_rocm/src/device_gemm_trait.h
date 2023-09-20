@@ -104,6 +104,7 @@ template <typename InputDataType_,
           typename GemmDataType_,
           typename ZDataType_,
           Index kCShuffleBlockTransferScalarPerVectorNPerBlock_,
+          GemmSpec kGemmSpec_,
           MaskingSpec kMaskingSpec_,
           bool kIsDeterministic_>
 struct Backward {
@@ -129,7 +130,7 @@ struct Backward {
 
   static constexpr Index kCShuffleBlockTransferScalarPerVectorNPerBlock = kCShuffleBlockTransferScalarPerVectorNPerBlock_;                                      
 
-  static constexpr auto kGemmSpec = GemmSpec::MNKOPadding;
+  static constexpr auto kGemmSpec = kGemmSpec_;
 
   static constexpr auto kTensorSpecQ = TensorSpec::Default;
   static constexpr auto kTensorSpecK = TensorSpec::Default;
