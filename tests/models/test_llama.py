@@ -135,6 +135,72 @@ def test_llama_optimized(model_name, checkpoint_format):
     ).abs().max().item()
 
 
+
+
+@pytest.mark.parametrize("model_name", ["PY007/TinyLlama-1.1B-step-50K-105b"])
+def test_mqa_optimized(model_name):
+    """Check that our implementation of Llama with MQA/GQA (with all optimizations enabled) matches the
+    HF implementation: the output of our forward pass in fp16 should be around the same as the HF
+    forward pass in fp16, when compared to the HF forward pass in fp32.
+    """
+    dtype = torch.float16
+    device = "cuda"
+    config = llama_config_to_gpt2_config(LlamaConfig.from_pretrained(model_name))
+    config.use_flash_attn = True  # FlashAttention-2 supports headdim 256
+    config.fused_bias_fc = True
+    config.fused_mlp = False
+    config.fused_dropout_add_ln = True
+    config.residual_in_fp32 = True
+
+    # Without device_map, the model is loaded on the CPU, which is very slow
+    model_ref = LlamaForCausalLM.from_pretrained(model_name, device_map={"": device})
+    model_ref.eval()
+
+    model = GPTLMHeadModel(config, device=device, dtype=dtype)
+    model.load_state_dict(remap_state_dict_hf_llama(model_ref.state_dict(), config))
+    model.eval()
+
+    torch.manual_seed(0)
+    batch_size = 2
+    max_seqlen = 256
+    input_ids = torch.randint(
+        0, config.vocab_size, (batch_size, max_seqlen), dtype=torch.long, device=device
+    )
+    with torch.no_grad():
+        out = model.transformer(input_ids)
+        logits = model(input_ids).logits
+    del model
+
+    with torch.no_grad():
+        out_ref = model_ref.model(input_ids).last_hidden_state
+        logits_ref = model_ref(input_ids).logits
+    del model_ref
+
+    model_hf = LlamaForCausalLM.from_pretrained(
+        model_name, torch_dtype=dtype, device_map={"": device}
+    )
+    model_hf.eval()
+    out_hf = model_hf.model(input_ids).last_hidden_state
+    logits_hf = model_hf(input_ids).logits
+    del model_hf
+
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    print(f"HF fp16 max diff: {(out_hf - out_ref).abs().max().item()}")
+    print(f"HF fp16 mean diff: {(out_hf - out_ref).abs().mean().item()}")
+    assert (out - out_ref).abs().max().item() < 3 * (
+        out_hf - out_ref
+    ).abs().max().item()
+
+    print(f"Logits max diff: {(logits - logits_ref).abs().max().item()}")
+    print(f"Logits mean diff: {(logits - logits_ref).abs().mean().item()}")
+    print(f"HF fp16 max diff: {(logits_hf - logits_ref).abs().max().item()}")
+    print(f"HF fp16 mean diff: {(logits_hf - logits_ref).abs().mean().item()}")
+    assert (logits - logits_ref).abs().max().item() < 3 * (
+        logits_hf - logits_ref
+    ).abs().max().item()
+
+
 # torchrun --no_python --nproc_per_node=2 pytest -q -s tests/models/test_llama.py -k "parallel"
 @pytest.mark.parametrize("world_size", [2])
 @pytest.mark.parametrize("model_name", ["13B"])
