@@ -198,7 +198,7 @@ using DeviceGemmQLoopHeadDim128 = device_op::DeviceGroupedMultiheadAttentionBack
         64,          // KPerBlock
         128,         // Gemm1NPerBlock
         32,          // Gemm1KPerBlock
-        64,
+        128,
         8,           // AK1
         8,           // BK1
         2,           // B1K1

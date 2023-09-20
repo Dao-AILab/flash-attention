@@ -34,7 +34,7 @@ void run_flash_bwd(LaunchParams<FlashBwdParams> &launch_params) {
     BF16_SWITCH(launch_params.params.is_bf16, [&] {
       BOOL_SWITCH(launch_params.params.is_causal, kIsCausal, [&] {
         auto flash_bwd_runner_ptr = std::make_unique<bwd_device_gemm::FlashBwdRunner>(launch_params);
-        flash_bwd_runner_ptr->Run<kHeadDim, T, kIsCausal>();
+        flash_bwd_runner_ptr->Run<kHeadDim, T, kIsCausal, true>();
       });
     });
   });
