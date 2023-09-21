@@ -26,10 +26,13 @@ def remap_state_dict_meta_llama(
         return f"transformer.{key}" if not key.startswith("output.") else key
 
     state_dict = OrderedDict((key_mapping_layers(k), v) for k, v in state_dict.items())
+
     # Word embedding
     def key_mapping_emb(key):
         return re.sub(
-            r"^transformer.tok_embeddings.", "transformer.embeddings.word_embeddings.", key
+            r"^transformer.tok_embeddings.",
+            "transformer.embeddings.word_embeddings.",
+            key,
         )
 
     state_dict = OrderedDict((key_mapping_emb(k), v) for k, v in state_dict.items())
@@ -61,7 +64,9 @@ def remap_state_dict_meta_llama(
     def key_mapping_ln(key):
         key = re.sub(r"^transformer.norm.", r"transformer.ln_f.", key)
         key = re.sub(
-            r"^transformer.layers.(\d+).attention_norm.", r"transformer.layers.\1.norm1.", key
+            r"^transformer.layers.(\d+).attention_norm.",
+            r"transformer.layers.\1.norm1.",
+            key,
         )
         key = re.sub(r"^transformer.layers.(\d+).ffn_norm.", r"transformer.layers.\1.norm2.", key)
         return key
@@ -77,7 +82,9 @@ def remap_state_dict_meta_llama(
 
     def key_mapping_mlp(key):
         return re.sub(
-            r"^transformer.layers.(\d+).feed_forward.w2.", r"transformer.layers.\1.mlp.fc2.", key
+            r"^transformer.layers.(\d+).feed_forward.w2.",
+            r"transformer.layers.\1.mlp.fc2.",
+            key,
         )
 
     state_dict = OrderedDict((key_mapping_mlp(k), v) for k, v in state_dict.items())
@@ -106,12 +113,13 @@ def remap_state_dict_meta_llama(
 
 
 def remap_state_dict_hf_llama(
-    state_dict: dict[str, torch.Tensor], config: GPT2Config
+    state_dict: dict[str, torch.Tensor], config: GPT2Config, multi_query: bool = False
 ) -> dict[str, torch.Tensor]:
     """Convert the state_dict in Hugging Face format to standard GPT format.
 
     This function modifies state_dict in place.
     """
+
     # Embedding
     def key_mapping_emb(key):
         return re.sub(r"^model.embed_tokens.", "transformer.embeddings.word_embeddings.", key)
@@ -153,28 +161,38 @@ def remap_state_dict_hf_llama(
         state_dict[f"transformer.layers.{l}.mlp.fc1.weight"] = torch.cat([w3, w1], dim=0)
 
     def key_mapping_mlp(key):
-        return re.sub(r"^model.layers.(\d+).mlp.down_proj.", r"transformer.layers.\1.mlp.fc2.", key)
+        return re.sub(
+            r"^model.layers.(\d+).mlp.down_proj.",
+            r"transformer.layers.\1.mlp.fc2.",
+            key,
+        )
 
     state_dict = OrderedDict((key_mapping_mlp(k), v) for k, v in state_dict.items())
 
     # LayerNorm
     def key_mapping_ln(key):
         key = re.sub(r"^model.norm.", r"transformer.ln_f.", key)
-        key = re.sub(r"^model.layers.(\d+).input_layernorm.", r"transformer.layers.\1.norm1.", key)
         key = re.sub(
-            r"^model.layers.(\d+).post_attention_layernorm.", r"transformer.layers.\1.norm2.", key
+            r"^model.layers.(\d+).input_layernorm.",
+            r"transformer.layers.\1.norm1.",
+            key,
+        )
+        key = re.sub(
+            r"^model.layers.(\d+).post_attention_layernorm.",
+            r"transformer.layers.\1.norm2.",
+            key,
         )
         return key
 
     state_dict = OrderedDict((key_mapping_ln(k), v) for k, v in state_dict.items())
 
-    def inv_permute(w):
+    def inv_permute(w, first_dim=None):
         # Inverse of permute implemented in:
         # https://github.com/huggingface/transformers/blob/b42010bb1d3cbf262d27e0a328661885be46dfdb/src/transformers/models/llama/convert_llama_weights_to_hf.py#L114
         return (
-            w.reshape(config.n_head, 2, config.n_embd // config.n_head // 2, config.n_embd)
+            w.reshape(first_dim or config.n_head, 2, -1, config.n_embd)
             .transpose(1, 2)
-            .reshape(config.n_embd, config.n_embd)
+            .reshape(-1, config.n_embd)
         )
 
     # Attention
@@ -182,15 +200,19 @@ def remap_state_dict_hf_llama(
         Wq = state_dict.pop(f"model.layers.{l}.self_attn.q_proj.weight")
         Wk = state_dict.pop(f"model.layers.{l}.self_attn.k_proj.weight")
         Wv = state_dict.pop(f"model.layers.{l}.self_attn.v_proj.weight")
+
         state_dict[f"transformer.layers.{l}.mixer.Wqkv.weight"] = torch.cat(
-            [inv_permute(Wq), inv_permute(Wk), Wv], dim=0
+            (inv_permute(Wq), inv_permute(Wk, getattr(config, "n_head_kv")), Wv),
+            dim=0,
         )
         # We don't store these
         state_dict.pop(f"model.layers.{l}.self_attn.rotary_emb.inv_freq", None)
 
     def key_mapping_attn(key):
         return re.sub(
-            r"^model.layers.(\d+).self_attn.o_proj.", r"transformer.layers.\1.mixer.out_proj.", key
+            r"^model.layers.(\d+).self_attn.o_proj.",
+            r"transformer.layers.\1.mixer.out_proj.",
+            key,
         )
 
     state_dict = OrderedDict((key_mapping_attn(k), v) for k, v in state_dict.items())
@@ -198,7 +220,7 @@ def remap_state_dict_hf_llama(
 
 
 def inv_remap_state_dict_hf_llama(
-    state_dict: dict[str, torch.Tensor], config: GPT2Config
+    state_dict: dict[str, torch.Tensor], config: GPT2Config, multi_query: bool = False
 ) -> dict[str, torch.Tensor]:
     """Convert the state_dict in standard GPT format to Hugging Face format.
 
@@ -246,26 +268,36 @@ def inv_remap_state_dict_hf_llama(
         state_dict[f"model.layers.{l}.mlp.up_proj.weight"] = w3
 
     def key_mapping_mlp(key):
-        return re.sub(r"^transformer.layers.(\d+).mlp.fc2.", r"model.layers.\1.mlp.down_proj.", key)
+        return re.sub(
+            r"^transformer.layers.(\d+).mlp.fc2.",
+            r"model.layers.\1.mlp.down_proj.",
+            key,
+        )
 
     state_dict = OrderedDict((key_mapping_mlp(k), v) for k, v in state_dict.items())
 
     # LayerNorm
     def key_mapping_ln(key):
         key = re.sub(r"^transformer.ln_f.", r"model.norm.", key)
-        key = re.sub(r"^transformer.layers.(\d+).norm1.", r"model.layers.\1.input_layernorm.", key)
         key = re.sub(
-            r"^transformer.layers.(\d+).norm2.", r"model.layers.\1.post_attention_layernorm.", key
+            r"^transformer.layers.(\d+).norm1.",
+            r"model.layers.\1.input_layernorm.",
+            key,
+        )
+        key = re.sub(
+            r"^transformer.layers.(\d+).norm2.",
+            r"model.layers.\1.post_attention_layernorm.",
+            key,
         )
         return key
 
     state_dict = OrderedDict((key_mapping_ln(k), v) for k, v in state_dict.items())
 
-    def permute(w):
+    def permute(w, first_dim=None):
         return (
-            w.view(config.n_head, config.n_embd // config.n_head // 2, 2, config.n_embd)
+            w.view(first_dim or config.n_head, -1, 2, config.n_embd)
             .transpose(1, 2)
-            .reshape(config.n_embd, config.n_embd)
+            .reshape(-1, config.n_embd)
         )
 
     n_head = config.n_head
@@ -284,13 +316,15 @@ def inv_remap_state_dict_hf_llama(
         Wk = Wqkv[q_dim : q_dim + k_dim]
         Wv = Wqkv[q_dim + k_dim : q_dim + k_dim + v_dim]
         state_dict[f"model.layers.{l}.self_attn.q_proj.weight"] = permute(Wq)
-        state_dict[f"model.layers.{l}.self_attn.k_proj.weight"] = permute(Wk)
+        state_dict[f"model.layers.{l}.self_attn.k_proj.weight"] = permute(Wk, n_head_kv)
         state_dict[f"model.layers.{l}.self_attn.v_proj.weight"] = Wv
         state_dict.pop(f"transformer.layers.{l}.attention.inner_attention.rope.freqs", None)
 
     def key_mapping_attn(key):
         return re.sub(
-            r"^transformer.layers.(\d+).mixer.out_proj.", r"model.layers.\1.self_attn.o_proj.", key
+            r"^transformer.layers.(\d+).mixer.out_proj.",
+            r"model.layers.\1.self_attn.o_proj.",
+            key,
         )
 
     state_dict = OrderedDict((key_mapping_attn(k), v) for k, v in state_dict.items())

@@ -141,7 +141,6 @@ def test_bigcode_generation(model_name):
         input_ids=input_ids,
         max_length=max_length,
         eos_token_id=eos_token_id,
-        fused_ft_kernel=True,
         return_dict_in_generate=True,
         output_scores=True,
         enable_timing=True,
@@ -159,7 +158,6 @@ def test_bigcode_generation(model_name):
     out_cg = model.generate(
         input_ids=input_ids,
         max_length=max_length,
-        fused_ft_kernel=True,
         cg=True,
         return_dict_in_generate=True,
         output_scores=True,

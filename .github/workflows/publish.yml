@@ -80,6 +80,11 @@ jobs:
               cuda-version: '11.7.1'
             - torch-version: '2.1.0.dev20230731'
               cuda-version: '11.8.0'
+            # Pytorch >= 2.1 with nvcc 12.1.0 segfaults during compilation, so
+            # we only use CUDA 12.2. setup.py as a special case that will
+            # download the wheel for CUDA 12.2 instead.
+            - torch-version: '2.1.0.dev20230731'
+              cuda-version: '12.1.0'
 
     steps:
       - name: Checkout

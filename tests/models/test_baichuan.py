@@ -217,9 +217,8 @@ def test_baichuan_parallel_forward(model_name, world_size):
         ).abs().max().item()
 
 
-@pytest.mark.parametrize("fused_ft_kernel", [False, True])
 @pytest.mark.parametrize("model_name", ["baichuan-inc/Baichuan-7B"])
-def test_baichuan_generation(model_name, fused_ft_kernel):
+def test_baichuan_generation(model_name):
     dtype = torch.float16
     device = "cuda"
     config = baichuan_config_to_gpt2_config(
@@ -236,8 +235,8 @@ def test_baichuan_generation(model_name, fused_ft_kernel):
 
     torch.manual_seed(0)
     batch_size = 1
-    seqlen = 100
-    max_length = 150
+    seqlen = 2048
+    max_length = 2048 + 150
     input_ids = torch.randint(
         0, config.vocab_size, (batch_size, seqlen), dtype=torch.long, device=device
     )
@@ -285,7 +284,6 @@ def test_baichuan_generation(model_name, fused_ft_kernel):
         input_ids=input_ids,
         max_length=max_length,
         eos_token_id=eos_token_id,
-        fused_ft_kernel=fused_ft_kernel,
         return_dict_in_generate=True,
         output_scores=True,
         enable_timing=True,
@@ -296,16 +294,13 @@ def test_baichuan_generation(model_name, fused_ft_kernel):
 
     # Capture graph outside the timing loop
     batch_size, seqlen_og = input_ids.shape
-    model._decoding_cache = update_graph_cache(
-        model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=fused_ft_kernel
-    )
+    model._decoding_cache = update_graph_cache(model, None, batch_size, seqlen_og, max_length)
     print("With CUDA graph")
     torch.cuda.synchronize()
     start = time.time()
     out_cg = model.generate(
         input_ids=input_ids,
         max_length=max_length,
-        fused_ft_kernel=fused_ft_kernel,
         cg=True,
         return_dict_in_generate=True,
         output_scores=True,
@@ -403,9 +398,7 @@ def test_baichuan_parallel_generation(model_name, world_size):
 
     # Capture graph outside the timing loop
     batch_size, seqlen_og = input_ids.shape
-    model._decoding_cache = update_graph_cache(
-        model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=False
-    )
+    model._decoding_cache = update_graph_cache(model, None, batch_size, seqlen_og, max_length)
     print("With CUDA graph")
     out_cg = model.generate(
         input_ids=input_ids,

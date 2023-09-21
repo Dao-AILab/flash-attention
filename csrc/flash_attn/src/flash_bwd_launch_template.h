@@ -63,7 +63,8 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream, 
         BOOL_SWITCH(params.is_alibi, IsAlibiConst, [&] {
             BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
                 BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
-                    auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout, IsCausalConst, IsAlibiConst, IsEvenMNConst, IsEvenKConst>;
+                    // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
+                    auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout, IsCausalConst, IsAlibiConst, IsEvenMNConst && IsEvenKConst, IsEvenKConst>;
                     // auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout, IsCausalConst, IsEvenMNConst, true>;
                     if (smem_size_dq_dk_dv >= 48 * 1024)  {
                         C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -104,7 +105,8 @@ void run_flash_bwd_seqq_parallel(Flash_bwd_params &params, cudaStream_t stream, 
         BOOL_SWITCH(params.is_alibi, IsAlibiConst, [&] {
             BOOL_SWITCH(is_even_N, IsEvenNConst, [&] {
                 BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
-                    auto kernel = &flash_bwd_dq_dk_dv_loop_seqq_parallel_kernel<Kernel_traits, Is_dropout, IsCausalConst, IsAlibiConst, IsEvenNConst, IsEvenKConst>;
+                    // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
+                    auto kernel = &flash_bwd_dq_dk_dv_loop_seqq_parallel_kernel<Kernel_traits, Is_dropout, IsCausalConst, IsAlibiConst, IsEvenNConst && IsEvenKConst, IsEvenKConst>;
                     // auto kernel = &flash_bwd_dq_dk_dv_loop_seqq_parallel_kernel<Kernel_traits, false, false, IsEvenNConst, IsEvenKConst>;
                     if (smem_size_dq_dk_dv >= 48 * 1024)  {
                         C10_CUDA_CHECK(cudaFuncSetAttribute(
