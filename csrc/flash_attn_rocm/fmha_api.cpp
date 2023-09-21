@@ -62,8 +62,7 @@ void set_params_fprop(FlashFwdParams &params,
                       float p_dropout,
                       float softmax_scale,
                       bool is_causal,
-                      bool is_deterministic,
-                      bool is_using_qloop) {
+                      bool is_deterministic) {
 
     auto acc_type = torch::kFloat32;
     auto data_type = q.dtype();
@@ -181,7 +180,6 @@ void set_params_fprop(FlashFwdParams &params,
     params.p_dropout = p_dropout;
     params.is_causal = is_causal;
     params.is_deterministic = is_deterministic;
-    params.is_using_qloop = is_using_qloop;
 }
 
 void set_params_dgrad(FlashBwdParams &params,
@@ -208,8 +206,7 @@ void set_params_dgrad(FlashBwdParams &params,
                       float softmax_scale,
                       bool is_causal,
                       bool is_deterministic,
-                      bool is_performance_mode,
-                      bool is_using_qloop) {
+                      bool is_performance_mode) {
 
     auto acc_type = torch::kFloat32;
     auto data_type = q.dtype();
@@ -391,7 +388,7 @@ void set_params_dgrad(FlashBwdParams &params,
     params.is_causal = is_causal;
     params.is_deterministic = is_deterministic;
     params.is_performance_mode = is_performance_mode;
-    params.is_using_qloop = is_using_qloop;
+
 }
 
 std::vector<at::Tensor>
@@ -408,7 +405,6 @@ mha_fwd(const at::Tensor &q,
         const bool zero_tensors,
         const bool is_causal,
         const bool is_deterministic,
-        const bool is_using_qloop,
         const bool return_softmax, // in rocm ,this will return the random number matrix when doing dropout
         const int num_splits,      // num_splits is not used in rocm
         c10::optional<at::Generator> gen_) {
@@ -492,8 +488,7 @@ mha_fwd(const at::Tensor &q,
                      p_dropout,
                      softmax_scale,
                      is_causal,
-                     is_deterministic,
-                     is_using_qloop);
+                     is_deterministic);
 
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
@@ -537,7 +532,6 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         const bool is_causal,
         const bool is_deterministic,
         const bool is_performance_mode,
-        const bool is_using_qloop,
         const int num_splits,
         c10::optional<at::Generator> gen_
 ) {
@@ -641,8 +635,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                          softmax_scale,
                          is_causal,
                          is_deterministic,
-                         is_performance_mode,
-                         is_using_qloop);
+                         is_performance_mode);
     }
     else{
         set_params_dgrad(launch_params.params,
@@ -661,8 +654,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                          softmax_scale,
                          is_causal,
                          is_deterministic,
-                         is_performance_mode,
-                         is_using_qloop);
+                         is_performance_mode);
     }
         
     if( is_dropout ) {
@@ -760,7 +752,6 @@ bool fwd_test(bool do_verification){
     bool zero_tensors = true;
     bool is_causal = false;
     bool is_deterministic = true;
-    bool is_using_qloop = true;
     bool return_softmax = true;
     int num_splits = 0;
 
@@ -780,7 +771,6 @@ bool fwd_test(bool do_verification){
             zero_tensors,
             is_causal,
             is_deterministic,
-            is_using_qloop,
             return_softmax,
             num_splits,
             gen_);
@@ -1122,8 +1112,7 @@ bool bwd_test(bool do_verification){
     bool zero_tensors = true;    
     bool is_causal = false;     
     bool is_deterministic = true;
-    bool is_performance_mode = true;  
-    bool is_using_qloop = true;
+    bool is_performance_mode = true; 
     bool return_softmax = false;  
     int num_splits = 0;    
     c10::optional<at::Generator> gen_ = c10::nullopt;
@@ -1140,7 +1129,6 @@ bool bwd_test(bool do_verification){
                   zero_tensors,
                   is_causal,
                   is_deterministic,
-                  is_using_qloop,
                   return_softmax,
                   num_splits,
                   gen_)[0];
@@ -1163,7 +1151,6 @@ bool bwd_test(bool do_verification){
             is_causal,
             is_deterministic,
             is_performance_mode,
-            is_using_qloop,
             num_splits,
             gen_);
     using F16 = ck::half_t;

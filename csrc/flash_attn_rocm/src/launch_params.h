@@ -93,7 +93,7 @@ struct FlashFwdParams : public QkvParams {
   // The dropout probability (probability of keeping an activation).
   float p_dropout;
   uint32_t p_dropout_in_uint;
-  uint16_t p_dropout_in_uint16_t;
+  // uint16_t p_dropout_in_uint16_t;
 
   // Scale factor of 1 / (1 - p_dropout).
   float rp_dropout;
@@ -116,7 +116,6 @@ struct FlashFwdParams : public QkvParams {
   bool is_causal;
   bool is_performance_mode;
   bool is_deterministic;
-  bool is_using_qloop;
   bool is_mnko_padding;
 };
 
@@ -152,7 +151,7 @@ struct FlashBwdParams : public FlashFwdParams {
   // The dropout probability (probability of keeping an activation).
   float p_dropout;
   uint32_t p_dropout_in_uint;
-  uint16_t p_dropout_in_uint16_t;
+  // uint16_t p_dropout_in_uint16_t;
 
   // Scale factor of 1 / (1 - p_dropout).
   float rp_dropout;

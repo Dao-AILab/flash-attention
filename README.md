@@ -211,11 +211,6 @@ export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=1
 export FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE=1
 ```
 
-By default we are using qloop. If you want to use kloop, please turn on the kloop flag by setting the environment variable:
-```sh
-export FLASH_ATTENTION_INTERNAL_USE_KLOOP=1
-```
-
 Run the unit tests:
 ```sh
 pytest tests/test_flash_attn.py
