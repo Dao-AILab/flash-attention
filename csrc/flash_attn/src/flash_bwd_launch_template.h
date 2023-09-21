@@ -123,14 +123,12 @@ void run_flash_bwd_seqq_parallel(Flash_bwd_params &params, cudaStream_t stream, 
     kernel_dkv<<<grid_n, Kernel_traits::kNThreads, Kernel_traits::kSmemKVSize, stream>>>(params);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-//
 
 template<typename Kernel_traits, bool Is_dropout>
 void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {
     if (configure) return;
     run_flash_bwd_seqk_parallel<Kernel_traits, Is_dropout>(params, stream, configure);
 }
-//
 
 template<typename T>
 void run_mha_bwd_hdim32(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {

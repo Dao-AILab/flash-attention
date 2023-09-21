@@ -20,10 +20,10 @@ __global__ void flash_fwd_splitkv_kernel(Flash_fwd_params params) {
     flash::compute_attn_splitkv<Kernel_traits, Is_causal, Is_even_MN, Is_even_K, Split, Append_KV>(params);
 }
 
-template<typename Kernel_traits, int Log_max_splits, bool Is_even_K>
+template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K>
 __global__ void flash_fwd_splitkv_combine_kernel(Flash_fwd_params params) {
     static_assert(Log_max_splits >= 1);
-    flash::combine_attn_seqk_parallel<Kernel_traits, Log_max_splits, Is_even_K>(params);
+    flash::combine_attn_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
@@ -93,22 +93,26 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         });
     });
     if (params.num_splits > 1) {
-        dim3 grid_combine((params.b * params.h * params.seqlen_q + 16 - 1) / 16);
+        // We want kBlockM to be as small as possible for more parallelism.
+        // With 128 threads we can load 512 elements at a time, so if headdim is divisible by 128, kBlockM = 4.
+        // If headdim is divisible by 64, then we set kBlockM = 8, etc.
+        constexpr int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
+        dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
         BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
             if (params.num_splits <= 2) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, 1, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 4) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, 2, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 2, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 8) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, 3, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 3, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 16) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, 4, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 4, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 32) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, 5, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 5, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 64) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, 6, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 6, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 128) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, 7, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             }
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         });

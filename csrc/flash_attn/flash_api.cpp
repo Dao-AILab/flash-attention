@@ -282,11 +282,14 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
 
     if (seqlen_q == 1) { is_causal = false; }  // causal=true is the same as causal=false in this case
 
-    // Faster to transpose q from (b, 1, h, d) to (b, h, 1, d) in this case
-    const int seqlenq_nheads_swapped = seqlen_q == 1 && num_heads_k == 1 && num_heads > 1 and p_dropout == 0.f and head_size_og % 8 == 0;
-    if (seqlenq_nheads_swapped) {
-        q = q.transpose(1, 2);
-        std::swap(seqlen_q, num_heads);
+    // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
+    // H/t Daniel Haziza
+    const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && p_dropout == 0.f && head_size_og % 8 == 0;
+    if (seqlenq_ngroups_swapped) {
+        const int ngroups = num_heads / num_heads_k;
+        q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
+        seqlen_q = ngroups;
+        num_heads = num_heads_k;
     }
 
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
@@ -353,9 +356,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      is_causal);
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
-    const int block_n = is_sm90 || is_sm8x
-        ? (head_size <= 64 ? 256 : (head_size <= 160 ? 128 : 64))
-        : (head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64));
+    const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
     const int num_n_blocks = (seqlen_k + block_n - 1) / block_n;
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
@@ -369,6 +370,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
             params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
             params.oaccum_ptr = out_accum.data_ptr();
         }
+        TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
     }
 
     // number of times random will be generated per thread, to offset philox counter in thc random
@@ -397,11 +399,11 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         if (out_.has_value()) { out_.value().copy_(out); }
     }
 
-    if (seqlenq_nheads_swapped) {
-        out = out.transpose(1, 2);
-        out_padded = out_padded.transpose(1, 2);
-        q_padded = q_padded.transpose(1, 2);
-        softmax_lse = softmax_lse.transpose(1, 2);
+    if (seqlenq_ngroups_swapped) {
+        out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
+        out_padded = out_padded.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
+        q_padded = q_padded.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
+        softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
     return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
 }
@@ -1050,11 +1052,14 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     if (seqlen_q == 1) { is_causal = false; }  // causal=true is the same as causal=false in this case
 
-    // Faster to transpose q from (b, 1, h, d) to (b, h, 1, d) in this case
-    const int seqlenq_nheads_swapped = seqlen_q == 1 && num_heads_k == 1 && num_heads > 1;
-    if (seqlenq_nheads_swapped) {
-        q = q.transpose(1, 2);
-        std::swap(seqlen_q, num_heads);
+    // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
+    // H/t Daniel Haziza
+    const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && head_size_og % 8 == 0;
+    if (seqlenq_ngroups_swapped) {
+        const int ngroups = num_heads / num_heads_k;
+        q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
+        seqlen_q = ngroups;
+        num_heads = num_heads_k;
     }
 
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
@@ -1184,12 +1189,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         params.rotary_dim = 0;
     }
 
-
     // This needs to match with run_mha_fwd_splitkv_dispatch
-    const int block_n = is_sm90 || is_sm8x
-        ? (head_size <= 64 ? 256 : (head_size <= 160 ? 128 : 64))
-        : (head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64));
-    const int num_n_blocks = (seqlen_k + (params.knew_ptr == nullptr ? 0 : seqlen_q) + block_n - 1) / block_n;
+    const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+    const int num_n_blocks = (seqlen_k + block_n - 1) / block_n;
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
     const int num_m_blocks = (seqlen_q + 64 - 1) / 64;
@@ -1197,6 +1199,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (num_splits < 1) {
         params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, dprops->multiProcessorCount, num_n_blocks, 128);
     }
+    TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
     if (params.num_splits > 1) {
         at::Tensor softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
         at::Tensor out_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
@@ -1219,9 +1222,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         }
     }
 
-    if (seqlenq_nheads_swapped) {
-        out = out.transpose(1, 2);
-        softmax_lse = softmax_lse.transpose(1, 2);
+    if (seqlenq_ngroups_swapped) {
+        out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
+        softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
     return {out, softmax_lse};
 }
