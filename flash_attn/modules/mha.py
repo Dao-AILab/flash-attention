@@ -725,7 +725,7 @@ class ParallelMHA(nn.Module):
             process_group,
             bias=qkv_proj_bias,
             sequence_parallel=sequence_parallel,
-            multiple_of=self.head_dim * (self.num_heads_per_rank + 2 * self.num_heads_kv_per_rank),
+            multiple_of=self.head_dim * (self.num_heads // self.num_heads_kv + 2),
             **factory_kwargs,
         )
         inner_attn_cls = FlashSelfAttention if use_flash_attn else SelfAttention

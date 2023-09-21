@@ -13,6 +13,8 @@ import torch.nn.functional as F
 from sentencepiece import SentencePieceProcessor
 from transformers import GPT2Config, LlamaConfig
 
+from einops import rearrange
+
 
 def remap_state_dict_meta_llama(
     state_dict: dict[str, torch.Tensor], config: GPT2Config
@@ -30,9 +32,7 @@ def remap_state_dict_meta_llama(
     # Word embedding
     def key_mapping_emb(key):
         return re.sub(
-            r"^transformer.tok_embeddings.",
-            "transformer.embeddings.word_embeddings.",
-            key,
+            r"^transformer.tok_embeddings.", "transformer.embeddings.word_embeddings.", key
         )
 
     state_dict = OrderedDict((key_mapping_emb(k), v) for k, v in state_dict.items())
@@ -113,7 +113,7 @@ def remap_state_dict_meta_llama(
 
 
 def remap_state_dict_hf_llama(
-    state_dict: dict[str, torch.Tensor], config: GPT2Config, multi_query: bool = False
+    state_dict: dict[str, torch.Tensor], config: GPT2Config
 ) -> dict[str, torch.Tensor]:
     """Convert the state_dict in Hugging Face format to standard GPT format.
 
@@ -186,13 +186,11 @@ def remap_state_dict_hf_llama(
 
     state_dict = OrderedDict((key_mapping_ln(k), v) for k, v in state_dict.items())
 
-    def inv_permute(w, first_dim=None):
+    def inv_permute(w):
         # Inverse of permute implemented in:
         # https://github.com/huggingface/transformers/blob/b42010bb1d3cbf262d27e0a328661885be46dfdb/src/transformers/models/llama/convert_llama_weights_to_hf.py#L114
-        return (
-            w.reshape(first_dim or config.n_head, 2, -1, config.n_embd)
-            .transpose(1, 2)
-            .reshape(-1, config.n_embd)
+        return rearrange(
+            w, "(h two d) n -> (h d two) n", d=config.n_embd // config.n_head // 2, two=2
         )
 
     # Attention
@@ -202,8 +200,7 @@ def remap_state_dict_hf_llama(
         Wv = state_dict.pop(f"model.layers.{l}.self_attn.v_proj.weight")
 
         state_dict[f"transformer.layers.{l}.mixer.Wqkv.weight"] = torch.cat(
-            (inv_permute(Wq), inv_permute(Wk, getattr(config, "n_head_kv")), Wv),
-            dim=0,
+            [inv_permute(Wq), inv_permute(Wk), Wv], dim=0
         )
         # We don't store these
         state_dict.pop(f"model.layers.{l}.self_attn.rotary_emb.inv_freq", None)
@@ -220,7 +217,7 @@ def remap_state_dict_hf_llama(
 
 
 def inv_remap_state_dict_hf_llama(
-    state_dict: dict[str, torch.Tensor], config: GPT2Config, multi_query: bool = False
+    state_dict: dict[str, torch.Tensor], config: GPT2Config
 ) -> dict[str, torch.Tensor]:
     """Convert the state_dict in standard GPT format to Hugging Face format.
 
@@ -293,11 +290,9 @@ def inv_remap_state_dict_hf_llama(
 
     state_dict = OrderedDict((key_mapping_ln(k), v) for k, v in state_dict.items())
 
-    def permute(w, first_dim=None):
-        return (
-            w.view(first_dim or config.n_head, -1, 2, config.n_embd)
-            .transpose(1, 2)
-            .reshape(-1, config.n_embd)
+    def permute(w):
+        return rearrange(
+            w, "(h d two) n -> (h two d) n", d=config.n_embd // config.n_head // 2, two=2
         )
 
     n_head = config.n_head
@@ -316,7 +311,7 @@ def inv_remap_state_dict_hf_llama(
         Wk = Wqkv[q_dim : q_dim + k_dim]
         Wv = Wqkv[q_dim + k_dim : q_dim + k_dim + v_dim]
         state_dict[f"model.layers.{l}.self_attn.q_proj.weight"] = permute(Wq)
-        state_dict[f"model.layers.{l}.self_attn.k_proj.weight"] = permute(Wk, n_head_kv)
+        state_dict[f"model.layers.{l}.self_attn.k_proj.weight"] = permute(Wk)
         state_dict[f"model.layers.{l}.self_attn.v_proj.weight"] = Wv
         state_dict.pop(f"transformer.layers.{l}.attention.inner_attention.rope.freqs", None)
 

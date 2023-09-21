@@ -160,6 +160,7 @@ def test_tensor_parallel(model_name, rotary, world_size):
     assert torch.allclose(
         torch.stack(out.scores, dim=1), torch.stack(scores, dim=1), rtol=rtol, atol=atol
     )
+    assert torch.equal(torch.stack(out.scores, dim=1), torch.stack(out_cg.scores, dim=1))
     if not rotary:
         assert torch.all(out.sequences == out_ref.sequences)
         assert torch.all(out.sequences == out_hf.sequences)
