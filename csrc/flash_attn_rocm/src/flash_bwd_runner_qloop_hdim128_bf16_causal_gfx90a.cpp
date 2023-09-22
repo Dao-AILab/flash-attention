@@ -26,10 +26,23 @@
 namespace bwd_device_gemm {
 // hdim 128, bf16, non-causal
 template <>
-void FlashBwdRunner::Run<true, 128, device_gemm_trait::BFloat16, true>() {
+void FlashBwdRunner::Run<128, device_gemm_trait::BFloat16, true, true>() {
   BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
     this->template run_<DeviceGemmQLoopHeadDim128,
                   device_gemm_trait::BFloat16, 
+                  device_gemm_trait::kGemmSpecPadding,
+                  device_gemm_trait::kMaskingSpecCausal,
+                  kIsDeterministic>();
+  });
+} // FlashBwdRunner::Run()
+
+// hdim 128, bf16, non-causal
+template <>
+void FlashBwdRunner::Run<128, device_gemm_trait::BFloat16, true, false>() {
+  BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
+    this->template run_<DeviceGemmQLoopHeadDim128,
+                  device_gemm_trait::BFloat16, 
+                  device_gemm_trait::kGemmSpecDefault,
                   device_gemm_trait::kMaskingSpecCausal,
                   kIsDeterministic>();
   });

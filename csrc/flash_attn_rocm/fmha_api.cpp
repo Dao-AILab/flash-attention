@@ -20,11 +20,9 @@ void run_flash_fwd(LaunchParams<FlashFwdParams> &launch_params) {
   HEADDIM_SWITCH(launch_params.params.d, [&] {
     BF16_SWITCH(launch_params.params.is_bf16, [&] {
       BOOL_SWITCH(launch_params.params.is_causal, kIsCausal, [&] {
-        BOOL_SWITCH(launch_params.params.is_using_qloop, kIsQLoop, [&] {
-          BOOL_SWITCH(launch_params.params.is_mnko_padding, kIsPadding, [&] {
-              auto flash_fwd_runner_ptr = std::make_unique<fwd_device_gemm::FlashFwdRunner>(launch_params);
-              flash_fwd_runner_ptr->Run<kIsQLoop, kHeadDim, T, kIsCausal, kIsPadding>(launch_params.is_dropout_);
-          });
+        BOOL_SWITCH(launch_params.params.is_mnko_padding, kIsPadding, [&] {
+            auto flash_fwd_runner_ptr = std::make_unique<fwd_device_gemm::FlashFwdRunner>(launch_params);
+            flash_fwd_runner_ptr->Run<kHeadDim, T, kIsCausal, kIsPadding>(launch_params.is_dropout_);
         });
       });
     });
@@ -35,9 +33,9 @@ void run_flash_bwd(LaunchParams<FlashBwdParams> &launch_params) {
   HEADDIM_SWITCH(launch_params.params.d, [&] {
     BF16_SWITCH(launch_params.params.is_bf16, [&] {
       BOOL_SWITCH(launch_params.params.is_causal, kIsCausal, [&] {
-        BOOL_SWITCH(launch_params.params.is_using_qloop, kIsQLoop, [&] {
-          auto flash_bwd_runner_ptr = std::make_unique<bwd_device_gemm::FlashBwdRunner>(launch_params);
-          flash_bwd_runner_ptr->Run<kIsQLoop, kHeadDim, T, kIsCausal>();
+        BOOL_SWITCH(launch_params.params.is_mnko_padding, kIsPadding, [&] {
+            auto flash_bwd_runner_ptr = std::make_unique<bwd_device_gemm::FlashBwdRunner>(launch_params);
+            flash_bwd_runner_ptr->Run<kHeadDim, T, kIsCausal, kIsPadding>();
         });
       });
     });
@@ -64,8 +62,7 @@ void set_params_fprop(FlashFwdParams &params,
                       float p_dropout,
                       float softmax_scale,
                       bool is_causal,
-                      bool is_deterministic,
-                      bool is_using_qloop) {
+                      bool is_deterministic) {
 
     auto acc_type = torch::kFloat32;
     auto data_type = q.dtype();
@@ -183,7 +180,6 @@ void set_params_fprop(FlashFwdParams &params,
     params.p_dropout = p_dropout;
     params.is_causal = is_causal;
     params.is_deterministic = is_deterministic;
-    params.is_using_qloop = is_using_qloop;
 }
 
 void set_params_dgrad(FlashBwdParams &params,
@@ -210,8 +206,7 @@ void set_params_dgrad(FlashBwdParams &params,
                       float softmax_scale,
                       bool is_causal,
                       bool is_deterministic,
-                      bool is_performance_mode,
-                      bool is_using_qloop) {
+                      bool is_performance_mode) {
 
     auto acc_type = torch::kFloat32;
     auto data_type = q.dtype();
@@ -271,7 +266,24 @@ void set_params_dgrad(FlashBwdParams &params,
         params.q_stride_multiplier = 1;
         params.kv_stride_multiplier = 1;
     }
-    
+
+    params.is_mnko_padding = false;    // MNKOpadding
+
+    if(!params.is_mnko_padding && d <= 32){
+        params.is_mnko_padding = ((d % 32)==0 ? false : true);
+    }
+    else if(!params.is_mnko_padding && d <= 64){
+        params.is_mnko_padding = ((d % 64)==0 ? false : true);
+    }
+    else if(!params.is_mnko_padding && d <= 128){
+        params.is_mnko_padding = ((d % 128)==0 ? false : true);
+    }
+    else{
+        std::cout << "Unsupported head dimension" << std::endl;
+    }
+
+    auto opts = q.options();
+
     for (int i = 0; i < b; i++){
         int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
         int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, data_type);
@@ -279,6 +291,22 @@ void set_params_dgrad(FlashBwdParams &params,
         int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
         int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, data_type);
         int temp_dk_stride = get_size_in_bytes(d * h * temp_seqlen_k, dk.dtype());
+
+        if(!params.is_mnko_padding && d <= 32){
+            params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+        }
+        else if(!params.is_mnko_padding && d <= 64){
+            params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+        }
+        else if(!params.is_mnko_padding && d <= 128){
+            params.is_mnko_padding = ((temp_seqlen_q % 64)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+        }
+
+        at::Tensor d_tensor;
+        d_tensor = at::empty({1, static_cast<long>(h), temp_seqlen_q}, opts.dtype(at::kFloat));
+        params.d_tensors.push_back(d_tensor);
+        params.d_ptr.push_back(reinterpret_cast<void*>(d_tensor.data_ptr()));
+
         if(is_performance_mode){
             params.q_ptr.push_back(reinterpret_cast<void*>(q_ptr));
             q_ptr = q_ptr + temp_q_stride * params.q_stride_multiplier;
@@ -360,7 +388,7 @@ void set_params_dgrad(FlashBwdParams &params,
     params.is_causal = is_causal;
     params.is_deterministic = is_deterministic;
     params.is_performance_mode = is_performance_mode;
-    params.is_using_qloop = is_using_qloop;
+
 }
 
 std::vector<at::Tensor>
@@ -377,7 +405,6 @@ mha_fwd(const at::Tensor &q,
         const bool zero_tensors,
         const bool is_causal,
         const bool is_deterministic,
-        const bool is_using_qloop,
         const bool return_softmax, // in rocm ,this will return the random number matrix when doing dropout
         const int num_splits,      // num_splits is not used in rocm
         c10::optional<at::Generator> gen_) {
@@ -461,8 +488,7 @@ mha_fwd(const at::Tensor &q,
                      p_dropout,
                      softmax_scale,
                      is_causal,
-                     is_deterministic,
-                     is_using_qloop);
+                     is_deterministic);
 
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
@@ -506,7 +532,6 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         const bool is_causal,
         const bool is_deterministic,
         const bool is_performance_mode,
-        const bool is_using_qloop,
         const int num_splits,
         c10::optional<at::Generator> gen_
 ) {
@@ -610,8 +635,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                          softmax_scale,
                          is_causal,
                          is_deterministic,
-                         is_performance_mode,
-                         is_using_qloop);
+                         is_performance_mode);
     }
     else{
         set_params_dgrad(launch_params.params,
@@ -630,8 +654,7 @@ mha_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                          softmax_scale,
                          is_causal,
                          is_deterministic,
-                         is_performance_mode,
-                         is_using_qloop);
+                         is_performance_mode);
     }
         
     if( is_dropout ) {
@@ -729,7 +752,6 @@ bool fwd_test(bool do_verification){
     bool zero_tensors = true;
     bool is_causal = false;
     bool is_deterministic = true;
-    bool is_using_qloop = true;
     bool return_softmax = true;
     int num_splits = 0;
 
@@ -749,7 +771,6 @@ bool fwd_test(bool do_verification){
             zero_tensors,
             is_causal,
             is_deterministic,
-            is_using_qloop,
             return_softmax,
             num_splits,
             gen_);
@@ -1091,8 +1112,7 @@ bool bwd_test(bool do_verification){
     bool zero_tensors = true;    
     bool is_causal = false;     
     bool is_deterministic = true;
-    bool is_performance_mode = true;  
-    bool is_using_qloop = true;
+    bool is_performance_mode = true; 
     bool return_softmax = false;  
     int num_splits = 0;    
     c10::optional<at::Generator> gen_ = c10::nullopt;
@@ -1109,7 +1129,6 @@ bool bwd_test(bool do_verification){
                   zero_tensors,
                   is_causal,
                   is_deterministic,
-                  is_using_qloop,
                   return_softmax,
                   num_splits,
                   gen_)[0];
@@ -1132,7 +1151,6 @@ bool bwd_test(bool do_verification){
             is_causal,
             is_deterministic,
             is_performance_mode,
-            is_using_qloop,
             num_splits,
             gen_);
     using F16 = ck::half_t;

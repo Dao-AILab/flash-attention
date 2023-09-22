@@ -377,7 +377,7 @@ def get_dropout_mask(S_dmask, dropout_p, cu_seqlens_q, cu_seqlens_k, batch_size,
                 #    #for m in range(current_seqlen_k):
                 #    #    index_for_S_dmask = j * current_seqlen_q * current_seqlen_k + k* current_seqlen_k + m
                 #    #    S_dmask_converted[i][j][k][m] = S_dmask_each[index_for_S_dmask]
-        dropout_mask_t = S_dmask_converted <= ((1 - dropout_p) * 65535)
+        dropout_mask_t = S_dmask_converted <= ((1 - dropout_p) * 255)
         dropout_mask = dropout_mask_t.contiguous()
     return dropout_mask
 
@@ -547,7 +547,7 @@ def test_flash_attn_unpadded_kvpacked(seqlen, d, dropout_p, causal, dtype):
     if dropout_p == 0.0:
         assert dropout_mask.all()
     else:
-        assert 0.99 <= dropout_fraction / dropout_p <= 1.01
+        assert 0.98 <= dropout_fraction / dropout_p <= 1.02
 
     if is_sm80 or d <= 64:  # Only run backward for d=128 on A100
         assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
@@ -637,7 +637,7 @@ def test_flash_attn_unpadded(seqlen, d, dropout_p, causal, dtype):
     if dropout_p == 0.0:
         assert dropout_mask.all()
     else:
-        assert 0.99 <= dropout_fraction / dropout_p <= 1.01
+        assert 0.98 <= dropout_fraction / dropout_p <= 1.02
 
     if is_sm80 or d <= 64:  # Only run backward for d=128 on A100
         assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()

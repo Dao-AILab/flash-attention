@@ -71,6 +71,7 @@ using DeviceGemmQLoopHeadDim32 = device_op::DeviceGroupedMultiheadAttentionForwa
         1,            // MXdlPerWave
         4,       // NXdlPerWave
         1,  // Gemm1NXdlPerWave
+        1,
         device_gemm_trait::S<4, 64, 1>,    // ABlockTransfer
         device_gemm_trait::S<1, 0, 2>,
         device_gemm_trait::S<1, 0, 2>,
@@ -85,6 +86,7 @@ using DeviceGemmQLoopHeadDim32 = device_op::DeviceGroupedMultiheadAttentionForwa
         8,
         8,
         true,  // B0BlockLdsExtraN
+        1,
         device_gemm_trait::S<16, 16, 1>,   // B1BlockTransfer
         device_gemm_trait::S<0, 2, 1>,
         device_gemm_trait::S<0, 2, 1>,
@@ -96,6 +98,7 @@ using DeviceGemmQLoopHeadDim32 = device_op::DeviceGroupedMultiheadAttentionForwa
         1,        // CShuffleNXdlPerWavePerShuffle
         device_gemm_trait::S<1, 64, 1, 4>,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,                                    // CShuffleBlockTransferScalarPerVector_NPerBlock
+        1,
         DeviceGemmTraits::kMaskingSpec,                      // MaskingSpecialization
         DeviceGemmTraits::kIsDeterministic>;
 // type alias for DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle with head_dim = 64
@@ -142,6 +145,7 @@ using DeviceGemmQLoopHeadDim64 = device_op::DeviceGroupedMultiheadAttentionForwa
         1,                 // MXdlPerWave
         4,       // NXdlPerWave
         2,  // Gemm1NXdlPerWave
+        1,
         device_gemm_trait::S<4, 64, 1>,    // ABlockTransfer
         device_gemm_trait::S<1, 0, 2>,
         device_gemm_trait::S<1, 0, 2>,
@@ -156,6 +160,7 @@ using DeviceGemmQLoopHeadDim64 = device_op::DeviceGroupedMultiheadAttentionForwa
         8,
         8,
         true,  // B0BlockLdsExtraN
+        1,
         device_gemm_trait::S<16, 16, 1>,   // B1BlockTransfer
         device_gemm_trait::S<0, 2, 1>,
         device_gemm_trait::S<0, 2, 1>,
@@ -167,6 +172,7 @@ using DeviceGemmQLoopHeadDim64 = device_op::DeviceGroupedMultiheadAttentionForwa
         2,        // CShuffleNXdlPerWavePerShuffle
         device_gemm_trait::S<1, 32, 1, 8>,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,                                    // CShuffleBlockTransferScalarPerVector_NPerBlock
+        1,
         DeviceGemmTraits::kMaskingSpec,                      // MaskingSpecialization
         DeviceGemmTraits::kIsDeterministic>;
 // type alias for DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle with head_dim = 64
@@ -213,6 +219,7 @@ using DeviceGemmQLoopHeadDim64NonDrop = device_op::DeviceGroupedMultiheadAttenti
         1,                 // MXdlPerWave
         8,       // NXdlPerWave
         2,  // Gemm1NXdlPerWave
+        1,
         device_gemm_trait::S<4, 64, 1>,    // ABlockTransfer
         device_gemm_trait::S<1, 0, 2>,
         device_gemm_trait::S<1, 0, 2>,
@@ -227,6 +234,7 @@ using DeviceGemmQLoopHeadDim64NonDrop = device_op::DeviceGroupedMultiheadAttenti
         8,
         8,
         true,  // B0BlockLdsExtraN
+        1,
         device_gemm_trait::S<16, 16, 1>,   // B1BlockTransfer
         device_gemm_trait::S<0, 2, 1>,
         device_gemm_trait::S<0, 2, 1>,
@@ -238,6 +246,7 @@ using DeviceGemmQLoopHeadDim64NonDrop = device_op::DeviceGroupedMultiheadAttenti
         2,        // CShuffleNXdlPerWavePerShuffle
         device_gemm_trait::S<1, 32, 1, 8>,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,                                    // CShuffleBlockTransferScalarPerVector_NPerBlock
+        1,
         DeviceGemmTraits::kMaskingSpec,                      // MaskingSpecialization
         DeviceGemmTraits::kIsDeterministic>;
 
@@ -285,6 +294,7 @@ using DeviceGemmQLoopHeadDim128 = device_op::DeviceGroupedMultiheadAttentionForw
         1,                 // MXdlPerWave
         4,       // NXdlPerWave
         4,  // Gemm1NXdlPerWave
+        1,
         device_gemm_trait::S<4, 64, 1>,    // ABlockTransfer
         device_gemm_trait::S<1, 0, 2>,
         device_gemm_trait::S<1, 0, 2>,
@@ -299,6 +309,7 @@ using DeviceGemmQLoopHeadDim128 = device_op::DeviceGroupedMultiheadAttentionForw
         8,
         8,
         true,  // B0BlockLdsExtraN
+        1,
         device_gemm_trait::S<8, 32, 1>,   // B1BlockTransfer
         device_gemm_trait::S<0, 2, 1>,
         device_gemm_trait::S<0, 2, 1>,
@@ -310,220 +321,10 @@ using DeviceGemmQLoopHeadDim128 = device_op::DeviceGroupedMultiheadAttentionForw
         2,        // CShuffleNXdlPerWavePerShuffle
         device_gemm_trait::S<1, 32, 1, 8>,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,                                    // CShuffleBlockTransferScalarPerVector_NPerBlock
+        1,
         DeviceGemmTraits::kMaskingSpec,                      // MaskingSpecialization
         DeviceGemmTraits::kIsDeterministic>;                       // MaskingSpecialization
 
 // type alias for DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle with head_dim = 32
-template <typename DeviceGemmTraits>
-using DeviceGemmKLoopHeadDim32 = device_op::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle_V1<
-        DeviceGemmTraits::kNumDimG,
-        DeviceGemmTraits::kNumDimM, 
-        DeviceGemmTraits::kNumDimN, 
-        DeviceGemmTraits::kNumDimK, 
-        DeviceGemmTraits::kNumDimO, 
-        typename DeviceGemmTraits::ADataType,
-        typename DeviceGemmTraits::B0DataType,
-        typename DeviceGemmTraits::B1DataType,
-        typename DeviceGemmTraits::CDataType,
-        typename DeviceGemmTraits::GemmDataType,
-        typename DeviceGemmTraits::ZDataType,
-        typename DeviceGemmTraits::LSEDataType,
-        typename DeviceGemmTraits::Acc0BiasDataType,
-        typename DeviceGemmTraits::Acc1BiasDataType,
-        typename DeviceGemmTraits::AccDataType,
-        typename DeviceGemmTraits::CShuffleDataType,
-        typename DeviceGemmTraits::AElementOp,
-        typename DeviceGemmTraits::B0ElementOp,
-        typename DeviceGemmTraits::Acc0ElementOp,
-        typename DeviceGemmTraits::B1ElementOp,
-        typename DeviceGemmTraits::CElementOp,
-        DeviceGemmTraits::kGemmSpec,
-        DeviceGemmTraits::kTensorSpecA,
-        DeviceGemmTraits::kTensorSpecB0,
-        DeviceGemmTraits::kTensorSpecB1,
-        DeviceGemmTraits::kTensorSpecC,
-        1,
-        256,
-        128,   // MPerBlock
-        128,   // NPerBlock
-        32,    // KPerBlock
-        32,    // Gemm1NPerBlock
-        32,    // Gemm1KPerBlock
-        8,     // AK1
-        8,     // BK1
-        2,     // B1K1
-        32,           // MPerXDL
-        32,           // NPerXDL
-        1,            // MXdlPerWave
-        4,       // NXdlPerWave
-        1,  // Gemm1NXdlPerWave
-        device_gemm_trait::S<4, 64, 1>,    // ABlockTransfer
-        device_gemm_trait::S<1, 0, 2>,
-        device_gemm_trait::S<1, 0, 2>,
-        2,
-        8,
-        8,
-        true,   // ABlockLdsExtraM
-        device_gemm_trait::S<4, 64, 1>,    // BBlockTransfer
-        device_gemm_trait::S<1, 0, 2>,
-        device_gemm_trait::S<1, 0, 2>,
-        2,
-        8,
-        8,
-        true,  // B0BlockLdsExtraN
-        device_gemm_trait::S<16, 16, 1>,   // B1BlockTransfer
-        device_gemm_trait::S<0, 2, 1>,
-        device_gemm_trait::S<0, 2, 1>,
-        1,
-        2,    //B1BlockTransferSrcScalarPerVector
-        2,
-        false,
-        1,        // CShuffleMXdlPerWavePerShuffle
-        1,        // CShuffleNXdlPerWavePerShuffle
-        device_gemm_trait::S<1, 64, 1, 4>,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-        8,                                    // CShuffleBlockTransferScalarPerVector_NPerBlock
-        DeviceGemmTraits::kMaskingSpec,                      // MaskingSpecialization
-        DeviceGemmTraits::kIsDeterministic>;
-// type alias for DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle with head_dim = 64
-template <typename DeviceGemmTraits>
-using DeviceGemmKLoopHeadDim64 = device_op::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle_V1<
-        DeviceGemmTraits::kNumDimG, 
-        DeviceGemmTraits::kNumDimM, 
-        DeviceGemmTraits::kNumDimN, 
-        DeviceGemmTraits::kNumDimK, 
-        DeviceGemmTraits::kNumDimO, 
-        typename DeviceGemmTraits::ADataType,
-        typename DeviceGemmTraits::B0DataType,
-        typename DeviceGemmTraits::B1DataType,
-        typename DeviceGemmTraits::CDataType,
-        typename DeviceGemmTraits::GemmDataType,
-        typename DeviceGemmTraits::ZDataType,
-        typename DeviceGemmTraits::LSEDataType,
-        typename DeviceGemmTraits::Acc0BiasDataType,
-        typename DeviceGemmTraits::Acc1BiasDataType,
-        typename DeviceGemmTraits::AccDataType,
-        typename DeviceGemmTraits::CShuffleDataType,
-        typename DeviceGemmTraits::AElementOp,
-        typename DeviceGemmTraits::B0ElementOp,
-        typename DeviceGemmTraits::Acc0ElementOp,
-        typename DeviceGemmTraits::B1ElementOp,
-        typename DeviceGemmTraits::CElementOp,
-        DeviceGemmTraits::kGemmSpec,
-        DeviceGemmTraits::kTensorSpecA,
-        DeviceGemmTraits::kTensorSpecB0,
-        DeviceGemmTraits::kTensorSpecB1,
-        DeviceGemmTraits::kTensorSpecC,
-        1,
-        256,
-        128,         // MPerBlock
-        128,         // NPerBlock
-        32,         // KPerBlock
-        64,    // Gemm1NPerBlock
-        32,    // Gemm1KPerBlock
-        8,                 // AK1
-        8,                 // BK1
-        2,                 // B1K1
-        32,           // MPerXDL
-        32,           // NPerXDL
-        1,                 // MXdlPerWave
-        4,       // NXdlPerWave
-        2,  // Gemm1NXdlPerWave
-        device_gemm_trait::S<4, 64, 1>,    // ABlockTransfer
-        device_gemm_trait::S<1, 0, 2>,
-        device_gemm_trait::S<1, 0, 2>,
-        2,
-        8,
-        8,
-        true,   // ABlockLdsExtraM
-        device_gemm_trait::S<4, 64, 1>,    // BBlockTransfer
-        device_gemm_trait::S<1, 0, 2>,
-        device_gemm_trait::S<1, 0, 2>,
-        2,
-        8,
-        8,
-        true,  // B0BlockLdsExtraN
-        device_gemm_trait::S<16, 16, 1>,   // B1BlockTransfer
-        device_gemm_trait::S<0, 2, 1>,
-        device_gemm_trait::S<0, 2, 1>,
-        1,
-        4,    //B1BlockTransferSrcScalarPerVector
-        2,
-        false,
-        1,                                    // CShuffleMXdlPerWavePerShuffle
-        2,        // CShuffleNXdlPerWavePerShuffle
-        device_gemm_trait::S<1, 32, 1, 8>,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-        8,                                    // CShuffleBlockTransferScalarPerVector_NPerBlock
-        DeviceGemmTraits::kMaskingSpec,                      // MaskingSpecialization
-        DeviceGemmTraits::kIsDeterministic>;
-// type alias for DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle with head_dim = 128
-template <typename DeviceGemmTraits>
-using DeviceGemmKLoopHeadDim128 = device_op::DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle_V1<
-        DeviceGemmTraits::kNumDimG, 
-        DeviceGemmTraits::kNumDimM, 
-        DeviceGemmTraits::kNumDimN, 
-        DeviceGemmTraits::kNumDimK, 
-        DeviceGemmTraits::kNumDimO, 
-        typename DeviceGemmTraits::ADataType,
-        typename DeviceGemmTraits::B0DataType,
-        typename DeviceGemmTraits::B1DataType,
-        typename DeviceGemmTraits::CDataType,
-        typename DeviceGemmTraits::GemmDataType,
-        typename DeviceGemmTraits::ZDataType,
-        typename DeviceGemmTraits::LSEDataType,
-        typename DeviceGemmTraits::Acc0BiasDataType,
-        typename DeviceGemmTraits::Acc1BiasDataType,
-        typename DeviceGemmTraits::AccDataType,
-        typename DeviceGemmTraits::CShuffleDataType,
-        typename DeviceGemmTraits::AElementOp,
-        typename DeviceGemmTraits::B0ElementOp,
-        typename DeviceGemmTraits::Acc0ElementOp,
-        typename DeviceGemmTraits::B1ElementOp,
-        typename DeviceGemmTraits::CElementOp,
-        DeviceGemmTraits::kGemmSpec,
-        DeviceGemmTraits::kTensorSpecA,
-        DeviceGemmTraits::kTensorSpecB0,
-        DeviceGemmTraits::kTensorSpecB1,
-        DeviceGemmTraits::kTensorSpecC,
-        1,
-        256,
-        128,         // MPerBlock
-        128,         // NPerBlock
-        32,         // KPerBlock
-        128,    // Gemm1NPerBlock
-        32,    // Gemm1KPerBlock
-        8,                 // AK1
-        8,                 // BK1
-        2,                 // B1K1
-        32,           // MPerXDL
-        32,           // NPerXDL
-        1,                 // MXdlPerWave
-        4,       // NXdlPerWave
-        4,  // Gemm1NXdlPerWave
-        device_gemm_trait::S<4, 64, 1>,    // ABlockTransfer
-        device_gemm_trait::S<1, 0, 2>,
-        device_gemm_trait::S<1, 0, 2>,
-        2,
-        8,
-        8,
-        true,   // ABlockLdsExtraM
-        device_gemm_trait::S<4, 64, 1>,    // BBlockTransfer
-        device_gemm_trait::S<1, 0, 2>,
-        device_gemm_trait::S<1, 0, 2>,
-        2,
-        8,
-        8,
-        true,  // B0BlockLdsExtraN
-        device_gemm_trait::S<8, 32, 1>,   // B1BlockTransfer
-        device_gemm_trait::S<0, 2, 1>,
-        device_gemm_trait::S<0, 2, 1>,
-        1,
-        4,    //B1BlockTransferSrcScalarPerVector
-        2,
-        false,
-        1,                                    // CShuffleMXdlPerWavePerShuffle
-        2,        // CShuffleNXdlPerWavePerShuffle
-        device_gemm_trait::S<1, 32, 1, 8>,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
-        8,                                    // CShuffleBlockTransferScalarPerVector_NPerBlock
-        DeviceGemmTraits::kMaskingSpec,                      // MaskingSpecialization
-        DeviceGemmTraits::kIsDeterministic>;                       // MaskingSpecialization
+
 } // namespace fwd_device_gemm

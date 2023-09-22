@@ -66,6 +66,7 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
   auto p_y = params.y_ptr;
   auto p_z = params.z_ptr;
   auto p_lse = params.lse_ptr;
+  auto p_d = params.d_ptr;
   auto p_ygrad = params.ygrad_ptr;
   auto p_qgrad = params.qgrad_ptr;
   auto p_kgrad = params.kgrad_ptr;
@@ -153,7 +154,7 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
   auto invoker = device_gemm_instance_ptr_->MakeInvoker();
 
   auto argument = device_gemm_instance_ptr_->MakeArgument(
-      p_q, p_k, p_z, p_v, p_y, p_lse, p_ygrad, p_qgrad, p_kgrad, p_vgrad, {},
+      p_q, p_k, p_z, p_v, p_y, p_lse, p_d, p_ygrad, p_qgrad, p_kgrad, p_vgrad, {},
       {}, problem_descs, a_element_op, b0_element_op, acc0_element_op,
       b1_element_op, c_element_op, dropout_ratio, seeds);
 

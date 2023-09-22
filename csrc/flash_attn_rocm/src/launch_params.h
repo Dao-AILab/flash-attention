@@ -93,7 +93,7 @@ struct FlashFwdParams : public QkvParams {
   // The dropout probability (probability of keeping an activation).
   float p_dropout;
   uint32_t p_dropout_in_uint;
-  uint16_t p_dropout_in_uint16_t;
+  // uint16_t p_dropout_in_uint16_t;
 
   // Scale factor of 1 / (1 - p_dropout).
   float rp_dropout;
@@ -116,7 +116,6 @@ struct FlashFwdParams : public QkvParams {
   bool is_causal;
   bool is_performance_mode;
   bool is_deterministic;
-  bool is_using_qloop;
   bool is_mnko_padding;
 };
 
@@ -125,11 +124,13 @@ struct FlashBwdParams : public FlashFwdParams {
   std::vector<const void*> y_ptr;
   std::vector<void*> z_ptr;
   std::vector<const void*> lse_ptr;
+  std::vector<void*> d_ptr;
   std::vector<const void*> ygrad_ptr;
   std::vector<void*> qgrad_ptr;
   std::vector<void*> kgrad_ptr;
   std::vector<void*> vgrad_ptr;
 
+  std::vector<at::Tensor> d_tensors;
   std::vector<at::Tensor> qgrad_tensors;
   std::vector<at::Tensor> kgrad_tensors;
   std::vector<at::Tensor> vgrad_tensors;
@@ -150,7 +151,7 @@ struct FlashBwdParams : public FlashFwdParams {
   // The dropout probability (probability of keeping an activation).
   float p_dropout;
   uint32_t p_dropout_in_uint;
-  uint16_t p_dropout_in_uint16_t;
+  // uint16_t p_dropout_in_uint16_t;
 
   // Scale factor of 1 / (1 - p_dropout).
   float rp_dropout;
@@ -169,6 +170,8 @@ struct FlashBwdParams : public FlashFwdParams {
   int kv_stride_multiplier;
 
   int num_splits; // How many SMs per attention matrix.
+
+  bool is_mnko_padding;
 };
 
 
