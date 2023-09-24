@@ -371,6 +371,7 @@ class RotaryEmbedding(torch.nn.Module):
         # or if we're switching from inference mode to training
         if (
             seqlen > self._seq_len_cached
+            or self._cos_cached is None
             or self._cos_cached.device != device
             or self._cos_cached.dtype != dtype
             or (self.training and self._cos_cached.is_inference())
