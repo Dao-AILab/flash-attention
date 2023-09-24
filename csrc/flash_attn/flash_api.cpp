@@ -713,7 +713,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     at::Tensor dq_accum;
     at::Tensor dk_accum, dv_accum;
     if (loop) {
-        dq_accum = torch::empty({batch_size, num_heads, seqlen_q_rounded, head_size_rounded}, opts.dtype(at::kFloat));
+        dq_accum = torch::empty({batch_size, seqlen_q_rounded, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
         // dk_accum = torch::empty({batch_size, num_heads_k, seqlen_k_rounded, head_size_rounded}, opts.dtype(at::kFloat));
         // dv_accum = torch::empty({batch_size, num_heads_k, seqlen_k_rounded, head_size_rounded}, opts.dtype(at::kFloat));
     }
@@ -923,7 +923,15 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
     at::Tensor dq_accum;
     if (loop) {
-        dq_accum = torch::empty({batch_size, num_heads, seqlen_q_rounded, head_size_rounded}, opts.dtype(at::kFloat));
+        // We don't want to allocate dq_accum of size (batch, seqlen_q_rounded, num_heads, head_size_rounded)
+        // because that would be too large if there is a very long sequence and the rest of the sequences are short.
+        // Instead, we allocate dq_accum of size (total_q + 128 * batch, num_heads, head_size_rounded).
+        // Note that 128 is the max block size on the seqlen_q dimension.
+        // For dQ, the i-th sequence is stored in indices from cu_seqlens[i] + 128 * i to
+        // cu_seqlens[i + 1] * 128 * i - 1. This ensures that the i-th sequence and (i + 1)-th sequence will
+        // be at least 128 apart. It's ok for us to do atomicAdds up to 128 rows beyond what we're normally
+        // allowed to do. So we won't have to do any bound checking, and performance should stay the same.
+        dq_accum = torch::empty({total_q + 128 * batch_size, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
     }
 
     at::Tensor dk_expanded, dv_expanded;

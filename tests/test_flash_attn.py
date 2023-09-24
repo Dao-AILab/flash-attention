@@ -492,16 +492,16 @@ def get_dropout_fraction(
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize('causal', [True])
+# @pytest.mark.parametrize('causal', [False])
 @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128])
 # @pytest.mark.parametrize('d', [64])
 # @pytest.mark.parametrize('seqlen', [128, 256, 384, 512, 768, 1024, 2048])
 @pytest.mark.parametrize("seqlen", [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
-# @pytest.mark.parametrize('seqlen', [97])
+# @pytest.mark.parametrize('seqlen', [128])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
-# @pytest.mark.parametrize('dropout_p', [0.17])
+# @pytest.mark.parametrize('dropout_p', [0.0])
 def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     if seqlen >= 2048 and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
