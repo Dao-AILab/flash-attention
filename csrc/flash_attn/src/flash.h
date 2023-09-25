@@ -105,6 +105,9 @@ struct Flash_fwd_params : public Qkv_params {
     float rp_dropout;
     float scale_softmax_rp_dropout;
 
+    // Local window size
+    int window_size_left, window_size_right;
+
     // Random state.
     at::PhiloxCudaState philox_args;
 
