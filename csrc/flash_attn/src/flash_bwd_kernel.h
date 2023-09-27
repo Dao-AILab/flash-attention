@@ -422,7 +422,7 @@ inline __device__ void convert_dKV(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
 inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -447,6 +447,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     if (n_block * kBlockN >= binfo.actual_seqlen_k || binfo.actual_seqlen_q == 0) return;
 
     int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
+    if (Is_local) {
+        m_block_max = std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k + params.window_size_left, kBlockM));
+    }
 
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
         + (m_block_max - 1) * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
@@ -655,14 +658,53 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     tdQgdQaccum.data() = tdQgdQaccum.data() + kBlockM * params.h * params.d_rounded;
 
     int m_block = m_block_max - 1;
-    int m_block_min = !Is_causal ? 0 : std::max(0, (n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k) / kBlockM);
-    // We're guaranteed that m_block_min <= m_block:
+    int m_block_min = (!Is_causal && !Is_local)
+        ? 0
+        : std::max(0, (n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k - params.window_size_right) / kBlockM);
+    // If not local, we're guaranteed that m_block_min <= m_block:
     // We checked earlier that n_block * kBlockN < actual_seqlen_k, so in the causal case,
     // n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k < actual_seqlen_q.
     // So m_block_min <= (actual_seqlen_q - 1) / kBlockM.
     // Recall that m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM) = (actual_seqlen_q + kBlockM - 1) / kBlockM.
     // So m_block_m - 1 = (actual_seqlen_q - 1) / kBlockM.
     // We conclude that m_block_min <= m_block, so we will always have at least 1 iteration of the for loop.
+    // However, if local, then this possible to have some blocks of K & V not attending to any query.
+    // We might need to exit early and write 0 to dK and dV for those blocks.
+    // Otherwise we get wrong result for the case where we don't enter the for loop.
+    // And we might read OOB elements from gQ and gdO.
+    if (Is_local && m_block < m_block_min) {
+        const index_t row_offset_dk = binfo.k_offset(params.dk_batch_stride, params.dk_row_stride, bidb)
+          + n_block * kBlockN * params.dk_row_stride + bidh * params.dk_head_stride;
+        const index_t row_offset_dv = binfo.k_offset(params.dv_batch_stride, params.dv_row_stride, bidb)
+          + n_block * kBlockN * params.dv_row_stride + bidh * params.dv_head_stride;
+        Tensor gdK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.dk_ptr) + row_offset_dk),
+                                 Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                 make_stride(params.dk_row_stride, _1{}));
+        Tensor gdV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.dv_ptr) + row_offset_dv),
+                                 Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                 make_stride(params.dv_row_stride, _1{}));
+        typename Kernel_traits::GmemTiledCopydKV gmem_tiled_copy_dKV;
+        auto gmem_thr_copy_dKV = gmem_tiled_copy_dKV.get_thread_slice(tidx);
+        Tensor tdKgdK = gmem_thr_copy_dKV.partition_D(gdK);
+        Tensor tdVgdV = gmem_thr_copy_dKV.partition_D(gdV);
+        Tensor tdKrdK = make_tensor<Element>(shape(tdKgdK));
+        Tensor tdVrdV = make_tensor<Element>(shape(tdVgdV));
+        clear(tdKrdK);
+        clear(tdVrdV);
+        Tensor cdKV = make_identity_tensor(make_shape(size<0>(gdK), size<1>(gdK)));    // (BLK_N,BLK_K) -> (blk_n,blk_k)
+        Tensor tdKVcdKV = gmem_thr_copy_dKV.partition_D(cdKV);
+        Tensor tdKVpdKV = make_tensor<bool>(make_shape(size<2>(tdKgdK)));
+        #pragma unroll
+        for (int k = 0; k < size(tdKVpdKV); ++k) { tdKVpdKV(k) = get<1>(tdKVcdKV(0, 0, k)) < params.d; }
+        // Clear_OOB_K must be false since we don't want to write zeros to gmem
+        flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+            gmem_tiled_copy_dKV, tdKrdK, tdKgdK, tdKVcdKV, tdKVpdKV, binfo.actual_seqlen_k - n_block * kBlockN
+        );
+        flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+            gmem_tiled_copy_dKV, tdVrdV, tdVgdV, tdKVcdKV, tdKVpdKV, binfo.actual_seqlen_k - n_block * kBlockN
+        );
+        return;
+    }
 
     if (Double_buffer && m_block % 2 == 1) {  // Double buffer for sQ
         tQsQ.data() = tQsQ.data() + size(sQ);
@@ -777,12 +819,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // However, it's possible that the values in acc_s are so large that they overflow
         // when we multiply with dP and convert to fp16, resulting in Inf in dS and NaNs in dQ.
         // So we need to mask out the elements beyond actual_seqlen_k.
-        if (!Is_causal) {
+        if (!Is_causal && !Is_local) {
             if (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k) {
                 flash::apply_mask(scores, binfo.actual_seqlen_k,
                                   n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16);
             }
-        } else {
+        } else if (Is_causal) {
             // Putting this causal masking right after acc_s is *much* slower for some reason.
             // TD [2023-08-16]: We need the 2nd condition because if seqlen_q is long and seqlen_k is short
             // (e.g., 256 and 2), the 2nd block of seqlen_q (from 128 to 255), we're not doing causal masking.
@@ -795,6 +837,16 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                                          // binfo.actual_seqlen_k, m_block * kBlockM + (tidx / 32) % AtomLayoutMS * 16 + (tidx % 32) / 4,
                                          AtomLayoutMS * 16);
             }
+        } else if (Is_local) {
+            if (m_block * kBlockM < (n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k - params.window_size_right
+                || (m_block + 1) * kBlockM >= n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k + params.window_size_left
+                || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k)) {
+                flash::apply_mask_local(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                                        binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
+                                        binfo.actual_seqlen_q, AtomLayoutMS * 16,
+                                        params.window_size_left, params.window_size_right);
+            }
+
         }
         // if (cute::thread(32, 0)) { print(scores); }
         // Compute the exponential value.
@@ -1510,7 +1562,7 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     const int n_block = blockIdx.x;
@@ -1519,7 +1571,7 @@ inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
     // The block index for the head.
     const int bidh = blockIdx.z;
 
-    compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+    compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
