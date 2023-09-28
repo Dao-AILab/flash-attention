@@ -92,6 +92,7 @@ struct FlashFwdParams : public QkvParams {
   // Pointer to the RNG seed (idx 0) and offset (idx 1).
   uint64_t* rng_state;
 
+  bool is_dropout;
   bool is_bf16;
   bool is_causal;
   bool is_mnko_padding;
@@ -101,6 +102,7 @@ struct FlashBwdParams : public FlashFwdParams {
   // The dO and dQKV matrices.
   std::vector<void*> z_ptrs;
   std::vector<const void*> out_ptrs;
+  std::vector<void*> d_ptrs;
   std::vector<const void*> dout_ptrs;
   std::vector<void*> dq_ptrs;
   std::vector<void*> dk_ptrs;
@@ -108,6 +110,7 @@ struct FlashBwdParams : public FlashFwdParams {
 
   std::vector<const void*> softmax_lse_ptrs;
 
+  std::vector<at::Tensor> d_tensors;
   std::vector<at::Tensor> dq_tensors;
   std::vector<at::Tensor> dk_tensors;
   std::vector<at::Tensor> dv_tensors;

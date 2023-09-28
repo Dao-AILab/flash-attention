@@ -61,6 +61,7 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
   auto p_y = params.out_ptrs;
   auto p_z = params.z_ptrs;
   auto p_lse = params.softmax_lse_ptrs;
+  auto p_d = params.d_ptrs;
   auto p_ygrad = params.dout_ptrs;
   auto p_qgrad = params.dq_ptrs;
   auto p_kgrad = params.dk_ptrs;
@@ -84,34 +85,30 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
     std::vector<ck::index_t> q_gs_ms_ks_lengths{G0, G1, M, K};
     std::vector<ck::index_t> q_gs_ms_ks_strides =
         input_permute
-            ? std::vector<ck::index_t>{M * G1 * K, K, G1 * K, 1}
+            ? std::vector<ck::index_t>{M * G1 * K * params.q_stride_multiplier, K, G1 * K * params.q_stride_multiplier, 1}
             // Q layout [G0, M, G1, K]
-            : std::vector<ck::index_t>{G1 * M * K, M * K, K,
-                                      1}; // Q layout [G0, G1, M, K]
+            : std::vector<ck::index_t>{G1 * M * K, M * K, K, 1}; // Q layout [G0, G1, M, K]
 
     std::vector<ck::index_t> k_gs_ns_ks_lengths{G0, G1, N, K};
     std::vector<ck::index_t> k_gs_ns_ks_strides =
         input_permute
-            ? std::vector<ck::index_t>{N * G1 * K, K, G1 * K, 1}
+            ? std::vector<ck::index_t>{N * G1 * K * params.kv_stride_multiplier, K, G1 * K * params.kv_stride_multiplier, 1}
             // K layout [G0, N, G1, K]
-            : std::vector<ck::index_t>{G1 * N * K, N * K, K,
-                                      1}; // K layout [G0, G1, N, K]
+            : std::vector<ck::index_t>{G1 * N * K, N * K, K, 1}; // K layout [G0, G1, N, K]
 
     std::vector<ck::index_t> v_gs_os_ns_lengths{G0, G1, O, N};
     std::vector<ck::index_t> v_gs_os_ns_strides =
         input_permute
-            ? std::vector<ck::index_t>{N * G1 * O, O, 1, G1 * O}
+            ? std::vector<ck::index_t>{N * G1 * O * params.kv_stride_multiplier, O, 1, G1 * O * params.kv_stride_multiplier}
             // V layout [G0, N, G1, O]
-            : std::vector<ck::index_t>{G1 * N * O, N * O, 1,
-                                      O}; // V layout [G0, G1, N, O]
+            : std::vector<ck::index_t>{G1 * N * O, N * O, 1, O}; // V layout [G0, G1, N, O]
 
     std::vector<ck::index_t> y_gs_ms_os_lengths{G0, G1, M, O};
     std::vector<ck::index_t> y_gs_ms_os_strides =
         output_permute
             ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1}
             // Y layout [G0, M, G1, O]
-            : std::vector<ck::index_t>{G1 * M * O, M * O, O,
-                                      1}; // Y layout [G0, G1, M, O]
+            : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // Y layout [G0, G1, M, O]
 
     std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
     std::vector<ck::index_t> z_gs_ms_ns_strides = 
@@ -152,7 +149,7 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
   auto invoker = device_gemm_instance_ptr_->MakeInvoker();
 
   auto argument = device_gemm_instance_ptr_->MakeArgument(
-      p_q, p_k, p_z, p_v, p_y, p_lse, p_ygrad, p_qgrad, p_kgrad, p_vgrad, {},
+      p_q, p_k, p_z, p_v, p_y, p_lse, p_d, p_ygrad, p_qgrad, p_kgrad, p_vgrad, {},
       {}, problem_descs, a_element_op, b0_element_op, acc0_element_op,
       b1_element_op, c_element_op, dropout_ratio, seeds);
 

@@ -24,14 +24,49 @@
 #include "flash_fwd_runner_gfx90a.h"
 
 namespace fwd_device_gemm {
-// hdim 64, fp16, non-causal
+// hdim 64, fp16, non-causal, MNKO-padding
 template <>
-void FlashFwdRunner::Run<true, 64, device_gemm_trait::Float16, false>(FlashFwdParams &params, hipStream_t &stream) {
-  BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
-    this->template run_<DeviceGemmQLoopHeadDim64,
-                        device_gemm_trait::Float16, 
-                        device_gemm_trait::kMaskingSpecDefault,
-                        kIsDeterministic>(params, stream);
-  });
+void FlashFwdRunner::Run<64, device_gemm_trait::Float16, false, true>(FlashFwdParams &params, hipStream_t &stream) {
+  if(params.is_dropout){
+    BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
+      this->template run_<DeviceGemmQLoopHeadDim64,
+                    device_gemm_trait::Float16, 
+                    device_gemm_trait::kGemmSpecPadding,
+                    device_gemm_trait::kMaskingSpecDefault,
+                    kIsDeterministic>(params, stream);
+    });    
+  }
+  else{
+    BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
+      this->template run_<DeviceGemmQLoopHeadDim64NonDrop,
+                    device_gemm_trait::Float16, 
+                    device_gemm_trait::kGemmSpecPadding,
+                    device_gemm_trait::kMaskingSpecDefault,
+                    kIsDeterministic>(params, stream);
+    });
+  }
+} // FlashFwdRunner::Run()
+
+// hdim 64, fp16, causal, non-padding
+template <>
+void FlashFwdRunner::Run<64, device_gemm_trait::Float16, false, false>(FlashFwdParams &params, hipStream_t &stream) {
+  if(params.is_dropout){
+    BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
+      this->template run_<DeviceGemmQLoopHeadDim64,
+                    device_gemm_trait::Float16, 
+                    device_gemm_trait::kGemmSpecDefault,
+                    device_gemm_trait::kMaskingSpecDefault,
+                    kIsDeterministic>(params, stream);
+    });
+  }
+  else{
+    BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
+      this->template run_<DeviceGemmQLoopHeadDim64NonDrop,
+                    device_gemm_trait::Float16, 
+                    device_gemm_trait::kGemmSpecDefault,
+                    device_gemm_trait::kMaskingSpecDefault,
+                    kIsDeterministic>(params, stream);
+    });    
+  }
 } // FlashFwdRunner::Run()
 } // namespace fwd_device_gemm

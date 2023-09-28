@@ -34,7 +34,9 @@ void FlashRunner::RunFwd(FlashFwdParams &params, hipStream_t &stream) {
   HEADDIM_SWITCH(params.d, [&] {
     BF16_SWITCH(params.is_bf16, [&] {
       BOOL_SWITCH(params.is_causal, kIsCausal, [&] {
-          pimpl_fwd_runner_->Run<true, kHeadDim, T, kIsCausal>(params, stream);
+        BOOL_SWITCH(params.is_mnko_padding, kIsPadding, [&] {
+          pimpl_fwd_runner_->Run<kHeadDim, T, kIsCausal, kIsPadding>(params, stream);
+        });
       });
     });
   });
@@ -44,7 +46,9 @@ void FlashRunner::RunBwd(FlashBwdParams &params, hipStream_t &stream) {
   HEADDIM_SWITCH(params.d, [&] {
     BF16_SWITCH(params.is_bf16, [&] {
       BOOL_SWITCH(params.is_causal, kIsCausal, [&] {
-          pimpl_bwd_runner_->Run<true, kHeadDim, T, kIsCausal>(params, stream);
+        BOOL_SWITCH(params.is_mnko_padding, kIsPadding, [&] {
+          pimpl_bwd_runner_->Run<kHeadDim, T, kIsCausal, kIsPadding>(params, stream);
+        });
       });
     });
   });

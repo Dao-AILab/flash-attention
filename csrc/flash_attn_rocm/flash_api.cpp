@@ -143,7 +143,7 @@ void set_params_fprop(bool is_dgrad, // is setting params for dgrad
       if(!params.is_mnko_padding && d <= 32) {
         params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
       } else if(!params.is_mnko_padding && d <= 64) {
-        if(p_dropout > 0.0) {
+        if(params.is_dropout) {
           params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
         } else {
           params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 256)==0 ? false : true);
@@ -197,6 +197,7 @@ void set_params_fprop(bool is_dgrad, // is setting params for dgrad
     // params.scale_softmax_rp_dropout = params.rp_dropout * params.scale_softmax;
     TORCH_CHECK(p_dropout < 1.f);
     
+    params.is_dropout = p_dropout > 0.0f;
     params.is_causal = is_causal;
 }
 
@@ -291,6 +292,13 @@ void set_params_dgrad(FlashBwdParams &params,
       else if(!params.is_mnko_padding && d <= 128) {
         params.is_mnko_padding = ((temp_seqlen_q % 64)==0 && (temp_seqlen_k % 128)==0 ? false : true);
       }
+
+      auto opts = q.options();
+
+      at::Tensor d_tensor;
+      d_tensor = at::empty({1, static_cast<long>(h), temp_seqlen_q}, opts.dtype(at::kFloat));
+      params.d_tensors.push_back(d_tensor);
+      params.d_ptrs.push_back(reinterpret_cast<void*>(d_tensor.data_ptr()));
 
       // unit test mode
       if(IS_UNIT_TEST_MODE) {
@@ -485,7 +493,7 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
     // Forward kernel will populate memory with the seed and offset.
     params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
-    if (p_dropout > 0.0) {
+    if (params.is_dropout) {
         auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
             gen_, at::cuda::detail::getDefaultCUDAGenerator());
         // See Note [Acquire lock when using random generators]
@@ -640,7 +648,7 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
     // Forward kernel will populate memory with the seed and offset.
     params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
-    if (p_dropout > 0.0)  {
+    if (params.is_dropout)  {
         auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
             gen_, at::cuda::detail::getDefaultCUDAGenerator());
         // See Note [Acquire lock when using random generators]
@@ -679,7 +687,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     bool is_gfx90x = dprops->major == 9 && dprops->minor == 0;
     bool is_gfx94x = dprops->major == 9 && dprops->minor == 4;
     TORCH_CHECK(is_gfx90x || is_gfx94x, "FlashAttention only supports AMD MI200 GPUs or newer.");
-    bool is_dropout = p_dropout > 0.0;
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -851,7 +858,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         
     if (rng_state.has_value()) {
       params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
-    } else if(is_dropout) {
+    } else if(params.is_dropout) {
       // See Note [Acquire lock when using random generators]
       std::lock_guard<std::mutex> lock(gen->mutex_);
       params.philox_args = gen->philox_cuda_state(counter_offset);
@@ -922,7 +929,6 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     bool is_gfx90x = dprops->major == 9 && dprops->minor == 0;
     bool is_gfx94x = dprops->major == 9 && dprops->minor == 4;
     TORCH_CHECK(is_gfx90x || is_gfx94x, "FlashAttention only supports AMD MI200 GPUs or newer.");
-    bool is_dropout = p_dropout > 0.0;
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -1107,7 +1113,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     if (rng_state.has_value()) {
       params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
-    } else if(is_dropout) {
+    } else if(params.is_dropout) {
       // See Note [Acquire lock when using random generators]
       std::lock_guard<std::mutex> lock(gen->mutex_);
       params.philox_args = gen->philox_cuda_state(counter_offset);

@@ -35,12 +35,13 @@ class FlashBwdRunner {
     : is_unit_test_mode_(is_unit_test_mode),
       is_deterministic_(is_deterministic) {}
 
-  template <bool kIsQLoop, int kHeadDim, typename T, bool kIsCausal>
+  template <int kHeadDim, typename T, bool kIsCausal, bool kIsPadding>
   void Run(FlashBwdParams &params, hipStream_t &stream);
 
  private:
   template <template <typename> typename DeviceGemmTemplate,
             typename T,
+            device_gemm_trait::GemmSpec kGemmSpec,
             device_gemm_trait::MaskingSpec kMaskingSpec, 
             bool kIsDeterministic>
   void run_(FlashBwdParams &params, hipStream_t &stream) {
@@ -52,6 +53,7 @@ class FlashBwdRunner {
                                                            device_gemm_trait::BFloat16, 
                                                            device_gemm_trait::Int16, 
                                                            8, 
+                                                           kGemmSpec,
                                                            kMaskingSpec, 
                                                            kIsDeterministic>;
       using DeviceGemmInstance = DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>;
@@ -65,6 +67,7 @@ class FlashBwdRunner {
                                                            T,
                                                            std::conditional_t<std::is_same_v<T, device_gemm_trait::Float16>, device_gemm_trait::Int16, device_gemm_trait::Int32>,
                                                            4, 
+                                                           kGemmSpec,
                                                            kMaskingSpec, 
                                                            kIsDeterministic>;
       using DeviceGemmInstance = DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>;

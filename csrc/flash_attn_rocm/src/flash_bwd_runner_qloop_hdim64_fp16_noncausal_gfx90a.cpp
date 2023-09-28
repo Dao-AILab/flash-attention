@@ -26,12 +26,25 @@
 namespace bwd_device_gemm {
 // hdim 64, fp16, non-causal
 template <>
-void FlashBwdRunner::Run<true, 64, device_gemm_trait::Float16, false>(FlashBwdParams &params, hipStream_t &stream) {
+void FlashBwdRunner::Run<64, device_gemm_trait::Float16, false, true>(FlashBwdParams &params, hipStream_t &stream) {
   BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
     this->template run_<DeviceGemmQLoopHeadDim64,
-                        device_gemm_trait::Float16, 
-                        device_gemm_trait::kMaskingSpecDefault,
-                        kIsDeterministic>(params, stream);
+                  device_gemm_trait::Float16, 
+                  device_gemm_trait::kGemmSpecPadding,
+                  device_gemm_trait::kMaskingSpecDefault,
+                  kIsDeterministic>(params, stream);
+  });
+} // FlashBwdRunner::Run()
+
+// hdim 64, fp16, non-causal
+template <>
+void FlashBwdRunner::Run<64, device_gemm_trait::Float16, false, false>(FlashBwdParams &params, hipStream_t &stream) {
+  BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
+    this->template run_<DeviceGemmQLoopHeadDim64,
+                  device_gemm_trait::Float16, 
+                  device_gemm_trait::kGemmSpecDefault,
+                  device_gemm_trait::kMaskingSpecDefault,
+                  kIsDeterministic>(params, stream);
   });
 } // FlashBwdRunner::Run()
 } // namespace bwd_device_gemm
