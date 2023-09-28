@@ -274,7 +274,7 @@ PyTorch Standard Attention - Forward + Backward pass
 
 For passing unit tests compile flash-attention from source which may take a while:
 ```
-FLASH_ATTENTION_INTERNAL_USE_RTZ=0 python setup.py install
+FLASH_ATTENTION_INTERNAL_USE_RTN=1 python setup.py install
 ```
 
 Before running unit tests, the unit test mode and deterministic flags should be both turned on by setting the environment variables:
