@@ -803,26 +803,45 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     }
 
     FlashBwdParams params;
-    set_params_dgrad(params,
-                     batch_size,
-                     seqlen_q, seqlen_k,
-                     seqlen_q_rounded, seqlen_k_rounded,
-                     num_heads, num_heads_k,
-                     head_size, head_size_rounded,
-                     q, k, v, out,
-                     dout_padded, dq, dk_expanded, dv_expanded,
-                     nullptr,
-                     nullptr,
-                     loop ? dq_accum.data_ptr() : nullptr,
-                     // loop ? dk_accum.data_ptr() : nullptr,
-                     // loop ? dv_accum.data_ptr() : nullptr,
-                     nullptr,
-                     nullptr,
-                     softmax_lse.data_ptr(),
-                     softmax_d.data_ptr(),
-                     p_dropout,
-                     softmax_scale,
-                     is_causal);
+    if(IS_UNIT_TEST_MODE) {
+      set_params_dgrad(params,
+                       batch_size,
+                       seqlen_q, seqlen_k,
+                       seqlen_q_rounded, seqlen_k_rounded,
+                       num_heads, num_heads_k,
+                       head_size, head_size_rounded,
+                       q, k, v, out,
+                       dout_padded, dq_tmp, dk_tmp, dv_tmp,
+                       nullptr,
+                       nullptr,
+                       loop ? dq_accum.data_ptr() : nullptr,
+                       nullptr,
+                       nullptr,
+                       softmax_lse.data_ptr(),
+                       softmax_d.data_ptr(),
+                       p_dropout,
+                       softmax_scale,
+                       is_causal);
+    } else {
+      set_params_dgrad(params,
+                       batch_size,
+                       seqlen_q, seqlen_k,
+                       seqlen_q_rounded, seqlen_k_rounded,
+                       num_heads, num_heads_k,
+                       head_size, head_size_rounded,
+                       q, k, v, out,
+                       dout_padded, dq, dk_expanded, dv_expanded,
+                       nullptr,
+                       nullptr,
+                       loop ? dq_accum.data_ptr() : nullptr,
+                       nullptr,
+                       nullptr,
+                       softmax_lse.data_ptr(),
+                       softmax_d.data_ptr(),
+                       p_dropout,
+                       softmax_scale,
+                       is_causal);
+    }
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
@@ -831,14 +850,14 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     int64_t counter_offset = params.b * params.h * 32;
         
     if (rng_state.has_value()) {
-        params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
+      params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
     } else if(is_dropout) {
-        // See Note [Acquire lock when using random generators]
-        std::lock_guard<std::mutex> lock(gen->mutex_);
-        params.philox_args = gen->philox_cuda_state(counter_offset);
-        auto seeds = unpack(params.philox_args);
-        params.rng_state[0] = std::get<0>(seeds);
-        params.rng_state[1] = std::get<1>(seeds);
+      // See Note [Acquire lock when using random generators]
+      std::lock_guard<std::mutex> lock(gen->mutex_);
+      params.philox_args = gen->philox_cuda_state(counter_offset);
+      auto seeds = unpack(params.philox_args);
+      params.rng_state[0] = std::get<0>(seeds);
+      params.rng_state[1] = std::get<1>(seeds);
     }
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
@@ -846,13 +865,13 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
-        at::sum_out(dk, at::reshape(dk_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
-        at::sum_out(dv, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
+      at::sum_out(dk, at::reshape(dk_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
+      at::sum_out(dv, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
     }
     if (head_size_og % 8 != 0) {
-        dq = dq.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-        dk = dk.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-        dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+      dq = dq.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+      dk = dk.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+      dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
     }
 
     if(IS_UNIT_TEST_MODE) {
@@ -1040,45 +1059,44 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
 
     FlashBwdParams params;
-
     if(IS_UNIT_TEST_MODE) {
       set_params_dgrad(params,
-                        batch_size,
-                        max_seqlen_q, max_seqlen_k,
-                        seqlen_q_rounded, seqlen_k_rounded,
-                        num_heads, num_heads_k,
-                        head_size, head_size_rounded,
-                        q, k, v, out,
-                        dout_padded, dq_tmp, dk_tmp, dv_tmp,
-                        cu_seqlens_q.data_ptr(),
-                        cu_seqlens_k.data_ptr(),
-                        loop ? dq_accum.data_ptr() : nullptr,
-                        nullptr,
-                        nullptr,
-                        softmax_lse.data_ptr(),
-                        softmax_d.data_ptr(),
-                        p_dropout,
-                        softmax_scale,
-                        is_causal);
+                       batch_size,
+                       max_seqlen_q, max_seqlen_k,
+                       seqlen_q_rounded, seqlen_k_rounded,
+                       num_heads, num_heads_k,
+                       head_size, head_size_rounded,
+                       q, k, v, out,
+                       dout_padded, dq_tmp, dk_tmp, dv_tmp,
+                       cu_seqlens_q.data_ptr(),
+                       cu_seqlens_k.data_ptr(),
+                       loop ? dq_accum.data_ptr() : nullptr,
+                       nullptr,
+                       nullptr,
+                       softmax_lse.data_ptr(),
+                       softmax_d.data_ptr(),
+                       p_dropout,
+                       softmax_scale,
+                       is_causal);
     } else {
       set_params_dgrad(params,
-                        batch_size,
-                        max_seqlen_q, max_seqlen_k,
-                        seqlen_q_rounded, seqlen_k_rounded,
-                        num_heads, num_heads_k,
-                        head_size, head_size_rounded,
-                        q, k, v, out,
-                        dout_padded, dq, dk_expanded, dv_expanded,
-                        cu_seqlens_q.data_ptr(),
-                        cu_seqlens_k.data_ptr(),
-                        loop ? dq_accum.data_ptr() : nullptr,
-                        nullptr,
-                        nullptr,
-                        softmax_lse.data_ptr(),
-                        softmax_d.data_ptr(),
-                        p_dropout,
-                        softmax_scale,
-                        is_causal);
+                       batch_size,
+                       max_seqlen_q, max_seqlen_k,
+                       seqlen_q_rounded, seqlen_k_rounded,
+                       num_heads, num_heads_k,
+                       head_size, head_size_rounded,
+                       q, k, v, out,
+                       dout_padded, dq, dk_expanded, dv_expanded,
+                       cu_seqlens_q.data_ptr(),
+                       cu_seqlens_k.data_ptr(),
+                       loop ? dq_accum.data_ptr() : nullptr,
+                       nullptr,
+                       nullptr,
+                       softmax_lse.data_ptr(),
+                       softmax_d.data_ptr(),
+                       p_dropout,
+                       softmax_scale,
+                       is_causal);
     }
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(

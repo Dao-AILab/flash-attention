@@ -72,12 +72,6 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
 
   auto seeds = unpack(params.philox_args);
 
-  auto seed_   = std::get<0>(seeds);
-  auto offset_ = std::get<1>(seeds);
-
-  //std::cout << "fwd seed is " << seed_ ;
-  //std::cout << " , fwd offset is " << offset_ << std::endl;
-
   for(size_t i = 0; i < batch_size; i++){
     int M     = params.host_seqlens_q[i + 1] - params.host_seqlens_q[i]; //seqlen Q
     int N     = params.host_seqlens_k[i + 1] - params.host_seqlens_k[i]; //seqlen K
