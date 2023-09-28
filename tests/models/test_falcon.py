@@ -1,10 +1,5 @@
 # Copyright (c) 2023, Tri Dao.
 
-# To run the huggingface implementation, we first need to convert the weights:
-# https://github.com/huggingface/transformers/pull/21955
-# python -m transformers.models.llama.convert_llama_weights_to_hf --input_dir $CHECKPOINT_DIR/llama --model_size 7B --output_dir $CHECKPOINT_DIR/llama/7B-hf
-# and repeat for 13B, 30B, 65B
-
 import os
 import time
 from pathlib import Path
@@ -15,24 +10,20 @@ import pytest
 
 from einops import rearrange
 
-from transformers import LlamaConfig, LlamaTokenizer
-from transformers.models.llama.modeling_llama import LlamaForCausalLM
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
 from flash_attn.models.gpt import GPTLMHeadModel, combine_state_dicts_tp, shard_state_dict_tp
-from flash_attn.models.llama import remap_state_dict_meta_llama, llama_config_to_gpt2_config
-from flash_attn.models.llama import config_from_checkpoint, state_dicts_from_checkpoint
+from flash_attn.models.falcon import remap_state_dict_hf_falcon, falcon_config_to_gpt2_config
 from flash_attn.utils.distributed import all_gather_raw
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 from flash_attn.utils.generation import update_graph_cache
 
 
-@pytest.mark.parametrize('model_name', ["7B"])
-def test_llama_state_dict(model_name):
-    checkpoint_path = Path(os.environ.get('CHECKPOINT_DIR',
-                                          current_dir.parent.parent / 'checkpoints')) / 'llama'
-    config = llama_config_to_gpt2_config(config_from_checkpoint(checkpoint_path, model_name))
-    ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
-    pretrained_state_dict = remap_state_dict_meta_llama(ckpt_state_dicts[0], config)
+@pytest.mark.parametrize('model_name', ["tiiuae/falcon-7b", "tiiuae/falcon-40b"])
+def test_falcon_state_dict(model_name):
+    config = falcon_config_to_gpt2_config(AutoConfig.from_pretrained(model_name,
+                                                                     trust_remote_code=True))
+    pretrained_state_dict = remap_state_dict_hf_falcon(state_dict_from_pretrained(model_name), config)
     model = GPTLMHeadModel(config, device='meta')  # Without device='meta' init is very slow
     state_dict = model.state_dict()
     assert state_dict.keys() == pretrained_state_dict.keys()
@@ -40,36 +31,28 @@ def test_llama_state_dict(model_name):
         assert state_dict[k].shape == pretrained_state_dict[k].shape
 
 
-@pytest.mark.parametrize('model_name', ["7B", "13B"])
-# @pytest.mark.parametrize('model_name', ["7B"])
-def test_llama_optimized(model_name):
-    """Check that our implementation of LLaMa (with all optimizations enabled) matches the
+@pytest.mark.parametrize('model_name', ["tiiuae/falcon-7b"])
+def test_falcon_optimized(model_name):
+    """Check that our implementation (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
     forward pass in fp16, when compared to the HF forward pass in fp32.
     """
-    checkpoint_path = Path(os.environ.get('CHECKPOINT_DIR',
-                                          current_dir.parent.parent / 'checkpoints')) / 'llama'
-
     dtype = torch.float16
     device = 'cuda'
-    config = llama_config_to_gpt2_config(config_from_checkpoint(checkpoint_path, model_name))
+    config = falcon_config_to_gpt2_config(AutoConfig.from_pretrained(model_name,
+                                                                     trust_remote_code=True))
     config.use_flash_attn = True
     config.fused_bias_fc = True
-    config.fused_mlp = False  # We don't have fused GatedMLP yet
+    config.fused_mlp = False  # We don't have fused MLP for "gelu" activation
     config.fused_dropout_add_ln = True
     config.residual_in_fp32 = True
 
-    ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
-    pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
-    pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
-    model = GPTLMHeadModel(config, device=device, dtype=dtype)
-    model.load_state_dict(pretrained_state_dict)
+    model = GPTLMHeadModel.from_pretrained(model_name, config, device=device, dtype=dtype)
     model.eval()
 
     torch.manual_seed(0)
     batch_size = 2
     max_seqlen = 256
-    seqlens = torch.randint(max_seqlen // 2, max_seqlen + 1, (batch_size,), device=device)
     input_ids = torch.randint(0, config.vocab_size, (batch_size, max_seqlen), dtype=torch.long,
                               device=device)
     with torch.no_grad():
@@ -78,21 +61,21 @@ def test_llama_optimized(model_name):
     del model
 
     # Without device_map, the model is loaded on the CPU, which is very slow
-    # Need auto here since the 13B fp32 model doesn't fit in memory on a A100 40GB
-    model_ref = LlamaForCausalLM.from_pretrained(Path(checkpoint_path) / f'{model_name}-hf',
-                                                 device_map='auto')
+    model_ref = AutoModelForCausalLM.from_pretrained(
+        model_name, device_map={"": device}, trust_remote_code=True
+    )
     model_ref.eval()
     with torch.no_grad():
-        out_ref = model_ref.model(input_ids).last_hidden_state.to(device=device)
+        out_ref = model_ref.transformer(input_ids).last_hidden_state.to(device=device)
         logits_ref = model_ref(input_ids).logits.to(device=device)
     del model_ref
 
-    model_hf = LlamaForCausalLM.from_pretrained(Path(checkpoint_path) / f'{model_name}-hf',
-                                                torch_dtype=dtype, device_map={"": device})
+    model_hf = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=dtype, device_map={"": device}, trust_remote_code=True
+    )
     model_hf.eval()
-    with torch.no_grad():
-        out_hf = model_hf.model(input_ids).last_hidden_state
-        logits_hf = model_hf(input_ids).logits
+    out_hf = model_hf.transformer(input_ids).last_hidden_state
+    logits_hf = model_hf(input_ids).logits
     del model_hf
 
     print(f'Output max diff: {(out - out_ref).abs().max().item()}')
@@ -108,25 +91,21 @@ def test_llama_optimized(model_name):
     assert (logits - logits_ref).abs().max().item() < 3 * (logits_hf - logits_ref).abs().max().item()
 
 
-# torchrun --no_python --nproc_per_node=2 pytest -q -s tests/models/test_llama.py -k "parallel"
-@pytest.mark.parametrize('world_size', [2])
-@pytest.mark.parametrize('model_name', ["13B"])
-def test_llama_parallel(model_name, world_size):
-    """Check that our implementation of LLaMa (with all optimizations enabled) matches the
-    HF implementation: the output of our forward pass in fp16 should be around the same as the HF
-    forward pass in fp16, when compared to the HF forward pass in fp32.
-    """
+# torchrun --no_python --nproc_per_node=4 pytest -q -s tests/models/test_falcon.py -k "falcon_parallel_forward"
+# We want to run this on a machine with 4 x A100 80GB or 8 x A100 40GB so we have enough
+# memory to run the model in fp32.
+@pytest.mark.parametrize('world_size', [4])
+@pytest.mark.parametrize('model_name', ["tiiuae/falcon-40b"])
+def test_falcon_parallel_forward(model_name, world_size):
     from apex.transformer import parallel_state
 
-    checkpoint_path = Path(os.environ.get('CHECKPOINT_DIR',
-                                          current_dir.parent.parent / 'checkpoints')) / 'llama'
-
     dtype = torch.float16
-    config = llama_config_to_gpt2_config(config_from_checkpoint(checkpoint_path, model_name))
-    config.use_flash_attn = True
+    config = falcon_config_to_gpt2_config(AutoConfig.from_pretrained(model_name,
+                                                                     trust_remote_code=True))
+    config.use_flash_attn = False
     config.fused_bias_fc = True
-    config.fused_mlp = False  # We don't have fused GatedMLP yet
-    config.fused_dropout_add_ln = True
+    config.fused_mlp = False  # We don't have fused MLP for "gelu" activation
+    config.fused_dropout_add_ln = False
     config.residual_in_fp32 = True
 
     if not torch.distributed.is_initialized():
@@ -137,9 +116,7 @@ def test_llama_parallel(model_name, world_size):
     rank = parallel_state.get_tensor_model_parallel_rank()
     process_group = parallel_state.get_tensor_model_parallel_group()
 
-    ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
-    pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
-    pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
+    pretrained_state_dict = remap_state_dict_hf_falcon(state_dict_from_pretrained(model_name), config)
 
     model = GPTLMHeadModel(config, process_group=process_group, device=device, dtype=dtype)
     model.load_state_dict(shard_state_dict_tp(pretrained_state_dict, config, world_size, rank))
@@ -162,24 +139,23 @@ def test_llama_parallel(model_name, world_size):
     del model
 
     if rank == 0:
+        model_hf = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=dtype, device_map="auto", trust_remote_code=True
+        )
+        model_hf.eval()
+        out_hf = model_hf.transformer(input_ids).last_hidden_state.to(device=device)
+        logits_hf = model_hf(input_ids).logits.to(device=device)
+        del model_hf
+
         # Without device_map, the model is loaded on the CPU, which is very slow
-        model_ref = LlamaForCausalLM.from_pretrained(
-            Path(checkpoint_path) / f'{model_name}-hf', device_map="auto"
+        model_ref = AutoModelForCausalLM.from_pretrained(
+            model_name, device_map="auto", trust_remote_code=True
         )
         model_ref.eval()
         with torch.no_grad():
-            out_ref = model_ref.model(input_ids).last_hidden_state.to(device=device)
+            out_ref = model_ref.transformer(input_ids).last_hidden_state.to(device=device)
             logits_ref = model_ref(input_ids).logits.to(device=device)
         del model_ref
-
-        model_hf = LlamaForCausalLM.from_pretrained(
-            Path(checkpoint_path) / f'{model_name}-hf', torch_dtype=dtype, device_map="auto"
-        )
-        model_hf.eval()
-        with torch.no_grad():
-            out_hf = model_hf.model(input_ids).last_hidden_state.to(device=device)
-            logits_hf = model_hf(input_ids).logits.to(device=device)
-        del model_hf
 
         print(f'Output max diff: {(out - out_ref).abs().max().item()}')
         print(f'Output mean diff: {(out - out_ref).abs().mean().item()}')
@@ -194,22 +170,23 @@ def test_llama_parallel(model_name, world_size):
         assert (logits - logits_ref).abs().max().item() < 2 * (logits_hf - logits_ref).abs().max().item()
 
 
-# @pytest.mark.parametrize('model_name', ["7B", "13B"])
-@pytest.mark.parametrize('model_name', ["7B"])
-def test_llama_generation(model_name):
-    checkpoint_path = Path(os.environ.get('CHECKPOINT_DIR',
-                                          current_dir.parent.parent / 'checkpoints')) / 'llama'
-
+@pytest.mark.parametrize('model_name', ["tiiuae/falcon-7b"])
+def test_falcon_generation(model_name):
+    """Check that our implementation (with all optimizations enabled) matches the
+    HF implementation: the output of our forward pass in fp16 should be around the same as the HF
+    forward pass in fp16, when compared to the HF forward pass in fp32.
+    """
     dtype = torch.float16
     device = 'cuda'
-    config = llama_config_to_gpt2_config(config_from_checkpoint(checkpoint_path, model_name))
+    config = falcon_config_to_gpt2_config(AutoConfig.from_pretrained(model_name,
+                                                                     trust_remote_code=True))
     config.use_flash_attn = True
     config.fused_bias_fc = True
-    config.fused_mlp = False  # We don't have fused GatedMLP yet
+    config.fused_mlp = False  # We don't have fused MLP for "gelu" activation
     config.fused_dropout_add_ln = True
     config.residual_in_fp32 = True
 
-    tokenizer = LlamaTokenizer.from_pretrained(Path(checkpoint_path) / f'{model_name}-hf')
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     eos_token_id = tokenizer.eos_token_id
 
     torch.manual_seed(0)
@@ -219,8 +196,9 @@ def test_llama_generation(model_name):
     input_ids = torch.randint(0, config.vocab_size, (batch_size, seqlen), dtype=torch.long,
                               device=device)
 
-    model_hf = LlamaForCausalLM.from_pretrained(Path(checkpoint_path) / f'{model_name}-hf',
-                                                torch_dtype=dtype, device_map={"": device})
+    model_hf = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=dtype, device_map={"": device}, trust_remote_code=True
+    )
     model_hf.eval()
     print("HF fp16")
     torch.cuda.synchronize()
@@ -231,19 +209,15 @@ def test_llama_generation(model_name):
     print(f'Prompt processing + decoding time: {(time.time() - start) * 1000:.0f}ms')
     del model_hf
 
-    # Need auto here since the 13B fp32 model doesn't fit in memory on a A100 40GB
-    model_ref = LlamaForCausalLM.from_pretrained(Path(checkpoint_path) / f'{model_name}-hf',
-                                                 device_map='auto')
+    model_ref = AutoModelForCausalLM.from_pretrained(
+        model_name, device_map={"": device}, trust_remote_code=True
+    )
     model_ref.eval()
     with torch.no_grad():
-        logits_ref = model_ref(out_hf.sequences).logits[:, (seqlen - 1):-1].to(device=device)
+        logits_ref = model_ref(out_hf.sequences).logits[:, (seqlen - 1):-1]
     del model_ref
 
-    ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
-    pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
-    pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
-    model = GPTLMHeadModel(config, device=device, dtype=dtype)
-    model.load_state_dict(pretrained_state_dict)
+    model = GPTLMHeadModel.from_pretrained(model_name, config, device=device, dtype=dtype)
     model.eval()
 
     print('Without CUDA graph')
@@ -278,34 +252,33 @@ def test_llama_generation(model_name):
     del model
 
     hf_error = (logits_hf - logits_ref).abs().max().item()
+    assert (logits_parallel - logits_ref).abs().max().item() < 2 * hf_error
 
     print(f'HF fp16 logits max diff: {hf_error}')
     print(f'Logits max diff: {(logits - logits_ref).abs().max().item() }')
-    print(f'Logits CG max diff: {(logits_cg - logits_ref).abs().max().item() }')
-
-    assert (logits_parallel - logits_ref).abs().max().item() < 2 * hf_error
     assert (logits - logits_ref).abs().max().item() < 2 * hf_error
+    print(f'Logits CG max diff: {(logits_cg - logits_ref).abs().max().item() }')
     assert torch.equal(logits_cg, logits)
 
 
-# torchrun --no_python --nproc_per_node=2 pytest -q -s tests/models/test_llama.py -k "llama_parallel_generation"
-@pytest.mark.parametrize('world_size', [2])
-@pytest.mark.parametrize('model_name', ["13B"])
-def test_llama_parallel_generation(model_name, world_size):
+# torchrun --no_python --nproc_per_node=4 pytest -q -s tests/models/test_falcon.py -k "falcon_parallel_generation"
+# We want to run this on a machine with 4 x A100 80GB or 8 x A100 40GB so we have enough
+# memory to run the model in fp32.
+@pytest.mark.parametrize('world_size', [4])
+@pytest.mark.parametrize('model_name', ["tiiuae/falcon-40b"])
+def test_falcon_parallel_generation(model_name, world_size):
     """Check that our implementation matches the HF implementation:
     the scores in fp16 should be around the same as the HF scores in fp16, when compared to
     the HF scores in fp32.
     """
     from apex.transformer import parallel_state
 
-    checkpoint_path = Path(os.environ.get('CHECKPOINT_DIR',
-                                          current_dir.parent.parent / 'checkpoints')) / 'llama'
-
     dtype = torch.float16
-    config = llama_config_to_gpt2_config(config_from_checkpoint(checkpoint_path, model_name))
+    config = falcon_config_to_gpt2_config(AutoConfig.from_pretrained(model_name,
+                                                                     trust_remote_code=True))
     config.use_flash_attn = False
     config.fused_bias_fc = True
-    config.fused_mlp = False  # We don't have fused GatedMLP yet
+    config.fused_mlp = False  # We don't have fused MLP for "gelu" activation
     config.fused_dropout_add_ln = False
     config.residual_in_fp32 = True
     config.pad_vocab_size_multiple = 8 * world_size
@@ -331,9 +304,7 @@ def test_llama_parallel_generation(model_name, world_size):
     # GPU0 and GPU1 and things would hang
     torch.cuda.set_device(device)
 
-    ckpt_state_dicts = state_dicts_from_checkpoint(checkpoint_path, model_name)
-    pretrained_state_dicts = [remap_state_dict_meta_llama(s, config) for s in ckpt_state_dicts]
-    pretrained_state_dict = combine_state_dicts_tp(pretrained_state_dicts, config)
+    pretrained_state_dict = remap_state_dict_hf_falcon(state_dict_from_pretrained(model_name), config)
 
     model = GPTLMHeadModel(config, process_group=process_group, device=device, dtype=dtype)
     model.load_state_dict(shard_state_dict_tp(pretrained_state_dict, config, world_size, rank))
@@ -361,9 +332,8 @@ def test_llama_parallel_generation(model_name, world_size):
     parallel_state.destroy_model_parallel()
 
     if rank == 0:
-        # Without device_map, the model is loaded on the CPU, which is very slow
-        model_hf = LlamaForCausalLM.from_pretrained(
-            Path(checkpoint_path) / f'{model_name}-hf', torch_dtype=dtype, device_map="auto"
+        model_hf = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=dtype, device_map="auto", trust_remote_code=True
         )
         model_hf.eval()
         print("HF fp16")
@@ -378,8 +348,8 @@ def test_llama_parallel_generation(model_name, world_size):
         print(f'Prompt processing + decoding time: {(time.time() - start) * 1000:.0f}ms')
         del model_hf
 
-        model_ref = LlamaForCausalLM.from_pretrained(
-            Path(checkpoint_path) / f'{model_name}-hf', device_map="auto"
+        model_ref = AutoModelForCausalLM.from_pretrained(
+            model_name, device_map="auto", trust_remote_code=True
         )
         model_ref.eval()
         with torch.inference_mode():

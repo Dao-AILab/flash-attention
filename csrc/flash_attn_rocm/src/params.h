@@ -14,10 +14,6 @@
 
 #include "utils.h"
 
-constexpr int TOTAL_DIM = 0;
-constexpr int H_DIM = 1;
-constexpr int D_DIM = 2;
-
 struct QkvParams {
   using index_t = uint32_t;
   
@@ -71,8 +67,8 @@ struct FlashFwdParams : public QkvParams {
   float scale_softmax_log2;
 
   // array of length b+1 holding starting offset of each sequence.
-  int * __restrict__ cu_seqlens_q;
-  int * __restrict__ cu_seqlens_k;
+  int* __restrict__ cu_seqlens_q;
+  int* __restrict__ cu_seqlens_k;
 
   std::vector<int> host_seqlens_q;
   std::vector<int> host_seqlens_k;
@@ -94,7 +90,7 @@ struct FlashFwdParams : public QkvParams {
   at::PhiloxCudaState philox_args;
 
   // Pointer to the RNG seed (idx 0) and offset (idx 1).
-  uint64_t * rng_state;
+  uint64_t* rng_state;
 
   bool is_bf16;
   bool is_causal;

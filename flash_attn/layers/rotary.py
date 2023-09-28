@@ -1,6 +1,6 @@
 # Copyright (c) 2023, Tri Dao.
 
-from typing import Tuple
+from typing import Tuple, Optional
 import math
 
 import torch
@@ -151,6 +151,51 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
 apply_rotary_emb_qkv_ = ApplyRotaryEmbQKV_.apply
 
 
+class ApplyRotaryEmbKV_(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, kv, cos, sin, interleaved=False):
+        """
+            kv: (batch_size, seqlen, 2, nheads, headdim)
+            cos, sin: (seqlen, rotary_dim / 2)
+            interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead of
+                1st half and 2nd half (GPT-NeoX style).
+        rotary_dim must be <= headdim
+        Apply rotary embedding *inplace* to the first rotary_dim of k.
+        """
+        batch, seqlen, two, nheads, headdim = kv.shape
+        assert two == 2
+        rotary_seqlen, rotary_dim = cos.shape
+        rotary_dim *= 2
+        assert rotary_dim <= headdim
+        assert seqlen <= rotary_seqlen
+        k_ro = kv[:, :, 0, :, :rotary_dim]
+        k1, k2 = k_ro.chunk(2, dim=-1) if not interleaved else (k_ro[..., ::2], k_ro[..., 1::2])
+        rotary_emb.apply_rotary(k1, k2, rearrange(cos[:seqlen], 's d -> s 1 d'),
+                                rearrange(sin[:seqlen], 's d -> s 1 d'), k1, k2,
+                                False)  # conj=False since this is the forward pass
+        ctx.save_for_backward(cos, sin)
+        ctx.interleaved = interleaved
+        return kv
+
+    @staticmethod
+    def backward(ctx, dkv):
+        cos, sin = ctx.saved_tensors
+        _, seqlen, _, _, headdim = dkv.shape
+        rotary_dim = cos.shape[-1]
+        rotary_dim *= 2
+        dk_ro = dkv[:, :, 0, :, :rotary_dim]
+        dk1, dk2 = (dk_ro.chunk(2, dim=-1) if not ctx.interleaved
+                    else (dk_ro[..., ::2], dk_ro[..., 1::2]))
+        rotary_emb.apply_rotary(dk1, dk2, rearrange(cos[:seqlen], 's d -> s 1 d'),
+                                rearrange(sin[:seqlen], 's d -> s 1 d'), dk1, dk2,
+                                True)  # conj=True since this is the backward pass
+        return dkv, None, None, None
+
+
+apply_rotary_emb_kv_ = ApplyRotaryEmbKV_.apply
+
+
 class RotaryEmbedding(torch.nn.Module):
     """
     The rotary position embeddings from RoFormer_ (Su et. al).
@@ -191,12 +236,12 @@ class RotaryEmbedding(torch.nn.Module):
         self.pos_idx_in_fp32 = pos_idx_in_fp32
         # Generate and save the inverse frequency buffer (non trainable)
         inv_freq = self._compute_inv_freq(device)
-        self.register_buffer("inv_freq", inv_freq)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.interleaved = interleaved
         self.scale_base = scale_base
         scale = ((torch.arange(0, dim, 2, device=device, dtype=torch.float32) + 0.4 * dim)
                  / (1.4 * dim) if scale_base is not None else None)
-        self.register_buffer("scale", scale)
+        self.register_buffer("scale", scale, persistent=False)
 
         self._seq_len_cached = 0
         self._cos_cached = None
@@ -249,21 +294,43 @@ class RotaryEmbedding(torch.nn.Module):
                 self._cos_k_cached = (torch.cos(freqs) / scale).to(dtype)
                 self._sin_k_cached = (torch.sin(freqs) / scale).to(dtype)
 
-    def forward(self, qkv: torch.Tensor, seqlen_offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, qkv: torch.Tensor, kv: Optional[torch.Tensor] = None,
+                seqlen_offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        qkv: (batch, seqlen, 3, nheads, headdim)
+        qkv: (batch, seqlen, 3, nheads, headdim) if kv is none,
+             else it's just q of shape (batch, seqlen, nheads, headdim)
+        kv: (batch, seqlen, 2, nheads, headdim)
         seqlen_offset: can be used in generation where the qkv being passed in is only the last
         token in the batch.
         """
-        self._update_cos_sin_cache(qkv.shape[1] + seqlen_offset, device=qkv.device, dtype=qkv.dtype)
-        if self.scale is None:
-            return apply_rotary_emb_qkv_(
-                qkv, self._cos_cached[seqlen_offset:], self._sin_cached[seqlen_offset:],
-                None, None, self.interleaved
-            )
+        seqlen = qkv.shape[1]
+        self._update_cos_sin_cache(seqlen + seqlen_offset, device=qkv.device, dtype=qkv.dtype)
+        if kv is None:
+            if self.scale is None:
+                return apply_rotary_emb_qkv_(
+                    qkv, self._cos_cached[seqlen_offset:], self._sin_cached[seqlen_offset:],
+                    None, None, self.interleaved
+                )
+            else:
+                return apply_rotary_emb_qkv_(
+                    qkv, self._cos_cached[seqlen_offset:], self._sin_cached[seqlen_offset:],
+                    self._cos_k_cached[seqlen_offset:], self._sin_k_cached[seqlen_offset:],
+                    self.interleaved
+                )
         else:
-            return apply_rotary_emb_qkv_(
-                qkv, self._cos_cached[seqlen_offset:], self._sin_cached[seqlen_offset:],
-                self._cos_k_cached[seqlen_offset:], self._sin_k_cached[seqlen_offset:],
-                self.interleaved
+            q = qkv
+            q = apply_rotary_emb_func(
+                q, self._cos_cached[seqlen_offset:], self._sin_cached[seqlen_offset:],
+                self.interleaved, True
             )
+            if self.scale is None:
+                kv = apply_rotary_emb_kv_(
+                    kv, self._cos_cached[seqlen_offset:], self._sin_cached[seqlen_offset:],
+                    self.interleaved
+                )
+            else:
+                kv = apply_rotary_emb_kv_(
+                    kv, self._cos_k_cached[seqlen_offset:], self._sin_k_cached[seqlen_offset:],
+                    self.interleaved
+                )
+            return q, kv

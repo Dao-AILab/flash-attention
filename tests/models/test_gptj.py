@@ -20,10 +20,8 @@ def test_gptj_state_dict(model_name):
     pretrained_state_dict = remap_state_dict_hf_gptj(state_dict_from_pretrained(model_name), config)
     model = GPTLMHeadModel(config, device='meta')  # Without device='meta' init is very slow
     state_dict = model.state_dict()
-    rotary_inv_freq_keys = {f'transformer.layers.{l}.mixer.rotary_emb.inv_freq'
-                            for l in range(config.n_layer)}
-    assert state_dict.keys() == pretrained_state_dict.keys() | rotary_inv_freq_keys
-    for k in state_dict.keys() - rotary_inv_freq_keys:
+    assert state_dict.keys() == pretrained_state_dict.keys()
+    for k in state_dict.keys():
         assert state_dict[k].shape == pretrained_state_dict[k].shape
 
 
@@ -36,7 +34,7 @@ def test_gptj_optimized(model_name):
     dtype = torch.float16
     device = 'cuda'
     config = gptj_config_to_gpt2_config(GPTJConfig.from_pretrained(model_name))
-    config.use_flash_attn = False  # FlashAttention doesn't support hdim 256 yet
+    config.use_flash_attn = True  # FlashAttention-2 supports headdim 256
     config.fused_bias_fc = True
     config.fused_mlp = True
     config.fused_dropout_add_ln = True
@@ -48,7 +46,6 @@ def test_gptj_optimized(model_name):
     torch.manual_seed(0)
     batch_size = 2
     max_seqlen = 256
-    seqlens = torch.randint(max_seqlen // 2, max_seqlen + 1, (batch_size,), device=device)
     input_ids = torch.randint(0, config.vocab_size, (batch_size, max_seqlen), dtype=torch.long,
                               device=device)
     with torch.no_grad():
@@ -93,7 +90,7 @@ def test_gptj_generation(model_name):
     dtype = torch.float16
     device = 'cuda'
     config = gptj_config_to_gpt2_config(GPTJConfig.from_pretrained(model_name))
-    config.use_flash_attn = False  # FlashAttention doesn't support hdim 256 yet
+    config.use_flash_attn = True  # FlashAttention-2 supports headdim 256
     config.fused_bias_fc = True
     config.fused_mlp = True
     config.fused_dropout_add_ln = True

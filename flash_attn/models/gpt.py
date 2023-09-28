@@ -18,7 +18,8 @@ from einops import rearrange
 
 from flash_attn.ops.activations import sqrelu_fwd
 from flash_attn.modules.mha import MHA, ParallelMHA
-from flash_attn.modules.mlp import Mlp, GatedMlp, FusedMLP, ParallelFusedMLP
+from flash_attn.modules.mlp import Mlp, ParallelMLP, FusedMLP, ParallelFusedMLP
+from flash_attn.modules.mlp import GatedMlp, ParallelGatedMlp
 from flash_attn.modules.block import Block, ParallelBlock
 from flash_attn.modules.embedding import GPT2Embeddings, ParallelGPT2Embeddings
 from flash_attn.utils.distributed import sync_shared_params, all_gather_raw
@@ -27,6 +28,7 @@ from flash_attn.utils.generation import GenerationMixin
 from flash_attn.models.opt import remap_state_dict_hf_opt
 from flash_attn.models.gptj import remap_state_dict_hf_gptj
 from flash_attn.models.gpt_neox import remap_state_dict_hf_gpt_neox
+from flash_attn.models.falcon import remap_state_dict_hf_falcon
 
 try:
     from flash_attn.ops.fused_dense import ColumnParallelLinear
@@ -88,7 +90,9 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
     parallel_kwargs = ({'process_group': process_group,
                         'sequence_parallel': getattr(config, 'sequence_parallel', True)}
                        if process_group is not None else {})
+    num_heads_kv = getattr(config, "n_head_kv", None)
     mixer_cls = partial(mha_cls, num_heads=config.num_attention_heads,
+                        num_heads_kv=num_heads_kv,
                         qkv_proj_bias=qkv_proj_bias, out_proj_bias=out_proj_bias,
                         dropout=config.attn_pdrop,
                         softmax_scale=softmax_scale, causal=True, layer_idx=layer_idx,
@@ -112,17 +116,20 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
         assert config.activation_function == 'sqrelu', ('fused_dense_sqrelu_dense only '
                                                'supports approximate activation_function sqrelu')
     assert not (fused_dense_sqrelu_dense and fused_mlp)
-    if process_group is not None:
-        assert fused_mlp, 'Tensor Parallel is only implemented for FusedMLP'
     if not fused_mlp and not fused_dense_sqrelu_dense:
-        assert config.activation_function in ['gelu_new', 'gelu_fast', 'gelu_approx', 'relu',
+        assert config.activation_function in ['gelu', 'gelu_new', 'gelu_fast', 'gelu_approx', 'relu',
                                               'sqrelu', 'glu', 'swiglu', 'geglu']
         if config.activation_function in ['glu', 'swiglu', 'geglu']:
             activation = (F.sigmoid if config.activation_function == 'glu'
                           else (F.silu if config.activation_function == 'swiglu'
                                 else F.gelu))
-            mlp_cls = partial(GatedMlp, hidden_features=config.n_inner, activation=activation,
-                              bias1=mlp_fc1_bias, bias2=mlp_fc2_bias, **factory_kwargs)
+            mlp_cls = GatedMlp if process_group is None else ParallelGatedMlp
+            parallel_kwargs = ({'process_group': process_group,
+                                'sequence_parallel': getattr(config, 'sequence_parallel', True)}
+                               if process_group is not None else {})
+            mlp_cls = partial(mlp_cls, hidden_features=config.n_inner, activation=activation,
+                              bias1=mlp_fc1_bias, bias2=mlp_fc2_bias,
+                              **parallel_kwargs, **factory_kwargs)
         else:
             if config.activation_function == 'relu':
                 activation = partial(F.relu, inplace=True)
@@ -132,8 +139,13 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
                 approximate = ('tanh' if config.activation_function
                             in ['gelu_new', 'gelu_fast', 'gelu_approx'] else 'none')
                 activation=partial(F.gelu, approximate=approximate)
-            mlp_cls = partial(Mlp, hidden_features=config.n_inner, activation=activation,
-                              bias1=mlp_fc1_bias, bias2=mlp_fc2_bias, **factory_kwargs)
+            mlp_cls = Mlp if process_group is None else ParallelMLP
+            parallel_kwargs = ({'process_group': process_group,
+                                'sequence_parallel': getattr(config, 'sequence_parallel', True)}
+                               if process_group is not None else {})
+            mlp_cls = partial(mlp_cls, hidden_features=config.n_inner, activation=activation,
+                              bias1=mlp_fc1_bias, bias2=mlp_fc2_bias,
+                              **parallel_kwargs, **factory_kwargs)
     else:
         mlp_checkpoint_lvl = getattr(config, 'mlp_checkpoint_lvl', 0)
         # mlp_checkpoint_lvl could be a list, which contains the checkpoint_lvl for each layer
@@ -154,6 +166,8 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
                               bias1=mlp_fc1_bias, bias2=mlp_fc2_bias,
                               **parallel_kwargs, **factory_kwargs)
         elif fused_dense_sqrelu_dense:
+            if process_group is not None:
+                assert fused_mlp, 'Tensor Parallel is not implemented for FusedDenseSqreluDense'
             assert FusedDenseSqreluDense is not None
             mlp_cls = partial(FusedDenseSqreluDense, hidden_features=config.n_inner,
                               checkpoint_lvl=mlp_checkpoint_lvl, **factory_kwargs)
@@ -234,9 +248,10 @@ class GPTPreTrainedModel(nn.Module):
             state_dict = remap_state_dict_hf_opt(state_dict, config)
         elif model_name.startswith('EleutherAI/gpt-j-'):
             state_dict = remap_state_dict_hf_gptj(state_dict, config)
-            strict = False  # We have rotary_emb.inf_freq buffers not in the GPT-J checkpoint
         elif model_name.startswith('EleutherAI/gpt-neox-'):
             state_dict = remap_state_dict_hf_gpt_neox(state_dict, config)
+        elif model_name.startswith('tiiuae/falcon-'):
+            state_dict = remap_state_dict_hf_falcon(state_dict, config)
         else:
             raise NotImplementedError(f'Model {model_name} not supported')
         if world_size > 1:
@@ -501,20 +516,46 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
     assert inner_dim % world_size == 0
 
     def shard_first_dim(state_dict, key):
-        x = state_dict[key]
-        dim = x.shape[0] // world_size
-        state_dict[key] = x[rank * dim:(rank + 1) * dim]
+        if key in state_dict:
+            x = state_dict[key]
+            dim = x.shape[0] // world_size
+            state_dict[key] = x[rank * dim:(rank + 1) * dim]
 
     def shard_last_dim(state_dict, key):
-        x = state_dict[key]
-        dim = x.shape[-1] // world_size
-        state_dict[key] = x[..., rank * dim:(rank + 1) * dim]
+        if key in state_dict:
+            x = state_dict[key]
+            dim = x.shape[-1] // world_size
+            state_dict[key] = x[..., rank * dim:(rank + 1) * dim]
+
+    def shard_gatedmlp_fc1_dim(state_dict, key):
+        if key in state_dict:
+            x = state_dict[key]
+            dim = x.shape[0] // world_size // 2
+            state_dict[key] = rearrange(
+                rearrange(x, "(two o) ... -> two o ...", two=2)[:, rank * dim:(rank + 1) * dim],
+                "two o ... -> (two o) ..."
+            )
 
     def shard_qkv_headdim(state_dict, key):
-        x = rearrange(state_dict[key], '(three d) ... -> three d ...', three=3)
-        dim = x.shape[1] // world_size
-        state_dict[key] = rearrange(x[:, rank * dim:(rank + 1) * dim],
-                                    'three d ... -> (three d) ...')
+        if key in state_dict:
+            n_head = config.n_head
+            n_head_kv = getattr(config, 'n_head_kv', n_head)
+            assert n_head % world_size == 0 and n_head_kv % world_size == 0
+            if n_head_kv == n_head:
+                x = rearrange(state_dict[key], '(three d) ... -> three d ...', three=3)
+                dim = x.shape[1] // world_size
+                state_dict[key] = rearrange(x[:, rank * dim:(rank + 1) * dim],
+                                            'three d ... -> (three d) ...')
+            else:
+                n_head_per_rank = n_head // world_size
+                n_head_kv_per_rank = n_head_kv // world_size
+                x = rearrange(state_dict[key], '(nheadqkv headdim) ... -> nheadqkv headdim ...',
+                              nheadqkv=n_head + 2 * n_head_kv)
+                state_dict[key] = rearrange(torch.cat([
+                    x[rank * n_head_per_rank:(rank + 1) * n_head_per_rank],
+                    x[n_head + rank * n_head_kv_per_rank:n_head + (rank + 1) * n_head_kv_per_rank],
+                    x[n_head + n_head_kv + rank * n_head_kv_per_rank:n_head + n_head_kv + (rank + 1) * n_head_kv_per_rank],
+                ], dim=0), "nheadqkv headdim ... -> (nheadqkv headdim) ...")
 
     shard_first_dim(state_dict, 'transformer.embeddings.word_embeddings.weight')
     if 'lm_head.weight' in state_dict:
@@ -526,12 +567,16 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
         shard_qkv_headdim(state_dict, f'transformer.layers.{i}.mixer.Wqkv.bias')
         shard_last_dim(state_dict, f'transformer.layers.{i}.mixer.out_proj.weight')
         if rank != 0:
-            state_dict.pop(f'transformer.layers.{i}.mixer.out_proj.bias')
-        shard_first_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.weight')
-        shard_first_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.bias')
+            state_dict.pop(f'transformer.layers.{i}.mixer.out_proj.bias', None)
+        if config.activation_function in ["glu", "swiglu", "geglu"]:
+            shard_gatedmlp_fc1_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.weight')
+            shard_gatedmlp_fc1_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.bias')
+        else:
+            shard_first_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.weight')
+            shard_first_dim(state_dict, f'transformer.layers.{i}.mlp.fc1.bias')
         shard_last_dim(state_dict, f'transformer.layers.{i}.mlp.fc2.weight')
         if rank != 0:
-            state_dict.pop(f'transformer.layers.{i}.mlp.fc2.bias')
+            state_dict.pop(f'transformer.layers.{i}.mlp.fc2.bias', None)
     return state_dict
 
 
@@ -559,9 +604,23 @@ def combine_state_dicts_tp(state_dicts, config):
             state_dict[key] = torch.cat([s[key] for s in state_dicts], dim=dim)
 
     def combine_qkv_headdim(state_dicts, state_dict, key):
+        n_head = config.n_head
+        n_head_kv = getattr(config, 'n_head_kv', n_head)
+        assert n_head % world_size == 0 and n_head_kv % world_size == 0
+        n_head_per_rank = n_head // world_size
+        n_head_kv_per_rank = n_head_kv // world_size
         if key in state_dict:
-            xs = [rearrange(s[key], '(three d) ... -> three d ...', three=3) for s in state_dicts]
-            state_dict[key] = rearrange(torch.cat(xs, dim=1), 'three d ... -> (three d) ...')
+            if n_head_kv == n_head:
+                xs = [rearrange(s[key], '(three d) ... -> three d ...', three=3) for s in state_dicts]
+                state_dict[key] = rearrange(torch.cat(xs, dim=1), 'three d ... -> (three d) ...')
+            else:
+                xs = [rearrange(s[key], '(nheadqkv headdim) ... -> nheadqkv headdim ...',
+                                nheadqkv=n_head + 2 * n_head_kv) for s in state_dicts]
+                state_dict[key] = rearrange(torch.cat([
+                    torch.cat([x[:n_head_per_rank] for x in xs], dim=0),
+                    torch.cat([x[n_head_per_rank:n_head_per_rank + n_head_kv_per_rank] for x in xs], dim=0),
+                    torch.cat([x[-n_head_kv_per_rank:] for x in xs], dim=0),
+                ], dim=0), "nheadqkv headdim ... -> (nheadqkv headdim) ...")
 
     def combine_gated_mlp(state_dicts, state_dict, key):
         if key in state_dict:

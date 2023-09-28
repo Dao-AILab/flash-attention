@@ -24,6 +24,7 @@ var/
 .vscode/settings.
 
 # Generated files
-csrc/flash_attn_rocm/fmha_api.cu
 csrc/flash_attn_rocm/src/*.cu
-csrc/flash_attn_rocm/fmha_api.hip
+csrc/flash_attn_rocm/src/*.hip
+csrc/flash_attn_rocm/*.cu
+csrc/flash_attn_rocm/*.hip

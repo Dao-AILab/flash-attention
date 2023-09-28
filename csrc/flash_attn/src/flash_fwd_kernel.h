@@ -130,6 +130,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // The thread index.
     const int tidx = threadIdx.x;
+    // The global block index.
+    const int block_id = blockIdx.x + blockIdx.y * gridDim.x + gridDim.x * gridDim.y * blockIdx.z;
 
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
@@ -307,6 +309,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     auto seeds = at::cuda::philox::unpack(params.philox_args);
     unsigned long long seed = std::get<0>(seeds);
     unsigned long long offset = std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + tidx % 32;
+
+    // Save seed and offset for backward.
+    if (block_id == 0 && tidx == 0) {
+        params.rng_state[0] = seed;
+        params.rng_state[1] = std::get<1>(seeds);
+    }
 
     clear(acc_o);
 

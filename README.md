@@ -42,7 +42,7 @@ To install:
 3. Make sure that `ninja` is installed and that it works correctly (e.g. `ninja
 --version` then `echo $?` should return exit code 0). If not (sometimes `ninja
 --version` then `echo $?` returns a nonzero exit code), uninstall then reinstall
-`ninja` (`pip uninstall -y ninja && pip install ninja`). Without `ninja`
+`ninja` (`pip uninstall -y ninja && pip install ninja`). Without `ninja`,
 compiling can take a very long time (2h) since it does not use multiple CPU
 cores. With `ninja` compiling takes 3-5 minutes on a 64-core machine.
 4. Then:
@@ -50,8 +50,16 @@ cores. With `ninja` compiling takes 3-5 minutes on a 64-core machine.
 pip install flash-attn --no-build-isolation
 ```
 Alternatively you can compile from source:
-```
+```sh
 python setup.py install
+```
+
+If your machine has less than 96GB of RAM and lots of CPU cores, `ninja` might
+run too many parallel compilation jobs that could exhaust the amount of RAM. To
+limit the number of parallel compilation jobs, you can set the environment
+variable `MAX_JOBS`:
+```sh
+MAX_JOBS=4 pip install flash-attn --no-build-isolation
 ```
 
 Interface: `src/flash_attention_interface.py`
@@ -68,11 +76,11 @@ FlashAttention-2 currently supports:
 
 The main functions implement scaled dot product attention (softmax(Q @ K^T *
 softmax_scale) @ V):
-```
+```python
 from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
 ```
 
-```
+```python
 flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False):
 """dropout_p should be set to 0.0 during evaluation
 If Q, K, V are already stacked into 1 tensor, this function will be faster than
@@ -86,13 +94,14 @@ Arguments:
     causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
 Return:
     out: (batch_size, seqlen, nheads, headdim).
+"""
 ```
 
-```
+```python
 flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False):
 """dropout_p should be set to 0.0 during evaluation
 Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
-than Q. Note that the number of heads in KV must be divisible by the number of heads in Q.
+than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
 For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
 0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
 
@@ -106,6 +115,7 @@ Arguments:
     causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
 Return:
     out: (batch_size, seqlen, nheads, headdim).
+"""
 ```
 
 To see how these functions are used in a multi-head attention layer (which
@@ -120,10 +130,10 @@ These functions have been renamed:
 
 If the inputs have the same sequence lengths in the same batch, it is simpler
 and faster to use these functions:
+```python
+flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False)
 ```
-flash_attn_qkvpacked_func(qkv, dropout_p, softmax_scale=None, causal=False)
-```
-```
+```python
 flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False)
 ```
 
@@ -197,7 +207,7 @@ of a baseline implementation in Pytorch (for different head dimensions, input
 dtype, sequence length, causal / non-causal).
 
 To run the tests:
-```
+```sh
 pytest -q -s tests/test_flash_attn.py
 ```
 
@@ -295,10 +305,10 @@ FlashAttention currently supports:
 
 ## When you encounter issues
 
-This new release of FlashAttention-2 have been tested on several GPT-style
+This new release of FlashAttention-2 has been tested on several GPT-style
 models, mostly on A100 GPUs.
 
-If you encounter any of bugs, please open a respective GitHub Issue!
+If you encounter bugs, please open a GitHub Issue!
 
 ## Citation
 If you use this codebase, or otherwise found our work valuable, please cite:

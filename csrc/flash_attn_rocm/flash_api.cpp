@@ -5,6 +5,7 @@
 // 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
 // 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
 
+#include <ATen/ATen.h>
 #include <torch/extension.h>
 #include <ATen/hip/HIPContext.h>
 #include <c10/hip/HIPGuard.h>
@@ -16,17 +17,20 @@
 
 // get environment variables for internal usage
 inline bool get_env_(const char* env_var) {
-  char* res = std::getenv(env_var);
-  if (res[0] == '0' || res == NULL) { return false; }
-  else { return true; }
+  if (char* value = std::getenv(env_var)) { 
+    if (strcmp(value, "0") == 0) { return false; }
+    return true;
+  }
+  return false;
 }
 
 bool IS_UNIT_TEST_MODE = get_env_("FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE");
-bool IS_DETERMINISITC = get_env_("FLASH_ATTENTION_INTERNAL_DETERMINISTIC");
+bool IS_DETERMINISTIC = get_env_("FLASH_ATTENTION_INTERNAL_DETERMINISTIC");
 
-auto flash_runner = std::make_unique<FlashRunner>(IS_UNIT_TEST_MODE, IS_DETERMINISITC);
+auto flash_runner = std::make_unique<FlashRunner>(IS_UNIT_TEST_MODE, IS_DETERMINISTIC);
 
-void set_params_fprop(FlashFwdParams &params,
+void set_params_fprop(bool is_dgrad, // is setting params for dgrad
+                      FlashFwdParams &params,
                       // sizes
                       const size_t b,
                       const size_t seqlen_q,
@@ -42,10 +46,10 @@ void set_params_fprop(FlashFwdParams &params,
                       const at::Tensor k,
                       const at::Tensor v,
                       at::Tensor out,
-                      void *cu_seqlens_q_d,
-                      void *cu_seqlens_k_d,
-                      void *p_d,
-                      void *softmax_lse_d,
+                      void* cu_seqlens_q_d,
+                      void* cu_seqlens_k_d,
+                      void* p_d,
+                      void* softmax_lse_d,
                       float p_dropout,
                       float softmax_scale,
                       bool is_causal) {
@@ -53,6 +57,19 @@ void set_params_fprop(FlashFwdParams &params,
     memset(&params, 0, sizeof(params));
 
     params.is_bf16 = q.dtype() == torch::kBFloat16;
+    
+    // Set the dimensions.
+    params.b = b;
+    params.h = h;
+    params.h_k = h_k;
+    params.h_h_k_ratio = h / h_k;
+    params.seqlen_q = seqlen_q;
+    params.seqlen_k = seqlen_k;
+    params.seqlen_q_rounded = seqlen_q_rounded;
+    params.seqlen_k_rounded = seqlen_k_rounded;
+    params.d = d;
+    params.d_rounded = d_rounded;
+    params.is_mnko_padding = false;    // MNKOpadding
 
     // Set the pointers and strides.
     char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
@@ -79,85 +96,63 @@ void set_params_fprop(FlashFwdParams &params,
     params.cu_seqlens_q = static_cast<int*>(cu_seqlens_q_d);
     params.cu_seqlens_k = static_cast<int*>(cu_seqlens_k_d);
 
-    // if(params.cu_seqlens_q->is_cuda()) {
-        params.host_seqlens_q = std::vector<int>(params.b+1);
-        params.host_seqlens_k = std::vector<int>(params.b+1);
-        FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_q.data(), cu_seqlens_q_d, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
-        FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_k.data(), cu_seqlens_k_d, (params.b+1)*sizeof(int), hipMemcpyDeviceToHost));
-    // } else {
-        // params.host_seqlens_q = std::vector<int>(static_cast<int*>(cu_seqlens_q_d), static_cast<int*>(cu_seqlens_q_d)+params.b+1);
-        // params.host_seqlens_k = std::vector<int>(static_cast<int*>(cu_seqlens_k_d), static_cast<int*>(cu_seqlens_k_d)+params.b+1);
-    // }
-
+    if(cu_seqlens_q_d != nullptr) {
+      params.host_seqlens_q = std::vector<int>(b+1);
+      params.host_seqlens_k = std::vector<int>(b+1);
+      FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_q.data(), cu_seqlens_q_d, (b+1)*sizeof(int), hipMemcpyDeviceToHost));
+      FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_k.data(), cu_seqlens_k_d, (b+1)*sizeof(int), hipMemcpyDeviceToHost));
+    }
+ 
     // P = softmax(QK^T)
     char* p_ptr = reinterpret_cast<char*>(p_d);
 
     // Softmax sum
     char* softmax_lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
 
-    // Set the dimensions.
-    params.b = b;
-    params.h = h;
-    params.h_k = h_k;
-    params.h_h_k_ratio = h / h_k;
-    params.seqlen_q = seqlen_q;
-    params.seqlen_k = seqlen_k;
-    params.seqlen_q_rounded = seqlen_q_rounded;
-    params.seqlen_k_rounded = seqlen_k_rounded;
-    params.d = d;
-    params.d_rounded = d_rounded;
-    params.is_mnko_padding = false;    // MNKOpadding
-
-    if(!params.is_mnko_padding && d <= 32){
-        params.is_mnko_padding = ((d % 32)==0 ? false : true);
-    }
-    else if(!params.is_mnko_padding && d <= 64){
-        params.is_mnko_padding = ((d % 64)==0 ? false : true);
-    }
-    else if(!params.is_mnko_padding && d <= 128){
-        params.is_mnko_padding = ((d % 128)==0 ? false : true);
-    }
-    else{
-        std::cout << "Unsupported head dimension" << std::endl;
+    if(!params.is_mnko_padding && d <= 32) {
+      params.is_mnko_padding = ((d % 32)==0 ? false : true);
+    } else if(!params.is_mnko_padding && d <= 64) {
+      params.is_mnko_padding = ((d % 64)==0 ? false : true);
+    } else if(!params.is_mnko_padding && d <= 128) {
+      params.is_mnko_padding = ((d % 128)==0 ? false : true);
+    } else {
+      std::cout << "Unsupported head dimension" << std::endl;
     }
 
-    if(q.is_contiguous() && k.is_contiguous() && v.is_contiguous()){  
-        params.q_stride_multiplier = 1;
-        params.kv_stride_multiplier = 1;
-    }
-    else if(q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()){
-        params.q_stride_multiplier = 1;
-        params.kv_stride_multiplier = 2;
-    }
-    else if(!q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()){
-        params.q_stride_multiplier = 3;
-        params.kv_stride_multiplier = 3;
-    }
-    else{
-        std::cout<< "Wrong matrix inputs." <<std::endl;
+    if(q.is_contiguous() && k.is_contiguous() && v.is_contiguous()) {  
+      params.q_stride_multiplier = 1;
+      params.kv_stride_multiplier = 1;
+    } else if(q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()) {
+      params.q_stride_multiplier = 1;
+      params.kv_stride_multiplier = 2;
+    } else if(!q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()) {
+      params.q_stride_multiplier = 3;
+      params.kv_stride_multiplier = 3;
+    } else {
+      std::cout<< "Wrong matrix inputs." <<std::endl;
     }
 
-    for (int i = 0; i < params.b; i++){
-        int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
-        int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, q.dtype());
-        int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
-        int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, q.dtype());
+    for (int i = 0; i < b; i++) {
+      int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
+      int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, q.dtype());
+      int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
+      int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, q.dtype());
 
-        if(!params.is_mnko_padding && d <= 32){
-            params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+      if(!params.is_mnko_padding && d <= 32) {
+        params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+      } else if(!params.is_mnko_padding && d <= 64) {
+        if(p_dropout > 0.0) {
+          params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+        } else {
+          params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 256)==0 ? false : true);
         }
-        else if(!params.is_mnko_padding && d <= 64){
-            if(p_dropout > 0.0){
-                params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
-            }
-            else{
-                params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 256)==0 ? false : true);
-            }
-        }
-        else if(!params.is_mnko_padding && d <= 128){
-            params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
-        }
+      } else if(!params.is_mnko_padding && d <= 128) {
+        params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+      }
 
+      // only set qkv when it is (not dgrad) or is (dgrad in performance mode)
+      // boolean expression ~X + X(~Y) = ~X + ~Y
+      if (!is_dgrad || !IS_UNIT_TEST_MODE) {
         params.q_ptrs.push_back(reinterpret_cast<void*>(q_ptr));
         q_ptr = q_ptr + temp_q_stride * params.q_stride_multiplier;
 
@@ -166,20 +161,21 @@ void set_params_fprop(FlashFwdParams &params,
 
         params.v_ptrs.push_back(reinterpret_cast<void*>(v_ptr));     
         v_ptr = v_ptr + temp_k_stride * params.kv_stride_multiplier;
+      }
 
-        params.out_ptrs.push_back(reinterpret_cast<void*>(out_ptr));
-        out_ptr = out_ptr + temp_q_stride;
+      params.out_ptrs.push_back(reinterpret_cast<void*>(out_ptr));
+      out_ptr = out_ptr + temp_q_stride;
 
-        params.softmax_lse_ptrs.push_back(reinterpret_cast<void*>(softmax_lse_ptr));
-        int temp_lse_stride = get_size_in_bytes(h * seqlen_q, torch::kFloat32);
-        softmax_lse_ptr = softmax_lse_ptr + temp_lse_stride;
+      params.softmax_lse_ptrs.push_back(reinterpret_cast<void*>(softmax_lse_ptr));
+      int temp_lse_stride = get_size_in_bytes(h * seqlen_q, torch::kFloat32);
+      softmax_lse_ptr = softmax_lse_ptr + temp_lse_stride;
 
-        if(p_d){
-            params.p_ptrs.push_back(reinterpret_cast<void*>(p_ptr + i * h * seqlen_q * seqlen_k * sizeof(int)));
-        }
-        else{
-            params.p_ptrs.push_back(nullptr);
-        }
+      if(p_d) {
+        params.p_ptrs.push_back(reinterpret_cast<void*>(p_ptr + i * h * seqlen_q * seqlen_k * sizeof(int)));
+      }
+      else{
+        params.p_ptrs.push_back(nullptr);
+      }
     }
 
     // Set the different scale values.
@@ -222,17 +218,19 @@ void set_params_dgrad(FlashBwdParams &params,
                       at::Tensor dq,
                       at::Tensor dk,
                       at::Tensor dv,
-                      void *cu_seqlens_q_d,
-                      void *cu_seqlens_k_d,
-                      void *dq_accum_d,
-                      void *dk_accum_d,
-                      void *dv_accum_d,
-                      void *softmax_lse_d,
-                      void *dsoftmax_sum_d,
+                      void* cu_seqlens_q_d,
+                      void* cu_seqlens_k_d,
+                      void* dq_accum_d,
+                      void* dk_accum_d,
+                      void* dv_accum_d,
+                      void* softmax_lse_d,
+                      void* dsoftmax_sum_d,
                       float p_dropout,
                       float softmax_scale,
                       bool is_causal) {
-    set_params_fprop(params,
+                        
+    set_params_fprop(true,
+                     params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
                      q, k, v, out,
                      cu_seqlens_q_d,
@@ -242,11 +240,14 @@ void set_params_dgrad(FlashBwdParams &params,
                      p_dropout,
                      softmax_scale,
                      is_causal);
+
     char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
     char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
     char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
     // Set the pointers and strides.
     char* dout_ptr = reinterpret_cast<char*>(dout.data_ptr());
+    char* out_ptr = reinterpret_cast<char*>(out.data_ptr());
+    char* softmax_lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
     // params.do_row_stride = dout.stride(-3);
     // params.do_head_stride = dout.stride(-2);
     char* dq_ptr = reinterpret_cast<char*>(dq.data_ptr());
@@ -260,8 +261,8 @@ void set_params_dgrad(FlashBwdParams &params,
     // params.dv_head_stride = dv.stride(-2);
 
     if(IS_UNIT_TEST_MODE) {
-        params.q_stride_multiplier = 1;
-        params.kv_stride_multiplier = 1;
+      params.q_stride_multiplier = 1;
+      params.kv_stride_multiplier = 1;
     }
 
     // if (cu_seqlens_q_d == nullptr) {
@@ -271,70 +272,90 @@ void set_params_dgrad(FlashBwdParams &params,
     //     params.dv_batch_stride = dv.stride(0);
     // }
 
-    for (int i = 0; i < params.b; i++) {
-        int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
-        int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, q.dtype());
-        int temp_dq_stride = get_size_in_bytes(d * h * temp_seqlen_q, dq.dtype());
-        int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
-        int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, q.dtype());
-        int temp_dk_stride = get_size_in_bytes(d * h * temp_seqlen_k, dk.dtype());
+    for (int i = 0; i < b; i++) {
+      int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
+      int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, q.dtype());
+      int temp_dq_stride = get_size_in_bytes(d * h * temp_seqlen_q, dq.dtype());
+      int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
+      int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, q.dtype());
+      int temp_dk_stride = get_size_in_bytes(d * h * temp_seqlen_k, dk.dtype());
 
-        if(!IS_UNIT_TEST_MODE) {
-            params.dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));
-            dq_ptr = dq_ptr + temp_dq_stride * params.q_stride_multiplier;
+      if(!params.is_mnko_padding && d <= 32) {
+        params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+      }
+      else if(!params.is_mnko_padding && d <= 64) {
+        params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+      }
+      else if(!params.is_mnko_padding && d <= 128) {
+        params.is_mnko_padding = ((temp_seqlen_q % 64)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+      }
 
-            params.dk_ptrs.push_back(reinterpret_cast<void*>(dk_ptr));
-            dk_ptr = dk_ptr + temp_dk_stride * params.kv_stride_multiplier;
-
-            params.dv_ptrs.push_back(reinterpret_cast<void*>(dv_ptr));
-            dv_ptr = dv_ptr + temp_dk_stride * params.kv_stride_multiplier;
-        }
-        else{
-            if(q.is_contiguous()) {
-                params.q_ptrs.push_back(reinterpret_cast<void*>(q_ptr));
-                params.dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));
-                q_ptr = q_ptr + temp_q_stride;
-                dq_ptr = dq_ptr + temp_dq_stride;
-            } else {
-                auto q_each_tmp = q.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
-                auto qgrad_each_tmp = dq.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
-                params.q_tensors.push_back(q_each_tmp);
-                params.dq_tensors.push_back(qgrad_each_tmp);
-                params.q_ptrs.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
-                params.dq_ptrs.push_back(reinterpret_cast<void*>(qgrad_each_tmp.data_ptr()));
-            }
-            if(k.is_contiguous()) {
-                params.k_ptrs.push_back(reinterpret_cast<void*>(k_ptr));
-                params.dk_ptrs.push_back(reinterpret_cast<void*>(dk_ptr));
-                k_ptr = k_ptr + temp_k_stride;
-                dk_ptr = dk_ptr + temp_dk_stride;
-            } else {
-                auto k_each_tmp = k.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-                auto kgrad_each_tmp = dk.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-                params.k_tensors.push_back(k_each_tmp);
-                params.dk_tensors.push_back(kgrad_each_tmp);
-                params.k_ptrs.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
-                params.dk_ptrs.push_back(reinterpret_cast<void*>(kgrad_each_tmp.data_ptr()));
-            }
-            if(v.is_contiguous()) {
-                params.v_ptrs.push_back(reinterpret_cast<void*>(v_ptr)); 
-                params.dv_ptrs.push_back(reinterpret_cast<void*>(dv_ptr));
-                v_ptr = v_ptr + temp_k_stride;   
-                dv_ptr = dv_ptr + temp_dk_stride;
-            } else {
-                auto v_each_tmp = v.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-                auto vgrad_each_tmp = dv.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-                params.v_tensors.push_back(v_each_tmp);
-                params.dv_tensors.push_back(vgrad_each_tmp);
-                params.v_ptrs.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
-                params.dv_ptrs.push_back(reinterpret_cast<void*>(vgrad_each_tmp.data_ptr()));
-            }
+      // unit test mode
+      if(IS_UNIT_TEST_MODE) {
+        if(q.is_contiguous()) {
+          params.q_ptrs.push_back(reinterpret_cast<void*>(q_ptr));
+          params.dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));
+          q_ptr = q_ptr + temp_q_stride;
+          dq_ptr = dq_ptr + temp_dq_stride;
+        } else {
+          auto q_each_tmp = q.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
+          auto qgrad_each_tmp = dq.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
+          params.q_tensors.push_back(q_each_tmp);
+          params.dq_tensors.push_back(qgrad_each_tmp);
+          params.q_ptrs.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
+          params.dq_ptrs.push_back(reinterpret_cast<void*>(qgrad_each_tmp.data_ptr()));
         }
 
-        params.dout_ptrs.push_back(reinterpret_cast<const void*>(dout_ptr));
-        dout_ptr += temp_q_stride;
+        if(k.is_contiguous()) {
+          params.k_ptrs.push_back(reinterpret_cast<void*>(k_ptr));
+          params.dk_ptrs.push_back(reinterpret_cast<void*>(dk_ptr));
+          k_ptr = k_ptr + temp_k_stride;
+          dk_ptr = dk_ptr + temp_dk_stride;
+        } else {
+          auto k_each_tmp = k.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
+          auto kgrad_each_tmp = dk.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
+          params.k_tensors.push_back(k_each_tmp);
+          params.dk_tensors.push_back(kgrad_each_tmp);
+          params.k_ptrs.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
+          params.dk_ptrs.push_back(reinterpret_cast<void*>(kgrad_each_tmp.data_ptr()));
+        }
 
-        params.z_ptrs.push_back(nullptr);
+        if(v.is_contiguous()) {
+          params.v_ptrs.push_back(reinterpret_cast<void*>(v_ptr)); 
+          params.dv_ptrs.push_back(reinterpret_cast<void*>(dv_ptr));
+          v_ptr = v_ptr + temp_k_stride;   
+          dv_ptr = dv_ptr + temp_dk_stride;
+        } else {
+          auto v_each_tmp = v.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
+          auto vgrad_each_tmp = dv.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
+          params.v_tensors.push_back(v_each_tmp);
+          params.dv_tensors.push_back(vgrad_each_tmp);
+          params.v_ptrs.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
+          params.dv_ptrs.push_back(reinterpret_cast<void*>(vgrad_each_tmp.data_ptr()));
+        }
+      // performance mode
+      } else {
+        params.dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));
+        dq_ptr = dq_ptr + temp_dq_stride * params.q_stride_multiplier;
+
+        params.dk_ptrs.push_back(reinterpret_cast<void*>(dk_ptr));
+        dk_ptr = dk_ptr + temp_dk_stride * params.kv_stride_multiplier;
+
+        params.dv_ptrs.push_back(reinterpret_cast<void*>(dv_ptr));
+        dv_ptr = dv_ptr + temp_dk_stride * params.kv_stride_multiplier;
+      }
+
+      params.dout_ptrs.push_back(reinterpret_cast<const void*>(dout_ptr));
+      dout_ptr += temp_q_stride;
+
+      params.out_ptrs.push_back(reinterpret_cast<const void*>(out_ptr));
+      out_ptr = out_ptr + temp_q_stride;
+
+      params.softmax_lse_ptrs.push_back(reinterpret_cast<const void*>(softmax_lse_ptr));
+      int temp_lse_stride = get_size_in_bytes(h * seqlen_q, torch::kFloat32);
+      softmax_lse_ptr = softmax_lse_ptr + temp_lse_stride;
+
+      params.z_ptrs.push_back(nullptr);
     }
 
     // params.dq_accum_ptr = dq_accum_d;
@@ -437,7 +458,8 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
     }
 
     FlashFwdParams params;
-    set_params_fprop(params,
+    set_params_fprop(false,
+                     params,
                      batch_size,
                      seqlen_q, seqlen_k,
                      seqlen_q_rounded, seqlen_k_rounded,
@@ -591,7 +613,8 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
     }
 
     FlashFwdParams params;
-    set_params_fprop(params,
+    set_params_fprop(false,
+                     params,
                      batch_size,
                      max_seqlen_q, max_seqlen_k,
                      seqlen_q_rounded, seqlen_k_rounded,
@@ -736,12 +759,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         dv = torch::empty_like(k);
     }
 
-    if(IS_UNIT_TEST_MODE) {
-        dq = dq.to(torch::kFloat32);
-        dk = dk.to(torch::kFloat32);
-        dv = dv.to(torch::kFloat32);
-    }
-
     at::Tensor dout_padded;
     if (head_size_og % 8 != 0) {
         dout_padded = torch::nn::functional::pad(dout, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
@@ -776,6 +793,13 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         dv_expanded = dv;
     }
 
+    at::Tensor dq_tmp, dk_tmp, dv_tmp;
+    if(IS_UNIT_TEST_MODE) {
+      dq_tmp = dq.to(torch::kFloat32);
+      dk_tmp = dk_expanded.to(torch::kFloat32);
+      dv_tmp = dv_expanded.to(torch::kFloat32);
+    }
+
     FlashBwdParams params;
     set_params_dgrad(params,
                      batch_size,
@@ -804,9 +828,9 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = params.b * params.h * 32;
         
-    if ( rng_state.has_value() ) {
+    if (rng_state.has_value()) {
         params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
-    } else if( is_dropout ) {
+    } else if(is_dropout) {
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         params.philox_args = gen->philox_cuda_state(counter_offset);
@@ -827,6 +851,27 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         dq = dq.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
         dk = dk.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
         dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+    }
+
+    if(IS_UNIT_TEST_MODE) {
+      if(!q.is_contiguous()) {
+        dq_tmp.copy_(torch::cat(params.dq_tensors, 0).contiguous(), true);
+      }
+      if(dq.data_ptr() != dq_tmp.data_ptr()) {
+        dq.copy_(dq_tmp, true);
+      }
+      if(!k.is_contiguous()) {
+        dk_tmp.copy_(torch::cat(params.dk_tensors, 0).contiguous(), true);
+      }
+      if(dk.data_ptr() != dk_tmp.data_ptr()) {
+        dk.copy_(dk_tmp, true);
+      }
+      if(!v.is_contiguous()) {
+        dv_tmp.copy_(torch::cat(params.dv_tensors, 0).contiguous(), true);
+      }
+      if(dv.data_ptr() != dv_tmp.data_ptr()) {
+        dv.copy_(dv_tmp, true);
+      }
     }
 
     return { dq, dk, dv, softmax_d };
@@ -918,44 +963,40 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     at::Tensor dq, dk, dv;
     if (dq_.has_value()) {
-        dq = dq_.value();
-        TORCH_CHECK(dq.dtype() == q_dtype, "dq must have the same dtype as q");
-        TORCH_CHECK(dq.is_cuda(), "dq must be on ROCm device");
-        TORCH_CHECK(dq.stride(-1) == 1, "dq must have contiguous last dimension");
-        CHECK_SHAPE(dq, total_q, num_heads, head_size);
+      dq = dq_.value();
+      TORCH_CHECK(dq.dtype() == q_dtype, "dq must have the same dtype as q");
+      TORCH_CHECK(dq.is_cuda(), "dq must be on ROCm device");
+      TORCH_CHECK(dq.stride(-1) == 1, "dq must have contiguous last dimension");
+      CHECK_SHAPE(dq, total_q, num_heads, head_size);
     } else {
-        dq = torch::empty_like(q);
-    }
-    if (dk_.has_value()) {
-        dk = dk_.value();
-        TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
-        TORCH_CHECK(dk.is_cuda(), "dk must be on ROCm device");
-        TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
-        CHECK_SHAPE(dk, total_k, num_heads_k, head_size);
-    } else {
-        dk = torch::empty_like(k);
-    }
-    if (dv_.has_value()) {
-        dv = dv_.value();
-        TORCH_CHECK(dv.dtype() == q_dtype, "dv must have the same dtype as q");
-        TORCH_CHECK(dv.is_cuda(), "dv must be on ROCm device");
-        TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
-        CHECK_SHAPE(dv, total_k, num_heads_k, head_size);
-    } else {
-        dv = torch::empty_like(k);
+      dq = torch::empty_like(q);
     }
 
-    if(IS_UNIT_TEST_MODE) {
-        dq = dq.to(torch::kFloat32);
-        dk = dk.to(torch::kFloat32);
-        dv = dv.to(torch::kFloat32);
+    if (dk_.has_value()) {
+      dk = dk_.value();
+      TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
+      TORCH_CHECK(dk.is_cuda(), "dk must be on ROCm device");
+      TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
+      CHECK_SHAPE(dk, total_k, num_heads_k, head_size);
+    } else {
+      dk = torch::empty_like(k);
+    }
+
+    if (dv_.has_value()) {
+      dv = dv_.value();
+      TORCH_CHECK(dv.dtype() == q_dtype, "dv must have the same dtype as q");
+      TORCH_CHECK(dv.is_cuda(), "dv must be on ROCm device");
+      TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
+      CHECK_SHAPE(dv, total_k, num_heads_k, head_size);
+    } else {
+      dv = torch::empty_like(k);
     }
 
     at::Tensor dout_padded;
     if (head_size_og % 8 != 0) {
-        dout_padded = torch::nn::functional::pad(dout, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+      dout_padded = torch::nn::functional::pad(dout, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
     } else {
-        dout_padded = dout;
+      dout_padded = dout;
     }
 
     // bool loop = max_seqlen_k > blocksize_c;
@@ -970,44 +1011,73 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
     at::Tensor dq_accum;
     if (loop) {
-        dq_accum = torch::empty({batch_size, num_heads, seqlen_q_rounded, head_size_rounded}, opts.dtype(at::kFloat));
+      dq_accum = torch::empty({batch_size, num_heads, seqlen_q_rounded, head_size_rounded}, opts.dtype(at::kFloat));
     }
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
-        dk_expanded = torch::empty({total_k, num_heads, head_size}, opts);
-        dv_expanded = torch::empty({total_k, num_heads, head_size}, opts);
+      dk_expanded = torch::empty({total_k, num_heads, head_size}, opts);
+      dv_expanded = torch::empty({total_k, num_heads, head_size}, opts);
     } else {
-        dk_expanded = dk;
-        dv_expanded = dv;
+      dk_expanded = dk;
+      dv_expanded = dv;
     }
     
-    if( zero_tensors ) {
-        dq.zero_();
-        dk_expanded.zero_();
-        dv_expanded.zero_();
-        softmax_d.zero_();
+    if(zero_tensors) {
+      dq.zero_();
+      dk_expanded.zero_();
+      dv_expanded.zero_();
+      // softmax_d.zero_();
+    }
+
+    at::Tensor dq_tmp, dk_tmp, dv_tmp;
+    if(IS_UNIT_TEST_MODE) {
+      dq_tmp = dq.to(torch::kFloat32);
+      dk_tmp = dk_expanded.to(torch::kFloat32);
+      dv_tmp = dv_expanded.to(torch::kFloat32);
     }
 
     FlashBwdParams params;
-    set_params_dgrad(params,
-                     batch_size,
-                     max_seqlen_q, max_seqlen_k,
-                     seqlen_q_rounded, seqlen_k_rounded,
-                     num_heads, num_heads_k,
-                     head_size, head_size_rounded,
-                     q, k, v, out,
-                     dout_padded, dq, dk_expanded, dv_expanded,
-                     cu_seqlens_q.data_ptr(),
-                     cu_seqlens_k.data_ptr(),
-                     loop ? dq_accum.data_ptr() : nullptr,
-                     nullptr,
-                     nullptr,
-                     softmax_lse.data_ptr(),
-                     softmax_d.data_ptr(),
-                     p_dropout,
-                     softmax_scale,
-                     is_causal);
+
+    if(IS_UNIT_TEST_MODE) {
+      set_params_dgrad(params,
+                        batch_size,
+                        max_seqlen_q, max_seqlen_k,
+                        seqlen_q_rounded, seqlen_k_rounded,
+                        num_heads, num_heads_k,
+                        head_size, head_size_rounded,
+                        q, k, v, out,
+                        dout_padded, dq_tmp, dk_tmp, dv_tmp,
+                        cu_seqlens_q.data_ptr(),
+                        cu_seqlens_k.data_ptr(),
+                        loop ? dq_accum.data_ptr() : nullptr,
+                        nullptr,
+                        nullptr,
+                        softmax_lse.data_ptr(),
+                        softmax_d.data_ptr(),
+                        p_dropout,
+                        softmax_scale,
+                        is_causal);
+    } else {
+      set_params_dgrad(params,
+                        batch_size,
+                        max_seqlen_q, max_seqlen_k,
+                        seqlen_q_rounded, seqlen_k_rounded,
+                        num_heads, num_heads_k,
+                        head_size, head_size_rounded,
+                        q, k, v, out,
+                        dout_padded, dq, dk_expanded, dv_expanded,
+                        cu_seqlens_q.data_ptr(),
+                        cu_seqlens_k.data_ptr(),
+                        loop ? dq_accum.data_ptr() : nullptr,
+                        nullptr,
+                        nullptr,
+                        softmax_lse.data_ptr(),
+                        softmax_d.data_ptr(),
+                        p_dropout,
+                        softmax_scale,
+                        is_causal);
+    }
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
@@ -1015,15 +1085,15 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = params.b * params.h * 32;
 
-    if ( rng_state.has_value() ) {
-        params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
-    } else if( is_dropout ) {
-        // See Note [Acquire lock when using random generators]
-        std::lock_guard<std::mutex> lock(gen->mutex_);
-        params.philox_args = gen->philox_cuda_state(counter_offset);
-        auto seeds = unpack(params.philox_args);
-        params.rng_state[0] = std::get<0>(seeds);
-        params.rng_state[1] = std::get<1>(seeds);
+    if (rng_state.has_value()) {
+      params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
+    } else if(is_dropout) {
+      // See Note [Acquire lock when using random generators]
+      std::lock_guard<std::mutex> lock(gen->mutex_);
+      params.philox_args = gen->philox_cuda_state(counter_offset);
+      auto seeds = unpack(params.philox_args);
+      params.rng_state[0] = std::get<0>(seeds);
+      params.rng_state[1] = std::get<1>(seeds);
     }
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
@@ -1031,13 +1101,34 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
-        at::sum_out(dk, at::reshape(dk_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
-        at::sum_out(dv, at::reshape(dv_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
+      at::sum_out(dk, at::reshape(dk_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
+      at::sum_out(dv, at::reshape(dv_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
     }
     if (head_size_og % 8 != 0) {
-        dq = dq.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-        dk = dk.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-        dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+      dq = dq.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+      dk = dk.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+      dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+    }
+
+    if(IS_UNIT_TEST_MODE) {
+      if(!q.is_contiguous()) {
+        dq_tmp.copy_(torch::cat(params.dq_tensors, 0).contiguous(), true);
+      }
+      if(dq.data_ptr() != dq_tmp.data_ptr()) {
+        dq.copy_(dq_tmp, true);
+      }
+      if(!k.is_contiguous()) {
+        dk_tmp.copy_(torch::cat(params.dk_tensors, 0).contiguous(), true);
+      }
+      if(dk.data_ptr() != dk_tmp.data_ptr()) {
+        dk.copy_(dk_tmp, true);
+      }
+      if(!v.is_contiguous()) {
+        dv_tmp.copy_(torch::cat(params.dv_tensors, 0).contiguous(), true);
+      }
+      if(dv.data_ptr() != dv_tmp.data_ptr()) {
+        dv.copy_(dv_tmp, true);
+      }
     }
 
     return { dq, dk, dv, softmax_d };
@@ -1074,7 +1165,7 @@ bool fwd_test(bool do_verification){
 
     //initialize the output tensor
     at::Tensor out_host = at::empty({batch_size*seqlen, nheads, d}, torch::kFloat16);
-    at::Tensor out = out_host.to(at::kCUDA);
+    c10::optional<at::Tensor> out = out_host.to(at::kCUDA);
 
     //initialize seqlens vector (size is b+1)
     std::vector<int> cu_seqlens_q_vec;
@@ -1093,7 +1184,7 @@ bool fwd_test(bool do_verification){
     int max_seqlen_k_ = seqlen;
 
     //dropout parameters
-    float p_drop                    = 0.2;
+    float p_drop                    = 0.17;
     float p_dropout                 = 1 - p_drop;
     uint16_t p_dropout_in_16bits    = uint16_t(std::floor(p_dropout * 65535.0));
     float rp_dropout                = 1.0 / p_dropout;
@@ -1104,15 +1195,12 @@ bool fwd_test(bool do_verification){
     float softmax_scale = 0.125;
     bool zero_tensors = true;
     bool is_causal = false;
-    bool is_deterministic = true;
-    bool is_using_qloop = true;
     bool return_softmax = true;
-    int num_splits = 0;
 
     c10::optional<at::Generator> gen_ = c10::nullopt;
 
-    auto result =
-    mha_fwd(q,
+    auto results =
+    mha_varlen_fwd(q,
             k,
             v,
             out,
@@ -1124,10 +1212,7 @@ bool fwd_test(bool do_verification){
             softmax_scale,
             zero_tensors,
             is_causal,
-            is_deterministic,
-            is_using_qloop,
             return_softmax,
-            num_splits,
             gen_);
 
     using FP16 = ck::half_t;
@@ -1269,9 +1354,9 @@ bool fwd_test(bool do_verification){
 
         }
 
-        at::Tensor out_device_result = out.to(torch::kCPU).view({batch_size, seqlen, nheads, d});
-        at::Tensor lse_device_result = result[0].to(torch::kCPU);
-        at::Tensor z_device_result = result[1].to(torch::kCPU);
+        at::Tensor out_device_result = results[4].to(torch::kCPU).view({batch_size, seqlen, nheads, d});
+        at::Tensor lse_device_result = results[5].to(torch::kCPU);
+        at::Tensor z_device_result = results[6].to(torch::kCPU);
 
         for(std::size_t i = 0; i < batch_size; i++)
         {
@@ -1411,7 +1496,7 @@ bool fwd_test(bool do_verification){
 
 
 bool bwd_test(bool do_verification){
-    int batch_size = 2;
+    int batch_size = 64;
     int nheads = 16;
     int seqlen = 256;
     int n = 1024;
@@ -1433,11 +1518,11 @@ bool bwd_test(bool do_verification){
     at::Tensor q = q_host.to(at::kCUDA);
     at::Tensor k = k_host.to(at::kCUDA);
     at::Tensor v = v_host.to(at::kCUDA);
-    at::Tensor y = y_host.to(at::kCUDA);
+    c10::optional<at::Tensor> y = y_host.to(at::kCUDA);
     at::Tensor lse = lse_host.to(at::kCUDA);
-    at::Tensor qgrad = qgrad_host.to(at::kCUDA);
-    at::Tensor vgrad = vgrad_host.to(at::kCUDA);
-    at::Tensor kgrad = kgrad_host.to(at::kCUDA);
+    c10::optional<at::Tensor> qgrad = qgrad_host.to(at::kCUDA);
+    c10::optional<at::Tensor> vgrad = vgrad_host.to(at::kCUDA);
+    c10::optional<at::Tensor> kgrad = kgrad_host.to(at::kCUDA);
     at::Tensor ygrad = ygrad_host.to(at::kCUDA);
 
     //initialize seqlens vector (size is b+1)
@@ -1457,7 +1542,7 @@ bool bwd_test(bool do_verification){
     int max_seqlen_k_ = seqlen;
     
     //other parameters
-    float p_dropout = 0.0;
+    float p_dropout = 0;
     float p_dropout2                = 1 - p_dropout;
     uint16_t p_dropout_in_16bits    = uint16_t(std::floor(p_dropout2 * 65535.0));
     float rp_dropout                = 1.0 / p_dropout2;
@@ -1465,14 +1550,11 @@ bool bwd_test(bool do_verification){
     const unsigned long long offset = 0;           
     float softmax_scale = 1/sqrt(d);  
     bool zero_tensors = true;    
-    bool is_causal = false;     
-    bool is_deterministic = true;
-    bool is_performance_mode = true;  
-    bool is_using_qloop = true;
-    bool return_softmax = false;  
-    int num_splits = 0;    
+    bool is_causal = false;
+    bool return_softmax = false;
     c10::optional<at::Generator> gen_ = c10::nullopt;
-    lse = mha_fwd(q,   
+    c10::optional<at::Tensor> rng_state = c10::nullopt;
+    auto results = mha_varlen_fwd(q,   
                   k,   
                   v,   
                   y, 
@@ -1484,17 +1566,14 @@ bool bwd_test(bool do_verification){
                   softmax_scale,
                   zero_tensors,
                   is_causal,
-                  is_deterministic,
-                  is_using_qloop,
                   return_softmax,
-                  num_splits,
-                  gen_)[0];
-    mha_bwd(ygrad,
+                  gen_);
+    mha_varlen_bwd(ygrad,
             q,   
             k,   
             v,   
-            y,
-            lse,
+            results[4],
+            lse = results[5],
             qgrad,
             kgrad,
             vgrad,
@@ -1506,11 +1585,8 @@ bool bwd_test(bool do_verification){
             softmax_scale,
             zero_tensors,
             is_causal,
-            is_deterministic,
-            is_performance_mode,
-            is_using_qloop,
-            num_splits,
-            gen_);
+            gen_,
+            rng_state);
     using F16 = ck::half_t;
     using BF16 = ck::bhalf_t;
     using F32 = float;
@@ -1655,11 +1731,11 @@ bool bwd_test(bool do_verification){
         auto acc0_element_op = Scale{softmax_scale};
         auto b1_element_op   = QKVElementOp{};
         auto c_element_op    = YElementOp{};
-        qgrad_host = qgrad.to(torch::kCPU).view({batch_size, seqlen, nheads, d});
-        kgrad_host = kgrad.to(torch::kCPU).view({batch_size, seqlen, nheads, d});
-        vgrad_host = vgrad.to(torch::kCPU).view({batch_size, seqlen, nheads, d});
+        qgrad_host = qgrad->to(torch::kCPU).view({batch_size, seqlen, nheads, d});
+        kgrad_host = kgrad->to(torch::kCPU).view({batch_size, seqlen, nheads, d});
+        vgrad_host = vgrad->to(torch::kCPU).view({batch_size, seqlen, nheads, d});
         lse_host = lse.to(torch::kCPU);
-        y_host = y.to(torch::kCPU).view({batch_size, seqlen, nheads, d});
+        y_host = y->to(torch::kCPU).view({batch_size, seqlen, nheads, d});
 
         for(std::size_t i=0; i<batch_size; i++){
             std::vector<ck::index_t> q_gs_ms_ks_lengths{G0, G1, M, K};

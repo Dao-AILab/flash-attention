@@ -73,8 +73,8 @@
 //}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static inline size_t get_size_in_bytes( size_t n, auto dtype ) {
+template<typename T>
+static inline size_t get_size_in_bytes(size_t n, T dtype) {
   if(dtype == torch::kFloat32){
     return n * 4;
   }else if(dtype == torch::kBFloat16){
@@ -88,7 +88,6 @@ static inline size_t get_size_in_bytes( size_t n, auto dtype ) {
   }
   return 0;
 }
-
 
 static std::tuple<uint64_t, uint64_t> unpack(at::PhiloxCudaState arg) {
   if (arg.captured_) {

@@ -50,13 +50,16 @@ template <typename T>
 void set_params(Masked_multihead_attention_params<T> &params,
                 const size_t batch_size,
                 const size_t nheads,
+                const size_t nheads_kv,
                 const size_t memory_max_seqlen,
                 const size_t headdim,
                 const int timestep,
                 const int rotary_embedding_dim,
                 const float rotary_base,
                 const bool neox_rotary_style,
-                const int qkv_batch_stride,
+                const int q_batch_stride,
+                const int k_batch_stride,
+                const int v_batch_stride,
                 const int nnz_heads,
                 T *q_ptr,
                 T *k_ptr,
@@ -80,11 +83,15 @@ void set_params(Masked_multihead_attention_params<T> &params,
     params.v_cache = v_cache_ptr;
     params.out = out_ptr;
     params.cache_indir = nullptr;
-    params.stride = qkv_batch_stride;
+    params.stride_q = q_batch_stride;
+    params.stride_k = k_batch_stride;
+    params.stride_v = v_batch_stride;
     params.batch_size = batch_size;
     params.beam_width = 1;
     params.memory_max_len = memory_max_seqlen;
     params.num_heads = nheads;
+    params.num_heads_kv = nheads_kv;
+    params.num_heads_q_kv_ratio = nheads / nheads_kv;
     params.nnz_heads = nnz_heads;
     params.hidden_size_per_head = headdim;
     params.rotary_embedding_dim = rotary_embedding_dim;
@@ -124,23 +131,23 @@ torch::Tensor single_query_attention(const torch::Tensor q,
                                      const bool neox_rotary_style=true) {
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v); CHECK_DEVICE(k_cache); CHECK_DEVICE(v_cache);
     int batch_size = v_cache.size(0);
-    int nheads = v_cache.size(1);
+    int nheads = q.size(1);
+    int nheads_kv = v_cache.size(1);
     int memory_max_seqlen = v_cache.size(2);
     int headdim = v_cache.size(3);
     auto input_type = q.scalar_type();
     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
 
     CHECK_SHAPE(q, batch_size, nheads, headdim);
-    CHECK_SHAPE(k, batch_size, nheads, headdim);
-    CHECK_SHAPE(v, batch_size, nheads, headdim);
-    CHECK_SHAPE(v_cache, batch_size, nheads, memory_max_seqlen, headdim);
+    CHECK_SHAPE(k, batch_size, nheads_kv, headdim);
+    CHECK_SHAPE(v, batch_size, nheads_kv, headdim);
+    CHECK_SHAPE(v_cache, batch_size, nheads_kv, memory_max_seqlen, headdim);
     // k_cache shape: [B, H, Dh/x, L, x] where x=8 for fp16 and x=4 for fp32
     int packsize = k_cache.dtype() == torch::kFloat32 ? 4 : 8;
-    CHECK_SHAPE(k_cache, batch_size, nheads, headdim / packsize, memory_max_seqlen, packsize);
+    CHECK_SHAPE(k_cache, batch_size, nheads_kv, headdim / packsize, memory_max_seqlen, packsize);
     TORCH_CHECK(q.stride(2) == 1 && q.stride(1) == headdim);
     TORCH_CHECK(k.stride(2) == 1 && k.stride(1) == headdim);
     TORCH_CHECK(v.stride(2) == 1 && v.stride(1) == headdim);
-    TORCH_CHECK(q.stride(0) == k.stride(0) && q.stride(0) == v.stride(0));
     CHECK_CONTIGUOUS(v_cache); CHECK_CONTIGUOUS(k_cache);
 
     TORCH_CHECK(q.scalar_type() == input_type);
@@ -191,8 +198,9 @@ torch::Tensor single_query_attention(const torch::Tensor q,
     DISPATCH_FLOAT_AND_HALF_AND_BF16(q.scalar_type(), "single_query_attention", [&] {
         using DataType = typename SATypeConverter<scalar_t>::Type;
         Masked_multihead_attention_params<DataType> params;
-        set_params(params, batch_size, nheads, memory_max_seqlen, headdim, timestep,
-                   rotary_embedding_dim, rotary_base, neox_rotary_style, q.stride(0),
+        set_params(params, batch_size, nheads, nheads_kv, memory_max_seqlen, headdim, timestep,
+                   rotary_embedding_dim, rotary_base, neox_rotary_style,
+                   q.stride(0), k.stride(0), v.stride(0),
                    nnz_head_idx_.has_value() ? nnz_head_idx_.value().size(0) : 0,
                    reinterpret_cast<DataType*>(q.data_ptr()),
                    reinterpret_cast<DataType*>(k.data_ptr()),
