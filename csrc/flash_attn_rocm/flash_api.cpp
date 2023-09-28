@@ -5,6 +5,8 @@
 // 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
 // 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
 
+#include <cstring>
+
 #include <ATen/ATen.h>
 #include <torch/extension.h>
 #include <ATen/hip/HIPContext.h>
@@ -500,7 +502,7 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
         if (out_.has_value()) { out_.value().copy_(out); }
     }
 
-    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
+    return { out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state };
 }
 
 std::vector<at::Tensor>
@@ -655,7 +657,7 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
         if (out_.has_value()) { out_.value().copy_(out); }
     }
 
-    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
+    return { out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state };
 }
 
 std::vector<at::Tensor>
@@ -1955,5 +1957,4 @@ int main(){
     }
     return pass ? 0 : 1;
 }
-
 #endif
