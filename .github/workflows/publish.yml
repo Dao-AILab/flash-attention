@@ -44,7 +44,7 @@ jobs:
           # manylinux docker image, but I haven't figured out how to install CUDA on manylinux.
           os: [ubuntu-20.04]
           python-version: ['3.7', '3.8', '3.9', '3.10', '3.11']
-          torch-version: ['1.12.1', '1.13.1', '2.0.1', '2.1.0.dev20230731']
+          torch-version: ['1.12.1', '1.13.1', '2.0.1', '2.1.0']
           cuda-version: ['11.6.2', '11.7.1', '11.8.0', '12.1.0', '12.2.0']
           # We need separate wheels that either uses C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI) or not.
           # Pytorch wheels currently don't use it, but nvcr images have Pytorch compiled with C++11 ABI.
@@ -58,7 +58,7 @@ jobs:
             # Pytorch >= 2.0 only supports Python >= 3.8
             - torch-version: '2.0.1'
               python-version: '3.7'
-            - torch-version: '2.1.0.dev20230731'
+            - torch-version: '2.1.0'
               python-version: '3.7'
             # Pytorch <= 2.0 only supports CUDA <= 11.8
             - torch-version: '1.12.1'
@@ -73,17 +73,15 @@ jobs:
               cuda-version: '12.1.0'
             - torch-version: '2.0.1'
               cuda-version: '12.2.0'
-            # Pytorch >= 2.1 only supports CUDA >= 12.1
-            - torch-version: '2.1.0.dev20230731'
+            # Pytorch >= 2.1 only supports CUDA >= 11.8
+            - torch-version: '2.1.0'
               cuda-version: '11.6.2'
-            - torch-version: '2.1.0.dev20230731'
+            - torch-version: '2.1.0'
               cuda-version: '11.7.1'
-            - torch-version: '2.1.0.dev20230731'
-              cuda-version: '11.8.0'
             # Pytorch >= 2.1 with nvcc 12.1.0 segfaults during compilation, so
             # we only use CUDA 12.2. setup.py as a special case that will
             # download the wheel for CUDA 12.2 instead.
-            - torch-version: '2.1.0.dev20230731'
+            - torch-version: '2.1.0'
               cuda-version: '12.1.0'
 
     steps:
@@ -132,7 +130,7 @@ jobs:
           # We want to figure out the CUDA version to download pytorch
           # e.g. we can have system CUDA version being 11.7 but if torch==1.12 then we need to download the wheel from cu116
           # This code is ugly, maybe there's a better way to do this.
-          export TORCH_CUDA_VERSION=$(python -c "import os; minv = {'1.12': 113, '1.13': 116, '2.0': 117, '2.1': 121}[os.environ['MATRIX_TORCH_VERSION']]; maxv = {'1.12': 116, '1.13': 117, '2.0': 118, '2.1': 121}[os.environ['MATRIX_TORCH_VERSION']]; print(max(min(int(os.environ['MATRIX_CUDA_VERSION']), maxv), minv))")
+          export TORCH_CUDA_VERSION=$(python -c "import os; minv = {'1.12': 113, '1.13': 116, '2.0': 117, '2.1': 118}[os.environ['MATRIX_TORCH_VERSION']]; maxv = {'1.12': 116, '1.13': 117, '2.0': 118, '2.1': 121}[os.environ['MATRIX_TORCH_VERSION']]; print(max(min(int(os.environ['MATRIX_CUDA_VERSION']), maxv), minv))")
           if [[ ${{ matrix.torch-version }} == *"dev"* ]]; then
             pip install --no-cache-dir --pre torch==${{ matrix.torch-version }} --index-url https://download.pytorch.org/whl/nightly/cu${TORCH_CUDA_VERSION}
           else
