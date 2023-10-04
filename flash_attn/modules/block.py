@@ -142,6 +142,10 @@ class Block(nn.Module):
             if RMSNorm and isinstance(self.norm1, RMSNorm)
             else dropout_add_layer_norm
         )
+
+        return_attn_weights = mixer_kwargs.get("return_attn_weights", False)
+        attn_weights = None
+
         if self.prenorm:
             if not self.fused_dropout_add_ln:
                 dropped = self.drop_path1(self.dropout1(hidden_states))
@@ -175,7 +179,14 @@ class Block(nn.Module):
                 mixer_kwargs = {}
             if mixer_subset is not None:
                 mixer_kwargs["mixer_subset"] = mixer_subset
-            hidden_states = self.mixer(hidden_states, **mixer_kwargs)
+
+            outputs = self.mixer(hidden_states, **mixer_kwargs)
+
+            if return_attn_weights:
+                hidden_states, attn_weights = outputs
+            else:
+                hidden_states = outputs
+
             if mixer_subset is not None:
                 residual = residual[:, mixer_subset]
             if not isinstance(self.mlp, nn.Identity):
@@ -208,12 +219,22 @@ class Block(nn.Module):
                         residual_in_fp32=self.residual_in_fp32,
                     )
                 hidden_states = self.mlp(hidden_states)
+
+            if attn_weights is not None:
+                return (hidden_states, residual), attn_weights
+            
             return hidden_states, residual
         else:
             assert residual is None
-            mixer_out = self.mixer(
+            outputs = self.mixer(
                 hidden_states, **(mixer_kwargs if mixer_kwargs is not None else {})
             )
+
+            if return_attn_weights:
+                mixer_out, attn_weights = outputs
+            else:
+                mixer_out = outputs
+
             if self.return_residual:  # mixer out is actually a pair here
                 mixer_out, hidden_states = mixer_out
             if not self.fused_dropout_add_ln:
@@ -270,6 +291,10 @@ class Block(nn.Module):
                         rowscale=rowscale2,
                         prenorm=False,
                     )
+
+            if attn_weights is not None:
+                return hidden_states, attn_weights
+            
             return hidden_states
 
 
