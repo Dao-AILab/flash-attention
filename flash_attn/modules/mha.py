@@ -189,7 +189,7 @@ class SelfAttention(nn.Module):
         self.softmax_scale = softmax_scale
         self.drop = nn.Dropout(attention_dropout)
 
-    def forward(self, qkv, causal=None, key_padding_mask=None):
+    def forward(self, qkv, causal=None, key_padding_mask=None, return_attn_weights=False):
         """Implements the multihead softmax attention.
         Arguments
         ---------
@@ -220,7 +220,11 @@ class SelfAttention(nn.Module):
             scores = scores + causal_mask.to(dtype=scores.dtype)
         attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
         attention_drop = self.drop(attention)
-        output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
+        output = torch.einsum('bhts,bshd->bthd', attention_drop, v)
+
+        if return_attn_weights:
+            return output, attention
+
         return output
 
 
@@ -241,7 +245,7 @@ class CrossAttention(nn.Module):
         self.softmax_scale = softmax_scale
         self.drop = nn.Dropout(attention_dropout)
 
-    def forward(self, q, kv, causal=None, key_padding_mask=None):
+    def forward(self, q, kv, causal=None, key_padding_mask=None, return_attn_weights=False):
         """Implements the multihead softmax attention.
         Arguments
         ---------
@@ -282,7 +286,11 @@ class CrossAttention(nn.Module):
             scores = scores.masked_fill(causal_mask, -10000.0)
         attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
         attention_drop = self.drop(attention)
-        output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
+        output = torch.einsum('bhts,bshd->bthd', attention_drop, v)
+
+        if return_attn_weights:
+            return output, attention
+        
         return output
 
 
