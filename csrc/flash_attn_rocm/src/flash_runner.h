@@ -26,8 +26,8 @@
 #include <memory>
 #include <cstdlib>
 
-#include "flash_fwd_runner_gfx90a.h"
-#include "flash_bwd_runner_gfx90a.h"
+#include "flash_fwd_runner_gfx9x.h"
+#include "flash_bwd_runner_gfx9x.h"
 #include "params.h"
 
 class FlashRunner {
@@ -35,8 +35,10 @@ class FlashRunner {
   // constructor
   explicit FlashRunner(bool is_unit_test_mode, bool is_deterministic);
 
-  void RunFwd(FlashFwdParams &params, hipStream_t &stream);
-  void RunBwd(FlashBwdParams &params, hipStream_t &stream);
+  void RunGroupedFwd(FlashFwdParams &params, hipStream_t &stream);
+  void RunGroupedBwd(FlashBwdParams &params, hipStream_t &stream);
+  void RunBatchedFwd(FlashFwdParams &params, hipStream_t &stream);
+  void RunBatchedBwd(FlashBwdParams &params, hipStream_t &stream);
 
  private:
   std::unique_ptr<fwd_device_gemm::FlashFwdRunner> pimpl_fwd_runner_;

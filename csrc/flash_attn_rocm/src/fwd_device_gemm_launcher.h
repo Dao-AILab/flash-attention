@@ -132,7 +132,6 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
                             {},   // acc0_biases_gs_ms_ns_strides
                             {},   // acc1_biases_gs_ms_os_lengths
                             {}}); // acc1_biases_gs_ms_os_strides
-
   }
 
   // do GEMM
@@ -169,7 +168,7 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
 
   float avg_time = invoker.Run(argument, StreamConfig{stream, time_kernel});
 
-  if(time_kernel){
+  if(time_kernel) {
       std::cout << "time elpase is " << avg_time <<" ms" << std::endl;
   }
 }

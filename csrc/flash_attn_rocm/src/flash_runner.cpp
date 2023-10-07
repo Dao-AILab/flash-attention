@@ -30,24 +30,48 @@ FlashRunner::FlashRunner(bool is_unit_test_mode, bool is_deterministic)
   : pimpl_fwd_runner_(std::make_unique<fwd_device_gemm::FlashFwdRunner>(is_unit_test_mode, is_deterministic)),
     pimpl_bwd_runner_(std::make_unique<bwd_device_gemm::FlashBwdRunner>(is_unit_test_mode, is_deterministic)) {}
 
-void FlashRunner::RunFwd(FlashFwdParams &params, hipStream_t &stream) {
+void FlashRunner::RunGroupedFwd(FlashFwdParams &params, hipStream_t &stream) {
   HEADDIM_SWITCH(params.d, [&] {
     BF16_SWITCH(params.is_bf16, [&] {
-      BOOL_SWITCH(params.is_causal, kIsCausal, [&] {
-        BOOL_SWITCH(params.is_mnko_padding, kIsPadding, [&] {
-          pimpl_fwd_runner_->Run<kHeadDim, T, kIsCausal, kIsPadding>(params, stream);
+      BOOL_SWITCH(params.is_mnko_padding, kIsPadding, [&] {
+        BOOL_SWITCH(params.is_causal, kIsCausal, [&] {
+          pimpl_fwd_runner_->Run<true, kHeadDim, T, kIsPadding, kIsCausal>(params, stream);
         });
       });
     });
   });
 }
 
-void FlashRunner::RunBwd(FlashBwdParams &params, hipStream_t &stream) {
+void FlashRunner::RunGroupedBwd(FlashBwdParams &params, hipStream_t &stream) {
   HEADDIM_SWITCH(params.d, [&] {
     BF16_SWITCH(params.is_bf16, [&] {
-      BOOL_SWITCH(params.is_causal, kIsCausal, [&] {
-        BOOL_SWITCH(params.is_mnko_padding, kIsPadding, [&] {
-          pimpl_bwd_runner_->Run<kHeadDim, T, kIsCausal, kIsPadding>(params, stream);
+      BOOL_SWITCH(params.is_mnko_padding, kIsPadding, [&] {
+        BOOL_SWITCH(params.is_causal, kIsCausal, [&] {
+          pimpl_bwd_runner_->Run<true, kHeadDim, T, kIsPadding, kIsCausal>(params, stream);
+        });
+      });
+    });
+  });
+}
+
+void FlashRunner::RunBatchedFwd(FlashFwdParams &params, hipStream_t &stream) {
+  HEADDIM_SWITCH(params.d, [&] {
+    BF16_SWITCH(params.is_bf16, [&] {
+      BOOL_SWITCH(params.is_mnko_padding, kIsPadding, [&] {
+        BOOL_SWITCH(params.is_causal, kIsCausal, [&] {
+          pimpl_fwd_runner_->Run<false, kHeadDim, T, kIsPadding, kIsCausal>(params, stream);
+        });
+      });
+    });
+  });
+}
+
+void FlashRunner::RunBatchedBwd(FlashBwdParams &params, hipStream_t &stream) {
+  HEADDIM_SWITCH(params.d, [&] {
+    BF16_SWITCH(params.is_bf16, [&] {
+      BOOL_SWITCH(params.is_mnko_padding, kIsPadding, [&] {
+        BOOL_SWITCH(params.is_causal, kIsCausal, [&] {
+          pimpl_bwd_runner_->Run<false, kHeadDim, T, kIsPadding, kIsCausal>(params, stream);
         });
       });
     });

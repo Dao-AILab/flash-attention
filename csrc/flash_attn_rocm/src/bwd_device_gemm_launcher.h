@@ -145,13 +145,31 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
         {}  // acc1_biases_gs_ms_os_strides
     });
   }
+
   // do GEMM
   auto invoker = device_gemm_instance_ptr_->MakeInvoker();
-
   auto argument = device_gemm_instance_ptr_->MakeArgument(
-      p_q, p_k, p_z, p_v, p_y, p_lse, p_d, p_ygrad, p_qgrad, p_kgrad, p_vgrad, {},
-      {}, problem_descs, a_element_op, b0_element_op, acc0_element_op,
-      b1_element_op, c_element_op, dropout_ratio, seeds);
+      p_q, 
+      p_k, 
+      p_z, 
+      p_v, 
+      p_y, 
+      p_lse, 
+      p_d, 
+      p_ygrad, 
+      p_qgrad, 
+      p_kgrad, 
+      p_vgrad, 
+      {},
+      {}, 
+      problem_descs, 
+      a_element_op, 
+      b0_element_op, 
+      acc0_element_op,
+      b1_element_op, 
+      c_element_op, 
+      dropout_ratio, 
+      seeds);
 
   // specify workspace for problem_desc
   SimpleDeviceMem problem_desc_workspace{device_gemm_instance_ptr_->GetWorkSpaceSize(&argument)};
