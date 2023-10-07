@@ -33,7 +33,7 @@ class DeviceGemmInstanceLauncher {
   // constructor
   explicit DeviceGemmInstanceLauncher()
     : device_gemm_instance_ptr_(std::make_unique<DeviceGemmTemplate<DeviceGemmTraits>>()) {}
-  
+
   void Launch(FlashFwdParams &params, hipStream_t &stream);
 
  private:
@@ -62,7 +62,8 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
   auto p_z = params.p_ptrs;
   auto p_lse = params.softmax_lse_ptrs;
 
-  std::vector<typename DeviceGemmTemplate<DeviceGemmTraits>::ProblemDesc> problem_descs;
+  using DeviceGemmTemplateInstance = DeviceGemmTemplate<DeviceGemmTraits>;
+  std::vector<typename DeviceGemmTemplateInstance::ProblemDesc> problem_descs;
 
   int batch_size = params.b;
   int num_heads = params.h;
@@ -72,14 +73,14 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
 
   auto seeds = unpack(params.philox_args);
 
-  for(size_t i = 0; i < batch_size; i++){
+  for(size_t i = 0; i < batch_size; i++) {
     int M     = params.host_seqlens_q[i + 1] - params.host_seqlens_q[i]; //seqlen Q
     int N     = params.host_seqlens_k[i + 1] - params.host_seqlens_k[i]; //seqlen K
     int K     = head_dim;
     int O     = head_dim;
     int G0 = 1; // G0 = batch_size
     int G1 = num_heads;
-    
+
 
     std::vector<ck::index_t> a_gs_ms_ks_lengths{G0, G1, M, K};
     std::vector<ck::index_t> a_gs_ms_ks_strides =
@@ -104,7 +105,7 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
         output_permute
             ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1} // C layout [G0, M, G1, O]
             : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // C layout [G0, G1, M, O]
-    
+
     std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
     std::vector<ck::index_t> z_gs_ms_ns_strides =
         z_tensor_permute
@@ -131,7 +132,7 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
                             {},   // acc0_biases_gs_ms_ns_strides
                             {},   // acc1_biases_gs_ms_os_lengths
                             {}}); // acc1_biases_gs_ms_os_strides
-                              
+
   }
 
   // do GEMM
