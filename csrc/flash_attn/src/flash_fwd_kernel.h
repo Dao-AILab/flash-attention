@@ -508,7 +508,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     #pragma unroll
     for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
         float sum = scores_sum(mi);
-        float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
+        float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / (sum + 1.f);
         lse(mi) = (sum == 0.f || sum != sum) ? INFINITY : scores_max(mi) * params.scale_softmax + __logf(sum);
         float scale = !Is_dropout ? inv_sum : inv_sum * params.rp_dropout;
         #pragma unroll
@@ -1047,7 +1047,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     #pragma unroll
     for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
         float sum = scores_sum(mi);
-        float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
+        float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / (sum + 1.f);
         lse(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : scores_max(mi) * params.scale_softmax + __logf(sum);
         float scale = inv_sum;
         #pragma unroll
