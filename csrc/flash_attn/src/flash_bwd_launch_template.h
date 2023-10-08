@@ -137,7 +137,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream, const bool con
 
 template<typename T>
 void run_mha_bwd_hdim32(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {
-    constexpr int Headdim = 32;
+    constexpr static int Headdim = 32;
     int device;
     cudaGetDevice(&device);
     int max_smem_per_block;
@@ -158,7 +158,7 @@ void run_mha_bwd_hdim32(Flash_bwd_params &params, cudaStream_t stream, const boo
 
 template<typename T>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {
-    constexpr int Headdim = 64;
+    constexpr static int Headdim = 64;
     int device;
     cudaGetDevice(&device);
     int max_smem_per_block;
@@ -201,7 +201,7 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream, const boo
 
 template<typename T>
 void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {
-    constexpr int Headdim = 96;
+    constexpr static int Headdim = 96;
     int device;
     cudaGetDevice(&device);
     int max_smem_per_block;
@@ -228,7 +228,7 @@ void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream, const boo
 
 template<typename T>
 void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {
-    constexpr int Headdim = 128;
+    constexpr static int Headdim = 128;
     int device;
     cudaGetDevice(&device);
     int max_smem_per_block;
@@ -264,7 +264,7 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream, const bo
 
 template<typename T>
 void run_mha_bwd_hdim160(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {
-    constexpr int Headdim = 160;
+    constexpr static int Headdim = 160;
     int device;
     cudaGetDevice(&device);
     int max_smem_per_block;
@@ -281,7 +281,7 @@ void run_mha_bwd_hdim160(Flash_bwd_params &params, cudaStream_t stream, const bo
 
 template<typename T>
 void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {
-    constexpr int Headdim = 192;
+    constexpr static int Headdim = 192;
     int device;
     cudaGetDevice(&device);
     int max_smem_per_block;
@@ -298,7 +298,7 @@ void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream, const bo
 
 template<typename T>
 void run_mha_bwd_hdim224(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {
-    constexpr int Headdim = 224;
+    constexpr static int Headdim = 224;
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, false, false, T>, Is_dropout>(params, stream, configure);
     });
@@ -306,7 +306,7 @@ void run_mha_bwd_hdim224(Flash_bwd_params &params, cudaStream_t stream, const bo
 
 template<typename T>
 void run_mha_bwd_hdim256(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {
-    constexpr int Headdim = 256;
+    constexpr static int Headdim = 256;
     int device;
     cudaGetDevice(&device);
     int max_smem_per_block;

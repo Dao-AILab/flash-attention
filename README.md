@@ -198,7 +198,7 @@ includes QKV projection, output projection), see the MHA [implementation](https:
 
 ## Changelog
 
-### 2.0
+### 2.0: Complete rewrite, 2x faster
 Upgrading from FlashAttention (1.x) to FlashAttention-2
 
 These functions have been renamed:
@@ -214,7 +214,7 @@ flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False)
 ```python
 flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False)
 ```
-### 2.1 
+### 2.1: Change behavior of causal flag
 
 If seqlen_q != seqlen_k and causal=True, the causal mask is aligned to the
 bottom right corner of the attention matrix, instead of the top-left corner.
@@ -243,7 +243,7 @@ v2.1:
     1 1  
 If the row of the mask is all zero, the output will be zero.
 
-### 2.2 
+### 2.2: Optimize for inference
 
 Optimize for inference (iterative decoding) when query has very small sequence
 length (e.g., query sequence length = 1). The bottleneck here is to load KV
@@ -256,7 +256,7 @@ See the function `flash_attn_with_kvcache` with more features for inference
 Thanks to the xformers team, and in particular Daniel Haziza, for this
 collaboration.
 
-### 2.3
+### 2.3: Local (i.e., sliding window) attention
 
 Implement sliding window attention (i.e., local attention). Thanks to [Mistral
 AI](https://mistral.ai/) and in particular Timothée Lacroix for this
