@@ -14,50 +14,16 @@
 
 #include "utils.h"
 
-struct QkvParams {
-  using index_t = uint32_t;
-  
-  // The QKV matrices.
-  std::vector<const void*> q_ptrs; //changed to ck input type
+struct CommonParams {
+  // ------------------------ batched usage ------------------------ 
+  const void* __restrict__ q_ptr;
+  const void* __restrict__ k_ptr;
+  const void* __restrict__ v_ptr;
+
+  // ------------------------ grouped usage ------------------------ 
+  std::vector<const void*> q_ptrs;
   std::vector<const void*> k_ptrs;
   std::vector<const void*> v_ptrs;
-
-  std::vector<at::Tensor> q_tensors;
-  std::vector<at::Tensor> k_tensors;
-  std::vector<at::Tensor> v_tensors;
-
-  // The stride between rows of the Q, K and V matrices.
-  // index_t q_batch_stride;
-  // index_t k_batch_stride;
-  // index_t v_batch_stride;
-  // index_t q_row_stride;
-  // index_t k_row_stride;
-  // index_t v_row_stride;
-  // index_t q_head_stride;
-  // index_t k_head_stride;
-  // index_t v_head_stride;
-
-  // The number of heads.
-  int h, h_k;
-  // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
-  // different from nheads (query).
-  int h_h_k_ratio; // precompute h / h_k,
-};
-
-struct FlashFwdParams : public QkvParams {
-  // The O matrix (output).
-  std::vector<void*> out_ptrs;
-  
-  // The stride between rows of O.
-  // index_t o_batch_stride;
-  // index_t o_row_stride;
-  // index_t o_head_stride;
-
-  // The pointer to the P matrix.
-  std::vector<void*> p_ptrs;
-
-  // The pointer to the softmax sum.
-  std::vector<void*> softmax_lse_ptrs;
 
   // The dimensions.
   int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded;
@@ -76,7 +42,19 @@ struct FlashFwdParams : public QkvParams {
   int q_stride_multiplier;
   int kv_stride_multiplier;
 
-  // int *__restrict__ blockmask;
+  const std::vector<Index> a_gs_ms_ks_lengths;
+  const std::vector<Index> a_gs_ms_ks_strides;
+  const std::vector<Index> b_gs_ns_ks_lengths;
+  const std::vector<Index> b_gs_ns_ks_strides;
+  const std::vector<Index> b1_gs_gemm1ns_gemm1ks_lengths; // b1_gs_os_ns_lengths
+  const std::vector<Index> b1_gs_gemm1ns_gemm1ks_strides; // b1_gs_os_ns_strides
+  const std::vector<Index> c_gs_ms_gemm1ns_lengths;       // c_gs_ms_os_lengths
+  const std::vector<Index> c_gs_ms_gemm1ns_strides;       // c_gs_ms_os_strides
+  const std::vector<Index> z_gs_ms_ns_lengths;
+  const std::vector<Index> z_gs_ms_ns_strides;
+  const std::vector<Index> lse_gs_ms_lengths;
+  const std::vector<Index> acc0_biases_gs_ms_ns_lengths;
+  const std::vector<Index> acc0_biases_gs_ms_ns_strides;
 
   // The dropout probability (probability of keeping an activation).
   float p_dropout;
@@ -89,6 +67,9 @@ struct FlashFwdParams : public QkvParams {
   // Random state.
   at::PhiloxCudaState philox_args;
 
+  // seeds
+  std::tuple<uint64_t, uint64_t> seeds;
+
   // Pointer to the RNG seed (idx 0) and offset (idx 1).
   uint64_t* rng_state;
 
@@ -96,50 +77,67 @@ struct FlashFwdParams : public QkvParams {
   bool is_bf16;
   bool is_causal;
   bool is_mnko_padding;
+
+  // The number of heads.
+  int h, h_k;
+  // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
+  // different from nheads (query).
+  int h_h_k_ratio; // precompute h / h_k,
 };
 
-struct FlashBwdParams : public FlashFwdParams {
-  // The dO and dQKV matrices.
-  std::vector<void*> z_ptrs;
-  std::vector<const void*> out_ptrs;
-  std::vector<void*> d_ptrs;
-  std::vector<const void*> dout_ptrs;
+struct FlashFwdParams : public CommonParams {
+  // ------------------------ batched usage ------------------------ 
+  // The O matrix (output).
+  void* __restrict__ out_ptr;
+
+  // The pointer to the P matrix.
+  void* __restrict__ p_ptr;
+
+  // The pointer to the softmax sum.
+  void* __restrict__ softmax_lse_ptr;
+  
+  // ------------------------ grouped usage ------------------------ 
+  // The O matrix (output).
+  std::vector<void*> out_ptrs;
+
+  // The pointer to the P matrix.
+  std::vector<void*> p_ptrs;
+
+  // The pointer to the softmax sum.
+  std::vector<void*> softmax_lse_ptrs;
+
+  std::vector<at::Tensor> q_tensors;
+  std::vector<at::Tensor> k_tensors;
+  std::vector<at::Tensor> v_tensors;
+};
+
+struct FlashBwdParams : public CommonParams {
+  // ------------------------ batched usage ------------------------ 
+  void* __restrict__ dq_ptr;
+  void* __restrict__ dk_ptr;
+  void* __restrict__ dv_ptr;
+
+  const void* __restrict__ out_ptr;
+  const void* __restrict__ dout_ptr;
+
+  void* __restrict__ z_ptr;
+  void* __restrict__ d_ptr;
+  void* __restrict__ softmax_lse_ptr;
+
+  // ------------------------ grouped usage ------------------------
   std::vector<void*> dq_ptrs;
   std::vector<void*> dk_ptrs;
   std::vector<void*> dv_ptrs;
 
+  std::vector<const void*> out_ptrs;
+  std::vector<const void*> dout_ptrs;
+
+  std::vector<void*> z_ptrs;
+  std::vector<void*> d_ptrs;
   std::vector<const void*> softmax_lse_ptrs;
 
   std::vector<at::Tensor> d_tensors;
   std::vector<at::Tensor> dq_tensors;
   std::vector<at::Tensor> dk_tensors;
   std::vector<at::Tensor> dv_tensors;
-
-  // To accumulate dQ
-  // std::vector<void*> dq_accum_ptrs;
-  // std::vector<void*> dk_accum_ptrs;
-  // std::vector<void*> dv_accum_ptrs;
-
-  // // To accumulate dK and dV in case we're splitting the bwd along seqlen_q
-  // dimension void *__restrict__ dk_accum_ptr; void *__restrict__
-  // dv_accum_ptr;
-
-  // The stride between rows of the dO, dQ, dK and dV matrices.
-  // TD [2022-04-16]: We're using 32-bit indexing to save registers.
-  // The code probably won't work for arrays larger than 2GB.
-  // index_t do_batch_stride;
-  // index_t do_row_stride;
-  // index_t do_head_stride;
-  // index_t dq_batch_stride;
-  // index_t dk_batch_stride;
-  // index_t dv_batch_stride;
-  // index_t dq_row_stride;
-  // index_t dk_row_stride;
-  // index_t dv_row_stride;
-  // index_t dq_head_stride;
-  // index_t dk_head_stride;
-  // index_t dv_head_stride;
-
-  // The pointer to the softmax d sum.
-  // std::vector<void*> dsoftmax_sum_ptrs;
 };

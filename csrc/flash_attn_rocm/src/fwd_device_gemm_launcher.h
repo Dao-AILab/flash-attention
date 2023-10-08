@@ -62,8 +62,7 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
   auto p_z = params.p_ptrs;
   auto p_lse = params.softmax_lse_ptrs;
 
-  using DeviceGemmTemplateInstance = DeviceGemmTemplate<DeviceGemmTraits>;
-  std::vector<typename DeviceGemmTemplateInstance::ProblemDesc> problem_descs;
+  std::vector<typename DeviceGemmTemplate::ProblemDesc> problem_descs;
 
   int batch_size = params.b;
   int num_heads = params.h;

@@ -79,11 +79,6 @@ struct Forward {
   using LSEDataType      = Float32;
   using Acc0BiasDataType = void;
   using Acc1BiasDataType = void;
-  using AElementOp       = PassThrough;
-  using B0ElementOp      = PassThrough;
-  using Acc0ElementOp    = Scale;
-  using B1ElementOp      = PassThrough;
-  using CElementOp       = PassThrough;
 
   static constexpr Index kNumDimG = 2;
   static constexpr Index kNumDimM = 1;

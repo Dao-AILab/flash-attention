@@ -494,11 +494,13 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
     params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     if (params.is_dropout) {
-        auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-            gen_, at::cuda::detail::getDefaultCUDAGenerator());
-        // See Note [Acquire lock when using random generators]
-        std::lock_guard<std::mutex> lock(gen->mutex_);
-        params.philox_args = gen->philox_cuda_state(counter_offset);
+      auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+          gen_, at::cuda::detail::getDefaultCUDAGenerator());
+      // See Note [Acquire lock when using random generators]
+      std::lock_guard<std::mutex> lock(gen->mutex_);
+      params.philox_args = gen->philox_cuda_state(counter_offset);
+      auto seeds = unpack(params.philox_args);
+      params.seeds = seeds;
     }
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
@@ -649,11 +651,13 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
     params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     if (params.is_dropout)  {
-        auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-            gen_, at::cuda::detail::getDefaultCUDAGenerator());
-        // See Note [Acquire lock when using random generators]
-        std::lock_guard<std::mutex> lock(gen->mutex_);
-        params.philox_args = gen->philox_cuda_state(counter_offset);
+      auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+          gen_, at::cuda::detail::getDefaultCUDAGenerator());
+      // See Note [Acquire lock when using random generators]
+      std::lock_guard<std::mutex> lock(gen->mutex_);
+      params.philox_args = gen->philox_cuda_state(counter_offset);
+      auto seeds = unpack(params.philox_args);
+      params.seeds = seeds;
     }
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
@@ -858,6 +862,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         
     if (rng_state.has_value()) {
       params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
+      params.seeds = std::tuple<uint64_t, uint64_t>(params.rng_state[0], params.rng_state[1]);
     } else if(params.is_dropout) {
       // See Note [Acquire lock when using random generators]
       std::lock_guard<std::mutex> lock(gen->mutex_);
@@ -1113,6 +1118,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     if (rng_state.has_value()) {
       params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
+      params.seeds = std::tuple<uint64_t, uint64_t>(params.rng_state[0], params.rng_state[1]);
     } else if(params.is_dropout) {
       // See Note [Acquire lock when using random generators]
       std::lock_guard<std::mutex> lock(gen->mutex_);
