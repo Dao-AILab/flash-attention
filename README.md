@@ -31,7 +31,7 @@ Please cite and credit FlashAttention if you use it.
 Requirements:
 - CUDA 11.6 and above.
 - PyTorch 1.12 and above.
-- Linux. Windows is not supported for now. If you have ideas on how to modify the code to support Windows, please reach out via Github issue.
+- Linux. Might work for Windows starting v2.3.2 (we've seen a few positive [reports](https://github.com/Dao-AILab/flash-attention/issues/595)) but Windows compilation still requires more testing. If you have ideas on how to set up prebuilt CUDA wheels for Windows, please reach out via Github issue.
 
 We recommend the
 [Pytorch](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch)
