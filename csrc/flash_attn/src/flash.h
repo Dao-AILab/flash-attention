@@ -95,6 +95,9 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ rotary_cos_ptr;
     void * __restrict__ rotary_sin_ptr;
 
+    // The indices to index into the KV cache.
+    int *__restrict__ cache_batch_idx;
+
     // The dropout probability (probability of keeping an activation).
     float p_dropout;
     // uint32_t p_dropout_in_uint;
@@ -104,6 +107,9 @@ struct Flash_fwd_params : public Qkv_params {
     // Scale factor of 1 / (1 - p_dropout).
     float rp_dropout;
     float scale_softmax_rp_dropout;
+
+    // Local window size
+    int window_size_left, window_size_right;
 
     // Random state.
     at::PhiloxCudaState philox_args;
