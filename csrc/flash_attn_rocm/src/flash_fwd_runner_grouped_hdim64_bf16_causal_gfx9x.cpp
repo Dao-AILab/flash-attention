@@ -27,7 +27,7 @@ namespace fwd_device_gemm {
 template <>
 void FlashFwdRunner::Run<true, 64, device_gemm_trait::BFloat16, true, true>(FlashFwdParams &params, hipStream_t &stream) {
   if(params.is_dropout){
-    BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
+    BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
       this->template run_<DeviceGemmGroupedHeadDim64,
                           device_gemm_trait::BFloat16, 
                           device_gemm_trait::kGemmSpecPadding,
@@ -36,7 +36,7 @@ void FlashFwdRunner::Run<true, 64, device_gemm_trait::BFloat16, true, true>(Flas
   });
   }
   else{
-    BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
+    BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
       this->template run_<DeviceGemmGroupedHeadDim64NonDrop,
                           device_gemm_trait::BFloat16, 
                           device_gemm_trait::kGemmSpecPadding,
@@ -49,7 +49,7 @@ void FlashFwdRunner::Run<true, 64, device_gemm_trait::BFloat16, true, true>(Flas
 template <>
 void FlashFwdRunner::Run<true, 64, device_gemm_trait::BFloat16, false, true>(FlashFwdParams &params, hipStream_t &stream) {
   if(params.is_dropout){
-    BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
+    BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
       this->template run_<DeviceGemmGroupedHeadDim64,
                           device_gemm_trait::BFloat16, 
                           device_gemm_trait::kGemmSpecDefault,
@@ -58,7 +58,7 @@ void FlashFwdRunner::Run<true, 64, device_gemm_trait::BFloat16, false, true>(Fla
     });
   }
   else{
-    BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
+    BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
       this->template run_<DeviceGemmGroupedHeadDim64NonDrop,
                           device_gemm_trait::BFloat16, 
                           device_gemm_trait::kGemmSpecDefault,

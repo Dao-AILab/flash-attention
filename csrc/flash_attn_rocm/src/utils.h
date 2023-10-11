@@ -120,4 +120,13 @@ class SimpleDeviceMem {
   void* p_mem_;
 };
 
+// get environment variables for internal usage
+static inline bool get_env_(const char* env_var) {
+  if (char* value = std::getenv(env_var)) { 
+    if (strcmp(value, "0") == 0) { return false; }
+    return true;
+  }
+  return false;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////

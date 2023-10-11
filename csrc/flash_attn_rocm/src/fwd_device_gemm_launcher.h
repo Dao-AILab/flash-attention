@@ -73,14 +73,6 @@ void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch(Fl
   auto seeds = unpack(params.philox_args);
 
   for(size_t i = 0; i < batch_size; i++) {
-    int M     = params.host_seqlens_q[i + 1] - params.host_seqlens_q[i]; //seqlen Q
-    int N     = params.host_seqlens_k[i + 1] - params.host_seqlens_k[i]; //seqlen K
-    int K     = head_dim;
-    int O     = head_dim;
-    int G0 = 1; // G0 = batch_size
-    int G1 = num_heads;
-
-
     std::vector<ck::index_t> a_gs_ms_ks_lengths{G0, G1, M, K};
     std::vector<ck::index_t> a_gs_ms_ks_strides =
         input_permute

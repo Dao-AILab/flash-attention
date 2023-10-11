@@ -26,7 +26,7 @@
 namespace bwd_device_gemm {
 template <>
 void FlashBwdRunner::Run<false, 32, device_gemm_trait::Float16, true, true>(FlashBwdParams &params, hipStream_t &stream) {
-  BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
+  BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
     this->template run_<DeviceGemmBatchedHeadDim32,
                         device_gemm_trait::Float16, 
                         device_gemm_trait::kGemmSpecPadding,
@@ -37,7 +37,7 @@ void FlashBwdRunner::Run<false, 32, device_gemm_trait::Float16, true, true>(Flas
 
 template <>
 void FlashBwdRunner::Run<false, 32, device_gemm_trait::Float16, false, true>(FlashBwdParams &params, hipStream_t &stream) {
-  BOOL_SWITCH(is_deterministic_, kIsDeterministic, [&] {
+  BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
     this->template run_<DeviceGemmBatchedHeadDim32,
                         device_gemm_trait::Float16, 
                         device_gemm_trait::kGemmSpecDefault,

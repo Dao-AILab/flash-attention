@@ -26,19 +26,46 @@
 #include <memory>
 #include <cstdlib>
 
+#include "params.h"
 #include "flash_fwd_runner_gfx9x.h"
 #include "flash_bwd_runner_gfx9x.h"
-#include "params.h"
+
+#include "static_switch.h"
 
 class FlashRunner {
  public:
   // constructor
-  explicit FlashRunner(bool is_unit_test_mode, bool is_deterministic);
+  explicit FlashRunner()
+  : pimpl_fwd_runner_(std::make_unique<fwd_device_gemm::FlashFwdRunner>()),
+    pimpl_bwd_runner_(std::make_unique<bwd_device_gemm::FlashBwdRunner>()) {}
 
-  void RunGroupedFwd(FlashFwdParams &params, hipStream_t &stream);
-  void RunGroupedBwd(FlashBwdParams &params, hipStream_t &stream);
-  void RunBatchedFwd(FlashFwdParams &params, hipStream_t &stream);
-  void RunBatchedBwd(FlashBwdParams &params, hipStream_t &stream);
+  void RunFwd(FlashFwdParams &params, hipStream_t &stream) {
+    HEADDIM_SWITCH(params.d, [&] {
+      BF16_SWITCH(params.is_bf16, [&] {
+        BOOL_SWITCH(params.is_mnko_padding, kIsPadding, [&] {
+          BOOL_SWITCH(params.is_causal, kIsCausal, [&] {
+            BOOL_SWITCH(params.cu_seqlens_q, kIsGrouped, [&] {
+              pimpl_fwd_runner_->Run<kIsGrouped, kHeadDim, T, kIsPadding, kIsCausal>(params, stream);
+            });
+          });
+        });
+      });
+    });
+  }
+
+  void RunBwd(FlashBwdParams &params, hipStream_t &stream) {
+    HEADDIM_SWITCH(params.d, [&] {
+      BF16_SWITCH(params.is_bf16, [&] {
+        BOOL_SWITCH(params.is_mnko_padding, kIsPadding, [&] {
+          BOOL_SWITCH(params.is_causal, kIsCausal, [&] {
+            BOOL_SWITCH(params.cu_seqlens_q, kIsGrouped, [&] {
+              pimpl_bwd_runner_->Run<kIsGrouped, kHeadDim, T, kIsPadding, kIsCausal>(params, stream);
+            });
+          });
+        });
+      });
+    });
+  }
 
  private:
   std::unique_ptr<fwd_device_gemm::FlashFwdRunner> pimpl_fwd_runner_;

@@ -30,11 +30,6 @@
 namespace bwd_device_gemm {
 class FlashBwdRunner {
  public:
-  // constructor
-  explicit FlashBwdRunner(bool is_unit_test_mode, bool is_deterministic)
-    : is_unit_test_mode_(is_unit_test_mode),
-      is_deterministic_(is_deterministic) {}
-
   template <bool kIsGrouped, int kHeadDim, typename T, bool kIsPadding, bool kIsCausal>
   void Run(FlashBwdParams &params, hipStream_t &stream);
 
@@ -45,7 +40,7 @@ class FlashBwdRunner {
             device_gemm_trait::MaskingSpec kMaskingSpec, 
             bool kIsDeterministic>
   void run_(FlashBwdParams &params, hipStream_t &stream) {
-    if (!is_unit_test_mode_) {
+    if (!params.kIsUnitTestMode) {
       // benchmark mode
       // input, output, gemm, dropout, cshuffle, masking specialization, deterministic
       using DeviceGemmTraits = device_gemm_trait::Backward<T, 
@@ -75,8 +70,5 @@ class FlashBwdRunner {
       device_gemm_instance_ptr->Launch(params, stream);
     }
   }
-
-  const bool is_unit_test_mode_;
-  const bool is_deterministic_;
 }; // class FlashBwdRunner
 } // namespace bwd_device_gemm

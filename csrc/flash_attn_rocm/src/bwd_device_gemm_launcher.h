@@ -29,204 +29,126 @@
 namespace bwd_device_gemm {
 template <template <typename> typename DeviceGemmTemplate, typename DeviceGemmTraits>
 class DeviceGemmInstanceLauncher {
+  using DeviceOp = DeviceGemmTemplate<DeviceGemmTraits>;
+
  public:
-  // constructor
-  explicit DeviceGemmInstanceLauncher(FlashBwdParams &params, hipStream_t &stream)
-    : b_(params.b),
-      h_(params.h),
-      d_(params.d),
-      scale_softmax_(params.scale_softmax),
-      q_ptr_(params.q_ptr),
-      k_ptr_(params.k_ptr),
-      z_ptr_(params.z_ptr),
-      v_ptr_(params.v_ptr),
-      out_ptr_(params.out_ptr),
-      softmax_lse_ptr_(params.softmax_lse_ptr),
-      d_ptr_(params.d_ptr),
-      dout_ptr_(params.dout_ptr),
-      dq_ptr_(params.dq_ptr),
-      dk_ptr_(params.dk_ptr),
-      dv_ptr_(params.dv_ptr),
-      a_gs_ms_ks_lengths_(params.a_gs_ms_ks_lengths),
-      a_gs_ms_ks_strides_(params.a_gs_ms_ks_strides),
-      b_gs_ns_ks_lengths_(params.b_gs_ns_ks_lengths),
-      b_gs_ns_ks_strides_(params.b_gs_ns_ks_strides),
-      b1_gs_gemm1ns_gemm1ks_lengths_(params.b1_gs_gemm1ns_gemm1ks_lengths),
-      b1_gs_gemm1ns_gemm1ks_strides_(params.b1_gs_gemm1ns_gemm1ks_strides),
-      c_gs_ms_gemm1ns_lengths_(params.c_gs_ms_gemm1ns_lengths), 
-      c_gs_ms_gemm1ns_strides_(params.c_gs_ms_gemm1ns_strides), 
-      z_gs_ms_ns_lengths_(params.z_gs_ms_ns_lengths),
-      z_gs_ms_ns_strides_(params.z_gs_ms_ns_strides),
-      lse_gs_ms_lengths_(params.lse_gs_ms_lengths),
-      acc0_biases_gs_ms_ns_lengths_(params.acc0_biases_gs_ms_ns_lengths),
-      acc0_biases_gs_ms_ns_strides_(params.acc0_biases_gs_ms_ns_strides),
-      p_dropout_(params.p_dropout),
-      seeds_(params.seeds),
-      device_gemm_instance_ptr_(std::make_unique<DeviceGemmTemplate<DeviceGemmTraits>>()),
-      stream_(stream) {
-    
+  // constructor for batched gemm
+  explicit DeviceGemmInstanceLauncher(FlashBwdBatchedParams &params, hipStream_t &stream)
+    : device_op_ptr(std::make_unique<DeviceOp>()),
+      invoker_ptr(device_op_ptr->MakeInvokerPointer()),
+      argument_ptr(device_op_ptr->MakeArgumentPointer(
+        params.q_ptr,
+        params.k_ptr,
+        params.z_ptr,
+        params.v_ptr,
+        params.out_ptr,
+        params.softmax_lse_ptr,
+        params.d_ptr,
+        params.dout_ptr, 
+        params.dq_ptr,
+        params.dk_ptr,
+        params.dv_ptr,
+        {},
+        {},
+        params.q_gs_ms_ks_lengths,
+        params.q_gs_ms_ks_strides,
+        params.k_gs_ns_ks_lengths,
+        params.k_gs_ns_ks_strides,
+        params.z_gs_ms_ns_lengths,
+        params.z_gs_ms_ns_strides,
+        params.v_gs_gemm1ns_gemm1ks_lengths,
+        params.v_gs_gemm1ns_gemm1ks_strides,
+        params.out_gs_ms_gemm1ns_lengths,
+        params.out_gs_ms_gemm1ns_strides,
+        params.lse_gs_ms_lengths,
+        {},
+        {},
+        {},
+        {},
+        device_gemm_trait::AElementOp{},
+        device_gemm_trait::B0ElementOp{},
+        device_gemm_trait::Acc0ElementOp{params.softmax_scale},
+        device_gemm_trait::B1ElementOp{},
+        device_gemm_trait::CElementOp{},
+        params.p_dropout, 
+        params.seeds)) {}
+
+  // constructor for grouped gemm
+  explicit DeviceGemmInstanceLauncher(FlashBwdGroupedParams &params, hipStream_t &stream)
+    : device_op_ptr(std::make_unique<DeviceOp>()),
+      invoker_ptr(device_op_ptr->MakeInvokerPointer()), {
+
+    std::vector<DeviceOp::ProblemDesc> problem_descs;
+    problem_descs.reserve(params.b);
+
+    for (int i = 0; i < params.b; ++i) {
+      problem_descs.push_back({
+          params.problem_descs[i].q_gs_ms_ks_lengths,
+          params.problem_descs[i].q_gs_ms_ks_strides,
+          params.problem_descs[i].k_gs_ns_ks_lengths,
+          params.problem_descs[i].k_gs_ns_ks_strides,
+          params.problem_descs[i].z_gs_ms_ns_lengths,
+          params.problem_descs[i].z_gs_ms_ns_strides,
+          params.problem_descs[i].v_gs_os_ns_lengths,
+          params.problem_descs[i].v_gs_os_ns_strides,
+          params.problem_descs[i].out_gs_ms_os_lengths,
+          params.problem_descs[i].out_gs_ms_os_strides,
+          params.problem_descs[i].lse_gs_ms_lengths,
+          params.problem_descs[i].lse_gs_ms_strides,
+          {}, // acc0_biases_gs_ms_ns_lengths
+          {}, // acc0_biases_gs_ms_ns_strides
+          {}, // acc1_biases_gs_ms_os_lengths
+          {}  // acc1_biases_gs_ms_os_strides
+      });
+    }
+
+    argument_ptr = device_op_ptr->MakeArgumentPointer(
+        params.q_ptrs,
+        params.k_ptrs,
+        params.z_ptrs,
+        params.v_ptrs,
+        params.bwd_out_ptrs,
+        params.bwd_softmax_lse_ptrs,
+        params.d_ptrs,
+        params.dout_ptrs, 
+        params.dq_ptrs,
+        params.dk_ptrs,
+        params.dv_ptrs,
+        {},
+        {},
+        problem_descs,
+        device_gemm_trait::AElementOp{},
+        device_gemm_trait::B0ElementOp{},
+        device_gemm_trait::Acc0ElementOp{params.softmax_scale},
+        device_gemm_trait::B1ElementOp{},
+        device_gemm_trait::CElementOp{},
+        params.p_dropout, 
+        params.seeds);
+
+    // specify workspace for problem_desc
+    SimpleDeviceMem problem_desc_workspace{ device_op_ptr->GetWorkSpaceSize(argument_ptr) };
+
+    device_op_ptr->SetWorkSpacePointer(argument_ptr,
+                            problem_desc_workspace.GetDeviceBuffer());
+
+    if (!device_op_ptr->IsSupportedArgument(argument_ptr)) {
+      std::cout << device_op_ptr->GetTypeString() << " does not support this problem"
+                << std::endl;
+      return;
+    }
+
+    float avg_time = invoker_ptr->Run(argument, StreamConfig{stream, time_kernel});
+
+    if (time_kernel) {
+      std::cout << "time elpase is " << avg_time << " ms" << std::endl;
+    }
   }
 
  private:
-  int b_;
-  int h_;
-  int d_;
-  float scale_softmax_;
-
-  const void* q_ptr_;
-  const void* k_ptr_;
-  void* z_ptr_;
-  const void* v_ptr_;
-  const void* out_ptr_; 
-  const void* softmax_lse_ptr_;
-  void* d_ptr_;
-  const void* dout_ptr_;
-  void* dq_ptr_;
-  void* dk_ptr_;
-  void* dv_ptr_;
-  std::vector<Index> a_gs_ms_ks_lengths_;
-  std::vector<Index> a_gs_ms_ks_strides_;
-  std::vector<Index> b_gs_ns_ks_lengths_;
-  std::vector<Index> b_gs_ns_ks_strides_;
-  std::vector<Index> b1_gs_gemm1ns_gemm1ks_lengths_; // b1_gs_os_ns_lengths
-  std::vector<Index> b1_gs_gemm1ns_gemm1ks_strides_; // b1_gs_os_ns_strides
-  std::vector<Index> c_gs_ms_gemm1ns_lengths_;       // c_gs_ms_os_lengths
-  std::vector<Index> c_gs_ms_gemm1ns_strides_;       // c_gs_ms_os_strides
-  std::vector<Index> z_gs_ms_ns_lengths_;
-  std::vector<Index> z_gs_ms_ns_strides_;
-  std::vector<Index> lse_gs_ms_lengths_;
-  std::vector<Index> acc0_biases_gs_ms_ns_lengths_;
-  std::vector<Index> acc0_biases_gs_ms_ns_strides_;
-  float p_dropout_;
-  std::tuple<uint64_t, uint64_t> seeds_;
-
-  std::unique_ptr<DeviceGemmTemplate<DeviceGemmTraits>> device_gemm_instance_ptr_;
-  hipStream_t &stream_;
-
-  static constexpr bool kIsBatched = std::is_same_v<DeviceGemmTemplate, DeviceGemmGroupedHeadDim32> || 
-                                     std::is_same_v<DeviceGemmTemplate, DeviceGemmGroupedHeadDim64> ||
-                                     std::is_same_v<DeviceGemmTemplate, DeviceGemmGroupedHeadDim128>;
+  std::unique_ptr<DeviceOp> device_op_ptr;
+  std::unique_ptr<DeviceOp::Invoker> invoker_ptr;
+  std::unique_ptr<DeviceOp::Argument> argument_ptr;
 
   static const bool time_kernel = false;
-  static const bool input_permute = true;
-  static const bool output_permute = true;
 }; // class BwdDeviceGemmInstanceLauncher
-
-template <template <typename> typename DeviceGemmTemplate, typename DeviceGemmTraits>
-void DeviceGemmInstanceLauncher<DeviceGemmTemplate, DeviceGemmTraits>::Launch() {
-  for (int i = 0; i < batch_size; ++i) {
-    int M = params.host_seqlens_q[i + 1] - params.host_seqlens_q[i]; // seqlen Q
-    int N = params.host_seqlens_k[i + 1] - params.host_seqlens_k[i]; // seqlen K
-    int K = head_dim;
-    int O = head_dim;
-    int G0 = 1; // G0 = batch_size
-    int G1 = num_heads;
-
-    std::vector<ck::index_t> q_gs_ms_ks_lengths{G0, G1, M, K};
-    std::vector<ck::index_t> q_gs_ms_ks_strides =
-        input_permute
-            ? std::vector<ck::index_t>{M * G1 * K * params.q_stride_multiplier, K, G1 * K * params.q_stride_multiplier, 1}
-            // Q layout [G0, M, G1, K]
-            : std::vector<ck::index_t>{G1 * M * K, M * K, K, 1}; // Q layout [G0, G1, M, K]
-
-    std::vector<ck::index_t> k_gs_ns_ks_lengths{G0, G1, N, K};
-    std::vector<ck::index_t> k_gs_ns_ks_strides =
-        input_permute
-            ? std::vector<ck::index_t>{N * G1 * K * params.kv_stride_multiplier, K, G1 * K * params.kv_stride_multiplier, 1}
-            // K layout [G0, N, G1, K]
-            : std::vector<ck::index_t>{G1 * N * K, N * K, K, 1}; // K layout [G0, G1, N, K]
-
-    std::vector<ck::index_t> v_gs_os_ns_lengths{G0, G1, O, N};
-    std::vector<ck::index_t> v_gs_os_ns_strides =
-        input_permute
-            ? std::vector<ck::index_t>{N * G1 * O * params.kv_stride_multiplier, O, 1, G1 * O * params.kv_stride_multiplier}
-            // V layout [G0, N, G1, O]
-            : std::vector<ck::index_t>{G1 * N * O, N * O, 1, O}; // V layout [G0, G1, N, O]
-
-    std::vector<ck::index_t> y_gs_ms_os_lengths{G0, G1, M, O};
-    std::vector<ck::index_t> y_gs_ms_os_strides =
-        output_permute
-            ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1}
-            // Y layout [G0, M, G1, O]
-            : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // Y layout [G0, G1, M, O]
-
-    std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
-    std::vector<ck::index_t> z_gs_ms_ns_strides = 
-        input_permute
-        ? std::vector<ck::index_t>{M * G1 * N, N, G1 * N, 1}
-        // Z layout [G0, M, G1, N]
-        : std::vector<ck::index_t>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
-    // The softmax stat log-sum-exp (LSE) is used to speed up softmax
-    // calculation in backward pass Pi = exp(Si) / sum(exp(S0) + exp(S1) +
-    // ...)
-    //    = exp(Si) / exp(log(sum(exp() + ...)))
-    //    = exp(Si - log(sum(exp() + ...)))
-    //               ^^^^^^^^^^^^^^^^^^^^^
-    //                       LSE
-    std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
-    std::vector<ck::index_t> lse_gs_ms_strides{G1 * M, M, 1}; // LSE layout [G0, G1, M]
-
-
-    std::vector<typename DeviceGemmTemplate::ProblemDesc> problem_descs_;
-    problem_descs.push_back({
-        q_gs_ms_ks_lengths,
-        q_gs_ms_ks_strides,
-        k_gs_ns_ks_lengths,
-        k_gs_ns_ks_strides,
-        z_gs_ms_ns_lengths,
-        z_gs_ms_ns_strides,
-        v_gs_os_ns_lengths,
-        v_gs_os_ns_strides,
-        y_gs_ms_os_lengths,
-        y_gs_ms_os_strides,
-        lse_gs_ms_lengths,
-        lse_gs_ms_strides,
-        {}, // acc0_biases_gs_ms_ns_lengths
-        {}, // acc0_biases_gs_ms_ns_strides
-        {}, // acc1_biases_gs_ms_os_lengths
-        {}  // acc1_biases_gs_ms_os_strides
-    });
-  }
-
-  auto invoker = device_gemm_instance_ptr_->MakeInvoker();
-  auto argument = device_gemm_instance_ptr_->MakeArgument(
-      p_q,
-      p_k,
-      p_z,
-      p_v,
-      p_y,
-      p_lse,
-      p_d,
-      p_ygrad, 
-      p_qgrad,
-      p_kgrad,
-      p_vgrad,
-      {},
-      {}, 
-      device_gemm_trait::AElementOp{};
-      device_gemm_trait::B0ElementOp{};
-      device_gemm_trait::Acc0ElementOp{scale_softmax_};
-      device_gemm_trait::B1ElementOp{};
-      device_gemm_trait::CElementOp{};  
-      dropout_ratio, 
-      seeds);
-
-  // specify workspace for problem_desc
-  SimpleDeviceMem problem_desc_workspace{ device_gemm_instance_ptr_->GetWorkSpaceSize(&argument) };
-
-  device_gemm_instance_ptr_->SetWorkSpacePointer(&argument,
-                          problem_desc_workspace.GetDeviceBuffer());
-
-  if (!device_gemm_instance_ptr_->IsSupportedArgument(argument)) {
-    std::cout << device_gemm_instance_ptr_->GetTypeString() << " does not support this problem"
-              << std::endl;
-    return;
-  }
-
-  float avg_time = invoker.Run(argument, StreamConfig{stream_, time_kernel});
-
-  if (time_kernel) {
-    std::cout << "time elpase is " << avg_time << " ms" << std::endl;
-  }
-} // end of function Launch
 } // namespace bwd_device_gemm

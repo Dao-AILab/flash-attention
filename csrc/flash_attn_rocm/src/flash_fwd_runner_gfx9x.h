@@ -30,11 +30,6 @@
 namespace fwd_device_gemm {
 class FlashFwdRunner {
  public:
-  // constructor
-  explicit FlashFwdRunner(bool is_unit_test_mode, bool is_deterministic)
-    : is_unit_test_mode_(is_unit_test_mode),
-      is_deterministic_(is_deterministic) {}
- 
   template <bool kIsGrouped, int kHeadDim, typename T,  bool kIsPadding, bool kIsCausal>
   void Run(FlashFwdParams &params, hipStream_t &stream);
  
@@ -54,8 +49,5 @@ class FlashFwdRunner {
     auto device_gemm_instance_ptr = std::make_unique<DeviceGemmInstance>();
     device_gemm_instance_ptr->Launch(params, stream);
   }
-
-  const bool is_unit_test_mode_;
-  const bool is_deterministic_;
 }; // class FlashFwdRunner
 } // namespace fwd_device_gemm

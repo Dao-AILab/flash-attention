@@ -9,52 +9,88 @@
 #pragma once
 
 #include <vector>
+#include <memory>
 
 #include <ATen/hip/HIPGeneratorImpl.h>
 
 #include "utils.h"
 
-struct CommonParams {
-  // ------------------------ batched usage ------------------------ 
-  const void* __restrict__ q_ptr;
-  const void* __restrict__ k_ptr;
-  const void* __restrict__ v_ptr;
+#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 
-  // ------------------------ grouped usage ------------------------ 
-  std::vector<const void*> q_ptrs;
-  std::vector<const void*> k_ptrs;
-  std::vector<const void*> v_ptrs;
+// Common argements used by both batched & grouped gemms
+struct BaseParams {
+  explicit BaseParams(const size_t b,
+                      const size_t seqlen_q,
+                      const size_t seqlen_k,
+                      const size_t seqlen_q_rounded,
+                      const size_t seqlen_k_rounded,
+                      const size_t h,
+                      const size_t h_k,
+                      const size_t d,
+                      const size_t d_rounded,
+                      const at::Tensor q,
+                      const at::Tensor k,
+                      const at::Tensor v,
+                      const float p_dropout,
+                      const float softmax_scale,
+                      const bool is_causal)
+    : b(b),
+      seqlen_q(seqlen_q),
+      seqlen_k(seqlen_k),
+      seqlen_q_rounded(seqlen_q_rounded),
+      seqlen_k_rounded(seqlen_k_rounded),
+      h(h),
+      h_k(h_k),
+      d(d),
+      d_rounded(d_rounded),
+      p_dropout(p_dropout),
+      softmax_scale(softmax_scale),
+      is_bf16(q.dtype() == torch::kBFloat16),
+      is_dropout(p_dropout > 0.0f),
+      is_mnko_padding(false),
+      is_causal(is_causal) {
+
+    TORCH_CHECK(p_dropout < 1.f);
+    
+    if(!is_mnko_padding && d <= 32) {
+      is_mnko_padding = ((d % 32)==0 ? false : true);
+    } else if(!is_mnko_padding && d <= 64) {
+      is_mnko_padding = ((d % 64)==0 ? false : true);
+    } else if(!is_mnko_padding && d <= 128) {
+      is_mnko_padding = ((d % 128)==0 ? false : true);
+    } else {
+      std::cout << "Unsupported head dimension" << std::endl;
+    }
+
+    if(q.is_contiguous() && k.is_contiguous() && v.is_contiguous()) {  
+      q_stride_multiplier = 1;
+      kv_stride_multiplier = 1;
+    } else if(q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()) {
+      q_stride_multiplier = 1;
+      kv_stride_multiplier = 2;
+    } else if(!q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()) {
+      q_stride_multiplier = 3;
+      kv_stride_multiplier = 3;
+    } else {
+      std::cout<< "Wrong matrix inputs." <<std::endl;
+    }
+  }
 
   // The dimensions.
   int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded;
 
+  // The number of heads.
+  int h, h_k;
+  // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
+  // different from nheads (query).
+  int h_h_k_ratio; // precompute h / h_k,
+
   // The scaling factors for the kernel.
-  float scale_softmax;
-  float scale_softmax_log2;
-
-  // array of length b+1 holding starting offset of each sequence.
-  int* __restrict__ cu_seqlens_q;
-  int* __restrict__ cu_seqlens_k;
-
-  std::vector<int> host_seqlens_q;
-  std::vector<int> host_seqlens_k;
+  float softmax_scale;
+  // float softmax_scale_log2;
 
   int q_stride_multiplier;
   int kv_stride_multiplier;
-
-  const std::vector<Index> a_gs_ms_ks_lengths;
-  const std::vector<Index> a_gs_ms_ks_strides;
-  const std::vector<Index> b_gs_ns_ks_lengths;
-  const std::vector<Index> b_gs_ns_ks_strides;
-  const std::vector<Index> b1_gs_gemm1ns_gemm1ks_lengths; // b1_gs_os_ns_lengths
-  const std::vector<Index> b1_gs_gemm1ns_gemm1ks_strides; // b1_gs_os_ns_strides
-  const std::vector<Index> c_gs_ms_gemm1ns_lengths;       // c_gs_ms_os_lengths
-  const std::vector<Index> c_gs_ms_gemm1ns_strides;       // c_gs_ms_os_strides
-  const std::vector<Index> z_gs_ms_ns_lengths;
-  const std::vector<Index> z_gs_ms_ns_strides;
-  const std::vector<Index> lse_gs_ms_lengths;
-  const std::vector<Index> acc0_biases_gs_ms_ns_lengths;
-  const std::vector<Index> acc0_biases_gs_ms_ns_strides;
 
   // The dropout probability (probability of keeping an activation).
   float p_dropout;
@@ -73,71 +109,597 @@ struct CommonParams {
   // Pointer to the RNG seed (idx 0) and offset (idx 1).
   uint64_t* rng_state;
 
-  bool is_dropout;
   bool is_bf16;
-  bool is_causal;
+  bool is_dropout;
   bool is_mnko_padding;
+  bool is_causal;
 
-  // The number of heads.
-  int h, h_k;
-  // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
-  // different from nheads (query).
-  int h_h_k_ratio; // precompute h / h_k,
+  static const bool input_permute = true;
+  static const bool output_permute = true;
+  static const bool z_tensor_permute = false;
+
+  static const bool kIsUnitTestMode = get_env_("FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE");
+  static const bool kIsDeterministic = get_env_("FLASH_ATTENTION_INTERNAL_DETERMINISTIC");
 };
 
-struct FlashFwdParams : public CommonParams {
-  // ------------------------ batched usage ------------------------ 
-  // The O matrix (output).
-  void* __restrict__ out_ptr;
-
-  // The pointer to the P matrix.
-  void* __restrict__ p_ptr;
-
-  // The pointer to the softmax sum.
-  void* __restrict__ softmax_lse_ptr;
+// Common Batched Arguments
+struct BatchedParams : public BaseParams {
+  explicit BatchedParams(const size_t b,
+                         const size_t seqlen_q,
+                         const size_t seqlen_k,
+                         const size_t seqlen_q_rounded,
+                         const size_t seqlen_k_rounded,
+                         const size_t h,
+                         const size_t h_k,
+                         const size_t d,
+                         const size_t d_rounded,
+                         const at::Tensor q,
+                         const at::Tensor k,
+                         const at::Tensor v,
+                         at::Tensor out,
+                         void* z_d,
+                         void* softmax_lse_d,
+                         float p_dropout,
+                         float softmax_scale,
+                         bool is_causal)
+    : BaseParams(b,
+                 seqlen_q,
+                 seqlen_k,
+                 seqlen_q_rounded,
+                 seqlen_k_rounded,
+                 h,
+                 h_k,
+                 d,
+                 d_rounded,
+                 q,
+                 k,
+                 v,
+                 p_dropout,
+                 softmax_scale,
+                 is_causal),
+      q_ptr(q.data_ptr()),
+      k_ptr(k.data_ptr()),
+      z_ptr(z_d),
+      v_ptr(v.data_ptr()),
+      out_ptr(out.data_ptr()),
+      softmax_lse_ptr(softmax_lse_d),
+      q_gs_ms_ks_lengths({b, h, seqlen_q_rounded, d}),
+      q_gs_ms_ks_strides(
+            input_permute
+          ? std::vector<Index>{seqlen_q_rounded * h * d * q_stride_multiplier, d, h * d * q_stride_multiplier, 1}    // A layout [b, seqlen_q_rounded, h, d]
+          : std::vector<Index>{h * seqlen_q_rounded * d, seqlen_q_rounded * d, d, 1}),   // A layout [b, h, seqlen_q_rounded, d]
+      k_gs_ns_ks_lengths({b, h, seqlen_k_rounded, d}),
+      k_gs_ns_ks_strides(
+            input_permute
+          ? std::vector<Index>{seqlen_k_rounded * h * d * kv_stride_multiplier, d, h * d * kv_stride_multiplier, 1}  // B0 layout [b, seqlen_k_rounded, h, d]
+          : std::vector<Index>{h * seqlen_k_rounded * d, seqlen_k_rounded * d, d, 1}), // B0 layout [b, h, seqlen_k_rounded, d]
+      z_gs_ms_ns_lengths({b, h, seqlen_q_rounded, seqlen_k_rounded}),  
+      z_gs_ms_ns_strides( 
+            z_tensor_permute
+          ? std::vector<Index>{seqlen_q_rounded * h * seqlen_k_rounded, seqlen_k_rounded, h * seqlen_k_rounded, 1}  // Z layout [b, seqlen_q_rounded, h, seqlen_k_rounded]
+          : std::vector<Index>{h * seqlen_q_rounded * seqlen_k_rounded, seqlen_q_rounded * seqlen_k_rounded, seqlen_k_rounded, 1}), // Z layout [b, h, seqlen_q_rounded, seqlen_k_rounded]
+      v_gs_gemm1ns_gemm1ks_lengths({b, h, d, seqlen_k_rounded}),
+      v_gs_gemm1ns_gemm1ks_strides(
+            input_permute
+          ? std::vector<Index>{seqlen_k_rounded * h * d * kv_stride_multiplier, d, 1, h * d * kv_stride_multiplier}  // B1 layout [b, seqlen_k_rounded, h, d]
+          : std::vector<Index>{h * seqlen_k_rounded * d, seqlen_k_rounded * d, 1, d}), // B1 layout [b, h, seqlen_k_rounded, d]
+      out_gs_ms_gemm1ns_lengths({b, h, seqlen_q_rounded, d}),  
+      out_gs_ms_gemm1ns_strides(
+            output_permute
+          ? std::vector<Index>{seqlen_q_rounded * h * d, d, h * d, 1}  // C layout [b, seqlen_q_rounded, h, d]
+          : std::vector<Index>{h * seqlen_q_rounded * d, seqlen_q_rounded * d, d, 1}), // C layout [b, h, seqlen_q_rounded, d]
+      lse_gs_ms_lengths({b, h, seqlen_q_rounded}),                       // LSE layout [b, h, seqlen_q_rounded]
+      lse_gs_ms_lengths({h * seqlen_q_rounded, seqlen_q_rounded, 1}) {}
   
-  // ------------------------ grouped usage ------------------------ 
-  // The O matrix (output).
-  std::vector<void*> out_ptrs;
+  void* __restrict__ q_ptr;
+  void* __restrict__ k_ptr;
+  void* __restrict__ z_ptr;
+  void* __restrict__ v_ptr;
 
-  // The pointer to the P matrix.
-  std::vector<void*> p_ptrs;
+  void* __restrict__ out_ptr;
+  void* __restrict__ softmax_lse_ptr;
 
-  // The pointer to the softmax sum.
-  std::vector<void*> softmax_lse_ptrs;
-
-  std::vector<at::Tensor> q_tensors;
-  std::vector<at::Tensor> k_tensors;
-  std::vector<at::Tensor> v_tensors;
+  std::vector<Index> q_gs_ms_ks_lengths;
+  std::vector<Index> q_gs_ms_ks_strides;
+  std::vector<Index> k_gs_ns_ks_lengths;
+  std::vector<Index> k_gs_ns_ks_strides;
+  std::vector<Index> z_gs_ms_ns_lengths;  
+  std::vector<Index> z_gs_ms_ns_strides;
+  std::vector<Index> v_gs_gemm1ns_gemm1ks_lengths;    // b1_gs_os_ns_lengths
+  std::vector<Index> v_gs_gemm1ns_gemm1ks_strides;    // b1_gs_os_ns_strides
+  std::vector<Index> out_gs_ms_gemm1ns_lengths;       // c_gs_ms_os_lengths
+  std::vector<Index> out_gs_ms_gemm1ns_strides;       // c_gs_ms_os_strides
+  std::vector<Index> lse_gs_ms_lengths;
+  std::vector<Index> lse_gs_ms_strides;
 };
 
-struct FlashBwdParams : public CommonParams {
-  // ------------------------ batched usage ------------------------ 
+// Forward Batched Arguments
+struct FlashFwdBatchedParams : public BatchedParams {
+  explicit FlashFwdBatchedParams(const size_t b,
+                                 const size_t seqlen_q,
+                                 const size_t seqlen_k,
+                                 const size_t seqlen_q_rounded,
+                                 const size_t seqlen_k_rounded,
+                                 const size_t h,
+                                 const size_t h_k,
+                                 const size_t d,
+                                 const size_t d_rounded,
+                                 const at::Tensor q,
+                                 const at::Tensor k,
+                                 const at::Tensor v,
+                                 at::Tensor out,
+                                 void* z_d,
+                                 void* softmax_lse_d,
+                                 float p_dropout,
+                                 float softmax_scale,
+                                 bool is_causal) 
+    : BatchedParams(b,
+                    seqlen_q,
+                    seqlen_k,
+                    seqlen_q_rounded,
+                    seqlen_k_rounded,
+                    h,
+                    h_k,
+                    d,
+                    d_rounded,
+                    q,
+                    k,
+                    v,
+                    out,
+                    z_d,
+                    softmax_lse_d,
+                    p_dropout,
+                    softmax_scale,
+                    is_causal) {}
+};
+
+// Backward Batched Arguments
+struct FlashBwdBatchedParams : public BatchedParams {
+  explicit FlashBwdBatchedParams(const size_t b,
+                                 const size_t seqlen_q,
+                                 const size_t seqlen_k,
+                                 const size_t seqlen_q_rounded,
+                                 const size_t seqlen_k_rounded,
+                                 const size_t h,
+                                 const size_t h_k,
+                                 const size_t d,
+                                 const size_t d_rounded,
+                                 const at::Tensor q,
+                                 const at::Tensor k,
+                                 const at::Tensor v,
+                                 at::Tensor out,
+                                 const at::Tensor out,
+                                 const at::Tensor dout,
+                                 at::Tensor dq,
+                                 at::Tensor dk,
+                                 at::Tensor dv,
+                                 void* z_d,
+                                 void* softmax_lse_d,
+                                 float p_dropout,
+                                 float softmax_scale,
+                                 bool is_causal)
+    : BatchedParams(b,
+                    seqlen_q,
+                    seqlen_k,
+                    seqlen_q_rounded,
+                    seqlen_k_rounded,
+                    h,
+                    h_k,
+                    d,
+                    d_rounded,
+                    q,
+                    k,
+                    v,
+                    out,
+                    z_d,
+                    softmax_lse_d,
+                    p_dropout,
+                    softmax_scale,
+                    is_causal),
+      dq_ptr(dq.data_ptr()),
+      dk_ptr(dk.data_ptr()),
+      dv_ptr(dv.data_ptr()),
+      dout_ptr(dout.data_ptr()),
+      d_ptr(at::empty({b, static_cast<long>(h), seqlen_q_rounded}, 
+                      q.options().dtype(at::kFloat)).data_ptr()) {}
+
   void* __restrict__ dq_ptr;
   void* __restrict__ dk_ptr;
   void* __restrict__ dv_ptr;
 
-  const void* __restrict__ out_ptr;
-  const void* __restrict__ dout_ptr;
-
-  void* __restrict__ z_ptr;
+  void* __restrict__ dout_ptr;
   void* __restrict__ d_ptr;
-  void* __restrict__ softmax_lse_ptr;
+};
 
-  // ------------------------ grouped usage ------------------------
+// Common Grouped Arguments
+struct GroupedParams : public BaseParams {
+  explicit GroupedParams(const size_t b,
+                         const size_t seqlen_q,
+                         const size_t seqlen_k,
+                         const size_t seqlen_q_rounded,
+                         const size_t seqlen_k_rounded,
+                         const size_t h,
+                         const size_t h_k,
+                         const size_t d,
+                         const size_t d_rounded,
+                         const at::Tensor q,
+                         const at::Tensor k,
+                         const at::Tensor v,
+                         at::Tensor out,
+                         void* cu_seqlens_q_d,
+                         void* cu_seqlens_k_d,
+                         void* z_d,
+                         void* softmax_lse_d,
+                         float p_dropout,
+                         float softmax_scale,
+                         bool is_causal)
+    : BaseParams(b,
+                 seqlen_q,
+                 seqlen_k,
+                 seqlen_q_rounded,
+                 seqlen_k_rounded,
+                 h,
+                 h_k,
+                 d,
+                 d_rounded,
+                 q,
+                 k,
+                 v,
+                 p_dropout,
+                 softmax_scale,
+                 is_causal),
+      host_seqlens_q(std::vector<int>(b+1)),
+      host_seqlens_k(std::vector<int>(b+1)) {
+    
+    char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
+    char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
+    char* z_ptr = reinterpret_cast<char*>(z_d);
+    char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
+
+    char* out_ptr = reinterpret_cast<char*>(out.data_ptr());
+    char* softmax_lse_ptr = reinterpret_cast<char*>(softmax_lse_d);    
+
+    FMHA_CHECK_HIP(hipMemcpy(host_seqlens_q.data(),   
+                             cu_seqlens_q_d, 
+                             (b+1)*sizeof(int), 
+                             hipMemcpyDeviceToHost));
+    FMHA_CHECK_HIP(hipMemcpy(host_seqlens_k.data(), 
+                             cu_seqlens_k_d, 
+                             (b+1)*sizeof(int), 
+                             hipMemcpyDeviceToHost));
+
+    problem_descs.reserve(b);
+
+    for (int i = 0; i < b; ++i) {
+      int temp_seqlen_q = host_seqlens_q[i+1] - host_seqlens_q[i];
+      int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, q.dtype());
+      int temp_seqlen_k = host_seqlens_k[i+1] - host_seqlens_k[i];
+      int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, q.dtype());
+
+      if(!is_mnko_padding && d <= 32) {
+        is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+      } else if(!is_mnko_padding && d <= 64) {
+        if(is_dropout) {
+          is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+        } else {
+          is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 256)==0 ? false : true);
+        }
+      } else if(!is_mnko_padding && d <= 128) {
+        is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+      }
+
+      q_ptrs.push_back(reinterpret_cast<void*>(q_ptr));
+      q_ptr = q_ptr + temp_q_stride * q_stride_multiplier;
+
+      k_ptrs.push_back(reinterpret_cast<void*>(k_ptr));
+      k_ptr = k_ptr + temp_k_stride * kv_stride_multiplier;
+
+      v_ptrs.push_back(reinterpret_cast<void*>(v_ptr));     
+      v_ptr = v_ptr + temp_k_stride * kv_stride_multiplier;      
+
+      out_ptrs.push_back(reinterpret_cast<void*>(out_ptr));
+      out_ptr = out_ptr + temp_q_stride;
+
+      softmax_lse_ptrs.push_back(reinterpret_cast<void*>(softmax_lse_ptr));
+      int temp_lse_stride = get_size_in_bytes(h * seqlen_q, torch::kFloat32);
+      softmax_lse_ptr = softmax_lse_ptr + temp_lse_stride;
+
+      if(z_d) {
+        z_ptrs.push_back(reinterpret_cast<void*>(z_ptr + i * h * seqlen_q * seqlen_k * sizeof(int)));
+      }
+      else{
+        z_ptrs.push_back(nullptr);
+      }
+
+      int K  = head_dim;
+      int O  = head_dim;
+      int G0 = 1;
+      int G1 = num_heads;
+      int M = host_seqlens_q[i + 1] - host_seqlens_q[i]; //seqlen Q
+      int N = host_seqlens_k[i + 1] - host_seqlens_k[i]; //seqlen K
+
+      std::vector<ck::index_t> q_gs_ms_ks_lengths{G0, G1, M, K};
+      std::vector<ck::index_t> q_gs_ms_ks_strides =
+          input_permute
+              ? std::vector<ck::index_t>{M * G1 * K * q_stride_multiplier, K, G1 * K * q_stride_multiplier, 1}
+              // Q layout [G0, M, G1, K]
+              : std::vector<ck::index_t>{G1 * M * K, M * K, K, 1}; // Q layout [G0, G1, M, K]
+
+      std::vector<ck::index_t> k_gs_ns_ks_lengths{G0, G1, N, K};
+      std::vector<ck::index_t> k_gs_ns_ks_strides =
+          input_permute
+              ? std::vector<ck::index_t>{N * G1 * K * kv_stride_multiplier, K, G1 * K * kv_stride_multiplier, 1}
+              // K layout [G0, N, G1, K]
+              : std::vector<ck::index_t>{G1 * N * K, N * K, K, 1}; // K layout [G0, G1, N, K]
+
+      std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
+      std::vector<ck::index_t> z_gs_ms_ns_strides = 
+          input_permute
+          ? std::vector<ck::index_t>{M * G1 * N, N, G1 * N, 1}
+          // Z layout [G0, M, G1, N]
+          : std::vector<ck::index_t>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
+
+      std::vector<ck::index_t> v_gs_os_ns_lengths{G0, G1, O, N};
+      std::vector<ck::index_t> v_gs_os_ns_strides =
+          input_permute
+              ? std::vector<ck::index_t>{N * G1 * O * kv_stride_multiplier, O, 1, G1 * O * kv_stride_multiplier}
+              // V layout [G0, N, G1, O]
+              : std::vector<ck::index_t>{G1 * N * O, N * O, 1, O}; // V layout [G0, G1, N, O]
+
+      std::vector<ck::index_t> out_gs_ms_os_lengths{G0, G1, M, O};
+      std::vector<ck::index_t> out_gs_ms_os_strides =
+          output_permute
+              ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1}
+              // Y layout [G0, M, G1, O]
+              : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // Y layout [G0, G1, M, O]
+
+      std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
+      std::vector<ck::index_t> lse_gs_ms_strides{G1 * M, M, 1}; // LSE layout [G0, G1, M]
+
+      problem_descs.push_back({
+          q_gs_ms_ks_lengths,
+          q_gs_ms_ks_strides,
+          k_gs_ns_ks_lengths,
+          k_gs_ns_ks_strides,
+          z_gs_ms_ns_lengths,
+          z_gs_ms_ns_strides,
+          v_gs_os_ns_lengths,
+          v_gs_os_ns_strides,
+          out_gs_ms_os_lengths,
+          out_gs_ms_os_strides,
+          lse_gs_ms_lengths,
+          lse_gs_ms_strides,
+          {}, // acc0_biases_gs_ms_ns_lengths
+          {}, // acc0_biases_gs_ms_ns_strides
+          {}, // acc1_biases_gs_ms_os_lengths
+          {}  // acc1_biases_gs_ms_os_strides
+      });
+    }
+  }
+
+  std::vector<const void*> q_ptrs;
+  std::vector<const void*> k_ptrs;
+  std::vector<void*> z_ptrs;
+  std::vector<const void*> v_ptrs;
+
+  std::vector<void*> out_ptrs;
+  std::vector<void*> softmax_lse_ptrs;
+
+  std::vector<int> host_seqlens_q;
+  std::vector<int> host_seqlens_k;
+
+  struct ProblemDesc {
+    std::vector<Index> q_gs_ms_ks_lengths;
+    std::vector<Index> q_gs_ms_ks_strides;
+    std::vector<Index> k_gs_ns_ks_lengths;
+    std::vector<Index> k_gs_ns_ks_strides;
+    std::vector<Index> z_gs_ms_ns_lengths;  
+    std::vector<Index> z_gs_ms_ns_strides;
+    std::vector<Index> v_gs_gemm1ns_gemm1ks_lengths;    // b1_gs_os_ns_lengths
+    std::vector<Index> v_gs_gemm1ns_gemm1ks_strides;    // b1_gs_os_ns_strides
+    std::vector<Index> out_gs_ms_gemm1ns_lengths;       // c_gs_ms_os_lengths
+    std::vector<Index> out_gs_ms_gemm1ns_strides;       // c_gs_ms_os_strides
+    std::vector<Index> lse_gs_ms_lengths;
+    std::vector<Index> lse_gs_ms_strides;
+  };
+
+  std::vector<ProblemDesc> problem_descs;
+};
+
+// Forward Grouped Arguments
+struct FlashFwdGroupedParams : public GroupedParams {
+  explicit FlashFwdGroupedParams(const size_t b,
+                                 const size_t seqlen_q,
+                                 const size_t seqlen_k,
+                                 const size_t seqlen_q_rounded,
+                                 const size_t seqlen_k_rounded,
+                                 const size_t h,
+                                 const size_t h_k,
+                                 const size_t d,
+                                 const size_t d_rounded,
+                                 const at::Tensor q,
+                                 const at::Tensor k,
+                                 const at::Tensor v,
+                                 at::Tensor out,
+                                 void* cu_seqlens_q_d,
+                                 void* cu_seqlens_k_d,
+                                 void* z_d,
+                                 void* softmax_lse_d,
+                                 float p_dropout,
+                                 float softmax_scale,
+                                 bool is_causal) 
+    : GroupedParams(b,
+                    seqlen_q,
+                    seqlen_k,
+                    seqlen_q_rounded,
+                    seqlen_k_rounded,
+                    h,
+                    h_k,
+                    d,
+                    d_rounded,
+                    q,
+                    k,
+                    v,
+                    out,
+                    cu_seqlens_q_d,
+                    cu_seqlens_k_d,
+                    z_d,
+                    softmax_lse_d,
+                    p_dropout,
+                    softmax_scale,
+                    is_causal) {
+                        
+  }
+};
+
+// Backward Grouped Arguments
+struct FlashBwdGroupedParams : public GroupedParams {
+  explicit FlashBwdGroupedParams(const size_t b,
+                                 const size_t seqlen_q,
+                                 const size_t seqlen_k,
+                                 const size_t seqlen_q_rounded,
+                                 const size_t seqlen_k_rounded,
+                                 const size_t h,
+                                 const size_t h_k,
+                                 const size_t d,
+                                 const size_t d_rounded,
+                                 const at::Tensor q,
+                                 const at::Tensor k,
+                                 const at::Tensor v,
+                                 at::Tensor out,
+                                 const at::Tensor out,
+                                 const at::Tensor dout,
+                                 at::Tensor dq,
+                                 at::Tensor dk,
+                                 at::Tensor dv,
+                                 void* cu_seqlens_q_d,
+                                 void* cu_seqlens_k_d,
+                                 void* z_d,
+                                 void* softmax_lse_d,
+                                 float p_dropout,
+                                 float softmax_scale,
+                                 bool is_causal)
+    : GroupedParams(b,
+                    seqlen_q,
+                    seqlen_k,
+                    seqlen_q_rounded,
+                    seqlen_k_rounded,
+                    h,
+                    h_k,
+                    d,
+                    d_rounded,
+                    q,
+                    k,
+                    v,
+                    out,
+                    cu_seqlens_q_d,
+                    cu_seqlens_k_d,
+                    z_d,
+                    softmax_lse_d,
+                    p_dropout,
+                    softmax_scale,
+                    is_causal),
+      bwd_out_ptrs(std::vector<const void*>(out_ptrs.begin(), out_ptrs.end())),
+      bwd_softmax_lse_ptrs(std::vector<const void*>(softmax_lse_ptrs.begin(), softmax_lse_ptrs.end())) {
+
+    char* dq_ptr = reinterpret_cast<char*>(dq.data_ptr());
+    char* dk_ptr = reinterpret_cast<char*>(dk.data_ptr());
+    char* dv_ptr = reinterpret_cast<char*>(dv.data_ptr());
+    char* dout_ptr = reinterpret_cast<char*>(dout.data_ptr());
+
+    for (int i = 0; i < b; ++i) {
+      int temp_seqlen_q = host_seqlens_q[i+1] - host_seqlens_q[i];
+      int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, q.dtype());
+      int temp_dq_stride = get_size_in_bytes(d * h * temp_seqlen_q, dq.dtype());
+      int temp_seqlen_k = host_seqlens_k[i+1] - host_seqlens_k[i];
+      int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, q.dtype());
+      int temp_dk_stride = get_size_in_bytes(d * h * temp_seqlen_k, dk.dtype());
+
+      if(!is_mnko_padding && d <= 32) {
+        is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+      }
+      else if(!is_mnko_padding && d <= 64) {
+        is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+      }
+      else if(!is_mnko_padding && d <= 128) {
+        is_mnko_padding = ((temp_seqlen_q % 64)==0 && (temp_seqlen_k % 128)==0 ? false : true);
+      }
+
+      auto opts = q.options();
+
+      at::Tensor d_tensor;
+      d_tensor = at::empty({1, static_cast<long>(h), temp_seqlen_q}, opts.dtype(at::kFloat));
+      d_tensors.push_back(d_tensor);
+      d_ptrs.push_back(reinterpret_cast<void*>(d_tensor.data_ptr()));
+
+      // unit test mode
+      if(kIsUnitTestMode) {
+        q_ptrs.clear();
+        k_ptrs.clear();
+        v_ptrs.clear();
+
+        if(q.is_contiguous()) {
+          q_ptrs.push_back(reinterpret_cast<void*>(q_ptr));
+          dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));
+          q_ptr = q_ptr + temp_q_stride;
+          dq_ptr = dq_ptr + temp_dq_stride;
+        } else {
+          auto q_each_tmp = q.index({torch::indexing::Slice(host_seqlens_q[i], host_seqlens_q[i+1])}).contiguous();
+          auto qgrad_each_tmp = dq.index({torch::indexing::Slice(host_seqlens_q[i], host_seqlens_q[i+1])}).contiguous();
+          dq_tensors.push_back(qgrad_each_tmp);
+          q_ptrs.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
+          dq_ptrs.push_back(reinterpret_cast<void*>(qgrad_each_tmp.data_ptr()));
+        }
+
+        if(k.is_contiguous()) {
+          k_ptrs.push_back(reinterpret_cast<void*>(k_ptr));
+          dk_ptrs.push_back(reinterpret_cast<void*>(dk_ptr));
+          k_ptr = k_ptr + temp_k_stride;
+          dk_ptr = dk_ptr + temp_dk_stride;
+        } else {
+          auto k_each_tmp = k.index({torch::indexing::Slice(host_seqlens_k[i], host_seqlens_k[i+1])}).contiguous();
+          auto kgrad_each_tmp = dk.index({torch::indexing::Slice(host_seqlens_k[i], host_seqlens_k[i+1])}).contiguous();
+          dk_tensors.push_back(kgrad_each_tmp);
+          k_ptrs.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
+          dk_ptrs.push_back(reinterpret_cast<void*>(kgrad_each_tmp.data_ptr()));
+        }
+
+        if(v.is_contiguous()) {
+          v_ptrs.push_back(reinterpret_cast<void*>(v_ptr)); 
+          dv_ptrs.push_back(reinterpret_cast<void*>(dv_ptr));
+          v_ptr = v_ptr + temp_k_stride;   
+          dv_ptr = dv_ptr + temp_dk_stride;
+        } else {
+          auto v_each_tmp = v.index({torch::indexing::Slice(host_seqlens_k[i], host_seqlens_k[i+1])}).contiguous();
+          auto vgrad_each_tmp = dv.index({torch::indexing::Slice(host_seqlens_k[i], host_seqlens_k[i+1])}).contiguous();
+          dv_tensors.push_back(vgrad_each_tmp);
+          v_ptrs.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
+          dv_ptrs.push_back(reinterpret_cast<void*>(vgrad_each_tmp.data_ptr()));
+        }
+      // performance mode
+      } else {
+        dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));
+        dq_ptr = dq_ptr + temp_dq_stride * q_stride_multiplier;
+
+        dk_ptrs.push_back(reinterpret_cast<void*>(dk_ptr));
+        dk_ptr = dk_ptr + temp_dk_stride * kv_stride_multiplier;
+
+        dv_ptrs.push_back(reinterpret_cast<void*>(dv_ptr));
+        dv_ptr = dv_ptr + temp_dk_stride * kv_stride_multiplier;
+      }
+
+      dout_ptrs.push_back(reinterpret_cast<const void*>(dout_ptr));
+      dout_ptr += temp_q_stride;
+    }            
+  }
+
   std::vector<void*> dq_ptrs;
   std::vector<void*> dk_ptrs;
   std::vector<void*> dv_ptrs;
 
-  std::vector<const void*> out_ptrs;
+  std::vector<const void*> bwd_out_ptrs;
+  std::vector<const void*> bwd_softmax_lse_ptrs;
+
   std::vector<const void*> dout_ptrs;
-
-  std::vector<void*> z_ptrs;
   std::vector<void*> d_ptrs;
-  std::vector<const void*> softmax_lse_ptrs;
-
-  std::vector<at::Tensor> d_tensors;
-  std::vector<at::Tensor> dq_tensors;
-  std::vector<at::Tensor> dk_tensors;
-  std::vector<at::Tensor> dv_tensors;
 };

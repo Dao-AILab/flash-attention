@@ -15,21 +15,8 @@
 #include "flash_runner.h"
 #include "params.h"
 
-#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 
-// get environment variables for internal usage
-inline bool get_env_(const char* env_var) {
-  if (char* value = std::getenv(env_var)) { 
-    if (strcmp(value, "0") == 0) { return false; }
-    return true;
-  }
-  return false;
-}
-
-bool IS_UNIT_TEST_MODE = get_env_("FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE");
-bool IS_DETERMINISTIC = get_env_("FLASH_ATTENTION_INTERNAL_DETERMINISTIC");
-
-auto flash_runner = std::make_unique<FlashRunner>(IS_UNIT_TEST_MODE, IS_DETERMINISTIC);
+auto flash_runner = std::make_unique<FlashRunner>();
 
 void set_params_fprop(bool is_dgrad, // is setting params for dgrad
                       FlashFwdParams &params,
@@ -58,151 +45,11 @@ void set_params_fprop(bool is_dgrad, // is setting params for dgrad
     // Reset the parameters
     memset(&params, 0, sizeof(params));
 
-    params.is_bf16 = q.dtype() == torch::kBFloat16;
-    
-    // Set the dimensions.
-    params.b = b;
-    params.h = h;
-    params.h_k = h_k;
-    params.h_h_k_ratio = h / h_k;
-    params.seqlen_q = seqlen_q;
-    params.seqlen_k = seqlen_k;
-    params.seqlen_q_rounded = seqlen_q_rounded;
-    params.seqlen_k_rounded = seqlen_k_rounded;
-    params.d = d;
-    params.d_rounded = d_rounded;
-    params.is_mnko_padding = false;    // MNKOpadding
 
-    // Set the pointers and strides.
-    char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
-    char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
-    char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
-    // All stride are in elements, not bytes.
-    // params.q_row_stride = q.stride(-3);
-    // params.k_row_stride = k.stride(-3);
-    // params.v_row_stride = v.stride(-3);
-    // params.q_head_stride = q.stride(-2);
-    // params.k_head_stride = k.stride(-2);
-    // params.v_head_stride = v.stride(-2);
-    char* out_ptr = reinterpret_cast<char*>(out.data_ptr());
-    // params.o_row_stride = out.stride(-3);
-    // params.o_head_stride = out.stride(-2);
-
-    // if (cu_seqlens_q_d == nullptr) {
-    //   params.q_batch_stride = q.stride(0);
-    //   params.k_batch_stride = k.stride(0);
-    //   params.v_batch_stride = v.stride(0);
-    //   params.o_batch_stride = out.stride(0);
-    // }
-
-    params.cu_seqlens_q = static_cast<int*>(cu_seqlens_q_d);
-    params.cu_seqlens_k = static_cast<int*>(cu_seqlens_k_d);
-
-    if(cu_seqlens_q_d != nullptr) {
-      params.host_seqlens_q = std::vector<int>(b+1);
-      params.host_seqlens_k = std::vector<int>(b+1);
-      FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_q.data(), cu_seqlens_q_d, (b+1)*sizeof(int), hipMemcpyDeviceToHost));
-      FMHA_CHECK_HIP(hipMemcpy(params.host_seqlens_k.data(), cu_seqlens_k_d, (b+1)*sizeof(int), hipMemcpyDeviceToHost));
-    }
- 
-    // P = softmax(QK^T)
-    char* p_ptr = reinterpret_cast<char*>(p_d);
-
-    // Softmax sum
-    char* softmax_lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
-
-    if(!params.is_mnko_padding && d <= 32) {
-      params.is_mnko_padding = ((d % 32)==0 ? false : true);
-    } else if(!params.is_mnko_padding && d <= 64) {
-      params.is_mnko_padding = ((d % 64)==0 ? false : true);
-    } else if(!params.is_mnko_padding && d <= 128) {
-      params.is_mnko_padding = ((d % 128)==0 ? false : true);
-    } else {
-      std::cout << "Unsupported head dimension" << std::endl;
-    }
-
-    if(q.is_contiguous() && k.is_contiguous() && v.is_contiguous()) {  
-      params.q_stride_multiplier = 1;
-      params.kv_stride_multiplier = 1;
-    } else if(q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()) {
-      params.q_stride_multiplier = 1;
-      params.kv_stride_multiplier = 2;
-    } else if(!q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()) {
-      params.q_stride_multiplier = 3;
-      params.kv_stride_multiplier = 3;
-    } else {
-      std::cout<< "Wrong matrix inputs." <<std::endl;
-    }
-
-    for (int i = 0; i < b; i++) {
-      int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
-      int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, q.dtype());
-      int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
-      int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, q.dtype());
-
-      if(!params.is_mnko_padding && d <= 32) {
-        params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
-      } else if(!params.is_mnko_padding && d <= 64) {
-        if(params.is_dropout) {
-          params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
-        } else {
-          params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 256)==0 ? false : true);
-        }
-      } else if(!params.is_mnko_padding && d <= 128) {
-        params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
-      }
-
-      // only set qkv when it is (not dgrad) or is (dgrad in performance mode)
-      // boolean expression ~X + X(~Y) = ~X + ~Y
-      if (!is_dgrad || !IS_UNIT_TEST_MODE) {
-        params.q_ptrs.push_back(reinterpret_cast<void*>(q_ptr));
-        q_ptr = q_ptr + temp_q_stride * params.q_stride_multiplier;
-
-        params.k_ptrs.push_back(reinterpret_cast<void*>(k_ptr));
-        k_ptr = k_ptr + temp_k_stride * params.kv_stride_multiplier;
-
-        params.v_ptrs.push_back(reinterpret_cast<void*>(v_ptr));     
-        v_ptr = v_ptr + temp_k_stride * params.kv_stride_multiplier;
-      }
-
-      params.out_ptrs.push_back(reinterpret_cast<void*>(out_ptr));
-      out_ptr = out_ptr + temp_q_stride;
-
-      params.softmax_lse_ptrs.push_back(reinterpret_cast<void*>(softmax_lse_ptr));
-      int temp_lse_stride = get_size_in_bytes(h * seqlen_q, torch::kFloat32);
-      softmax_lse_ptr = softmax_lse_ptr + temp_lse_stride;
-
-      if(p_d) {
-        params.p_ptrs.push_back(reinterpret_cast<void*>(p_ptr + i * h * seqlen_q * seqlen_k * sizeof(int)));
-      }
-      else{
-        params.p_ptrs.push_back(nullptr);
-      }
-    }
-
-    // Set the different scale values.
-    params.scale_softmax = softmax_scale;
-    // params.scale_softmax_log2 = softmax_scale * M_LOG2E;
-
-    // Set this to probability of keeping an element to simplify things.
-    // params.p_dropout = 1.f - p_dropout;
-    params.p_dropout = p_dropout;
-
-    // Convert p from float to int so we don't have to convert the random uint to float to compare.
-    // [Minor] We want to round down since when we do the comparison we use <= instead of <
-    // params.p_dropout_in_uint = uint32_t(std::floor(params.p_dropout * 4294967295.0));
-    // params.p_dropout_in_uint16_t = uint16_t(std::floor(params.p_dropout * 65535.0));
-    // params.p_dropout_in_uint8_t = uint8_t(std::floor(params.p_dropout * 255.0));
-    // params.rp_dropout = 1.f / params.p_dropout;
-    // params.scale_softmax_rp_dropout = params.rp_dropout * params.scale_softmax;
-    TORCH_CHECK(p_dropout < 1.f);
-    
-    params.is_dropout = p_dropout > 0.0f;
-    params.is_causal = is_causal;
+   
 }
 
 void set_params_dgrad(FlashBwdParams &params,
-                      // sizes
                       const size_t b,
                       const size_t seqlen_q,
                       const size_t seqlen_k,
@@ -212,7 +59,6 @@ void set_params_dgrad(FlashBwdParams &params,
                       const size_t h_k,
                       const size_t d,
                       const size_t d_rounded,
-                      // device pointers
                       const at::Tensor q,
                       const at::Tensor k,
                       const at::Tensor v,
@@ -232,148 +78,33 @@ void set_params_dgrad(FlashBwdParams &params,
                       float softmax_scale,
                       bool is_causal) {
                         
-    set_params_fprop(true,
-                     params,
-                     b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
-                     q, k, v, out,
-                     cu_seqlens_q_d,
-                     cu_seqlens_k_d,
-                     nullptr,
-                     softmax_lse_d,
-                     p_dropout,
-                     softmax_scale,
-                     is_causal);
+  set_params_fprop(true,
+                   params,
+                   b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
+                   q, k, v, out,
+                   cu_seqlens_q_d,
+                   cu_seqlens_k_d,
+                   nullptr,
+                   softmax_lse_d,
+                   p_dropout,
+                   softmax_scale,
+                   is_causal);
 
-    char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
-    char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
-    char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
-    // Set the pointers and strides.
-    char* dout_ptr = reinterpret_cast<char*>(dout.data_ptr());
-    char* out_ptr = reinterpret_cast<char*>(out.data_ptr());
-    char* softmax_lse_ptr = reinterpret_cast<char*>(softmax_lse_d);
-    // params.do_row_stride = dout.stride(-3);
-    // params.do_head_stride = dout.stride(-2);
-    char* dq_ptr = reinterpret_cast<char*>(dq.data_ptr());
-    char* dk_ptr = reinterpret_cast<char*>(dk.data_ptr());
-    char* dv_ptr = reinterpret_cast<char*>(dv.data_ptr());
-    // params.dq_row_stride = dq.stride(-3);
-    // params.dk_row_stride = dk.stride(-3);
-    // params.dv_row_stride = dv.stride(-3);
-    // params.dq_head_stride = dq.stride(-2);
-    // params.dk_head_stride = dk.stride(-2);
-    // params.dv_head_stride = dv.stride(-2);
+  // Set the pointers and strides.
+  params.q_ptr = q.data_ptr();
+  params.k_ptr = k.data_ptr();
+  params.z_ptr = nullptr;
+  params.v_ptr = v.data_ptr();
+  params.out_ptr = out.data_ptr();
+  params.softmax_lse_ptr = softmax_lse_d;
 
-    if(IS_UNIT_TEST_MODE) {
-      params.q_stride_multiplier = 1;
-      params.kv_stride_multiplier = 1;
-    }
+  at::Tensor d_tensor = at::empty({1, static_cast<long>(h), seqlen_q_rounded}, opts.dtype(at::kFloat));
+  params.d_ptr = d_tensor.data_ptr();
 
-    // if (cu_seqlens_q_d == nullptr) {
-    //     params.do_batch_stride = dout.stride(0);
-    //     params.dq_batch_stride = dq.stride(0);
-    //     params.dk_batch_stride = dk.stride(0);
-    //     params.dv_batch_stride = dv.stride(0);
-    // }
-
-    for (int i = 0; i < b; i++) {
-      int temp_seqlen_q = params.host_seqlens_q[i+1] - params.host_seqlens_q[i];
-      int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, q.dtype());
-      int temp_dq_stride = get_size_in_bytes(d * h * temp_seqlen_q, dq.dtype());
-      int temp_seqlen_k = params.host_seqlens_k[i+1] - params.host_seqlens_k[i];
-      int temp_k_stride = get_size_in_bytes(d * h * temp_seqlen_k, q.dtype());
-      int temp_dk_stride = get_size_in_bytes(d * h * temp_seqlen_k, dk.dtype());
-
-      if(!params.is_mnko_padding && d <= 32) {
-        params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
-      }
-      else if(!params.is_mnko_padding && d <= 64) {
-        params.is_mnko_padding = ((temp_seqlen_q % 128)==0 && (temp_seqlen_k % 128)==0 ? false : true);
-      }
-      else if(!params.is_mnko_padding && d <= 128) {
-        params.is_mnko_padding = ((temp_seqlen_q % 64)==0 && (temp_seqlen_k % 128)==0 ? false : true);
-      }
-
-      auto opts = q.options();
-
-      at::Tensor d_tensor;
-      d_tensor = at::empty({1, static_cast<long>(h), temp_seqlen_q}, opts.dtype(at::kFloat));
-      params.d_tensors.push_back(d_tensor);
-      params.d_ptrs.push_back(reinterpret_cast<void*>(d_tensor.data_ptr()));
-
-      // unit test mode
-      if(IS_UNIT_TEST_MODE) {
-        if(q.is_contiguous()) {
-          params.q_ptrs.push_back(reinterpret_cast<void*>(q_ptr));
-          params.dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));
-          q_ptr = q_ptr + temp_q_stride;
-          dq_ptr = dq_ptr + temp_dq_stride;
-        } else {
-          auto q_each_tmp = q.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
-          auto qgrad_each_tmp = dq.index({torch::indexing::Slice(params.host_seqlens_q[i], params.host_seqlens_q[i+1])}).contiguous();
-          params.q_tensors.push_back(q_each_tmp);
-          params.dq_tensors.push_back(qgrad_each_tmp);
-          params.q_ptrs.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
-          params.dq_ptrs.push_back(reinterpret_cast<void*>(qgrad_each_tmp.data_ptr()));
-        }
-
-        if(k.is_contiguous()) {
-          params.k_ptrs.push_back(reinterpret_cast<void*>(k_ptr));
-          params.dk_ptrs.push_back(reinterpret_cast<void*>(dk_ptr));
-          k_ptr = k_ptr + temp_k_stride;
-          dk_ptr = dk_ptr + temp_dk_stride;
-        } else {
-          auto k_each_tmp = k.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-          auto kgrad_each_tmp = dk.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-          params.k_tensors.push_back(k_each_tmp);
-          params.dk_tensors.push_back(kgrad_each_tmp);
-          params.k_ptrs.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
-          params.dk_ptrs.push_back(reinterpret_cast<void*>(kgrad_each_tmp.data_ptr()));
-        }
-
-        if(v.is_contiguous()) {
-          params.v_ptrs.push_back(reinterpret_cast<void*>(v_ptr)); 
-          params.dv_ptrs.push_back(reinterpret_cast<void*>(dv_ptr));
-          v_ptr = v_ptr + temp_k_stride;   
-          dv_ptr = dv_ptr + temp_dk_stride;
-        } else {
-          auto v_each_tmp = v.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-          auto vgrad_each_tmp = dv.index({torch::indexing::Slice(params.host_seqlens_k[i], params.host_seqlens_k[i+1])}).contiguous();
-          params.v_tensors.push_back(v_each_tmp);
-          params.dv_tensors.push_back(vgrad_each_tmp);
-          params.v_ptrs.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
-          params.dv_ptrs.push_back(reinterpret_cast<void*>(vgrad_each_tmp.data_ptr()));
-        }
-      // performance mode
-      } else {
-        params.dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));
-        dq_ptr = dq_ptr + temp_dq_stride * params.q_stride_multiplier;
-
-        params.dk_ptrs.push_back(reinterpret_cast<void*>(dk_ptr));
-        dk_ptr = dk_ptr + temp_dk_stride * params.kv_stride_multiplier;
-
-        params.dv_ptrs.push_back(reinterpret_cast<void*>(dv_ptr));
-        dv_ptr = dv_ptr + temp_dk_stride * params.kv_stride_multiplier;
-      }
-
-      params.dout_ptrs.push_back(reinterpret_cast<const void*>(dout_ptr));
-      dout_ptr += temp_q_stride;
-
-      params.out_ptrs.push_back(reinterpret_cast<const void*>(out_ptr));
-      out_ptr = out_ptr + temp_q_stride;
-
-      params.softmax_lse_ptrs.push_back(reinterpret_cast<const void*>(softmax_lse_ptr));
-      int temp_lse_stride = get_size_in_bytes(h * seqlen_q, torch::kFloat32);
-      softmax_lse_ptr = softmax_lse_ptr + temp_lse_stride;
-
-      params.z_ptrs.push_back(nullptr);
-    }
-
-    // params.dq_accum_ptr = dq_accum_d;
-    // params.dk_accum_ptr = dk_accum_d;
-    // params.dv_accum_ptr = dv_accum_d;
-
-    // Softmax sum
-    // params.dsoftmax_sum = dsoftmax_sum_d;
+  params.dout_ptr = dout.data_ptr();
+  params.dq_ptr = dq.data_ptr();
+  params.dk_ptr = dk.data_ptr();
+  params.dv_ptr = dv.data_ptr();
 }
 
 std::vector<at::Tensor>
@@ -807,14 +538,14 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     }
 
     at::Tensor dq_tmp, dk_tmp, dv_tmp;
-    if(IS_UNIT_TEST_MODE) {
+    if(params.kIsUnitTestMode) {
       dq_tmp = dq.to(torch::kFloat32);
       dk_tmp = dk_expanded.to(torch::kFloat32);
       dv_tmp = dv_expanded.to(torch::kFloat32);
     }
 
     FlashBwdParams params;
-    if(IS_UNIT_TEST_MODE) {
+    if(params.kIsUnitTestMode) {
       set_params_dgrad(params,
                        batch_size,
                        seqlen_q, seqlen_k,
@@ -886,7 +617,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
       dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
     }
 
-    if(IS_UNIT_TEST_MODE) {
+    if(params.kIsUnitTestMode) {
       if(!q.is_contiguous()) {
         dq_tmp.copy_(torch::cat(params.dq_tensors, 0).contiguous(), true);
       }
@@ -1063,14 +794,14 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
 
     at::Tensor dq_tmp, dk_tmp, dv_tmp;
-    if(IS_UNIT_TEST_MODE) {
+    if(params.kIsUnitTestMode) {
       dq_tmp = dq.to(torch::kFloat32);
       dk_tmp = dk_expanded.to(torch::kFloat32);
       dv_tmp = dv_expanded.to(torch::kFloat32);
     }
 
     FlashBwdParams params;
-    if(IS_UNIT_TEST_MODE) {
+    if(params.kIsUnitTestMode) {
       set_params_dgrad(params,
                        batch_size,
                        max_seqlen_q, max_seqlen_k,
@@ -1142,7 +873,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
       dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
     }
 
-    if(IS_UNIT_TEST_MODE) {
+    if(params.kIsUnitTestMode) {
       if(!q.is_contiguous()) {
         dq_tmp.copy_(torch::cat(params.dq_tensors, 0).contiguous(), true);
       }
