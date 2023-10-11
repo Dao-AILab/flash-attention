@@ -29,7 +29,7 @@ void FlashRunner::run_<FlashBwdBatchedParams,
                        device_gemm_trait::Float16, 
                        true, 
                        false>(FlashBwdBatchedParams &params, hipStream_t &stream) {
-  BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
+  BOOL_SWITCH(BaseParams.kIsDeterministic, kIsDeterministic, [&] {
     this->template run_bwd_<FlashBwdBatchedParams, 
                             bwd_device_gemm::DeviceGemmBatchedHeadDim32,
                             device_gemm_trait::Float16, 
@@ -45,7 +45,7 @@ void FlashRunner::run_<FlashBwdBatchedParams,
                        device_gemm_trait::Float16, 
                        false, 
                        false>(FlashBwdBatchedParams &params, hipStream_t &stream) {
-  BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
+  BOOL_SWITCH(BaseParams.kIsDeterministic, kIsDeterministic, [&] {
     this->template run_bwd_<FlashBwdBatchedParams, 
                             bwd_device_gemm::DeviceGemmBatchedHeadDim32,
                             device_gemm_trait::Float16, 

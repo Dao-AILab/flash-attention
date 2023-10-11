@@ -30,7 +30,7 @@ void FlashRunner::run_<FlashFwdGroupedParams,
                        true, 
                        false>(FlashFwdGroupedParams &params, hipStream_t &stream) {
   if(params.is_dropout){
-    BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
+    BOOL_SWITCH(BaseParams.kIsDeterministic, kIsDeterministic, [&] {
       this->template run_fwd_<FlashFwdGroupedParams, 
                               fwd_device_gemm::DeviceGemmGroupedHeadDim64,
                               device_gemm_trait::Float16, 
@@ -40,7 +40,7 @@ void FlashRunner::run_<FlashFwdGroupedParams,
     });    
   }
   else{
-    BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
+    BOOL_SWITCH(BaseParams.kIsDeterministic, kIsDeterministic, [&] {
       this->template run_fwd_<FlashFwdGroupedParams, 
                               fwd_device_gemm::DeviceGemmGroupedHeadDim64NonDrop,
                               device_gemm_trait::Float16, 
@@ -58,7 +58,7 @@ void FlashRunner::run_<FlashFwdGroupedParams,
                        false, 
                        false>(FlashFwdGroupedParams &params, hipStream_t &stream) {
   if(params.is_dropout){
-    BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
+    BOOL_SWITCH(BaseParams.kIsDeterministic, kIsDeterministic, [&] {
       this->template run_fwd_<FlashFwdGroupedParams, 
                               fwd_device_gemm::DeviceGemmGroupedHeadDim64,
                               device_gemm_trait::Float16, 
@@ -68,7 +68,7 @@ void FlashRunner::run_<FlashFwdGroupedParams,
     });
   }
   else{
-    BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
+    BOOL_SWITCH(BaseParams.kIsDeterministic, kIsDeterministic, [&] {
       this->template run_fwd_<FlashFwdGroupedParams, 
                               fwd_device_gemm::DeviceGemmGroupedHeadDim64NonDrop,
                               device_gemm_trait::Float16, 
