@@ -9,10 +9,17 @@
 
 #pragma once
 
-#include <assert.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+
+// libtorch headers
 #include <torch/torch.h>
+#include <ATen/ATen.h>
+#include <torch/extension.h>
+#include <ATen/hip/HIPContext.h>
+#include <c10/hip/HIPGuard.h>
+#include <ATen/hip/HIPGeneratorImpl.h>
 
 #include "ck/ck.hpp"
 #include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
@@ -27,10 +34,9 @@
 #include "ck/library/reference_tensor_operation/cpu/reference_softmax.hpp"
 #include "ck/library/reference_tensor_operation/cpu/reference_dropout.hpp"
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
+#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 
 #define NEW_UNPACK (TORCH_VERSION_MAJOR * 10000 + TORCH_VERSION_MINOR * 100 + TORCH_VERSION_PATCH) > 11300
-
 
 #define FMHA_CHECK_HIP( call )                                                                     \
     do {                                                                                           \
@@ -44,33 +50,6 @@
             exit( 1 );                                                                             \
         }                                                                                          \
     } while( 0 )
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// enum DataType {kFloat16, kFloat32, kBFloat16, kInt32, kInt8};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-//static inline void set_alpha( uint32_t &alpha, float norm, Data_type dtype ) {
-//    if( dtype == DATA_TYPE_FP16 ) {
-//        ck::half_t x = ck::type_convert<ck::half_t>( norm );
-//        uint16_t h = reinterpret_cast<const uint16_t &>( x );
-//        ushort2 h2 = { h, h };
-//        alpha = reinterpret_cast<const uint32_t &>( h2 );
-//    } else if( dtype == DATA_TYPE_BF16 ) {
-//        ck::bhalf_t x = ck::type_convert<ck::bhalf_t>( norm );
-//        uint16_t h = reinterpret_cast<const uint16_t &>( x );
-//        ushort2 h2 = { h, h };
-//        alpha = reinterpret_cast<const uint32_t &>( h2 );
-//    } else if( dtype == DATA_TYPE_FP32 ) {
-//        alpha = reinterpret_cast<const uint32_t &>( norm );
-//    } else if( dtype == DATA_TYPE_INT32 ) {
-//        int32_t inorm = static_cast<int32_t>( norm );
-//        alpha = reinterpret_cast<const uint32_t &>( inorm );
-//    } else {
-//        assert( false );
-//    }
-//}
 
 using Index = ck::index_t;
 
@@ -128,5 +107,3 @@ static inline bool get_env_(const char* env_var) {
   }
   return false;
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////

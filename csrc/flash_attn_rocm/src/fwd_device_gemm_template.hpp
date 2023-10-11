@@ -23,7 +23,7 @@
 
 #pragma once
 
-#include "device_gemm_trait.h"
+#include "device_gemm_trait.hpp"
 
 namespace fwd_device_gemm {
 namespace device_op = ck::tensor_operation::device; // namespace alias for internal use

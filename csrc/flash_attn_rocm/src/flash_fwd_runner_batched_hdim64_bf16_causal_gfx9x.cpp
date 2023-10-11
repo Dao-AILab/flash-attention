@@ -21,50 +21,60 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
 // EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include "flash_fwd_runner_gfx9x.h"
+#include "flash_runner.h"
 
-namespace fwd_device_gemm {
 template <>
-void FlashFwdRunner::Run<false, 64, device_gemm_trait::BFloat16, true, true>(FlashFwdParams &params, hipStream_t &stream) {
+void FlashRunner::run_<FlashFwdBatchedParams, 
+                       64, 
+                       device_gemm_trait::BFloat16, 
+                       true, 
+                       true>(FlashFwdBatchedParams &params, hipStream_t &stream) {
   if(params.is_dropout){
     BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
-      this->template run_<DeviceGemmBatchedHeadDim64,
-                          device_gemm_trait::BFloat16, 
-                          device_gemm_trait::kGemmSpecPadding,
-                          device_gemm_trait::kMaskingSpecCausal,
-                          kIsDeterministic>(params, stream);
+      this->template run_fwd_<FlashFwdBatchedParams, 
+                              fwd_device_gemm::DeviceGemmBatchedHeadDim64,
+                              device_gemm_trait::BFloat16, 
+                              device_gemm_trait::kGemmSpecPadding,
+                              device_gemm_trait::kMaskingSpecCausal,
+                              kIsDeterministic>(params, stream);
   });
   }
   else{
     BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
-      this->template run_<DeviceGemmBatchedHeadDim64NonDrop,
-                          device_gemm_trait::BFloat16, 
-                          device_gemm_trait::kGemmSpecPadding,
-                          device_gemm_trait::kMaskingSpecCausal,
-                          kIsDeterministic>(params, stream);
+      this->template run_fwd_<FlashFwdBatchedParams, 
+                              fwd_device_gemm::DeviceGemmBatchedHeadDim64NonDrop,
+                              device_gemm_trait::BFloat16, 
+                              device_gemm_trait::kGemmSpecPadding,
+                              device_gemm_trait::kMaskingSpecCausal,
+                              kIsDeterministic>(params, stream);
     });
   }
-} // FlashFwdRunner::Run()
+} // FlashRunner::run_()
 
 template <>
-void FlashFwdRunner::Run<false, 64, device_gemm_trait::BFloat16, false, true>(FlashFwdParams &params, hipStream_t &stream) {
+void FlashRunner::run_<FlashFwdBatchedParams, 
+                       64, 
+                       device_gemm_trait::BFloat16, 
+                       false, 
+                       true>(FlashFwdBatchedParams &params, hipStream_t &stream) {
   if(params.is_dropout){
     BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
-      this->template run_<DeviceGemmBatchedHeadDim64,
-                          device_gemm_trait::BFloat16, 
-                          device_gemm_trait::kGemmSpecDefault,
-                          device_gemm_trait::kMaskingSpecCausal,
-                          kIsDeterministic>(params, stream);
+      this->template run_fwd_<FlashFwdBatchedParams, 
+                              fwd_device_gemm::DeviceGemmBatchedHeadDim64,
+                              device_gemm_trait::BFloat16, 
+                              device_gemm_trait::kGemmSpecDefault,
+                              device_gemm_trait::kMaskingSpecCausal,
+                              kIsDeterministic>(params, stream);
     });
   }
   else{
     BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
-      this->template run_<DeviceGemmBatchedHeadDim64NonDrop,
-                          device_gemm_trait::BFloat16, 
-                          device_gemm_trait::kGemmSpecDefault,
-                          device_gemm_trait::kMaskingSpecCausal,
-                          kIsDeterministic>(params, stream);
+      this->template run_fwd_<FlashFwdBatchedParams, 
+                              fwd_device_gemm::DeviceGemmBatchedHeadDim64NonDrop,
+                              device_gemm_trait::BFloat16, 
+                              device_gemm_trait::kGemmSpecDefault,
+                              device_gemm_trait::kMaskingSpecCausal,
+                              kIsDeterministic>(params, stream);
     });
   }
-} // FlashFwdRunner::Run()
-} // namespace fwd_device_gemm
+} // FlashRunner::run_()

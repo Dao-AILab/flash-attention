@@ -23,17 +23,17 @@
 
 #pragma once
 
-#include "bwd_device_gemm_template.h"
-#include "params.h"
+#include "bwd_device_gemm_template.hpp"
+#include "params.hpp"
 
 namespace bwd_device_gemm {
 template <template <typename> typename DeviceGemmTemplate, typename DeviceGemmTraits>
-class DeviceGemmInstanceLauncher {
+class DeviceGemmInvoker {
   using DeviceOp = DeviceGemmTemplate<DeviceGemmTraits>;
 
  public:
   // constructor for batched gemm
-  explicit DeviceGemmInstanceLauncher(FlashBwdBatchedParams &params, hipStream_t &stream)
+  explicit DeviceGemmInvoker(FlashBwdBatchedParams &params, hipStream_t &stream)
     : device_op_ptr(std::make_unique<DeviceOp>()),
       invoker_ptr(device_op_ptr->MakeInvokerPointer()),
       argument_ptr(device_op_ptr->MakeArgumentPointer(
@@ -48,8 +48,8 @@ class DeviceGemmInstanceLauncher {
         params.dq_ptr,
         params.dk_ptr,
         params.dv_ptr,
-        {},
-        {},
+        nullptr,
+        nullptr,
         params.q_gs_ms_ks_lengths,
         params.q_gs_ms_ks_strides,
         params.k_gs_ns_ks_lengths,
@@ -74,7 +74,7 @@ class DeviceGemmInstanceLauncher {
         params.seeds)) {}
 
   // constructor for grouped gemm
-  explicit DeviceGemmInstanceLauncher(FlashBwdGroupedParams &params, hipStream_t &stream)
+  explicit DeviceGemmInvoker(FlashBwdGroupedParams &params, hipStream_t &stream)
     : device_op_ptr(std::make_unique<DeviceOp>()),
       invoker_ptr(device_op_ptr->MakeInvokerPointer()), {
 
@@ -126,22 +126,25 @@ class DeviceGemmInstanceLauncher {
         params.seeds);
 
     // specify workspace for problem_desc
-    SimpleDeviceMem problem_desc_workspace{ device_op_ptr->GetWorkSpaceSize(argument_ptr) };
+    SimpleDeviceMem problem_desc_workspace{ device_op_ptr->GetWorkSpaceSize(argument_ptr.get()) };
 
-    device_op_ptr->SetWorkSpacePointer(argument_ptr,
+    device_op_ptr->SetWorkSpacePointer(argument_ptr.get(),
                             problem_desc_workspace.GetDeviceBuffer());
+  }
 
-    if (!device_op_ptr->IsSupportedArgument(argument_ptr)) {
-      std::cout << device_op_ptr->GetTypeString() << " does not support this problem"
+  float Run() {
+    if (!device_op_ptr->IsSupportedArgument(argument_ptr.get())) {
+      std::cout << device_op_ptr->GetTypeString() 
+                << " does not support this problem"
                 << std::endl;
-      return;
+      return 0;
     }
 
-    float avg_time = invoker_ptr->Run(argument, StreamConfig{stream, time_kernel});
+    return invoker_ptr->Run(argument_ptr.get(), StreamConfig{stream, time_kernel});
 
-    if (time_kernel) {
-      std::cout << "time elpase is " << avg_time << " ms" << std::endl;
-    }
+    // if (time_kernel) {
+    //   std::cout << "time elpase is " << avg_time << " ms" << std::endl;
+    // }
   }
 
  private:
@@ -149,6 +152,6 @@ class DeviceGemmInstanceLauncher {
   std::unique_ptr<DeviceOp::Invoker> invoker_ptr;
   std::unique_ptr<DeviceOp::Argument> argument_ptr;
 
-  static const bool time_kernel = false;
-}; // class BwdDeviceGemmInstanceLauncher
+  // static const bool time_kernel = false;
+};
 } // namespace bwd_device_gemm

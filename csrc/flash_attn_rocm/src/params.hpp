@@ -11,11 +11,7 @@
 #include <vector>
 #include <memory>
 
-#include <ATen/hip/HIPGeneratorImpl.h>
-
-#include "utils.h"
-
-#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+#include "utils.hpp"
 
 // Common argements used by both batched & grouped gemms
 struct BaseParams {
@@ -232,7 +228,7 @@ struct FlashFwdBatchedParams : public BatchedParams {
                                  void* softmax_lse_d,
                                  float p_dropout,
                                  float softmax_scale,
-                                 bool is_causal) 
+                                 bool is_causal)
     : BatchedParams(b,
                     seqlen_q,
                     seqlen_k,

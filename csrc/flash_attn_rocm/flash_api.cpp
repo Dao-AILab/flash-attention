@@ -5,107 +5,7 @@
 // 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
 // 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
 
-#include <cstring>
-
-#include <ATen/ATen.h>
-#include <torch/extension.h>
-#include <ATen/hip/HIPContext.h>
-#include <c10/hip/HIPGuard.h>
-
 #include "flash_runner.h"
-#include "params.h"
-
-
-auto flash_runner = std::make_unique<FlashRunner>();
-
-void set_params_fprop(bool is_dgrad, // is setting params for dgrad
-                      FlashFwdParams &params,
-                      // sizes
-                      const size_t b,
-                      const size_t seqlen_q,
-                      const size_t seqlen_k,
-                      const size_t seqlen_q_rounded,
-                      const size_t seqlen_k_rounded,
-                      const size_t h,
-                      const size_t h_k,
-                      const size_t d,
-                      const size_t d_rounded,
-                      // device pointers
-                      const at::Tensor q,
-                      const at::Tensor k,
-                      const at::Tensor v,
-                      at::Tensor out,
-                      void* cu_seqlens_q_d,
-                      void* cu_seqlens_k_d,
-                      void* p_d,
-                      void* softmax_lse_d,
-                      float p_dropout,
-                      float softmax_scale,
-                      bool is_causal) {
-    // Reset the parameters
-    memset(&params, 0, sizeof(params));
-
-
-   
-}
-
-void set_params_dgrad(FlashBwdParams &params,
-                      const size_t b,
-                      const size_t seqlen_q,
-                      const size_t seqlen_k,
-                      const size_t seqlen_q_rounded,
-                      const size_t seqlen_k_rounded,
-                      const size_t h,
-                      const size_t h_k,
-                      const size_t d,
-                      const size_t d_rounded,
-                      const at::Tensor q,
-                      const at::Tensor k,
-                      const at::Tensor v,
-                      const at::Tensor out,
-                      const at::Tensor dout,
-                      at::Tensor dq,
-                      at::Tensor dk,
-                      at::Tensor dv,
-                      void* cu_seqlens_q_d,
-                      void* cu_seqlens_k_d,
-                      void* dq_accum_d,
-                      void* dk_accum_d,
-                      void* dv_accum_d,
-                      void* softmax_lse_d,
-                      void* dsoftmax_sum_d,
-                      float p_dropout,
-                      float softmax_scale,
-                      bool is_causal) {
-                        
-  set_params_fprop(true,
-                   params,
-                   b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
-                   q, k, v, out,
-                   cu_seqlens_q_d,
-                   cu_seqlens_k_d,
-                   nullptr,
-                   softmax_lse_d,
-                   p_dropout,
-                   softmax_scale,
-                   is_causal);
-
-  // Set the pointers and strides.
-  params.q_ptr = q.data_ptr();
-  params.k_ptr = k.data_ptr();
-  params.z_ptr = nullptr;
-  params.v_ptr = v.data_ptr();
-  params.out_ptr = out.data_ptr();
-  params.softmax_lse_ptr = softmax_lse_d;
-
-  at::Tensor d_tensor = at::empty({1, static_cast<long>(h), seqlen_q_rounded}, opts.dtype(at::kFloat));
-  params.d_ptr = d_tensor.data_ptr();
-
-  params.dout_ptr = dout.data_ptr();
-  params.dq_ptr = dq.data_ptr();
-  params.dk_ptr = dk.data_ptr();
-  params.dv_ptr = dv.data_ptr();
-}
 
 std::vector<at::Tensor>
 mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
@@ -191,29 +91,31 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
     auto opts = q.options();
 
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
-    at::Tensor p;
+    at::Tensor z;
     // Only return softmax if there's dropout to reduce compilation time
     if (return_softmax) {
         TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
-        p = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts.dtype(at::kInt));
+        z = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts.dtype(at::kInt));
     }
 
-    FlashFwdParams params;
-    set_params_fprop(false,
-                     params,
-                     batch_size,
-                     seqlen_q, seqlen_k,
-                     seqlen_q_rounded, seqlen_k_rounded,
-                     num_heads, num_heads_k,
-                     head_size, head_size_rounded,
-                     q_padded, k_padded, v_padded, out,
-                     /*cu_seqlens_q_d=*/nullptr,
-                     /*cu_seqlens_k_d=*/nullptr,
-                     return_softmax ? p.data_ptr() : nullptr,
-                     softmax_lse.data_ptr(),
-                     p_dropout,
-                     softmax_scale,
-                     is_causal);
+    FlashFwdBatchedParams params(batch_size,
+                                 seqlen_q,
+                                 seqlen_k,
+                                 seqlen_q_rounded,
+                                 seqlen_k_rounded,
+                                 num_heads,
+                                 num_heads_k,
+                                 head_size,
+                                 head_size_rounded,
+                                 q_padded,
+                                 k_padded,
+                                 v_padded,
+                                 out,
+                                 return_softmax ? z.data_ptr() : nullptr,
+                                 softmax_lse.data_ptr(),
+                                 p_dropout,
+                                 softmax_scale,
+                                 is_causal);
 
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
@@ -235,7 +137,8 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
     }
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
-    flash_runner->RunBatchedFwd(params, stream);
+    auto flash_runner = std::make_unique<FlashRunner>();
+    flash_runner->Run(params, stream);
 
     at::Tensor out_padded = out;
     if (head_size_og % 8 != 0) {
@@ -343,10 +246,10 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
     auto opts = q.options();
 
     auto softmax_lse = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
-    at::Tensor p;
+    at::Tensor z;
     if (return_softmax) {
         TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
-        p = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts.dtype(at::kInt));
+        z = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts.dtype(at::kInt));
     }
     
     if (zero_tensors) {
@@ -355,22 +258,26 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
         if (return_softmax) {p.zero_();}
     }
 
-    FlashFwdParams params;
-    set_params_fprop(false,
-                     params,
-                     batch_size,
-                     max_seqlen_q, max_seqlen_k,
-                     seqlen_q_rounded, seqlen_k_rounded,
-                     num_heads, num_heads_k,
-                     head_size, head_size_rounded,
-                     q_padded, k_padded, v_padded, out,
-                     cu_seqlens_q.data_ptr(),
-                     cu_seqlens_k.data_ptr(),
-                     return_softmax ? p.data_ptr() : nullptr,
-                     softmax_lse.data_ptr(),
-                     p_dropout,
-                     softmax_scale,
-                     is_causal);
+    FlashFwdGroupedParams params(batch_size,
+                                 max_seqlen_q, 
+                                 max_seqlen_k,
+                                 seqlen_q_rounded, 
+                                 seqlen_k_rounded,
+                                 num_heads, 
+                                 num_heads_k,
+                                 head_size, 
+                                 head_size_rounded,
+                                 q_padded, 
+                                 k_padded, 
+                                 v_padded, 
+                                 out,
+                                 cu_seqlens_q.data_ptr(),
+                                 cu_seqlens_k.data_ptr(),
+                                 return_softmax ? z.data_ptr() : nullptr,
+                                 softmax_lse.data_ptr(),
+                                 p_dropout,
+                                 softmax_scale,
+                                 is_causal);
 
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
@@ -392,7 +299,8 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
     }
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
-    flash_runner->RunGroupedFwd(params, stream);
+    auto flash_runner = std::make_unique<FlashRunner>();
+    flash_runner->Run(params, stream);
 
     at::Tensor out_padded = out;
     if (head_size_og % 8 != 0) {
@@ -520,13 +428,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
-    at::Tensor dq_accum;
-    at::Tensor dk_accum, dv_accum;
-    if (loop) {
-        dq_accum = torch::empty({batch_size, num_heads, seqlen_q_rounded, head_size_rounded}, opts.dtype(at::kFloat));
-        // dk_accum = torch::empty({batch_size, num_heads_k, seqlen_k_rounded, head_size_rounded}, opts.dtype(at::kFloat));
-        // dv_accum = torch::empty({batch_size, num_heads_k, seqlen_k_rounded, head_size_rounded}, opts.dtype(at::kFloat));
-    }
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
@@ -538,51 +439,58 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     }
 
     at::Tensor dq_tmp, dk_tmp, dv_tmp;
-    if(params.kIsUnitTestMode) {
+    if(BaseParams.kIsUnitTestMode) {
       dq_tmp = dq.to(torch::kFloat32);
       dk_tmp = dk_expanded.to(torch::kFloat32);
       dv_tmp = dv_expanded.to(torch::kFloat32);
     }
 
-    FlashBwdParams params;
-    if(params.kIsUnitTestMode) {
-      set_params_dgrad(params,
-                       batch_size,
-                       seqlen_q, seqlen_k,
-                       seqlen_q_rounded, seqlen_k_rounded,
-                       num_heads, num_heads_k,
-                       head_size, head_size_rounded,
-                       q, k, v, out,
-                       dout_padded, dq_tmp, dk_tmp, dv_tmp,
-                       nullptr,
-                       nullptr,
-                       loop ? dq_accum.data_ptr() : nullptr,
-                       nullptr,
-                       nullptr,
-                       softmax_lse.data_ptr(),
-                       softmax_d.data_ptr(),
-                       p_dropout,
-                       softmax_scale,
-                       is_causal);
+    if(BaseParams.kIsUnitTestMode) {
+      FlashBwdBatchedParams params(batch_size,
+                                   seqlen_q, 
+                                   seqlen_k,
+                                   seqlen_q_rounded, 
+                                   seqlen_k_rounded,
+                                   num_heads, 
+                                   num_heads_k,
+                                   head_size, 
+                                   head_size_rounded,
+                                   q, 
+                                   k, 
+                                   v, 
+                                   out,
+                                   dout_padded, 
+                                   dq_tmp, 
+                                   dk_tmp, 
+                                   dv_tmp,
+                                   nullptr,
+                                   softmax_lse.data_ptr(),
+                                   p_dropout,
+                                   softmax_scale,
+                                   is_causal);
     } else {
-      set_params_dgrad(params,
-                       batch_size,
-                       seqlen_q, seqlen_k,
-                       seqlen_q_rounded, seqlen_k_rounded,
-                       num_heads, num_heads_k,
-                       head_size, head_size_rounded,
-                       q, k, v, out,
-                       dout_padded, dq, dk_expanded, dv_expanded,
-                       nullptr,
-                       nullptr,
-                       loop ? dq_accum.data_ptr() : nullptr,
-                       nullptr,
-                       nullptr,
-                       softmax_lse.data_ptr(),
-                       softmax_d.data_ptr(),
-                       p_dropout,
-                       softmax_scale,
-                       is_causal);
+      FlashBwdBatchedParams params(batch_size,
+                                   seqlen_q, 
+                                   seqlen_k,
+                                   seqlen_q_rounded, 
+                                   seqlen_k_rounded,
+                                   num_heads, 
+                                   num_heads_k,
+                                   head_size, 
+                                   head_size_rounded,
+                                   q, 
+                                   k, 
+                                   v, 
+                                   out,
+                                   dout_padded, 
+                                   dq, 
+                                   dk_expanded, 
+                                   dv_expanded,
+                                   nullptr,
+                                   softmax_lse.data_ptr(),
+                                   p_dropout,
+                                   softmax_scale,
+                                   is_causal);
     }
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
@@ -604,7 +512,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     }
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
-    flash_runner->RunBatchedBwd(params, stream);
+    auto flash_runner = std::make_unique<FlashRunner>();
+    flash_runner->Run(params, stream);
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
@@ -617,7 +526,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
       dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
     }
 
-    if(params.kIsUnitTestMode) {
+    if(BaseParams.kIsUnitTestMode) {
       if(!q.is_contiguous()) {
         dq_tmp.copy_(torch::cat(params.dq_tensors, 0).contiguous(), true);
       }
@@ -794,51 +703,58 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
 
     at::Tensor dq_tmp, dk_tmp, dv_tmp;
-    if(params.kIsUnitTestMode) {
+    if(BaseParams.kIsUnitTestMode) {
       dq_tmp = dq.to(torch::kFloat32);
       dk_tmp = dk_expanded.to(torch::kFloat32);
       dv_tmp = dv_expanded.to(torch::kFloat32);
     }
 
-    FlashBwdParams params;
-    if(params.kIsUnitTestMode) {
-      set_params_dgrad(params,
-                       batch_size,
-                       max_seqlen_q, max_seqlen_k,
-                       seqlen_q_rounded, seqlen_k_rounded,
-                       num_heads, num_heads_k,
-                       head_size, head_size_rounded,
-                       q, k, v, out,
-                       dout_padded, dq_tmp, dk_tmp, dv_tmp,
-                       cu_seqlens_q.data_ptr(),
-                       cu_seqlens_k.data_ptr(),
-                       loop ? dq_accum.data_ptr() : nullptr,
-                       nullptr,
-                       nullptr,
-                       softmax_lse.data_ptr(),
-                       softmax_d.data_ptr(),
-                       p_dropout,
-                       softmax_scale,
-                       is_causal);
+    if(BaseParams.kIsUnitTestMode) {
+      FlashBwdGroupedParams params(batch_size,
+                                   seqlen_q, 
+                                   seqlen_k,
+                                   seqlen_q_rounded, 
+                                   seqlen_k_rounded,
+                                   num_heads, 
+                                   num_heads_k,
+                                   head_size, 
+                                   head_size_rounded,
+                                   q, 
+                                   k, 
+                                   v, 
+                                   out,
+                                   dout_padded, 
+                                   dq_tmp, 
+                                   dk_tmp, 
+                                   dv_tmp,
+                                   nullptr,
+                                   softmax_lse.data_ptr(),
+                                   p_dropout,
+                                   softmax_scale,
+                                   is_causal);
     } else {
-      set_params_dgrad(params,
-                       batch_size,
-                       max_seqlen_q, max_seqlen_k,
-                       seqlen_q_rounded, seqlen_k_rounded,
-                       num_heads, num_heads_k,
-                       head_size, head_size_rounded,
-                       q, k, v, out,
-                       dout_padded, dq, dk_expanded, dv_expanded,
-                       cu_seqlens_q.data_ptr(),
-                       cu_seqlens_k.data_ptr(),
-                       loop ? dq_accum.data_ptr() : nullptr,
-                       nullptr,
-                       nullptr,
-                       softmax_lse.data_ptr(),
-                       softmax_d.data_ptr(),
-                       p_dropout,
-                       softmax_scale,
-                       is_causal);
+      FlashBwdGroupedParams params(batch_size,
+                                   seqlen_q, 
+                                   seqlen_k,
+                                   seqlen_q_rounded, 
+                                   seqlen_k_rounded,
+                                   num_heads, 
+                                   num_heads_k,
+                                   head_size, 
+                                   head_size_rounded,
+                                   q, 
+                                   k, 
+                                   v, 
+                                   out,
+                                   dout_padded, 
+                                   dq, 
+                                   dk_expanded, 
+                                   dv_expanded,
+                                   nullptr,
+                                   softmax_lse.data_ptr(),
+                                   p_dropout,
+                                   softmax_scale,
+                                   is_causal);
     }
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
@@ -860,7 +776,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
-    flash_runner->RunGroupedBwd(params, stream);
+    auto flash_runner = std::make_unique<FlashRunner>();
+    flash_runner->Run(params, stream);
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
@@ -873,7 +790,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
       dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
     }
 
-    if(params.kIsUnitTestMode) {
+    if(BaseParams.kIsUnitTestMode) {
       if(!q.is_contiguous()) {
         dq_tmp.copy_(torch::cat(params.dq_tensors, 0).contiguous(), true);
       }

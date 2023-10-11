@@ -21,28 +21,36 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
 // EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include "flash_bwd_runner_gfx9x.h"
-
-namespace bwd_device_gemm {
-template <>
-void FlashBwdRunner::Run<true, 64, device_gemm_trait::Float16, true, false>(FlashBwdParams &params, hipStream_t &stream) {
-  BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
-    this->template run_<DeviceGemmGroupedHeadDim64,
-                        device_gemm_trait::Float16, 
-                        device_gemm_trait::kGemmSpecPadding,
-                        device_gemm_trait::kMaskingSpecDefault,
-                        kIsDeterministic>(params, stream);
-  });
-} // FlashBwdRunner::Run()
+#include "flash_runner.h"
 
 template <>
-void FlashBwdRunner::Run<true, 64, device_gemm_trait::Float16, false, false>(FlashBwdParams &params, hipStream_t &stream) {
+void FlashRunner::run_<FlashBwdGroupedParams, 
+                       64, 
+                       device_gemm_trait::Float16, 
+                       true, 
+                       false>(FlashBwdGroupedParams &params, hipStream_t &stream) {
   BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
-    this->template run_<DeviceGemmGroupedHeadDim64,
-                        device_gemm_trait::Float16, 
-                        device_gemm_trait::kGemmSpecDefault,
-                        device_gemm_trait::kMaskingSpecDefault,
-                        kIsDeterministic>(params, stream);
+    this->template run_bwd_<FlashBwdGroupedParams, 
+                            bwd_device_gemm::DeviceGemmGroupedHeadDim64,
+                            device_gemm_trait::Float16, 
+                            device_gemm_trait::kGemmSpecPadding,
+                            device_gemm_trait::kMaskingSpecDefault,
+                            kIsDeterministic>(params, stream);
   });
-} // FlashBwdRunner::Run()
-} // namespace bwd_device_gemm
+} // FlashRunner::run_()
+
+template <>
+void FlashRunner::run_<FlashBwdGroupedParams, 
+                       64, 
+                       device_gemm_trait::Float16, 
+                       false, 
+                       false>(FlashBwdGroupedParams &params, hipStream_t &stream) {
+  BOOL_SWITCH(params.kIsDeterministic, kIsDeterministic, [&] {
+    this->template run_bwd_<FlashBwdGroupedParams, 
+                            bwd_device_gemm::DeviceGemmGroupedHeadDim64,
+                            device_gemm_trait::Float16, 
+                            device_gemm_trait::kGemmSpecDefault,
+                            device_gemm_trait::kMaskingSpecDefault,
+                            kIsDeterministic>(params, stream);
+  });
+} // FlashRunner::run_()
