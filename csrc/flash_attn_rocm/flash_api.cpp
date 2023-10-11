@@ -438,60 +438,34 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         dv_expanded = dv;
     }
 
-    at::Tensor dq_tmp, dk_tmp, dv_tmp;
     if(BaseParams.kIsUnitTestMode) {
-      dq_tmp = dq.to(torch::kFloat32);
-      dk_tmp = dk_expanded.to(torch::kFloat32);
-      dv_tmp = dv_expanded.to(torch::kFloat32);
+      dq = dq.to(torch::kFloat32);
+      dk_expanded = dk_expanded.to(torch::kFloat32);
+      dv_expanded = dv_expanded.to(torch::kFloat32);
     }
 
-    if(BaseParams.kIsUnitTestMode) {
-      FlashBwdBatchedParams params(batch_size,
-                                   seqlen_q, 
-                                   seqlen_k,
-                                   seqlen_q_rounded, 
-                                   seqlen_k_rounded,
-                                   num_heads, 
-                                   num_heads_k,
-                                   head_size, 
-                                   head_size_rounded,
-                                   q, 
-                                   k, 
-                                   v, 
-                                   out,
-                                   dout_padded, 
-                                   dq_tmp, 
-                                   dk_tmp, 
-                                   dv_tmp,
-                                   nullptr,
-                                   softmax_lse.data_ptr(),
-                                   p_dropout,
-                                   softmax_scale,
-                                   is_causal);
-    } else {
-      FlashBwdBatchedParams params(batch_size,
-                                   seqlen_q, 
-                                   seqlen_k,
-                                   seqlen_q_rounded, 
-                                   seqlen_k_rounded,
-                                   num_heads, 
-                                   num_heads_k,
-                                   head_size, 
-                                   head_size_rounded,
-                                   q, 
-                                   k, 
-                                   v, 
-                                   out,
-                                   dout_padded, 
-                                   dq, 
-                                   dk_expanded, 
-                                   dv_expanded,
-                                   nullptr,
-                                   softmax_lse.data_ptr(),
-                                   p_dropout,
-                                   softmax_scale,
-                                   is_causal);
-    }
+    FlashBwdBatchedParams params(batch_size,
+                                 seqlen_q, 
+                                 seqlen_k,
+                                 seqlen_q_rounded, 
+                                 seqlen_k_rounded,
+                                 num_heads, 
+                                 num_heads_k,
+                                 head_size, 
+                                 head_size_rounded,
+                                 q, 
+                                 k, 
+                                 v, 
+                                 out,
+                                 dout_padded, 
+                                 dq, 
+                                 dk_expanded, 
+                                 dv_expanded,
+                                 nullptr,
+                                 softmax_lse.data_ptr(),
+                                 p_dropout,
+                                 softmax_scale,
+                                 is_causal);
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
@@ -528,22 +502,13 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
 
     if(BaseParams.kIsUnitTestMode) {
       if(!q.is_contiguous()) {
-        dq_tmp.copy_(torch::cat(params.dq_tensors, 0).contiguous(), true);
-      }
-      if(dq.data_ptr() != dq_tmp.data_ptr()) {
-        dq.copy_(dq_tmp, true);
+        dq.copy_(torch::cat(params.dq_tensors, 0).contiguous(), true);
       }
       if(!k.is_contiguous()) {
-        dk_tmp.copy_(torch::cat(params.dk_tensors, 0).contiguous(), true);
-      }
-      if(dk.data_ptr() != dk_tmp.data_ptr()) {
-        dk.copy_(dk_tmp, true);
+        dk.copy_(torch::cat(params.dk_tensors, 0).contiguous(), true);
       }
       if(!v.is_contiguous()) {
-        dv_tmp.copy_(torch::cat(params.dv_tensors, 0).contiguous(), true);
-      }
-      if(dv.data_ptr() != dv_tmp.data_ptr()) {
-        dv.copy_(dv_tmp, true);
+        dv.copy_(torch::cat(params.dv_tensors, 0).contiguous(), true);
       }
     }
 
@@ -702,60 +667,34 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
       // softmax_d.zero_();
     }
 
-    at::Tensor dq_tmp, dk_tmp, dv_tmp;
     if(BaseParams.kIsUnitTestMode) {
-      dq_tmp = dq.to(torch::kFloat32);
-      dk_tmp = dk_expanded.to(torch::kFloat32);
-      dv_tmp = dv_expanded.to(torch::kFloat32);
+      dq = dq.to(torch::kFloat32);
+      dk_expanded = dk_expanded.to(torch::kFloat32);
+      dv_expanded = dv_expanded.to(torch::kFloat32);
     }
 
-    if(BaseParams.kIsUnitTestMode) {
-      FlashBwdGroupedParams params(batch_size,
-                                   seqlen_q, 
-                                   seqlen_k,
-                                   seqlen_q_rounded, 
-                                   seqlen_k_rounded,
-                                   num_heads, 
-                                   num_heads_k,
-                                   head_size, 
-                                   head_size_rounded,
-                                   q, 
-                                   k, 
-                                   v, 
-                                   out,
-                                   dout_padded, 
-                                   dq_tmp, 
-                                   dk_tmp, 
-                                   dv_tmp,
-                                   nullptr,
-                                   softmax_lse.data_ptr(),
-                                   p_dropout,
-                                   softmax_scale,
-                                   is_causal);
-    } else {
-      FlashBwdGroupedParams params(batch_size,
-                                   seqlen_q, 
-                                   seqlen_k,
-                                   seqlen_q_rounded, 
-                                   seqlen_k_rounded,
-                                   num_heads, 
-                                   num_heads_k,
-                                   head_size, 
-                                   head_size_rounded,
-                                   q, 
-                                   k, 
-                                   v, 
-                                   out,
-                                   dout_padded, 
-                                   dq, 
-                                   dk_expanded, 
-                                   dv_expanded,
-                                   nullptr,
-                                   softmax_lse.data_ptr(),
-                                   p_dropout,
-                                   softmax_scale,
-                                   is_causal);
-    }
+    FlashBwdGroupedParams params(batch_size,
+                                 seqlen_q, 
+                                 seqlen_k,
+                                 seqlen_q_rounded, 
+                                 seqlen_k_rounded,
+                                 num_heads, 
+                                 num_heads_k,
+                                 head_size, 
+                                 head_size_rounded,
+                                 q, 
+                                 k, 
+                                 v, 
+                                 out,
+                                 dout_padded, 
+                                 dq, 
+                                 dk_expanded, 
+                                 dv_expanded,
+                                 nullptr,
+                                 softmax_lse.data_ptr(),
+                                 p_dropout,
+                                 softmax_scale,
+                                 is_causal);
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
@@ -792,22 +731,13 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     if(BaseParams.kIsUnitTestMode) {
       if(!q.is_contiguous()) {
-        dq_tmp.copy_(torch::cat(params.dq_tensors, 0).contiguous(), true);
-      }
-      if(dq.data_ptr() != dq_tmp.data_ptr()) {
-        dq.copy_(dq_tmp, true);
+        dq.copy_(torch::cat(params.dq_tensors, 0).contiguous(), true);
       }
       if(!k.is_contiguous()) {
-        dk_tmp.copy_(torch::cat(params.dk_tensors, 0).contiguous(), true);
-      }
-      if(dk.data_ptr() != dk_tmp.data_ptr()) {
-        dk.copy_(dk_tmp, true);
+        dk.copy_(torch::cat(params.dk_tensors, 0).contiguous(), true);
       }
       if(!v.is_contiguous()) {
-        dv_tmp.copy_(torch::cat(params.dv_tensors, 0).contiguous(), true);
-      }
-      if(dv.data_ptr() != dv_tmp.data_ptr()) {
-        dv.copy_(dv_tmp, true);
+        dv.copy_(torch::cat(params.dv_tensors, 0).contiguous(), true);
       }
     }
 
