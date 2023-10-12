@@ -29,56 +29,67 @@
 namespace bwd_device_gemm {
 template <template <typename> typename DeviceGemmTemplate, typename DeviceGemmTraits>
 class DeviceGemmInvoker {
-  using DeviceOp = DeviceGemmTemplate<DeviceGemmTraits>;
+  using Gemm = DeviceGemmTemplate<DeviceGemmTraits>;
 
  public:
   // constructor for batched gemm
-  explicit DeviceGemmInvoker(FlashBwdBatchedParams &params)
-    : device_op_ptr(std::make_unique<DeviceOp>()),
-      invoker_ptr(device_op_ptr->MakeInvokerPointer()),
-      argument_ptr(device_op_ptr->MakeArgumentPointer(
-        params.q_ptr,
-        params.k_ptr,
-        params.z_ptr,
-        params.v_ptr,
-        params.out_ptr,
-        params.softmax_lse_ptr,
-        params.d_ptr,
-        params.dout_ptr, 
-        params.dq_ptr,
-        params.dk_ptr,
-        params.dv_ptr,
-        nullptr,
-        nullptr,
-        params.q_gs_ms_ks_lengths,
-        params.q_gs_ms_ks_strides,
-        params.k_gs_ns_ks_lengths,
-        params.k_gs_ns_ks_strides,
-        params.z_gs_ms_ns_lengths,
-        params.z_gs_ms_ns_strides,
-        params.v_gs_gemm1ns_gemm1ks_lengths,
-        params.v_gs_gemm1ns_gemm1ks_strides,
-        params.out_gs_ms_gemm1ns_lengths,
-        params.out_gs_ms_gemm1ns_strides,
-        params.lse_gs_ms_lengths,
-        {},
-        {},
-        {},
-        {},
-        device_gemm_trait::AElementOp{},
-        device_gemm_trait::B0ElementOp{},
-        device_gemm_trait::Acc0ElementOp{params.softmax_scale},
-        device_gemm_trait::B1ElementOp{},
-        device_gemm_trait::CElementOp{},
-        params.p_dropout, 
-        params.seeds)) {}
+  explicit DeviceGemmInvoker(FlashBwdBatchedParams &params, hipStream_t &stream) {
+    auto gemm_ptr = std::make_unique<Gemm>();
+    auto invoker_ptr = gemm_ptr->MakeInvokerPointer();
+    auto argument_ptr = gemm_ptr->MakeArgumentPointer(
+      params.q_ptr,
+      params.k_ptr,
+      params.z_ptr,
+      params.v_ptr,
+      params.out_ptr,
+      params.softmax_lse_ptr,
+      params.d_ptr,
+      params.dout_ptr, 
+      params.dq_ptr,
+      params.dk_ptr,
+      params.dv_ptr,
+      nullptr,
+      nullptr,
+      params.q_gs_ms_ks_lengths,
+      params.q_gs_ms_ks_strides,
+      params.k_gs_ns_ks_lengths,
+      params.k_gs_ns_ks_strides,
+      params.z_gs_ms_ns_lengths,
+      params.z_gs_ms_ns_strides,
+      params.v_gs_gemm1ns_gemm1ks_lengths,
+      params.v_gs_gemm1ns_gemm1ks_strides,
+      params.out_gs_ms_gemm1ns_lengths,
+      params.out_gs_ms_gemm1ns_strides,
+      params.lse_gs_ms_lengths,
+      {},
+      {},
+      {},
+      {},
+      device_gemm_trait::AElementOp{},
+      device_gemm_trait::B0ElementOp{},
+      device_gemm_trait::Acc0ElementOp{params.softmax_scale},
+      device_gemm_trait::B1ElementOp{},
+      device_gemm_trait::CElementOp{},
+      params.p_dropout, 
+      params.seeds);
+
+    if (!gemm_ptr->IsSupportedArgument(argument_ptr.get())) {
+      throw std::runtime_error(gemm_ptr->GetTypeString() + " does not support this problem");
+    }
+
+    invoker_ptr->Run(argument_ptr.get(), StreamConfig{stream, time_kernel});
+
+    // if (time_kernel) {
+    //   std::cout << "time elpase is " << avg_time << " ms" << std::endl;
+    // }
+  }
 
   // constructor for grouped gemm
-  explicit DeviceGemmInvoker(FlashBwdGroupedParams &params)
-    : device_op_ptr(std::make_unique<DeviceOp>()),
-      invoker_ptr(device_op_ptr->MakeInvokerPointer()) {
+  explicit DeviceGemmInvoker(FlashBwdGroupedParams &params, hipStream_t &stream) {
+    auto gemm_ptr = std::make_unique<Gemm>();
+    auto invoker_ptr = gemm_ptr->MakeInvokerPointer();
 
-    std::vector<typename DeviceOp::ProblemDesc> problem_descs;
+    std::vector<typename Gemm::ProblemDesc> problem_descs;
     problem_descs.reserve(params.b);
 
     for (int i = 0; i < params.b; ++i) {
@@ -102,7 +113,7 @@ class DeviceGemmInvoker {
       });
     }
 
-    argument_ptr = device_op_ptr->MakeArgumentPointer(
+    auto argument_ptr = gemm_ptr->MakeArgumentPointer(
         params.q_ptrs,
         params.k_ptrs,
         params.z_ptrs,
@@ -126,21 +137,16 @@ class DeviceGemmInvoker {
         params.seeds);
 
     // specify workspace for problem_desc
-    SimpleDeviceMem problem_desc_workspace{ device_op_ptr->GetWorkSpaceSize(argument_ptr.get()) };
+    SimpleDeviceMem problem_desc_workspace{ gemm_ptr->GetWorkSpaceSize(argument_ptr.get()) };
 
-    device_op_ptr->SetWorkSpacePointer(argument_ptr.get(),
+    gemm_ptr->SetWorkSpacePointer(argument_ptr.get(),
                             problem_desc_workspace.GetDeviceBuffer());
-  }
 
-  float Run(hipStream_t &stream) {
-    if (!device_op_ptr->IsSupportedArgument(argument_ptr.get())) {
-      std::cout << device_op_ptr->GetTypeString() 
-                << " does not support this problem"
-                << std::endl;
-      return 0;
+    if (!gemm_ptr->IsSupportedArgument(argument_ptr.get())) {
+      throw std::runtime_error(gemm_ptr->GetTypeString() + " does not support this problem");
     }
 
-    return invoker_ptr->Run(argument_ptr.get(), StreamConfig{stream, time_kernel});
+    invoker_ptr->Run(argument_ptr.get(), StreamConfig{stream, time_kernel});
 
     // if (time_kernel) {
     //   std::cout << "time elpase is " << avg_time << " ms" << std::endl;
@@ -148,10 +154,6 @@ class DeviceGemmInvoker {
   }
 
  private:
-  std::unique_ptr<DeviceOp> device_op_ptr;
-  std::unique_ptr<typename DeviceOp::Invoker> invoker_ptr;
-  std::unique_ptr<typename DeviceOp::Argument> argument_ptr;
-
   static const bool time_kernel = false;
 };
 } // namespace bwd_device_gemm
