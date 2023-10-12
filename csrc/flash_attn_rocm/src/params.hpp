@@ -15,15 +15,15 @@
 
 // Common argements used by both batched & grouped gemms
 struct BaseParams {
-  explicit BaseParams(const size_t b,
-                      const size_t seqlen_q,
-                      const size_t seqlen_k,
-                      const size_t seqlen_q_rounded,
-                      const size_t seqlen_k_rounded,
-                      const size_t h,
-                      const size_t h_k,
-                      const size_t d,
-                      const size_t d_rounded,
+  explicit BaseParams(const Index b,
+                      const Index seqlen_q,
+                      const Index seqlen_k,
+                      const Index seqlen_q_rounded,
+                      const Index seqlen_k_rounded,
+                      const Index h,
+                      const Index h_k,
+                      const Index d,
+                      const Index d_rounded,
                       const at::Tensor q,
                       const at::Tensor k,
                       const at::Tensor v,
@@ -114,21 +114,21 @@ struct BaseParams {
   static const bool output_permute = true;
   static const bool z_tensor_permute = false;
 
-  static const bool kIsUnitTestMode = get_env_("FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE");
-  static const bool kIsDeterministic = get_env_("FLASH_ATTENTION_INTERNAL_DETERMINISTIC");
+  static inline const bool kIsUnitTestMode = get_env_("FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE");
+  static inline const bool kIsDeterministic = get_env_("FLASH_ATTENTION_INTERNAL_DETERMINISTIC");
 };
 
 // Common Batched Arguments
 struct BatchedParams : public BaseParams {
-  explicit BatchedParams(const size_t b,
-                         const size_t seqlen_q,
-                         const size_t seqlen_k,
-                         const size_t seqlen_q_rounded,
-                         const size_t seqlen_k_rounded,
-                         const size_t h,
-                         const size_t h_k,
-                         const size_t d,
-                         const size_t d_rounded,
+  explicit BatchedParams(const Index b,
+                         const Index seqlen_q,
+                         const Index seqlen_k,
+                         const Index seqlen_q_rounded,
+                         const Index seqlen_k_rounded,
+                         const Index h,
+                         const Index h_k,
+                         const Index d,
+                         const Index d_rounded,
                          const at::Tensor q,
                          const at::Tensor k,
                          const at::Tensor v,
@@ -185,7 +185,7 @@ struct BatchedParams : public BaseParams {
           ? std::vector<Index>{seqlen_q_rounded * h * d, d, h * d, 1}  // C layout [b, seqlen_q_rounded, h, d]
           : std::vector<Index>{h * seqlen_q_rounded * d, seqlen_q_rounded * d, d, 1}), // C layout [b, h, seqlen_q_rounded, d]
       lse_gs_ms_lengths({b, h, seqlen_q_rounded}),                       // LSE layout [b, h, seqlen_q_rounded]
-      lse_gs_ms_lengths({h * seqlen_q_rounded, seqlen_q_rounded, 1}) {}
+      lse_gs_ms_strides({h * seqlen_q_rounded, seqlen_q_rounded, 1}) {}
   
   void* __restrict__ q_ptr;
   void* __restrict__ k_ptr;
@@ -211,15 +211,15 @@ struct BatchedParams : public BaseParams {
 
 // Forward Batched Arguments
 struct FlashFwdBatchedParams : public BatchedParams {
-  explicit FlashFwdBatchedParams(const size_t b,
-                                 const size_t seqlen_q,
-                                 const size_t seqlen_k,
-                                 const size_t seqlen_q_rounded,
-                                 const size_t seqlen_k_rounded,
-                                 const size_t h,
-                                 const size_t h_k,
-                                 const size_t d,
-                                 const size_t d_rounded,
+  explicit FlashFwdBatchedParams(const Index b,
+                                 const Index seqlen_q,
+                                 const Index seqlen_k,
+                                 const Index seqlen_q_rounded,
+                                 const Index seqlen_k_rounded,
+                                 const Index h,
+                                 const Index h_k,
+                                 const Index d,
+                                 const Index d_rounded,
                                  const at::Tensor q,
                                  const at::Tensor k,
                                  const at::Tensor v,
@@ -251,19 +251,18 @@ struct FlashFwdBatchedParams : public BatchedParams {
 
 // Backward Batched Arguments
 struct FlashBwdBatchedParams : public BatchedParams {
-  explicit FlashBwdBatchedParams(const size_t b,
-                                 const size_t seqlen_q,
-                                 const size_t seqlen_k,
-                                 const size_t seqlen_q_rounded,
-                                 const size_t seqlen_k_rounded,
-                                 const size_t h,
-                                 const size_t h_k,
-                                 const size_t d,
-                                 const size_t d_rounded,
+  explicit FlashBwdBatchedParams(const Index b,
+                                 const Index seqlen_q,
+                                 const Index seqlen_k,
+                                 const Index seqlen_q_rounded,
+                                 const Index seqlen_k_rounded,
+                                 const Index h,
+                                 const Index h_k,
+                                 const Index d,
+                                 const Index d_rounded,
                                  const at::Tensor q,
                                  const at::Tensor k,
                                  const at::Tensor v,
-                                 at::Tensor out,
                                  const at::Tensor out,
                                  const at::Tensor dout,
                                  at::Tensor dq,
@@ -309,15 +308,15 @@ struct FlashBwdBatchedParams : public BatchedParams {
 
 // Common Grouped Arguments
 struct GroupedParams : public BaseParams {
-  explicit GroupedParams(const size_t b,
-                         const size_t seqlen_q,
-                         const size_t seqlen_k,
-                         const size_t seqlen_q_rounded,
-                         const size_t seqlen_k_rounded,
-                         const size_t h,
-                         const size_t h_k,
-                         const size_t d,
-                         const size_t d_rounded,
+  explicit GroupedParams(const Index b,
+                         const Index seqlen_q,
+                         const Index seqlen_k,
+                         const Index seqlen_q_rounded,
+                         const Index seqlen_k_rounded,
+                         const Index h,
+                         const Index h_k,
+                         const Index d,
+                         const Index d_rounded,
                          const at::Tensor q,
                          const at::Tensor k,
                          const at::Tensor v,
@@ -407,50 +406,50 @@ struct GroupedParams : public BaseParams {
         z_ptrs.push_back(nullptr);
       }
 
-      int K  = head_dim;
-      int O  = head_dim;
+      int K  = d;
+      int O  = d;
       int G0 = 1;
-      int G1 = num_heads;
+      int G1 = h;
       int M = host_seqlens_q[i + 1] - host_seqlens_q[i]; //seqlen Q
       int N = host_seqlens_k[i + 1] - host_seqlens_k[i]; //seqlen K
 
-      std::vector<ck::index_t> q_gs_ms_ks_lengths{G0, G1, M, K};
-      std::vector<ck::index_t> q_gs_ms_ks_strides =
+      std::vector<Index> q_gs_ms_ks_lengths{G0, G1, M, K};
+      std::vector<Index> q_gs_ms_ks_strides =
           input_permute
-              ? std::vector<ck::index_t>{M * G1 * K * q_stride_multiplier, K, G1 * K * q_stride_multiplier, 1}
+              ? std::vector<Index>{M * G1 * K * q_stride_multiplier, K, G1 * K * q_stride_multiplier, 1}
               // Q layout [G0, M, G1, K]
-              : std::vector<ck::index_t>{G1 * M * K, M * K, K, 1}; // Q layout [G0, G1, M, K]
+              : std::vector<Index>{G1 * M * K, M * K, K, 1}; // Q layout [G0, G1, M, K]
 
-      std::vector<ck::index_t> k_gs_ns_ks_lengths{G0, G1, N, K};
-      std::vector<ck::index_t> k_gs_ns_ks_strides =
+      std::vector<Index> k_gs_ns_ks_lengths{G0, G1, N, K};
+      std::vector<Index> k_gs_ns_ks_strides =
           input_permute
-              ? std::vector<ck::index_t>{N * G1 * K * kv_stride_multiplier, K, G1 * K * kv_stride_multiplier, 1}
+              ? std::vector<Index>{N * G1 * K * kv_stride_multiplier, K, G1 * K * kv_stride_multiplier, 1}
               // K layout [G0, N, G1, K]
-              : std::vector<ck::index_t>{G1 * N * K, N * K, K, 1}; // K layout [G0, G1, N, K]
+              : std::vector<Index>{G1 * N * K, N * K, K, 1}; // K layout [G0, G1, N, K]
 
-      std::vector<ck::index_t> z_gs_ms_ns_lengths{G0, G1, M, N};
-      std::vector<ck::index_t> z_gs_ms_ns_strides = 
+      std::vector<Index> z_gs_ms_ns_lengths{G0, G1, M, N};
+      std::vector<Index> z_gs_ms_ns_strides = 
           input_permute
-          ? std::vector<ck::index_t>{M * G1 * N, N, G1 * N, 1}
+          ? std::vector<Index>{M * G1 * N, N, G1 * N, 1}
           // Z layout [G0, M, G1, N]
-          : std::vector<ck::index_t>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
+          : std::vector<Index>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
 
-      std::vector<ck::index_t> v_gs_os_ns_lengths{G0, G1, O, N};
-      std::vector<ck::index_t> v_gs_os_ns_strides =
+      std::vector<Index> v_gs_os_ns_lengths{G0, G1, O, N};
+      std::vector<Index> v_gs_os_ns_strides =
           input_permute
-              ? std::vector<ck::index_t>{N * G1 * O * kv_stride_multiplier, O, 1, G1 * O * kv_stride_multiplier}
+              ? std::vector<Index>{N * G1 * O * kv_stride_multiplier, O, 1, G1 * O * kv_stride_multiplier}
               // V layout [G0, N, G1, O]
-              : std::vector<ck::index_t>{G1 * N * O, N * O, 1, O}; // V layout [G0, G1, N, O]
+              : std::vector<Index>{G1 * N * O, N * O, 1, O}; // V layout [G0, G1, N, O]
 
-      std::vector<ck::index_t> out_gs_ms_os_lengths{G0, G1, M, O};
-      std::vector<ck::index_t> out_gs_ms_os_strides =
+      std::vector<Index> out_gs_ms_os_lengths{G0, G1, M, O};
+      std::vector<Index> out_gs_ms_os_strides =
           output_permute
-              ? std::vector<ck::index_t>{M * G1 * O, O, G1 * O, 1}
+              ? std::vector<Index>{M * G1 * O, O, G1 * O, 1}
               // Y layout [G0, M, G1, O]
-              : std::vector<ck::index_t>{G1 * M * O, M * O, O, 1}; // Y layout [G0, G1, M, O]
+              : std::vector<Index>{G1 * M * O, M * O, O, 1}; // Y layout [G0, G1, M, O]
 
-      std::vector<ck::index_t> lse_gs_ms_lengths{G0, G1, M};
-      std::vector<ck::index_t> lse_gs_ms_strides{G1 * M, M, 1}; // LSE layout [G0, G1, M]
+      std::vector<Index> lse_gs_ms_lengths{G0, G1, M};
+      std::vector<Index> lse_gs_ms_strides{G1 * M, M, 1}; // LSE layout [G0, G1, M]
 
       problem_descs.push_back({
           q_gs_ms_ks_lengths,
@@ -465,10 +464,6 @@ struct GroupedParams : public BaseParams {
           out_gs_ms_os_strides,
           lse_gs_ms_lengths,
           lse_gs_ms_strides,
-          {}, // acc0_biases_gs_ms_ns_lengths
-          {}, // acc0_biases_gs_ms_ns_strides
-          {}, // acc1_biases_gs_ms_os_lengths
-          {}  // acc1_biases_gs_ms_os_strides
       });
     }
   }
@@ -504,15 +499,15 @@ struct GroupedParams : public BaseParams {
 
 // Forward Grouped Arguments
 struct FlashFwdGroupedParams : public GroupedParams {
-  explicit FlashFwdGroupedParams(const size_t b,
-                                 const size_t seqlen_q,
-                                 const size_t seqlen_k,
-                                 const size_t seqlen_q_rounded,
-                                 const size_t seqlen_k_rounded,
-                                 const size_t h,
-                                 const size_t h_k,
-                                 const size_t d,
-                                 const size_t d_rounded,
+  explicit FlashFwdGroupedParams(const Index b,
+                                 const Index seqlen_q,
+                                 const Index seqlen_k,
+                                 const Index seqlen_q_rounded,
+                                 const Index seqlen_k_rounded,
+                                 const Index h,
+                                 const Index h_k,
+                                 const Index d,
+                                 const Index d_rounded,
                                  const at::Tensor q,
                                  const at::Tensor k,
                                  const at::Tensor v,
@@ -550,19 +545,18 @@ struct FlashFwdGroupedParams : public GroupedParams {
 
 // Backward Grouped Arguments
 struct FlashBwdGroupedParams : public GroupedParams {
-  explicit FlashBwdGroupedParams(const size_t b,
-                                 const size_t seqlen_q,
-                                 const size_t seqlen_k,
-                                 const size_t seqlen_q_rounded,
-                                 const size_t seqlen_k_rounded,
-                                 const size_t h,
-                                 const size_t h_k,
-                                 const size_t d,
-                                 const size_t d_rounded,
+  explicit FlashBwdGroupedParams(const Index b,
+                                 const Index seqlen_q,
+                                 const Index seqlen_k,
+                                 const Index seqlen_q_rounded,
+                                 const Index seqlen_k_rounded,
+                                 const Index h,
+                                 const Index h_k,
+                                 const Index d,
+                                 const Index d_rounded,
                                  const at::Tensor q,
                                  const at::Tensor k,
                                  const at::Tensor v,
-                                 at::Tensor out,
                                  const at::Tensor out,
                                  const at::Tensor dout,
                                  at::Tensor dq,
@@ -597,6 +591,10 @@ struct FlashBwdGroupedParams : public GroupedParams {
                     is_causal),
       bwd_out_ptrs(std::vector<const void*>(out_ptrs.begin(), out_ptrs.end())),
       bwd_softmax_lse_ptrs(std::vector<const void*>(softmax_lse_ptrs.begin(), softmax_lse_ptrs.end())) {
+    
+    char* q_ptr = reinterpret_cast<char*>(q.data_ptr());  
+    char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
+    char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
 
     char* dq_ptr = reinterpret_cast<char*>(dq.data_ptr());
     char* dk_ptr = reinterpret_cast<char*>(dk.data_ptr());
@@ -625,7 +623,6 @@ struct FlashBwdGroupedParams : public GroupedParams {
 
       at::Tensor d_tensor;
       d_tensor = at::empty({1, static_cast<long>(h), temp_seqlen_q}, opts.dtype(at::kFloat));
-      d_tensors.push_back(d_tensor);
       d_ptrs.push_back(reinterpret_cast<void*>(d_tensor.data_ptr()));
 
       // unit test mode
@@ -698,4 +695,8 @@ struct FlashBwdGroupedParams : public GroupedParams {
 
   std::vector<const void*> dout_ptrs;
   std::vector<void*> d_ptrs;
+
+  std::vector<at::Tensor> dq_tensors;
+  std::vector<at::Tensor> dk_tensors;
+  std::vector<at::Tensor> dv_tensors;
 };

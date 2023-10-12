@@ -33,7 +33,7 @@ class DeviceGemmInvoker {
 
  public:
   // constructor for batched gemm
-  explicit DeviceGemmInvoker(FlashBwdBatchedParams &params, hipStream_t &stream)
+  explicit DeviceGemmInvoker(FlashBwdBatchedParams &params)
     : device_op_ptr(std::make_unique<DeviceOp>()),
       invoker_ptr(device_op_ptr->MakeInvokerPointer()),
       argument_ptr(device_op_ptr->MakeArgumentPointer(
@@ -74,11 +74,11 @@ class DeviceGemmInvoker {
         params.seeds)) {}
 
   // constructor for grouped gemm
-  explicit DeviceGemmInvoker(FlashBwdGroupedParams &params, hipStream_t &stream)
+  explicit DeviceGemmInvoker(FlashBwdGroupedParams &params)
     : device_op_ptr(std::make_unique<DeviceOp>()),
-      invoker_ptr(device_op_ptr->MakeInvokerPointer()), {
+      invoker_ptr(device_op_ptr->MakeInvokerPointer()) {
 
-    std::vector<DeviceOp::ProblemDesc> problem_descs;
+    std::vector<typename DeviceOp::ProblemDesc> problem_descs;
     problem_descs.reserve(params.b);
 
     for (int i = 0; i < params.b; ++i) {
@@ -89,10 +89,10 @@ class DeviceGemmInvoker {
           params.problem_descs[i].k_gs_ns_ks_strides,
           params.problem_descs[i].z_gs_ms_ns_lengths,
           params.problem_descs[i].z_gs_ms_ns_strides,
-          params.problem_descs[i].v_gs_os_ns_lengths,
-          params.problem_descs[i].v_gs_os_ns_strides,
-          params.problem_descs[i].out_gs_ms_os_lengths,
-          params.problem_descs[i].out_gs_ms_os_strides,
+          params.problem_descs[i].v_gs_gemm1ns_gemm1ks_lengths,
+          params.problem_descs[i].v_gs_gemm1ns_gemm1ks_strides,
+          params.problem_descs[i].out_gs_ms_gemm1ns_lengths,
+          params.problem_descs[i].out_gs_ms_gemm1ns_strides,
           params.problem_descs[i].lse_gs_ms_lengths,
           params.problem_descs[i].lse_gs_ms_strides,
           {}, // acc0_biases_gs_ms_ns_lengths
@@ -132,7 +132,7 @@ class DeviceGemmInvoker {
                             problem_desc_workspace.GetDeviceBuffer());
   }
 
-  float Run() {
+  float Run(hipStream_t &stream) {
     if (!device_op_ptr->IsSupportedArgument(argument_ptr.get())) {
       std::cout << device_op_ptr->GetTypeString() 
                 << " does not support this problem"
@@ -149,9 +149,9 @@ class DeviceGemmInvoker {
 
  private:
   std::unique_ptr<DeviceOp> device_op_ptr;
-  std::unique_ptr<DeviceOp::Invoker> invoker_ptr;
-  std::unique_ptr<DeviceOp::Argument> argument_ptr;
+  std::unique_ptr<typename DeviceOp::BaseInvoker> invoker_ptr;
+  std::unique_ptr<typename DeviceOp::BaseArgument> argument_ptr;
 
-  // static const bool time_kernel = false;
+  static const bool time_kernel = false;
 };
 } // namespace bwd_device_gemm

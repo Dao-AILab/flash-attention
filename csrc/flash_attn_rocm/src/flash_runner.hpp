@@ -64,8 +64,8 @@ class FlashRunner {
                                                         kMaskingSpec, 
                                                         kIsDeterministic>;
     using Invoker = fwd_device_gemm::DeviceGemmInvoker<DeviceGemmTemplate, DeviceGemmTraits>;
-    auto invoker = std::make_unique<Invoker>(params, stream);
-    invoker->Run();
+    auto invoker = std::make_unique<Invoker>(params);
+    invoker->Run(stream);
   }
   
   template <typename FlashBwdParams,
@@ -75,7 +75,7 @@ class FlashRunner {
             device_gemm_trait::MaskingSpec kMaskingSpec, 
             bool kIsDeterministic>
   void run_bwd_(FlashBwdParams &params, hipStream_t &stream) {
-    if (BaseParams.kIsUnitTestMode) {     
+    if (BaseParams::kIsUnitTestMode) {     
       // unit test mode
       // input, output, gemm, dropout, cshuffle, masking specialization, deterministic
       using DeviceGemmTraits = device_gemm_trait::Backward<T, 
@@ -87,8 +87,8 @@ class FlashRunner {
                                                            kMaskingSpec, 
                                                            kIsDeterministic>;
       using Invoker = bwd_device_gemm::DeviceGemmInvoker<DeviceGemmTemplate, DeviceGemmTraits>;
-      auto invoker = std::make_unique<Invoker>(params, stream);
-      invoker->Run();
+      auto invoker = std::make_unique<Invoker>(params);
+      invoker->Run(stream);
     } else { 
       // performance mode
       // input, output, gemm, dropout, cshuffle, masking specialization, deterministic
@@ -101,8 +101,8 @@ class FlashRunner {
                                                            kMaskingSpec, 
                                                            kIsDeterministic>;
       using Invoker = bwd_device_gemm::DeviceGemmInvoker<DeviceGemmTemplate, DeviceGemmTraits>;
-      auto invoker = std::make_unique<Invoker>(params, stream);
-      invoker->Run();
+      auto invoker = std::make_unique<Invoker>(params);
+      invoker->Run(stream);
     }
   }
 };

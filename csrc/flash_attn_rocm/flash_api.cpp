@@ -146,7 +146,7 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
         if (out_.has_value()) { out_.value().copy_(out); }
     }
 
-    return { out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state };
+    return { out, q_padded, k_padded, v_padded, out_padded, softmax_lse, z, rng_state };
 }
 
 std::vector<at::Tensor>
@@ -255,7 +255,7 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
     if (zero_tensors) {
         out.zero_();
         softmax_lse.fill_(-std::numeric_limits<float>::infinity());
-        if (return_softmax) {p.zero_();}
+        if (return_softmax) {z.zero_();}
     }
 
     FlashFwdGroupedParams params(batch_size,
@@ -308,7 +308,7 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
         if (out_.has_value()) { out_.value().copy_(out); }
     }
 
-    return { out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state };
+    return { out, q_padded, k_padded, v_padded, out_padded, softmax_lse, z, rng_state };
 }
 
 std::vector<at::Tensor>
@@ -438,7 +438,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         dv_expanded = dv;
     }
 
-    if(BaseParams.kIsUnitTestMode) {
+    if(BaseParams::kIsUnitTestMode) {
       dq = dq.to(torch::kFloat32);
       dk_expanded = dk_expanded.to(torch::kFloat32);
       dv_expanded = dv_expanded.to(torch::kFloat32);
@@ -500,17 +500,17 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
       dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
     }
 
-    if(BaseParams.kIsUnitTestMode) {
-      if(!q.is_contiguous()) {
-        dq.copy_(torch::cat(params.dq_tensors, 0).contiguous(), true);
-      }
-      if(!k.is_contiguous()) {
-        dk.copy_(torch::cat(params.dk_tensors, 0).contiguous(), true);
-      }
-      if(!v.is_contiguous()) {
-        dv.copy_(torch::cat(params.dv_tensors, 0).contiguous(), true);
-      }
-    }
+    // if(BaseParams::kIsUnitTestMode) {
+    //   if(!q.is_contiguous()) {
+    //     dq.copy_(torch::cat(params.dq_tensors, 0).contiguous(), true);
+    //   }
+    //   if(!k.is_contiguous()) {
+    //     dk.copy_(torch::cat(params.dk_tensors, 0).contiguous(), true);
+    //   }
+    //   if(!v.is_contiguous()) {
+    //     dv.copy_(torch::cat(params.dv_tensors, 0).contiguous(), true);
+    //   }
+    // }
 
     return { dq, dk, dv, softmax_d };
 }
@@ -636,20 +636,12 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
       dout_padded = dout;
     }
 
-    // bool loop = max_seqlen_k > blocksize_c;
-    // TODO: change later, for now set to true for simplicity
-    bool loop = true;
-
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
     at::cuda::HIPGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
-    at::Tensor dq_accum;
-    if (loop) {
-      dq_accum = torch::empty({batch_size, num_heads, seqlen_q_rounded, head_size_rounded}, opts.dtype(at::kFloat));
-    }
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
@@ -667,15 +659,15 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
       // softmax_d.zero_();
     }
 
-    if(BaseParams.kIsUnitTestMode) {
+    if(BaseParams::kIsUnitTestMode) {
       dq = dq.to(torch::kFloat32);
       dk_expanded = dk_expanded.to(torch::kFloat32);
       dv_expanded = dv_expanded.to(torch::kFloat32);
     }
 
     FlashBwdGroupedParams params(batch_size,
-                                 seqlen_q, 
-                                 seqlen_k,
+                                 max_seqlen_q, 
+                                 max_seqlen_k,
                                  seqlen_q_rounded, 
                                  seqlen_k_rounded,
                                  num_heads, 
@@ -690,6 +682,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                                  dq, 
                                  dk_expanded, 
                                  dv_expanded,
+                                 cu_seqlens_q.data_ptr(),
+                                 cu_seqlens_k.data_ptr(),
                                  nullptr,
                                  softmax_lse.data_ptr(),
                                  p_dropout,
@@ -729,7 +723,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
       dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
     }
 
-    if(BaseParams.kIsUnitTestMode) {
+    if(BaseParams::kIsUnitTestMode) {
       if(!q.is_contiguous()) {
         dq.copy_(torch::cat(params.dq_tensors, 0).contiguous(), true);
       }
