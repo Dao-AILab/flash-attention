@@ -12,3 +12,4 @@ RUN cd /workspace/triton/python \
 RUN pip install gitpython
 RUN apt install bc
 RUN pip install einops
+RUN pip install matplotlib pandas
