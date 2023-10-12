@@ -1,5 +1,6 @@
 FROM rocm/pytorch:latest-release
 
+RUN pip uninstall -y triton
 WORKDIR /workspace
 USER root
 
