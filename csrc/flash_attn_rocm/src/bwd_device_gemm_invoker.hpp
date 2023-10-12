@@ -149,8 +149,8 @@ class DeviceGemmInvoker {
 
  private:
   std::unique_ptr<DeviceOp> device_op_ptr;
-  std::unique_ptr<typename DeviceOp::BaseInvoker> invoker_ptr;
-  std::unique_ptr<typename DeviceOp::BaseArgument> argument_ptr;
+  std::unique_ptr<typename DeviceOp::Invoker> invoker_ptr;
+  std::unique_ptr<typename DeviceOp::Argument> argument_ptr;
 
   static const bool time_kernel = false;
 };
