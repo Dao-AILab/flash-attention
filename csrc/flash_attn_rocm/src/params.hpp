@@ -146,9 +146,7 @@ struct BatchedParams : public BaseParams {
                          bool is_causal,
                          const bool input_permute,
                          const bool output_permute,
-                         const bool z_tensor_permute
-                         int q_stride_multiplier,
-                         int kv_stride_multiplier)
+                         const bool z_tensor_permute)
     : BaseParams(b,
                  seqlen_q,
                  seqlen_k,
@@ -176,12 +174,12 @@ struct BatchedParams : public BaseParams {
       q_gs_ms_ks_lengths({b, h, seqlen_q_rounded, d}),
       q_gs_ms_ks_strides(
             input_permute
-          ? std::vector<Index>{seqlen_q_rounded * h * d * q_stride_multiplier, d, h * d * q_stride_multiplier, 1}    // A layout [b, seqlen_q_rounded, h, d]
+          ? std::vector<Index>{seqlen_q_rounded * h * d, d, h * d, 1}    // A layout [b, seqlen_q_rounded, h, d]
           : std::vector<Index>{h * seqlen_q_rounded * d, seqlen_q_rounded * d, d, 1}),   // A layout [b, h, seqlen_q_rounded, d]
       k_gs_ns_ks_lengths({b, h, seqlen_k_rounded, d}),
       k_gs_ns_ks_strides(
             input_permute
-          ? std::vector<Index>{seqlen_k_rounded * h * d * kv_stride_multiplier, d, h * d * kv_stride_multiplier, 1}  // B0 layout [b, seqlen_k_rounded, h, d]
+          ? std::vector<Index>{seqlen_k_rounded * h * d, d, h * d, 1}  // B0 layout [b, seqlen_k_rounded, h, d]
           : std::vector<Index>{h * seqlen_k_rounded * d, seqlen_k_rounded * d, d, 1}), // B0 layout [b, h, seqlen_k_rounded, d]
       z_gs_ms_ns_lengths({b, h, seqlen_q_rounded, seqlen_k_rounded}),  
       z_gs_ms_ns_strides( 
@@ -191,7 +189,7 @@ struct BatchedParams : public BaseParams {
       v_gs_gemm1ns_gemm1ks_lengths({b, h, d, seqlen_k_rounded}),
       v_gs_gemm1ns_gemm1ks_strides(
             input_permute
-          ? std::vector<Index>{seqlen_k_rounded * h * d * kv_stride_multiplier, d, 1, h * d * kv_stride_multiplier}  // B1 layout [b, seqlen_k_rounded, h, d]
+          ? std::vector<Index>{seqlen_k_rounded * h * d, d, 1, h * d}  // B1 layout [b, seqlen_k_rounded, h, d]
           : std::vector<Index>{h * seqlen_k_rounded * d, seqlen_k_rounded * d, 1, d}), // B1 layout [b, h, seqlen_k_rounded, d]
       out_gs_ms_gemm1ns_lengths({b, h, seqlen_q_rounded, d}),  
       out_gs_ms_gemm1ns_strides(
@@ -442,14 +440,14 @@ struct GroupedParams : public BaseParams {
       std::vector<Index> q_gs_ms_ks_lengths{G0, G1, M, K};
       std::vector<Index> q_gs_ms_ks_strides =
           input_permute
-              ? std::vector<Index>{M * G1 * K * q_stride_multiplier, K, G1 * K * q_stride_multiplier, 1}
+              ? std::vector<Index>{M * G1 * K, K, G1 * K, 1}
               // Q layout [G0, M, G1, K]
               : std::vector<Index>{G1 * M * K, M * K, K, 1}; // Q layout [G0, G1, M, K]
 
       std::vector<Index> k_gs_ns_ks_lengths{G0, G1, N, K};
       std::vector<Index> k_gs_ns_ks_strides =
           input_permute
-              ? std::vector<Index>{N * G1 * K * kv_stride_multiplier, K, G1 * K * kv_stride_multiplier, 1}
+              ? std::vector<Index>{N * G1 * K, K, G1 * K, 1}
               // K layout [G0, N, G1, K]
               : std::vector<Index>{G1 * N * K, N * K, K, 1}; // K layout [G0, G1, N, K]
 
@@ -463,7 +461,7 @@ struct GroupedParams : public BaseParams {
       std::vector<Index> v_gs_os_ns_lengths{G0, G1, O, N};
       std::vector<Index> v_gs_os_ns_strides =
           input_permute
-              ? std::vector<Index>{N * G1 * O * kv_stride_multiplier, O, 1, G1 * O * kv_stride_multiplier}
+              ? std::vector<Index>{N * G1 * O, O, 1, G1 * O}
               // V layout [G0, N, G1, O]
               : std::vector<Index>{G1 * N * O, N * O, 1, O}; // V layout [G0, G1, N, O]
 
