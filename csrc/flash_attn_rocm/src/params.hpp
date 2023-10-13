@@ -24,9 +24,9 @@ struct BaseParams {
                       const Index h_k,
                       const Index d,
                       const Index d_rounded,
-                      const at::Tensor q,
-                      const at::Tensor k,
-                      const at::Tensor v,
+                      const torch::Tensor q,
+                      const torch::Tensor k,
+                      const torch::Tensor v,
                       const float p_dropout,
                       const float softmax_scale,
                       const bool is_causal,
@@ -63,19 +63,6 @@ struct BaseParams {
     } else {
       std::cout << "Unsupported head dimension" << std::endl;
     }
-
-    if(q.is_contiguous() && k.is_contiguous() && v.is_contiguous()) {  
-      q_stride_multiplier = 1;
-      kv_stride_multiplier = 1;
-    } else if(q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()) {
-      q_stride_multiplier = 1;
-      kv_stride_multiplier = 2;
-    } else if(!q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous()) {
-      q_stride_multiplier = 3;
-      kv_stride_multiplier = 3;
-    } else {
-      std::cout<< "Wrong matrix inputs." <<std::endl;
-    }
   }
 
   // The dimensions.
@@ -90,9 +77,6 @@ struct BaseParams {
   // The scaling factors for the kernel.
   float softmax_scale;
   // float softmax_scale_log2;
-
-  int q_stride_multiplier;
-  int kv_stride_multiplier;
 
   // The dropout probability (probability of keeping an activation).
   float p_dropout;
@@ -135,10 +119,10 @@ struct BatchedParams : public BaseParams {
                          const Index h_k,
                          const Index d,
                          const Index d_rounded,
-                         const at::Tensor q,
-                         const at::Tensor k,
-                         const at::Tensor v,
-                         at::Tensor out,
+                         const torch::Tensor q,
+                         const torch::Tensor k,
+                         const torch::Tensor v,
+                         torch::Tensor out,
                          void* z_d,
                          void* softmax_lse_d,
                          float p_dropout,
@@ -171,33 +155,33 @@ struct BatchedParams : public BaseParams {
       v_ptr(v.data_ptr()),
       out_ptr(out.data_ptr()),
       softmax_lse_ptr(softmax_lse_d),
-      q_gs_ms_ks_lengths({b, h, seqlen_q_rounded, d}),
+      q_gs_ms_ks_lengths({b, h, seqlen_q, d}),
       q_gs_ms_ks_strides(
             input_permute
-          ? std::vector<Index>{seqlen_q_rounded * h * d, d, h * d, 1}    // A layout [b, seqlen_q_rounded, h, d]
-          : std::vector<Index>{h * seqlen_q_rounded * d, seqlen_q_rounded * d, d, 1}),   // A layout [b, h, seqlen_q_rounded, d]
-      k_gs_ns_ks_lengths({b, h, seqlen_k_rounded, d}),
+          ? std::vector<Index>{seqlen_q * h * d, d, h * d, 1}    // A layout [b, seqlen_q, h, d]
+          : std::vector<Index>{h * seqlen_q * d, seqlen_q * d, d, 1}),   // A layout [b, h, seqlen_q, d]
+      k_gs_ns_ks_lengths({b, h, seqlen_k, d}),
       k_gs_ns_ks_strides(
             input_permute
-          ? std::vector<Index>{seqlen_k_rounded * h * d, d, h * d, 1}  // B0 layout [b, seqlen_k_rounded, h, d]
-          : std::vector<Index>{h * seqlen_k_rounded * d, seqlen_k_rounded * d, d, 1}), // B0 layout [b, h, seqlen_k_rounded, d]
-      z_gs_ms_ns_lengths({b, h, seqlen_q_rounded, seqlen_k_rounded}),  
+          ? std::vector<Index>{seqlen_k * h * d, d, h * d, 1}  // B0 layout [b, seqlen_k, h, d]
+          : std::vector<Index>{h * seqlen_k * d, seqlen_k * d, d, 1}), // B0 layout [b, h, seqlen_k_rounded, d]
+      z_gs_ms_ns_lengths({b, h, seqlen_q, seqlen_k}),  
       z_gs_ms_ns_strides( 
             z_tensor_permute
-          ? std::vector<Index>{seqlen_q_rounded * h * seqlen_k_rounded, seqlen_k_rounded, h * seqlen_k_rounded, 1}  // Z layout [b, seqlen_q_rounded, h, seqlen_k_rounded]
-          : std::vector<Index>{h * seqlen_q_rounded * seqlen_k_rounded, seqlen_q_rounded * seqlen_k_rounded, seqlen_k_rounded, 1}), // Z layout [b, h, seqlen_q_rounded, seqlen_k_rounded]
-      v_gs_gemm1ns_gemm1ks_lengths({b, h, d, seqlen_k_rounded}),
+          ? std::vector<Index>{seqlen_q * h * seqlen_k, seqlen_k, h * seqlen_k, 1}  // Z layout [b, seqlen_q, h, seqlen_k]
+          : std::vector<Index>{h * seqlen_q * seqlen_k, seqlen_q * seqlen_k, seqlen_k, 1}), // Z layout [b, h, seqlen_q, seqlen_k]
+      v_gs_gemm1ns_gemm1ks_lengths({b, h, d, seqlen_k}),
       v_gs_gemm1ns_gemm1ks_strides(
             input_permute
-          ? std::vector<Index>{seqlen_k_rounded * h * d, d, 1, h * d}  // B1 layout [b, seqlen_k_rounded, h, d]
-          : std::vector<Index>{h * seqlen_k_rounded * d, seqlen_k_rounded * d, 1, d}), // B1 layout [b, h, seqlen_k_rounded, d]
-      out_gs_ms_gemm1ns_lengths({b, h, seqlen_q_rounded, d}),  
+          ? std::vector<Index>{seqlen_k * h * d, d, 1, h * d}  // B1 layout [b, seqlen_k, h, d]
+          : std::vector<Index>{h * seqlen_k * d, seqlen_k * d, 1, d}), // B1 layout [b, h, seqlen_k, d]
+      out_gs_ms_gemm1ns_lengths({b, h, seqlen_q, d}),  
       out_gs_ms_gemm1ns_strides(
             output_permute
-          ? std::vector<Index>{seqlen_q_rounded * h * d, d, h * d, 1}  // C layout [b, seqlen_q_rounded, h, d]
-          : std::vector<Index>{h * seqlen_q_rounded * d, seqlen_q_rounded * d, d, 1}), // C layout [b, h, seqlen_q_rounded, d]
-      lse_gs_ms_lengths({b, h, seqlen_q_rounded}),                       // LSE layout [b, h, seqlen_q_rounded]
-      lse_gs_ms_strides({h * seqlen_q_rounded, seqlen_q_rounded, 1}) {}
+          ? std::vector<Index>{seqlen_q * h * d, d, h * d, 1}  // C layout [b, seqlen_q, h, d]
+          : std::vector<Index>{h * seqlen_q * d, seqlen_q * d, d, 1}), // C layout [b, h, seqlen_q, d]
+      lse_gs_ms_lengths({b, h, seqlen_q}),                       // LSE layout [b, h, seqlen_q]
+      lse_gs_ms_strides({h * seqlen_q, seqlen_q, 1}) {}
   
   void* __restrict__ q_ptr;
   void* __restrict__ k_ptr;
@@ -232,10 +216,10 @@ struct FlashFwdBatchedParams : public BatchedParams {
                                  const Index h_k,
                                  const Index d,
                                  const Index d_rounded,
-                                 const at::Tensor q,
-                                 const at::Tensor k,
-                                 const at::Tensor v,
-                                 at::Tensor out,
+                                 const torch::Tensor q,
+                                 const torch::Tensor k,
+                                 const torch::Tensor v,
+                                 torch::Tensor out,
                                  void* z_d,
                                  void* softmax_lse_d,
                                  float p_dropout,
@@ -275,14 +259,14 @@ struct FlashBwdBatchedParams : public BatchedParams {
                                  const Index h_k,
                                  const Index d,
                                  const Index d_rounded,
-                                 const at::Tensor q,
-                                 const at::Tensor k,
-                                 const at::Tensor v,
-                                 const at::Tensor out,
-                                 const at::Tensor dout,
-                                 at::Tensor dq,
-                                 at::Tensor dk,
-                                 at::Tensor dv,
+                                 const torch::Tensor q,
+                                 const torch::Tensor k,
+                                 const torch::Tensor v,
+                                 const torch::Tensor out,
+                                 const torch::Tensor dout,
+                                 torch::Tensor dq,
+                                 torch::Tensor dk,
+                                 torch::Tensor dv,
                                  void* z_d,
                                  void* softmax_lse_d,
                                  float p_dropout,
@@ -313,8 +297,8 @@ struct FlashBwdBatchedParams : public BatchedParams {
       dk_ptr(dk.data_ptr()),
       dv_ptr(dv.data_ptr()),
       dout_ptr(dout.data_ptr()),
-      d_ptr(at::empty({b, static_cast<long>(h), seqlen_q_rounded}, 
-                      q.options().dtype(at::kFloat)).data_ptr()) {}
+      d_ptr(torch::empty({b, static_cast<long>(h), seqlen_q_rounded}, 
+                      q.options().dtype(torch::kFloat32)).data_ptr()) {}
 
   void* __restrict__ dq_ptr;
   void* __restrict__ dk_ptr;
@@ -335,10 +319,10 @@ struct GroupedParams : public BaseParams {
                          const Index h_k,
                          const Index d,
                          const Index d_rounded,
-                         const at::Tensor q,
-                         const at::Tensor k,
-                         const at::Tensor v,
-                         at::Tensor out,
+                         const torch::Tensor q,
+                         const torch::Tensor k,
+                         const torch::Tensor v,
+                         torch::Tensor out,
                          void* cu_seqlens_q_d,
                          void* cu_seqlens_k_d,
                          void* z_d,
@@ -408,13 +392,13 @@ struct GroupedParams : public BaseParams {
       }
 
       q_ptrs.push_back(reinterpret_cast<void*>(q_ptr));
-      q_ptr = q_ptr + temp_q_stride * q_stride_multiplier;
+      q_ptr = q_ptr + temp_q_stride;
 
       k_ptrs.push_back(reinterpret_cast<void*>(k_ptr));
-      k_ptr = k_ptr + temp_k_stride * kv_stride_multiplier;
+      k_ptr = k_ptr + temp_k_stride;
 
       v_ptrs.push_back(reinterpret_cast<void*>(v_ptr));     
-      v_ptr = v_ptr + temp_k_stride * kv_stride_multiplier;      
+      v_ptr = v_ptr + temp_k_stride;      
 
       out_ptrs.push_back(reinterpret_cast<void*>(out_ptr));
       out_ptr = out_ptr + temp_q_stride;
@@ -532,10 +516,10 @@ struct FlashFwdGroupedParams : public GroupedParams {
                                  const Index h_k,
                                  const Index d,
                                  const Index d_rounded,
-                                 const at::Tensor q,
-                                 const at::Tensor k,
-                                 const at::Tensor v,
-                                 at::Tensor out,
+                                 const torch::Tensor q,
+                                 const torch::Tensor k,
+                                 const torch::Tensor v,
+                                 torch::Tensor out,
                                  void* cu_seqlens_q_d,
                                  void* cu_seqlens_k_d,
                                  void* z_d,
@@ -581,14 +565,14 @@ struct FlashBwdGroupedParams : public GroupedParams {
                                  const Index h_k,
                                  const Index d,
                                  const Index d_rounded,
-                                 const at::Tensor q,
-                                 const at::Tensor k,
-                                 const at::Tensor v,
-                                 const at::Tensor out,
-                                 const at::Tensor dout,
-                                 at::Tensor dq,
-                                 at::Tensor dk,
-                                 at::Tensor dv,
+                                 const torch::Tensor q,
+                                 const torch::Tensor k,
+                                 const torch::Tensor v,
+                                 const torch::Tensor out,
+                                 const torch::Tensor dout,
+                                 torch::Tensor dq,
+                                 torch::Tensor dk,
+                                 torch::Tensor dv,
                                  void* cu_seqlens_q_d,
                                  void* cu_seqlens_k_d,
                                  void* z_d,
@@ -631,12 +615,6 @@ struct FlashBwdGroupedParams : public GroupedParams {
     char* dv_ptr = reinterpret_cast<char*>(dv.data_ptr());
     char* dout_ptr = reinterpret_cast<char*>(dout.data_ptr());
 
-    if(kIsUnitTestMode) {
-      q_ptrs.clear();
-      k_ptrs.clear();
-      v_ptrs.clear();
-    }
-
     for (int i = 0; i < b; ++i) {
       int temp_seqlen_q = host_seqlens_q[i+1] - host_seqlens_q[i];
       int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, q.dtype());
@@ -656,65 +634,22 @@ struct FlashBwdGroupedParams : public GroupedParams {
       }
 
       auto opts = q.options();
-
-      at::Tensor d_tensor;
-      d_tensor = at::empty({1, static_cast<long>(h), temp_seqlen_q}, opts.dtype(at::kFloat));
-      d_ptrs.push_back(reinterpret_cast<void*>(d_tensor.data_ptr()));
-
-      // unit test mode
-      if(kIsUnitTestMode) {
-        if(q.is_contiguous()) {
-          q_ptrs.push_back(reinterpret_cast<void*>(q_ptr));
-          dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));
-          q_ptr = q_ptr + temp_q_stride;
-          dq_ptr = dq_ptr + temp_dq_stride;
-        } else {
-          auto q_each_tmp = q.index({torch::indexing::Slice(host_seqlens_q[i], host_seqlens_q[i+1])}).contiguous();
-          auto qgrad_each_tmp = dq.index({torch::indexing::Slice(host_seqlens_q[i], host_seqlens_q[i+1])}).contiguous();
-          dq_tensors.push_back(qgrad_each_tmp);
-          q_ptrs.push_back(reinterpret_cast<const void*>(q_each_tmp.data_ptr()));
-          dq_ptrs.push_back(reinterpret_cast<void*>(qgrad_each_tmp.data_ptr()));
-        }
-
-        if(k.is_contiguous()) {
-          k_ptrs.push_back(reinterpret_cast<void*>(k_ptr));
-          dk_ptrs.push_back(reinterpret_cast<void*>(dk_ptr));
-          k_ptr = k_ptr + temp_k_stride;
-          dk_ptr = dk_ptr + temp_dk_stride;
-        } else {
-          auto k_each_tmp = k.index({torch::indexing::Slice(host_seqlens_k[i], host_seqlens_k[i+1])}).contiguous();
-          auto kgrad_each_tmp = dk.index({torch::indexing::Slice(host_seqlens_k[i], host_seqlens_k[i+1])}).contiguous();
-          dk_tensors.push_back(kgrad_each_tmp);
-          k_ptrs.push_back(reinterpret_cast<const void*>(k_each_tmp.data_ptr()));
-          dk_ptrs.push_back(reinterpret_cast<void*>(kgrad_each_tmp.data_ptr()));
-        }
-
-        if(v.is_contiguous()) {
-          v_ptrs.push_back(reinterpret_cast<void*>(v_ptr)); 
-          dv_ptrs.push_back(reinterpret_cast<void*>(dv_ptr));
-          v_ptr = v_ptr + temp_k_stride;   
-          dv_ptr = dv_ptr + temp_dk_stride;
-        } else {
-          auto v_each_tmp = v.index({torch::indexing::Slice(host_seqlens_k[i], host_seqlens_k[i+1])}).contiguous();
-          auto vgrad_each_tmp = dv.index({torch::indexing::Slice(host_seqlens_k[i], host_seqlens_k[i+1])}).contiguous();
-          dv_tensors.push_back(vgrad_each_tmp);
-          v_ptrs.push_back(reinterpret_cast<const void*>(v_each_tmp.data_ptr()));
-          dv_ptrs.push_back(reinterpret_cast<void*>(vgrad_each_tmp.data_ptr()));
-        }
-      // performance mode
-      } else {
-        dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));
-        dq_ptr = dq_ptr + temp_dq_stride * q_stride_multiplier;
-
-        dk_ptrs.push_back(reinterpret_cast<void*>(dk_ptr));
-        dk_ptr = dk_ptr + temp_dk_stride * kv_stride_multiplier;
-
-        dv_ptrs.push_back(reinterpret_cast<void*>(dv_ptr));
-        dv_ptr = dv_ptr + temp_dk_stride * kv_stride_multiplier;
-      }
-
+  
       dout_ptrs.push_back(reinterpret_cast<const void*>(dout_ptr));
       dout_ptr += temp_q_stride;
+
+      torch::Tensor d_tensor;
+      d_tensor = torch::empty({1, static_cast<long>(h), temp_seqlen_q}, opts.dtype(torch::kFloat32));
+      d_ptrs.push_back(reinterpret_cast<void*>(d_tensor.data_ptr()));
+
+      dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));
+      dq_ptr = dq_ptr + temp_dq_stride;
+
+      dk_ptrs.push_back(reinterpret_cast<void*>(dk_ptr));
+      dk_ptr = dk_ptr + temp_dk_stride;
+
+      dv_ptrs.push_back(reinterpret_cast<void*>(dv_ptr));
+      dv_ptr = dv_ptr + temp_dk_stride;
     }            
   }
 
@@ -727,8 +662,4 @@ struct FlashBwdGroupedParams : public GroupedParams {
 
   std::vector<const void*> dout_ptrs;
   std::vector<void*> d_ptrs;
-
-  std::vector<at::Tensor> dq_tensors;
-  std::vector<at::Tensor> dk_tensors;
-  std::vector<at::Tensor> dv_tensors;
 };

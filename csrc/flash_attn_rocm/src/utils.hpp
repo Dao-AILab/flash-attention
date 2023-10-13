@@ -53,7 +53,6 @@
 
 using Index = ck::index_t;
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
 template<typename T>
 static inline size_t get_size_in_bytes(size_t n, T dtype) {
   if(dtype == torch::kFloat32){
@@ -86,18 +85,18 @@ static std::tuple<uint64_t, uint64_t> unpack(at::PhiloxCudaState arg) {
   }
 }
 
-class SimpleDeviceMem {
- public:
-  SimpleDeviceMem() = delete;
-  explicit SimpleDeviceMem(std::size_t mem_size) 
-      : p_mem_{} { (void)hipMalloc(static_cast<void**>(&p_mem_), mem_size); }
+// class SimpleDeviceMem {
+//  public:
+//   SimpleDeviceMem() = delete;
+//   explicit SimpleDeviceMem(std::size_t mem_size) 
+//       : p_mem_{} { (void)hipMalloc(static_cast<void**>(&p_mem_), mem_size); }
       
-    void* GetDeviceBuffer() const { return p_mem_; }
-    ~SimpleDeviceMem() { (void)hipFree(p_mem_); }
+//     void* GetDeviceBuffer() const { return p_mem_; }
+//     ~SimpleDeviceMem() { (void)hipFree(p_mem_); }
 
- private:
-  void* p_mem_;
-};
+//  private:
+//   void* p_mem_;
+// };
 
 // get environment variables for internal usage
 static inline bool get_env_(const char* env_var) {

@@ -113,17 +113,17 @@ class DeviceGemmInvoker {
       });
     }
 
-    TORCH_CHECK(problem_descs.size() == params.q_ptrs.size());
-    TORCH_CHECK(problem_descs.size() == params.k_ptrs.size());
-    TORCH_CHECK(problem_descs.size() == params.z_ptrs.size());
-    TORCH_CHECK(problem_descs.size() == params.v_ptrs.size());
-    TORCH_CHECK(problem_descs.size() == params.bwd_out_ptrs.size());
-    TORCH_CHECK(problem_descs.size() == params.bwd_softmax_lse_ptrs.size());
-    TORCH_CHECK(problem_descs.size() == params.d_ptrs.size());
-    TORCH_CHECK(problem_descs.size() == params.dout_ptrs.size());
-    TORCH_CHECK(problem_descs.size() == params.dq_ptrs.size());
-    TORCH_CHECK(problem_descs.size() == params.dk_ptrs.size());
-    TORCH_CHECK(problem_descs.size() == params.dv_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.q_ptrs.size(), "Wrong q_ptrs size", params.q_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.k_ptrs.size(), "Wrong k_ptrs size", params.k_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.z_ptrs.size(), "Wrong z_ptrs size", params.z_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.v_ptrs.size(), "Wrong v_ptrs size", params.v_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.bwd_out_ptrs.size(), "Wrong out_ptrs size", params.bwd_out_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.bwd_softmax_lse_ptrs.size(), "Wrong softmax_lse_ptrs size", params.bwd_softmax_lse_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.d_ptrs.size(), "Wrong d_ptrs size", params.d_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.dout_ptrs.size(), "Wrong dout_ptrs size", params.dout_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.dq_ptrs.size(), "Wrong dq_ptrs size", params.dq_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.dk_ptrs.size(), "Wrong dk_ptrs size", params.dk_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.dv_ptrs.size(), "Wrong dv_ptrs size", params.dv_ptrs.size());
 
     auto argument_ptr = gemm_ptr->MakeArgumentPointer(
         params.q_ptrs,
@@ -149,7 +149,7 @@ class DeviceGemmInvoker {
         params.seeds);
 
     // specify workspace for problem_desc
-    SimpleDeviceMem problem_desc_workspace{ gemm_ptr->GetWorkSpaceSize(argument_ptr.get()) };
+    DeviceMem problem_desc_workspace{ gemm_ptr->GetWorkSpaceSize(argument_ptr.get()) };
 
     gemm_ptr->SetWorkSpacePointer(argument_ptr.get(),
                             problem_desc_workspace.GetDeviceBuffer());
