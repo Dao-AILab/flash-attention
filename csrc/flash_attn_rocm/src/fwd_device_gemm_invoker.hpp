@@ -60,11 +60,11 @@ class DeviceGemmInvoker {
       {},
       {},
       {},
-      device_gemm_trait::AElementOp{},
-      device_gemm_trait::B0ElementOp{},
-      device_gemm_trait::Acc0ElementOp{params.softmax_scale},
-      device_gemm_trait::B1ElementOp{},
-      device_gemm_trait::CElementOp{},
+      typename DeviceGemmTraits::QElementOp{},
+      typename DeviceGemmTraits::KElementOp{},
+      typename DeviceGemmTraits::Acc0ElementOp{params.softmax_scale},
+      typename DeviceGemmTraits::VElementOp{},
+      typename DeviceGemmTraits::OutElementOp{},
       params.p_dropout, 
       params.seeds);
 
@@ -118,11 +118,11 @@ class DeviceGemmInvoker {
         {},
         {},
         problem_descs,
-        device_gemm_trait::AElementOp{},
-        device_gemm_trait::B0ElementOp{},
-        device_gemm_trait::Acc0ElementOp{params.softmax_scale},
-        device_gemm_trait::B1ElementOp{},
-        device_gemm_trait::CElementOp{},
+        typename DeviceGemmTraits::QElementOp{},
+        typename DeviceGemmTraits::KElementOp{},
+        typename DeviceGemmTraits::Acc0ElementOp{params.softmax_scale},
+        typename DeviceGemmTraits::VElementOp{},
+        typename DeviceGemmTraits::OutElementOp{},
         params.p_dropout, 
         params.seeds);
 

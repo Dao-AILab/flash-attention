@@ -83,7 +83,7 @@ class FlashRunner {
                                                            std::conditional_t<std::is_same_v<T, device_gemm_trait::Float16>, device_gemm_trait::Int16, device_gemm_trait::Int32>,
                                                            4, 
                                                            kGemmSpec,
-                                                           kMaskingSpec, 
+                                                           kMaskingSpec,
                                                            kIsDeterministic>;
       using Invoker = bwd_device_gemm::DeviceGemmInvoker<DeviceGemmTemplate, DeviceGemmTraits>;
       auto invoker = std::make_unique<Invoker>(params, stream);

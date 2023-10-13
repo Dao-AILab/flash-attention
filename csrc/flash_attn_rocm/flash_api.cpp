@@ -759,16 +759,16 @@ bool fwd_test(bool do_verification){
     int d = n / nheads; //head_size//64
 
     //initialize the tensors
-    at::Tensor q_host = at::rand({batch_size*seqlen, nheads, d}, torch::kFloat16);//torch::kBFloat16;at::kHalf
-    at::Tensor k_host = at::rand({batch_size*seqlen, nheads, d}, torch::kFloat16);
-    at::Tensor v_host = at::rand({batch_size*seqlen, nheads, d}, torch::kFloat16);
+    at::Tensor q_host = at::rand({batch_size, seqlen, nheads, d}, torch::kFloat16);//torch::kBFloat16;at::kHalf
+    at::Tensor k_host = at::rand({batch_size, seqlen, nheads, d}, torch::kFloat16);
+    at::Tensor v_host = at::rand({batch_size, seqlen, nheads, d}, torch::kFloat16);
 
     at::Tensor q = q_host.to(at::kCUDA);
     at::Tensor k = k_host.to(at::kCUDA);
     at::Tensor v = v_host.to(at::kCUDA);
 
     //initialize the output tensor
-    at::Tensor out_host = at::empty({batch_size*seqlen, nheads, d}, torch::kFloat16);
+    at::Tensor out_host = at::empty({batch_size, seqlen, nheads, d}, torch::kFloat16);
     c10::optional<at::Tensor> out = out_host.to(at::kCUDA);
 
     //initialize seqlens vector (size is b+1)
@@ -804,17 +804,12 @@ bool fwd_test(bool do_verification){
     c10::optional<at::Generator> gen_ = c10::nullopt;
 
     auto results =
-    mha_varlen_fwd(q,
+    mha_fwd(q,
             k,
             v,
             out,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q_,
-            max_seqlen_k_,
             p_drop,
             softmax_scale,
-            zero_tensors,
             is_causal,
             return_softmax,
             gen_);
@@ -1107,17 +1102,17 @@ bool bwd_test(bool do_verification){
     int d = n / nheads; //head_size//64
 
     //initialize the tensors
-    at::Tensor q_host = at::rand({batch_size*seqlen, nheads, d}, torch::kFloat16);//torch::kBFloat16;at::kHalf
-    at::Tensor k_host = at::rand({batch_size*seqlen, nheads, d}, torch::kFloat16);
-    at::Tensor v_host = at::rand({batch_size*seqlen, nheads, d}, torch::kFloat16);
-    at::Tensor y_host = at::empty({batch_size*seqlen, nheads, d}, torch::kFloat16);
-    at::Tensor z_host = at::empty({batch_size*nheads, seqlen, seqlen}, torch::kInt32);
+    at::Tensor q_host = at::rand({batch_size, seqlen, nheads, d}, torch::kFloat16);//torch::kBFloat16;at::kHalf
+    at::Tensor k_host = at::rand({batch_size, seqlen, nheads, d}, torch::kFloat16);
+    at::Tensor v_host = at::rand({batch_size, seqlen, nheads, d}, torch::kFloat16);
+    at::Tensor y_host = at::empty({batch_size, seqlen, nheads, d}, torch::kFloat16);
+    at::Tensor z_host = at::empty({batch_size, nheads, seqlen, seqlen}, torch::kInt32);
     at::Tensor lse_host = at::empty({batch_size, nheads, seqlen}, torch::kFloat32);
 
-    at::Tensor ygrad_host = at::rand({batch_size*seqlen, nheads, d}, torch::kFloat16);
-    at::Tensor qgrad_host = at::empty({batch_size*seqlen, nheads, d}, torch::kFloat16);
-    at::Tensor kgrad_host = at::empty({batch_size*seqlen, nheads, d}, torch::kFloat16);
-    at::Tensor vgrad_host = at::empty({batch_size*seqlen, nheads, d}, torch::kFloat16);
+    at::Tensor ygrad_host = at::rand({batch_size, seqlen, nheads, d}, torch::kFloat16);
+    at::Tensor qgrad_host = at::empty({batch_size, seqlen, nheads, d}, torch::kFloat16);
+    at::Tensor kgrad_host = at::empty({batch_size, seqlen, nheads, d}, torch::kFloat16);
+    at::Tensor vgrad_host = at::empty({batch_size, seqlen, nheads, d}, torch::kFloat16);
 
     at::Tensor q = q_host.to(at::kCUDA);
     at::Tensor k = k_host.to(at::kCUDA);
@@ -1158,21 +1153,16 @@ bool bwd_test(bool do_verification){
     bool return_softmax = false;
     c10::optional<at::Generator> gen_ = c10::nullopt;
     c10::optional<at::Tensor> rng_state = c10::nullopt;
-    auto results = mha_varlen_fwd(q,   
+    auto results = mha_fwd(q,   
                   k,   
                   v,   
                   y, 
-                  cu_seqlens_q, 
-                  cu_seqlens_k, 
-                  max_seqlen_q_,
-                  max_seqlen_k_,
                   p_dropout,
                   softmax_scale,
-                  zero_tensors,
                   is_causal,
                   return_softmax,
                   gen_);
-    mha_varlen_bwd(ygrad,
+    mha_bwd(ygrad,
             q,   
             k,   
             v,   
@@ -1181,13 +1171,8 @@ bool bwd_test(bool do_verification){
             qgrad,
             kgrad,
             vgrad,
-            cu_seqlens_q, 
-            cu_seqlens_k, 
-            max_seqlen_q_,
-            max_seqlen_k_,
             p_dropout,
             softmax_scale,
-            zero_tensors,
             is_causal,
             gen_,
             rng_state);
@@ -1254,8 +1239,8 @@ bool bwd_test(bool do_verification){
         ck::tensor_operation::host::ReferenceDropout<ushort, DataType, DataType>;
                                                                                     
     if(do_verification){
-        bool input_permute = true;
-        bool output_permute = true;
+        bool input_permute = false;
+        bool output_permute = false;
         auto run_attention_fwd_host = []<typename TensorQ,
           typename TensorK,
           typename TensorV,

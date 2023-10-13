@@ -23,6 +23,8 @@
 
 #pragma once
 
+#include "params.hpp"
+
 // grouped
 #include "ck/tensor_operation/gpu/device/impl/device_grouped_mha_fwd_xdl_cshuffle_v2.hpp"
 
@@ -41,18 +43,13 @@ using Int16 = unsigned short;
 using Float32 = float;
 using BFloat16 = ck::bhalf_t;
 using Float16 = ck::half_t;
+
 using PassThrough = ck::tensor_operation::element_wise::PassThrough;
 using Scale = ck::tensor_operation::element_wise::Scale;
 using MaskingSpec = ck::tensor_operation::device::MaskingSpecialization;
 using TensorSpec  = ck::tensor_operation::device::TensorSpecialization;
 using GemmSpec  = ck::tensor_operation::device::GemmSpecialization;
 using Index = ck::index_t;
-
-using AElementOp  = PassThrough;
-using B0ElementOp = PassThrough;
-using Acc0ElementOp = Scale;
-using B1ElementOp = PassThrough;
-using CElementOp  = PassThrough;
 
 template <ck::index_t... Is> 
 using S = ck::Sequence<Is...>;
@@ -81,11 +78,11 @@ struct Forward {
   using Acc0BiasDataType = void;
   using Acc1BiasDataType = void;
 
-  using AElementOp  = PassThrough;
-  using B0ElementOp = PassThrough;
+  using QElementOp  = PassThrough;
+  using KElementOp  = PassThrough;
+  using VElementOp  = PassThrough;
+  using OutElementOp  = PassThrough;
   using Acc0ElementOp = Scale;
-  using B1ElementOp = PassThrough;
-  using CElementOp  = PassThrough;
 
   static constexpr Index kNumDimG = 2;
   static constexpr Index kNumDimM = 1;
@@ -117,15 +114,18 @@ struct Backward {
   using OutputDataType   = OutputDataType_;
   using GemmDataType     = GemmDataType_;
   using ZDataType        = ZDataType_;
-  using QkvElementOp     = PassThrough;
-  using YElementOp       = PassThrough;
   using AccDataType      = Float32;
   using ShuffleDataType  = Float32;
   using LSEDataType      = Float32;
   using Acc0BiasDataType = void;
   using Acc1BiasDataType = void;
   using DDataType        = Float32;
-  using Acc0ElementOp    = Scale;
+
+  using QElementOp  = PassThrough;
+  using KElementOp  = PassThrough;
+  using VElementOp  = PassThrough;
+  using OutElementOp  = PassThrough;
+  using Acc0ElementOp = Scale;
 
   static constexpr Index kNumDimG = 2;
   static constexpr Index kNumDimM = 1;

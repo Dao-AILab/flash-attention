@@ -29,7 +29,10 @@ struct BaseParams {
                       const at::Tensor v,
                       const float p_dropout,
                       const float softmax_scale,
-                      const bool is_causal)
+                      const bool is_causal,
+                      const bool input_permute,
+                      const bool output_permute,
+                      const bool z_tensor_permute)
     : b(b),
       seqlen_q(seqlen_q),
       seqlen_k(seqlen_k),
@@ -44,7 +47,10 @@ struct BaseParams {
       is_bf16(q.dtype() == torch::kBFloat16),
       is_dropout(p_dropout > 0.0f),
       is_mnko_padding(false),
-      is_causal(is_causal) {
+      is_causal(is_causal),
+      input_permute(input_permute),
+      output_permute(output_permute),
+      z_tensor_permute(z_tensor_permute) {
 
     TORCH_CHECK(p_dropout < 1.f);
     
@@ -110,9 +116,9 @@ struct BaseParams {
   bool is_mnko_padding;
   bool is_causal;
 
-  static const bool input_permute = true;
-  static const bool output_permute = true;
-  static const bool z_tensor_permute = false;
+  bool input_permute;
+  bool output_permute;
+  bool z_tensor_permute;
 
   static inline const bool kIsUnitTestMode = get_env_("FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE");
   static inline const bool kIsDeterministic = get_env_("FLASH_ATTENTION_INTERNAL_DETERMINISTIC");
@@ -137,7 +143,10 @@ struct BatchedParams : public BaseParams {
                          void* softmax_lse_d,
                          float p_dropout,
                          float softmax_scale,
-                         bool is_causal)
+                         bool is_causal,
+                         const bool input_permute,
+                         const bool output_permute,
+                         const bool z_tensor_permute)
     : BaseParams(b,
                  seqlen_q,
                  seqlen_k,
@@ -152,7 +161,10 @@ struct BatchedParams : public BaseParams {
                  v,
                  p_dropout,
                  softmax_scale,
-                 is_causal),
+                 is_causal,
+                 input_permute,
+                 output_permute,
+                 z_tensor_permute),
       q_ptr(q.data_ptr()),
       k_ptr(k.data_ptr()),
       z_ptr(z_d),
@@ -246,7 +258,10 @@ struct FlashFwdBatchedParams : public BatchedParams {
                     softmax_lse_d,
                     p_dropout,
                     softmax_scale,
-                    is_causal) {}
+                    is_causal,
+                    false,
+                    false,
+                    false) {}
 };
 
 // Backward Batched Arguments
@@ -290,7 +305,10 @@ struct FlashBwdBatchedParams : public BatchedParams {
                     softmax_lse_d,
                     p_dropout,
                     softmax_scale,
-                    is_causal),
+                    is_causal,
+                    false,
+                    false,
+                    false),
       dq_ptr(dq.data_ptr()),
       dk_ptr(dk.data_ptr()),
       dv_ptr(dv.data_ptr()),
@@ -327,7 +345,10 @@ struct GroupedParams : public BaseParams {
                          void* softmax_lse_d,
                          float p_dropout,
                          float softmax_scale,
-                         bool is_causal)
+                         bool is_causal,
+                         const bool input_permute,
+                         const bool output_permute,
+                         const bool z_tensor_permute)
     : BaseParams(b,
                  seqlen_q,
                  seqlen_k,
@@ -342,7 +363,10 @@ struct GroupedParams : public BaseParams {
                  v,
                  p_dropout,
                  softmax_scale,
-                 is_causal),
+                 is_causal,
+                 input_permute,
+                 output_permute,
+                 z_tensor_permute),
       host_seqlens_q(std::vector<int>(b+1)),
       host_seqlens_k(std::vector<int>(b+1)) {
     
@@ -429,7 +453,7 @@ struct GroupedParams : public BaseParams {
 
       std::vector<Index> z_gs_ms_ns_lengths{G0, G1, M, N};
       std::vector<Index> z_gs_ms_ns_strides = 
-          input_permute
+          z_tensor_permute
           ? std::vector<Index>{M * G1 * N, N, G1 * N, 1}
           // Z layout [G0, M, G1, N]
           : std::vector<Index>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
@@ -538,7 +562,10 @@ struct FlashFwdGroupedParams : public GroupedParams {
                     softmax_lse_d,
                     p_dropout,
                     softmax_scale,
-                    is_causal) {
+                    is_causal,
+                    true,
+                    true,
+                    false) {
                         
   }
 };
@@ -588,7 +615,10 @@ struct FlashBwdGroupedParams : public GroupedParams {
                     softmax_lse_d,
                     p_dropout,
                     softmax_scale,
-                    is_causal),
+                    is_causal,
+                    true,
+                    true,
+                    true),
       bwd_out_ptrs(std::vector<const void*>(out_ptrs.begin(), out_ptrs.end())),
       bwd_softmax_lse_ptrs(std::vector<const void*>(softmax_lse_ptrs.begin(), softmax_lse_ptrs.end())) {
     
