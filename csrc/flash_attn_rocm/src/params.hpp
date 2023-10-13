@@ -122,7 +122,7 @@ struct BatchedParams : public BaseParams {
                          const torch::Tensor q,
                          const torch::Tensor k,
                          const torch::Tensor v,
-                         torch::Tensor out,
+                         torch::Tensor &out,
                          void* z_d,
                          void* softmax_lse_d,
                          float p_dropout,
@@ -154,34 +154,65 @@ struct BatchedParams : public BaseParams {
       z_ptr(z_d),
       v_ptr(v.data_ptr()),
       out_ptr(out.data_ptr()),
-      softmax_lse_ptr(softmax_lse_d),
-      q_gs_ms_ks_lengths({b, h, seqlen_q, d}),
-      q_gs_ms_ks_strides(
-            input_permute
-          ? std::vector<Index>{seqlen_q * h * d, d, h * d, 1}    // A layout [b, seqlen_q, h, d]
-          : std::vector<Index>{h * seqlen_q * d, seqlen_q * d, d, 1}),   // A layout [b, h, seqlen_q, d]
-      k_gs_ns_ks_lengths({b, h, seqlen_k, d}),
-      k_gs_ns_ks_strides(
-            input_permute
-          ? std::vector<Index>{seqlen_k * h * d, d, h * d, 1}  // B0 layout [b, seqlen_k, h, d]
-          : std::vector<Index>{h * seqlen_k * d, seqlen_k * d, d, 1}), // B0 layout [b, h, seqlen_k_rounded, d]
-      z_gs_ms_ns_lengths({b, h, seqlen_q, seqlen_k}),  
-      z_gs_ms_ns_strides( 
-            z_tensor_permute
-          ? std::vector<Index>{seqlen_q * h * seqlen_k, seqlen_k, h * seqlen_k, 1}  // Z layout [b, seqlen_q, h, seqlen_k]
-          : std::vector<Index>{h * seqlen_q * seqlen_k, seqlen_q * seqlen_k, seqlen_k, 1}), // Z layout [b, h, seqlen_q, seqlen_k]
-      v_gs_gemm1ns_gemm1ks_lengths({b, h, d, seqlen_k}),
-      v_gs_gemm1ns_gemm1ks_strides(
-            input_permute
-          ? std::vector<Index>{seqlen_k * h * d, d, 1, h * d}  // B1 layout [b, seqlen_k, h, d]
-          : std::vector<Index>{h * seqlen_k * d, seqlen_k * d, 1, d}), // B1 layout [b, h, seqlen_k, d]
-      out_gs_ms_gemm1ns_lengths({b, h, seqlen_q, d}),  
-      out_gs_ms_gemm1ns_strides(
-            output_permute
-          ? std::vector<Index>{seqlen_q * h * d, d, h * d, 1}  // C layout [b, seqlen_q, h, d]
-          : std::vector<Index>{h * seqlen_q * d, seqlen_q * d, d, 1}), // C layout [b, h, seqlen_q, d]
-      lse_gs_ms_lengths({b, h, seqlen_q}),                       // LSE layout [b, h, seqlen_q]
-      lse_gs_ms_strides({h * seqlen_q, seqlen_q, 1}) {}
+      softmax_lse_ptr(softmax_lse_d) {
+    
+    if(!is_mnko_padding && d <= 32) {
+      is_mnko_padding = ((seqlen_q % 128)==0 && (seqlen_k % 128)==0 ? false : true);
+    } else if(!is_mnko_padding && d <= 64) {
+      if(is_dropout) {
+        is_mnko_padding = ((seqlen_q % 128)==0 && (seqlen_k % 128)==0 ? false : true);
+      } else {
+        is_mnko_padding = ((seqlen_q % 128)==0 && (seqlen_k % 256)==0 ? false : true);
+      }
+    } else if(!is_mnko_padding && d <= 128) {
+      is_mnko_padding = ((seqlen_q % 128)==0 && (seqlen_k % 128)==0 ? false : true);
+    }
+
+    int K  = d;
+    int O  = d;
+    int G0 = b;
+    int G1 = h;
+    int M = seqlen_q;
+    int N = seqlen_k;
+
+    q_gs_ms_ks_lengths = std::vector<Index>{G0, G1, M, K};
+    q_gs_ms_ks_strides =
+        input_permute
+            ? std::vector<Index>{M * G1 * K, K, G1 * K, 1}
+            // Q layout [G0, M, G1, K]
+            : std::vector<Index>{G1 * M * K, M * K, K, 1}; // Q layout [G0, G1, M, K]
+
+    k_gs_ns_ks_lengths = std::vector<Index>{G0, G1, N, K};
+    k_gs_ns_ks_strides =
+        input_permute
+            ? std::vector<Index>{N * G1 * K, K, G1 * K, 1}
+            // K layout [G0, N, G1, K]
+            : std::vector<Index>{G1 * N * K, N * K, K, 1}; // K layout [G0, G1, N, K]
+
+    z_gs_ms_ns_lengths = std::vector<Index>{G0, G1, M, N};
+    z_gs_ms_ns_strides = 
+        z_tensor_permute
+        ? std::vector<Index>{M * G1 * N, N, G1 * N, 1}
+        // Z layout [G0, M, G1, N]
+        : std::vector<Index>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
+
+    v_gs_gemm1ns_gemm1ks_lengths = std::vector<Index>{G0, G1, O, N};
+    v_gs_gemm1ns_gemm1ks_strides =
+        input_permute
+            ? std::vector<Index>{N * G1 * O, O, 1, G1 * O}
+            // V layout [G0, N, G1, O]
+            : std::vector<Index>{G1 * N * O, N * O, 1, O}; // V layout [G0, G1, N, O]
+
+    out_gs_ms_gemm1ns_lengths = std::vector<Index>{G0, G1, M, O};
+    out_gs_ms_gemm1ns_strides =
+        output_permute
+            ? std::vector<Index>{M * G1 * O, O, G1 * O, 1}
+            // Y layout [G0, M, G1, O]
+            : std::vector<Index>{G1 * M * O, M * O, O, 1}; // Y layout [G0, G1, M, O]
+
+    lse_gs_ms_lengths = std::vector<Index>{G0, G1, M};
+    lse_gs_ms_strides = std::vector<Index>{G1 * M, M, 1}; // LSE layout [G0, G1, M]
+  }
   
   void* __restrict__ q_ptr;
   void* __restrict__ k_ptr;
@@ -219,7 +250,7 @@ struct FlashFwdBatchedParams : public BatchedParams {
                                  const torch::Tensor q,
                                  const torch::Tensor k,
                                  const torch::Tensor v,
-                                 torch::Tensor out,
+                                 torch::Tensor &out,
                                  void* z_d,
                                  void* softmax_lse_d,
                                  float p_dropout,
@@ -262,11 +293,11 @@ struct FlashBwdBatchedParams : public BatchedParams {
                                  const torch::Tensor q,
                                  const torch::Tensor k,
                                  const torch::Tensor v,
-                                 const torch::Tensor out,
+                                 torch::Tensor out,
                                  const torch::Tensor dout,
-                                 torch::Tensor dq,
-                                 torch::Tensor dk,
-                                 torch::Tensor dv,
+                                 torch::Tensor &dq,
+                                 torch::Tensor &dk,
+                                 torch::Tensor &dv,
                                  void* z_d,
                                  void* softmax_lse_d,
                                  float p_dropout,
@@ -297,8 +328,8 @@ struct FlashBwdBatchedParams : public BatchedParams {
       dk_ptr(dk.data_ptr()),
       dv_ptr(dv.data_ptr()),
       dout_ptr(dout.data_ptr()),
-      d_ptr(torch::empty({b, static_cast<long>(h), seqlen_q_rounded}, 
-                      q.options().dtype(torch::kFloat32)).data_ptr()) {}
+      d_ptr(torch::empty({b, static_cast<long>(h), seqlen_q}, 
+            q.options().dtype(torch::kFloat32)).data_ptr()) {}
 
   void* __restrict__ dq_ptr;
   void* __restrict__ dk_ptr;
@@ -322,7 +353,7 @@ struct GroupedParams : public BaseParams {
                          const torch::Tensor q,
                          const torch::Tensor k,
                          const torch::Tensor v,
-                         torch::Tensor out,
+                         torch::Tensor &out,
                          void* cu_seqlens_q_d,
                          void* cu_seqlens_k_d,
                          void* z_d,
@@ -442,15 +473,15 @@ struct GroupedParams : public BaseParams {
           // Z layout [G0, M, G1, N]
           : std::vector<Index>{G1 * M * N, M * N, N, 1}; // Z layout [G0, G1, M, N]
 
-      std::vector<Index> v_gs_os_ns_lengths{G0, G1, O, N};
-      std::vector<Index> v_gs_os_ns_strides =
+      std::vector<Index> v_gs_gemm1ns_gemm1ks_lengths{G0, G1, O, N};
+      std::vector<Index> v_gs_gemm1ns_gemm1ks_strides =
           input_permute
               ? std::vector<Index>{N * G1 * O, O, 1, G1 * O}
               // V layout [G0, N, G1, O]
               : std::vector<Index>{G1 * N * O, N * O, 1, O}; // V layout [G0, G1, N, O]
 
-      std::vector<Index> out_gs_ms_os_lengths{G0, G1, M, O};
-      std::vector<Index> out_gs_ms_os_strides =
+      std::vector<Index> out_gs_ms_gemm1ns_lengths{G0, G1, M, O};
+      std::vector<Index> out_gs_ms_gemm1ns_strides =
           output_permute
               ? std::vector<Index>{M * G1 * O, O, G1 * O, 1}
               // Y layout [G0, M, G1, O]
@@ -466,10 +497,10 @@ struct GroupedParams : public BaseParams {
           k_gs_ns_ks_strides,
           z_gs_ms_ns_lengths,
           z_gs_ms_ns_strides,
-          v_gs_os_ns_lengths,
-          v_gs_os_ns_strides,
-          out_gs_ms_os_lengths,
-          out_gs_ms_os_strides,
+          v_gs_gemm1ns_gemm1ks_lengths,
+          v_gs_gemm1ns_gemm1ks_strides,
+          out_gs_ms_gemm1ns_lengths,
+          out_gs_ms_gemm1ns_strides,
           lse_gs_ms_lengths,
           lse_gs_ms_strides,
       });
@@ -519,7 +550,7 @@ struct FlashFwdGroupedParams : public GroupedParams {
                                  const torch::Tensor q,
                                  const torch::Tensor k,
                                  const torch::Tensor v,
-                                 torch::Tensor out,
+                                 torch::Tensor &out,
                                  void* cu_seqlens_q_d,
                                  void* cu_seqlens_k_d,
                                  void* z_d,
@@ -568,11 +599,11 @@ struct FlashBwdGroupedParams : public GroupedParams {
                                  const torch::Tensor q,
                                  const torch::Tensor k,
                                  const torch::Tensor v,
-                                 const torch::Tensor out,
+                                 torch::Tensor out,
                                  const torch::Tensor dout,
-                                 torch::Tensor dq,
-                                 torch::Tensor dk,
-                                 torch::Tensor dv,
+                                 torch::Tensor &dq,
+                                 torch::Tensor &dk,
+                                 torch::Tensor &dv,
                                  void* cu_seqlens_q_d,
                                  void* cu_seqlens_k_d,
                                  void* z_d,
