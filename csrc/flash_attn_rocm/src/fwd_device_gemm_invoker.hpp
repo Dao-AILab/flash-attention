@@ -108,6 +108,13 @@ class DeviceGemmInvoker {
       });
     }
 
+    TORCH_CHECK(problem_descs.size() == params.q_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.k_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.z_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.v_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.out_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.softmax_lse_ptrs.size());
+
     auto argument_ptr = gemm_ptr->MakeArgumentPointer(
         params.q_ptrs,
         params.k_ptrs,

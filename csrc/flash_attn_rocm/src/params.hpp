@@ -146,7 +146,9 @@ struct BatchedParams : public BaseParams {
                          bool is_causal,
                          const bool input_permute,
                          const bool output_permute,
-                         const bool z_tensor_permute)
+                         const bool z_tensor_permute
+                         int q_stride_multiplier,
+                         int kv_stride_multiplier)
     : BaseParams(b,
                  seqlen_q,
                  seqlen_k,
@@ -631,6 +633,12 @@ struct FlashBwdGroupedParams : public GroupedParams {
     char* dv_ptr = reinterpret_cast<char*>(dv.data_ptr());
     char* dout_ptr = reinterpret_cast<char*>(dout.data_ptr());
 
+    if(kIsUnitTestMode) {
+      q_ptrs.clear();
+      k_ptrs.clear();
+      v_ptrs.clear();
+    }
+
     for (int i = 0; i < b; ++i) {
       int temp_seqlen_q = host_seqlens_q[i+1] - host_seqlens_q[i];
       int temp_q_stride = get_size_in_bytes(d * h * temp_seqlen_q, q.dtype());
@@ -657,10 +665,6 @@ struct FlashBwdGroupedParams : public GroupedParams {
 
       // unit test mode
       if(kIsUnitTestMode) {
-        q_ptrs.clear();
-        k_ptrs.clear();
-        v_ptrs.clear();
-
         if(q.is_contiguous()) {
           q_ptrs.push_back(reinterpret_cast<void*>(q_ptr));
           dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));

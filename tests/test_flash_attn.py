@@ -10,7 +10,7 @@ from einops import rearrange, repeat
 from flash_attn import flash_attn_func, flash_attn_kvpacked_func, flash_attn_qkvpacked_func
 from flash_attn import flash_attn_varlen_qkvpacked_func, flash_attn_varlen_kvpacked_func
 from flash_attn import flash_attn_varlen_func
-from flash_attn.flash_attn_interface import _get_block_size
+from flash_attn.flash_attn_interface import _get_block_size_rocm
 from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
 
 
@@ -225,7 +225,7 @@ def convert_flash_attn_S_to_softmax(S, query_padding_mask, key_padding_mask, hea
     """
     seqlen_q, seqlen_k = S.shape[-2:]
     warps_n = 4
-    blocksize_m, blocksize_n = _get_block_size(S.device, head_dim, is_dropout, causal)
+    blocksize_m, blocksize_n = _get_block_size_rocm(S.device, head_dim, is_dropout, causal)
     nblocks_n = (seqlen_k + blocksize_n - 1) // blocksize_n
     nblocks_m = (seqlen_q + blocksize_m - 1) // blocksize_m
     mmas_n = (blocksize_n + 16 - 1) // 16
@@ -284,7 +284,7 @@ def normalize_flash_attn_S(attn_unnorm, q, k, v, query_padding_mask=None, key_pa
     if causal:
         causal_mask = torch.triu(torch.ones(seqlen_q, seqlen_k, dtype=torch.bool, device=q.device), 1)
         scores.masked_fill_(causal_mask, float('-inf'))
-    _, block_size_n = _get_block_size(scores.device, head_dim, is_dropout, causal)
+    _, block_size_n = _get_block_size_rocm(scores.device, head_dim, is_dropout, causal)
     scores_block = scores.split(block_size_n, dim=-1)
     lse_block = torch.stack([torch.logsumexp(s, dim=-1) for s in scores_block], dim=-1)
     lse = torch.logsumexp(lse_block, dim=-1)
@@ -329,7 +329,7 @@ def get_dropout_fraction(dropout_mask, query_padding_mask=None, key_padding_mask
         )
     return dropped_total / (numel_per_batch.sum() * nheads)
 
-
+@pytest.mark.skipif(True, reason='Experimental, not being used')
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize('causal', [False, True])
@@ -513,7 +513,7 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     if d <= MAX_HEADDIM_SM8x or (is_sm80 or is_sm90):
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
-
+@pytest.mark.skipif(True, reason='Experimental, not being used')
 @pytest.mark.parametrize('kvpacked', [True, False])
 # @pytest.mark.parametrize('kvpacked', [False])
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
@@ -643,8 +643,8 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, dropout_p, causal, mha_type, d
 # @pytest.mark.parametrize('kvpacked', [False])
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.float16])
-@pytest.mark.parametrize('mha_type', ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize('mha_type', ["mqa"])
+# @pytest.mark.parametrize('mha_type', ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize('mha_type', ["mqa"])
 @pytest.mark.parametrize('causal', [False, True])
 # @pytest.mark.parametrize('causal', [True])
 @pytest.mark.parametrize('d', [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])

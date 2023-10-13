@@ -138,7 +138,7 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
     auto flash_runner = std::make_unique<FlashRunner>();
-    flash_runner->Run(params, stream);
+    flash_runner->Run<FlashFwdBatchedParams>(params, stream);
 
     at::Tensor out_padded = out;
     if (head_size_og % 8 != 0) {
@@ -300,7 +300,7 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
     auto flash_runner = std::make_unique<FlashRunner>();
-    flash_runner->Run(params, stream);
+    flash_runner->Run<FlashFwdGroupedParams>(params, stream);
 
     at::Tensor out_padded = out;
     if (head_size_og % 8 != 0) {
@@ -487,7 +487,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
     auto flash_runner = std::make_unique<FlashRunner>();
-    flash_runner->Run(params, stream);
+    flash_runner->Run<FlashBwdBatchedParams>(params, stream);
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
@@ -710,7 +710,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
     auto flash_runner = std::make_unique<FlashRunner>();
-    flash_runner->Run(params, stream);
+    flash_runner->Run<FlashBwdGroupedParams>(params, stream);
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
