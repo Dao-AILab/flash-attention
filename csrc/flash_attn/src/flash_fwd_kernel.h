@@ -71,7 +71,7 @@ inline __device__ void write_softmax_to_gmem(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -93,16 +93,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q || binfo.actual_seqlen_k == 0) return;
 
+    const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
-    if (Is_causal) {
+    if (Is_causal || Is_local) {
         n_block_max = std::min(n_block_max,
-                               cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q, kBlockN));
+                               cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
         // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
         //     printf("m_block = %d, n_block_max = %d\n", m_block, n_block_max);
         // }
         // We exit early and write 0 to gO and gLSE.
         // Otherwise we might read OOB elements from gK and gV.
-        if (n_block_max <= 0) {
+        if (n_block_max <= n_block_min) {
             // Save seed and offset for backward. If we don't have this here, the 0-th thread block might
             // exit early and no one saves the rng state.
             if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
@@ -145,6 +146,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             return;
         }
     }
+    // if (tidx == 0) { printf("m_block = %d, n_block_min = %d, n_block_max = %d\n", m_block, n_block_min, n_block_max); }
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
@@ -326,9 +328,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // If not even_N, then seqlen_k might end in the middle of a block. In that case we need to
     // mask 2 blocks (e.g. when kBlockM == kBlockN), not just 1.
-    constexpr int n_masking_steps = !Is_causal
+    constexpr int n_masking_steps = (!Is_causal && !Is_local)
         ? 1
-        : (Is_even_MN ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
+        : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -356,11 +358,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
-        // if (cute::thread0()) { print(scores); }
+        // if (cute::thread0()) { print_tensor(scores); }
         // We don't put the masking before the matmul S = Q K^T because we don't clear sK
         // for rows outside actual_seqlen_k. So those rows could have Inf / NaN, and the matmul
         // can produce Inf / NaN.
-        if (!Is_causal) {
+        if (!Is_causal && !Is_local) {
             if (!Is_even_MN) { flash::apply_mask(scores, binfo.actual_seqlen_k - n_block * kBlockN); }
         } else {
             // Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});    // (BLK_M,BLK_N) -> (blk_m,blk_n)
@@ -374,18 +376,21 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             // Idk why it's get<1> and not get<0> of the stride.
             // if (cute::thread0()) { print(idx_row.layout()); print(stride<1>(idx_row)); printf("stride = %d \n", get<1>(stride<1>(idx_row))); }
             // I can't get the stride from idx_row
-            flash::apply_mask_causal(scores, n_block * kBlockN, binfo.actual_seqlen_k,
-                                     // m_block * kBlockM + get<0>(idx_row(0)),
-                                     m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-                                     binfo.actual_seqlen_q,
-                                     kNWarps * 16);
-                                     // m_block * kBlockM + (tidx / 32) * 16, kNWarps * 16);
-                                     // m_block * kBlockM + (tidx / 32) * (kBlockM / kNWarps), 16);
+            flash::apply_mask_local</*HasWSLeft=*/Is_local>(
+                scores, n_block * kBlockN, binfo.actual_seqlen_k,
+                // m_block * kBlockM + get<0>(idx_row(0)),
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q, kNWarps * 16,
+                params.window_size_left, params.window_size_right
+                // m_block * kBlockM + (tidx / 32) * 16, kNWarps * 16
+                // m_block * kBlockM + (tidx / 32) * (kBlockM / kNWarps), 16
+            );
+            // if (cute::thread0()) { print_tensor(scores); }
         }
 
         flash::cp_async_wait<0>();
         __syncthreads();
-        if (n_block > 0) {
+        if (n_block > n_block_min) {
             // Advance gK
             tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
@@ -396,8 +401,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
         masking_step == 0
-            ? softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2)
-            : softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
+            ? softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2)
+            : softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
 
         // Convert scores from fp32 to fp16/bf16
         Tensor rP = flash::convert_type<Element>(scores);
@@ -426,14 +431,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // if (cute::thread0()) { print(scores); }
 
         // This check is at the end of the loop since we always have at least 1 iteration
-        if (n_masking_steps > 1 && n_block <= 0) {
+        if (n_masking_steps > 1 && n_block <= n_block_min) {
             --n_block;
             break;
         }
     }
 
     // These are the iterations where we don't need masking on S
-    for (; n_block >= 0; --n_block) {
+    for (; n_block >= n_block_min; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
         flash::cp_async_wait<0>();
@@ -450,7 +455,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         flash::cp_async_wait<0>();
         __syncthreads();
-        if (n_block > 0) {
+        if (n_block > n_block_min) {
             // Advance gK
             tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
@@ -461,7 +466,15 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
-        softmax_rescale_o</*Is_first=*/false>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
+        if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
+            flash::apply_mask_local(
+                scores, n_block * kBlockN, binfo.actual_seqlen_k,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q, kNWarps * 16,
+                params.window_size_left, params.window_size_right
+            );
+        }
+        softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
 
         Tensor rP = flash::convert_type<Element>(scores);
         // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
@@ -568,7 +581,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
 
     using Element = typename Kernel_traits::Element;
@@ -599,11 +612,13 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
     const int n_blocks_per_split = ((params.seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
-    const int n_block_min = n_split_idx * n_blocks_per_split;
+    const int n_block_min = !Is_local
+        ? n_split_idx * n_blocks_per_split
+        : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
-    if (Is_causal) {
+    if (Is_causal || Is_local) {
         n_block_max = std::min(n_block_max,
-                               cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q, kBlockN));
+                               cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
     }
     if (n_block_min >= n_block_max) {  // This also covers the case where n_block_max <= 0
         // We exit early and write 0 to gOaccum and -inf to gLSEaccum.
@@ -653,9 +668,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
         + m_block * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
     // We move K and V to the last block.
-    const index_t row_offset_k = binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)
+    const int bidb_cache = params.cache_batch_idx == nullptr ? bidb : params.cache_batch_idx[bidb];
+    const index_t row_offset_k = binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
         + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
-    const index_t row_offset_v = binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)
+    const index_t row_offset_v = binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache)
         + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
 
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
@@ -842,21 +858,21 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
                                            binfo.actual_seqlen_q - m_block * kBlockM);
     } else {
-        const index_t row_offset_cossin = (binfo.seqlen_k_cache + (Is_causal ? m_block * kBlockM : 0)) * (params.rotary_dim / 2);
+        const index_t row_offset_cossin = (binfo.seqlen_k_cache + (Is_causal || Is_local ? m_block * kBlockM : 0)) * (params.rotary_dim / 2);
         // If not causal, all the queries get the same the cos/sin, taken at location seqlen_k_cache.
         // We do this by setting the row stride of gCos / gSin to 0.
         Tensor gCos = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
                                   Shape<Int<kBlockM>, Int<kHeadDim / 2>>{},
-                                  make_stride(Is_causal ? params.rotary_dim / 2 : 0, _1{}));
+                                  make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
         Tensor gSin = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
                                   Shape<Int<kBlockM>, Int<kHeadDim / 2>>{},
-                                  make_stride(Is_causal ? params.rotary_dim / 2 : 0, _1{}));
+                                  make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
         Tensor gCosCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
                                   Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                                  make_stride(Is_causal ? params.rotary_dim / 2 : 0, _1{}));
+                                  make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
         Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
                                   Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                                  make_stride(Is_causal ? params.rotary_dim / 2 : 0, _1{}));
+                                  make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
         Tensor tRgCos = gmem_thr_copy_rotary.partition_S(gCos);
         Tensor tRgSin = gmem_thr_copy_rotary.partition_S(gSin);
         Tensor tRgCosCont = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
@@ -895,9 +911,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // If not even_N, then seqlen_k might end in the middle of a block. In that case we need to
     // mask 2 blocks (e.g. when kBlockM == kBlockN), not just 1.
-    constexpr int n_masking_steps = !Is_causal
+    constexpr int n_masking_steps = (!Is_causal && !Is_local)
         ? 1
-        : (Is_even_MN ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
+        : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -929,13 +945,14 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // We don't put the masking before the matmul S = Q K^T because we don't clear sK
         // for rows outside actual_seqlen_k. So those rows could have Inf / NaN, and the matmul
         // can produce Inf / NaN.
-        if (!Is_causal) {
+        if (!Is_causal && !Is_local) {
             if (!Is_even_MN) { flash::apply_mask(scores, binfo.actual_seqlen_k - n_block * kBlockN); }
         } else {
-            flash::apply_mask_causal(scores, n_block * kBlockN, binfo.actual_seqlen_k,
-                                     m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-                                     binfo.actual_seqlen_q,
-                                     kNWarps * 16);
+            flash::apply_mask_local(scores, n_block * kBlockN, binfo.actual_seqlen_k,
+                                    m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                                    binfo.actual_seqlen_q, kNWarps * 16,
+                                    params.window_size_left, params.window_size_right
+                                    );
         }
 
         flash::cp_async_wait<0>();
@@ -954,8 +971,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // We have key_padding_mask so we'll need to Check_inf
         masking_step == 0
-            ? softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || !Is_even_MN>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2)
-            : softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || !Is_even_MN>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
+            ? softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2)
+            : softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
         // if (cute::thread0()) { print(scores_max); print(scores_sum); print(scores); }
 
         // Convert scores from fp32 to fp16/bf16
@@ -1003,7 +1020,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
-        softmax_rescale_o</*Is_first=*/false>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
+        if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
+            flash::apply_mask_local(
+                scores, n_block * kBlockN, binfo.actual_seqlen_k,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q, kNWarps * 16,
+                params.window_size_left, params.window_size_right
+            );
+        }
+        softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
 
         Tensor rP = flash::convert_type<Element>(scores);
         // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
@@ -1106,7 +1131,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1122,12 +1147,12 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, Return_softmax>(params, bidb, bidh, m_block);
+    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Is_even_MN, Is_even_K, Return_softmax>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_splitkv(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1136,24 +1161,23 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
-    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_even_MN, Is_even_K, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Is_even_MN, Is_even_K, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, int Log_max_splits, bool Is_even_K, typename Params>
+template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, typename Params>
 inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
     constexpr int kMaxSplits = 1 << Log_max_splits;
-    constexpr int kBlockM = 16;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    constexpr int kNThreads = Kernel_traits::kNThreads;
 
     static_assert(kMaxSplits <= 128, "kMaxSplits must be <= 128");
-    // static_assert(kMaxSplits <= 8, "kMaxSplits must be <= 8 for now, will extend layer");
-    static_assert(kBlockM == 16 || kBlockM == 32, "kBlockM must be 16 or 32");
-    static_assert(Kernel_traits::kNThreads == 128, "We assume that each block has 128 threads");
+    static_assert(kBlockM == 4 || kBlockM == 8 || kBlockM == 16 || kBlockM == 32, "kBlockM must be 4, 8, 16 or 32");
+    static_assert(kNThreads == 128, "We assume that each block has 128 threads");
 
     // Shared memory.
     // kBlockM + 1 instead of kBlockM to reduce bank conflicts.
@@ -1169,17 +1193,17 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
                                    make_stride(params.b * params.h * params.seqlen_q, _1{}));
     Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
                               Shape<Int<kBlockM>>{}, Stride<_1>{});
-    constexpr int kNLsePerThread = (kMaxSplits * kBlockM + Kernel_traits::kNThreads - 1) / Kernel_traits::kNThreads;
+    constexpr int kNLsePerThread = (kMaxSplits * kBlockM + kNThreads - 1) / kNThreads;
 
     // Read the LSE values from gmem and store them in shared memory, then tranpose them.
-    constexpr int kRowsPerLoadLSE = Kernel_traits::kNThreads / kBlockM;
+    constexpr int kRowsPerLoadLSE = kNThreads / kBlockM;
     #pragma unroll
     for (int l = 0; l < kNLsePerThread; ++l) {
         const int row = l * kRowsPerLoadLSE + tidx / kBlockM;
         const int col = tidx % kBlockM;
         ElementAccum lse = (row < params.num_splits && col < params.b * params.h * params.seqlen_q - bidx * kBlockM) ? gLSEaccum(row, col) : -INFINITY;
         if (row < kMaxSplits) { sLSE[row][col] = lse; }
-        // if (bidx == 0 && tidx < 32) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse_accum(l)); }
+        // if (bidx == 0 && tidx < 32) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse); }
     }
     // if (bidx == 1 && tidx < 32) { printf("tidx = %d, row_offset_lse = %d, lse = %f\n", tidx, row_offset_lse, lse_accum(0)); }
     __syncthreads();
@@ -1187,7 +1211,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     constexpr int kRowsPerLoadTranspose = std::min(kRowsPerLoadLSE, kMaxSplits);
     // To make sure that kMaxSplits is within 1 warp: we decide how many elements within kMaxSplits
     // each thread should hold. If kMaxSplits = 16, then each thread holds 2 elements (128 threads,
-    // 16 rows, so each time we load we can load 8 rows).
+    // kBlockM rows, so each time we load we can load 128 / kBlockM rows).
     // constexpr int kThreadsPerSplit = kMaxSplits / kRowsPerLoadTranspose;
     // static_assert(kThreadsPerSplit <= 32);
     static_assert(kRowsPerLoadTranspose <= 32);
@@ -1230,7 +1254,13 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.oaccum_ptr) + row_offset_oaccum),
                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                  Stride<Int<kHeadDim>, _1>{});
-    typename Kernel_traits::GmemTiledCopyOaccum gmem_tiled_copy_Oaccum;
+    constexpr int kBlockN = kNThreads / kBlockM;
+    using GmemLayoutAtomOaccum = Layout<Shape<Int<kBlockM>, Int<kBlockN>>, Stride<Int<kBlockN>, _1>>;
+    using GmemTiledCopyOaccum = decltype(
+        make_tiled_copy(Copy_Atom<DefaultCopy, ElementAccum>{},
+                        GmemLayoutAtomOaccum{},
+                        Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
+    GmemTiledCopyOaccum gmem_tiled_copy_Oaccum;
     auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
     Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_S(gOaccum);
     Tensor tOrO = make_tensor<ElementAccum>(shape(tOgOaccum));
@@ -1247,7 +1277,6 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
         for (int k = 0; k < size(tOpOaccum); ++k) { tOpOaccum(k) = get<1>(tOcOaccum(0, 0, k)) < params.d; }
     }
     // Load Oaccum in then scale and accumulate to O
-    #pragma unroll 2
     for (int split = 0; split < params.num_splits; ++split) {
         flash::copy</*Is_even_MN=*/false, Is_even_K>(
             gmem_tiled_copy_Oaccum, tOgOaccum, tOrOaccum, tOcOaccum, tOpOaccum, params.b * params.h * params.seqlen_q - bidx * kBlockM
@@ -1263,11 +1292,11 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
                     tOrO(i, m, k) += lse_scale * tOrOaccum(i, m, k);
                 }
             }
-        // if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE[split][0], sLSE[split][1]); print(tOrOaccum); print(tOrO); }
+        // if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE[split][0], sLSE[split][1]); print(tOrOaccum); }
         }
         tOgOaccum.data() = tOgOaccum.data() + params.b * params.h * params.seqlen_q * params.d_rounded;
     }
-    // if (cute::thread0()) { print(tOrO); }
+    // if (cute::thread0()) { print_tensor(tOrO); }
 
     Tensor rO = flash::convert_type<Element>(tOrO);
     // Write to gO
