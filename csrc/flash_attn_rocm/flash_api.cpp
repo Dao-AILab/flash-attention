@@ -94,7 +94,7 @@ mha_fwd(const torch::Tensor &q,         // batch_size x seqlen_q x num_heads x h
   torch::Tensor z;
   // Only return softmax if there's dropout to reduce compilation time
   if (return_softmax) {
-    TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
+    // TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
     z = torch::empty({ batch_size, num_heads, seqlen_q, seqlen_k }, opts.dtype(torch::kInt32));
   }
 
@@ -248,8 +248,8 @@ mha_varlen_fwd(const torch::Tensor &q,  // total_q x num_heads x head_size, tota
   auto softmax_lse = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(torch::kFloat32));
   torch::Tensor z;
   if (return_softmax) {
-    TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
-    z = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts.dtype(torch::kInt32));
+    // TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
+    z = torch::empty({ batch_size, num_heads, max_seqlen_q, max_seqlen_k }, opts.dtype(torch::kInt32));
   }
   
   if (zero_tensors) {
