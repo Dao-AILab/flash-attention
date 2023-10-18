@@ -13,17 +13,18 @@
 
 #include "utils.hpp"
 
+// TODO: Use shared_ptr to use the same memory of BaseParams when calling forward/backward parameters
 // Common argements used by both batched & grouped gemms
 struct BaseParams {
   explicit BaseParams(const Index b,
                       const Index seqlen_q,
-                      const Index seqlen_k,
-                      const Index seqlen_q_rounded,
-                      const Index seqlen_k_rounded,
-                      const Index h,
-                      const Index h_k,
+                      const Index seqlen_kv,
+                      const Index seqlen_q_rounded, // TODO: remove me
+                      const Index seqlen_k_rounded, // TODO: remove me
+                      const Index h_q,
+                      const Index h_kv,
                       const Index d,
-                      const Index d_rounded,
+                      const Index d_rounded, //TODO: remove me
                       const torch::Tensor &q,
                       const torch::Tensor &k,
                       const torch::Tensor &v,
@@ -34,13 +35,13 @@ struct BaseParams {
                       const bool z_permute)
     : b(b),
       seqlen_q(seqlen_q),
-      seqlen_k(seqlen_k),
-      seqlen_q_rounded(seqlen_q_rounded),
-      seqlen_k_rounded(seqlen_k_rounded),
-      h(h),
-      h_k(h_k),
+      seqlen_kv(seqlen_kv),
+      seqlen_q_rounded(seqlen_q_rounded), // TODO: remove me
+      seqlen_k_rounded(seqlen_k_rounded), // TODO: remove me
+      h_q(h_q),
+      h_kv(h_kv),
       d(d),
-      d_rounded(d_rounded),
+      d_rounded(d_rounded), //TODO: remove me
       p_dropout(p_dropout),
       softmax_scale(softmax_scale),
       is_bf16(q.dtype() == torch::kBFloat16),
@@ -68,10 +69,10 @@ struct BaseParams {
     }
   }  
   // The dimensions.
-  Index b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded;
+  Index b, seqlen_q, seqlen_kv, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded;  // TODO: remove seqlen_q_rounded, seqlen_k_rounded, d_rounded;
 
   // The number of heads.
-  Index h, h_k;
+  Index h_q, h_kv;
   // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
   // different from nheads (query).
   // int h_h_k_ratio; // precompute h / h_k
@@ -104,13 +105,13 @@ struct BaseParams {
 
   bool z_permute;
 
-  int q_seq_stride;
-  int kv_seq_stride;
-  int out_seq_stride;
+  Index q_seq_stride;
+  Index kv_seq_stride;
+  Index out_seq_stride;
 
-  int q_head_stride;
-  int kv_head_stride;
-  int out_head_stride;
+  Index q_head_stride;
+  Index kv_head_stride;
+  Index out_head_stride;
 
   static inline const bool kIsUnitTestMode = get_env_("FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE");
   static inline const bool kIsDeterministic = get_env_("FLASH_ATTENTION_INTERNAL_DETERMINISTIC");
@@ -120,13 +121,13 @@ struct BaseParams {
 struct BatchedParams : public BaseParams {
   explicit BatchedParams(const Index b,
                          const Index seqlen_q,
-                         const Index seqlen_k,
-                         const Index seqlen_q_rounded,
-                         const Index seqlen_k_rounded,
-                         const Index h,
-                         const Index h_k,
+                         const Index seqlen_kv,
+                         const Index seqlen_q_rounded, //TODO: remove me
+                         const Index seqlen_k_rounded, //TODO: remove me
+                         const Index h_q,
+                         const Index h_kv,
                          const Index d,
-                         const Index d_rounded,
+                         const Index d_rounded, //TODO: remove me
                          const torch::Tensor &q,
                          const torch::Tensor &k,
                          const torch::Tensor &v,
@@ -140,12 +141,12 @@ struct BatchedParams : public BaseParams {
     : BaseParams(b,
                  seqlen_q,
                  seqlen_k,
-                 seqlen_q_rounded,
-                 seqlen_k_rounded,
-                 h,
-                 h_k,
+                 seqlen_q_rounded, //TODO: remove me
+                 seqlen_k_rounded, //TODO: remove me
+                 h_q,
+                 h_kv,
                  d,
-                 d_rounded,
+                 d_rounded, //TODO: remove me
                  q,
                  k,
                  v,
@@ -165,44 +166,44 @@ struct BatchedParams : public BaseParams {
       out_batch_stride(out.stride(0)) {
     
     if(!is_mnko_padding && d <= 32) {
-      is_mnko_padding = ((seqlen_q % 128)==0 && (seqlen_k % 128)==0 ? false : true);
+      is_mnko_padding = ((seqlen_q % 128)==0 && (seqlen_kv % 128)==0 ? false : true);
     } else if(!is_mnko_padding && d <= 64) {
       if(is_dropout) {
-        is_mnko_padding = ((seqlen_q % 128)==0 && (seqlen_k % 128)==0 ? false : true);
+        is_mnko_padding = ((seqlen_q % 128)==0 && (seqlen_kv % 128)==0 ? false : true);
       } else {
-        is_mnko_padding = ((seqlen_q % 128)==0 && (seqlen_k % 256)==0 ? false : true);
+        is_mnko_padding = ((seqlen_q % 128)==0 && (seqlen_kv % 256)==0 ? false : true);
       }
     } else if(!is_mnko_padding && d <= 128) {
-      is_mnko_padding = ((seqlen_q % 128)==0 && (seqlen_k % 128)==0 ? false : true);
+      is_mnko_padding = ((seqlen_q % 128)==0 && (seqlen_kv % 128)==0 ? false : true);
     }
 
-    // Q layout [b, seqlen_q, h, d]
-    std::vector<Index> q_lengths{b, h, seqlen_q, d};
+    // Q layout [b, seqlen_q, h_q, d]
+    std::vector<Index> q_lengths{b, h_q, seqlen_q, d};
     std::vector<Index> q_strides{q_batch_stride, q_head_stride, q_seq_stride, 1};
 
-    // K layout [b, seqlen_kv, h, d]
-    std::vector<Index> k_lengths{b, h, seqlen_k, d};
+    // K layout [b, seqlen_kv, h_kv, d]
+    std::vector<Index> k_lengths{b, h_kv, seqlen_kv, d};
     std::vector<Index> k_strides{kv_batch_stride, kv_head_stride, kv_seq_stride, 1};
 
-    // V layout [b, seqlen_kv, h, d]
-    std::vector<Index> v_lengths{b, h, d, seqlen_k};
+    // V layout [b, seqlen_kv, h_kv, d]
+    std::vector<Index> v_lengths{b, h_kv, d, seqlen_kv};
     std::vector<Index> v_strides{kv_batch_stride, kv_head_stride, 1, kv_seq_stride};
 
-    // Y layout [b, seqlen_q, h, O]
-    std::vector<Index> out_lengths{b, h, seqlen_q, d};
+    // Y layout [b, seqlen_q, h_q, d]
+    std::vector<Index> out_lengths{b, h_q, seqlen_q, d};
     std::vector<Index> out_strides{out_batch_stride, out_head_stride, out_seq_stride, 1};
 
-    std::vector<Index> z_lengths{b, h, seqlen_q, seqlen_k};
+    std::vector<Index> z_lengths{b, h_q, seqlen_q, seqlen_kv};
     std::vector<Index> z_strides = 
         z_permute ? 
-        std::vector<Index>{h*seqlen_q*seqlen_k, seqlen_k, h*seqlen_k, 1} :
-        // Z layout [b, seqlen_q, h, seqlen_kv]
-        std::vector<Index>{h*seqlen_q*seqlen_k, seqlen_q*seqlen_k, seqlen_k, 1};
-        // Z layout [b, h, seqlen_q, seqlen_kv]
+        std::vector<Index>{h*seqlen_q*seqlen_kv, seqlen_kv, h*seqlen_kv, 1} :
+        // Z layout [b, seqlen_q, h_q, seqlen_kv]
+        std::vector<Index>{h*seqlen_q*seqlen_kv, seqlen_q*seqlen_kv, seqlen_kv, 1};
+        // Z layout [b, h_q, seqlen_q, seqlen_kv]
 
     // LSE layout [b, h, seqlen_q]
-    std::vector<Index> lse_lengths{b, h, seqlen_q};
-    // std::vector<Index> lse_strides{h*seqlen_q, seqlen_q, 1};
+    std::vector<Index> lse_lengths{b, h_q, seqlen_q};
+    // std::vector<Index> lse_strides{h_q*seqlen_q, seqlen_q, 1};
   }
   
   void* __restrict__ q_ptr;
@@ -320,7 +321,20 @@ struct FlashBwdBatchedParams : public BatchedParams {
       dv_ptr(dv.data_ptr()),
       dout_ptr(dout.data_ptr()),
       d_ptr(torch::empty({b, static_cast<long>(h), seqlen_q}, 
-            q.options().dtype(torch::kFloat32)).data_ptr()) {}
+            q.options().dtype(torch::kFloat32)).data_ptr()) {
+
+    Index dkv_batch_stride = dk.stride(0);
+    Index dkv_seq_stride = dk.stride(-3);
+    Index dkv_head_stride = dk.stride(-2);
+      
+    // KGrad layout [b, seqlen_kv, h_q, d]
+    std::vector<Index> dk_lengths{b, h_q, seqlen_kv, d};
+    std::vector<Index> dk_strides{dkv_batch_stride, dkv_head_stride, dkv_seq_stride, 1};
+
+    // VGrad layout [b, seqlen_kv, h_q, d]
+    std::vector<Index> dv_lengths{b, h_q, d, seqlen_kv};
+    std::vector<Index> dv_strides{dkv_batch_stride, dkv_head_stride, 1, dkv_seq_stride};  
+  }
 
   void* __restrict__ dq_ptr;
   void* __restrict__ dk_ptr;
@@ -428,39 +442,39 @@ struct GroupedParams : public BaseParams {
       softmax_lse_ptr = softmax_lse_ptr + get_size_in_bytes(h * seqlen_q, torch::kFloat32);
 
       if(z_d) {
-        z_ptrs.push_back(reinterpret_cast<void*>(z_ptr + i * h * seqlen_q * seqlen_k * sizeof(int)));
+        z_ptrs.push_back(reinterpret_cast<void*>(z_ptr + i * h_q * seqlen_q * seqlen_kv * sizeof(int)));
       }
       else{
         z_ptrs.push_back(nullptr);
       }
 
       // Q layout [b, seqlen_q, h, d]
-      std::vector<Index> q_lengths{1, h, curr_seqlen_q, d};
+      std::vector<Index> q_lengths{1, h_q, curr_seqlen_q, d};
       std::vector<Index> q_strides{curr_q_batch_stride, q_head_stride, q_seq_stride, 1};
  
       // K layout [b, seqlen_kv, h, d]
-      std::vector<Index> k_lengths{1, h, curr_seqlen_kv, d};
+      std::vector<Index> k_lengths{1, h_kv, curr_seqlen_kv, d};
       std::vector<Index> k_strides{curr_kv_batch_stride, kv_head_stride, kv_seq_stride, 1};
 
       // V layout [b, seqlen_kv, h, d]
-      std::vector<Index> v_lengths{1, h, d, curr_seqlen_kv};
+      std::vector<Index> v_lengths{1, h_kv, d, curr_seqlen_kv};
       std::vector<Index> v_strides{curr_kv_batch_stride, kv_head_stride, 1, kv_seq_stride};
 
       // Y layout [b, seqlen_q, h, O]
-      std::vector<Index> out_lengths{1, h, curr_seqlen_q, d};
+      std::vector<Index> out_lengths{1, h_q, curr_seqlen_q, d};
       std::vector<Index> out_strides{curr_out_batch_stride, out_head_stride, out_seq_stride, 1};
 
-      std::vector<Index> z_lengths{1, h, curr_seqlen_q, curr_seqlen_kv};
+      std::vector<Index> z_lengths{1, h_q, curr_seqlen_q, curr_seqlen_kv};
       std::vector<Index> z_strides = 
           z_permute ? 
-          std::vector<Index>{h*curr_seqlen_q*curr_seqlen_kv, curr_seqlen_kv, h*curr_seqlen_kv, 1} :
+          std::vector<Index>{h_q*curr_seqlen_q*curr_seqlen_kv, curr_seqlen_kv, h_q*curr_seqlen_kv, 1} :
           // Z layout [b, seqlen_q, h, seqlen_kv]
-          std::vector<Index>{h*curr_seqlen_q*curr_seqlen_kv, curr_seqlen_q*curr_seqlen_kv, curr_seqlen_kv, 1};
+          std::vector<Index>{h_q*curr_seqlen_q*curr_seqlen_kv, curr_seqlen_q*curr_seqlen_kv, curr_seqlen_kv, 1};
           // Z layout [b, h, seqlen_q, seqlen_kv]
 
       // LSE layout [b, h, seqlen_q]
-      std::vector<Index> lse_lengths{1, h, curr_seqlen_q};
-      std::vector<Index> lse_strides{h*curr_seqlen_q, curr_seqlen_q, 1};
+      std::vector<Index> lse_lengths{1, h_q, curr_seqlen_q};
+      std::vector<Index> lse_strides{h_q*curr_seqlen_q, curr_seqlen_q, 1};
 
       problem_descs.push_back({
           q_lengths,
@@ -473,6 +487,10 @@ struct GroupedParams : public BaseParams {
           out_strides,
           z_lengths,
           z_strides,
+          dk_lengths,
+          dk_strides,
+          dv_lengths,
+          dv_strides,
           lse_lengths,
           lse_strides,
       });
@@ -490,22 +508,22 @@ struct GroupedParams : public BaseParams {
   std::vector<int> host_seqlens_q;
   std::vector<int> host_seqlens_k;
 
-  struct ProblemDesc {
-    std::vector<Index> q_lengths;
-    std::vector<Index> q_strides;
-    std::vector<Index> k_lengths;
-    std::vector<Index> k_strides;
-    std::vector<Index> v_lengths;
-    std::vector<Index> v_strides;
-    std::vector<Index> out_lengths;
-    std::vector<Index> out_strides;
-    std::vector<Index> z_lengths;
-    std::vector<Index> z_strides;
-    std::vector<Index> lse_lengths;
-    std::vector<Index> lse_strides;
-  };
-
-  std::vector<ProblemDesc> problem_descs;
+  std::vector<std::vector<Index>> q_lengths;
+  std::vector<std::vector<Index>> q_strides;
+  std::vector<std::vector<Index>> k_lengths;
+  std::vector<std::vector<Index>> k_strides;
+  std::vector<std::vector<Index>> v_lengths;
+  std::vector<std::vector<Index>> v_strides;
+  std::vector<Index><std::vector<Index>> out_lengths;
+  std::vector<Index><std::vector<Index>> out_strides;
+  std::vector<Index><std::vector<Index>> z_lengths;
+  std::vector<Index><std::vector<Index>> z_strides;
+  std::vector<Index><std::vector<Index>> dk_lengths;
+  std::vector<Index><std::vector<Index>> dk_strides;
+  std::vector<Index><std::vector<Index>> dv_lengths;
+  std::vector<Index><std::vector<Index>> dv_strides;
+  std::vector<Index><std::vector<Index>> lse_lengths;
+  std::vector<Index><std::vector<Index>> lse_strides;
 };
 
 // Forward Grouped Arguments
