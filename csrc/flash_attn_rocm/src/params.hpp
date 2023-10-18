@@ -194,10 +194,10 @@ struct BatchedParams : public BaseParams {
 
     std::vector<Index> z_lengths{b, h, seqlen_q, seqlen_k};
     std::vector<Index> z_strides = 
-        z_permute
-        ? std::vector<Index>{h*seqlen_q*seqlen_k, seqlen_k, h*seqlen_k, 1}
+        z_permute ? 
+        std::vector<Index>{h*seqlen_q*seqlen_k, seqlen_k, h*seqlen_k, 1} :
         // Z layout [b, seqlen_q, h, seqlen_kv]
-        : std::vector<Index>{h*seqlen_q*seqlen_k, seqlen_q*seqlen_k, seqlen_k, 1};
+        std::vector<Index>{h*seqlen_q*seqlen_k, seqlen_q*seqlen_k, seqlen_k, 1};
         // Z layout [b, h, seqlen_q, seqlen_kv]
 
     // LSE layout [b, h, seqlen_q]
@@ -435,22 +435,22 @@ struct GroupedParams : public BaseParams {
       }
 
       // Q layout [b, seqlen_q, h, d]
-      std::vector<Index> q_lengths{b, h, curr_seqlen_q, d};
+      std::vector<Index> q_lengths{1, h, curr_seqlen_q, d};
       std::vector<Index> q_strides = std::vector<Index>{curr_q_batch_stride, q_head_stride, q_seq_stride, 1};
  
       // K layout [b, seqlen_kv, h, d]
-      std::vector<Index> k_lengths{b, h, curr_seqlen_kv, d};
+      std::vector<Index> k_lengths{1, h, curr_seqlen_kv, d};
       std::vector<Index> k_strides = std::vector<Index>{curr_kv_batch_stride, kv_head_stride, kv_seq_stride, 1};
 
       // V layout [b, seqlen_kv, h, d]
-      std::vector<Index> v_lengths{b, h, d, curr_seqlen_kv};
+      std::vector<Index> v_lengths{1, h, d, curr_seqlen_kv};
       std::vector<Index> v_strides = std::vector<Index>{curr_kv_batch_stride, kv_head_stride, 1, kv_seq_stride};
 
       // Y layout [b, seqlen_q, h, O]
-      std::vector<Index> out_lengths{b, h, curr_seqlen_q, d};
+      std::vector<Index> out_lengths{1, h, curr_seqlen_q, d};
       std::vector<Index> out_strides = std::vector<Index>{curr_out_batch_stride, out_head_stride, out_seq_stride, 1};
 
-      std::vector<Index> z_lengths{b, h, curr_seqlen_q, curr_seqlen_kv};
+      std::vector<Index> z_lengths{1, h, curr_seqlen_q, curr_seqlen_kv};
       std::vector<Index> z_strides = 
           z_permute
           ? std::vector<Index>{h*curr_seqlen_q*curr_seqlen_kv, curr_seqlen_kv, h*curr_seqlen_kv, 1}
@@ -459,7 +459,7 @@ struct GroupedParams : public BaseParams {
           // Z layout [b, h, seqlen_q, seqlen_kv]
 
       // LSE layout [b, h, seqlen_q]
-      std::vector<Index> lse_lengths{b, h, curr_seqlen_q};
+      std::vector<Index> lse_lengths{1, h, curr_seqlen_q};
       std::vector<Index> lse_strides{h*curr_seqlen_q, curr_seqlen_q, 1};
 
       problem_descs.push_back({
