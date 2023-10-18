@@ -68,13 +68,13 @@ struct BaseParams {
     }
   }  
   // The dimensions.
-  int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded;
+  Index b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded;
 
   // The number of heads.
-  int h, h_k;
+  Index h, h_k;
   // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
   // different from nheads (query).
-  int h_h_k_ratio; // precompute h / h_k,
+  // int h_h_k_ratio; // precompute h / h_k
 
   // The scaling factors for the kernel.
   float softmax_scale;
