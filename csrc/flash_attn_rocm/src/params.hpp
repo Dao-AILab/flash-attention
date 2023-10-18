@@ -19,12 +19,9 @@ struct BaseParams {
   explicit BaseParams(const Index b,
                       const Index max_seqlen_q,
                       const Index max_seqlen_kv,
-                      const Index max_seqlen_q_rounded, // TODO: remove me
-                      const Index seqlen_k_rounded, // TODO: remove me
                       const Index h_q,
                       const Index h_kv,
                       const Index d,
-                      const Index d_rounded, //TODO: remove me
                       const torch::Tensor &q,
                       const torch::Tensor &k,
                       const torch::Tensor &v,
@@ -36,12 +33,9 @@ struct BaseParams {
     : b(b),
       max_seqlen_q(max_seqlen_q),
       max_seqlen_kv(max_seqlen_kv),
-      max_seqlen_q_rounded(max_seqlen_q_rounded), // TODO: remove me
-      seqlen_k_rounded(seqlen_k_rounded), // TODO: remove me
       h_q(h_q),
       h_kv(h_kv),
       d(d),
-      d_rounded(d_rounded), //TODO: remove me
       p_dropout(p_dropout),
       softmax_scale(softmax_scale),
       is_bf16(q.dtype() == torch::kBFloat16),
@@ -69,7 +63,7 @@ struct BaseParams {
     }
   }  
   // The dimensions.
-  Index b, max_seqlen_q, max_seqlen_kv, d, max_seqlen_q_rounded, seqlen_k_rounded, d_rounded;  // TODO: remove max_seqlen_q_rounded, seqlen_k_rounded, d_rounded;
+  Index b, max_seqlen_q, max_seqlen_kv, d;
 
   // The number of heads.
   Index h_q, h_kv;
@@ -612,11 +606,11 @@ struct FlashBwdGroupedParams : public GroupedParams {
 
       // KGrad layout [b, max_seqlen_kv, h_q, d]
       std::vector<Index> dk_lengths{1, h_q, max_seqlen_kv, d};
-      std::vector<Index> dk_strides{dkv_batch_stride, dkv_head_stride, dkv_seq_stride, 1};
+      std::vector<Index> dk_strides{curr_dkv_batch_stride, dkv_head_stride, dkv_seq_stride, 1};
 
       // VGrad layout [b, max_seqlen_kv, h_q, d]
       std::vector<Index> dv_lengths{1, h_q, d, max_seqlen_kv};
-      std::vector<Index> dv_strides{dkv_batch_stride, dkv_head_stride, 1, dkv_seq_stride};  
+      std::vector<Index> dv_strides{curr_dkv_batch_stride, dkv_head_stride, 1, dkv_seq_stride};  
 
       dk_lengths_vec.push_back(dk_lengths);
       dk_strides_vec.push_back(dk_strides);
