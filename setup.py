@@ -122,10 +122,10 @@ if not SKIP_CUDA_BUILD:
     # cc_flag.append("arch=compute_75,code=sm_75")
     cc_flag.append("-gencode")
     cc_flag.append("arch=compute_80,code=sm_80")
-    # if CUDA_HOME is not None:
-    #     if bare_metal_version >= Version("11.8"):
-    #         cc_flag.append("-gencode")
-    #         cc_flag.append("arch=compute_90,code=sm_90")
+    if CUDA_HOME is not None:
+        if bare_metal_version >= Version("11.8"):
+            cc_flag.append("-gencode")
+            cc_flag.append("arch=compute_90,code=sm_90")
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -201,7 +201,7 @@ if not SKIP_CUDA_BUILD:
                         "--use_fast_math",
                         # "--ptxas-options=-v",
                         # "--ptxas-options=-O2",
-                        "-lineinfo",
+                        # "-lineinfo",
                     ]
                     + generator_flag
                     + cc_flag
@@ -233,7 +233,8 @@ def get_wheel_url():
     # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
     torch_cuda_version = parse(torch.version.cuda)
     torch_version_raw = parse(torch.__version__)
-    if torch_version_raw.major == 2 and torch_version_raw.minor == 1:
+    # Workaround for nvcc 12.1 segfaults when compiling with Pytorch 2.1
+    if torch_version_raw.major == 2 and torch_version_raw.minor == 1 and torch_cuda_version.major == 12:
         torch_cuda_version = parse("12.2")
     python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
     platform_name = get_platform()

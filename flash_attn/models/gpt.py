@@ -6,6 +6,7 @@ import re
 from collections import OrderedDict, namedtuple
 from collections.abc import Sequence
 from functools import partial
+from typing import Dict, List
 
 import torch
 import torch.nn as nn
@@ -810,7 +811,7 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
     return state_dict
 
 
-def combine_state_dicts_tp(state_dicts: list[dict[str, torch.Tensor]], config: GPT2Config):
+def combine_state_dicts_tp(state_dicts: List[Dict[str, torch.Tensor]], config: GPT2Config):
     """Convert the list of sharded state_dict of a GPT model with tensor parallel to
     the state_dict of a standard GPT model.
 
