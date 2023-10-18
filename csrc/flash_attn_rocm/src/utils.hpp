@@ -106,3 +106,34 @@ static inline bool get_env_(const char* env_var) {
   }
   return false;
 }
+
+// compute differences
+__global__ void compute_differences(const int* in, int* out, int len) {
+    int i = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
+    if (i < len) {
+        out[i] = in[i + 1] - in[i];
+    }
+}
+
+// compute seqlens and move to host
+std::vector<int> get_host_seqlens(const int* d_seqlens_acc, int b) {
+    int* d_seqlens;
+    FMHA_CHECK_HIP(hipMalloc((void**)&d_seqlens, b * sizeof(int)));
+
+    int threadsPerBlock = 256;
+    int blocks = (b + threadsPerBlock - 1) / threadsPerBlock;
+
+    FMHA_CHECK_HIP(hipLaunchKernelGGL(compute_differences, dim3(blocks), dim3(threadsPerBlock), 0, 0, d_seqlens_acc, d_seqlens, b));
+    FMHA_CHECK_HIP(hipDeviceSynchronize());
+
+    std::vector<int> h_seqlens(b);
+
+    FMHA_CHECK_HIP(hipMemcpy(h_seqlens.data(),   
+                             d_seqlens, 
+                             b*sizeof(int), 
+                             hipMemcpyDeviceToHost));
+    
+    FMHA_CHECK_HIP(hipFree(d_seqlens));
+    
+    return h_seqlens;
+}

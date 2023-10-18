@@ -89,18 +89,18 @@ class DeviceGemmInvoker {
 
     for (int i = 0; i < params.b; ++i) {
       problem_descs.push_back({
-          params.problem_descs[i].q_lengths,
-          params.problem_descs[i].q_strides,
-          params.problem_descs[i].k_lengths,
-          params.problem_descs[i].k_strides,
-          params.problem_descs[i].v_lengths,
-          params.problem_descs[i].v_strides,
-          params.problem_descs[i].out_lengths,
-          params.problem_descs[i].out_strides,          
-          params.problem_descs[i].z_lengths,
-          params.problem_descs[i].z_strides,
-          params.problem_descs[i].lse_lengths,
-          params.problem_descs[i].lse_strides,
+          params.q_lengths_vec[i],
+          params.q_strides_vec[i],
+          params.k_lengths_vec[i],
+          params.k_strides_vec[i],
+          params.v_lengths_vec[i],
+          params.v_strides_vec[i],
+          params.out_lengths_vec[i],
+          params.out_strides_vec[i],          
+          params.z_lengths_vec[i],
+          params.z_strides_vec[i],
+          params.lse_lengths_vec[i],
+          params.lse_strides_vec[i],
           {}, // acc0_biases_gs_ms_ns_lengths
           {}, // acc0_biases_gs_ms_ns_strides
           {}, // acc1_biases_gs_ms_os_lengths
