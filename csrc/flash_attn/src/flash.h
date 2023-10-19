@@ -59,6 +59,12 @@ struct Flash_fwd_params : public Qkv_params {
     index_t o_row_stride;
     index_t o_head_stride;
 
+    // Attention biases
+    void * __restrict__ attn_bias_ptr;
+    index_t attn_bias_batch_stride;
+    index_t attn_bias_head_stride;
+    index_t attn_bias_q_stride;
+
     // The pointer to the P matrix.
     void * __restrict__ p_ptr;
 
@@ -138,6 +144,9 @@ struct Flash_bwd_params : public Flash_fwd_params {
     void *__restrict__ dq_ptr;
     void *__restrict__ dk_ptr;
     void *__restrict__ dv_ptr;
+
+    // Attention biases
+    void *__restrict__ attn_ds_ptr;
 
     // To accumulate dQ
     void *__restrict__ dq_accum_ptr;

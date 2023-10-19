@@ -18,20 +18,20 @@ __global__ void flash_bwd_clear_dkvaccum_kernel(Flash_bwd_params params) {
     flash::clear_dKVaccum<Kernel_traits>(params);
 }
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_M, bool Is_even_K>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Has_attn_bias, bool Is_even_M, bool Is_even_K>
 __global__ void flash_bwd_dq_dk_dv_loop_kernel(Flash_bwd_params params) {
-    flash::compute_dq_dk_dv<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K>(params);
+    flash::compute_dq_dk_dv<Kernel_traits, Is_dropout, Is_causal, Has_attn_bias, Is_even_M, Is_even_K>(params);
 }
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_attn_bias, bool Is_even_MN, bool Is_even_K>
 __global__ void flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel(Flash_bwd_params params) {
     static_assert(!(Is_causal && Is_local));  // If Is_local is true, Is_causal should be false
-    flash::compute_dq_dk_dv_seqk_parallel<Kernel_traits, Is_dropout, Is_causal, Is_local, Is_even_MN, Is_even_K>(params);
+    flash::compute_dq_dk_dv_seqk_parallel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_attn_bias, Is_even_MN, Is_even_K>(params);
 }
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_N, bool Is_even_K>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Has_attn_bias, bool Is_even_N, bool Is_even_K>
 __global__ void flash_bwd_dq_dk_dv_loop_seqq_parallel_kernel(Flash_bwd_params params) {
-    flash::compute_dq_dk_dv_seqq_parallel<Kernel_traits, Is_dropout, Is_causal, Is_even_N, Is_even_K>(params);
+    flash::compute_dq_dk_dv_seqq_parallel<Kernel_traits, Is_dropout, Is_causal, Has_attn_bias, Is_even_N, Is_even_K>(params);
 }
 
 template<typename Kernel_traits>
@@ -59,22 +59,26 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream, 
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_q % Kernel_traits::kBlockM == 0 && params.seqlen_k % Kernel_traits::kBlockN == 0;
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
     constexpr int smem_size_dq_dk_dv = Kernel_traits::kSmemSize1colblock;
+    const bool has_attn_bias = (params.attn_bias_ptr != nullptr);
+
     // printf("smem_size_dq_dk_dv = %d\n", smem_size_dq_dk_dv);
-    BOOL_SWITCH(params.is_causal, IsCausalConst, [&] {
-        BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
-            BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
-                BOOL_SWITCH(params.window_size_left >= 0 || params.window_size_right >= 0, Is_local, [&] {
-                    // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
-                    // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
-                    // If Is_local, set Is_causal to false
-                    auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout, IsCausalConst && !Is_local, Is_local, IsEvenMNConst && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst>;
-                    // auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout, IsCausalConst, IsEvenMNConst, true>;
-                    if (smem_size_dq_dk_dv >= 48 * 1024)  {
-                        C10_CUDA_CHECK(cudaFuncSetAttribute(
-                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
-                    }
-                    kernel<<<grid_n, Kernel_traits::kNThreads, smem_size_dq_dk_dv, stream>>>(params);
-                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    BOOL_SWITCH(has_attn_bias, HasAttnBias, [&] {
+        BOOL_SWITCH(params.is_causal, IsCausalConst, [&] {
+            BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
+                BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
+                    BOOL_SWITCH(params.window_size_left >= 0 || params.window_size_right >= 0, Is_local, [&] {
+                        // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
+                        // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
+                        // If Is_local, set Is_causal to false
+                        auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout, IsCausalConst && !Is_local, Is_local, HasAttnBias, IsEvenMNConst && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst>;
+                        // auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout, IsCausalConst, IsEvenMNConst, true>;
+                        if (smem_size_dq_dk_dv >= 48 * 1024)  {
+                            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
+                        }
+                        kernel<<<grid_n, Kernel_traits::kNThreads, smem_size_dq_dk_dv, stream>>>(params);
+                        C10_CUDA_KERNEL_LAUNCH_CHECK();
+                    });
                 });
             });
         });
@@ -103,19 +107,23 @@ void run_flash_bwd_seqq_parallel(Flash_bwd_params &params, cudaStream_t stream, 
     const bool is_even_N = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0;
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
     constexpr int smem_size_dq_dk_dv = Kernel_traits::kSmemSize1rowblock;
+    const bool has_attn_bias = (params.attn_bias_ptr != nullptr);
+
     // printf("smem_size_dq_dk_dv = %d\n", smem_size_dq_dk_dv);
-    BOOL_SWITCH(params.is_causal, IsCausalConst, [&] {
-        BOOL_SWITCH(is_even_N, IsEvenNConst, [&] {
-            BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
-                // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
-                auto kernel = &flash_bwd_dq_dk_dv_loop_seqq_parallel_kernel<Kernel_traits, Is_dropout, IsCausalConst, IsEvenNConst && IsEvenKConst, IsEvenKConst>;
-                // auto kernel = &flash_bwd_dq_dk_dv_loop_seqq_parallel_kernel<Kernel_traits, false, false, IsEvenNConst, IsEvenKConst>;
-                if (smem_size_dq_dk_dv >= 48 * 1024)  {
-                    C10_CUDA_CHECK(cudaFuncSetAttribute(
-                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
-                }
-                kernel<<<grid_m, Kernel_traits::kNThreads, smem_size_dq_dk_dv, stream>>>(params);
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
+    BOOL_SWITCH(has_attn_bias, HasAttnBias, [&] {
+        BOOL_SWITCH(params.is_causal, IsCausalConst, [&] {
+            BOOL_SWITCH(is_even_N, IsEvenNConst, [&] {
+                BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
+                    // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
+                    auto kernel = &flash_bwd_dq_dk_dv_loop_seqq_parallel_kernel<Kernel_traits, Is_dropout, IsCausalConst, HasAttnBias, IsEvenNConst && IsEvenKConst, IsEvenKConst>;
+                    // auto kernel = &flash_bwd_dq_dk_dv_loop_seqq_parallel_kernel<Kernel_traits, false, false, IsEvenNConst, IsEvenKConst>;
+                    if (smem_size_dq_dk_dv >= 48 * 1024)  {
+                        C10_CUDA_CHECK(cudaFuncSetAttribute(
+                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
+                    }
+                    kernel<<<grid_m, Kernel_traits::kNThreads, smem_size_dq_dk_dv, stream>>>(params);
+                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+                });
             });
         });
     });
@@ -144,7 +152,7 @@ void run_mha_bwd_hdim32(Flash_bwd_params &params, cudaStream_t stream, const boo
     cudaError status_ = cudaDeviceGetAttribute(
         &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        if (max_smem_per_block >= 2 * ((3 * 128 + 2 * 128) * Headdim + 2 * 128 * 128)) { // 104 KB
+        if (max_smem_per_block >= 2 * ((3 * 128 + 2 * 128) * Headdim + 3 * 128 * 128)) { // 104 KB
             if constexpr(!Is_dropout) {  // We can afford more registers to keep V in registers
                 run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout>(params, stream, configure);
             } else {
@@ -173,7 +181,7 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream, const boo
         // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 4, false, false, T>, Is_dropout>(params, stream, configure);
         // This is slightly faster. We want to split M more so we need fewer registers to store LSE.
         if (max_smem_per_block >= 144 * 1024) {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout>(params, stream, configure);
+            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 4, 4, 4, false, false, T>, Is_dropout>(params, stream, configure);
             // This has a lot of register spilling
             // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout>(params, stream, configure);
         } else {
@@ -242,7 +250,7 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream, const bo
             // Out of these three, the 2nd one is slightly faster (2% faster than the first). Idk why.
             // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 2, 2, false, false, T>>(params, stream, configure);
             if (max_smem_per_block >= 144 * 1024) {
-                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 2, false, false, T>, Is_dropout>(params, stream, configure);
+                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout>(params, stream, configure);
                 // run_flash_bwd_seqk_parallel<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout>(params, stream, configure);
                 // run_flash_bwd_seqk_parallel<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, true, T>, Is_dropout>(params, stream, configure);
                 // run_flash_bwd_seqq_parallel<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout>(params, stream, configure);
@@ -300,7 +308,7 @@ template<typename T>
 void run_mha_bwd_hdim224(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {
     constexpr static int Headdim = 224;
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, false, false, T>, Is_dropout>(params, stream, configure);
+        run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, false, true, T>, Is_dropout>(params, stream, configure);
     });
 }
 

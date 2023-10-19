@@ -41,7 +41,11 @@ void set_params_fprop(Flash_fwd_params &params,
                       float p_dropout,
                       float softmax_scale,
                       int window_size_left,
-                      int window_size_right) {
+                      int window_size_right,
+                      void* attn_bias,
+                      uint32_t attn_bias_batch_stride,
+                      uint32_t attn_bias_head_stride,
+                      uint32_t attn_bias_q_stride) {
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -62,6 +66,12 @@ void set_params_fprop(Flash_fwd_params &params,
     params.o_ptr = out.data_ptr();
     params.o_row_stride = out.stride(-3);
     params.o_head_stride = out.stride(-2);
+
+    // Attention biases
+    params.attn_bias_ptr = attn_bias;
+    params.attn_bias_batch_stride = attn_bias_batch_stride;
+    params.attn_bias_head_stride = attn_bias_head_stride;
+    params.attn_bias_q_stride = attn_bias_q_stride;
 
     if (cu_seqlens_q_d == nullptr) {
         params.q_batch_stride = q.stride(0);
@@ -148,7 +158,12 @@ void set_params_dgrad(Flash_bwd_params &params,
                       float p_dropout,
                       float softmax_scale,
                       int window_size_left,
-                      int window_size_right) {
+                      int window_size_right,
+                      void* attn_bias,
+                      void* attn_ds,
+                      uint32_t attn_bias_batch_stride,
+                      uint32_t attn_bias_head_stride,
+                      uint32_t attn_bias_q_stride) {
 
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
@@ -160,7 +175,11 @@ void set_params_dgrad(Flash_bwd_params &params,
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     attn_bias,
+                     attn_bias_batch_stride,
+                     attn_bias_head_stride,
+                     attn_bias_q_stride);
 
     // Set the pointers and strides.
     params.do_ptr = dout.data_ptr();
@@ -175,6 +194,9 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.dq_head_stride = dq.stride(-2);
     params.dk_head_stride = dk.stride(-2);
     params.dv_head_stride = dv.stride(-2);
+
+    // Attention biases
+    params.attn_ds_ptr = attn_ds;
 
     if (cu_seqlens_q_d == nullptr) {
         params.do_batch_stride = dout.stride(0);
@@ -255,6 +277,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         bool is_causal,
         const int window_size_left,
         int window_size_right,
+        const c10::optional<at::Tensor> &attn_bias, // batch_size x num_heads_k x seqlen_q x seqlen_k
         const bool return_softmax,
         c10::optional<at::Generator> gen_) {
 
@@ -309,6 +332,22 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size_og);
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_og);
+
+    // Attention biases
+    uint32_t attn_bias_batch_stride = 0;
+    uint32_t attn_bias_head_stride = 0;
+    uint32_t attn_bias_q_stride = 0;
+
+    if (attn_bias.has_value()) {
+        TORCH_CHECK(attn_bias.value().is_cuda(), "Input tensor must be on CUDA device");
+        TORCH_CHECK(attn_bias.value().stride(-1) == 1, "Input tensor must have contiguous last dimension");
+        TORCH_CHECK(attn_bias.value().dtype() == q_dtype, "attention bias and query must have the same dtype");
+        CHECK_SHAPE(attn_bias.value(), batch_size, num_heads, seqlen_q, seqlen_k);
+
+        attn_bias_batch_stride = attn_bias.value().stride(0);
+        attn_bias_head_stride = attn_bias.value().stride(1);
+        attn_bias_q_stride = attn_bias.value().stride(2);
+    }
 
     at::Tensor q_padded, k_padded, v_padded;
     if (head_size_og % 8 != 0) {
@@ -368,7 +407,11 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     attn_bias ? attn_bias->data_ptr() : nullptr,
+                     attn_bias_batch_stride,
+                     attn_bias_head_stride,
+                     attn_bias_q_stride);
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
     const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
@@ -553,7 +596,11 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     nullptr,
+                     0,
+                     0,
+                     0);
 
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
@@ -621,6 +668,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         const bool is_causal,
         const int window_size_left,
         int window_size_right,
+        const c10::optional<at::Tensor> &attn_bias,
         c10::optional<at::Generator> gen_,
         c10::optional<at::Tensor> &rng_state) {
 
@@ -686,6 +734,27 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
     CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size);
     CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size_og);
+
+    // Attention biases
+    uint32_t attn_bias_batch_stride = 0;
+    uint32_t attn_bias_head_stride = 0;
+    uint32_t attn_bias_q_stride = 0;
+    at::Tensor ds;
+
+    if (attn_bias.has_value()) {
+        TORCH_CHECK(attn_bias.value().is_cuda(), "Input tensor must be on CUDA device");
+        TORCH_CHECK(attn_bias.value().stride(-1) == 1, "Input tensor must have contiguous last dimension");
+        TORCH_CHECK(attn_bias.value().dtype() == q_dtype, "attention bias and query must have the same dtype");
+        CHECK_SHAPE(attn_bias.value(), batch_size, num_heads, seqlen_q, seqlen_k);
+
+        attn_bias_batch_stride = attn_bias.value().stride(0);
+        attn_bias_head_stride = attn_bias.value().stride(1);
+        attn_bias_q_stride = attn_bias.value().stride(2);
+
+        ds = torch::empty({batch_size, num_heads, seqlen_q, seqlen_k}, q_dtype);
+        ds.zero_();
+        TORCH_CHECK(ds.is_contiguous());
+    }
 
     at::Tensor dq, dk, dv;
     if (dq_.has_value()) {
@@ -772,7 +841,12 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     attn_bias ? attn_bias->data_ptr() : nullptr,
+                     attn_bias ? ds.data_ptr() : nullptr,
+                     attn_bias_batch_stride,
+                     attn_bias_head_stride,
+                     attn_bias_q_stride);
 
     auto launch = &run_mha_bwd;
     // launch(params, stream, /*configure=*/true);
@@ -997,7 +1071,12 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     nullptr,
+                     nullptr,
+                     0,
+                     0,
+                     0);
 
     auto launch = &run_mha_bwd;
     // launch(params, stream, /*configure=*/true);
@@ -1159,7 +1238,11 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      /*p_dropout=*/0.f,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     nullptr,
+                     0,
+                     0,
+                     0);
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {

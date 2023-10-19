@@ -10,10 +10,10 @@
 #include "flash.h"
 #include "flash_fwd_kernel.h"
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Return_softmax>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_attn_bias, bool Is_even_MN, bool Is_even_K, bool Return_softmax>
 __global__ void flash_fwd_kernel(Flash_fwd_params params) {
     static_assert(!(Is_causal && Is_local));  // If Is_local is true, Is_causal should be false
-    flash::compute_attn<Kernel_traits, Is_dropout, Is_causal, Is_local, Is_even_MN, Is_even_K, Return_softmax>(params);
+    flash::compute_attn<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_attn_bias, Is_even_MN, Is_even_K, Return_softmax>(params);
 }
 
 template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV>
@@ -41,26 +41,30 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
     const bool return_softmax = params.p_ptr != nullptr;
-    BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
-        BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
-            BOOL_SWITCH(params.window_size_left >= 0 || params.window_size_right >= 0, Is_local, [&] {
-                BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
-                    // Will only return softmax if dropout, to reduce compilation time.
-                    // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
-                    // If return_softmax, set IsEvenMNConst to false to reduce number of templates
-                    // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
-                    // If Is_local, set Is_causal to false
-                    auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal && !Is_local, Is_local, IsEvenMNConst && IsEvenKConst && !Is_local && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, ReturnSoftmaxConst && Is_dropout>;
-                    if (smem_size >= 48 * 1024) {
-                        C10_CUDA_CHECK(cudaFuncSetAttribute(
-                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-                    }
-                    // int ctas_per_sm;
-                    // cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                    //     &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
-                    // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
-                    kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
-                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    const bool has_attn_bias = (params.attn_bias_ptr != nullptr);
+
+    BOOL_SWITCH(has_attn_bias, HasAttnBias, [&] {
+        BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
+            BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
+                BOOL_SWITCH(params.window_size_left >= 0 || params.window_size_right >= 0, Is_local, [&] {
+                    BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
+                        // Will only return softmax if dropout, to reduce compilation time.
+                        // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
+                        // If return_softmax, set IsEvenMNConst to false to reduce number of templates
+                        // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
+                        // If Is_local, set Is_causal to false
+                        auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal && !Is_local, Is_local, HasAttnBias, IsEvenMNConst && IsEvenKConst && !Is_local && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, ReturnSoftmaxConst && Is_dropout>;
+                        if (smem_size >= 48 * 1024) {
+                            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                        }
+                        // int ctas_per_sm;
+                        // cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                        //     &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
+                        // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
+                        kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+                        C10_CUDA_KERNEL_LAUNCH_CHECK();
+                    });
                 });
             });
         });
