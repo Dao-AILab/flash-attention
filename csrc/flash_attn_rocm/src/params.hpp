@@ -30,6 +30,7 @@
 #include "utils.hpp"
 
 // TODO: Use shared_ptr to use the same memory of BaseParams when calling forward/backward parameters
+// TODO: Fix input constness
 // Common argements used by both batched & grouped gemms
 struct BaseParams {
   explicit BaseParams(const Index b,
@@ -591,16 +592,6 @@ struct FlashBwdGroupedParams : public GroupedParams {
       int curr_dq_batch_stride = seqlens_q[i] * dq_seq_stride;
       int curr_dkv_batch_stride = seqlens_kv[i] * dkv_seq_stride;
       int curr_dout_batch_stride = seqlens_q[i] * dout_seq_stride;
-
-      if(!is_mnko_padding && d <= 32) {
-        is_mnko_padding = ((seqlens_q[i] % 128)==0 && (seqlens_kv[i] % 128)==0 ? false : true);
-      }
-      else if(!is_mnko_padding && d <= 64) {
-        is_mnko_padding = ((seqlens_q[i] % 128)==0 && (seqlens_kv[i] % 128)==0 ? false : true);
-      }
-      else if(!is_mnko_padding && d <= 128) {
-        is_mnko_padding = ((seqlens_q[i] % 64)==0 && (seqlens_kv[i] % 128)==0 ? false : true);
-      }
 
       dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));
       dq_ptr += get_size_in_bytes(curr_dq_batch_stride, dq.dtype());
