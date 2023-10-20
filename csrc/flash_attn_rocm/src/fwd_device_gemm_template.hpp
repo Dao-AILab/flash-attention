@@ -386,7 +386,7 @@ using DeviceGemmBatchedHeadDim32 = device_op::DeviceBatchedMultiheadAttentionFor
         8,
         8,
         true,
-        4,
+        1, // 4,
         device_gemm_trait::S<16, 16, 1>,   // B1BlockTransfer
         device_gemm_trait::S<0, 2, 1>,
         device_gemm_trait::S<0, 2, 1>,
@@ -398,7 +398,7 @@ using DeviceGemmBatchedHeadDim32 = device_op::DeviceBatchedMultiheadAttentionFor
         1,              // CShuffleNXdlPerWavePerShuffle
         device_gemm_trait::S<1, 64, 1, 4>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
-        4,
+        1, // 4,
         DeviceGemmTraits::kMaskingSpec,    // MaskingSpecialization
         DeviceGemmTraits::kIsDeterministic>;
 
@@ -461,7 +461,7 @@ using DeviceGemmBatchedHeadDim64 = device_op::DeviceBatchedMultiheadAttentionFor
         8,
         8,
         true,
-        4,
+        1, // 4,
         device_gemm_trait::S<16, 16, 1>,   // B1BlockTransfer
         device_gemm_trait::S<0, 2, 1>,
         device_gemm_trait::S<0, 2, 1>,
@@ -473,7 +473,7 @@ using DeviceGemmBatchedHeadDim64 = device_op::DeviceBatchedMultiheadAttentionFor
         2,              // CShuffleNXdlPerWavePerShuffle
         device_gemm_trait::S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
-        4,
+        1, // 4,
         DeviceGemmTraits::kMaskingSpec,    // MaskingSpecialization
         DeviceGemmTraits::kIsDeterministic>;
 
@@ -536,7 +536,7 @@ using DeviceGemmBatchedHeadDim64NonDrop = device_op::DeviceBatchedMultiheadAtten
         8,
         8,
         true,
-        4,
+        1, // 4,
         device_gemm_trait::S<16, 16, 1>,   // B1BlockTransfer
         device_gemm_trait::S<0, 2, 1>,
         device_gemm_trait::S<0, 2, 1>,
@@ -548,7 +548,7 @@ using DeviceGemmBatchedHeadDim64NonDrop = device_op::DeviceBatchedMultiheadAtten
         2,              // CShuffleNXdlPerWavePerShuffle
         device_gemm_trait::S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
-        4,
+        1, // 4,
         DeviceGemmTraits::kMaskingSpec,    // MaskingSpecialization
         DeviceGemmTraits::kIsDeterministic>;
 
@@ -586,7 +586,7 @@ using DeviceGemmBatchedHeadDim128 = device_op::DeviceBatchedMultiheadAttentionFo
         128,         // MPerBlock
         128,         // NPerBlock
         32,          // KPerBlock
-        64,          // Gemm1NPerBlock
+        128, // 64,          // Gemm1NPerBlock
         32,          // Gemm1KPerBlock
         8,           // AK1
         8,           // BK1
@@ -595,7 +595,7 @@ using DeviceGemmBatchedHeadDim128 = device_op::DeviceBatchedMultiheadAttentionFo
         32,          // NPerXDL
         1,           // MXdlPerWave
         4,           // NXdlPerWave
-        2,           // Gemm1NXdlPerWave
+        4, // 2,           // Gemm1NXdlPerWave
         1,           // DropoutStep
         device_gemm_trait::S<4, 64, 1>,    // ABlockTransfer
         device_gemm_trait::S<1, 0, 2>,
@@ -611,7 +611,7 @@ using DeviceGemmBatchedHeadDim128 = device_op::DeviceBatchedMultiheadAttentionFo
         8,
         8,
         true,
-        4,
+        1, // 4,
         device_gemm_trait::S<8, 32, 1>,   // B1BlockTransfer
         device_gemm_trait::S<0, 2, 1>,
         device_gemm_trait::S<0, 2, 1>,
@@ -623,7 +623,7 @@ using DeviceGemmBatchedHeadDim128 = device_op::DeviceBatchedMultiheadAttentionFo
         2,              // CShuffleNXdlPerWavePerShuffle
         device_gemm_trait::S<1, 32, 1, 8>,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
-        4,
+        1, // 4,
         DeviceGemmTraits::kMaskingSpec,     // MaskingSpecialization
         DeviceGemmTraits::kIsDeterministic>;
 } // namespace fwd_device_gemm

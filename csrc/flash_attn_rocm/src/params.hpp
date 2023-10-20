@@ -1,10 +1,26 @@
 // BSD 3 Clause
 // Copyright 2023 Advanced Micro Devices, Inc.
-// Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
-// 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
-// 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
-// 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+// 1. Redistributions of source code must retain the above copyright notice,
+// this list of conditions and the following disclaimer.
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+// this list of conditions and the following disclaimer in the documentation
+// and/or other materials provided with the distribution.
+// 3. Neither the name of the copyright holder nor the names of its contributors
+// may be used to endorse or promote products derived from this software without
+// specific prior written permission. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT
+// HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+// INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+// FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+// COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+// INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA,
+// OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+// LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+// NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
+// EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
 
 #pragma once
 
@@ -163,23 +179,23 @@ struct BatchedParams : public BaseParams {
     }
 
     // Q layout [b, max_seqlen_q, h_q, d]
-    std::vector<Index> q_lengths{b, h_q, max_seqlen_q, d};
-    std::vector<Index> q_strides{q_batch_stride, q_head_stride, q_seq_stride, 1};
+    q_lengths = std::vector<Index>{b, h_q, max_seqlen_q, d};
+    q_strides = std::vector<Index>{q_batch_stride, q_head_stride, q_seq_stride, 1};
 
     // K layout [b, max_seqlen_kv, h_kv, d]
-    std::vector<Index> k_lengths{b, h_kv, max_seqlen_kv, d};
-    std::vector<Index> k_strides{kv_batch_stride, kv_head_stride, kv_seq_stride, 1};
+    k_lengths = std::vector<Index>{b, h_kv, max_seqlen_kv, d};
+    k_strides = std::vector<Index>{kv_batch_stride, kv_head_stride, kv_seq_stride, 1};
 
     // V layout [b, max_seqlen_kv, h_kv, d]
-    std::vector<Index> v_lengths{b, h_kv, d, max_seqlen_kv};
-    std::vector<Index> v_strides{kv_batch_stride, kv_head_stride, 1, kv_seq_stride};
+    v_lengths = std::vector<Index>{b, h_kv, d, max_seqlen_kv};
+    v_strides = std::vector<Index>{kv_batch_stride, kv_head_stride, 1, kv_seq_stride};
 
     // Y layout [b, max_seqlen_q, h_q, d]
-    std::vector<Index> out_lengths{b, h_q, max_seqlen_q, d};
-    std::vector<Index> out_strides{out_batch_stride, out_head_stride, out_seq_stride, 1};
+    out_lengths = std::vector<Index>{b, h_q, max_seqlen_q, d};
+    out_strides = std::vector<Index>{out_batch_stride, out_head_stride, out_seq_stride, 1};
 
-    std::vector<Index> z_lengths{b, h_q, max_seqlen_q, max_seqlen_kv};
-    std::vector<Index> z_strides = 
+    z_lengths = std::vector<Index>{b, h_q, max_seqlen_q, max_seqlen_kv};
+    z_strides = 
         z_permute ? 
         std::vector<Index>{h_q*max_seqlen_q*max_seqlen_kv, max_seqlen_kv, h_q*max_seqlen_kv, 1} :
         // Z layout [b, max_seqlen_q, h_q, max_seqlen_kv]
@@ -187,7 +203,7 @@ struct BatchedParams : public BaseParams {
         // Z layout [b, h_q, max_seqlen_q, max_seqlen_kv]
 
     // LSE layout [b, h_q, max_seqlen_q]
-    std::vector<Index> lse_lengths{b, h_q, max_seqlen_q};
+    lse_lengths = std::vector<Index>{b, h_q, max_seqlen_q};
     // std::vector<Index> lse_strides{h_q*max_seqlen_q, max_seqlen_q, 1};
   }
   
@@ -300,6 +316,7 @@ struct FlashBwdBatchedParams : public BatchedParams {
     Index dkv_seq_stride = dk.stride(-3);
     Index dkv_head_stride = dk.stride(-2);
       
+    // MQA / GQA readiness
     // KGrad layout [b, max_seqlen_kv, h_q, d]
     std::vector<Index> dk_lengths{b, h_q, max_seqlen_kv, d};
     std::vector<Index> dk_strides{dkv_batch_stride, dkv_head_stride, dkv_seq_stride, 1};
@@ -329,8 +346,8 @@ struct GroupedParams : public BaseParams {
                          const at::Tensor &k,
                          const at::Tensor &v,
                          torch::Tensor &out,
-                         void* cu_seqlens_q_d,
-                         void* cu_seqlens_k_d,
+                         const void* cu_seqlens_q_d,
+                         const void* cu_seqlens_k_d,
                          void* z_d,
                          void* softmax_lse_d,
                          float p_dropout,
@@ -351,8 +368,8 @@ struct GroupedParams : public BaseParams {
                  softmax_scale,
                  is_causal,
                  z_permute),
-      seqlens_q(get_host_seqlens(cu_seqlens_q_d, b)),
-      seqlens_kv(get_host_seqlens(cu_seqlens_k_d, b)) {
+      seqlens_q(get_host_seqlens(static_cast<const int*>(cu_seqlens_q_d), b)),
+      seqlens_kv(get_host_seqlens(static_cast<const int*>(cu_seqlens_k_d), b)) {
     
     char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
     char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
@@ -482,8 +499,8 @@ struct FlashFwdGroupedParams : public GroupedParams {
                                  const torch::Tensor &k,
                                  const torch::Tensor &v,
                                  torch::Tensor &out,
-                                 void* cu_seqlens_q_d,
-                                 void* cu_seqlens_k_d,
+                                 const void* cu_seqlens_q_d,
+                                 const void* cu_seqlens_k_d,
                                  void* z_d,
                                  void* softmax_lse_d,
                                  float p_dropout,
@@ -525,8 +542,8 @@ struct FlashBwdGroupedParams : public GroupedParams {
                                  torch::Tensor &dq,
                                  torch::Tensor &dk,
                                  torch::Tensor &dv,
-                                 void* cu_seqlens_q_d,
-                                 void* cu_seqlens_k_d,
+                                 const void* cu_seqlens_q_d,
+                                 const void* cu_seqlens_k_d,
                                  void* z_d,
                                  void* softmax_lse_d,
                                  float p_dropout,
@@ -562,20 +579,18 @@ struct FlashBwdGroupedParams : public GroupedParams {
     char* dv_ptr = reinterpret_cast<char*>(dv.data_ptr());
     char* dout_ptr = reinterpret_cast<char*>(dout.data_ptr());
 
-    Index dq_seq_stride = dk.stride(-3);
+    Index dq_seq_stride = dq.stride(-3);
     Index dkv_seq_stride = dk.stride(-3);
     Index dout_seq_stride = dout.stride(-3);
-    Index dq_head_stride = dk.stride(-2);
+    Index dq_head_stride = dq.stride(-2);
     Index dkv_head_stride = dk.stride(-2);
     Index dout_head_stride = dout.stride(-2);
 
     for (int i = 0; i < b; ++i) {
       // TODO: reuse it in the foward on GPU
-      int curr_q_batch_stride = seqlens_q[i] * q_seq_stride;
-      int curr_kv_batch_stride = seqlens_kv[i] * kv_seq_stride;
-
       int curr_dq_batch_stride = seqlens_q[i] * dq_seq_stride;
       int curr_dkv_batch_stride = seqlens_kv[i] * dkv_seq_stride;
+      int curr_dout_batch_stride = seqlens_q[i] * dout_seq_stride;
 
       if(!is_mnko_padding && d <= 32) {
         is_mnko_padding = ((seqlens_q[i] % 128)==0 && (seqlens_kv[i] % 128)==0 ? false : true);
@@ -597,13 +612,14 @@ struct FlashBwdGroupedParams : public GroupedParams {
       dv_ptr += get_size_in_bytes(curr_dkv_batch_stride, dv.dtype());
 
       dout_ptrs.push_back(reinterpret_cast<const void*>(dout_ptr));
-      dout_ptr += get_size_in_bytes(dout_head_stride, dout.dtype());
+      dout_ptr += get_size_in_bytes(curr_dout_batch_stride, dout.dtype());
 
       auto opts = q.options();
       torch::Tensor d_tensor;
       d_tensor = torch::empty({1, static_cast<long>(h_q), seqlens_q[i]}, opts.dtype(torch::kFloat32));
       d_ptrs.push_back(reinterpret_cast<void*>(d_tensor.data_ptr()));
 
+      // MQA / GQA readiness
       // KGrad layout [b, max_seqlen_kv, h_q, d]
       std::vector<Index> dk_lengths{1, h_q, max_seqlen_kv, d};
       std::vector<Index> dk_strides{curr_dkv_batch_stride, dkv_head_stride, dkv_seq_stride, 1};
@@ -629,6 +645,7 @@ struct FlashBwdGroupedParams : public GroupedParams {
   std::vector<const void*> dout_ptrs;
   std::vector<void*> d_ptrs;
 
+  // MQA / GQA readiness
   std::vector<std::vector<Index>> dk_lengths_vec;
   std::vector<std::vector<Index>> dk_strides_vec;
   std::vector<std::vector<Index>> dv_lengths_vec;
