@@ -364,6 +364,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // We don't put the masking before the matmul S = Q K^T because we don't clear sK
         // for rows outside actual_seqlen_k. So those rows could have Inf / NaN, and the matmul
         // can produce Inf / NaN.
+
+        if (Is_alibi) {
+            flash::apply_alibi(scores, n_block * kBlockN, bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
+        }
+
         if (!Is_causal && !Is_local) {
             if (!Is_even_MN) { flash::apply_mask(scores, binfo.actual_seqlen_k - n_block * kBlockN); }
         } else {
@@ -399,10 +404,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
-        }
-
-        if (Is_alibi) {
-            flash::apply_alibi(scores, n_block * kBlockN, bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
         }
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
@@ -472,6 +473,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        
+        if (Is_alibi) {
+            flash::apply_alibi(scores, n_block * kBlockN, bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
+        }
+        
         if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
             flash::apply_mask_local(
                 scores, n_block * kBlockN, binfo.actual_seqlen_k,
@@ -479,10 +485,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 binfo.actual_seqlen_q, kNWarps * 16,
                 params.window_size_left, params.window_size_right
             );
-        }
-
-        if (Is_alibi) {
-            flash::apply_alibi(scores, n_block * kBlockN, bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
         }
 
         softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);

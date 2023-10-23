@@ -814,6 +814,13 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (col=(2, MMA_N), row=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         // if (cute::thread(32, 0)) { print(scores); }
+
+        if (Is_alibi) {
+            flash::apply_alibi(scores, 
+                               n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16, 
+                               bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
+        }
+        
         // TD [2023-07-29]: I was thinking that we don't need to mask out the elements beyond
         // actual_seqlen_k, because acc_s would be some finite value for those indices.
         // In the end when we multiply with K to get dQ, the corresponding values of K would be 0,
@@ -849,12 +856,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                                         params.window_size_left, params.window_size_right);
             }
 
-        }
-
-        if (Is_alibi) {
-            flash::apply_alibi(scores, 
-                               n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16, 
-                               bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
         }
 
         // if (cute::thread(32, 0)) { print(scores); }
@@ -1392,6 +1393,13 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
 
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (col=(2, MMA_N), row=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+
+        if (Is_alibi) {
+            flash::apply_alibi(scores, 
+                               n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16, 
+                               bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
+        }
+
         // We don't need to mask out the elements beyond actual_seqlen_k, because acc_s would
         // be some finite value for those indices. In the end when we multiply with K to get dQ,
         // the corresponding values of K would be 0, so the result would still be correct.
@@ -1401,12 +1409,6 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
                                      // binfo.actual_seqlen_k, m_block * kBlockM + (tidx / 32) % AtomLayoutMS * 16 + (tidx % 32) / 4,
                                      binfo.actual_seqlen_q,
                                      AtomLayoutMS * 16);
-        }
-
-        if (Is_alibi) {
-            flash::apply_alibi(scores, 
-                               n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16, 
-                               bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
         }
 
         // Compute the exponential value.
