@@ -1088,7 +1088,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 const int window_size_left,
                 int window_size_right,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int num_splits
+                int num_splits,
+                const bool is_alibi,
+                const float alibi_start,
+                const float alibi_ratio
                 ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1197,9 +1200,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     false,
-                     0.0f,
-                     0.0f);
+                     is_alibi,
+                     alibi_start,
+                     alibi_ratio);
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {

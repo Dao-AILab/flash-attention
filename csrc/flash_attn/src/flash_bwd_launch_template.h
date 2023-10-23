@@ -107,9 +107,9 @@ void run_flash_bwd_seqq_parallel(Flash_bwd_params &params, cudaStream_t stream, 
     constexpr int smem_size_dq_dk_dv = Kernel_traits::kSmemSize1rowblock;
     // printf("smem_size_dq_dk_dv = %d\n", smem_size_dq_dk_dv);
     BOOL_SWITCH(params.is_causal, IsCausalConst, [&] {
-        BOOL_SWITCH(params.is_alibi, IsAlibiConst, [&] {
-            BOOL_SWITCH(is_even_N, IsEvenNConst, [&] {
-                BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
+        BOOL_SWITCH(is_even_N, IsEvenNConst, [&] {
+            BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
+                BOOL_SWITCH(params.is_alibi, IsAlibiConst, [&] {
                     // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
                     auto kernel = &flash_bwd_dq_dk_dv_loop_seqq_parallel_kernel<Kernel_traits, Is_dropout, IsCausalConst, IsAlibiConst, IsEvenNConst && IsEvenKConst, IsEvenKConst>;
                     // auto kernel = &flash_bwd_dq_dk_dv_loop_seqq_parallel_kernel<Kernel_traits, false, false, IsEvenNConst, IsEvenKConst>;

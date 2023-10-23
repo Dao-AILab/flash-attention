@@ -1045,6 +1045,9 @@ def flash_attn_with_kvcache(
     window_size=(-1, -1),  # -1 means infinite context window
     rotary_interleaved=True,
     num_splits=0,
+    alibi=False,
+    alibi_start=0.0,
+    alibi_ratio=0.0
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -1149,5 +1152,8 @@ def flash_attn_with_kvcache(
         window_size[1],
         rotary_interleaved,
         num_splits,
+        alibi,
+        alibi_start,
+        alibi_ratio
     )
     return out
