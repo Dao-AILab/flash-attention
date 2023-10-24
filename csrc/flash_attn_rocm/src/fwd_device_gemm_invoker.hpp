@@ -43,19 +43,19 @@ class DeviceGemmInvoker {
       params.out_ptr,        
       params.z_ptr,
       params.softmax_lse_ptr,
-      {},
-      {},
-      params.q_gs_ms_ks_lengths,
-      params.q_gs_ms_ks_strides,
-      params.k_gs_ns_ks_lengths,
-      params.k_gs_ns_ks_strides,
-      params.v_gs_gemm1ns_gemm1ks_lengths,
-      params.v_gs_gemm1ns_gemm1ks_strides,
-      params.out_gs_ms_gemm1ns_lengths,
-      params.out_gs_ms_gemm1ns_strides,
-      params.z_gs_ms_ns_lengths,
-      params.z_gs_ms_ns_strides,
-      params.lse_gs_ms_lengths,
+      nullptr,
+      nullptr,
+      params.q_lengths,
+      params.q_strides,
+      params.k_lengths,
+      params.k_strides,
+      params.v_lengths,
+      params.v_strides,
+      params.out_lengths,
+      params.out_strides,
+      params.z_lengths,
+      params.z_strides,
+      params.lse_lengths,
       {},
       {},
       {},
@@ -89,18 +89,18 @@ class DeviceGemmInvoker {
 
     for (int i = 0; i < params.b; ++i) {
       problem_descs.push_back({
-          params.problem_descs[i].q_gs_ms_ks_lengths,
-          params.problem_descs[i].q_gs_ms_ks_strides,
-          params.problem_descs[i].k_gs_ns_ks_lengths,
-          params.problem_descs[i].k_gs_ns_ks_strides,
-          params.problem_descs[i].v_gs_gemm1ns_gemm1ks_lengths,
-          params.problem_descs[i].v_gs_gemm1ns_gemm1ks_strides,
-          params.problem_descs[i].out_gs_ms_gemm1ns_lengths,
-          params.problem_descs[i].out_gs_ms_gemm1ns_strides,          
-          params.problem_descs[i].z_gs_ms_ns_lengths,
-          params.problem_descs[i].z_gs_ms_ns_strides,
-          params.problem_descs[i].lse_gs_ms_lengths,
-          params.problem_descs[i].lse_gs_ms_strides,
+          params.q_lengths_vec[i],
+          params.q_strides_vec[i],
+          params.k_lengths_vec[i],
+          params.k_strides_vec[i],
+          params.v_lengths_vec[i],
+          params.v_strides_vec[i],
+          params.out_lengths_vec[i],
+          params.out_strides_vec[i],          
+          params.z_lengths_vec[i],
+          params.z_strides_vec[i],
+          params.lse_lengths_vec[i],
+          params.lse_strides_vec[i],
           {}, // acc0_biases_gs_ms_ns_lengths
           {}, // acc0_biases_gs_ms_ns_strides
           {}, // acc1_biases_gs_ms_os_lengths
@@ -136,8 +136,7 @@ class DeviceGemmInvoker {
     // specify workspace for problem_desc
     DeviceMem problem_desc_workspace{ gemm_ptr->GetWorkSpaceSize(argument_ptr.get()) };
 
-    gemm_ptr->SetWorkSpacePointer(argument_ptr.get(),
-                            problem_desc_workspace.GetDeviceBuffer());
+    gemm_ptr->SetWorkSpacePointer(argument_ptr.get(), problem_desc_workspace.GetDeviceBuffer());
 
     if (!gemm_ptr->IsSupportedArgument(argument_ptr.get())) {
       throw std::runtime_error(gemm_ptr->GetTypeString() + " does not support this problem");

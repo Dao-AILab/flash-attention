@@ -43,24 +43,24 @@ class DeviceGemmInvoker {
       params.v_ptr,
       params.out_ptr,
       params.softmax_lse_ptr,
-      params.d_ptr,
+      params.dsoftmax_ptr,
       params.dout_ptr, 
       params.dq_ptr,
       params.dk_ptr,
       params.dv_ptr,
-      {},
-      {},
-      params.q_gs_ms_ks_lengths,
-      params.q_gs_ms_ks_strides,
-      params.k_gs_ns_ks_lengths,
-      params.k_gs_ns_ks_strides,
-      params.z_gs_ms_ns_lengths,
-      params.z_gs_ms_ns_strides,
-      params.v_gs_gemm1ns_gemm1ks_lengths,
-      params.v_gs_gemm1ns_gemm1ks_strides,
-      params.out_gs_ms_gemm1ns_lengths,
-      params.out_gs_ms_gemm1ns_strides,
-      params.lse_gs_ms_lengths,
+      nullptr,
+      nullptr,
+      params.q_lengths,
+      params.q_strides,
+      params.k_lengths,
+      params.k_strides,
+      params.z_lengths,
+      params.z_strides,
+      params.v_lengths,
+      params.v_strides,
+      params.out_lengths,
+      params.out_strides,
+      params.lse_lengths,
       {},
       {},
       {},
@@ -94,18 +94,18 @@ class DeviceGemmInvoker {
 
     for (int i = 0; i < params.b; ++i) {
       problem_descs.push_back({
-          params.problem_descs[i].q_gs_ms_ks_lengths,
-          params.problem_descs[i].q_gs_ms_ks_strides,
-          params.problem_descs[i].k_gs_ns_ks_lengths,
-          params.problem_descs[i].k_gs_ns_ks_strides,
-          params.problem_descs[i].z_gs_ms_ns_lengths,
-          params.problem_descs[i].z_gs_ms_ns_strides,
-          params.problem_descs[i].v_gs_gemm1ns_gemm1ks_lengths,
-          params.problem_descs[i].v_gs_gemm1ns_gemm1ks_strides,
-          params.problem_descs[i].out_gs_ms_gemm1ns_lengths,
-          params.problem_descs[i].out_gs_ms_gemm1ns_strides,
-          params.problem_descs[i].lse_gs_ms_lengths,
-          params.problem_descs[i].lse_gs_ms_strides,
+          params.q_lengths_vec[i],
+          params.q_strides_vec[i],
+          params.k_lengths_vec[i],
+          params.k_strides_vec[i],
+          params.z_lengths_vec[i],
+          params.z_strides_vec[i],
+          params.v_lengths_vec[i],
+          params.v_strides_vec[i],
+          params.out_lengths_vec[i],
+          params.out_strides_vec[i],
+          params.lse_lengths_vec[i],
+          params.lse_strides_vec[i],
           {}, // acc0_biases_gs_ms_ns_lengths
           {}, // acc0_biases_gs_ms_ns_strides
           {}, // acc1_biases_gs_ms_os_lengths
@@ -119,7 +119,7 @@ class DeviceGemmInvoker {
     TORCH_CHECK(problem_descs.size() == params.v_ptrs.size(), "Wrong v_ptrs size", params.v_ptrs.size());
     TORCH_CHECK(problem_descs.size() == params.bwd_out_ptrs.size(), "Wrong out_ptrs size", params.bwd_out_ptrs.size());
     TORCH_CHECK(problem_descs.size() == params.bwd_softmax_lse_ptrs.size(), "Wrong softmax_lse_ptrs size", params.bwd_softmax_lse_ptrs.size());
-    TORCH_CHECK(problem_descs.size() == params.d_ptrs.size(), "Wrong d_ptrs size", params.d_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.dsoftmax_ptrs.size(), "Wrong dsoftmax_ptrs size", params.dsoftmax_ptrs.size());
     TORCH_CHECK(problem_descs.size() == params.dout_ptrs.size(), "Wrong dout_ptrs size", params.dout_ptrs.size());
     TORCH_CHECK(problem_descs.size() == params.dq_ptrs.size(), "Wrong dq_ptrs size", params.dq_ptrs.size());
     TORCH_CHECK(problem_descs.size() == params.dk_ptrs.size(), "Wrong dk_ptrs size", params.dk_ptrs.size());
@@ -132,7 +132,7 @@ class DeviceGemmInvoker {
         params.v_ptrs,
         params.bwd_out_ptrs,
         params.bwd_softmax_lse_ptrs,
-        params.d_ptrs,
+        params.dsoftmax_ptrs,
         params.dout_ptrs, 
         params.dq_ptrs,
         params.dk_ptrs,
