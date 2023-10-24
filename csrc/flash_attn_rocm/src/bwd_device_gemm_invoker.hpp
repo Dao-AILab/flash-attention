@@ -43,7 +43,7 @@ class DeviceGemmInvoker {
       params.v_ptr,
       params.out_ptr,
       params.softmax_lse_ptr,
-      params.d_ptr,
+      params.dsoftmax_ptr,
       params.dout_ptr, 
       params.dq_ptr,
       params.dk_ptr,
@@ -119,7 +119,7 @@ class DeviceGemmInvoker {
     TORCH_CHECK(problem_descs.size() == params.v_ptrs.size(), "Wrong v_ptrs size", params.v_ptrs.size());
     TORCH_CHECK(problem_descs.size() == params.bwd_out_ptrs.size(), "Wrong out_ptrs size", params.bwd_out_ptrs.size());
     TORCH_CHECK(problem_descs.size() == params.bwd_softmax_lse_ptrs.size(), "Wrong softmax_lse_ptrs size", params.bwd_softmax_lse_ptrs.size());
-    TORCH_CHECK(problem_descs.size() == params.d_ptrs.size(), "Wrong d_ptrs size", params.d_ptrs.size());
+    TORCH_CHECK(problem_descs.size() == params.dsoftmax_ptrs.size(), "Wrong dsoftmax_ptrs size", params.dsoftmax_ptrs.size());
     TORCH_CHECK(problem_descs.size() == params.dout_ptrs.size(), "Wrong dout_ptrs size", params.dout_ptrs.size());
     TORCH_CHECK(problem_descs.size() == params.dq_ptrs.size(), "Wrong dq_ptrs size", params.dq_ptrs.size());
     TORCH_CHECK(problem_descs.size() == params.dk_ptrs.size(), "Wrong dk_ptrs size", params.dk_ptrs.size());
@@ -132,7 +132,7 @@ class DeviceGemmInvoker {
         params.v_ptrs,
         params.bwd_out_ptrs,
         params.bwd_softmax_lse_ptrs,
-        params.d_ptrs,
+        params.dsoftmax_ptrs,
         params.dout_ptrs, 
         params.dq_ptrs,
         params.dk_ptrs,

@@ -106,11 +106,12 @@ mha_fwd(const torch::Tensor &q,                         // batch_size x seqlen_q
                                k_padded,
                                v_padded,
                                out,
-                               return_softmax ? z.data_ptr() : nullptr,
-                               softmax_lse.data_ptr(),
+                               z,
+                               softmax_lse,
                                p_dropout,
                                softmax_scale,
-                               is_causal);
+                               is_causal,
+                               return_softmax);
 
   // number of times random will be generated per thread, to offset philox counter in thc random
   // state
@@ -133,7 +134,7 @@ mha_fwd(const torch::Tensor &q,                         // batch_size x seqlen_q
 
   auto stream = at::cuda::getCurrentHIPStream().stream();
   auto flash_runner = std::make_unique<FlashRunner>();
-  flash_runner->Run<FlashFwdBatchedParams>(params, stream);
+  flash_runner->Run(params, stream);
 
   torch::Tensor out_padded = out;
   if (head_size_og % 8 != 0) {
@@ -146,13 +147,13 @@ mha_fwd(const torch::Tensor &q,                         // batch_size x seqlen_q
 
 std::vector<torch::Tensor>
 mha_varlen_fwd(const torch::Tensor &q,  // total_q x num_heads_q x head_size, total_q := \sum_{i=0}^{b} s_i
-               const torch::Tensor &k,  // total_k x num_heads_kv x head_size, total_k := \sum_{i=0}^{b} s_i
-               const torch::Tensor &v,  // total_k x num_heads_kv x head_size, total_k := \sum_{i=0}^{b} s_i
-               c10::optional<torch::Tensor> &out_, // total_q x num_heads_q x head_size, total_k := \sum_{i=0}^{b} s_i
+               const torch::Tensor &k,  // total_kv x num_heads_kv x head_size, total_kv := \sum_{i=0}^{b} s_i
+               const torch::Tensor &v,  // total_kv x num_heads_kv x head_size, total_kv := \sum_{i=0}^{b} s_i
+               c10::optional<torch::Tensor> &out_, // total_q x num_heads_q x head_size, total_kv := \sum_{i=0}^{b} s_i
                const torch::Tensor &cu_seqlens_q,  // b+1
-               const torch::Tensor &cu_seqlens_k,  // b+1
+               const torch::Tensor &cu_seqlens_kv,  // b+1
                const int max_seqlen_q,
-               const int max_seqlen_k,
+               const int max_seqlen_kv,
                const float p_dropout,
                const float softmax_scale,
                const bool zero_tensors,
@@ -173,19 +174,19 @@ mha_varlen_fwd(const torch::Tensor &q,  // total_q x num_heads_q x head_size, to
   TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
   TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
   TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
-  TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
+  TORCH_CHECK(cu_seqlens_kv.dtype() == torch::kInt32, "cu_seqlens_kv must have dtype int32");
 
   TORCH_CHECK(q.is_cuda(), "Input tensor must be on ROCm device");
   TORCH_CHECK(k.is_cuda(), "Input tensor must be on ROCm device");
   TORCH_CHECK(v.is_cuda(), "Input tensor must be on ROCm device");
   TORCH_CHECK(cu_seqlens_q.is_cuda(), "cu_seqlens_q must be on ROCm device");
-  TORCH_CHECK(cu_seqlens_k.is_cuda(), "cu_seqlens_k must be on ROCm device");
+  TORCH_CHECK(cu_seqlens_kv.is_cuda(), "cu_seqlens_kv must be on ROCm device");
 
   TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
   TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
   TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
   TORCH_CHECK(cu_seqlens_q.is_contiguous(), "cu_seqlens_q must be contiguous");
-  TORCH_CHECK(cu_seqlens_k.is_contiguous(), "cu_seqlens_k must be contiguous");
+  TORCH_CHECK(cu_seqlens_kv.is_contiguous(), "cu_seqlens_kv must be contiguous");
 
   const auto sizes = q.sizes();
 
@@ -193,7 +194,7 @@ mha_varlen_fwd(const torch::Tensor &q,  // total_q x num_heads_q x head_size, to
   const int batch_size = cu_seqlens_q.numel() - 1;
   const int num_heads_q = sizes[1];
   const int head_size_og = sizes[2];
-  const int total_k = k.size(0);
+  const int total_kv = k.size(0);
   const int num_heads_kv = k.size(1);
   TORCH_CHECK(batch_size > 0, "batch size must be positive");
   TORCH_CHECK(head_size_og <= 128, "FlashAttention forward only supports head dimension at most 128");
@@ -204,10 +205,10 @@ mha_varlen_fwd(const torch::Tensor &q,  // total_q x num_heads_q x head_size, to
   TORCH_CHECK(head_size == round_multiple(head_size_og, 8), "head_size must be head_size_og rounded to a multiple of 8");
 
   CHECK_SHAPE(q, total_q, num_heads_q, head_size_og);
-  CHECK_SHAPE(k, total_k, num_heads_kv, head_size_og);
-  CHECK_SHAPE(v, total_k, num_heads_kv, head_size_og);
+  CHECK_SHAPE(k, total_kv, num_heads_kv, head_size_og);
+  CHECK_SHAPE(v, total_kv, num_heads_kv, head_size_og);
   CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
-  CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+  CHECK_SHAPE(cu_seqlens_kv, batch_size + 1);
 
   torch::Tensor q_padded, k_padded, v_padded;
   if (head_size_og % 8 != 0) {
@@ -237,12 +238,12 @@ mha_varlen_fwd(const torch::Tensor &q,  // total_q x num_heads_q x head_size, to
   at::cuda::HIPGuard device_guard{(char)q.get_device()};
 
   auto opts = q.options();
-
   auto softmax_lse = torch::empty({batch_size, num_heads_q, max_seqlen_q}, opts.dtype(torch::kFloat32));
+
   torch::Tensor z;
   if (return_softmax) {
     // TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
-    z = torch::empty({ batch_size, num_heads_q, max_seqlen_q, max_seqlen_k }, opts.dtype(torch::kInt32));
+    z = torch::empty({ batch_size, num_heads_q, max_seqlen_q, max_seqlen_kv }, opts.dtype(torch::kInt32));
   }
   
   if (zero_tensors) {
@@ -253,7 +254,7 @@ mha_varlen_fwd(const torch::Tensor &q,  // total_q x num_heads_q x head_size, to
 
   FlashFwdGroupedParams params(batch_size,
                                max_seqlen_q, 
-                               max_seqlen_k,
+                               max_seqlen_kv,
                                num_heads_q, 
                                num_heads_kv,
                                head_size,
@@ -262,12 +263,13 @@ mha_varlen_fwd(const torch::Tensor &q,  // total_q x num_heads_q x head_size, to
                                v_padded, 
                                out,
                                cu_seqlens_q.data_ptr(),
-                               cu_seqlens_k.data_ptr(),
-                               return_softmax ? z.data_ptr() : nullptr,
-                               softmax_lse.data_ptr(),
+                               cu_seqlens_kv.data_ptr(),
+                               z,
+                               softmax_lse,
                                p_dropout,
                                softmax_scale,
-                               is_causal);
+                               is_causal,
+                               return_softmax);
 
   // number of times random will be generated per thread, to offset philox counter in thc random
   // state
@@ -290,7 +292,7 @@ mha_varlen_fwd(const torch::Tensor &q,  // total_q x num_heads_q x head_size, to
 
   auto stream = at::cuda::getCurrentHIPStream().stream();
   auto flash_runner = std::make_unique<FlashRunner>();
-  flash_runner->Run<FlashFwdGroupedParams>(params, stream);
+  flash_runner->Run(params, stream);
 
   torch::Tensor out_padded = out;
   if (head_size_og % 8 != 0) {
@@ -306,8 +308,8 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
         const torch::Tensor &q,   // batch_size x seqlen_q x num_heads_q x head_size
         const torch::Tensor &k,   // batch_size x seqlen_kv x num_heads_kv x head_size
         const torch::Tensor &v,   // batch_size x seqlen_kv x num_heads_kv x head_size
-        const torch::Tensor &out,   // batch_size x seqlen_q x num_heads_q x head_size
-        const torch::Tensor &softmax_lse,     // b x h x seqlen_q
+        torch::Tensor &out,   // batch_size x seqlen_q x num_heads_q x head_size
+        torch::Tensor &softmax_lse,     // b x h x seqlen_q
         c10::optional<torch::Tensor> &dq_,   // batch_size x seqlen_q x num_heads_q x head_size
         c10::optional<torch::Tensor> &dk_,   // batch_size x seqlen_kv x num_heads_kv x head_size
         c10::optional<torch::Tensor> &dv_,   // batch_size x seqlen_kv x num_heads_kv x head_size
@@ -369,7 +371,11 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
   CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads_q, head_size_og);
 
   torch::Tensor dq, dk, dv;
-  if (dq_.has_value()) {
+  // make dQKV passed to CK point to input dQKV iff:
+  // 1. QKV are NOT padded: padded QKV will have different memory strides from dQKV when QKV and dQKV are packed,
+  //    this is because the original packed QKV are not passed from forward to backward, instead, padded ones are passed here.
+  // 2. QKV are NOT packed: in this case, dQKV_ will be contiguous so stride of QKV and dQKV will be the same regardless of padding
+  if (dq_.has_value() && ((q.stride(0) == dq_.value().stride(0)) || dq_.value().is_contiguous())) {
     dq = dq_.value();
     TORCH_CHECK(dq.dtype() == q_dtype, "dq must have the same dtype as q");
     TORCH_CHECK(dq.is_cuda(), "dq must be on ROCm device");
@@ -378,7 +384,7 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
   } else {
     dq = torch::empty_like(q);
   }
-  if (dk_.has_value()) {
+  if (dk_.has_value() && ((k.stride(0) == dk_.value().stride(0)) || dk_.value().is_contiguous())) {
     dk = dk_.value();
     TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
     TORCH_CHECK(dk.is_cuda(), "dk must be on ROCm device");
@@ -387,14 +393,14 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
   } else {
     dk = torch::empty_like(k);
   }
-  if (dv_.has_value()) {
+  if (dv_.has_value() && ((v.stride(0) == dv_.value().stride(0)) || dv_.value().is_contiguous())) {
     dv = dv_.value();
     TORCH_CHECK(dv.dtype() == q_dtype, "dv must have the same dtype as q");
     TORCH_CHECK(dv.is_cuda(), "dv must be on ROCm device");
     TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
     CHECK_SHAPE(dv, batch_size, seqlen_kv, num_heads_kv, head_size);
   } else {
-    dv = torch::empty_like(k);
+    dv = torch::empty_like(v);
   }
 
   torch::Tensor dout_padded;
@@ -409,8 +415,10 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
   at::cuda::HIPGuard device_guard{(char)q.get_device()};
 
   auto opts = q.options();
-  auto softmax_d = torch::empty({batch_size, num_heads_q, seqlen_q}, opts.dtype(torch::kFloat32));
-
+  auto dsoftmax = torch::empty({batch_size, static_cast<long>(num_heads_q), seqlen_q}, opts.dtype(torch::kFloat32));
+  
+  // TODO: use zeros_like()
+  // CK need zeroed tensors
   dq.zero_();
 
   FlashBwdBatchedParams params(batch_size,
@@ -419,16 +427,16 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
                                num_heads_q, 
                                num_heads_kv,
                                head_size,
-                               q, 
-                               k, 
-                               v, 
-                               out,
+                               q,   // q is padded
+                               k,   // k is padded
+                               v,   // v is padded
+                               out, // out is padded
                                dout_padded, 
-                               dq, 
-                               dk, 
-                               dv,
-                               nullptr,
-                               softmax_lse.data_ptr(),
+                               dq,  // dq is padded
+                               dk,  // dk is padded
+                               dv,  // dv is padded
+                               dsoftmax,
+                               softmax_lse,
                                p_dropout,
                                softmax_scale,
                                is_causal);
@@ -453,25 +461,37 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
 
   auto stream = at::cuda::getCurrentHIPStream().stream();
   auto flash_runner = std::make_unique<FlashRunner>();
-  flash_runner->Run<FlashBwdBatchedParams>(params, stream);
+  flash_runner->Run(params, stream);
 
-  return { dq, dk, dv, softmax_d };
+  if (dq_.value().data_ptr() != dq.data_ptr()) {
+    dq_.value().index_put_({"...", "...", "...", "..."}, dq);
+  }
+
+  if (dk_.value().data_ptr() != dk.data_ptr()) {
+    dk_.value().index_put_({"...", "...", "...", "..."}, dk);
+  }
+
+  if (dv_.value().data_ptr() != dv.data_ptr()) {
+    dv_.value().index_put_({"...", "...", "...", "..."}, dv);
+  }
+
+  return { dq, dk, dv, dsoftmax };
 }
 
 std::vector<torch::Tensor>
 mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
                const torch::Tensor &q,   // total_q x num_heads_q x head_size, total_q := \sum_{i=0}^{b} s_i
-               const torch::Tensor &k,   // total_k x num_heads_kv x head_size, total_k := \sum_{i=0}^{b} s_i
-               const torch::Tensor &v,   // total_k x num_heads_kv x head_size, total_k := \sum_{i=0}^{b} s_i
-               const torch::Tensor &out,   // total_q x num_heads_q x head_size
-               const torch::Tensor &softmax_lse,     // b x h x s   softmax logsumexp
+               const torch::Tensor &k,   // total_kv x num_heads_kv x head_size, total_kv := \sum_{i=0}^{b} s_i
+               const torch::Tensor &v,   // total_kv x num_heads_kv x head_size, total_kv := \sum_{i=0}^{b} s_i
+               torch::Tensor &out,   // total_q x num_heads_q x head_size
+               torch::Tensor &softmax_lse,     // b x h x s   softmax logsumexp
                c10::optional<torch::Tensor> &dq_,   // total_q x num_heads_q x head_size, total_q := \sum_{i=0}^{b} s_i
-               c10::optional<torch::Tensor> &dk_,   // total_k x num_heads_kv x head_size, total_k := \sum_{i=0}^{b} s_i
-               c10::optional<torch::Tensor> &dv_,   // total_k x num_heads_kv x head_size, total_k := \sum_{i=0}^{b} s_i
+               c10::optional<torch::Tensor> &dk_,   // total_kv x num_heads_kv x head_size, total_kv := \sum_{i=0}^{b} s_i
+               c10::optional<torch::Tensor> &dv_,   // total_kv x num_heads_kv x head_size, total_kv := \sum_{i=0}^{b} s_i
                const torch::Tensor &cu_seqlens_q,  // b+1
-               const torch::Tensor &cu_seqlens_k,  // b+1
+               const torch::Tensor &cu_seqlens_kv,  // b+1
                const int max_seqlen_q,
-               const int max_seqlen_k,          // max sequence length to choose the kernel
+               const int max_seqlen_kv,          // max sequence length to choose the kernel
                const float p_dropout,         // probability to drop
                const float softmax_scale,
                const bool zero_tensors,
@@ -494,7 +514,7 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
   TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
   TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
   TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
-  TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
+  TORCH_CHECK(cu_seqlens_kv.dtype() == torch::kInt32, "cu_seqlens_kv must have dtype int32");
 
   TORCH_CHECK(q.is_cuda(), "Input tensor must be on ROCm device");
   TORCH_CHECK(k.is_cuda(), "Input tensor must be on ROCm device");
@@ -503,7 +523,7 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
   TORCH_CHECK(dout.is_cuda(), "dout tensor must be on ROCm device");
   TORCH_CHECK(softmax_lse.is_cuda(), "softmax_lse tensor must be on ROCm device");
   TORCH_CHECK(cu_seqlens_q.is_cuda(), "cu_seqlens_q must be on ROCm device");
-  TORCH_CHECK(cu_seqlens_k.is_cuda(), "cu_seqlens_k must be on ROCm device");
+  TORCH_CHECK(cu_seqlens_kv.is_cuda(), "cu_seqlens_kv must be on ROCm device");
 
   TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
   TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -511,7 +531,7 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
   TORCH_CHECK(out.stride(-1) == 1, "out tensor must have contiguous last dimension");
   TORCH_CHECK(dout.stride(-1) == 1, "dout tensor must have contiguous last dimension");
   TORCH_CHECK(cu_seqlens_q.is_contiguous(), "cu_seqlens_q must be contiguous");
-  TORCH_CHECK(cu_seqlens_k.is_contiguous(), "cu_seqlens_k must be contiguous");
+  TORCH_CHECK(cu_seqlens_kv.is_contiguous(), "cu_seqlens_kv must be contiguous");
 
   const auto sizes = q.sizes();
 
@@ -520,7 +540,7 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
   const int num_heads_q = sizes[1];
   const int head_size_og = dout.size(2);
   const int head_size = sizes[2];
-  const int total_k = k.size(0);
+  const int total_kv = k.size(0);
   const int num_heads_kv = k.size(1);
   TORCH_CHECK(batch_size > 0, "batch size must be positive");
   TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
@@ -531,15 +551,19 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
   TORCH_CHECK(head_size == round_multiple(head_size_og, 8), "head_size must be head_size_og rounded to a multiple of 8");
 
   CHECK_SHAPE(q, total_q, num_heads_q, head_size);
-  CHECK_SHAPE(k, total_k, num_heads_kv, head_size);
-  CHECK_SHAPE(v, total_k, num_heads_kv, head_size);
+  CHECK_SHAPE(k, total_kv, num_heads_kv, head_size);
+  CHECK_SHAPE(v, total_kv, num_heads_kv, head_size);
   CHECK_SHAPE(out, total_q, num_heads_q, head_size);
   CHECK_SHAPE(dout, total_q, num_heads_q, head_size_og);
   CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
-  CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+  CHECK_SHAPE(cu_seqlens_kv, batch_size + 1);
 
   torch::Tensor dq, dk, dv;
-  if (dq_.has_value()) {
+  // make dQKV passed to CK point to input dQKV iff:
+  // 1. QKV are NOT padded: padded QKV will have different memory strides from dQKV when QKV and dQKV are packed,
+  //    this is because the original packed QKV are not passed from forward to backward, instead, padded ones are passed here.
+  // 2. QKV are NOT packed: in this case, dQKV_ will be contiguous so stride of QKV and dQKV will be the same regardless of padding
+  if (dq_.has_value() && ((q.stride(0) == dq_.value().stride(0)) || dq_.value().is_contiguous())) {
     dq = dq_.value();
     TORCH_CHECK(dq.dtype() == q_dtype, "dq must have the same dtype as q");
     TORCH_CHECK(dq.is_cuda(), "dq must be on ROCm device");
@@ -548,32 +572,27 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
   } else {
     dq = torch::empty_like(q);
   }
-
-  if (dk_.has_value()) {
+  if (dk_.has_value() && ((k.stride(0) == dk_.value().stride(0)) || dk_.value().is_contiguous())) {
     dk = dk_.value();
     TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
     TORCH_CHECK(dk.is_cuda(), "dk must be on ROCm device");
     TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
-    CHECK_SHAPE(dk, total_k, num_heads_kv, head_size);
+    CHECK_SHAPE(dk, total_kv, num_heads_kv, head_size);
   } else {
     dk = torch::empty_like(k);
   }
-
-  if (dv_.has_value()) {
+  if (dv_.has_value() && ((v.stride(0) == dv_.value().stride(0)) || dv_.value().is_contiguous())) {
     dv = dv_.value();
     TORCH_CHECK(dv.dtype() == q_dtype, "dv must have the same dtype as q");
     TORCH_CHECK(dv.is_cuda(), "dv must be on ROCm device");
     TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
-    CHECK_SHAPE(dv, total_k, num_heads_kv, head_size);
+    CHECK_SHAPE(dv, total_kv, num_heads_kv, head_size);
   } else {
-    dv = torch::empty_like(k);
+    dv = torch::empty_like(v);
   }
 
   torch::Tensor dout_padded;
   if (head_size_og % 8 != 0) {
-    // dq = dq.contiguous();
-    // dk = dk.contiguous();
-    // dv = dv.contiguous();
     dout_padded = torch::nn::functional::pad(dout, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
   } else {
     dout_padded = dout;
@@ -584,8 +603,8 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
   at::cuda::HIPGuard device_guard{(char)q.get_device()};
 
   auto opts = q.options();
-  auto softmax_d = torch::empty({batch_size, num_heads_q, max_seqlen_q}, opts.dtype(torch::kFloat32));
-  
+  std::vector<torch::Tensor> dsoftmax_vec;
+
   // CK need zeroed tensors
   dq.zero_();
   dk.zero_();
@@ -593,22 +612,22 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
 
   FlashBwdGroupedParams params(batch_size,
                                max_seqlen_q, 
-                               max_seqlen_k,
+                               max_seqlen_kv,
                                num_heads_q, 
                                num_heads_kv,
                                head_size, 
-                               q, 
-                               k, 
-                               v, 
-                               out,
+                               q,   // q is padded
+                               k,   // k is padded
+                               v,   // v is padded
+                               out, // out is padded
                                dout_padded, 
-                               dq, 
-                               dk, 
-                               dv,
+                               dq,  // dq is padded
+                               dk,  // dk is padded
+                               dv,  // dv is padded
                                cu_seqlens_q.data_ptr(),
-                               cu_seqlens_k.data_ptr(),
-                               nullptr,
-                               softmax_lse.data_ptr(),
+                               cu_seqlens_kv.data_ptr(),
+                               dsoftmax_vec,
+                               softmax_lse,
                                p_dropout,
                                softmax_scale,
                                is_causal);
@@ -633,9 +652,21 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
 
   auto stream = at::cuda::getCurrentHIPStream().stream();
   auto flash_runner = std::make_unique<FlashRunner>();
-  flash_runner->Run<FlashBwdGroupedParams>(params, stream);
+  flash_runner->Run(params, stream);
 
-  return { dq, dk, dv, softmax_d };
+  if (dq_.value().data_ptr() != dq.data_ptr()) {
+    dq_.value().index_put_({"...", "...", "..."}, dq);
+  }
+
+  if (dk_.value().data_ptr() != dk.data_ptr()) {
+    dk_.value().index_put_({"...", "...", "..."}, dk);
+  }
+
+  if (dv_.value().data_ptr() != dv.data_ptr()) {
+    dv_.value().index_put_({"...", "...", "..."}, dv);
+  }
+
+  return { dq, dk, dv, dsoftmax_vec[0] };
 }
 
 

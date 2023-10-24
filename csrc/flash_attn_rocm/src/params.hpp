@@ -43,10 +43,10 @@ struct BaseParams {
                       const torch::Tensor &k,
                       const torch::Tensor &v,
                       torch::Tensor &out,
+                      torch::Tensor &softmax_lse, // TODO: forward reference, backward const reference
                       const float p_dropout,
                       const float softmax_scale,
-                      const bool is_causal,
-                      const bool z_permute)
+                      const bool is_causal)
     : b(b),
       max_seqlen_q(max_seqlen_q),
       max_seqlen_kv(max_seqlen_kv),
@@ -59,13 +59,13 @@ struct BaseParams {
       is_dropout(p_dropout > 0.0f),
       is_mnko_padding(false),
       is_causal(is_causal),
-      z_permute(z_permute),
       q_seq_stride(q.stride(-3)),
       kv_seq_stride(k.stride(-3)),
       out_seq_stride(out.stride(-3)),
       q_head_stride(q.stride(-2)),
       kv_head_stride(k.stride(-2)),
-      out_head_stride(out.stride(-2)) {
+      out_head_stride(out.stride(-2)),
+      softmax_lse_batch_stride(softmax_lse.stride(0)) {
 
     TORCH_CHECK(p_dropout < 1.f);
     
@@ -111,8 +111,6 @@ struct BaseParams {
   bool is_mnko_padding;
   bool is_causal;
 
-  bool z_permute;
-
   Index q_seq_stride;
   Index kv_seq_stride;
   Index out_seq_stride;
@@ -120,6 +118,8 @@ struct BaseParams {
   Index q_head_stride;
   Index kv_head_stride;
   Index out_head_stride;
+
+  Index softmax_lse_batch_stride;
 
   static inline const bool kIsUnitTestMode = get_env_("FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE");
   static inline const bool kIsDeterministic = get_env_("FLASH_ATTENTION_INTERNAL_DETERMINISTIC");
@@ -137,12 +137,10 @@ struct BatchedParams : public BaseParams {
                          const torch::Tensor &k,
                          const torch::Tensor &v,
                          torch::Tensor &out,
-                         void* z_d,
-                         void* softmax_lse_d,
-                         float p_dropout,
-                         float softmax_scale,
-                         bool is_causal,
-                         bool z_permute)
+                         torch::Tensor &softmax_lse, // TODO: forward reference, backward const reference
+                         const float p_dropout,
+                         const float softmax_scale,
+                         const bool is_causal)
     : BaseParams(b,
                  max_seqlen_q,
                  max_seqlen_kv,
@@ -153,16 +151,15 @@ struct BatchedParams : public BaseParams {
                  k,
                  v,
                  out,
+                 softmax_lse,
                  p_dropout,
                  softmax_scale,
-                 is_causal,
-                 z_permute),
+                 is_causal),
       q_ptr(q.data_ptr()),
       k_ptr(k.data_ptr()),
       v_ptr(v.data_ptr()),
       out_ptr(out.data_ptr()),
-      z_ptr(z_d),
-      softmax_lse_ptr(softmax_lse_d),
+      softmax_lse_ptr(softmax_lse.data_ptr()),
       q_batch_stride(q.stride(0)),
       kv_batch_stride(k.stride(0)),
       out_batch_stride(out.stride(0)) {
@@ -179,6 +176,7 @@ struct BatchedParams : public BaseParams {
       is_mnko_padding = ((max_seqlen_q % 128)==0 && (max_seqlen_kv % 128)==0 ? false : true);
     }
 
+    // TODO: Change to tensor.shape()
     // Q layout [b, max_seqlen_q, h_q, d]
     q_lengths = std::vector<Index>{b, h_q, max_seqlen_q, d};
     q_strides = std::vector<Index>{q_batch_stride, q_head_stride, q_seq_stride, 1};
@@ -195,14 +193,6 @@ struct BatchedParams : public BaseParams {
     out_lengths = std::vector<Index>{b, h_q, max_seqlen_q, d};
     out_strides = std::vector<Index>{out_batch_stride, out_head_stride, out_seq_stride, 1};
 
-    z_lengths = std::vector<Index>{b, h_q, max_seqlen_q, max_seqlen_kv};
-    z_strides = 
-        z_permute ? 
-        std::vector<Index>{h_q*max_seqlen_q*max_seqlen_kv, max_seqlen_kv, h_q*max_seqlen_kv, 1} :
-        // Z layout [b, max_seqlen_q, h_q, max_seqlen_kv]
-        std::vector<Index>{h_q*max_seqlen_q*max_seqlen_kv, max_seqlen_q*max_seqlen_kv, max_seqlen_kv, 1};
-        // Z layout [b, h_q, max_seqlen_q, max_seqlen_kv]
-
     // LSE layout [b, h_q, max_seqlen_q]
     lse_lengths = std::vector<Index>{b, h_q, max_seqlen_q};
     // std::vector<Index> lse_strides{h_q*max_seqlen_q, max_seqlen_q, 1};
@@ -211,14 +201,14 @@ struct BatchedParams : public BaseParams {
   void* __restrict__ q_ptr;
   void* __restrict__ k_ptr;
   void* __restrict__ v_ptr;
-
-  void* __restrict__ out_ptr;
   void* __restrict__ z_ptr;
+  void* __restrict__ out_ptr;
   void* __restrict__ softmax_lse_ptr;
 
-  int q_batch_stride;
-  int kv_batch_stride;
-  int out_batch_stride;
+  Index q_batch_stride;
+  Index kv_batch_stride;
+  Index out_batch_stride;
+  Index softmax_lse_batch_stride;
 
   std::vector<Index> q_lengths;
   std::vector<Index> q_strides;
@@ -226,10 +216,10 @@ struct BatchedParams : public BaseParams {
   std::vector<Index> k_strides;
   std::vector<Index> v_lengths;
   std::vector<Index> v_strides;
+  std::vector<Index> z_lengths;
+  std::vector<Index> z_strides;
   std::vector<Index> out_lengths;
   std::vector<Index> out_strides;
-  std::vector<Index> z_lengths;  
-  std::vector<Index> z_strides;
   std::vector<Index> lse_lengths;
   // std::vector<Index> lse_strides;
 };
@@ -246,11 +236,12 @@ struct FlashFwdBatchedParams : public BatchedParams {
                                  const torch::Tensor &k,
                                  const torch::Tensor &v,
                                  torch::Tensor &out,
-                                 void* z_d,
-                                 void* softmax_lse_d,
-                                 float p_dropout,
-                                 float softmax_scale,
-                                 bool is_causal)
+                                 torch::Tensor &z,
+                                 torch::Tensor &softmax_lse, // TODO: forward reference, backward const reference
+                                 const float p_dropout,
+                                 const float softmax_scale,
+                                 const bool is_causal,
+                                 const bool return_softmax)
     : BatchedParams(b,
                     max_seqlen_q,
                     max_seqlen_kv,
@@ -261,12 +252,23 @@ struct FlashFwdBatchedParams : public BatchedParams {
                     k,
                     v,
                     out,
-                    z_d,
-                    softmax_lse_d,
+                    softmax_lse,
                     p_dropout,
                     softmax_scale,
-                    is_causal,
-                    false) {}
+                    is_causal) {
+
+    z_ptr = return_softmax ? z.data_ptr() : nullptr;              
+    
+    // Index z_batch_stride = z.stride(0);
+    // Index z_head_stride = z.stride(-3);
+    // Index z_seq_stride = z.stride(-2);
+
+    // Z layout [b, h_q, max_seqlen_q, max_seqlen_kv]
+    z_lengths = std::vector<Index>{b, h_q, max_seqlen_q, max_seqlen_kv};
+    z_strides = std::vector<Index>{h_q*max_seqlen_q*max_seqlen_kv, max_seqlen_q*max_seqlen_kv, max_seqlen_kv, 1};
+  }
+
+  bool return_softmax;
 };
 
 // Backward Batched Arguments
@@ -280,16 +282,16 @@ struct FlashBwdBatchedParams : public BatchedParams {
                                  const torch::Tensor &q,
                                  const torch::Tensor &k,
                                  const torch::Tensor &v,
-                                 torch::Tensor out,
+                                 torch::Tensor &out, // TODO: Fix constness
                                  const torch::Tensor &dout,
                                  torch::Tensor &dq,
                                  torch::Tensor &dk,
                                  torch::Tensor &dv,
-                                 void* z_d,
-                                 void* softmax_lse_d,
-                                 float p_dropout,
-                                 float softmax_scale,
-                                 bool is_causal)
+                                 torch::Tensor &dsoftmax,
+                                 torch::Tensor &softmax_lse, // TODO: Fix constness
+                                 const float p_dropout,
+                                 const float softmax_scale,
+                                 const bool is_causal)
     : BatchedParams(b,
                     max_seqlen_q,
                     max_seqlen_kv,
@@ -300,22 +302,25 @@ struct FlashBwdBatchedParams : public BatchedParams {
                     k,
                     v,
                     out,
-                    z_d,
-                    softmax_lse_d,
+                    softmax_lse,
                     p_dropout,
                     softmax_scale,
-                    is_causal,
-                    true),
+                    is_causal),
       dq_ptr(dq.data_ptr()),
       dk_ptr(dk.data_ptr()),
       dv_ptr(dv.data_ptr()),
       dout_ptr(dout.data_ptr()),
-      d_ptr(torch::empty({b, static_cast<long>(h_q), max_seqlen_q}, 
-            q.options().dtype(torch::kFloat32)).data_ptr()) {
+      dsoftmax_ptr(dsoftmax.data_ptr()) {
+    
+    z_ptr = nullptr;
 
     Index dkv_batch_stride = dk.stride(0);
     Index dkv_seq_stride = dk.stride(-3);
     Index dkv_head_stride = dk.stride(-2);
+
+    // Z layout [b, h_q, max_seqlen_q, max_seqlen_kv]
+    z_lengths = std::vector<Index>{b, h_q, max_seqlen_q, max_seqlen_kv};
+    z_strides = std::vector<Index>{h_q*max_seqlen_q*max_seqlen_kv, max_seqlen_q*max_seqlen_kv, max_seqlen_kv, 1};
       
     // MQA / GQA readiness
     // KGrad layout [b, max_seqlen_kv, h_q, d]
@@ -332,7 +337,7 @@ struct FlashBwdBatchedParams : public BatchedParams {
   void* __restrict__ dv_ptr;
 
   void* __restrict__ dout_ptr;
-  void* __restrict__ d_ptr;
+  void* __restrict__ dsoftmax_ptr;
 };
 
 // Common Grouped Arguments
@@ -343,18 +348,16 @@ struct GroupedParams : public BaseParams {
                          const Index h_q,
                          const Index h_kv,
                          const Index d,
-                         const at::Tensor &q,
-                         const at::Tensor &k,
-                         const at::Tensor &v,
+                         const torch::Tensor &q,
+                         const torch::Tensor &k,
+                         const torch::Tensor &v,
                          torch::Tensor &out,
                          const void* cu_seqlens_q_d,
-                         const void* cu_seqlens_k_d,
-                         void* z_d,
-                         void* softmax_lse_d,
-                         float p_dropout,
-                         float softmax_scale,
-                         bool is_causal,
-                         const bool z_permute)
+                         const void* cu_seqlens_kv_d,
+                         torch::Tensor &softmax_lse,
+                         const float p_dropout,
+                         const float softmax_scale,
+                         const bool is_causal)
     : BaseParams(b,
                  max_seqlen_q,
                  max_seqlen_kv,
@@ -365,20 +368,18 @@ struct GroupedParams : public BaseParams {
                  k,
                  v,
                  out,
+                 softmax_lse,
                  p_dropout,
                  softmax_scale,
-                 is_causal,
-                 z_permute),
+                 is_causal),
       seqlens_q(get_host_seqlens(static_cast<const int*>(cu_seqlens_q_d), b)),
-      seqlens_kv(get_host_seqlens(static_cast<const int*>(cu_seqlens_k_d), b)) {
+      seqlens_kv(get_host_seqlens(static_cast<const int*>(cu_seqlens_kv_d), b)) {
     
     char* q_ptr = reinterpret_cast<char*>(q.data_ptr());
     char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
     char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
-
     char* out_ptr = reinterpret_cast<char*>(out.data_ptr());
-    char* z_ptr = reinterpret_cast<char*>(z_d);
-    char* softmax_lse_ptr = reinterpret_cast<char*>(softmax_lse_d);  
+    char* softmax_lse_ptr = reinterpret_cast<char*>(softmax_lse.data_ptr());  
 
     // TODO: move to GPU
     for (int i = 0; i < b; ++i) {
@@ -411,14 +412,7 @@ struct GroupedParams : public BaseParams {
       out_ptr += get_size_in_bytes(curr_out_batch_stride, out.dtype());
 
       softmax_lse_ptrs.push_back(reinterpret_cast<void*>(softmax_lse_ptr));
-      softmax_lse_ptr += get_size_in_bytes(h_q * max_seqlen_q, torch::kFloat32);
-
-      if(z_d) {
-        z_ptrs.push_back(reinterpret_cast<void*>(z_ptr + i * h_q * max_seqlen_q * max_seqlen_kv * sizeof(int)));
-      }
-      else{
-        z_ptrs.push_back(nullptr);
-      }
+      softmax_lse_ptr += get_size_in_bytes(softmax_lse_batch_stride, softmax_lse.dtype());
 
       // Q layout [b, max_seqlen_q, h_q, d]
       std::vector<Index> q_lengths{1, h_q, seqlens_q[i], d};
@@ -436,14 +430,6 @@ struct GroupedParams : public BaseParams {
       std::vector<Index> out_lengths{1, h_q, seqlens_q[i], d};
       std::vector<Index> out_strides{curr_out_batch_stride, out_head_stride, out_seq_stride, 1};
 
-      std::vector<Index> z_lengths{1, h_q, seqlens_q[i], seqlens_kv[i]};
-      std::vector<Index> z_strides = 
-          z_permute ? 
-          std::vector<Index>{h_q*seqlens_q[i]*seqlens_kv[i], seqlens_kv[i], h_q*seqlens_kv[i], 1} :
-          // Z layout [b, max_seqlen_q, h_q, max_seqlen_kv]
-          std::vector<Index>{h_q*seqlens_q[i]*seqlens_kv[i], seqlens_q[i]*seqlens_kv[i], seqlens_kv[i], 1};
-          // Z layout [b, h_q, max_seqlen_q, max_seqlen_kv]
-
       // LSE layout [b, h_q, max_seqlen_q]
       std::vector<Index> lse_lengths{1, h_q, seqlens_q[i]};
       std::vector<Index> lse_strides{h_q*seqlens_q[i], seqlens_q[i], 1};
@@ -456,23 +442,20 @@ struct GroupedParams : public BaseParams {
       v_strides_vec.push_back(v_strides);
       out_lengths_vec.push_back(out_lengths);
       out_strides_vec.push_back(out_strides);
-      z_lengths_vec.push_back(z_lengths);
-      z_strides_vec.push_back(z_strides);
       lse_lengths_vec.push_back(lse_lengths);
       lse_strides_vec.push_back(lse_strides);
     }
   }
 
+  std::vector<int> seqlens_q;
+  std::vector<int> seqlens_kv;
+
   std::vector<const void*> q_ptrs;
   std::vector<const void*> k_ptrs;
   std::vector<const void*> v_ptrs;
-
-  std::vector<void*> out_ptrs;
   std::vector<void*> z_ptrs;
+  std::vector<void*> out_ptrs;
   std::vector<void*> softmax_lse_ptrs;
-
-  std::vector<int> seqlens_q;
-  std::vector<int> seqlens_kv;
 
   std::vector<std::vector<Index>> q_lengths_vec;
   std::vector<std::vector<Index>> q_strides_vec;
@@ -480,10 +463,10 @@ struct GroupedParams : public BaseParams {
   std::vector<std::vector<Index>> k_strides_vec;
   std::vector<std::vector<Index>> v_lengths_vec;
   std::vector<std::vector<Index>> v_strides_vec;
-  std::vector<std::vector<Index>> out_lengths_vec;
-  std::vector<std::vector<Index>> out_strides_vec;
   std::vector<std::vector<Index>> z_lengths_vec;
   std::vector<std::vector<Index>> z_strides_vec;
+  std::vector<std::vector<Index>> out_lengths_vec;
+  std::vector<std::vector<Index>> out_strides_vec;
   std::vector<std::vector<Index>> lse_lengths_vec;
   std::vector<std::vector<Index>> lse_strides_vec;
 };
@@ -501,12 +484,13 @@ struct FlashFwdGroupedParams : public GroupedParams {
                                  const torch::Tensor &v,
                                  torch::Tensor &out,
                                  const void* cu_seqlens_q_d,
-                                 const void* cu_seqlens_k_d,
-                                 void* z_d,
-                                 void* softmax_lse_d,
-                                 float p_dropout,
-                                 float softmax_scale,
-                                 bool is_causal) 
+                                 const void* cu_seqlens_kv_d,
+                                 torch::Tensor &z,
+                                 torch::Tensor &softmax_lse,
+                                 const float p_dropout,
+                                 const float softmax_scale,
+                                 const bool is_causal,
+                                 const bool return_softmax) 
     : GroupedParams(b,
                     max_seqlen_q,
                     max_seqlen_kv,
@@ -518,13 +502,26 @@ struct FlashFwdGroupedParams : public GroupedParams {
                     v,
                     out,
                     cu_seqlens_q_d,
-                    cu_seqlens_k_d,
-                    z_d,
-                    softmax_lse_d,
+                    cu_seqlens_kv_d,
+                    softmax_lse,
                     p_dropout,
                     softmax_scale,
-                    is_causal,
-                    false) {}
+                    is_causal) {
+
+    char* z_ptr = return_softmax ? reinterpret_cast<char*>(z.data_ptr()) : nullptr;
+
+    for (int i = 0; i < b; ++i) {
+      z_ptrs.push_back(reinterpret_cast<void*>(z_ptr));
+      if (return_softmax) { z_ptr += get_size_in_bytes(h_q*seqlens_q[i]*seqlens_kv[i], z.dtype()); }
+
+      // Z layout [b, h_q, max_seqlen_q, max_seqlen_kv]
+      std::vector<Index> z_lengths{1, h_q, seqlens_q[i], seqlens_kv[i]};
+      std::vector<Index> z_strides{h_q*seqlens_q[i]*seqlens_kv[i], seqlens_q[i]*seqlens_kv[i], seqlens_kv[i], 1};
+
+      z_lengths_vec.push_back(z_lengths);
+      z_strides_vec.push_back(z_strides);
+    }
+  }
 };
 
 // Backward Grouped Arguments
@@ -538,18 +535,18 @@ struct FlashBwdGroupedParams : public GroupedParams {
                                  const torch::Tensor &q,
                                  const torch::Tensor &k,
                                  const torch::Tensor &v,
-                                 torch::Tensor out,
+                                 torch::Tensor &out,
                                  const torch::Tensor &dout,
                                  torch::Tensor &dq,
                                  torch::Tensor &dk,
                                  torch::Tensor &dv,
                                  const void* cu_seqlens_q_d,
-                                 const void* cu_seqlens_k_d,
-                                 void* z_d,
-                                 void* softmax_lse_d,
-                                 float p_dropout,
-                                 float softmax_scale,
-                                 bool is_causal)
+                                 const void* cu_seqlens_kv_d,
+                                 std::vector<torch::Tensor> &dsoftmax_vec,
+                                 torch::Tensor &softmax_lse,
+                                 const float p_dropout,
+                                 const float softmax_scale,
+                                 const bool is_causal)
     : GroupedParams(b,
                     max_seqlen_q,
                     max_seqlen_kv,
@@ -561,20 +558,15 @@ struct FlashBwdGroupedParams : public GroupedParams {
                     v,
                     out,
                     cu_seqlens_q_d,
-                    cu_seqlens_k_d,
-                    z_d,
-                    softmax_lse_d,
+                    cu_seqlens_kv_d,
+                    softmax_lse,
                     p_dropout,
                     softmax_scale,
-                    is_causal,
-                    true),
+                    is_causal),
       bwd_out_ptrs(std::vector<const void*>(out_ptrs.begin(), out_ptrs.end())),
       bwd_softmax_lse_ptrs(std::vector<const void*>(softmax_lse_ptrs.begin(), softmax_lse_ptrs.end())) {
     
-    char* q_ptr = reinterpret_cast<char*>(q.data_ptr());  
-    char* k_ptr = reinterpret_cast<char*>(k.data_ptr());
-    char* v_ptr = reinterpret_cast<char*>(v.data_ptr());
-
+    // TODO: Use the actual type
     char* dq_ptr = reinterpret_cast<char*>(dq.data_ptr());
     char* dk_ptr = reinterpret_cast<char*>(dk.data_ptr());
     char* dv_ptr = reinterpret_cast<char*>(dv.data_ptr());
@@ -587,11 +579,14 @@ struct FlashBwdGroupedParams : public GroupedParams {
     Index dkv_head_stride = dk.stride(-2);
     Index dout_head_stride = dout.stride(-2);
 
+    auto opts = q.options();
     for (int i = 0; i < b; ++i) {
       // TODO: reuse it in the foward on GPU
       int curr_dq_batch_stride = seqlens_q[i] * dq_seq_stride;
       int curr_dkv_batch_stride = seqlens_kv[i] * dkv_seq_stride;
       int curr_dout_batch_stride = seqlens_q[i] * dout_seq_stride;
+
+      z_ptrs.push_back(nullptr);
 
       dq_ptrs.push_back(reinterpret_cast<void*>(dq_ptr));
       dq_ptr += get_size_in_bytes(curr_dq_batch_stride, dq.dtype());
@@ -605,10 +600,12 @@ struct FlashBwdGroupedParams : public GroupedParams {
       dout_ptrs.push_back(reinterpret_cast<const void*>(dout_ptr));
       dout_ptr += get_size_in_bytes(curr_dout_batch_stride, dout.dtype());
 
-      auto opts = q.options();
-      torch::Tensor d_tensor;
-      d_tensor = torch::empty({1, static_cast<long>(h_q), seqlens_q[i]}, opts.dtype(torch::kFloat32));
-      d_ptrs.push_back(reinterpret_cast<void*>(d_tensor.data_ptr()));
+      dsoftmax_vec.push_back(torch::empty({1, static_cast<long>(h_q), seqlens_q[i]}, opts.dtype(torch::kFloat32)));
+      dsoftmax_ptrs.push_back(reinterpret_cast<void*>(dsoftmax_vec[i].data_ptr()));
+
+      // Z layout [b, h_q, max_seqlen_q, max_seqlen_kv]
+      std::vector<Index> z_lengths = std::vector<Index>{b, h_q, max_seqlen_q, max_seqlen_kv};
+      std::vector<Index> z_strides = std::vector<Index>{h_q*seqlens_q[i]*seqlens_kv[i], seqlens_q[i]*seqlens_kv[i], seqlens_kv[i], 1};
 
       // MQA / GQA readiness
       // KGrad layout [b, max_seqlen_kv, h_q, d]
@@ -619,6 +616,9 @@ struct FlashBwdGroupedParams : public GroupedParams {
       std::vector<Index> dv_lengths{1, h_q, d, max_seqlen_kv};
       std::vector<Index> dv_strides{curr_dkv_batch_stride, dkv_head_stride, 1, dkv_seq_stride};  
 
+
+      z_lengths_vec.push_back(z_lengths);
+      z_strides_vec.push_back(z_strides);
       dk_lengths_vec.push_back(dk_lengths);
       dk_strides_vec.push_back(dk_strides);
       dv_lengths_vec.push_back(dv_lengths);
@@ -634,11 +634,13 @@ struct FlashBwdGroupedParams : public GroupedParams {
   std::vector<const void*> bwd_softmax_lse_ptrs;
 
   std::vector<const void*> dout_ptrs;
-  std::vector<void*> d_ptrs;
-
+  std::vector<void*> dsoftmax_ptrs;
+  
   // MQA / GQA readiness
   std::vector<std::vector<Index>> dk_lengths_vec;
   std::vector<std::vector<Index>> dk_strides_vec;
   std::vector<std::vector<Index>> dv_lengths_vec;
   std::vector<std::vector<Index>> dv_strides_vec;
+
+  bool return_softmax;
 };

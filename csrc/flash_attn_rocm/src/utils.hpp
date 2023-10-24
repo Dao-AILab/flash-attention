@@ -126,7 +126,7 @@ static inline std::vector<int> get_host_seqlens(const int* d_seqlens_acc, int b)
   int threadsPerBlock = 256;
   int blocks = (b + threadsPerBlock - 1) / threadsPerBlock;
 
-  hipLaunchKernelGGL(( compute_differences), dim3(dim3(blocks)), dim3(dim3(threadsPerBlock)), 0, 0, d_seqlens_acc, d_seqlens, b);
+  hipLaunchKernelGGL(compute_differences, dim3(blocks), dim3(threadsPerBlock), 0, 0, d_seqlens_acc, d_seqlens, b);
   FMHA_CHECK_HIP(hipDeviceSynchronize());
 
   std::vector<int> h_seqlens(b);
