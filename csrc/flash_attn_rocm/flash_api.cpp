@@ -117,8 +117,8 @@ mha_fwd(const torch::Tensor &q,                         // batch_size x seqlen_q
   // state
   // We use a custom RNG that increases the offset by batch_size * nheads * 32.
   int64_t counter_offset = params.b * params.h_q * 32;
-  auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-  auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
+  auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+  auto rng_state = torch::empty({2}, options);
   // Forward kernel will populate memory with the seed and offset.
   params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
@@ -275,8 +275,8 @@ mha_varlen_fwd(const torch::Tensor &q,  // total_q x num_heads_q x head_size, to
   // state
   // We use a custom RNG that increases the offset by batch_size * nheads * 32.
   int64_t counter_offset = params.b * params.h_q * 32;
-  auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-  auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
+  auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+  auto rng_state = torch::empty({2}, options);
   // Forward kernel will populate memory with the seed and offset.
   params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 

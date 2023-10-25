@@ -68,14 +68,8 @@ struct BaseParams {
       softmax_lse_batch_stride(softmax_lse.stride(0)) {
 
     TORCH_CHECK(p_dropout < 1.f);
-    
-    if(!is_mnko_padding && d <= 32) {
-      is_mnko_padding = ((d % 32)==0 ? false : true);
-    } else if(!is_mnko_padding && d <= 64) {
-      is_mnko_padding = ((d % 64)==0 ? false : true);
-    } else if(!is_mnko_padding && d <= 128) {
-      is_mnko_padding = ((d % 128)==0 ? false : true);
-    } else {
+    is_mnko_padding = ((d % 32) != 0) || (d == 96);
+    if (d > 128) {
       std::cout << "Unsupported head dimension" << std::endl;
     }
   }  
