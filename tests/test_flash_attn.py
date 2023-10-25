@@ -225,7 +225,7 @@ def convert_flash_attn_S_to_softmax(S, query_padding_mask, key_padding_mask, hea
     """
     seqlen_q, seqlen_k = S.shape[-2:]
     warps_n = 4
-    blocksize_m, blocksize_n = _get_block_size_rocm(S.device, head_dim, is_dropout, causal)
+    blocksize_m, blocksize_n = _get_block_size(S.device, head_dim, is_dropout, causal)
     nblocks_n = (seqlen_k + blocksize_n - 1) // blocksize_n
     nblocks_m = (seqlen_q + blocksize_m - 1) // blocksize_m
     mmas_n = (blocksize_n + 16 - 1) // 16
@@ -284,7 +284,7 @@ def normalize_flash_attn_S(attn_unnorm, q, k, v, query_padding_mask=None, key_pa
     if causal:
         causal_mask = torch.triu(torch.ones(seqlen_q, seqlen_k, dtype=torch.bool, device=q.device), 1)
         scores.masked_fill_(causal_mask, float('-inf'))
-    _, block_size_n = _get_block_size_rocm(scores.device, head_dim, is_dropout, causal)
+    _, block_size_n = _get_block_size(scores.device, head_dim, is_dropout, causal)
     scores_block = scores.split(block_size_n, dim=-1)
     lse_block = torch.stack([torch.logsumexp(s, dim=-1) for s in scores_block], dim=-1)
     lse = torch.logsumexp(lse_block, dim=-1)
@@ -329,7 +329,7 @@ def get_dropout_fraction(dropout_mask, query_padding_mask=None, key_padding_mask
         )
     return dropped_total / (numel_per_batch.sum() * nheads)
 
-# @pytest.mark.skipif(True, reason='Experimental, not being used')
+
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize('causal', [False, True])
@@ -341,8 +341,8 @@ def get_dropout_fraction(dropout_mask, query_padding_mask=None, key_padding_mask
 # @pytest.mark.parametrize('seqlen', [128, 256, 384, 512, 768, 1024, 2048])
 @pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
 # @pytest.mark.parametrize('seqlen', [97])
-# @pytest.mark.parametrize('dropout_p', [0.0, 0.17])
-@pytest.mark.parametrize('dropout_p', [0.0])
+@pytest.mark.parametrize('dropout_p', [0.0, 0.17])
+# @pytest.mark.parametrize('dropout_p', [0.17])
 def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     if seqlen >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
@@ -427,7 +427,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, dtype):
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
-# @pytest.mark.skipif(True, reason='Experimental, not being used')
+
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize('causal', [False, True])
@@ -436,8 +436,8 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, dtype):
 # @pytest.mark.parametrize('d', [64])
 @pytest.mark.parametrize('seqlen', [97, 128, 200, 256, 257, 384, 512, 768, 1024, 1025, 2048])
 # @pytest.mark.parametrize('seqlen', [128])
-# @pytest.mark.parametrize('dropout_p', [0.0, 0.17])
-@pytest.mark.parametrize('dropout_p', [0.0])
+@pytest.mark.parametrize('dropout_p', [0.0, 0.17])
+# @pytest.mark.parametrize('dropout_p', [0.0])
 def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     if seqlen >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
@@ -513,13 +513,13 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, dtype):
     if d <= MAX_HEADDIM_SM8x or (is_sm80 or is_sm90):
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
-@pytest.mark.skipif(True, reason='Experimental, not being used')
+
 @pytest.mark.parametrize('kvpacked', [True, False])
 # @pytest.mark.parametrize('kvpacked', [False])
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.bfloat16])
-# @pytest.mark.parametrize('mha_type', ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize('mha_type', ["mha"])
+@pytest.mark.parametrize('mha_type', ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize('mha_type', ["mha"])
 @pytest.mark.parametrize('causal', [False, True])
 # @pytest.mark.parametrize('causal', [False])
 @pytest.mark.parametrize('d', [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
@@ -530,8 +530,8 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, dtype):
 # @pytest.mark.parametrize('d', [64])
 @pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (1023, 1024), (1024, 1023), (2048, 2048)])
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
-# @pytest.mark.parametrize('dropout_p', [0.0, 0.17])
-@pytest.mark.parametrize('dropout_p', [0.0])
+@pytest.mark.parametrize('dropout_p', [0.0, 0.17])
+# @pytest.mark.parametrize('dropout_p', [0.0])
 def test_flash_attn_output(seqlen_q, seqlen_k, d, dropout_p, causal, mha_type, dtype, kvpacked):
     if max(seqlen_q, seqlen_k) >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
@@ -638,13 +638,13 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, dropout_p, causal, mha_type, d
         assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
 
-@pytest.mark.skipif(True, reason='Experimental, not being used')
+
 @pytest.mark.parametrize('kvpacked', [True, False])
 # @pytest.mark.parametrize('kvpacked', [False])
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.float16])
-# @pytest.mark.parametrize('mha_type', ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize('mha_type', ["mha"])
+@pytest.mark.parametrize('mha_type', ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize('mha_type', ["mqa"])
 @pytest.mark.parametrize('causal', [False, True])
 # @pytest.mark.parametrize('causal', [True])
 @pytest.mark.parametrize('d', [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
@@ -652,8 +652,8 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, dropout_p, causal, mha_type, d
 # @pytest.mark.parametrize('d', [64])
 @pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (1023, 1024), (1024, 1023), (2048, 2048)])
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
-# @pytest.mark.parametrize('dropout_p', [0.0, 0.17])
-@pytest.mark.parametrize('dropout_p', [0.0])
+@pytest.mark.parametrize('dropout_p', [0.0, 0.17])
+# @pytest.mark.parametrize('dropout_p', [0.0])
 def test_flash_attn_varlen_output(seqlen_q, seqlen_k, d, dropout_p, causal, mha_type, dtype,
                                   kvpacked):
     if max(seqlen_q, seqlen_k) >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
@@ -782,7 +782,7 @@ def test_flash_attn_varlen_output(seqlen_q, seqlen_k, d, dropout_p, causal, mha_
         assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
 
-@pytest.mark.skipif(True, reason='Experimental, not being used')
+
 # @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 @pytest.mark.parametrize('dtype', [torch.float16])
 # @pytest.mark.parametrize('causal', [False, True])
@@ -831,7 +831,7 @@ def test_flash_attn_race_condition(seqlen, d, dropout_p, causal, dtype):
             assert torch.equal(dqkv[:, :, 1], dqkv0[:, :, 1])
             assert torch.equal(dqkv[:, :, 2], dqkv0[:, :, 2])
 
-@pytest.mark.skipif(True, reason='Experimental, not being used')
+
 @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize('causal', [False, True])
 # @pytest.mark.parametrize('causal', [False])
@@ -877,7 +877,7 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
     assert (k.grad - k_ref.grad).abs().max().item() <= 5 * (k_pt.grad - k_ref.grad).abs().max().item() + 1e-3
     assert (v.grad - v_ref.grad).abs().max().item() <= 5 * (v_pt.grad - v_ref.grad).abs().max().item() + 1e-3
 
-@pytest.mark.skipif(True, reason='Experimental, not being used')
+
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.bfloat16])
 @pytest.mark.parametrize('causal', [False, True])

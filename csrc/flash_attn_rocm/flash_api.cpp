@@ -422,12 +422,8 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
   // CK need zeroed tensors
   dq.zero_();
 
-  torch::Tensor q_contiguous, k_contiguous, v_contiguous;
   torch::Tensor dq_fp32, dk_fp32, dv_fp32;
   if (BaseParams::kIsUnitTestMode) {
-    q_contiguous = q.contiguous();
-    k_contiguous = k.contiguous();
-    v_contiguous = v.contiguous();
     dq_fp32 = dq.to(torch::kFloat32, true);
     dk_fp32 = dk.to(torch::kFloat32, true);
     dv_fp32 = dv.to(torch::kFloat32, true);
@@ -439,9 +435,9 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
                                num_heads_q, 
                                num_heads_kv,
                                head_size,
-                               BaseParams::kIsUnitTestMode ? q_contiguous : q,   // q is padded
-                               BaseParams::kIsUnitTestMode ? k_contiguous : k,   // k is padded
-                               BaseParams::kIsUnitTestMode ? v_contiguous : v,   // v is padded
+                               BaseParams::kIsUnitTestMode ? q.contiguous() : q,   // q is padded
+                               BaseParams::kIsUnitTestMode ? k.contiguous() : k,   // k is padded
+                               BaseParams::kIsUnitTestMode ? v.contiguous() : v,   // v is padded
                                out, // out is padded
                                dout_padded, 
                                BaseParams::kIsUnitTestMode ? dq_fp32 : dq,  // dq is padded
@@ -629,12 +625,8 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
   dk.zero_();
   dv.zero_();
 
-  torch::Tensor q_contiguous, k_contiguous, v_contiguous;
   torch::Tensor dq_fp32, dk_fp32, dv_fp32;
   if (BaseParams::kIsUnitTestMode) {
-    q_contiguous = q.contiguous();
-    k_contiguous = k.contiguous();
-    v_contiguous = v.contiguous();
     dq_fp32 = dq.to(torch::kFloat32, true);
     dk_fp32 = dk.to(torch::kFloat32, true);
     dv_fp32 = dv.to(torch::kFloat32, true);
@@ -646,9 +638,9 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
                                num_heads_q, 
                                num_heads_kv,
                                head_size, 
-                               BaseParams::kIsUnitTestMode ? q_contiguous : q,   // q is padded
-                               BaseParams::kIsUnitTestMode ? k_contiguous : k,   // k is padded
-                               BaseParams::kIsUnitTestMode ? v_contiguous : v,   // v is padded
+                               BaseParams::kIsUnitTestMode ? q.contiguous() : q,   // q is padded
+                               BaseParams::kIsUnitTestMode ? k.contiguous() : k,   // k is padded
+                               BaseParams::kIsUnitTestMode ? v.contiguous() : v,   // v is padded
                                out, // out is padded
                                dout_padded, 
                                BaseParams::kIsUnitTestMode ? dq_fp32 : dq,  // dq is padded
