@@ -133,8 +133,8 @@ mha_fwd(const torch::Tensor &q,                         // batch_size x seqlen_q
   }
 
   auto stream = at::cuda::getCurrentHIPStream().stream();
-  auto flash_runner = std::make_unique<FlashRunner>();
-  flash_runner->Run(params, stream);
+  FlashRunner flash_runner;
+  flash_runner.Run(params, stream);
 
   torch::Tensor out_padded = out;
   if (head_size_og % 8 != 0) {
@@ -291,8 +291,8 @@ mha_varlen_fwd(const torch::Tensor &q,  // total_q x num_heads_q x head_size, to
   }
 
   auto stream = at::cuda::getCurrentHIPStream().stream();
-  auto flash_runner = std::make_unique<FlashRunner>();
-  flash_runner->Run(params, stream);
+  FlashRunner flash_runner;
+  flash_runner.Run(params, stream);
 
   torch::Tensor out_padded = out;
   if (head_size_og % 8 != 0) {
@@ -371,6 +371,7 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
   CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads_q, head_size_og);
 
   torch::Tensor dq, dk, dv;
+  // CK uses stride of QKV to set dQKV value: BE CAREFUL
   // make dQKV passed to CK point to input dQKV iff:
   // 1. QKV are NOT padded: padded QKV will have different memory strides from dQKV when QKV and dQKV are packed,
   //    this is because the original packed QKV are not passed from forward to backward, instead, padded ones are passed here.
@@ -421,20 +422,31 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
   // CK need zeroed tensors
   dq.zero_();
 
+  torch::Tensor q_contiguous, k_contiguous, v_contiguous;
+  torch::Tensor dq_fp32, dk_fp32, dv_fp32;
+  if (BaseParams::kIsUnitTestMode) {
+    q_contiguous = q.contiguous();
+    k_contiguous = k.contiguous();
+    v_contiguous = v.contiguous();
+    dq_fp32 = dq.to(torch::kFloat32, true);
+    dk_fp32 = dk.to(torch::kFloat32, true);
+    dv_fp32 = dv.to(torch::kFloat32, true);
+  }
+
   FlashBwdBatchedParams params(batch_size,
                                seqlen_q, 
                                seqlen_kv,
                                num_heads_q, 
                                num_heads_kv,
                                head_size,
-                               q,   // q is padded
-                               k,   // k is padded
-                               v,   // v is padded
+                               BaseParams::kIsUnitTestMode ? q_contiguous : q,   // q is padded
+                               BaseParams::kIsUnitTestMode ? k_contiguous : k,   // k is padded
+                               BaseParams::kIsUnitTestMode ? v_contiguous : v,   // v is padded
                                out, // out is padded
                                dout_padded, 
-                               dq,  // dq is padded
-                               dk,  // dk is padded
-                               dv,  // dv is padded
+                               BaseParams::kIsUnitTestMode ? dq_fp32 : dq,  // dq is padded
+                               BaseParams::kIsUnitTestMode ? dk_fp32 : dk,  // dk is padded
+                               BaseParams::kIsUnitTestMode ? dv_fp32 : dv,  // dv is padded
                                dsoftmax,
                                softmax_lse,
                                p_dropout,
@@ -460,8 +472,14 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
   }
 
   auto stream = at::cuda::getCurrentHIPStream().stream();
-  auto flash_runner = std::make_unique<FlashRunner>();
-  flash_runner->Run(params, stream);
+  FlashRunner flash_runner;
+  flash_runner.Run(params, stream);
+
+  if (BaseParams::kIsUnitTestMode) {
+    dq.index_put_({"...", "...", "...", "..."}, dq_fp32);
+    dk.index_put_({"...", "...", "...", "..."}, dk_fp32);
+    dv.index_put_({"...", "...", "...", "..."}, dv_fp32);
+  }
 
   if (dq_.value().data_ptr() != dq.data_ptr()) {
     dq_.value().index_put_({"...", "...", "...", "..."}, dq);
@@ -559,6 +577,7 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
   CHECK_SHAPE(cu_seqlens_kv, batch_size + 1);
 
   torch::Tensor dq, dk, dv;
+  // CK uses stride of QKV to set dQKV value: BE CAREFUL
   // make dQKV passed to CK point to input dQKV iff:
   // 1. QKV are NOT padded: padded QKV will have different memory strides from dQKV when QKV and dQKV are packed,
   //    this is because the original packed QKV are not passed from forward to backward, instead, padded ones are passed here.
@@ -610,20 +629,31 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
   dk.zero_();
   dv.zero_();
 
+  torch::Tensor q_contiguous, k_contiguous, v_contiguous;
+  torch::Tensor dq_fp32, dk_fp32, dv_fp32;
+  if (BaseParams::kIsUnitTestMode) {
+    q_contiguous = q.contiguous();
+    k_contiguous = k.contiguous();
+    v_contiguous = v.contiguous();
+    dq_fp32 = dq.to(torch::kFloat32, true);
+    dk_fp32 = dk.to(torch::kFloat32, true);
+    dv_fp32 = dv.to(torch::kFloat32, true);
+  }
+
   FlashBwdGroupedParams params(batch_size,
                                max_seqlen_q, 
                                max_seqlen_kv,
                                num_heads_q, 
                                num_heads_kv,
                                head_size, 
-                               q,   // q is padded
-                               k,   // k is padded
-                               v,   // v is padded
+                               BaseParams::kIsUnitTestMode ? q_contiguous : q,   // q is padded
+                               BaseParams::kIsUnitTestMode ? k_contiguous : k,   // k is padded
+                               BaseParams::kIsUnitTestMode ? v_contiguous : v,   // v is padded
                                out, // out is padded
                                dout_padded, 
-                               dq,  // dq is padded
-                               dk,  // dk is padded
-                               dv,  // dv is padded
+                               BaseParams::kIsUnitTestMode ? dq_fp32 : dq,  // dq is padded
+                               BaseParams::kIsUnitTestMode ? dk_fp32 : dk,  // dk is padded
+                               BaseParams::kIsUnitTestMode ? dv_fp32 : dv,  // dv is padded
                                cu_seqlens_q.data_ptr(),
                                cu_seqlens_kv.data_ptr(),
                                dsoftmax_vec,
@@ -651,8 +681,14 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
   }
 
   auto stream = at::cuda::getCurrentHIPStream().stream();
-  auto flash_runner = std::make_unique<FlashRunner>();
-  flash_runner->Run(params, stream);
+  FlashRunner flash_runner;
+  flash_runner.Run(params, stream);
+
+  if (BaseParams::kIsUnitTestMode) {
+    dq.index_put_({"...", "...", "..."}, dq_fp32);
+    dk.index_put_({"...", "...", "..."}, dk_fp32);
+    dv.index_put_({"...", "...", "..."}, dv_fp32);
+  }
 
   if (dq_.value().data_ptr() != dq.data_ptr()) {
     dq_.value().index_put_({"...", "...", "..."}, dq);
@@ -669,8 +705,6 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
   return { dq, dk, dv, dsoftmax_vec[0] };
 }
 
-
-#ifdef BUILD_PYTHON_PACKAGE
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");
@@ -678,4 +712,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bwd", &mha_bwd, "Backward pass");
     m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
 }
-#endif

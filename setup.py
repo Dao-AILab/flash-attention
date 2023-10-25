@@ -234,7 +234,6 @@ else:
                       "-O3",
                       "-std=c++20",
                       "-DNDEBUG",
-                      "-DBUILD_PYTHON_PACKAGE", 
                       "-U__CUDA_NO_HALF_OPERATORS__",
                       "-U__CUDA_NO_HALF_CONVERSIONS__",
                   ]

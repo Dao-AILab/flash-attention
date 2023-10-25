@@ -316,7 +316,13 @@ struct FlashBwdBatchedParams : public BatchedParams {
 
     Index dkv_batch_stride = dk.stride(0);
     Index dkv_seq_stride = dk.stride(-3);
+    Index dq_seq_stride = dq.stride(-3);
+    Index dout_seq_stride = dout.stride(-3);
     Index dkv_head_stride = dk.stride(-2);
+
+    TORCH_CHECK(dq_seq_stride == q_seq_stride);
+    TORCH_CHECK(dkv_seq_stride == kv_seq_stride);
+    TORCH_CHECK(dout_seq_stride == out_seq_stride);
 
     // Z layout [b, h_q, max_seqlen_q, max_seqlen_kv]
     z_lengths = std::vector<Index>{b, h_q, max_seqlen_q, max_seqlen_kv};
@@ -578,6 +584,10 @@ struct FlashBwdGroupedParams : public GroupedParams {
     Index dq_head_stride = dq.stride(-2);
     Index dkv_head_stride = dk.stride(-2);
     Index dout_head_stride = dout.stride(-2);
+
+    TORCH_CHECK(dq_seq_stride == q_seq_stride);
+    TORCH_CHECK(dkv_seq_stride == kv_seq_stride);
+    TORCH_CHECK(dout_seq_stride == out_seq_stride);
 
     auto opts = q.options();
     for (int i = 0; i < b; ++i) {
