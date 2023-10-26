@@ -111,7 +111,7 @@ static inline bool get_env_(const char* env_var) {
 }
 
 // compute differences
-static inline  __global__ void compute_differences(const int* in, int* out, int len) {
+static __global__ void compute_differences(const int* in, int* out, int len) {
   int i = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
   if (i < len) {
       out[i] = in[i + 1] - in[i];

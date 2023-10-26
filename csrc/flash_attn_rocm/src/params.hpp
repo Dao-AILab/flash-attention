@@ -387,16 +387,12 @@ struct GroupedParams : public BaseParams {
       int curr_kv_batch_stride = seqlens_kv[i] * kv_seq_stride;
       int curr_out_batch_stride = seqlens_q[i] * out_seq_stride;
 
-      if(!is_mnko_padding && d <= 32) {
-        is_mnko_padding = ((seqlens_q[i] % 128)==0 && (seqlens_kv[i] % 128)==0 ? false : true);
-      } else if(!is_mnko_padding && d <= 64) {
-        if(is_dropout) {
-          is_mnko_padding = ((seqlens_q[i] % 128)==0 && (seqlens_kv[i] % 128)==0 ? false : true);
-        } else {
-          is_mnko_padding = ((seqlens_q[i] % 128)==0 && (seqlens_kv[i] % 256)==0 ? false : true);
+      if(!is_mnko_padding) {
+        if(!is_dropout && d > 32 && d <= 64) {
+          is_mnko_padding = !((seqlens_q[i] % 128)==0 && (seqlens_kv[i] % 256)==0);
+        }else{
+          is_mnko_padding = !((seqlens_q[i] % 128)==0 && (seqlens_kv[i] % 128)==0);
         }
-      } else if(!is_mnko_padding && d <= 128) {
-        is_mnko_padding = ((seqlens_q[i] % 128)==0 && (seqlens_kv[i] % 128)==0 ? false : true);
       }
 
       q_ptrs.push_back(reinterpret_cast<void*>(q_ptr));
