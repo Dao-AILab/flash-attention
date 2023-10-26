@@ -390,7 +390,7 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
     TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
     TORCH_CHECK(dk.is_cuda(), "dk must be on ROCm device");
     TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
-    CHECK_SHAPE(dk, batch_size, seqlen_kv, num_heads_kv, head_size);
+    CHECK_SHAPE(dk, batch_size, seqlen_kv, num_heads_q, head_size);
   } else {
     dk = torch::empty_like(k);
   }
@@ -399,7 +399,7 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
     TORCH_CHECK(dv.dtype() == q_dtype, "dv must have the same dtype as q");
     TORCH_CHECK(dv.is_cuda(), "dv must be on ROCm device");
     TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
-    CHECK_SHAPE(dv, batch_size, seqlen_kv, num_heads_kv, head_size);
+    CHECK_SHAPE(dv, batch_size, seqlen_kv, num_heads_q, head_size);
   } else {
     dv = torch::empty_like(v);
   }
@@ -592,7 +592,7 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
     TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
     TORCH_CHECK(dk.is_cuda(), "dk must be on ROCm device");
     TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
-    CHECK_SHAPE(dk, total_kv, num_heads_kv, head_size);
+    CHECK_SHAPE(dk, total_kv, num_heads_q, head_size);
   } else {
     dk = torch::empty_like(k);
   }
@@ -601,7 +601,7 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
     TORCH_CHECK(dv.dtype() == q_dtype, "dv must have the same dtype as q");
     TORCH_CHECK(dv.is_cuda(), "dv must be on ROCm device");
     TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
-    CHECK_SHAPE(dv, total_kv, num_heads_kv, head_size);
+    CHECK_SHAPE(dv, total_kv, num_heads_q, head_size);
   } else {
     dv = torch::empty_like(v);
   }
