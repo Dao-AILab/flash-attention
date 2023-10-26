@@ -71,12 +71,12 @@ class DeviceGemmInvoker {
     if (!gemm_ptr->IsSupportedArgument(argument_ptr.get())) {
       throw std::runtime_error(gemm_ptr->GetTypeString() + " does not support this problem");
     }
+    auto time_kernel = get_env_("FLASH_ATTENTION_INTERNAL_ENABLE_TIME_KERNEL");
+    auto avg_time = invoker_ptr->Run(argument_ptr.get(), StreamConfig{stream, time_kernel});
 
-    invoker_ptr->Run(argument_ptr.get(), StreamConfig{stream, time_kernel});
-
-    // if (time_kernel) {
-    //   std::cout << "time elpase is " << avg_time << " ms" << std::endl;
-    // }
+    if (time_kernel) {
+      std::cout << "time elpase is " << avg_time << " ms" << std::endl;
+    }
   }
 
   // constructor for grouped gemm
@@ -141,15 +141,12 @@ class DeviceGemmInvoker {
     if (!gemm_ptr->IsSupportedArgument(argument_ptr.get())) {
       throw std::runtime_error(gemm_ptr->GetTypeString() + " does not support this problem");
     }
+    auto time_kernel = get_env_("FLASH_ATTENTION_INTERNAL_ENABLE_TIME_KERNEL");
+    auto avg_time = invoker_ptr->Run(argument_ptr.get(), StreamConfig{stream, time_kernel});
 
-    invoker_ptr->Run(argument_ptr.get(), StreamConfig{stream, time_kernel});
-
-    // if (time_kernel) {
-    //   std::cout << "time elpase is " << avg_time << " ms" << std::endl;
-    // }
+    if (time_kernel) {
+      std::cout << "time elpase is " << avg_time << " ms" << std::endl;
+    }
   }
-
- private:
-  static const bool time_kernel = false;
 };
 } // namespace fwd_device_gemm
