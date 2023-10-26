@@ -315,7 +315,6 @@ struct FlashBwdBatchedParams : public BatchedParams {
     Index dkv_head_stride = dk.stride(-2);
 
     TORCH_CHECK(dq_seq_stride == q_seq_stride);
-    TORCH_CHECK(dkv_seq_stride == kv_seq_stride);
     TORCH_CHECK(dout_seq_stride == out_seq_stride);
 
     // Z layout [b, h_q, max_seqlen_q, max_seqlen_kv]
@@ -588,7 +587,6 @@ struct FlashBwdGroupedParams : public GroupedParams {
     Index dout_head_stride = dout.stride(-2);
 
     TORCH_CHECK(dq_seq_stride == q_seq_stride);
-    TORCH_CHECK(dkv_seq_stride == kv_seq_stride);
     TORCH_CHECK(dout_seq_stride == out_seq_stride);
 
     auto opts = q.options();
