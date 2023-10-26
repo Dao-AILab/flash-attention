@@ -93,18 +93,8 @@ struct BaseParams {
   float p_dropout;
   // uint8_t p_dropout_in_uint8_t;
 
-  // Scale factor of 1 / (1 - p_dropout).
-  // float rp_dropout;
-  // float scale_softmax_rp_dropout;
-
-  // Random state.
-  at::PhiloxCudaState philox_args;
-
   // seeds
   std::tuple<uint64_t, uint64_t> seeds;
-
-  // Pointer to the RNG seed (idx 0) and offset (idx 1).
-  uint64_t* rng_state;
 
   bool is_bf16;
   bool is_dropout;
@@ -258,10 +248,6 @@ struct FlashFwdBatchedParams : public BatchedParams {
                     is_causal) {
 
     z_ptr = return_softmax ? z.data_ptr() : nullptr;              
-    
-    // Index z_batch_stride = z.stride(0);
-    // Index z_head_stride = z.stride(-3);
-    // Index z_seq_stride = z.stride(-2);
 
     // Z layout [b, h_q, max_seqlen_q, max_seqlen_kv]
     z_lengths = std::vector<Index>{b, h_q, max_seqlen_q, max_seqlen_kv};
@@ -491,7 +477,7 @@ struct FlashFwdGroupedParams : public GroupedParams {
                                  torch::Tensor &out,
                                  const void* cu_seqlens_q_d,
                                  const void* cu_seqlens_kv_d,
-                                 torch::Tensor &z,
+                                 std::vector<torch::Tensor> &z_vec,
                                  torch::Tensor &softmax_lse,
                                  const float p_dropout,
                                  const float softmax_scale,
@@ -513,12 +499,15 @@ struct FlashFwdGroupedParams : public GroupedParams {
                     p_dropout,
                     softmax_scale,
                     is_causal) {
-
-    char* z_ptr = return_softmax ? reinterpret_cast<char*>(z.data_ptr()) : nullptr;
-
+    
+    auto opts = q.options();
     for (int i = 0; i < b; ++i) {
-      z_ptrs.push_back(reinterpret_cast<void*>(z_ptr));
-      if (return_softmax) { z_ptr += get_size_in_bytes(h_q*seqlens_q[i]*seqlens_kv[i], z.dtype()); }
+      if (return_softmax) { 
+        z_vec.push_back(torch::empty({1, h_q, seqlens_q[i], seqlens_kv[i]}, opts.dtype(torch::kInt32)));
+        z_ptrs.push_back(reinterpret_cast<void*>(z_vec[i].data_ptr()));
+      } else {
+        z_ptrs.push_back(nullptr);
+      }
 
       // Z layout [b, h_q, max_seqlen_q, max_seqlen_kv]
       std::vector<Index> z_lengths{1, h_q, seqlens_q[i], seqlens_kv[i]};
@@ -610,11 +599,11 @@ struct FlashBwdGroupedParams : public GroupedParams {
       dout_ptrs.push_back(reinterpret_cast<const void*>(dout_ptr));
       dout_ptr += get_size_in_bytes(curr_dout_batch_stride, dout.dtype());
 
-      dsoftmax_vec.push_back(torch::empty({1, static_cast<long>(h_q), seqlens_q[i]}, opts.dtype(torch::kFloat32)));
+      dsoftmax_vec.push_back(torch::empty({1, h_q, seqlens_q[i]}, opts.dtype(torch::kFloat32)));
       dsoftmax_ptrs.push_back(reinterpret_cast<void*>(dsoftmax_vec[i].data_ptr()));
 
       // Z layout [b, h_q, max_seqlen_q, max_seqlen_kv]
-      std::vector<Index> z_lengths = std::vector<Index>{b, h_q, max_seqlen_q, max_seqlen_kv};
+      std::vector<Index> z_lengths = std::vector<Index>{b, h_q, seqlens_q[i], seqlens_kv[i]};
       std::vector<Index> z_strides = std::vector<Index>{h_q*seqlens_q[i]*seqlens_kv[i], seqlens_q[i]*seqlens_kv[i], seqlens_kv[i], 1};
 
       // MQA / GQA readiness
