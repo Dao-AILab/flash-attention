@@ -459,8 +459,8 @@ mha_bwd(const torch::Tensor &dout,  // batch_size x seqlen_q x num_heads_q, x he
                                out, // out is padded
                                dout_padded, 
                                BaseParams::kIsUnitTestMode ? dq_fp32 : dq,  // dq is padded 
-                               dk_expanded, // BaseParams::kIsUnitTestMode ? dk_fp32 : dk_expanded,  // dk is padded
-                               dv_expanded, // BaseParams::kIsUnitTestMode ? dv_fp32 : dv_expanded,  // dv is padded
+                               dk_expanded, // dk is padded
+                               dv_expanded, // dv is padded
                                dsoftmax,
                                softmax_lse,
                                p_dropout,
@@ -651,11 +651,36 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
   dk.zero_();
   dv.zero_();
 
-  torch::Tensor dq_fp32, dk_fp32, dv_fp32;
-  if (BaseParams::kIsUnitTestMode) {
-    dq_fp32 = dq.to(torch::kFloat32, true);
-    dk_fp32 = dk.to(torch::kFloat32, true);
-    dv_fp32 = dv.to(torch::kFloat32, true);
+  torch::Tensor dq_fp32;// 
+  at::Tensor dk_expanded, dv_expanded;
+  if (num_heads_kv != num_heads_q) {  // MQA / GQA
+      dk_expanded = torch::empty({total_kv, num_heads_q, head_size}, opts);
+      dv_expanded = torch::empty({total_kv, num_heads_q, head_size}, opts);
+  } else {
+      dk_expanded = dk;
+      dv_expanded = dv;
+  }
+
+  if (num_heads_kv != num_heads_q) {  // MQA / GQA
+    if (BaseParams::kIsUnitTestMode) {
+      dq_fp32 = dq.to(torch::kFloat32, true);
+      dk_expanded = torch::empty({total_kv, num_heads_q, head_size}, opts.dtype(torch::kFloat32));
+      dv_expanded = torch::empty({total_kv, num_heads_q, head_size}, opts.dtype(torch::kFloat32));
+    }
+    else{
+      dk_expanded = torch::empty({total_kv, num_heads_q, head_size}, opts);
+      dv_expanded = torch::empty({total_kv, num_heads_q, head_size}, opts);
+    }
+  } else { //MHA
+    if (BaseParams::kIsUnitTestMode) {
+      dq_fp32 = dq.to(torch::kFloat32, true);
+      dk_expanded = dk.to(torch::kFloat32, true);
+      dv_expanded = dv.to(torch::kFloat32, true);
+    }
+    else{
+      dk_expanded = dk;
+      dv_expanded = dv;
+    }
   }
 
   FlashBwdGroupedParams params(batch_size,
@@ -670,8 +695,8 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
                                out, // out is padded
                                dout_padded, 
                                BaseParams::kIsUnitTestMode ? dq_fp32 : dq,  // dq is padded
-                               BaseParams::kIsUnitTestMode ? dk_fp32 : dk,  // dk is padded
-                               BaseParams::kIsUnitTestMode ? dv_fp32 : dv,  // dv is padded
+                               dk_expanded, // dk is padded
+                               dv_expanded, // dv is padded
                                cu_seqlens_q.data_ptr(),
                                cu_seqlens_kv.data_ptr(),
                                dsoftmax_vec,
@@ -702,10 +727,17 @@ mha_varlen_bwd(const torch::Tensor &dout,  // total_q x num_heads_q, x head_size
   FlashRunner flash_runner;
   flash_runner.Run(params, stream);
 
-  if (BaseParams::kIsUnitTestMode) {
+  if (num_heads_kv != num_heads_q) { //MQA GQA
+    at::sum_out(dk, at::reshape(dk_expanded, {total_kv, num_heads_kv, num_heads_q / num_heads_kv, head_size}), {2});
+    at::sum_out(dv, at::reshape(dv_expanded, {total_kv, num_heads_kv, num_heads_q / num_heads_kv, head_size}), {2});
+  }
+  else if (BaseParams::kIsUnitTestMode) { //MHA with unittest
+    dk.index_put_({"...", "...", "..."}, dk_expanded);
+    dv.index_put_({"...", "...", "..."}, dv_expanded);
+  }
+
+  if (BaseParams::kIsUnitTestMode){
     dq.index_put_({"...", "...", "..."}, dq_fp32);
-    dk.index_put_({"...", "...", "..."}, dk_fp32);
-    dv.index_put_({"...", "...", "..."}, dv_fp32);
   }
 
   if (dq_.value().data_ptr() != dq.data_ptr()) {
