@@ -816,9 +816,16 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // if (cute::thread(32, 0)) { print(scores); }
 
         if (Is_alibi) {
-            flash::apply_alibi(scores, 
-                               n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16, 
-                               bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
+            flash::apply_alibi(
+                scores, 
+                n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                binfo.actual_seqlen_k, 
+                m_block * kBlockM + get<0>(taccScS_row(0)),
+                binfo.actual_seqlen_q, 
+                AtomLayoutMS * 16,
+                bidh, params.h, params.scale_softmax, 
+                params.alibi_start, params.alibi_ratio
+            );
         }
         
         // TD [2023-07-29]: I was thinking that we don't need to mask out the elements beyond
@@ -1395,9 +1402,16 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (Is_alibi) {
-            flash::apply_alibi(scores, 
-                               n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16, 
-                               bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
+            flash::apply_alibi(
+                scores, 
+                n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                binfo.actual_seqlen_k, 
+                m_block * kBlockM + get<0>(taccScS_row(0)),
+                binfo.actual_seqlen_q, 
+                AtomLayoutMS * 16,
+                bidh, params.h, params.scale_softmax, 
+                params.alibi_start, params.alibi_ratio
+            );
         }
 
         // We don't need to mask out the elements beyond actual_seqlen_k, because acc_s would

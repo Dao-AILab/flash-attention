@@ -366,7 +366,16 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // can produce Inf / NaN.
 
         if (Is_alibi) {
-            flash::apply_alibi(scores, n_block * kBlockN, bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
+            flash::apply_alibi(
+                scores, 
+                n_block * kBlockN, 
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q, 
+                kNWarps * 16,
+                bidh, params.h, params.scale_softmax, 
+                params.alibi_start, params.alibi_ratio
+            );
         }
 
         if (!Is_causal && !Is_local) {
@@ -475,7 +484,16 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         
         if (Is_alibi) {
-            flash::apply_alibi(scores, n_block * kBlockN, bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
+            flash::apply_alibi(
+                scores, 
+                n_block * kBlockN, 
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q, 
+                kNWarps * 16,
+                bidh, params.h, params.scale_softmax, 
+                params.alibi_start, params.alibi_ratio
+            );
         }
         
         if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
@@ -956,7 +974,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (Is_alibi) {
-            flash::apply_alibi(scores, n_block * kBlockN, bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
+            flash::apply_alibi(
+                scores, 
+                n_block * kBlockN, 
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q, 
+                kNWarps * 16,
+                bidh, params.h, params.scale_softmax, 
+                params.alibi_start, params.alibi_ratio
+            );
         }
 
         // if (cute::thread0()) { print(scores); }
@@ -1040,7 +1067,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (Is_alibi) {
-            flash::apply_alibi(scores, n_block * kBlockN, bidh, params.h, params.scale_softmax, params.alibi_start, params.alibi_ratio);
+            flash::apply_alibi(
+                scores, 
+                n_block * kBlockN, 
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q, 
+                kNWarps * 16,
+                bidh, params.h, params.scale_softmax, 
+                params.alibi_start, params.alibi_ratio
+            );
         }
 
         if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
