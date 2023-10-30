@@ -416,8 +416,8 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, dtype):
 # @pytest.mark.parametrize('kvpacked', [False])
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.bfloat16])
-# @pytest.mark.parametrize('mha_type', ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize('mha_type', ["mha"])
+@pytest.mark.parametrize('mha_type', ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize('mha_type', ["mha"])
 @pytest.mark.parametrize('causal', [False, True])
 # @pytest.mark.parametrize('causal', [False])
 # @pytest.mark.parametrize('d', [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
@@ -536,13 +536,14 @@ def test_flash_attn_output(seqlen_q, seqlen_kv, d, dropout_p, causal, mha_type, 
         assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
 
+
 # @pytest.mark.skipif(True, reason='Experimental, not being used')
 @pytest.mark.parametrize('kvpacked', [True, False])
 # @pytest.mark.parametrize('kvpacked', [True])
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.float16])
-# @pytest.mark.parametrize('mha_type', ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize('mha_type', ["mha"])
+@pytest.mark.parametrize('mha_type', ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize('mha_type', ["mha"])
 @pytest.mark.parametrize('causal', [False, True])
 # @pytest.mark.parametrize('causal', [True])
 # @pytest.mark.parametrize('d', [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
@@ -680,7 +681,7 @@ def test_flash_attn_varlen_output(seqlen_q, seqlen_kv, d, dropout_p, causal, mha
         assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
 
-@pytest.mark.skipif(True, reason='Experimental, not being used')
+
 # @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 @pytest.mark.parametrize('dtype', [torch.float16])
 # @pytest.mark.parametrize('causal', [False, True])
@@ -729,7 +730,7 @@ def test_flash_attn_race_condition(seqlen, d, dropout_p, causal, dtype):
             assert torch.equal(dqkv[:, :, 1], dqkv0[:, :, 1])
             assert torch.equal(dqkv[:, :, 2], dqkv0[:, :, 2])
 
-@pytest.mark.skipif(True, reason='Experimental, not being used')
+
 @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize('causal', [False, True])
 # @pytest.mark.parametrize('causal', [False])
@@ -774,6 +775,7 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
     assert (q.grad - q_ref.grad).abs().max().item() <= 5 * (q_pt.grad - q_ref.grad).abs().max().item() + 1e-3
     assert (k.grad - k_ref.grad).abs().max().item() <= 5 * (k_pt.grad - k_ref.grad).abs().max().item() + 1e-3
     assert (v.grad - v_ref.grad).abs().max().item() <= 5 * (v_pt.grad - v_ref.grad).abs().max().item() + 1e-3
+
 
 @pytest.mark.skipif(True, reason='Experimental, not being used')
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
@@ -822,6 +824,3 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
     assert (q.grad - q_ref.grad).abs().max().item() <= 2 * (q_pt.grad - q_ref.grad).abs().max().item()
     assert (k.grad - k_ref.grad).abs().max().item() <= 2 * (k_pt.grad - k_ref.grad).abs().max().item()
     assert (v.grad - v_ref.grad).abs().max().item() <= 2 * (v_pt.grad - v_ref.grad).abs().max().item()
-    
-if __name__ == "__main__":
-   test_flash_attn_varlen_output(seqlen_q=128, seqlen_kv=127, d=8, dropout_p=0.17, causal=False, mha_type='mha', dtype=torch.float16, kvpacked=False)

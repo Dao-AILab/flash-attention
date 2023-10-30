@@ -209,7 +209,11 @@ else:
   cc_flag = []
   cc_flag.append("--offload-arch=native")
                         
-  cc_flag.append(f"-DFLASH_ATTENTION_INTERNAL_USE_RTN={os.environ.get('FLASH_ATTENTION_INTERNAL_USE_RTN', 0)}")
+  if int(os.environ.get('FLASH_ATTENTION_INTERNAL_USE_RTN', 0)):
+    print("RTN IS USED")
+    cc_flag.append(f"-DUSE_RTN_BF16_CONVERT")
+  else:
+    print("RTZ IS USED")
 
   ck_sources = ["csrc/flash_attn_rocm/composable_kernel/library/src/utility/convolution_parameter.cpp", 
                 "csrc/flash_attn_rocm/composable_kernel/library/src/utility/device_memory.cpp", 
