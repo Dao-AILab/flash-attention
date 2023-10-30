@@ -99,8 +99,7 @@ using DeviceGemmGroupedHeadDim32 = device_op::DeviceGroupedMultiheadAttentionFor
         device_gemm_trait::S<1, 64, 1, 4>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
         1,
-        DeviceGemmTraits::kMaskingSpec,    // MaskingSpecialization
-        DeviceGemmTraits::kIsDeterministic>;
+        DeviceGemmTraits::kMaskingSpec>;
 
 // type alias for DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle with head_dim = 64
 template <typename DeviceGemmTraits>
@@ -174,8 +173,7 @@ using DeviceGemmGroupedHeadDim64 = device_op::DeviceGroupedMultiheadAttentionFor
         device_gemm_trait::S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
         1,
-        DeviceGemmTraits::kMaskingSpec,    // MaskingSpecialization
-        DeviceGemmTraits::kIsDeterministic>;
+        DeviceGemmTraits::kMaskingSpec>;
 
 // type alias for DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle with head_dim = 64
 template <typename DeviceGemmTraits>
@@ -249,8 +247,7 @@ using DeviceGemmGroupedHeadDim64NonDrop = device_op::DeviceGroupedMultiheadAtten
         device_gemm_trait::S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
         1,
-        DeviceGemmTraits::kMaskingSpec,    // MaskingSpecialization
-        DeviceGemmTraits::kIsDeterministic>;
+        DeviceGemmTraits::kMaskingSpec>;
 
 // type alias for DeviceGroupedMultiheadAttentionForward_Xdl_CShuffle with head_dim = 128
 template <typename DeviceGemmTraits>
@@ -324,8 +321,7 @@ using DeviceGemmGroupedHeadDim128 = device_op::DeviceGroupedMultiheadAttentionFo
         device_gemm_trait::S<1, 32, 1, 8>,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
         1,
-        DeviceGemmTraits::kMaskingSpec,                      // MaskingSpecialization
-        DeviceGemmTraits::kIsDeterministic>;
+        DeviceGemmTraits::kMaskingSpec>;
 
 // type alias for DeviceBatchedMultiheadAttentionForward_Xdl_CShuffle with head_dim = 32
 template <typename DeviceGemmTraits>
@@ -399,8 +395,7 @@ using DeviceGemmBatchedHeadDim32 = device_op::DeviceBatchedMultiheadAttentionFor
         device_gemm_trait::S<1, 64, 1, 4>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
         1, // 4,
-        DeviceGemmTraits::kMaskingSpec,    // MaskingSpecialization
-        DeviceGemmTraits::kIsDeterministic>;
+        DeviceGemmTraits::kMaskingSpec>;
 
 // type alias for DeviceBatchedMultiheadAttentionForward_Xdl_CShuffle with head_dim = 64
 template <typename DeviceGemmTraits>
@@ -474,8 +469,7 @@ using DeviceGemmBatchedHeadDim64 = device_op::DeviceBatchedMultiheadAttentionFor
         device_gemm_trait::S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
         1, // 4,
-        DeviceGemmTraits::kMaskingSpec,    // MaskingSpecialization
-        DeviceGemmTraits::kIsDeterministic>;
+        DeviceGemmTraits::kMaskingSpec>;
 
 // type alias for DeviceBatchedMultiheadAttentionForward_Xdl_CShuffle with head_dim = 64
 template <typename DeviceGemmTraits>
@@ -549,8 +543,7 @@ using DeviceGemmBatchedHeadDim64NonDrop = device_op::DeviceBatchedMultiheadAtten
         device_gemm_trait::S<1, 32, 1, 8>, // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
         1, // 4,
-        DeviceGemmTraits::kMaskingSpec,    // MaskingSpecialization
-        DeviceGemmTraits::kIsDeterministic>;
+        DeviceGemmTraits::kMaskingSpec>;
 
 // type alias for DeviceBatchedMultiheadAttentionForward_Xdl_CShuffle with head_dim = 128
 template <typename DeviceGemmTraits>
@@ -624,6 +617,5 @@ using DeviceGemmBatchedHeadDim128 = device_op::DeviceBatchedMultiheadAttentionFo
         device_gemm_trait::S<1, 32, 1, 8>,  // CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock
         8,              // CShuffleBlockTransferScalarPerVector_NPerBlock
         1, // 4,
-        DeviceGemmTraits::kMaskingSpec,     // MaskingSpecialization
-        DeviceGemmTraits::kIsDeterministic>;
+        DeviceGemmTraits::kMaskingSpec>;
 } // namespace fwd_device_gemm

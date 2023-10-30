@@ -301,7 +301,6 @@ struct FlashBwdBatchedParams : public BatchedParams {
     Index dkv_head_stride = dk.stride(-2);
 
     TORCH_CHECK(dq_seq_stride == q_seq_stride);
-    TORCH_CHECK(dkv_seq_stride == kv_seq_stride);
     TORCH_CHECK(dout_seq_stride == out_seq_stride);
 
     // Z layout [b, h_q, max_seqlen_q, max_seqlen_kv]
@@ -310,12 +309,12 @@ struct FlashBwdBatchedParams : public BatchedParams {
       
     // MQA / GQA readiness
     // KGrad layout [b, max_seqlen_kv, h_q, d]
-    std::vector<Index> dk_lengths{b, h_q, max_seqlen_kv, d};
-    std::vector<Index> dk_strides{dkv_batch_stride, dkv_head_stride, dkv_seq_stride, 1};
+    dk_lengths = std::vector<Index>{b, h_q, max_seqlen_kv, d};
+    dk_strides = std::vector<Index>{dkv_batch_stride, dkv_head_stride, dkv_seq_stride, 1};
 
     // VGrad layout [b, max_seqlen_kv, h_q, d]
-    std::vector<Index> dv_lengths{b, h_q, d, max_seqlen_kv};
-    std::vector<Index> dv_strides{dkv_batch_stride, dkv_head_stride, 1, dkv_seq_stride};  
+    dv_lengths = std::vector<Index>{b, h_q, d, max_seqlen_kv};
+    dv_strides = std::vector<Index>{dkv_batch_stride, dkv_head_stride, 1, dkv_seq_stride};  
   }
 
   void* __restrict__ dq_ptr;
@@ -324,6 +323,14 @@ struct FlashBwdBatchedParams : public BatchedParams {
 
   void* __restrict__ dout_ptr;
   void* __restrict__ dsoftmax_ptr;
+
+  // KGrad layout [b, max_seqlen_kv, h_q, d]
+  std::vector<Index> dk_lengths;
+  std::vector<Index> dk_strides;
+
+  // VGrad layout [b, max_seqlen_kv, h_q, d]
+  std::vector<Index> dv_lengths;
+  std::vector<Index> dv_strides;
 };
 
 // Common Grouped Arguments
@@ -565,7 +572,6 @@ struct FlashBwdGroupedParams : public GroupedParams {
     Index dout_head_stride = dout.stride(-2);
 
     TORCH_CHECK(dq_seq_stride == q_seq_stride);
-    TORCH_CHECK(dkv_seq_stride == kv_seq_stride);
     TORCH_CHECK(dout_seq_stride == out_seq_stride);
 
     auto opts = q.options();
@@ -598,12 +604,12 @@ struct FlashBwdGroupedParams : public GroupedParams {
 
       // MQA / GQA readiness
       // KGrad layout [b, max_seqlen_kv, h_q, d]
-      std::vector<Index> dk_lengths{1, h_q, max_seqlen_kv, d};
-      std::vector<Index> dk_strides{curr_dkv_batch_stride, dkv_head_stride, dkv_seq_stride, 1};
+      std::vector<Index> dk_lengths{1, h_q, seqlens_kv[i], d};
+      std::vector<Index> dk_strides{seqlens_kv[i] * q_seq_stride, dkv_head_stride, q_seq_stride, 1};
 
       // VGrad layout [b, max_seqlen_kv, h_q, d]
-      std::vector<Index> dv_lengths{1, h_q, d, max_seqlen_kv};
-      std::vector<Index> dv_strides{curr_dkv_batch_stride, dkv_head_stride, 1, dkv_seq_stride};  
+      std::vector<Index> dv_lengths{1, h_q, d, seqlens_kv[i]};
+      std::vector<Index> dv_strides{seqlens_kv[i] * q_seq_stride, dkv_head_stride, 1, q_seq_stride};  
 
 
       z_lengths_vec.push_back(z_lengths);
