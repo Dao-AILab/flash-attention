@@ -40,6 +40,7 @@
 namespace device_gemm_trait {
 using Int32 = int;
 using Int16 = unsigned short;
+using Int8 = uint8_t;
 using Float32 = float;
 using BFloat16 = ck::bhalf_t;
 using Float16 = ck::half_t;
@@ -73,7 +74,7 @@ struct Forward {
   using CShuffleDataType = Float32;
   using CDataType        = InputDataType_;
   using GemmDataType     = InputDataType_;
-  using ZDataType        = Int32;
+  using ZDataType        = Int8;
   using LSEDataType      = Float32;
   using Acc0BiasDataType = void;
   using Acc1BiasDataType = void;

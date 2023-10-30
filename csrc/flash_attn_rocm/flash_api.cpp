@@ -93,7 +93,7 @@ mha_fwd(const torch::Tensor &q,                         // batch_size x seqlen_q
   // Only return softmax if there's dropout to reduce compilation time
   if (return_softmax) {
     // TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
-    z = torch::empty({ batch_size, num_heads_q, seqlen_q, seqlen_kv }, opts.dtype(torch::kInt32));
+    z = torch::empty({ batch_size, num_heads_q, seqlen_q, seqlen_kv }, opts.dtype(torch::kUInt8));
   }
 
   FlashFwdBatchedParams params(batch_size,

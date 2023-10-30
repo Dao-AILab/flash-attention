@@ -500,7 +500,7 @@ struct FlashFwdGroupedParams : public GroupedParams {
     auto opts = q.options();
     for (int i = 0; i < b; ++i) {
       if (return_softmax) { 
-        z_vec.push_back(torch::empty({1, h_q, seqlens_q[i], seqlens_kv[i]}, opts.dtype(torch::kInt32)));
+        z_vec.push_back(torch::empty({1, h_q, seqlens_q[i], seqlens_kv[i]}, opts.dtype(torch::kUInt8)));
         z_ptrs.push_back(reinterpret_cast<void*>(z_vec[i].data_ptr()));
       } else {
         z_ptrs.push_back(nullptr);
