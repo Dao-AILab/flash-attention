@@ -337,6 +337,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     uint32_t attn_bias_batch_stride = 0;
     uint32_t attn_bias_head_stride = 0;
     uint32_t attn_bias_q_stride = 0;
+    at::Tensor attn_bias_padded;
 
     if (attn_bias.has_value()) {
         TORCH_CHECK(attn_bias.value().is_cuda(), "Input tensor must be on CUDA device");
@@ -344,9 +345,15 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         TORCH_CHECK(attn_bias.value().dtype() == q_dtype, "attention bias and query must have the same dtype");
         CHECK_SHAPE(attn_bias.value(), batch_size, num_heads, seqlen_q, seqlen_k);
 
-        attn_bias_batch_stride = attn_bias.value().stride(0);
-        attn_bias_head_stride = attn_bias.value().stride(1);
-        attn_bias_q_stride = attn_bias.value().stride(2);
+        if ((seqlen_q % 8 != 0) || (seqlen_k % 8 != 0)) {
+            attn_bias_padded = torch::nn::functional::pad(attn_bias.value(), torch::nn::functional::PadFuncOptions({0, 8 - seqlen_k % 8, 0, 8 - seqlen_q % 8}));
+        } else {
+            attn_bias_padded = attn_bias.value();
+        }
+
+        attn_bias_batch_stride = attn_bias_padded.stride(0);
+        attn_bias_head_stride = attn_bias_padded.stride(1);
+        attn_bias_q_stride = attn_bias_padded.stride(2);
     }
 
     at::Tensor q_padded, k_padded, v_padded;
@@ -408,7 +415,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     attn_bias ? attn_bias->data_ptr() : nullptr,
+                     attn_bias ? attn_bias_padded.data_ptr() : nullptr,
                      attn_bias_batch_stride,
                      attn_bias_head_stride,
                      attn_bias_q_stride);
