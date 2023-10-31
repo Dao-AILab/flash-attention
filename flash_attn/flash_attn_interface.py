@@ -490,3 +490,20 @@ def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, ma
         q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
         dropout_p, softmax_scale, causal, return_attn_probs
     )
+    
+# Legacy Interface Support
+def flash_attn_unpadded_qkvpacked_func(qkv, cu_seqlens, max_seqlen, dropout_p, softmax_scale=None,
+                                       causal=False, return_attn_probs=False):
+  return flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen, dropout_p, softmax_scale,
+                                          causal, return_attn_probs)
+  
+def flash_attn_unpadded_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                                      dropout_p, softmax_scale=None, causal=False, return_attn_probs=False):
+  return flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                                         dropout_p, softmax_scale, causal, return_attn_probs)
+    
+def flash_attn_unpadded_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                             dropout_p, softmax_scale=None, 
+                             causal=False, return_attn_probs=False):
+  return flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                                dropout_p, softmax_scale, causal, return_attn_probs)
