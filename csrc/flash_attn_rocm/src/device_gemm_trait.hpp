@@ -105,7 +105,6 @@ struct Forward {
 template <typename InputDataType_,
           typename OutputDataType_,
           typename GemmDataType_,
-          typename ZDataType_,
           Index kCShuffleBlockTransferScalarPerVectorNPerBlock_,
           GemmSpec kGemmSpec_,
           MaskingSpec kMaskingSpec_,
@@ -114,7 +113,7 @@ struct Backward {
   using InputDataType    = InputDataType_;
   using OutputDataType   = OutputDataType_;
   using GemmDataType     = GemmDataType_;
-  using ZDataType        = ZDataType_;
+  using ZDataType        = Int8;
   using AccDataType      = Float32;
   using ShuffleDataType  = Float32;
   using LSEDataType      = Float32;

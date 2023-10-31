@@ -80,7 +80,6 @@ class FlashRunner {
       using DeviceGemmTraits = device_gemm_trait::Backward<T, 
                                                            device_gemm_trait::Float32, 
                                                            T,
-                                                           device_gemm_trait::Int8, // std::conditional_t<std::is_same_v<T, device_gemm_trait::Float16>, device_gemm_trait::Int16, device_gemm_trait::Int32>,
                                                            4, 
                                                            kGemmSpec,
                                                            kMaskingSpec,
@@ -92,8 +91,7 @@ class FlashRunner {
       // input, output, gemm, dropout, cshuffle, masking specialization, deterministic
       using DeviceGemmTraits = device_gemm_trait::Backward<T, 
                                                            T, 
-                                                           device_gemm_trait::BFloat16, 
-                                                           device_gemm_trait::Int8, 
+                                                           device_gemm_trait::BFloat16,
                                                            8, 
                                                            kGemmSpec,
                                                            kMaskingSpec, 
