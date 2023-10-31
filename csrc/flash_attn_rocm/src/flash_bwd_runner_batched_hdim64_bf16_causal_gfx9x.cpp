@@ -24,33 +24,27 @@
 #include "flash_runner.hpp"
 
 template <>
-void FlashRunner::run_<FlashBwdBatchedParams, 
-                       64, 
-                       device_gemm_trait::BFloat16, 
-                       true, 
-                       true>(FlashBwdBatchedParams &params, hipStream_t &stream) {
+void FlashRunner::run_<FlashBwdBatchedParams, 64, device_gemm_trait::BFloat16,
+                       true, true>(FlashBwdBatchedParams &params,
+                                   hipStream_t &stream) {
   BOOL_SWITCH(BaseParams::kIsDeterministic, kIsDeterministic, [&] {
-    this->template run_bwd_<FlashBwdBatchedParams, 
-                            bwd_device_gemm::DeviceGemmBatchedHeadDim64,
-                            device_gemm_trait::BFloat16, 
-                            device_gemm_trait::kGemmSpecPadding,
-                            device_gemm_trait::kMaskingSpecCausal,
-                            kIsDeterministic>(params, stream);
+    this->template run_bwd_<
+        FlashBwdBatchedParams, bwd_device_gemm::DeviceGemmBatchedHeadDim64,
+        device_gemm_trait::BFloat16, device_gemm_trait::kGemmSpecPadding,
+        device_gemm_trait::kMaskingSpecCausal, kIsDeterministic>(params,
+                                                                 stream);
   });
 } // FlashRunner::run_()
 
 template <>
-void FlashRunner::run_<FlashBwdBatchedParams, 
-                       64, 
-                       device_gemm_trait::BFloat16, 
-                       false, 
-                       true>(FlashBwdBatchedParams &params, hipStream_t &stream) {
+void FlashRunner::run_<FlashBwdBatchedParams, 64, device_gemm_trait::BFloat16,
+                       false, true>(FlashBwdBatchedParams &params,
+                                    hipStream_t &stream) {
   BOOL_SWITCH(BaseParams::kIsDeterministic, kIsDeterministic, [&] {
-    this->template run_bwd_<FlashBwdBatchedParams, 
-                            bwd_device_gemm::DeviceGemmBatchedHeadDim64,
-                            device_gemm_trait::BFloat16, 
-                            device_gemm_trait::kGemmSpecDefault,
-                            device_gemm_trait::kMaskingSpecCausal,
-                            kIsDeterministic>(params, stream);
+    this->template run_bwd_<
+        FlashBwdBatchedParams, bwd_device_gemm::DeviceGemmBatchedHeadDim64,
+        device_gemm_trait::BFloat16, device_gemm_trait::kGemmSpecDefault,
+        device_gemm_trait::kMaskingSpecCausal, kIsDeterministic>(params,
+                                                                 stream);
   });
 } // FlashRunner::run_()

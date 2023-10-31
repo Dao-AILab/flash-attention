@@ -23,80 +23,73 @@
 
 #pragma once
 
-#include "fwd_device_gemm_invoker.hpp"
 #include "bwd_device_gemm_invoker.hpp"
+#include "fwd_device_gemm_invoker.hpp"
 
 #include "static_switch.hpp"
 
 class FlashRunner {
- public:
+public:
   template <typename FlashParams>
   void Run(FlashParams &params, hipStream_t &stream) {
     HEADDIM_SWITCH(params.d, [&] {
       BF16_SWITCH(params.is_bf16, [&] {
         BOOL_SWITCH(params.is_mnko_padding, kIsPadding, [&] {
           BOOL_SWITCH(params.is_causal, kIsCausal, [&] {
-            this->template run_<FlashParams, kHeadDim, T, kIsPadding, kIsCausal>(params, stream);
+            this->template run_<FlashParams, kHeadDim, T, kIsPadding,
+                                kIsCausal>(params, stream);
           });
         });
       });
     });
   }
 
- private:
-  template <typename FlashParams, 
-            int kHeadDim, 
-            typename T, 
-            bool kIsPadding, 
+private:
+  template <typename FlashParams, int kHeadDim, typename T, bool kIsPadding,
             bool kIsCausal>
   void run_(FlashParams &params, hipStream_t &stream);
 
   template <typename FlashFwdParams,
-            template <typename> typename DeviceGemmTemplate,
-            typename T, 
+            template <typename> typename DeviceGemmTemplate, typename T,
             device_gemm_trait::GemmSpec kGemmSpec,
-            device_gemm_trait::MaskingSpec kMaskingSpec, 
-            bool kIsDeterministic>
+            device_gemm_trait::MaskingSpec kMaskingSpec, bool kIsDeterministic>
   void run_fwd_(FlashFwdParams &params, hipStream_t &stream) {
-    // input, output, gemm, dropout, cshuffle, masking specialization, deterministic
-    using DeviceGemmTraits = device_gemm_trait::Forward<T,
-                                                        kGemmSpec,
-                                                        kMaskingSpec, 
-                                                        kIsDeterministic>;
-    using Invoker = fwd_device_gemm::DeviceGemmInvoker<DeviceGemmTemplate, DeviceGemmTraits>;
+    // input, output, gemm, dropout, cshuffle, masking specialization,
+    // deterministic
+    using DeviceGemmTraits =
+        device_gemm_trait::Forward<T, kGemmSpec, kMaskingSpec,
+                                   kIsDeterministic>;
+    using Invoker = fwd_device_gemm::DeviceGemmInvoker<DeviceGemmTemplate,
+                                                       DeviceGemmTraits>;
     Invoker(params, stream);
   }
-  
+
   template <typename FlashBwdParams,
-            template <typename> typename DeviceGemmTemplate,
-            typename T,
+            template <typename> typename DeviceGemmTemplate, typename T,
             device_gemm_trait::GemmSpec kGemmSpec,
-            device_gemm_trait::MaskingSpec kMaskingSpec, 
-            bool kIsDeterministic>
+            device_gemm_trait::MaskingSpec kMaskingSpec, bool kIsDeterministic>
   void run_bwd_(FlashBwdParams &params, hipStream_t &stream) {
-    if (BaseParams::kIsUnitTestMode) {     
+    if (BaseParams::kIsUnitTestMode) {
       // unit test mode
-      // input, output, gemm, dropout, cshuffle, masking specialization, deterministic
-      using DeviceGemmTraits = device_gemm_trait::Backward<T, 
-                                                           device_gemm_trait::Float32, 
-                                                           T,
-                                                           4, 
-                                                           kGemmSpec,
-                                                           kMaskingSpec,
-                                                           kIsDeterministic>;
-      using Invoker = bwd_device_gemm::DeviceGemmInvoker<DeviceGemmTemplate, DeviceGemmTraits>;
+      // input, output, gemm, dropout, cshuffle, masking specialization,
+      // deterministic
+      using DeviceGemmTraits =
+          device_gemm_trait::Backward<T, device_gemm_trait::Float32, T, 4,
+                                      kGemmSpec, kMaskingSpec,
+                                      kIsDeterministic>;
+      using Invoker = bwd_device_gemm::DeviceGemmInvoker<DeviceGemmTemplate,
+                                                         DeviceGemmTraits>;
       Invoker(params, stream);
-    } else { 
+    } else {
       // performance mode
-      // input, output, gemm, dropout, cshuffle, masking specialization, deterministic
-      using DeviceGemmTraits = device_gemm_trait::Backward<T, 
-                                                           T, 
-                                                           device_gemm_trait::BFloat16,
-                                                           8, 
-                                                           kGemmSpec,
-                                                           kMaskingSpec, 
-                                                           kIsDeterministic>;
-      using Invoker = bwd_device_gemm::DeviceGemmInvoker<DeviceGemmTemplate, DeviceGemmTraits>;
+      // input, output, gemm, dropout, cshuffle, masking specialization,
+      // deterministic
+      using DeviceGemmTraits =
+          device_gemm_trait::Backward<T, T, device_gemm_trait::BFloat16, 8,
+                                      kGemmSpec, kMaskingSpec,
+                                      kIsDeterministic>;
+      using Invoker = bwd_device_gemm::DeviceGemmInvoker<DeviceGemmTemplate,
+                                                         DeviceGemmTraits>;
       Invoker(params, stream);
     }
   }
