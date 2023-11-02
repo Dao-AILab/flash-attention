@@ -841,12 +841,23 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
                     smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
 
-        if (Has_attn_bias) {
-            flash::apply_attn_bias(acc_s, tBrB, params.scale_softmax);
-        }
-
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (col=(2, MMA_N), row=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        Tensor bias_fragment = make_tensor(tBrB.data(), flash::convert_layout_acc_rowcol(tBrB.layout()));
+
+        if (Has_attn_bias) {
+            flash::apply_attn_bias(
+                scores, bias_fragment,
+                n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + get<0>(taccScS_row(0)),
+                binfo.actual_seqlen_q,
+                AtomLayoutMS * 16,
+                params.scale_softmax
+            );
+            __syncthreads();
+        }
+
         // if (cute::thread(32, 0)) { print(scores); }
         // TD [2023-07-29]: I was thinking that we don't need to mask out the elements beyond
         // actual_seqlen_k, because acc_s would be some finite value for those indices.
@@ -1456,12 +1467,22 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
         flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
                     smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
 
-        if (Has_attn_bias) {
-            flash::apply_attn_bias(acc_s, tSsB, params.scale_softmax);
-        }
-
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (col=(2, MMA_N), row=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        Tensor bias_fragment = make_tensor(tBrB.data(), flash::convert_layout_acc_rowcol(tBrB.layout()));
+
+        if (Has_attn_bias) {
+            flash::apply_attn_bias(
+                scores, bias_fragment,
+                n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + get<0>(taccScS_row(0)),
+                binfo.actual_seqlen_q,
+                AtomLayoutMS * 16,
+                params.scale_softmax
+            );
+            __syncthreads();
+        }
         // We don't need to mask out the elements beyond actual_seqlen_k, because acc_s would
         // be some finite value for those indices. In the end when we multiply with K to get dQ,
         // the corresponding values of K would be 0, so the result would still be correct.

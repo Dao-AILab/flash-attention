@@ -46,7 +46,7 @@ def _flash_attn_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if attn_bias is not None:
         attn_bias = maybe_contiguous(attn_bias)
-    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_cuda.fwd(
+    out, q, k, v, out_padded, attn_bias, softmax_lse, S_dmask, rng_state = flash_attn_cuda.fwd(
         q,
         k,
         v,
@@ -60,7 +60,7 @@ def _flash_attn_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, 
         return_softmax,
         None,
     )
-    return out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state
+    return out, q, k, v, out_padded, attn_bias, softmax_lse, S_dmask, rng_state
 
 
 def _flash_attn_varlen_forward(
@@ -203,7 +203,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
     def forward(ctx, qkv, dropout_p, softmax_scale, causal, window_size, attn_bias, return_softmax):
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+        out, q, k, v, out_padded, attn_bias, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             qkv[:, :, 0],
             qkv[:, :, 1],
             qkv[:, :, 2],
@@ -318,7 +318,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
     def forward(ctx, q, kv, dropout_p, softmax_scale, causal, window_size, attn_bias, return_softmax):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+        out, q, k, v, out_padded, attn_bias, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q,
             kv[:, :, 0],
             kv[:, :, 1],
@@ -443,7 +443,7 @@ class FlashAttnFunc(torch.autograd.Function):
     def forward(ctx, q, k, v, dropout_p, softmax_scale, causal, window_size, attn_bias, return_softmax):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+        out, q, k, v, out_padded, attn_bias, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q,
             k,
             v,

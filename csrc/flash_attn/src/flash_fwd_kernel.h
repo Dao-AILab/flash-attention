@@ -387,12 +387,23 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         );
         // if (cute::thread0()) { print(acc_s); }
 
-        if (Has_attn_bias) {
-            flash::apply_attn_bias(acc_s, tBrB, params.scale_softmax);
-        }
-
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        Tensor bias_fragment = make_tensor(tBrB.data(), flash::convert_layout_acc_rowcol(tBrB.layout()));
+
+        if (Has_attn_bias) {
+            flash::apply_attn_bias(
+                scores, bias_fragment,
+                n_block * kBlockN,
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q,
+                kNWarps * 16,
+                params.scale_softmax
+            );
+            __syncthreads();
+        }
+
         // if (cute::thread0()) { print_tensor(scores); }
         // We don't put the masking before the matmul S = Q K^T because we don't clear sK
         // for rows outside actual_seqlen_k. So those rows could have Inf / NaN, and the matmul
@@ -500,11 +511,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             smem_thr_copy_Q, smem_thr_copy_K
         );
 
-        // Apply attention biases
-        if (Has_attn_bias) {
-            flash::apply_attn_bias(acc_s, tBrB, params.scale_softmax);
-        }
-
         flash::cp_async_wait<0>();
         __syncthreads();
         if (n_block > n_block_min) {
@@ -525,6 +531,21 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        Tensor bias_fragment = make_tensor(tBrB.data(), flash::convert_layout_acc_rowcol(tBrB.layout()));
+
+        if (Has_attn_bias) {
+            flash::apply_attn_bias(
+                scores, bias_fragment,
+                n_block * kBlockN,
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q,
+                kNWarps * 16,
+                params.scale_softmax
+            );
+            __syncthreads();
+        }
+
         if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
             flash::apply_mask_local(
                 scores, n_block * kBlockN, binfo.actual_seqlen_k,

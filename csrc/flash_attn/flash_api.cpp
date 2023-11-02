@@ -470,7 +470,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         q_padded = q_padded.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
-    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
+    return {out, q_padded, k_padded, v_padded, out_padded, attn_bias_padded, softmax_lse, p, rng_state};
 }
 
 std::vector<at::Tensor>
@@ -752,7 +752,10 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         TORCH_CHECK(attn_bias.value().is_cuda(), "Input tensor must be on CUDA device");
         TORCH_CHECK(attn_bias.value().stride(-1) == 1, "Input tensor must have contiguous last dimension");
         TORCH_CHECK(attn_bias.value().dtype() == q_dtype, "attention bias and query must have the same dtype");
-        CHECK_SHAPE(attn_bias.value(), batch_size, num_heads, seqlen_q, seqlen_k);
+
+        const int seqlen_q_round8 = round_multiple(seqlen_q, 8);
+        const int seqlen_k_round8 = round_multiple(seqlen_k, 8);
+        CHECK_SHAPE(attn_bias.value(), batch_size, num_heads, seqlen_q_round8, seqlen_k_round8);
 
         attn_bias_batch_stride = attn_bias.value().stride(0);
         attn_bias_head_stride = attn_bias.value().stride(1);

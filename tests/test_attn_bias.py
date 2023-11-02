@@ -155,8 +155,8 @@ def get_tensors(batch_size, seq_len, num_heads, head_dim, dtype):
     "dtype", [torch.bfloat16, torch.float16]
 )
 @pytest.mark.parametrize(
-    "bs_seqlen", [(8, 512), (4, 1024), (2, 2048),
-                  (1, 4096)]
+    "bs_seqlen", [(8, 128), (8,256), (8, 512), (4, 1024), (2, 2048),
+                  (1, 4096), (5, 127), (5, 257), (5, 513)]
 )
 @pytest.mark.parametrize(
     "nh_headdim", [(16,32), (16, 64), (16, 96),
