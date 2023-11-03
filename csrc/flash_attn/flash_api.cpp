@@ -676,6 +676,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         const int window_size_left,
         int window_size_right,
         const c10::optional<at::Tensor> &attn_bias,
+        c10::optional<at::Tensor> &ds_,   // batch_size x num_heads x seqlen_q x seqlen_k
         c10::optional<at::Generator> gen_,
         c10::optional<at::Tensor> &rng_state) {
 
@@ -761,9 +762,16 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         attn_bias_head_stride = attn_bias.value().stride(1);
         attn_bias_q_stride = attn_bias.value().stride(2);
 
-        ds = torch::empty({batch_size, num_heads, seqlen_q, seqlen_k}, q_dtype);
-        ds.zero_();
-        TORCH_CHECK(ds.is_contiguous());
+        if (ds_.has_value()) {
+            ds = ds_.value();
+            TORCH_CHECK(ds.dtype() == q_dtype, "ds must have the same dtype as q");
+            CHECK_DEVICE(ds);
+            TORCH_CHECK(ds.stride(-1) == 1, "ds must have contiguous last dimension");
+            CHECK_SHAPE(ds, batch_size, num_heads, seqlen_q_round8, seqlen_k_round8);
+
+            ds.zero_();
+            TORCH_CHECK(ds.is_contiguous());
+        }
     }
 
     at::Tensor dq, dk, dv;
@@ -853,7 +861,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      window_size_left,
                      window_size_right,
                      attn_bias ? attn_bias->data_ptr() : nullptr,
-                     attn_bias ? ds.data_ptr() : nullptr,
+                     attn_bias && ds_.has_value() ? ds.data_ptr() : nullptr,
                      attn_bias_batch_stride,
                      attn_bias_head_stride,
                      attn_bias_q_stride);

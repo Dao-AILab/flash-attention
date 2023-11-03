@@ -419,6 +419,10 @@ struct Flash_bwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, elem_type>{},
                         GmemLayoutAtomB{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
+    using GmemTiledCopydS = decltype(
+        make_tiled_copy(Copy_Atom<DefaultCopy, elem_type>{},
+                        GmemLayoutAtomB{},
+                        Layout<Shape < _1, _8>>{}));  // Val layout, 8 vals per store
 
     using GmemLayoutAtomdQaccum = std::conditional_t<
         kBlockKSmem == 32,

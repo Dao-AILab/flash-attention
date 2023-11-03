@@ -587,6 +587,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                     make_stride(params.attn_bias_q_stride, _1{})); // (BLK_M,BLK_N)
     Tensor sB = make_tensor(sP.data() + size(sP), typename Kernel_traits::SmemLayoutB{});
 
+    Tensor gdS = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.attn_ds_ptr) + row_offset_attn_bias),
+                            Shape<Int<kBlockM>, Int<kBlockN>>{},
+                            make_stride(params.attn_bias_q_stride, _1{}));
+
+    bool copy_dS = (Has_attn_bias && (params.attn_ds_ptr != nullptr));
+
     typename Kernel_traits::GmemTiledCopyB gmem_tiled_copy_B;
     auto gmem_thr_copy_B = gmem_tiled_copy_B.get_thread_slice(tidx);
 
@@ -594,6 +600,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);
 
     Tensor tBrB = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});
+
+    typename Kernel_traits::GmemTiledCopydS gmem_tiled_copy_dS;
+    auto gmem_thr_copy_dS = gmem_tiled_copy_dS.get_thread_slice(tidx);
+
+    Tensor tBsdS = gmem_thr_copy_dS.partition_S(sdS);
+    Tensor tBgdS = gmem_thr_copy_dS.partition_D(gdS);
 
     //
     // Copy Atom retiling
@@ -911,13 +923,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             );
         }
 
-        if (Has_attn_bias && m_block > m_block_min) {
-            // Advance gB
-            tBgB.data() = tBgB.data() + (-int(kBlockM * params.attn_bias_q_stride));
-            cute::copy(gmem_tiled_copy_B, tBgB, tBsB);
-            cute::cp_async_fence();
-        }
-
         // Convert scores from fp32 to fp16/bf16
         Tensor rP = !Is_dropout
             ? flash::convert_type<Element>(scores)
@@ -1022,6 +1027,13 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_dO, tdOgdO, tdOsdO, tQcQ, tQpQ);
                 flash::cp_async_fence();
             }
+
+            if (Has_attn_bias) {
+                // Advance gB
+                tBgB.data() = tBgB.data() + (-int(kBlockM * params.attn_bias_q_stride));
+                cute::copy(gmem_tiled_copy_B, tBgB, tBsB);
+                cute::cp_async_fence();
+            }
         }
 
         flash::gemm(acc_dq, tdQrdS, tdQrKt, tdQsdS, tdQsKt, tiled_mma_dq,
@@ -1076,6 +1088,25 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             cute::copy(tdOrdO, tdOsdO);
             dot_do_o<Kernel_traits::kGmemThreadsPerRow>(tdOrdO, tdOrO, gdPsum,
                                                         Kernel_traits::kNThreads / (Kernel_traits::kGmemThreadsPerRow), params.p_dropout);
+        }
+
+        if (copy_dS) {
+            Tensor cdS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+            Tensor tdScdS = gmem_thr_copy_dS.partition_D(cdS);
+            #pragma unroll
+            for (int m = 0; m < size<1>(tdScdS); ++m) {
+                if (Is_even_MN || get<0>(tdScdS(0, m, 0)) < binfo.actual_seqlen_q - m_block * kBlockM) {
+                    for (int n = 0; n < size<2>(tdScdS); ++n) {
+                        if (Is_even_MN || get<0>(tdScdS(0, 0, n)) < binfo.actual_seqlen_k - n_block * kBlockN) {
+                            cute::copy(gmem_tiled_copy_dS, tBsdS(_, m, n), tBgdS(_, m, n));
+                        }
+                    }
+                }
+            }
+
+            if (m_block > m_block_min) {
+                tBgdS.data() = tBgdS.data() + (-int(kBlockM * params.attn_bias_q_stride));
+            }
         }
 
         if (Is_last) {
@@ -1312,6 +1343,12 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
                     make_stride(params.attn_bias_q_stride, _1{})); // (BLK_M,BLK_N)
     Tensor sB = make_tensor(sP.data() + size(sP), typename Kernel_traits::SmemLayoutB{});
 
+    Tensor gdS = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.attn_ds_ptr) + row_offset_attn_bias),
+                            Shape<Int<kBlockM>, Int<kBlockN>>{},
+                            make_stride(params.attn_bias_q_stride, _1{}));
+
+    bool copy_dS = (Has_attn_bias && (params.attn_ds_ptr != nullptr));
+
     typename Kernel_traits::GmemTiledCopyB gmem_tiled_copy_B;
     auto gmem_thr_copy_B = gmem_tiled_copy_B.get_thread_slice(tidx);
 
@@ -1319,6 +1356,12 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);
 
     Tensor tBrB = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});
+
+    typename Kernel_traits::GmemTiledCopydS gmem_tiled_copy_dS;
+    auto gmem_thr_copy_dS = gmem_tiled_copy_dS.get_thread_slice(tidx);
+
+    Tensor tBsdS = gmem_thr_copy_dS.partition_S(sdS);
+    Tensor tBgdS = gmem_thr_copy_dS.partition_D(gdS);
 
     //
     // Copy Atom retiling
@@ -1564,6 +1607,25 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
                 tBgB.data() = tBgB.data() + (-kBlockN);
                 cute::copy(gmem_tiled_copy_B, tBgB, tBsB);
                 cute::cp_async_fence();
+            }
+        }
+
+        if (copy_dS) {
+            Tensor cdS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+            Tensor tdScdS = gmem_thr_copy_dS.partition_D(cdS);
+            #pragma unroll
+            for (int m = 0; m < size<1>(tdScdS); ++m) {
+                if (Is_even_MN || get<0>(tdScdS(0, m, 0)) < binfo.actual_seqlen_q - m_block * kBlockM) {
+                    for (int n = 0; n < size<2>(tdScdS); ++n) {
+                        if (Is_even_MN || get<0>(tdScdS(0, 0, n)) < binfo.actual_seqlen_k - n_block * kBlockN) {
+                            cute::copy(gmem_tiled_copy_dS, tBsdS(_, m, n), tBgdS(_, m, n));
+                        }
+                    }
+                }
+            }
+
+            if (m_block > m_block_min) {
+                tBgdS.data() = tBgdS.data() + (-kBlockN);
             }
         }
 

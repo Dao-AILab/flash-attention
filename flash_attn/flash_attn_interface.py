@@ -117,6 +117,7 @@ def _flash_attn_backward(
     causal,
     window_size,
     attn_bias,
+    ds,
     rng_state=None,
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
@@ -141,6 +142,7 @@ def _flash_attn_backward(
         window_size[0],
         window_size[1],
         attn_bias,
+        ds,
         None,
         rng_state,
     )
@@ -203,7 +205,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
     def forward(ctx, qkv, dropout_p, softmax_scale, causal, window_size, attn_bias, return_softmax):
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, attn_bias, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+        out, q, k, v, out_padded, attn_bias_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             qkv[:, :, 0],
             qkv[:, :, 1],
             qkv[:, :, 2],
@@ -214,11 +216,12 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             attn_bias=attn_bias,
             return_softmax=return_softmax and dropout_p > 0,
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state, attn_bias)
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state, attn_bias_padded)
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.bias_requires_grad = attn_bias.requires_grad
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -226,6 +229,11 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         q, k, v, out, softmax_lse, rng_state, attn_bias = ctx.saved_tensors
         qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
         dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
+
+        ds = None
+        if ctx.bias_requires_grad:
+            ds = torch.zeros(attn_bias.shape, dtype=attn_bias.dtype, device=attn_bias.device)
+
         _flash_attn_backward(
             dout,
             q,
@@ -241,10 +249,14 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             attn_bias,
+            ds,
             rng_state=rng_state,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None
+        if ds is not None:
+            ds = ds[...,: q.shape[1], : k.shape[1]]
+
+        return dqkv, None, None, None, None, ds, None
 
 
 class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
@@ -318,7 +330,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
     def forward(ctx, q, kv, dropout_p, softmax_scale, causal, window_size, attn_bias, return_softmax):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, attn_bias, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+        out, q, k, v, out_padded, attn_bias_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q,
             kv[:, :, 0],
             kv[:, :, 1],
@@ -329,11 +341,12 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             attn_bias=attn_bias,
             return_softmax=return_softmax and dropout_p > 0,
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state, attn_bias)
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state, attn_bias_padded)
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.bias_requires_grad = attn_bias.requires_grad
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -342,6 +355,11 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         dq = torch.empty_like(q)
         kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
         dkv = torch.empty(kv_shape, dtype=k.dtype, device=k.device)
+
+        ds = None
+        if ctx.bias_requires_grad:
+            ds = torch.zeros(attn_bias.shape, dtype=attn_bias.dtype, device=attn_bias.device)
+
         _flash_attn_backward(
             dout,
             q,
@@ -357,11 +375,15 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             attn_bias,
+            ds,
             rng_state=rng_state,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., : dout.shape[-1]]
-        return dq, dkv, None, None, None, None, None, None
+        if ds is not None:
+            ds = ds[...,: q.shape[1], : k.shape[1]]
+
+        return dq, dkv, None, None, None, None, ds, None
 
 
 class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
@@ -443,7 +465,7 @@ class FlashAttnFunc(torch.autograd.Function):
     def forward(ctx, q, k, v, dropout_p, softmax_scale, causal, window_size, attn_bias, return_softmax):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, attn_bias, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+        out, q, k, v, out_padded, attn_bias_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q,
             k,
             v,
@@ -454,17 +476,23 @@ class FlashAttnFunc(torch.autograd.Function):
             attn_bias=attn_bias,
             return_softmax=return_softmax and dropout_p > 0,
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state, attn_bias)
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state, attn_bias_padded)
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.bias_requires_grad = attn_bias.requires_grad
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, rng_state, attn_bias = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+        ds = None
+        if ctx.bias_requires_grad:
+            ds = torch.zeros(attn_bias.shape, dtype=attn_bias.dtype, device=attn_bias.device)
+
         _flash_attn_backward(
             dout,
             q,
@@ -480,12 +508,16 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             attn_bias,
+            ds,
             rng_state=rng_state,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None
+        if ds is not None:
+            ds = ds[..., : q.shape[1], : k.shape[1]]
+
+        return dq, dk, dv, None, None, None, None, ds, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):

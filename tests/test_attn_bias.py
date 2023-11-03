@@ -195,11 +195,12 @@ def test_bias_attention(bs_seqlen, nh_headdim, dtype):
         )
 
     # Compute gradients
-    (dq, dk, dv) = torch.autograd.grad(out_fl, (q, k, v), dout)
-    (dq_ref, dk_ref, dv_ref) = torch.autograd.grad(out_ref, (q, k, v), dout)
-    (dq_pt, dk_pt, dv_pt) = torch.autograd.grad(out_pt, (q, k, v), dout)
+    (dq, dk, dv, dbias) = torch.autograd.grad(out_fl, (q, k, v, bias), dout)
+    (dq_ref, dk_ref, dv_ref, dbias_ref) = torch.autograd.grad(out_ref, (q, k, v, bias), dout)
+    (dq_pt, dk_pt, dv_pt, dbias_pt) = torch.autograd.grad(out_pt, (q, k, v, bias), dout)
 
     assert (out_fl - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
     assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
     assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
     assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
+    assert (dbias - dbias_ref).abs().max().item() <= 2 * (dbias_pt - dbias_ref).abs().max().item()
