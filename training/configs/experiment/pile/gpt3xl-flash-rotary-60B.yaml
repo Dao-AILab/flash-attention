@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - /experiment/pile/gpt3xl-flash-rotary.yaml
+
+trainer:
+  max_steps: 60000
+
+train:
+  scheduler:
+    t_initial: ${trainer.max_steps}

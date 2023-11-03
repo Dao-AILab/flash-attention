@@ -1,0 +1,19 @@
+# @package _global_
+defaults:
+  - /experiment/owt/base.yaml
+  - override /model: gpt2
+  - override /model/gpt2model: gpt2-small
+
+model:
+  config:
+    # n_positions is already set to ${datamodule.max_length}
+    residual_in_fp32: True
+    use_flash_attn: True
+    fused_bias_fc: True
+    fused_mlp: True
+    fused_dropout_add_ln: True
+    pad_vocab_size_multiple: 8
+
+datamodule:
+  # batch_size: 64
+  batch_size: ${eval:"16 if ${train.gpu_mem} < 24 else (32 if ${train.gpu_mem} < 40 else 64)"}

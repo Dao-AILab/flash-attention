@@ -1,0 +1,2 @@
+causality-monitor:
+  _target_: src.callbacks.causality_monitor.CausalityMonitor

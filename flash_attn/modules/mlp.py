@@ -3,70 +3,114 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed import ProcessGroup
 
 try:
-    from flash_attn.ops.fused_dense import fused_dense_gelu_dense_function_td
-    from flash_attn.ops.fused_dense import fused_dense_res_gelu_dense_function_td
+    from flash_attn.ops.fused_dense import ColumnParallelLinear, RowParallelLinear
 except ImportError:
-    fused_dense_gelu_dense_function_td = None
-    fused_dense_res_gelu_dense_function_td = None
+    ColumnParallelLinear, RowParallelLinear = None, None
+
+try:
+    from flash_attn.ops.fused_dense import FusedMLP, ParallelFusedMLP
+except ImportError:
+    FusedMLP, ParallelFusedMLP = None, None
 
 
 class Mlp(nn.Module):
 
     def __init__(self, in_features, hidden_features=None, out_features=None, activation=F.gelu,
+                 bias1=True, bias2=True, return_residual=False, device=None, dtype=None):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features * 4
+        self.return_residual = return_residual
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias1, **factory_kwargs)
+        self.activation = activation
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias2, **factory_kwargs)
+
+    def forward(self, x):
+        y = self.fc1(x)
+        y = self.activation(y)
+        y = self.fc2(y)
+        return y if not self.return_residual else (y, x)
+
+
+class ParallelMLP(nn.Module):
+
+    def __init__(self, in_features, hidden_features=None, out_features=None, activation=F.gelu,
+                 process_group: ProcessGroup = None, sequence_parallel=True,
+                 bias1=True, bias2=True, device=None, dtype=None):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+        assert ColumnParallelLinear is not None, "Need to install fused_dense"
+        assert RowParallelLinear is not None, "Need to install fused_dense"
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features * 4
+        self.fc1 = ColumnParallelLinear(in_features, hidden_features, process_group, bias=bias1,
+                                        sequence_parallel=sequence_parallel, **factory_kwargs)
+        self.activation = activation
+        self.fc2 = RowParallelLinear(hidden_features, out_features, process_group, bias=bias2,
+                                     sequence_parallel=sequence_parallel, **factory_kwargs)
+
+    def forward(self, x):
+        y = self.fc1(x)
+        y = self.activation(y)
+        y = self.fc2(y)
+        return y
+
+
+class GatedMlp(nn.Module):
+
+    def __init__(self, in_features, hidden_features=None, out_features=None, activation=F.sigmoid,
+                 bias1=True, bias2=True, multiple_of=256, return_residual=False,
                  device=None, dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
         out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features, **factory_kwargs)
+        hidden_features = hidden_features or int(8 * in_features / 3)
+        hidden_features = (hidden_features + multiple_of - 1) // multiple_of * multiple_of
+        self.return_residual = return_residual
+        self.fc1 = nn.Linear(in_features, 2 * hidden_features, bias=bias1, **factory_kwargs)
         self.activation = activation
-        self.fc2 = nn.Linear(hidden_features, out_features, **factory_kwargs)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias2, **factory_kwargs)
 
     def forward(self, x):
-        x = self.fc1(x)
-        x = self.activation(x)
-        x = self.fc2(x)
-        return x
+        y = self.fc1(x)
+        if self.activation == F.sigmoid:  # Special case for GLU
+            y = F.glu(y, dim=-1)
+        else:
+            y, gate = y.chunk(2, dim=-1)
+            y = y * self.activation(gate)
+        y = self.fc2(y)
+        return y if not self.return_residual else (y, x)
 
 
-class FusedDenseGeluDense(nn.Module):
+class ParallelGatedMlp(nn.Module):
+    """ Parallel GatedMlp """
 
-    def __init__(self, in_features, hidden_features=None, out_features=None, bias=True,
-                 checkpoint_lvl=0, heuristic=0, return_residual=False, device=None, dtype=None):
-        """
-        checkpoint_lvl (increasing lvl means slower but more memory saving):
-            0: no recomputation in the bwd
-            1: recompute gelu_out in the bwd
-            2: recompute gelu_in and gelu_out in the bwd
-        heuristic:
-            -1: don't fuse gemm + gelu (separate kernel)
-            0..4: use this heuristic for the algo section in the fused gemm + gelu
-            For CUDA >= 11.8, you'd want heuristic=0 for both fp16 and bf16 for best perf.
-            For CUDA <= 11.7, you'd want heuristic=1 for fp16 and heuristic=-1 for bf16.
-        return_residual: whether to return the input x along with the output. This is for
-            performance reason: for post-norm architecture, returning the input allows us
-            to fuse the backward of nn.Linear with the residual connection.
-        """
-        assert checkpoint_lvl in [0, 1, 2]
+    def __init__(self, in_features, process_group, hidden_features=None, out_features=None,
+                 activation=F.sigmoid, bias1=True, bias2=True, multiple_of=256,
+                 sequence_parallel=True, device=None, dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
         out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        assert bias == True, "DenseGeluDense module without bias is currently not supported"
-        assert (fused_dense_gelu_dense_function_td is not None
-                and fused_dense_res_gelu_dense_function_td is not None), 'fused_dense_lib is not installed'
-        self.checkpoint_lvl = checkpoint_lvl
-        self.heuristic = heuristic
-        self.return_residual = return_residual
-        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias, **factory_kwargs)
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias, **factory_kwargs)
+        hidden_features = hidden_features or int(8 * in_features / 3)
+        hidden_features = (hidden_features + multiple_of - 1) // multiple_of * multiple_of
+        if ColumnParallelLinear is None or RowParallelLinear is None:
+            raise ImportError('fused_dense is not installed')
+        self.fc1 = ColumnParallelLinear(in_features, 2 * hidden_features, process_group, bias=bias1,
+                                        sequence_parallel=sequence_parallel, **factory_kwargs)
+        self.activation = activation
+        self.fc2 = RowParallelLinear(hidden_features, out_features, process_group, bias=bias2,
+                                     sequence_parallel=sequence_parallel, **factory_kwargs)
 
     def forward(self, x):
-        assert x.dtype in [torch.float16, torch.bfloat16]
-        assert x.is_cuda
-        fn = (fused_dense_gelu_dense_function_td if not self.return_residual
-              else fused_dense_res_gelu_dense_function_td)
-        return fn(x, self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias,
-                  self.checkpoint_lvl, self.heuristic)
+        y = self.fc1(x)
+        if self.activation == F.sigmoid:  # Special case for GLU
+            y = F.glu(y, dim=-1)
+        else:
+            y, gate = y.chunk(2, dim=-1)
+            y = y * self.activation(gate)
+        y = self.fc2(y)
+        return y

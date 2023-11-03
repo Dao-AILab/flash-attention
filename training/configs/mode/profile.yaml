@@ -1,0 +1,31 @@
+# @package _global_
+# Run the Pytorch profiler
+
+trainer:
+  profiler:
+    _target_: pytorch_lightning.profilers.PyTorchProfiler
+    dirpath: ${hydra.run.dir}
+    schedule:
+      _target_: torch.profiler.schedule
+      wait: 5
+      warmup: 5
+      active: 5
+    use_cuda: True
+  max_steps: 20
+
+logger:
+  wandb:
+    mode: disabled
+
+callbacks:
+  model_checkpoint: null
+  model_checkpoint_progress: null
+  early_stopping: null
+
+hydra:
+  # sets output paths for all file logs to 'logs/profile/'
+  run:
+    dir: ${oc.env:RESULT_DIR,${work_dir}/logs}/profile/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${oc.env:RESULT_DIR,${work_dir}/logs}/profile/multirun_${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}

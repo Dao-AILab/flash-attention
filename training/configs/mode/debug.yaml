@@ -1,0 +1,27 @@
+# @package _global_
+
+# run in debug mode with:
+# `python run.py mode=debug`
+
+defaults:
+  - override /trainer: debug.yaml
+
+debug_mode: True
+
+hydra:
+  # sets level of all command line loggers to 'DEBUG'
+  verbose: True
+
+  # https://hydra.cc/docs/tutorials/basic/running_your_app/logging/
+  # sets level of only chosen command line loggers to 'DEBUG'
+  # verbose: [src.train, src.utils.utils]
+
+  # sets output paths for all file logs to 'logs/debug/'
+  run:
+    dir: ${oc.env:RESULT_DIR,${work_dir}/logs}/debug/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${oc.env:RESULT_DIR,${work_dir}/logs}/debug/multirun_${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}
+
+# disable rich config printing, since it will be already printed by hydra when `verbose: True`
+print_config: False

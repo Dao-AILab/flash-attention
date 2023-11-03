@@ -2,9 +2,13 @@
 // We make it work for bfloat16
 #include <torch/extension.h>
 #include <torch/torch.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <vector>
 
 #include <stdio.h>
+
+#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 
 // https://github.com/NVIDIA/apex/blob/master/csrc/type_shim.h
 // #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -24,120 +28,50 @@
     AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");            \
   }
 
-#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+template <typename T>
+int linear_bias_wgrad_cuda(const T *input, const T *d_output, int64_t in_features, int64_t batch_size, int64_t out_features, T *d_weight, T *d_bias, void *lt_workspace, size_t workspaceSize);
 
 template <typename T>
-int linear_bias_forward_cuda(at::Tensor input, T *weight, at::Tensor bias, int in_features, int batch_size, int out_features, at::Tensor output, void *lt_workspace);
+int linear_act_forward_cuda(const T *input, const T *weight, const T *bias, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, T *output, void *pre_act, void *lt_workspace, size_t workspaceSize);
 
 template <typename T>
-int linear_bias_backward_cuda(T *input, T *weight, T *d_output, int in_features, int batch_size, int out_features, T *d_weight, T *d_bias, T *d_input,  bool residual, void *lt_workspace);
+int bias_act_linear_dgrad_bgrad_cuda(const T *weight, const T *d_output, const void *pre_act, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, T *d_input, T *d_bias, void *lt_workspace, size_t workspaceSize);
 
-template <typename T>
-int linear_bias_wgrad_cuda(T *input, T *d_output, int in_features, int batch_size, int out_features, T *d_weight, T *d_bias, void *lt_workspace);
+std::vector<at::Tensor> linear_bias_wgrad(at::Tensor input, at::Tensor d_output, bool has_d_bias) {
 
-template <typename T>
-int linear_gelu_forward_cuda(T *input, T *weight, T *bias, int in_features, int batch_size, int out_features, int heuristic, T *output, T *gelu_in, void *lt_workspace) ;
+  int64_t batch_size = input.size(0);
+  int64_t in_features = input.size(1);
+  int64_t out_features = d_output.size(1);
 
-template <typename T>
-int linear_gelu_linear_backward_cuda(T *input, T *gelu_in, T *output1, T *weight1, T *weight2, T *d_output1, T *d_output2, int in_features, int batch_size, int hidden_features, int out_features, int heuristic, T *d_weight1, T *d_weight2, T *d_bias1, T *d_bias2, T *d_input, bool residual, void *lt_workspace);
+  TORCH_CHECK(input.dtype() == torch::kFloat16 || input.dtype() == torch::kBFloat16);
+  TORCH_CHECK(input.dtype() == d_output.dtype());
+  TORCH_CHECK(input.is_cuda());
+  TORCH_CHECK(d_output.is_cuda());
+  TORCH_CHECK(input.is_contiguous());
+  TORCH_CHECK(d_output.is_contiguous());
+  CHECK_SHAPE(input, batch_size, in_features);
+  CHECK_SHAPE(d_output, batch_size, out_features);
 
-at::Tensor linear_bias_forward(at::Tensor input, at::Tensor weight, at::Tensor bias) {
-
-  auto batch_size = input.size(0);
-  auto in_features = input.size(1);
-
-  int out_features = weight.size(0);
-
-  //auto reserved_size = get_mlp_reserved_space(batch_size, num_layers, output_features.data());
-
-  // create output/workspace tensor
-  auto out = at::empty({batch_size, out_features}, at::dtype(input.dtype()).device(input.device()));
-  //auto reserved_space = at::empty({reserved_size}, inputs[0].type());
-  // allocate fixed 4MB workspace for cublaslt for now, and this gets at least 4 MB
-  auto lt_workspace = at::empty({1 << 22}, at::dtype(input.dtype()).device(input.device()));
-
-  DISPATCH_HALF_AND_BF16(input.scalar_type(), "linear_bias_forward", [&] {
-    scalar_t* w_ptr = weight.data_ptr<scalar_t>();
-    auto result = linear_bias_forward_cuda<scalar_t>(
-        input,
-        w_ptr,
-        bias,
-        in_features,
-        batch_size,
-        out_features,
-        out,
-        //out.data_ptr<scalar_t>(),
-       // reserved_space.data_ptr<scalar_t>(),
-        (void*) (lt_workspace.data_ptr<scalar_t>()));
-    TORCH_CHECK(result == 0, "linear_bias_forward failed.")
-  });
-
-  return {out};
-}
-
-std::vector<at::Tensor> linear_bias_backward(at::Tensor input, at::Tensor weight, at::Tensor d_output) {
-
-  auto batch_size = input.size(0);
-  auto in_features = input.size(1);
-
-  int out_features = weight.size(0);
-
-  //auto reserved_size = get_mlp_reserved_space(batch_size, num_layers, output_features.data());
+  // Otherwise the kernel will be launched from cuda:0 device
+  // Cast to char to avoid compiler warning about narrowing
+  at::cuda::CUDAGuard device_guard{(char)input.get_device()};
 
   // create output/workspace tensor
   auto opts = input.options();
   auto d_weight = at::empty({out_features, in_features}, opts);
+  at::Tensor d_bias;
+  if (has_d_bias) {
 #if defined(CUBLAS_VERSION) && CUBLAS_VERSION < 11600
-  auto d_bias = d_output.view({-1, out_features}).sum(0, false);
+    d_bias = d_output.view({-1, out_features}).sum(0, false);
 #else
-  auto d_bias = at::empty({out_features}, opts);
+    d_bias = at::empty({out_features}, opts);
 #endif
-  auto d_input = at::empty({batch_size, in_features}, opts);
-  //auto reserved_space = at::empty({reserved_size}, inputs[0].type());
-  // allocate fixed 4MB workspace for cublaslt for now, and this gets at least 4 MB
-  auto lt_workspace = at::empty({1 << 22}, opts);
-
-  DISPATCH_HALF_AND_BF16(input.scalar_type(), "linear_bias_backward", [&] {
-    scalar_t* w_ptr = weight.data_ptr<scalar_t>();
-    auto result = linear_bias_backward_cuda<scalar_t>(
-        input.data_ptr<scalar_t>(),
-        w_ptr,
-        d_output.data_ptr<scalar_t>(),
-        in_features,
-        batch_size,
-        out_features,
-        d_weight.data_ptr<scalar_t>(),
-        d_bias.data_ptr<scalar_t>(),
-        d_input.data_ptr<scalar_t>(),
-       // reserved_space.data_ptr<scalar_t>(),
-        /*residual=*/false,
-        (void*) (lt_workspace.data_ptr<scalar_t>()));
-    TORCH_CHECK(result == 0, "linear_bias_backward failed.")
-  });
-
-  return {d_input, d_weight, d_bias};
-}
-
-std::vector<at::Tensor> linear_bias_wgrad(at::Tensor input, at::Tensor d_output) {
-
-  auto batch_size = input.size(0);
-  auto in_features = input.size(1);
-
-  int out_features = d_output.size(1);
-
-  //auto reserved_size = get_mlp_reserved_space(batch_size, num_layers, output_features.data());
-
-  // create output/workspace tensor
-  auto opts = input.options();
-  auto d_weight = at::empty({out_features, in_features}, opts);
-#if defined(CUBLAS_VERSION) && CUBLAS_VERSION < 11600
-  auto d_bias = d_output.view({-1, out_features}).sum(0, false);
-#else
-  auto d_bias = at::empty({out_features}, opts);
-#endif
-  //auto reserved_space = at::empty({reserved_size}, inputs[0].type());
-  // allocate fixed 4MB workspace for cublaslt for now, and this gets at least 4 MB
-  auto lt_workspace = at::empty({1 << 22}, opts);
+  }
+  // See https://github.com/pytorch/pytorch/issues/73328 for reasoning behind setting this to 1M.
+  // However, Apex sets it to 4M and TransformerEngine sets to 32M for Hopper and 4M for other GPUs
+  // https://github.com/NVIDIA/TransformerEngine/blob/a0f0065498bbcfc1da78cf9e8b166f5381613fbc/transformer_engine/pytorch/module.py#L91
+  size_t workspaceSize = 1024 * 1024 * (at::cuda::getCurrentDeviceProperties()->major >= 9 ? 32 : 4);
+  auto lt_workspace = at::empty({static_cast<int64_t>(workspaceSize)}, opts.dtype(torch::kUInt8));
 
   DISPATCH_HALF_AND_BF16(input.scalar_type(), "linear_bias_wgrad", [&] {
     auto result = linear_bias_wgrad_cuda<scalar_t>(
@@ -147,210 +81,136 @@ std::vector<at::Tensor> linear_bias_wgrad(at::Tensor input, at::Tensor d_output)
         batch_size,
         out_features,
         d_weight.data_ptr<scalar_t>(),
-        d_bias.data_ptr<scalar_t>(),
-       // reserved_space.data_ptr<scalar_t>(),
-        (void*) (lt_workspace.data_ptr<scalar_t>()));
-    TORCH_CHECK(result == 0, "linear_bias_wgrad failed.")
+        has_d_bias ? d_bias.data_ptr<scalar_t>() : nullptr,
+        (void*) (lt_workspace.data_ptr()),
+        workspaceSize);
+    TORCH_CHECK(result == 0, "linear_bias_wgrad failed.");
   });
 
   return {d_weight, d_bias};
 }
 
-std::vector<at::Tensor> linear_bias_residual_backward(at::Tensor input, at::Tensor weight, at::Tensor d_output, at::Tensor d_input) {
+std::vector<at::Tensor> linear_act_forward(at::Tensor input, at::Tensor weight,
+                                           c10::optional<at::Tensor> bias_,
+                                           bool is_gelu, bool save_pre_act, int heuristic) {
 
-  auto batch_size = input.size(0);
-  auto in_features = input.size(1);
+  int64_t batch_size = input.size(0);
+  int64_t in_features = input.size(1);
+  int64_t out_features = weight.size(0);
 
-  int out_features = weight.size(0);
+  TORCH_CHECK(input.dtype() == torch::kFloat16 || input.dtype() == torch::kBFloat16);
+  TORCH_CHECK(input.dtype() == weight.dtype());
+  TORCH_CHECK(input.is_cuda());
+  TORCH_CHECK(weight.is_cuda());
+  TORCH_CHECK(input.is_contiguous());
+  TORCH_CHECK(weight.is_contiguous());
+  CHECK_SHAPE(input, batch_size, in_features);
+  CHECK_SHAPE(weight, out_features, in_features);
+  if (bias_.has_value()) {
+    auto bias = bias_.value();
+    TORCH_CHECK(bias.dtype() == input.dtype());
+    TORCH_CHECK(bias.is_cuda());
+    TORCH_CHECK(bias.is_contiguous());
+    CHECK_SHAPE(bias, out_features);
+  }
 
-  //auto reserved_size = get_mlp_reserved_space(batch_size, num_layers, output_features.data());
-
-  // create output/workspace tensor
-  auto opts = input.options();
-  auto d_weight = at::empty({out_features, in_features}, opts);
-#if defined(CUBLAS_VERSION) && CUBLAS_VERSION < 11600
-  auto d_bias = d_output.view({-1, out_features}).sum(0, false);
-#else
-  auto d_bias = at::empty({out_features}, opts);
-#endif
-  CHECK_SHAPE(d_input, batch_size, in_features);
-  //auto reserved_space = at::empty({reserved_size}, inputs[0].type());
-  // allocate fixed 4MB workspace for cublaslt for now, and this gets at least 4 MB
-  auto lt_workspace = at::empty({1 << 22}, opts);
-
-  DISPATCH_HALF_AND_BF16(input.scalar_type(), "linear_bias_backward", [&] {
-    scalar_t* w_ptr = weight.data_ptr<scalar_t>();
-    auto result = linear_bias_backward_cuda<scalar_t>(
-        input.data_ptr<scalar_t>(),
-        w_ptr,
-        d_output.data_ptr<scalar_t>(),
-        in_features,
-        batch_size,
-        out_features,
-        d_weight.data_ptr<scalar_t>(),
-        d_bias.data_ptr<scalar_t>(),
-        d_input.data_ptr<scalar_t>(),
-       // reserved_space.data_ptr<scalar_t>(),
-        /*residual=*/true,
-        (void*) (lt_workspace.data_ptr<scalar_t>()));
-    TORCH_CHECK(result == 0, "linear_bias_residual_backward failed.")
-  });
-
-  return {d_input, d_weight, d_bias};
-}
-
-std::vector<at::Tensor> linear_gelu_forward(at::Tensor input, at::Tensor weight, at::Tensor bias,
-                                            bool save_gelu_in, int heuristic) {
-
-  auto batch_size = input.size(0);
-  auto in_features = input.size(1);
-
-  int out_features = weight.size(0);
-
-  //auto reserved_size = get_mlp_reserved_space(batch_size, num_layers, output_features.data());
+  // Otherwise the kernel will be launched from cuda:0 device
+  // Cast to char to avoid compiler warning about narrowing
+  at::cuda::CUDAGuard device_guard{(char)input.get_device()};
 
   // create output/workspace tensor
   auto opts = input.options();
   auto output = at::empty({batch_size, out_features}, opts);
-  at::Tensor gelu_in;
-  if (save_gelu_in) { gelu_in = at::empty({batch_size, out_features}, opts); }
-  //auto reserved_space = at::empty({reserved_size}, inputs[0].type());
-  // allocate fixed 4MB workspace for cublaslt for now, and this gets at least 4 MB
-  auto lt_workspace = at::empty({1 << 22}, opts);
+  at::Tensor pre_act;
+  // If ReLU, cuBlasLT stores a bit-mask (1 bit per element)
+  if (save_pre_act) { pre_act = at::empty({batch_size, is_gelu ? out_features : out_features / 8},
+                                          is_gelu ? opts : opts.dtype(torch::kUInt8)); }
+  // See https://github.com/pytorch/pytorch/issues/73328 for reasoning behind setting this to 1M.
+  // However, Apex sets it to 4M and TransformerEngine sets to 32M for Hopper and 4M for other GPUs
+  // https://github.com/NVIDIA/TransformerEngine/blob/a0f0065498bbcfc1da78cf9e8b166f5381613fbc/transformer_engine/pytorch/module.py#L91
+  size_t workspaceSize = 1024 * 1024 * (at::cuda::getCurrentDeviceProperties()->major >= 9 ? 32 : 4);
+  auto lt_workspace = at::empty({static_cast<int64_t>(workspaceSize)}, opts.dtype(torch::kUInt8));
 
-  DISPATCH_HALF_AND_BF16(input.scalar_type(), "linear_gelu_forward", [&] {
-    scalar_t* w_ptr = weight.data_ptr<scalar_t>();
-    scalar_t* b_ptr = bias.data_ptr<scalar_t>();
-    auto result = linear_gelu_forward_cuda<scalar_t>(
+  DISPATCH_HALF_AND_BF16(input.scalar_type(), "linear_act_forward", [&] {
+    auto result = linear_act_forward_cuda<scalar_t>(
         input.data_ptr<scalar_t>(),
-        w_ptr,
-        b_ptr,
+        weight.data_ptr<scalar_t>(),
+        bias_.has_value()? bias_.value().data_ptr<scalar_t>() : nullptr,
         in_features,
         batch_size,
         out_features,
+        is_gelu,
         heuristic,
         output.data_ptr<scalar_t>(),
-        save_gelu_in ? gelu_in.data_ptr<scalar_t>() : nullptr,
-       // reserved_space.data_ptr<scalar_t>(),
-        (void*) (lt_workspace.data_ptr<scalar_t>()));
-    TORCH_CHECK(result == 0, "linear_gelu_forward failed.")
+        save_pre_act ? pre_act.data_ptr() : nullptr,
+        (void*) (lt_workspace.data_ptr()),
+        workspaceSize);
+    TORCH_CHECK(result == 0, "linear_act_forward failed.");
   });
 
   std::vector<at::Tensor> result = {output};
-  if (save_gelu_in) { result.push_back(gelu_in); };
+  if (save_pre_act) { result.push_back(pre_act); };
   return result;
 }
 
-std::vector<at::Tensor> linear_gelu_linear_backward(at::Tensor input, at::Tensor gelu_in, at::Tensor output1, at::Tensor weight1, at::Tensor weight2, at::Tensor d_output2, int heuristic) {
+std::vector<at::Tensor> bias_act_linear_dgrad_bgrad(
+  at::Tensor weight, at::Tensor d_output, at::Tensor pre_act, bool is_gelu, int heuristic
+) {
 
-  auto batch_size = input.size(0);
-  auto in_features = input.size(1);
+  int64_t batch_size = d_output.size(0);
+  int64_t out_features = d_output.size(1);
+  int64_t in_features = weight.size(1);
 
-  int hidden_features = weight1.size(0);
-  int out_features = weight2.size(0);
+  TORCH_CHECK(weight.dtype() == torch::kFloat16 || weight.dtype() == torch::kBFloat16);
+  TORCH_CHECK(weight.dtype() == d_output.dtype());
+  TORCH_CHECK(is_gelu ? (pre_act.dtype() == weight.dtype()) : (pre_act.dtype() == torch::kUInt8));
+  TORCH_CHECK(weight.is_cuda());
+  TORCH_CHECK(d_output.is_cuda());
+  TORCH_CHECK(pre_act.is_cuda());
+  TORCH_CHECK(weight.is_contiguous());
+  TORCH_CHECK(d_output.is_contiguous());
+  TORCH_CHECK(pre_act.is_contiguous());
+  CHECK_SHAPE(weight, out_features, in_features);
+  CHECK_SHAPE(d_output, batch_size, out_features);
+  // If ReLU, cuBlasLT stores a bit-mask (1 bit per element)
+  CHECK_SHAPE(pre_act, batch_size, is_gelu ? in_features : in_features / 8);
 
-  //auto reserved_size = get_mlp_reserved_space(batch_size, num_layers, output_features.data());
+  // Otherwise the kernel will be launched from cuda:0 device
+  // Cast to char to avoid compiler warning about narrowing
+  at::cuda::CUDAGuard device_guard{(char)weight.get_device()};
 
   // create output/workspace tensor
-  auto opts = input.options();
-  auto d_weight1 = at::empty({hidden_features, in_features}, opts);
-  auto d_weight2 = at::empty({out_features, hidden_features}, opts);
-  auto d_bias1 = at::empty({hidden_features}, opts);
-  auto d_bias2 = at::empty({out_features}, opts);
+  auto opts = weight.options();
+  auto d_bias = at::empty({in_features}, opts);
   auto d_input = at::empty({batch_size, in_features}, opts);
-  auto d_output1 = at::empty({batch_size, hidden_features}, opts);
-  //auto reserved_space = at::empty({reserved_size}, inputs[0].type());
-  // allocate fixed 4MB workspace for cublaslt for now, and this gets at least 4 MB
-  auto lt_workspace = at::empty({1 << 22}, opts);
+  // See https://github.com/pytorch/pytorch/issues/73328 for reasoning behind setting this to 1M.
+  // However, Apex sets it to 4M and TransformerEngine sets to 32M for Hopper and 4M for other GPUs
+  // https://github.com/NVIDIA/TransformerEngine/blob/a0f0065498bbcfc1da78cf9e8b166f5381613fbc/transformer_engine/pytorch/module.py#L91
+  size_t workspaceSize = 1024 * 1024 * (at::cuda::getCurrentDeviceProperties()->major >= 9 ? 32 : 4);
+  auto lt_workspace = at::empty({static_cast<int64_t>(workspaceSize)}, opts.dtype(torch::kUInt8));
 
-  DISPATCH_HALF_AND_BF16(input.scalar_type(), "linear_bias_backward", [&] {
-    //scalar_t* w_ptr = weight.data_ptr<scalar_t>();
-    //scalar_t* d_b_ptr = d_bias.data_ptr<scalar_t>();
-    auto result = linear_gelu_linear_backward_cuda<scalar_t>(
-        input.data_ptr<scalar_t>(),
-        gelu_in.data_ptr<scalar_t>(),
-        output1.data_ptr<scalar_t>(),
-        weight1.data_ptr<scalar_t>(),
-        weight2.data_ptr<scalar_t>(),
-        d_output1.data_ptr<scalar_t>(),
-        d_output2.data_ptr<scalar_t>(),
+  DISPATCH_HALF_AND_BF16(weight.scalar_type(), "bias_act_linear_dgrad_bgrad", [&] {
+    auto result = bias_act_linear_dgrad_bgrad_cuda<scalar_t>(
+        weight.data_ptr<scalar_t>(),
+        d_output.data_ptr<scalar_t>(),
+        pre_act.data_ptr(),
         in_features,
         batch_size,
-        hidden_features,
         out_features,
+        is_gelu,
         heuristic,
-        d_weight1.data_ptr<scalar_t>(),
-        d_weight2.data_ptr<scalar_t>(),
-        d_bias1.data_ptr<scalar_t>(),
-        d_bias2.data_ptr<scalar_t>(),
         d_input.data_ptr<scalar_t>(),
-       // reserved_space.data_ptr<scalar_t>(),
-        /*residual=*/false,
-        (void*) (lt_workspace.data_ptr<scalar_t>()));
-    TORCH_CHECK(result == 0, "linear_gelu_linear_backward failed.")
+        d_bias.data_ptr<scalar_t>(),
+        (void*) (lt_workspace.data_ptr()),
+        workspaceSize);
+    TORCH_CHECK(result == 0, "bias_act_linear_dgrad_bgrad failed.");
   });
 
-  return {d_input, d_weight1, d_bias1, d_weight2, d_bias2};
-}
-
-std::vector<at::Tensor> linear_residual_gelu_linear_backward(at::Tensor input, at::Tensor gelu_in, at::Tensor output1, at::Tensor weight1, at::Tensor weight2, at::Tensor d_output2, at::Tensor d_input, int heuristic) {
-
-  auto batch_size = input.size(0);
-  auto in_features = input.size(1);
-
-  int hidden_features = weight1.size(0);
-  int out_features = weight2.size(0);
-
-  //auto reserved_size = get_mlp_reserved_space(batch_size, num_layers, output_features.data());
-
-  // create output/workspace tensor
-  auto opts = input.options();
-  auto d_weight1 = at::empty({hidden_features, in_features}, opts);
-  auto d_weight2 = at::empty({out_features, hidden_features}, opts);
-  auto d_bias1 = at::empty({hidden_features}, opts);
-  auto d_bias2 = at::empty({out_features}, opts);
-  CHECK_SHAPE(d_input, batch_size, in_features);
-  auto d_output1 = at::empty({batch_size, hidden_features}, opts);
-  //auto reserved_space = at::empty({reserved_size}, inputs[0].type());
-  // allocate fixed 4MB workspace for cublaslt for now, and this gets at least 4 MB
-  auto lt_workspace = at::empty({1 << 22}, opts);
-
-  DISPATCH_HALF_AND_BF16(input.scalar_type(), "linear_bias_backward", [&] {
-    //scalar_t* w_ptr = weight.data_ptr<scalar_t>();
-    //scalar_t* d_b_ptr = d_bias.data_ptr<scalar_t>();
-    auto result = linear_gelu_linear_backward_cuda<scalar_t>(
-        input.data_ptr<scalar_t>(),
-        gelu_in.data_ptr<scalar_t>(),
-        output1.data_ptr<scalar_t>(),
-        weight1.data_ptr<scalar_t>(),
-        weight2.data_ptr<scalar_t>(),
-        d_output1.data_ptr<scalar_t>(),
-        d_output2.data_ptr<scalar_t>(),
-        in_features,
-        batch_size,
-        hidden_features,
-        out_features,
-        heuristic,
-        d_weight1.data_ptr<scalar_t>(),
-        d_weight2.data_ptr<scalar_t>(),
-        d_bias1.data_ptr<scalar_t>(),
-        d_bias2.data_ptr<scalar_t>(),
-        d_input.data_ptr<scalar_t>(),
-       // reserved_space.data_ptr<scalar_t>(),
-        /*residual=*/true,
-        (void*) (lt_workspace.data_ptr<scalar_t>()));
-    TORCH_CHECK(result == 0, "linear_residual_gelu_linear_backward failed.")
-  });
-
-  return {d_input, d_weight1, d_bias1, d_weight2, d_bias2};
+  return {d_input, d_bias};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("linear_bias_forward", &linear_bias_forward, "linear bias forward");
-  m.def("linear_bias_backward", &linear_bias_backward, "linear bias backward");
   m.def("linear_bias_wgrad", &linear_bias_wgrad, "linear bias wgrad");
-  m.def("linear_bias_residual_backward", &linear_bias_residual_backward, "linear bias residual backward");
-  m.def("linear_gelu_forward", &linear_gelu_forward, "linear gelu forward");
-  m.def("linear_gelu_linear_backward", &linear_gelu_linear_backward, "linear gelu linear backward");
-  m.def("linear_residual_gelu_linear_backward", &linear_residual_gelu_linear_backward, "linear residual gelu linear backward");
+  m.def("linear_act_forward", &linear_act_forward, "linear gelu/relu forward");
+  m.def("bias_act_linear_dgrad_bgrad", &bias_act_linear_dgrad_bgrad, "bias gelu/relu linear dgrad bgrad");
 }

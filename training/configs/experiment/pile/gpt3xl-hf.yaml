@@ -1,0 +1,35 @@
+# @package _global_
+defaults:
+  - /experiment/pile/gpt3s-hf.yaml
+  - override /optimizer: adamw-zero
+
+model:
+  config:
+    n_embd: 2048
+    n_head: 16
+    n_layer: 24
+
+datamodule:
+  batch_size: 2
+
+train:
+  global_batch_size: 512
+  optimizer:
+    lr: 2.0e-4
+  scheduler:
+    t_initial: 300000
+
+trainer:
+  strategy:
+    _target_: src.utils.ddp_zero1.DDPStrategyZero1
+    find_unused_parameters: False
+    gradient_as_bucket_view: True
+  max_steps: 400000
+  val_check_interval: ${eval:1000 * ${.accumulate_grad_batches}}
+
+callbacks:
+  model_checkpoint:
+    every_n_train_steps: 1000
+  model_checkpoint_progress:
+    every_n_train_steps: 12500
+    fault_tolerant: False  # Saving takes too long

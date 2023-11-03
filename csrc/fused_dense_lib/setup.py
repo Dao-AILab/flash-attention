@@ -1,5 +1,6 @@
 import os
 import subprocess
+from packaging.version import parse, Version
 
 import torch
 from setuptools import setup
@@ -10,16 +11,14 @@ def get_cuda_bare_metal_version(cuda_dir):
     raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
     output = raw_output.split()
     release_idx = output.index("release") + 1
-    release = output[release_idx].split(".")
-    bare_metal_major = release[0]
-    bare_metal_minor = release[1][0]
+    bare_metal_version = parse(output[release_idx].split(",")[0])
 
-    return raw_output, bare_metal_major, bare_metal_minor
+    return raw_output, bare_metal_version
 
 
 def append_nvcc_threads(nvcc_extra_args):
-    _, bare_metal_major, bare_metal_minor = get_cuda_bare_metal_version(CUDA_HOME)
-    if int(bare_metal_major) >= 11 and int(bare_metal_minor) >= 2:
+    _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
+    if bare_metal_version >= Version("11.2"):
         return nvcc_extra_args + ["--threads", "4"]
     return nvcc_extra_args
 

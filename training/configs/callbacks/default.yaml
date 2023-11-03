@@ -1,0 +1,45 @@
+# rich_progress_bar:
+#   _target_: pytorch_lightning.callbacks.RichProgressBar
+
+rich_model_summary:
+  _target_: pytorch_lightning.callbacks.RichModelSummary
+
+model_checkpoint:
+  _target_: pytorch_lightning.callbacks.ModelCheckpoint
+  monitor: "val/acc" # name of the logged metric which determines when model is improving
+  mode: "max" # can be "max" or "min"
+  save_top_k: 1 # save k best models (determined by above metric)
+  save_last: True # additionally always save model from last epoch
+  verbose: False
+  dirpath: ${oc.env:CHECKPOINT_DIR,checkpoints}/${oc.select:name,''}
+  filename: "epoch_{epoch:03d}"
+  auto_insert_metric_name: False
+
+early_stopping:
+  _target_: pytorch_lightning.callbacks.EarlyStopping
+  monitor: "val/acc" # name of the logged metric which determines when model is improving
+  mode: "max" # can be "max" or "min"
+  patience: 100 # how many epochs of not improving until training stops
+  min_delta: 0 # minimum change in the monitored metric needed to qualify as an improvement
+
+learning_rate_monitor:
+  _target_: pytorch_lightning.callbacks.LearningRateMonitor
+  logging_interval: step
+
+speed_monitor:
+  _target_: src.callbacks.speed_monitor.SpeedMonitor
+  intra_step_time: True
+  inter_step_time: True
+  epoch_time: True
+
+loss_scale_monitor:
+  _target_: src.callbacks.loss_scale_monitor.LossScaleMonitor
+
+params_log:
+  _target_: src.callbacks.params_log.ParamsLog
+  total_params_log: True
+  trainable_params_log: True
+  non_trainable_params_log: True
+
+gpu_affinity:
+  _target_: src.callbacks.gpu_affinity.GpuAffinity

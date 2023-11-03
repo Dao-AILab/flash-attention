@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - /experiment/owt/gpt2s.yaml
+  - override /model/gpt2model: gpt2-medium
+
+datamodule:
+  batch_size: 8  # Per GPU
+
+train:
+  optimizer:
+    lr: 1.5e-4

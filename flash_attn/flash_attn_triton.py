@@ -1,5 +1,10 @@
 """
 *Experimental* implementation of FlashAttention in Triton.
+Tested with triton==2.0.0.dev20221202.
+Triton 2.0 has a new backend (MLIR) but seems like it doesn't yet work for head dimensions
+other than 64:
+https://github.com/openai/triton/blob/d376020f90002757eea3ea9475d4f7cfc2ec5ead/python/triton/ops/flash_attention.py#L207
+We'll update this implementation with the new Triton backend once this is fixed.
 
 We use the FlashAttention implementation from Phil Tillet a starting point.
 https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention.py
@@ -37,8 +42,6 @@ than CUDA forward + backward.
 import math
 
 import torch
-
-from einops import rearrange, repeat
 
 import triton
 import triton.language as tl
@@ -212,8 +215,8 @@ def _fwd_kernel(
     lse_ptrs = Lse + off_hb * seqlen_q_rounded + offs_m
     tl.store(lse_ptrs, lse_i)
     # initialize pointers to output
-    offs_n = tl.arange(0, BLOCK_HEADDIM)
-    out_ptrs = Out + off_b * stride_ob + off_h * stride_oh + (offs_m[:, None] * stride_om + offs_n[None, :])
+    offs_d = tl.arange(0, BLOCK_HEADDIM)
+    out_ptrs = Out + off_b * stride_ob + off_h * stride_oh + (offs_m[:, None] * stride_om + offs_d[None, :])
     if EVEN_M:
         if EVEN_HEADDIM:
             tl.store(out_ptrs, acc_o)
@@ -605,11 +608,7 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None):
         else:
             raise RuntimeError('Last 2 dimensions of bias must be (1, seqlen_k)'
                                ' or (seqlen_q, seqlen_k)')
-        if bias.shape[:2] == (1, nheads):
-            bias = repeat(bias, '1 h ... -> b h ...', b=batch)
-        elif bias.shape[:2] == (batch, 1):
-            bias = repeat(bias, 'b 1 ... -> b h ...', h=nheads)
-        assert bias.shape[:2] == (batch, nheads), 'First 2 dimensions of bias must be broadcastible to (batch, nheads)'
+        bias = bias.expand(batch, nheads, seqlen_q, seqlen_k)
     bias_strides = (bias.stride(0), bias.stride(1), bias.stride(2)) if has_bias else (0, 0, 0)
 
     seqlen_q_rounded = math.ceil(seqlen_q / 128) * 128
@@ -684,11 +683,7 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
         else:
             raise RuntimeError('Last 2 dimensions of bias must be (1, seqlen_k)'
                                ' or (seqlen_q, seqlen_k)')
-        if bias.shape[:2] == (1, nheads):
-            bias = repeat(bias, '1 h ... -> b h ...', b=batch)
-        elif bias.shape[:2] == (batch, 1):
-            bias = repeat(bias, 'b 1 ... -> b h ...', h=nheads)
-        assert bias.shape[:2] == (batch, nheads), 'First 2 dimensions of bias must be broadcastible to (batch, nheads)'
+        bias = bias.expand(batch, nheads, seqlen_q, seqlen_k)
     bias_strides = (bias.stride(0), bias.stride(1), bias.stride(2)) if has_bias else (0, 0, 0)
 
     # BLOCK_M = 128
@@ -783,13 +778,14 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         q, kv, o, lse, bias = ctx.saved_tensors
-        assert not ctx.needs_input_grad[2], 'FlashAttention does not support bias gradient yet'
+        if len(ctx.needs_input_grad) >= 3:
+            assert not ctx.needs_input_grad[2], 'FlashAttention does not support bias gradient yet'
         # Triton's autotune causes the Tensor._version to change, and so Pytorch autograd
         # does a memcpy. To avoid this we run in inference_mode, which doesn't track the version.
         with torch.inference_mode():
             dq = torch.empty_like(q)
             dkv = torch.empty_like(kv)
-            _flash_attn_backward(do, q, qkv[:, :, 0], qkv[:, :, 1], o, lse,
+            _flash_attn_backward(do, q, kv[:, :, 0], kv[:, :, 1], o, lse,
                                  dq, dkv[:, :, 0], dkv[:, :, 1],
                                  bias=bias, causal=ctx.causal, softmax_scale=ctx.softmax_scale)
         return dq, dkv, None, None, None

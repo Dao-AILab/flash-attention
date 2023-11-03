@@ -1,0 +1,7 @@
+# @package train.optimizer
+_target_: torch.distributed.optim.ZeroRedundancyOptimizer
+_recursive_: True
+optimizer_class:
+  _target_: torch.optim.__getattribute__
+  _args_:
+    - "AdamW"

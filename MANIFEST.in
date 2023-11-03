@@ -2,13 +2,16 @@ recursive-include csrc *.cu
 recursive-include csrc *.h
 recursive-include csrc *.cuh
 recursive-include csrc *.cpp
+recursive-include csrc *.hpp
 
 recursive-include flash_attn *.cu
 recursive-include flash_attn *.h
 recursive-include flash_attn *.cuh
 recursive-include flash_attn *.cpp
+recursive-include flash_attn *.hpp
 
 recursive-include flash_attn_rocm *.cu
 recursive-include flash_attn_rocm *.h
 recursive-include flash_attn_rocm *.cuh
 recursive-include flash_attn_rocm *.cpp
+recursive-include flash_attn_rocm *.hpp

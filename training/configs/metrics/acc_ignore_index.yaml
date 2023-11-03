@@ -1,0 +1,4 @@
+# @package eval.metrics
+acc:
+  _target_: torchmetrics.Accuracy
+  ignore_index: -100

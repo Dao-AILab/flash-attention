@@ -7,7 +7,12 @@
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 cmake_minimum_required(VERSION 3.0 FATAL_ERROR)
-project(fmha_api)
+
+set(CMAKE_CXX_COMPILER /opt/rocm/bin/hipcc)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+project(flash_api)
 
 IF(NOT DEFINED ENV{ROCM_PATH})
   SET(ROCM_PATH /opt/rocm)
@@ -129,12 +134,7 @@ set(CMAKE_MODULE_PATH ${HIP_PATH}/cmake ${CMAKE_MODULE_PATH})
 
 find_package(HIP)
 
-set(CMAKE_CXX_COMPILER /opt/rocm/hip/bin/hipcc)
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_FLAGS "-ferror-limit=0")
-set(CMAKE_CXX_FLAGS "--offload-arch=gfx90a")
-
-list(APPEND CMAKE_PREFIX_PATH "/opt/conda/lib/python3.8/site-packages/torch/share/cmake")
+list(APPEND CMAKE_PREFIX_PATH "/opt/conda/envs/py_3.8/lib/python3.8/site-packages/torch/share/cmake/")
 find_package(Torch REQUIRED)
 
 find_package(rocblas)
@@ -142,15 +142,18 @@ find_package(hipfft)
 find_package(hiprand)
 find_package(hipsparse)
 
+add_compile_options(-g -O --offload-arch=gfx90a)
+
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/composable_kernel/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/composable_kernel/library/include)
-include_directories(/opt/conda/include/python3.8)
+include_directories(/opt/conda/envs/py_3.8/include/python3.8/)
 
 aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR}/src FLA_SRCS)
 aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR}/composable_kernel/library/src/utility CK_SRCS)
 
-add_executable(fmha_api fmha_api.cpp ${FLA_SRCS} ${CK_SRCS})
-target_link_libraries(fmha_api "${TORCH_LIBRARIES}")
+add_executable(flash_api flash_api.cpp ${FLA_SRCS} ${CK_SRCS})
+target_link_libraries(flash_api "${TORCH_LIBRARIES}")
 
 message("${TORCH_LIBRARIES}")
+message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")

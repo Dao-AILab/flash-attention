@@ -1,0 +1,7 @@
+# https://www.comet.ml
+
+comet:
+  _target_: pytorch_lightning.loggers.comet.CometLogger
+  api_key: ${oc.env:COMET_API_TOKEN} # api key is loaded from environment variable
+  project_name: "template-tests"
+  experiment_name: ${name}

@@ -1,0 +1,2 @@
+norm_monitor:
+  _target_: src.callbacks.norm_monitor.NormMonitor
