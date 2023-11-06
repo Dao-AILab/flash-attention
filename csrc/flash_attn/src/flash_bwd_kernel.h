@@ -823,7 +823,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 m_block * kBlockM + get<0>(taccScS_row(0)),
                 binfo.actual_seqlen_q, 
                 AtomLayoutMS * 16,
-                bidh, params.h, params.scale_softmax, 
+                bidh, params.scale_softmax, 
                 params.alibi_start, params.alibi_ratio
             );
         }
@@ -1409,7 +1409,7 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
                 m_block * kBlockM + get<0>(taccScS_row(0)),
                 binfo.actual_seqlen_q, 
                 AtomLayoutMS * 16,
-                bidh, params.h, params.scale_softmax, 
+                bidh, params.scale_softmax, 
                 params.alibi_start, params.alibi_ratio
             );
         }

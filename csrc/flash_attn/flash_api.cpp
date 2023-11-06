@@ -42,7 +42,6 @@ void set_params_fprop(Flash_fwd_params &params,
                       float softmax_scale,
                       int window_size_left,
                       int window_size_right,
-                      bool is_alibi,
                       float alibi_start,
                       float alibi_ratio) {
 
@@ -120,7 +119,6 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.is_seqlens_k_cumulative = true;
 
-    params.is_alibi = is_alibi;
     params.alibi_start = alibi_start;
     params.alibi_ratio = alibi_ratio;
 }
@@ -156,7 +154,6 @@ void set_params_dgrad(Flash_bwd_params &params,
                       float softmax_scale,
                       int window_size_left,
                       int window_size_right,
-                      bool is_alibi,
                       float alibi_start,
                       float alibi_ratio) {
 
@@ -171,7 +168,6 @@ void set_params_dgrad(Flash_bwd_params &params,
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     is_alibi,
                      alibi_start,
                      alibi_ratio);
 
@@ -268,7 +264,6 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         bool is_causal,
         const int window_size_left,
         int window_size_right,
-        bool is_alibi,
         const float alibi_start,
         const float alibi_ratio,
         const bool return_softmax,
@@ -385,7 +380,6 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     is_alibi,
                      alibi_start,
                      alibi_ratio);
 
@@ -457,7 +451,6 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
                const bool is_causal,
                const int window_size_left,
                int window_size_right,
-               const bool is_alibi,
                const float alibi_start,
                const float alibi_ratio,
                const bool return_softmax,
@@ -576,7 +569,6 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     is_alibi,
                      alibi_start,
                      alibi_ratio);
 
@@ -646,7 +638,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         const bool is_causal,
         const int window_size_left,
         int window_size_right,
-        const bool is_alibi,
         const float alibi_start,
         const float alibi_ratio,
         c10::optional<at::Generator> gen_,
@@ -801,7 +792,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     is_alibi,
                      alibi_start,
                      alibi_ratio);
 
@@ -861,7 +851,6 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const bool is_causal,
                const int window_size_left,
                int window_size_right,
-               const bool is_alibi,
                const float alibi_start,
                const float alibi_ratio,
                c10::optional<at::Generator> gen_,
@@ -1032,7 +1021,6 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     is_alibi,
                      alibi_start,
                      alibi_ratio);
 
@@ -1089,7 +1077,6 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 int window_size_right,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
                 int num_splits,
-                const bool is_alibi,
                 const float alibi_start,
                 const float alibi_ratio
                 ) {
@@ -1200,7 +1187,6 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     is_alibi,
                      alibi_start,
                      alibi_ratio);
 

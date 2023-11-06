@@ -373,7 +373,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
                 binfo.actual_seqlen_q, 
                 kNWarps * 16,
-                bidh, params.h, params.scale_softmax, 
+                bidh, params.scale_softmax, 
                 params.alibi_start, params.alibi_ratio
             );
         }
@@ -491,7 +491,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
                 binfo.actual_seqlen_q, 
                 kNWarps * 16,
-                bidh, params.h, params.scale_softmax, 
+                bidh, params.scale_softmax, 
                 params.alibi_start, params.alibi_ratio
             );
         }
@@ -981,7 +981,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
                 binfo.actual_seqlen_q, 
                 kNWarps * 16,
-                bidh, params.h, params.scale_softmax, 
+                bidh, params.scale_softmax, 
                 params.alibi_start, params.alibi_ratio
             );
         }
@@ -1074,7 +1074,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
                 binfo.actual_seqlen_q, 
                 kNWarps * 16,
-                bidh, params.h, params.scale_softmax, 
+                bidh, params.scale_softmax, 
                 params.alibi_start, params.alibi_ratio
             );
         }

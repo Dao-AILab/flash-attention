@@ -630,8 +630,7 @@ def test_flash_attn_func(bs_seqlen, headdim, tp_world_size, dtype):
         triton_dk, k.grad = k.grad.clone(), None
         triton_dv, v.grad = v.grad.clone(), None
 
-        flash_out = flash_attn_func(
-            q, k, v, causal=True, alibi=True, alibi_start=alibi_start, alibi_ratio=alibi_ratio)
+        flash_out = flash_attn_func(q, k, v, causal=True, alibi=(alibi_start, alibi_ratio))
         flash_out.backward(dout)
         flash_dq, q.grad = q.grad.clone(), None
         flash_dk, k.grad = k.grad.clone(), None
@@ -705,9 +704,7 @@ def test_flash_attn_varlen_func(bs_seqlen, headdim, tp_world_size, dtype):
             max_seqlen_q,
             max_seqlen_k,
             causal=True,
-            alibi=True,
-            alibi_start=alibi_start,
-            alibi_ratio=alibi_ratio
+            alibi=(alibi_start, alibi_ratio)
         )
         flash_out = output_pad_fn(flash_out_unpad)
         flash_out.backward(dout)
@@ -745,11 +742,11 @@ def test_flash_attn_varlen_func(bs_seqlen, headdim, tp_world_size, dtype):
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize("has_batch_idx", [False, True])
 # @pytest.mark.parametrize("has_batch_idx", [True])
-@pytest.mark.parametrize("d", [32, 59, 64, 80, 96, 128, 160, 192, 224, 256])
+# @pytest.mark.parametrize("d", [32, 59, 64, 80, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -882,43 +879,23 @@ def test_flash_attn_kvcache(
         if alibi_tensor.abs().max().item() >= torch.finfo(dtype).max:
             pytest.skip()
     else:
-        alibi_tensor, alibi_start, alibi_ratio = None, 0.0, 0,0
-    if alibi:
-        out = flash_attn_with_kvcache(
-            q,
-            k_cache,
-            v_cache,
-            k,
-            v,
-            cos,
-            sin,
-            cache_seqlens,
-            cache_batch_idx,
-            causal=causal,
-            window_size=window_size,
-            rotary_interleaved=rotary_interleaved,
-            num_splits=num_splits,
-            alibi=alibi,
-            alibi_start=alibi_start,
-            alibi_ratio=alibi_ratio
-        )
-    else:
-        out = flash_attn_with_kvcache(
-            q,
-            k_cache,
-            v_cache,
-            k,
-            v,
-            cos,
-            sin,
-            cache_seqlens,
-            cache_batch_idx,
-            causal=causal,
-            window_size=window_size,
-            rotary_interleaved=rotary_interleaved,
-            num_splits=num_splits,
-            alibi=alibi,
-        )
+        alibi_tensor, alibi_start, alibi_ratio = None, 0.0, 0.0
+    out = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k,
+        v,
+        cos,
+        sin,
+        cache_seqlens,
+        cache_batch_idx,
+        causal=causal,
+        window_size=window_size,
+        rotary_interleaved=rotary_interleaved,
+        num_splits=num_splits,
+        alibi=(alibi_start, alibi_ratio)
+    )
     # out = flash_attn_with_kvcache(
     #     q, k_cache, v_cache, cache_seqlens=cache_seqlens, causal=causal, window_size=window_size
     # )

@@ -128,7 +128,6 @@ struct Flash_fwd_params : public Qkv_params {
 
     int num_splits;  // For split-KV version
 
-    bool is_alibi;
     float alibi_start;
     float alibi_ratio;
 };

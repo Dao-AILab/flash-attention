@@ -82,7 +82,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 BOOL_SWITCH(params.window_size_left >= 0 || params.window_size_right >= 0, Is_local, [&] {
                     BOOL_SWITCH(params.num_splits > 1, Split, [&] {
                         BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV, [&] {
-                            BOOL_SWITCH(params.is_alibi, Is_alibi, [&] {
+                            BOOL_SWITCH(params.alibi_start != 0.0f && params.alibi_ratio != 0.0f, Is_alibi, [&] {
                                 // If Append_KV, then we must have seqlen_offsets, which means cu_seqlens_k != nullptr.
                                 // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
                                 // If Is_local, set Is_causal to false
@@ -144,7 +144,7 @@ void run_mha_fwd_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 32;
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-            BOOL_SWITCH(params.is_alibi, Is_alibi, [&] {
+            BOOL_SWITCH(params.alibi_start != 0.0f && params.alibi_ratio != 0.0f, Is_alibi, [&] {
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal, Is_alibi>(params, stream);
             });
         });
@@ -156,7 +156,7 @@ void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-            BOOL_SWITCH(params.is_alibi, Is_alibi, [&] {
+            BOOL_SWITCH(params.alibi_start != 0.0f && params.alibi_ratio != 0.0f, Is_alibi, [&] {
                 if constexpr(!Is_dropout) {
                     // Using 8 warps is 18% slower for seqlen=2k, 2 warps is 5% slower
                     // Using block size (64 x 256) is 27% slower for seqlen=2k
@@ -182,7 +182,7 @@ void run_mha_fwd_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
     bool is_sm8x = dprops->major == 8 && dprops->minor > 0;
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-            BOOL_SWITCH(params.is_alibi, Is_alibi, [&] {
+            BOOL_SWITCH(params.alibi_start != 0.0f && params.alibi_ratio != 0.0f, Is_alibi, [&] {
                 // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
                 if (is_sm8x) {
                     if constexpr(!Is_causal) {
@@ -210,7 +210,7 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
     bool is_sm8x = dprops->major == 8 && dprops->minor > 0;
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-            BOOL_SWITCH(params.is_alibi, Is_alibi, [&] {
+            BOOL_SWITCH(params.alibi_start != 0.0f && params.alibi_ratio != 0.0f, Is_alibi, [&] {
                 if constexpr(!Is_dropout) {
                     // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
                     // and 128 x 32 (48 KB smem) is the fastest for non-causal since we get 2 CTAs per SM.
@@ -249,7 +249,7 @@ void run_mha_fwd_hdim160(Flash_fwd_params &params, cudaStream_t stream) {
     bool is_sm8x = dprops->major == 8 && dprops->minor > 0;
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-            BOOL_SWITCH(params.is_alibi, Is_alibi, [&] {
+            BOOL_SWITCH(params.alibi_start != 0.0f && params.alibi_ratio != 0.0f, Is_alibi, [&] {
                 // For A100, H100, 128 x 32 is the fastest.
                 // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
                 // and 128 x 64 with 8 warps is the fastest for non-causal.
@@ -279,7 +279,7 @@ void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 192;
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-            BOOL_SWITCH(params.is_alibi, Is_alibi, [&] {
+            BOOL_SWITCH(params.alibi_start != 0.0f && params.alibi_ratio != 0.0f, Is_alibi, [&] {
                 if constexpr(!Is_dropout) {
                     run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal, Is_alibi>(params, stream);
                 } else {
@@ -306,7 +306,7 @@ void run_mha_fwd_hdim224(Flash_fwd_params &params, cudaStream_t stream) {
     // printf("max_smem_per_block = %d\n", max_smem_per_block);
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-            BOOL_SWITCH(params.is_alibi, Is_alibi, [&] {
+            BOOL_SWITCH(params.alibi_start != 0.0f && params.alibi_ratio != 0.0f, Is_alibi, [&] {
                 if (max_smem_per_block >= 2 * Headdim * (128 + 2 * 64)) {  // 112 KB
                     run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal, Is_alibi>(params, stream);
                 } else {
@@ -336,7 +336,7 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
     // printf("max_smem_per_sm = %d, max_smem_per_block = %d\n", max_smem_per_sm, max_smem_per_block);
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-            BOOL_SWITCH(params.is_alibi, Is_alibi, [&] {
+            BOOL_SWITCH(params.alibi_start != 0.0f && params.alibi_ratio != 0.0f, Is_alibi, [&] {
                 // For A100, we want to run with 128 x 64 (128KB smem).
                 // For H100 we want to run with 64 x 64 (96KB smem) since then we can get 2 CTAs per SM.
                 if (max_smem_per_block >= 2 * Headdim * (128 + 2 * 64) && max_smem_per_sm < 4 * Headdim * (64 + 2 * 64)) {
