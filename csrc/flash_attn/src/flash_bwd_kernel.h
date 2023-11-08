@@ -1615,16 +1615,16 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
             Tensor tdScdS = gmem_thr_copy_dS.partition_D(cdS);
             #pragma unroll
             for (int m = 0; m < size<1>(tdScdS); ++m) {
-                if (Is_even_MN || get<0>(tdScdS(0, m, 0)) < binfo.actual_seqlen_q - m_block * kBlockM) {
+                if (get<0>(tdScdS(0, m, 0)) < binfo.actual_seqlen_q - m_block * kBlockM) {
                     for (int n = 0; n < size<2>(tdScdS); ++n) {
-                        if (Is_even_MN || get<0>(tdScdS(0, 0, n)) < binfo.actual_seqlen_k - n_block * kBlockN) {
+                        if (Is_even_N || get<0>(tdScdS(0, 0, n)) < binfo.actual_seqlen_k - n_block * kBlockN) {
                             cute::copy(gmem_tiled_copy_dS, tBsdS(_, m, n), tBgdS(_, m, n));
                         }
                     }
                 }
             }
 
-            if (m_block > m_block_min) {
+            if (n_block > 0) {
                 tBgdS.data() = tBgdS.data() + (-kBlockN);
             }
         }
