@@ -163,7 +163,10 @@ def get_tensors(batch_size, seq_len, num_heads, head_dim, dtype):
                     (16, 128), (16, 160), (8, 192),
                     (8, 224), (8, 256)]
 )
-def test_bias_attention(bs_seqlen, nh_headdim, dtype):
+@pytest.mark.parametrize(
+    "causal", [True, False]
+)
+def test_bias_attention(bs_seqlen, nh_headdim, dtype, causal):
 
     q, k, v, _, bias = get_tensors(bs_seqlen[0], bs_seqlen[1], nh_headdim[0], nh_headdim[1], dtype)
     dout = torch.rand_like(q)
@@ -174,7 +177,7 @@ def test_bias_attention(bs_seqlen, nh_headdim, dtype):
         key_padding_mask=None,
         dropout_p=0.0,
         dropout_mask=None,
-        causal=False
+        causal=causal
     )
 
     out_pt, attn_pt = attention_ref(q, k, v,
@@ -183,14 +186,14 @@ def test_bias_attention(bs_seqlen, nh_headdim, dtype):
         key_padding_mask=None,
         dropout_p=0.0,
         dropout_mask=None,
-        causal=False,
+        causal=causal,
         upcast=False,
         reorder_ops=True
     )
 
     out_fl = flash_attn_func(q, k, v,
         dropout_p=0.,
-        causal=False,
+        causal=causal,
         attn_bias=bias
         )
 
