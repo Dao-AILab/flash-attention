@@ -232,7 +232,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
 
         ds = None
         if ctx.bias_requires_grad:
-            ds = torch.zeros(attn_bias.shape, dtype=attn_bias.dtype, device=attn_bias.device)
+            ds = torch.empty_like(attn_bias)
 
         _flash_attn_backward(
             dout,
@@ -358,7 +358,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
 
         ds = None
         if ctx.bias_requires_grad:
-            ds = torch.zeros(attn_bias.shape, dtype=attn_bias.dtype, device=attn_bias.device)
+            ds = torch.empty_like(attn_bias)
 
         _flash_attn_backward(
             dout,
@@ -491,7 +491,7 @@ class FlashAttnFunc(torch.autograd.Function):
 
         ds = None
         if ctx.bias_requires_grad:
-            ds = torch.zeros(attn_bias.shape, dtype=attn_bias.dtype, device=attn_bias.device)
+            ds = torch.empty_like(attn_bias)
 
         _flash_attn_backward(
             dout,
