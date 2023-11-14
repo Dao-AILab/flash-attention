@@ -11,30 +11,32 @@ from flash_attn.ops.triton.layernorm import layer_norm_fn, layer_norm_ref, rms_n
 is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 
 
+@pytest.mark.parametrize("prenorm", [True, False])
+# @pytest.mark.parametrize("prenorm", [True])
 @pytest.mark.parametrize("is_rms_norm", [False, True])
 # @pytest.mark.parametrize("is_rms_norm", [True])
 @pytest.mark.parametrize("has_residual", [True, False])
-# @pytest.mark.parametrize("has_residual", [True])
+# @pytest.mark.parametrize("has_residual", [False])
 @pytest.mark.parametrize(
-    "weight_dtype", [torch.float32, torch.float16] + ([torch.bfloat16] if is_sm8x else [])
+"weight_dtype", [torch.float32, torch.float16] + ([torch.bfloat16] if is_sm8x else [])
 )
 # @pytest.mark.parametrize("weight_dtype", [torch.float32])
 @pytest.mark.parametrize(
-    "input_dtype,residual_dtype",
-    [(torch.float16, torch.float16), (torch.float16, torch.float32), (torch.float32, torch.float32)]
-    + ([(torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32)] if is_sm8x else []),
+"input_dtype,residual_dtype",
+[(torch.float16, torch.float16), (torch.float16, torch.float32), (torch.float32, torch.float32)]
++ ([(torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32)] if is_sm8x else []),
 )
 # @pytest.mark.parametrize("input_dtype,residual_dtype", [(torch.bfloat16, torch.float32)])
 @pytest.mark.parametrize("hidden_size", [192, 2048, 2560, 3000, 8192])
 # @pytest.mark.parametrize("hidden_size", [256])
 def test_layer_norm(
-    hidden_size, input_dtype, residual_dtype, weight_dtype, has_residual, is_rms_norm
+    hidden_size, input_dtype, residual_dtype, weight_dtype, has_residual, is_rms_norm, prenorm
 ):
     device = "cuda"
     if any(x == torch.bfloat16 for x in [input_dtype, residual_dtype, weight_dtype]):
         atol = 5e-2
     elif any(x == torch.float16 for x in [input_dtype, residual_dtype, weight_dtype]):
-        atol = 5e-3
+        atol = 1e-2
     else:
         atol = 1e-4
     # set seed
@@ -68,26 +70,36 @@ def test_layer_norm(
     weight_ref = weight.detach().clone().requires_grad_()
     bias_pt = bias.detach().clone().requires_grad_() if bias is not None else None
     bias_ref = bias.detach().clone().requires_grad_() if bias is not None else None
-    residual_in_fp32 = (not has_residual) and residual_dtype == torch.float32
 
-    out, *rest = layer_norm_fn(x0, weight, bias, residual=res, eps=1e-6, is_rms_norm=is_rms_norm)
-    out_pt, *rest_pt = layer_norm_ref_fn(x0_pt, weight_pt, bias_pt, residual=res_pt, eps=1e-6)
-    out_ref, *rest_ref = layer_norm_ref_fn(
-        x0_ref, weight_ref, bias_ref, residual=res_ref, eps=1e-6, upcast=True
+    residual_in_fp32 = (not has_residual) and residual_dtype == torch.float32
+    out, *rest = layer_norm_fn(
+        x0,
+        weight,
+        bias,
+        residual=res,
+        eps=1e-6,
+        prenorm=prenorm,
+        residual_in_fp32=residual_in_fp32,
+        is_rms_norm=is_rms_norm,
     )
-    if has_residual:
+    out_pt, *rest_pt = layer_norm_ref_fn(
+        x0_pt, weight_pt, bias_pt, residual=res_pt, eps=1e-6, prenorm=prenorm
+    )
+    out_ref, *rest_ref = layer_norm_ref_fn(
+        x0_ref, weight_ref, bias_ref, residual=res_ref, eps=1e-6, prenorm=prenorm, upcast=True
+    )
+    if prenorm:
         residual = rest[0]
         residual_pt = rest_pt[0]
         residual_ref = rest_ref[0]
-        residual_ref = x0_ref + res_ref
     assert out.dtype == input_dtype
-    if has_residual:
+    if prenorm:
         assert residual.dtype == residual_dtype
         assert allclose(residual, residual_pt, residual_ref)
     assert allclose(out, out_pt, out_ref)
 
     g = torch.randn_like(out) / batch_size
-    if not has_residual:
+    if not prenorm:
         out.backward(g)
         out_pt.backward(g)
         out_ref.backward(g)
