@@ -27,7 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-// libtorch headers
+// torch headers
 #include <ATen/ATen.h>
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/HIPGeneratorImpl.h>
@@ -36,17 +36,13 @@
 #include <torch/torch.h>
 
 #include "ck/ck.hpp"
-#include "ck/library/reference_tensor_operation/cpu/reference_batched_gemm.hpp"
-#include "ck/library/reference_tensor_operation/cpu/reference_dropout.hpp"
-#include "ck/library/reference_tensor_operation/cpu/reference_softmax.hpp"
-#include "ck/library/utility/check_err.hpp"
 #include "ck/library/utility/device_memory.hpp"
-#include "ck/library/utility/host_tensor.hpp"
-#include "ck/library/utility/host_tensor_generator.hpp"
-#include "ck/library/utility/literals.hpp"
+
 #include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
 #include "ck/tensor_operation/gpu/device/tensor_specialization.hpp"
 #include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
+
+#include "hip/hip_runtime.h"
 
 #define CHECK_SHAPE(x, ...)                                                    \
   TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}),                  \

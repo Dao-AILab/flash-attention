@@ -1,19 +1,35 @@
 # BSD 3 Clause
 # Copyright 2023 Advanced Micro Devices, Inc.
-# Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
-# 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
-# 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
-# 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+# 1. Redistributions of source code must retain the above copyright notice,
+# this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+# 3. Neither the name of the copyright holder nor the names of its contributors
+# may be used to endorse or promote products derived from this software without
+# specific prior written permission.
 
-FROM rocm/pytorch:rocm5.4.2_ubuntu20.04_py3.8_pytorch_2.0.0_preview
+ARG VERSION=latest
+FROM rocm/pytorch:$VERSION
 
-WORKDIR /workspace
 USER root
 
-RUN pip install ninja
-COPY ./ /workspace/flash-attention/
-RUN cd /workspace/flash-attention \
-	&& git submodule update --init \
-       	&& patch /opt/conda/envs/py_3.8/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py hipify_patch.patch \
-       	&& python setup.py install
+COPY ./ /workspace/flash-attention
+WORKDIR /workspace/flash-attention
+
+# Initialize git submodule and apply patch
+RUN git submodule update --init \
+  && PYTHON_SITE_PACKAGES=$(python -c 'import site; print(site.getsitepackages()[0])') \
+  && echo "Patching ${PYTHON_SITE_PACKAGES}/torch/utils/hipify/hipify_python.py" \
+  && patch "${PYTHON_SITE_PACKAGES}/torch/utils/hipify/hipify_python.py" hipify_patch.patch
+
+ARG GPU_ARCHS=native
+ARG MAX_JOBS=-1
+
+RUN echo "GPU_ARCHS is set to: ${GPU_ARCHS}"
+RUN echo "Ninja building with MAX_JOBS=${MAX_JOBS}"
+
+# Build Flash Attention for ROCm
+RUN GPU_ARCHS=${GPU_ARCHS} MAX_JOBS=${MAX_JOBS} pip install .

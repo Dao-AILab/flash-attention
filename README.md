@@ -211,92 +211,121 @@ To run the tests:
 pytest -q -s tests/test_flash_attn.py
 ```
 
-## AMD GPU/ROCm support
+## AMD GPU/ROCm Support
 
 To install (requiring ROCm, and MI210 or MI250 GPU):
-You can compile from source:
+### 1. You can compile from source
+#### i. Launch docker rocm/pytorch:rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1
+#### ii. Clone the repo
+#### iv. (optional): Build for the desired GPU architecture(s) by setting the enviroment variable (comma seperated). We currently only support the following options. If you do not specify, defaultly it will build for your native device architecture:
+```bash
+export GPU_ARCHS="gfx90a,gfx940,gfx941,gfx942"
 ```
-Launch docker rocm/pytorch:rocm5.4.2_ubuntu20.04_py3.8_pytorch_2.0.0_preview
-Enter flash_attention
-$patch /opt/conda/envs/py_3.8/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py hipify_patch.patch
-$python setup.py install
+#### iv. Build from source
+```bash
+$ cd flash-attention
+$ export PYTHON_SITE_PACKAGES=$(python -c 'import site; print(site.getsitepackages()[0])')
+$ patch "${PYTHON_SITE_PACKAGES}/torch/utils/hipify/hipify_python.py" hipify_patch.patch
+$ pip install .
 ```
 
+### 2. You can also use the Dockerfile to build the Flash-Attention in one shot:
+```bash
+docker build . -f Dockerfile.rocm -t [image_name]
 ```
-Launch docker rocm/pytorch:rocm5.4_ubuntu20.04_py3.8_pytorch_1.12.1
-or any pytorch 1.13.1 docker
-Enter flash_attention
-$patch /opt/conda/lib/python3.8/site-packages/torch/utils/hipify/hipify_python.py hipify_patch_1.12.patch
-$python setup.py install
+By default, the **rocm/pytorch:latest** image will be the base image, but you can override this with any valid tags from DockerHub. For example:
+```bash
+--build-arg="VERSION=rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1"
 ```
-
-Alternatively you can build the whole docker image with flash attention automatically.
+The Dockerfile will also detect your native GPU architecture for the Flash-Attention, but if you need to select a different one, pass the arguments to the Dockerfile. For example:
+```bash
+--build-arg="GPU_ARCHS=gfx90a,gfx940,gfx941,gfx942"
 ```
-docker build . -f Dockerfile.rocm -t [IMAGE NAME you like]
+If you encountered RAM issues, you can lower the MAX_JOBS environment for ninja by:
+```bash
+--build-arg="MAX_JOBS=4"
 ```
 
 Run the container using the following command:
-```
-docker run -it --network host --ipc host --device /dev/dri --device /dev/kfd --cap-add SYS_PTRACE --group-add video --security-opt seccomp=unconfined [IMAGE NAME you like]
+```bash
+docker run -it --network host --ipc host --device /dev/dri --device /dev/kfd --cap-add SYS_PTRACE --group-add video --security-opt seccomp=unconfined --privileged --name [container_name] [image_name]
 ```
 
 Flash-attention in the dockerfile will have the best performance automatically. 
 To run the benchmark against PyTorch standard attention: 
-```
+```bash
 PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
 ```
 
 Benchmark results(MI250, deterministic off, unit test mode off, RTZ):
-```
-PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py
-FlashAttention - Forward pass
-  8.23 ms
-  1 measurement, 30 runs , 128 threads
-FlashAttention - Backward pass
-  29.06 ms
-  1 measurement, 30 runs , 128 threads
-FlashAttention - Forward + Backward pass
-  37.88 ms
-  1 measurement, 30 runs , 128 threads
-PyTorch Standard Attention - Forward pass
-  26.28 ms
-  1 measurement, 30 runs , 128 threads
-PyTorch Standard Attention - Backward pass
-  63.20 ms
-  1 measurement, 30 runs , 128 threads
-PyTorch Standard Attention - Forward + Backward pass
-  89.37 ms
-  1 measurement, 30 runs , 128 threads
+```bash
+PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py 
+### causal=False, headdim=64, batch_size=32, seqlen=512 ###
+Flash2 fwd: 66.38 TFLOPs/s, bwd: 36.46 TFLOPs/s, fwd + bwd: 41.85 TFLOPs/s
+Pytorch fwd: 15.87 TFLOPs/s, bwd: 19.43 TFLOPs/s, fwd + bwd: 18.26 TFLOPs/s
+### causal=False, headdim=64, batch_size=8, seqlen=2048 ###
+Flash2 fwd: 73.72 TFLOPs/s, bwd: 43.80 TFLOPs/s, fwd + bwd: 49.55 TFLOPs/s
+Pytorch fwd: 18.92 TFLOPs/s, bwd: 24.36 TFLOPs/s, fwd + bwd: 22.51 TFLOPs/s
+### causal=False, headdim=64, batch_size=2, seqlen=8192 ###
+Flash2 fwd: 75.70 TFLOPs/s, bwd: 44.86 TFLOPs/s, fwd + bwd: 50.77 TFLOPs/s
+Pytorch fwd: 19.40 TFLOPs/s, bwd: 29.32 TFLOPs/s, fwd + bwd: 25.58 TFLOPs/s
+### causal=False, headdim=128, batch_size=32, seqlen=512 ###
+Flash2 fwd: 61.47 TFLOPs/s, bwd: 44.31 TFLOPs/s, fwd + bwd: 48.15 TFLOPs/s
+Pytorch fwd: 22.65 TFLOPs/s, bwd: 19.92 TFLOPs/s, fwd + bwd: 20.63 TFLOPs/s
+### causal=False, headdim=128, batch_size=8, seqlen=2048 ###
+Flash2 fwd: 74.88 TFLOPs/s, bwd: 52.49 TFLOPs/s, fwd + bwd: 57.39 TFLOPs/s
+Pytorch fwd: 28.89 TFLOPs/s, bwd: 34.99 TFLOPs/s, fwd + bwd: 33.00 TFLOPs/s
+### causal=False, headdim=128, batch_size=2, seqlen=8192 ###
+Flash2 fwd: 78.00 TFLOPs/s, bwd: 53.70 TFLOPs/s, fwd + bwd: 58.94 TFLOPs/s
+Pytorch fwd: 33.54 TFLOPs/s, bwd: 53.66 TFLOPs/s, fwd + bwd: 45.81 TFLOPs/s
+### causal=True, headdim=64, batch_size=32, seqlen=512 ###
+Flash2 fwd: 30.61 TFLOPs/s, bwd: 18.59 TFLOPs/s, fwd + bwd: 20.94 TFLOPs/s
+Pytorch fwd: 5.85 TFLOPs/s, bwd: 9.68 TFLOPs/s, fwd + bwd: 8.16 TFLOPs/s
+### causal=True, headdim=64, batch_size=8, seqlen=2048 ###
+Flash2 fwd: 44.62 TFLOPs/s, bwd: 29.61 TFLOPs/s, fwd + bwd: 32.76 TFLOPs/s
+Pytorch fwd: 6.28 TFLOPs/s, bwd: 12.33 TFLOPs/s, fwd + bwd: 9.67 TFLOPs/s
+### causal=True, headdim=64, batch_size=2, seqlen=8192 ###
+Flash2 fwd: 58.47 TFLOPs/s, bwd: 42.12 TFLOPs/s, fwd + bwd: 45.77 TFLOPs/s
+Pytorch fwd: 6.38 TFLOPs/s, bwd: 14.89 TFLOPs/s, fwd + bwd: 10.78 TFLOPs/s
+### causal=True, headdim=128, batch_size=32, seqlen=512 ###
+Flash2 fwd: 29.54 TFLOPs/s, bwd: 23.47 TFLOPs/s, fwd + bwd: 24.93 TFLOPs/s
+Pytorch fwd: 9.02 TFLOPs/s, bwd: 9.96 TFLOPs/s, fwd + bwd: 9.67 TFLOPs/s
+### causal=True, headdim=128, batch_size=8, seqlen=2048 ###
+Flash2 fwd: 46.04 TFLOPs/s, bwd: 36.84 TFLOPs/s, fwd + bwd: 39.07 TFLOPs/s
+Pytorch fwd: 10.40 TFLOPs/s, bwd: 17.59 TFLOPs/s, fwd + bwd: 14.69 TFLOPs/s
+### causal=True, headdim=128, batch_size=2, seqlen=8192 ###
+Flash2 fwd: 61.03 TFLOPs/s, bwd: 51.99 TFLOPs/s, fwd + bwd: 54.29 TFLOPs/s
+Pytorch fwd: 11.48 TFLOPs/s, bwd: 27.39 TFLOPs/s, fwd + bwd: 19.62 TFLOPs/s
 ```
 
 ### Unit Test Mode
 #### How to build
 
 For passing unit tests compile flash-attention from source which may take a while:
-```
-FLASH_ATTENTION_INTERNAL_USE_RTN=1 python setup.py install
+```bash
+FLASH_ATTENTION_INTERNAL_USE_RTN=1 pip install .
 ```
 
 Before running unit tests, the unit test mode and deterministic flags should be both turned on by setting the environment variables:
-```sh
+```bash
 export FLASH_ATTENTION_INTERNAL_DETERMINISTIC=1
 export FLASH_ATTENTION_INTERNAL_UNIT_TEST_MODE=1
 ```
 
 Run the unit tests:
-```sh
+```bash
 pytest tests/test_flash_attn.py
 ```
 
 Unit tests results(MI250, deterministic on, unit test mode on, RTN):
-```
-2113 passed, 2848 skipped in 128.24s (0:02:08)
+```bash
+9119 passed, 32 skipped in 395.27s (0:06:35)
 ```
 
 FlashAttention currently supports:
 1. MI200 GPUs (MI210, MI250).
 2. fp16 and bf16.
-3. Head dimensions that are multiples of 8, up to 128 (e.g., 8, 16, 24, ..., 128).
+3. Head dimensions up to 128 (e.g., 32, 40, 59, ..., 128).
 
 ## When you encounter issues
 
