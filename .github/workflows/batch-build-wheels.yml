@@ -1,0 +1,45 @@
+name: Batch Build flash-attention Wheels for Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: 'Version tag of flash-attention to build: v2.3.4'
+        default: 'v2.3.2,v2.3.3,v2.3.4'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  define_matrix:
+    name: Define Workflow Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PCKGVERS: ${{ inputs.versions }}
+        
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Define Job Output
+        id: set-matrix
+        run: |
+          $x = ConvertTo-Json $env:PCKGVERS.Split(',').Trim() -Compress
+          Write-Output ('matrix=' + $x) >> $env:GITHUB_OUTPUT
+          
+  run_workflows:
+    name: Build ${{ matrix.version }} Wheels
+    needs: define_matrix
+    strategy:
+      max-parallel: 1
+      matrix:
+        version: ${{ fromJSON(needs.define_matrix.outputs.matrix) }}
+    uses: ./.github/workflows/build-wheels.yml
+    with:
+      version: ${{ matrix.version }}
