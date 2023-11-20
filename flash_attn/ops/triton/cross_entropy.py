@@ -196,18 +196,17 @@ class CrossEntropyLoss(torch.autograd.Function):
             # -0.9 * predicted logit - 0.1 * sum logit / total_classes.
             # For labels not in the vocab of this partition, losses contains
             # -0.1 * sum logit / total_classes.
+            if n_splits > 1:
+                lse = torch.logsumexp(lse, dim=0)
+                losses = losses.sum(dim=0)
             if world_size > 1:
-                lse_allgather = torch.empty(world_size * n_splits, n_rows, dtype=lse.dtype, device=lse.device)
+                lse_allgather = torch.empty(world_size, n_rows, dtype=lse.dtype, device=lse.device)
                 torch.distributed.all_gather_into_tensor(lse_allgather, lse, group=process_group)
-                if n_splits > 1: losses = losses.sum(dim=0)
                 handle_losses = torch.distributed.all_reduce(
                     losses, op=torch.distributed.ReduceOp.SUM, group=process_group, async_op=True
                 )
                 lse = torch.logsumexp(lse_allgather, dim=0)
                 handle_losses.wait()
-            else:
-                lse = torch.logsumexp(lse, dim=0)
-                losses = losses.sum(dim=0)
             # After the allreduce, if there's no smoothing, the total losses are - predicted_logit,
             # we just have to add the (global) lse.
             # If there's smoothing=0.1, the total losses are
