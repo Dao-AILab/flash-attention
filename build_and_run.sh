@@ -57,7 +57,7 @@ docker build "${BUILD_ARGS[@]}" -f Dockerfile.rocm -t $IMAGE_NAME_TMP .
 docker run --network host --ipc host --device /dev/dri --device /dev/kfd \
 --cap-add SYS_PTRACE --group-add video --security-opt seccomp=unconfined \
 --privileged --name $CONTAINER_NAME_TMP \
--e MAX_JOBS=$MAX_JOBS -e PYTORCH_ROCM_ARCH=$GPU_ARCHS \
+-e MAX_JOBS=$MAX_JOBS -e GPU_ARCHS=$GPU_ARCHS \
 -e FLASH_ATTENTION_INTERNAL_USE_RTN=$FLASH_ATTENTION_INTERNAL_USE_RTN \
 $IMAGE_NAME_TMP /bin/bash -c "pip install ."
 
