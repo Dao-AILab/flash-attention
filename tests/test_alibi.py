@@ -25,7 +25,7 @@ is_sm80 = torch.cuda.get_device_capability("cuda") == (8, 0)
 is_sm90 = torch.cuda.get_device_capability("cuda") == (9, 0)
 
 
-def generate_alibi(max_seq_len, num_attention_heads, tp_world_size, tp_index, device="cuda"):
+def generate_alibi(max_seq_len, num_attention_heads, tp_world_size, tp_index, key_padding_mask=None, device="cuda"):
     def get_slopes(n):
         def get_slopes_power_of_2(n):
             start = (2 ** (-2 ** -(math.log2(n) - 3)))
@@ -36,17 +36,7 @@ def generate_alibi(max_seq_len, num_attention_heads, tp_world_size, tp_index, de
         ), "it works only when num_attention_heads is power of 2"
 
         return get_slopes_power_of_2(n)
-
-    slopes = torch.tensor(get_slopes(num_attention_heads))
-    alibi_tensor = slopes.unsqueeze(1).unsqueeze(
-        1) * torch.arange(max_seq_len).unsqueeze(0).unsqueeze(0).expand(num_attention_heads, -1, -1)
-    # Select the part of the tensor that corresponds to our tensor parallel index.
-    alibi_tensor = alibi_tensor.reshape(
-        (tp_world_size, -1, *alibi_tensor.shape[1:]))[tp_index]
-    # (1, nheads, 1, seqlen_k)
-    alibi_tensor = alibi_tensor.unsqueeze(0).contiguous().to(
-        device=device, dtype=torch.float32)
-
+    
     assert (num_attention_heads/tp_world_size).is_integer(
     ), "it works only when (num_attention_heads/tp_world_size) is integer"
     nh_tp = num_attention_heads // tp_world_size
@@ -54,10 +44,30 @@ def generate_alibi(max_seq_len, num_attention_heads, tp_world_size, tp_index, de
     alibi_start = (2 ** (-2 ** -(math.log2(num_attention_heads) - 3))
                    ) * alibi_ratio ** (nh_tp * tp_index)
 
+    slopes = torch.tensor(get_slopes(num_attention_heads))
+    if (key_padding_mask is None):
+        arange_tensor = torch.arange(max_seq_len).unsqueeze(0).unsqueeze(0).expand(num_attention_heads, -1, -1)
+        alibi_tensor = slopes.unsqueeze(1).unsqueeze(
+        1) * torch.arange(max_seq_len).unsqueeze(0).unsqueeze(0).expand(num_attention_heads, -1, -1)
+        # Select the part of the tensor that corresponds to our tensor parallel index.
+        alibi_tensor = alibi_tensor.reshape(
+            (tp_world_size, -1, *alibi_tensor.shape[1:]))[tp_index]
+        # (1, nheads, 1, seqlen_k)
+        alibi_tensor = alibi_tensor.unsqueeze(0).contiguous().to(
+            device=device, dtype=torch.float32)
+    else:
+        arange_tensor = (key_padding_mask.cumsum(dim=-1, dtype=slopes.dtype) - 1) \
+            .masked_fill_(~key_padding_mask, torch.finfo(torch.float).min)
+        slopes = slopes[nh_tp * tp_index:nh_tp * (tp_index + 1)]
+        slopes = rearrange(slopes, 'nh -> 1 nh 1 1').to(device=device)
+        arange_tensor = rearrange(arange_tensor, 'b sqk -> b 1 1 sqk')
+        # (batch, nheads, 1, seqlen_k)
+        alibi_tensor = slopes * arange_tensor
+
     return alibi_tensor, alibi_start, alibi_ratio
 
 
-def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random"):
+def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random", right_padding=True):
     assert mode in ["full", "random", "third"]
     if mode == "full":
         lengths = torch.full((batch_size, 1), max_seqlen,
@@ -69,10 +79,16 @@ def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random"):
     elif mode == "third":
         lengths = torch.randint(
             max_seqlen // 3, max_seqlen + 1, (batch_size, 1), device=device)
-    padding_mask = (
-        repeat(torch.arange(max_seqlen, device=device),
-               "s -> b s", b=batch_size) < lengths
-    )
+    if right_padding:
+        padding_mask = (
+            repeat(torch.arange(max_seqlen, device=device),
+                "s -> b s", b=batch_size) < lengths
+        )
+    else:
+        padding_mask = (
+            repeat(torch.arange(start=max_seqlen-1, end=-1, step=-1, device=device),
+                "s -> b s", b=batch_size) < lengths
+        )
     return padding_mask
 
 
@@ -621,7 +637,13 @@ def test_flash_attn_func(bs_seqlen, headdim, tp_world_size, dtype):
 
     for tp_index in range(tp_world_size):
         alibi, alibi_start, alibi_ratio = generate_alibi(
-            seqlen, nh, tp_world_size, tp_index, "cuda")
+            max_seq_len=seqlen,
+            num_attention_heads=nh,
+            tp_world_size=tp_world_size,
+            tp_index=tp_index,
+            key_padding_mask=None,
+            device="cuda"
+        )
 
         triton_out = flash_attn_func_triton(
             q, k, v, alibi, True, headdim**(-0.5))
@@ -646,8 +668,12 @@ def test_flash_attn_func(bs_seqlen, headdim, tp_world_size, dtype):
     "dtype", [torch.float16]
 )
 @pytest.mark.parametrize(
+    "right_padding", [True, False]
+)
+@pytest.mark.parametrize(
     "bs_seqlen", [(32, 512), (16, 1024), (8, 2048),
                   (4, 4096), (2, 8192), (1, 16384)]
+    # "bs_seqlen", [(32, 512)]
 )
 @pytest.mark.parametrize(
     "headdim", [64, 128]
@@ -655,15 +681,21 @@ def test_flash_attn_func(bs_seqlen, headdim, tp_world_size, dtype):
 @pytest.mark.parametrize(
     "tp_world_size", [1, 2, 4, 8]
 )
-def test_flash_attn_varlen_func(bs_seqlen, headdim, tp_world_size, dtype):
-    bs, seqlen = bs_seqlen
+def test_flash_attn_varlen_func(bs_seqlen, headdim, tp_world_size, right_padding, dtype):
+    bs, seqlen_k = bs_seqlen
     nh = 2048 // headdim
     nh_tp = nh // tp_world_size
-    q, k, v = [torch.randn(bs, seqlen, nh_tp, headdim, device="cuda",
-                           dtype=dtype, requires_grad=True) for _ in range(3)]
+    # q, k, v = [torch.randn(bs, seqlen, nh_tp, headdim, device="cuda",
+    #                        dtype=dtype, requires_grad=True) for _ in range(3)]
+    # flash_attn_func_triton(), flash-attention v2 (above v2.1) causal logic are different
+    # so only (seqlen_q == 1, causal=False to triton ver.) shows correct results
+    # https://github.com/huggingface/text-generation-inference/blob/v1.1.1/server/text_generation_server/models/custom_modeling/mpt_modeling.py#L53-L63
+    q = torch.randn(bs, 1, nh_tp, headdim, device="cuda", dtype=dtype, requires_grad=True)
+    k, v = [torch.randn(bs, seqlen_k, nh_tp, headdim, device="cuda",
+                        dtype=dtype, requires_grad=True) for _ in range(2)]
     dout = torch.rand_like(q)
 
-    padding_mask = generate_random_padding_mask(seqlen, bs, "cuda", "random")
+    padding_mask = generate_random_padding_mask(seqlen_k, bs, "cuda", "random", right_padding)
     (
         q_unpad,
         k_unpad,
@@ -678,18 +710,20 @@ def test_flash_attn_varlen_func(bs_seqlen, headdim, tp_world_size, dtype):
         output_pad_fn,
         dq_pad_fn,
         dk_pad_fn,
-    ) = generate_qkv(q, k, v, padding_mask, padding_mask, kvpacked=False)
+    ) = generate_qkv(q, k, v, None, padding_mask, kvpacked=False)
 
     for tp_index in range(tp_world_size):
         alibi, alibi_start, alibi_ratio = generate_alibi(
-            seqlen, nh, tp_world_size, tp_index, "cuda")
-        alibi_masked = alibi.expand(bs, -1, -1, -1).masked_fill(~(rearrange(
-            padding_mask, "b sqk -> b 1 1 sqk")), torch.finfo(torch.float).min)
+            max_seq_len=seqlen_k,
+            num_attention_heads=nh,
+            tp_world_size=tp_world_size,
+            tp_index=tp_index,
+            key_padding_mask=padding_mask,
+            device="cuda"
+        )
 
         triton_out = flash_attn_func_triton(
-            q, k, v, alibi_masked, True, headdim**(-0.5))
-        triton_out = triton_out.masked_fill(
-            ~rearrange(padding_mask, "b sq -> b sq 1 1"), 0.0)
+            q, k, v, alibi, False, headdim**(-0.5))
         triton_out.backward(dout)
         triton_dq, q.grad = q.grad.clone(), None
         triton_dk, k.grad = k.grad.clone(), None
