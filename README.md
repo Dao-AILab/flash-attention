@@ -230,28 +230,40 @@ $ pip install .
 ```
 
 ### 2. You can also use the Dockerfile to build the Flash-Attention in one shot:
+#### Build and Run the Container with Flash-Attention
 ```bash
-docker build . -f Dockerfile.rocm -t [image_name]
+bash ./build_and_run.sh
 ```
+#### Optional Arguments:
 By default, the **rocm/pytorch:latest** image will be the base image, but you can override this with any valid tags from DockerHub. For example:
 ```bash
---build-arg="VERSION=rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1"
+tag="rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1"
 ```
-The Dockerfile will also detect your native GPU architecture for the Flash-Attention, but if you need to select a different one, pass the arguments to the Dockerfile. For example:
+If you want to use the nightly PyTorch from ROCm, use the version argument which will look for tags from the rocm/pytorch-nightly:
 ```bash
---build-arg="GPU_ARCHS=gfx90a,gfx940,gfx941,gfx942"
+version="-nightly"
+```
+The script will detect your native GPU architecture for the Flash-Attention, but if you need to select a different one, pass the arguments to the script. For example:
+```bash
+gpu-archs="gfx90a;gfx940;gfx941;gfx942"
 ```
 If you encountered RAM issues, you can lower the MAX_JOBS environment for ninja by:
 ```bash
---build-arg="MAX_JOBS=4"
+max-jobs=4
 ```
-
-Run the container using the following command:
+Additionally, you can build the Flash-Attention in unit test mode by setting"
 ```bash
-docker run -it --network host --ipc host --device /dev/dri --device /dev/kfd --cap-add SYS_PTRACE --group-add video --security-opt seccomp=unconfined --privileged --name [container_name] [image_name]
+unit-test=true
 ```
 
-Flash-attention in the dockerfile will have the best performance automatically. 
+#### Example Command:
+The following command will build the Flash-Attention in non-unit-test mode for MI200s and MI300X with the base docker rocm/pytorch:rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1 with max-jobs=128 for ninja:
+```bash
+bash ./build_and_run.sh tag="rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1" gpu-archs="gfx90a;gfx941" max-jobs=128
+```
+
+
+By default, Flash-attention is built with optimized performance.
 To run the benchmark against PyTorch standard attention: 
 ```bash
 PYTHONPATH=$PWD python benchmarks/benchmark_flash_attention.py

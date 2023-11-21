@@ -11,8 +11,9 @@
 # may be used to endorse or promote products derived from this software without
 # specific prior written permission.
 
-ARG VERSION=latest
-FROM rocm/pytorch:$VERSION
+ARG VERSION=""
+ARG TAG=latest
+FROM rocm/pytorch${VERSION}:$TAG
 
 USER root
 
@@ -25,11 +26,11 @@ RUN git submodule update --init \
   && echo "Patching ${PYTHON_SITE_PACKAGES}/torch/utils/hipify/hipify_python.py" \
   && patch "${PYTHON_SITE_PACKAGES}/torch/utils/hipify/hipify_python.py" hipify_patch.patch
 
-ARG GPU_ARCHS=native
-ARG MAX_JOBS=-1
+# ARG GPU_ARCHS=native
+# ARG MAX_JOBS=-1
 
-RUN echo "GPU_ARCHS is set to: ${GPU_ARCHS}"
-RUN echo "Ninja building with MAX_JOBS=${MAX_JOBS}"
+# RUN echo "GPU_ARCHS is set to: ${GPU_ARCHS}"
+# RUN echo "Ninja building with MAX_JOBS=${MAX_JOBS}"
 
-# Build Flash Attention for ROCm
-RUN GPU_ARCHS=${GPU_ARCHS} MAX_JOBS=${MAX_JOBS} pip install .
+# # Build Flash Attention for ROCm
+# RUN GPU_ARCHS=${GPU_ARCHS} MAX_JOBS=${MAX_JOBS} pip install .

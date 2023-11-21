@@ -74,16 +74,6 @@ def append_nvcc_threads(nvcc_extra_args):
     return nvcc_extra_args
 
 
-def rename_cpp_cu(cpp_files):
-    """rename .cpp to .cu for nvcc
-
-    Args:
-        cpp_files (file): _description_
-    """
-    for entry in cpp_files:
-        shutil.copy(entry, os.path.splitext(entry)[0] + ".hip")
-
-
 if not torch.cuda.is_available():
     # https://github.com/NVIDIA/apex/issues/486
     # Extension builds after https://github.com/pytorch/pytorch/pull/23408 attempt to query torch.cuda.get_device_capability(),
@@ -214,9 +204,26 @@ def build_for_cuda():
     )
 
 
+def rename_cpp_to_hip(cpp_files):
+    for entry in cpp_files:
+        shutil.copy(entry, os.path.splitext(entry)[0] + ".hip")
+
+
+# Defining a function to validate the GPU architectures and update them if necessary
+def validate_and_update_archs(archs):
+    # List of allowed architectures
+    allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942"]
+
+    # Validate if each element in archs is in allowed_archs
+    assert all(
+        arch in allowed_archs for arch in archs
+    ), f"One of GPU archs of {archs} is invalid or not supported by Flash-Attention"
+
+
 def build_for_rocm():
     """build for ROCm platform"""
-    archs = os.getenv("GPU_ARCHS", "native").split(",")
+    archs = os.getenv("GPU_ARCHS", "native").split(";")
+    validate_and_update_archs(archs)
     cc_flag = [f"--offload-arch={arch}" for arch in archs]
 
     if int(os.environ.get("FLASH_ATTENTION_INTERNAL_USE_RTN", 0)):
@@ -225,17 +232,11 @@ def build_for_rocm():
     else:
         print("RTZ IS USED")
 
-    ck_sources = [
-        "csrc/flash_attn_rocm/composable_kernel/library/src/utility/convolution_parameter.cpp",
-        "csrc/flash_attn_rocm/composable_kernel/library/src/utility/device_memory.cpp",
-        "csrc/flash_attn_rocm/composable_kernel/library/src/utility/host_tensor.cpp",
-    ]
     fa_sources = ["csrc/flash_attn_rocm/flash_api.cpp"] + glob.glob(
         "csrc/flash_attn_rocm/src/*.cpp"
     )
 
-    # rename_cpp_cu(ck_sources)
-    rename_cpp_cu(fa_sources)
+    rename_cpp_to_hip(fa_sources)
 
     subprocess.run(
         [
@@ -251,12 +252,7 @@ def build_for_rocm():
         CUDAExtension(
             name="flash_attn_2_cuda",
             sources=["csrc/flash_attn_rocm/flash_api.hip"]
-            + glob.glob("csrc/flash_attn_rocm/src/*.hip")
-            + [
-                #     "csrc/flash_attn_rocm/composable_kernel/library/src/utility/convolution_parameter.hip",
-                # "csrc/flash_attn_rocm/composable_kernel/library/src/utility/device_memory.cpp",
-                #     "csrc/flash_attn_rocm/composable_kernel/library/src/utility/host_tensor.hip",
-            ],
+            + glob.glob("csrc/flash_attn_rocm/src/*.hip"),
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++20", "-DNDEBUG"] + generator_flag,
                 "nvcc": [
