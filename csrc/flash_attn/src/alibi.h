@@ -42,8 +42,8 @@ inline __device__ void apply_alibi(Tensor<Engine, Layout> &tensor,
                 #pragma unroll
                 for (int j = 0; j < size<1, 0>(tensor); ++j) {
                     const int col_idx = col_idx_base + j;
+                    const float alibi = (alibi_slope * col_idx) / softmax_scale;
                     if (col_idx < max_seqlen_k && row_idx < max_seqlen_q) {
-                        const float alibi = (alibi_slope * col_idx) / softmax_scale;
                         tensor(make_coord(i, mi), make_coord(j, nj)) += alibi;
                     }
                 }
