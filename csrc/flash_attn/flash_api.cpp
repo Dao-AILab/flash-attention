@@ -41,9 +41,7 @@ void set_params_fprop(Flash_fwd_params &params,
                       float p_dropout,
                       float softmax_scale,
                       int window_size_left,
-                      int window_size_right,
-                      float alibi_start,
-                      float alibi_ratio) {
+                      int window_size_right) {
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -118,9 +116,6 @@ void set_params_fprop(Flash_fwd_params &params,
     params.window_size_right = window_size_right;
 
     params.is_seqlens_k_cumulative = true;
-
-    params.alibi_start = alibi_start;
-    params.alibi_ratio = alibi_ratio;
 }
 
 void set_params_dgrad(Flash_bwd_params &params,
@@ -153,9 +148,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                       float p_dropout,
                       float softmax_scale,
                       int window_size_left,
-                      int window_size_right,
-                      float alibi_start,
-                      float alibi_ratio) {
+                      int window_size_right) {
 
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
@@ -167,9 +160,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right,
-                     alibi_start,
-                     alibi_ratio);
+                     window_size_right);
 
     // Set the pointers and strides.
     params.do_ptr = dout.data_ptr();
@@ -264,8 +255,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         bool is_causal,
         const int window_size_left,
         int window_size_right,
-        const float alibi_start,
-        const float alibi_ratio,
+        c10::optional<at::Tensor> &alibi_slopes_, // batch_size x num_heads
         const bool return_softmax,
         c10::optional<at::Generator> gen_) {
 
@@ -379,9 +369,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right,
-                     alibi_start,
-                     alibi_ratio);
+                     window_size_right);
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
     const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
@@ -418,6 +406,19 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         params.philox_args = gen->philox_cuda_state(counter_offset);
     }
 
+    if (alibi_slopes_.has_value()) {
+        auto alibi_slopes = alibi_slopes_.value();
+        TORCH_CHECK(alibi_slopes.dtype() == torch::kFloat32, "ALiBi slopes must have dtype fp32");
+        CHECK_DEVICE(alibi_slopes);
+        TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
+        CHECK_SHAPE(alibi_slopes, batch_size, num_heads);
+        params.is_alibi = true;
+        params.alibi_slopes_ptr = alibi_slopes.data_ptr();
+        params.alibi_slopes_batch_stride = alibi_slopes.stride(0);
+    } else {
+        params.is_alibi = false;
+    }
+
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     run_mha_fwd(params, stream);
 
@@ -451,8 +452,7 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
                const bool is_causal,
                const int window_size_left,
                int window_size_right,
-               const float alibi_start,
-               const float alibi_ratio,
+               c10::optional<at::Tensor> &alibi_slopes_, // b x num_heads
                const bool return_softmax,
                c10::optional<at::Generator> gen_) {
 
@@ -568,9 +568,7 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right,
-                     alibi_start,
-                     alibi_ratio);
+                     window_size_right);
 
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
@@ -587,6 +585,19 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         params.philox_args = gen->philox_cuda_state(counter_offset);
+    }
+
+    if (alibi_slopes_.has_value()) {
+        auto alibi_slopes = alibi_slopes_.value();
+        TORCH_CHECK(alibi_slopes.dtype() == torch::kFloat32, "ALiBi slopes must have dtype fp32");
+        CHECK_DEVICE(alibi_slopes);
+        TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
+        CHECK_SHAPE(alibi_slopes, batch_size, num_heads);
+        params.is_alibi = true;
+        params.alibi_slopes_ptr = alibi_slopes.data_ptr();
+        params.alibi_slopes_batch_stride = alibi_slopes.stride(0);
+    } else {
+        params.is_alibi = false;
     }
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -638,8 +649,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         const bool is_causal,
         const int window_size_left,
         int window_size_right,
-        const float alibi_start,
-        const float alibi_ratio,
+        c10::optional<at::Tensor> &alibi_slopes_, // batch_size x num_heads
         c10::optional<at::Generator> gen_,
         c10::optional<at::Tensor> &rng_state) {
 
@@ -791,9 +801,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right,
-                     alibi_start,
-                     alibi_ratio);
+                     window_size_right);
 
     auto launch = &run_mha_bwd;
     // launch(params, stream, /*configure=*/true);
@@ -813,6 +821,19 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         auto seeds = at::cuda::philox::unpack(params.philox_args);
         params.rng_state[0] = std::get<0>(seeds);
         params.rng_state[1] = std::get<1>(seeds);
+    }
+
+    if (alibi_slopes_.has_value()) {
+        auto alibi_slopes = alibi_slopes_.value();
+        TORCH_CHECK(alibi_slopes.dtype() == torch::kFloat32, "ALiBi slopes must have dtype fp32");
+        CHECK_DEVICE(alibi_slopes);
+        TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
+        CHECK_SHAPE(alibi_slopes, batch_size, num_heads);
+        params.is_alibi = true;
+        params.alibi_slopes_ptr = alibi_slopes.data_ptr();
+        params.alibi_slopes_batch_stride = alibi_slopes.stride(0);
+    } else {
+        params.is_alibi = false;
     }
 
     launch(params, stream, /*configure=*/false);
@@ -851,8 +872,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const bool is_causal,
                const int window_size_left,
                int window_size_right,
-               const float alibi_start,
-               const float alibi_ratio,
+               c10::optional<at::Tensor> &alibi_slopes_, // b x num_heads
                c10::optional<at::Generator> gen_,
                c10::optional<at::Tensor> &rng_state) {
 
@@ -1020,9 +1040,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right,
-                     alibi_start,
-                     alibi_ratio);
+                     window_size_right);
 
     auto launch = &run_mha_bwd;
     // launch(params, stream, /*configure=*/true);
@@ -1042,6 +1060,19 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         auto seeds = at::cuda::philox::unpack(params.philox_args);
         params.rng_state[0] = std::get<0>(seeds);
         params.rng_state[1] = std::get<1>(seeds);
+    }
+
+    if (alibi_slopes_.has_value()) {
+        auto alibi_slopes = alibi_slopes_.value();
+        TORCH_CHECK(alibi_slopes.dtype() == torch::kFloat32, "ALiBi slopes must have dtype fp32");
+        CHECK_DEVICE(alibi_slopes);
+        TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
+        CHECK_SHAPE(alibi_slopes, batch_size, num_heads);
+        params.is_alibi = true;
+        params.alibi_slopes_ptr = alibi_slopes.data_ptr();
+        params.alibi_slopes_batch_stride = alibi_slopes.stride(0);
+    } else {
+        params.is_alibi = false;
     }
 
     launch(params, stream, /*configure=*/false);
@@ -1077,8 +1108,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 int window_size_right,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
                 int num_splits,
-                const float alibi_start,
-                const float alibi_ratio
+                c10::optional<at::Tensor> &alibi_slopes_ // batch_size x num_heads
                 ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1186,9 +1216,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      /*p_dropout=*/0.f,
                      softmax_scale,
                      window_size_left,
-                     window_size_right,
-                     alibi_start,
-                     alibi_ratio);
+                     window_size_right);
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {
@@ -1283,6 +1311,19 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         at::Tensor out_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
         params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
         params.oaccum_ptr = out_accum.data_ptr();
+    }
+
+    if (alibi_slopes_.has_value()) {
+        auto alibi_slopes = alibi_slopes_.value();
+        TORCH_CHECK(alibi_slopes.dtype() == torch::kFloat32, "ALiBi slopes must have dtype fp32");
+        CHECK_DEVICE(alibi_slopes);
+        TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
+        CHECK_SHAPE(alibi_slopes, batch_size, num_heads);
+        params.is_alibi = true;
+        params.alibi_slopes_ptr = alibi_slopes.data_ptr();
+        params.alibi_slopes_batch_stride = alibi_slopes.stride(0);
+    } else {
+        params.is_alibi = false;
     }
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();

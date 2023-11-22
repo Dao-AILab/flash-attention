@@ -328,6 +328,22 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // We also need masking on S if it's causal, for the last ceil_div(kBlockM, kBlockN) blocks.
     // We will have at least 1 "masking" iteration.
 
+    float alibi_slope = 0.0f;
+    if (Is_alibi) {
+        Tensor gAS = make_tensor(
+        make_gmem_ptr(
+            reinterpret_cast<ElementAccum *>(params.alibi_slopes_ptr) 
+            + bidb * params.alibi_slopes_batch_stride + bidh
+        ),
+        Shape<_1>{});
+        Tensor rAS = make_fragment_like(gAS);
+        cute::copy(gAS, rAS);
+        alibi_slope = rAS(0);
+        // if (m_block == 0 && tidx == 0) {
+        //     printf("%d,%d,%f\n", bidb, bidh, alibi_slope);
+        // }
+    }
+
     // If not even_N, then seqlen_k might end in the middle of a block. In that case we need to
     // mask 2 blocks (e.g. when kBlockM == kBlockN), not just 1.
     constexpr int n_masking_steps = (!Is_causal && !Is_local)
@@ -374,7 +390,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 binfo.actual_seqlen_q, 
                 kNWarps * 16,
                 bidh, params.scale_softmax, 
-                params.alibi_start, params.alibi_ratio
+                alibi_slope
             );
         }
 
@@ -492,7 +508,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 binfo.actual_seqlen_q, 
                 kNWarps * 16,
                 bidh, params.scale_softmax, 
-                params.alibi_start, params.alibi_ratio
+                alibi_slope
             );
         }
         
@@ -940,6 +956,22 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // We also need masking on S if it's causal, for the last ceil_div(kBlockM, kBlockN) blocks.
     // We will have at least 1 "masking" iteration.
 
+    float alibi_slope = 0.0f;
+    if (Is_alibi) {
+        Tensor gAS = make_tensor(
+        make_gmem_ptr(
+            reinterpret_cast<ElementAccum *>(params.alibi_slopes_ptr) 
+            + bidb * params.alibi_slopes_batch_stride + bidh
+        ),
+        Shape<_1>{});
+        Tensor rAS = make_fragment_like(gAS);
+        cute::copy(gAS, rAS);
+        alibi_slope = rAS(0);
+        // if (m_block == 0 && tidx == 0) {
+        //     printf("%d,%d,%f\n", bidb, bidh, alibi_slope);
+        // }
+    }
+
     // If not even_N, then seqlen_k might end in the middle of a block. In that case we need to
     // mask 2 blocks (e.g. when kBlockM == kBlockN), not just 1.
     constexpr int n_masking_steps = (!Is_causal && !Is_local)
@@ -982,7 +1014,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 binfo.actual_seqlen_q, 
                 kNWarps * 16,
                 bidh, params.scale_softmax, 
-                params.alibi_start, params.alibi_ratio
+                alibi_slope
             );
         }
 
@@ -1075,7 +1107,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 binfo.actual_seqlen_q, 
                 kNWarps * 16,
                 bidh, params.scale_softmax, 
-                params.alibi_start, params.alibi_ratio
+                alibi_slope
             );
         }
 

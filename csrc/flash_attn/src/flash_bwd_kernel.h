@@ -791,6 +791,19 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     clear(acc_dv);
     clear(acc_dk);
 
+    float alibi_slope = 0.0f;
+    if (Is_alibi) {
+        Tensor gAS = make_tensor(
+        make_gmem_ptr(
+            reinterpret_cast<ElementAccum *>(params.alibi_slopes_ptr) 
+            + bidb * params.alibi_slopes_batch_stride + bidh
+        ),
+        Shape<_1>{});
+        Tensor rAS = make_fragment_like(gAS);
+        cute::copy(gAS, rAS);
+        alibi_slope = rAS(0);
+    }
+
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
         clear(acc_s);
@@ -824,7 +837,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 binfo.actual_seqlen_q, 
                 AtomLayoutMS * 16,
                 bidh, params.scale_softmax, 
-                params.alibi_start, params.alibi_ratio
+                alibi_slope
             );
         }
         
@@ -1389,6 +1402,19 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
 
     clear(acc_dq);
 
+    float alibi_slope = 0.0f;
+    if (Is_alibi) {
+        Tensor gAS = make_tensor(
+        make_gmem_ptr(
+            reinterpret_cast<ElementAccum *>(params.alibi_slopes_ptr) 
+            + bidb * params.alibi_slopes_batch_stride + bidh
+        ),
+        Shape<_1>{});
+        Tensor rAS = make_fragment_like(gAS);
+        cute::copy(gAS, rAS);
+        alibi_slope = rAS(0);
+    }
+
     for (; n_block >= 0; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M_SdP, MMA_N)
         clear(acc_s);
@@ -1410,7 +1436,7 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
                 binfo.actual_seqlen_q, 
                 AtomLayoutMS * 16,
                 bidh, params.scale_softmax, 
-                params.alibi_start, params.alibi_ratio
+                alibi_slope
             );
         }
 
