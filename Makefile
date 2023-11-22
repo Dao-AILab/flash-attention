@@ -1,4 +1,7 @@
 
+clean:
+	rm -rf build/ dist/ *.egg-info/ *.so
+
 clean_dist:
 	rm -rf dist/*
 
