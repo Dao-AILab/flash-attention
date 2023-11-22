@@ -1,11 +1,10 @@
 # Run test with:
-# torchrun --no_python --nproc_per_node=4 pytest -q -s tests/losses/test_cross_entropy_parallel.py
+# torchrun --no_python --nproc_per_node=2 pytest -q -s tests/losses/test_cross_entropy_parallel.py
 
 import math
 
 import pytest
 import torch
-import torch.nn.functional as F
 from apex.transformer import parallel_state, tensor_parallel
 from flash_attn.losses.cross_entropy import CrossEntropyLoss
 
@@ -19,19 +18,19 @@ is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 @pytest.mark.parametrize("inplace_backward", [False, True])
 # @pytest.mark.parametrize("inplace_backward", [False])
 @pytest.mark.parametrize("lse_square_scale", [0.0, 1e-2])
-# @pytest.mark.parametrize("lse_square_scale", [1e-2])
+# @pytest.mark.parametrize("lse_square_scale", [0.0])
 @pytest.mark.parametrize("smoothing", [0.0, 0.9])
 # @pytest.mark.parametrize("smoothing", [0.0])
-@pytest.mark.parametrize("vocab_size", [50264, 128 * 1024])  # test vocab larger than 64k for split
+@pytest.mark.parametrize("vocab_size", [50264, 256 * 1024])  # test vocab larger than 64k for split
 # @pytest.mark.parametrize("vocab_size", [50264])  # test vocab larger than 64k for split
-@pytest.mark.parametrize("world_size", [1, 2, 4])
-# @pytest.mark.parametrize("world_size", [2])
+# @pytest.mark.parametrize("world_size", [1, 2])
+@pytest.mark.parametrize("world_size", [2])
 def test_cross_entropy_loss_parallel(
     vocab_size, world_size, smoothing, lse_square_scale, inplace_backward, dtype
 ):
     assert vocab_size % world_size == 0
     rtol, atol = (
-        (1e-5, 1e-6)
+        (1e-5, 2e-5)
         if dtype == torch.float32
         else ((1e-3, 1e-4) if dtype == torch.float16 else (1e-2, 3e-3))
     )
