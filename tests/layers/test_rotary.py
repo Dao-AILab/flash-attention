@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from flash_attn.layers.rotary import RotaryEmbedding, apply_rotary_emb_func, apply_rotary_emb_qkv_
+from flash_attn.bert_padding import unpad_input, pad_input
 
 
 # NeoX-style rotary embedding
@@ -160,3 +161,109 @@ def test_rotary_gptj_interleaved(rotary_emb_fraction, seqlen_offset):
     assert torch.allclose(k_pt.grad, qkv.grad[:, :, 1, :, :rotary_dim], rtol=rtol, atol=atol)
     assert torch.equal(qkv.grad[:, :, 0:2, :, rotary_dim:], g_og[:, :, 0:2, :, rotary_dim:])
     assert torch.equal(qkv.grad[:, :, 2], g_og[:, :, 2])
+
+
+@pytest.mark.parametrize("max_seqlen_offset", [0, 10, 811])
+# @pytest.mark.parametrize("max_seqlen_offset", [0])
+@pytest.mark.parametrize("max_seqlen_qkv", [10, 128, 204])
+# @pytest.mark.parametrize("max_seqlen_qkv", [10])
+@pytest.mark.parametrize("rotary_emb_fraction", [0.5, 1.0])
+# @pytest.mark.parametrize("rotary_emb_fraction", [1.0])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
+# @pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("nheads", [16, 32])
+# @pytest.mark.parametrize("nheads", [16])
+def test_rotary_varlen(
+    rotary_emb_fraction,
+    max_seqlen_qkv,
+    max_seqlen_offset,
+    mha_type,
+    nheads,
+):
+    device = "cuda"
+    dtype = torch.float16
+    rtol, atol = (1e-3, 5e-3)
+    # set seed
+    torch.random.manual_seed(0)
+    batch_size = 8
+    headdim = 128
+    rotary_dim = int(headdim * rotary_emb_fraction)
+    if max_seqlen_offset > 0:
+        seqlen_offset = torch.randint(
+            0, max_seqlen_offset, (batch_size,), device=device, dtype=torch.long
+        )
+    else:
+        seqlen_offset = torch.zeros(batch_size, device=device, dtype=torch.long)
+    seqlens_q = torch.randint(0, max_seqlen_qkv, (batch_size,), device=device, dtype=torch.long)
+    attention_mask = torch.arange(max_seqlen_qkv, device=device, dtype=torch.long).unsqueeze(
+        0
+    ) < seqlens_q.unsqueeze(1)
+    if mha_type == "mha":
+        qkv = torch.randn(
+            batch_size,
+            max_seqlen_qkv,
+            3,
+            nheads,
+            headdim,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        q, kv = qkv[:, :, 0], qkv[:, :, 1:]
+    elif mha_type == "mqa":
+        qkv = torch.randn(
+            batch_size,
+            max_seqlen_qkv,
+            nheads + 2,
+            headdim,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        q, kv = qkv[:, :, :nheads], qkv[:, :, nheads:].unsqueeze(-2)
+    else:
+        qkv = torch.randn(
+            batch_size,
+            max_seqlen_qkv,
+            nheads + 8,
+            headdim,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        q, kv = qkv[:, :, :nheads], qkv[:, :, nheads:]
+        kv = kv.view(batch_size, max_seqlen_qkv, 2, 4, headdim)
+    q_unpad, indices_q, cu_seqlens_q, max_seqlen_q = unpad_input(q, attention_mask)
+    kv_unpad, *_ = unpad_input(kv, attention_mask)
+    kv_unpad_original = kv_unpad.clone().detach()
+    q_unpad = q_unpad.clone().detach().requires_grad_()
+    kv_unpad = kv_unpad.clone().detach().requires_grad_()
+    rotary = RotaryEmbedding(rotary_dim, device=device)
+    qout1_unpad, kvout1_unpad = rotary(
+        q_unpad,
+        kv_unpad,
+        seqlen_offset=seqlen_offset,
+        cu_seqlens=cu_seqlens_q,
+        max_seqlen=max_seqlen_q,
+    )
+    q2, kv2 = q.clone().detach().requires_grad_(), kv.clone().detach().requires_grad_()
+    qout2, kvout2 = rotary(q2, kv2, seqlen_offset=seqlen_offset)
+    qout2_unpad = unpad_input(qout2, attention_mask)[0]
+    kvout2_unpad = unpad_input(kvout2, attention_mask)[0]
+    assert torch.allclose(qout1_unpad, qout2_unpad)
+    assert torch.allclose(kvout1_unpad, kvout2_unpad)
+    assert torch.allclose(kvout2_unpad[:, 1], kv_unpad_original[:, 1])
+
+    g = torch.randn_like(qout1_unpad)
+    gg = g.clone().detach()
+    qout1_unpad.backward(g)
+    qout2_unpad.backward(gg)
+    g2 = unpad_input(q2.grad, attention_mask)[0]
+    assert torch.allclose(g2, q_unpad.grad)
+
+    g = torch.randn_like(kvout1_unpad)
+    gg = g.clone().detach()
+    kvout1_unpad.backward(g)
+    kvout2_unpad.backward(gg)
+    g2 = unpad_input(kv2.grad, attention_mask)[0]
+    assert torch.allclose(g2, kv_unpad.grad)
