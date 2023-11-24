@@ -7,18 +7,28 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from flash_attn.layers.rotary import RotaryEmbedding, apply_rotary_emb_func, apply_rotary_emb_qkv_
-from transformers.models.gpt_neox.modeling_gpt_neox import RotaryEmbedding as RotaryEmbeddingNeoX
-from transformers.models.gpt_neox.modeling_gpt_neox import (
-    apply_rotary_pos_emb as apply_rotary_pos_emb_neox,
-)
-from transformers.models.gptj.modeling_gptj import apply_rotary_pos_emb as apply_rotary_pos_emb_gptj
-from transformers.models.gptj.modeling_gptj import fixed_pos_embedding
 
 
 # NeoX-style rotary embedding
-@pytest.mark.parametrize("seqlen_offset", [0, 711])
-@pytest.mark.parametrize("rotary_emb_fraction", [0.5, 1.0])
-def test_rotary(rotary_emb_fraction, seqlen_offset):
+@pytest.mark.parametrize("seqlen_offset", [0, 128, 711, 2047])
+@pytest.mark.parametrize("rotary_emb_fraction", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("rotary_type", ["gpt-neox", "llama"])
+def test_rotary_neox(rotary_emb_fraction, seqlen_offset, rotary_type):
+    if rotary_type == "gpt-neox":
+        from transformers.models.gpt_neox.modeling_gpt_neox import (
+            GPTNeoXRotaryEmbedding as RotaryEmbeddingHF,
+        )
+        from transformers.models.gpt_neox.modeling_gpt_neox import (
+            apply_rotary_pos_emb as apply_rotary_pos_emb_hf,
+        )
+    elif rotary_type == "llama":
+        from transformers.models.llama.modeling_llama import (
+            LlamaRotaryEmbedding as RotaryEmbeddingHF,
+        )
+        from transformers.models.llama.modeling_llama import (
+            apply_rotary_pos_emb as apply_rotary_pos_emb_hf,
+        )
+
     device = "cuda"
     dtype = torch.float16
     rtol, atol = (1e-3, 5e-3)
@@ -27,6 +37,7 @@ def test_rotary(rotary_emb_fraction, seqlen_offset):
     batch_size = 8
     seqlen_total = 2048
     seqlen = seqlen_total - seqlen_offset
+    position_ids = torch.arange(seqlen_offset, seqlen_total, device=device, dtype=torch.long)
     nheads = 16
     headdim = 128
     rotary_dim = int(headdim * rotary_emb_fraction)
@@ -35,7 +46,7 @@ def test_rotary(rotary_emb_fraction, seqlen_offset):
     )
     qkv_og = qkv.clone().detach()  # Our implementation modifies qkv inplace
     rotary = RotaryEmbedding(rotary_dim, device=device)
-    rotary_neox = RotaryEmbeddingNeoX(rotary_dim, seqlen_total, device=device)
+    rotary_neox = RotaryEmbeddingHF(rotary_dim, seqlen_total, device=device)
     # Doesn't matter what tensor we pass in, rotary_neox only uses the device of the tensor
     cos_neox, sin_neox = rotary_neox(qkv, seq_len=seqlen_total)
     cos_neox, sin_neox = cos_neox.to(dtype=dtype), sin_neox.to(dtype=dtype)
@@ -51,7 +62,9 @@ def test_rotary(rotary_emb_fraction, seqlen_offset):
         .clone()
         .requires_grad_(True)
     )
-    q_neox, k_neox = apply_rotary_pos_emb_neox(q_pt, k_pt, cos_neox, sin_neox, offset=seqlen_offset)
+    q_neox, k_neox = apply_rotary_pos_emb_hf(
+        q_pt, k_pt, cos_neox, sin_neox, position_ids, unsqueeze_dim=0
+    )
     out = rotary(qkv, seqlen_offset=seqlen_offset)
     assert torch.allclose(
         rotary._cos_cached, cos_neox[..., : rotary_dim // 2].to(dtype=dtype), rtol=rtol, atol=atol
@@ -92,7 +105,12 @@ def test_rotary(rotary_emb_fraction, seqlen_offset):
 # GPT-J-style rotary embedding
 @pytest.mark.parametrize("seqlen_offset", [0, 711])
 @pytest.mark.parametrize("rotary_emb_fraction", [0.5, 1.0])
-def test_rotary_interleaved(rotary_emb_fraction, seqlen_offset):
+def test_rotary_gptj_interleaved(rotary_emb_fraction, seqlen_offset):
+    from transformers.models.gptj.modeling_gptj import (
+        apply_rotary_pos_emb as apply_rotary_pos_emb_gptj,
+    )
+    from transformers.models.gptj.modeling_gptj import create_sinusoidal_positions
+
     device = "cuda"
     dtype = torch.float16
     rtol, atol = (1e-3, 5e-3)
@@ -109,15 +127,25 @@ def test_rotary_interleaved(rotary_emb_fraction, seqlen_offset):
     )
     qkv_og = qkv.clone().detach()  # Our implementation modifies qkv inplace
     rotary = RotaryEmbedding(rotary_dim, interleaved=True, device=device)
-    sincos_gptj = fixed_pos_embedding(qkv[..., :rotary_dim], seq_dim=1, seq_len=seqlen_total)
-    sincos_gptj = tuple(x.to(dtype=dtype) for x in sincos_gptj)
+    position_ids = torch.arange(
+        seqlen_offset, seqlen_total, device=device, dtype=torch.long
+    ).unsqueeze(0)
+    embed_positions = (
+        create_sinusoidal_positions(seqlen_total, rotary_dim)
+        .repeat(position_ids.shape[0], 1, 1)
+        .to(device=device, dtype=dtype)
+    )
+    repeated_position_ids = position_ids.unsqueeze(-1).repeat(1, 1, embed_positions.shape[-1])
+    sincos = torch.gather(embed_positions, 1, repeated_position_ids)
+    sin_gptj, cos_gptj = torch.split(sincos, sincos.shape[-1] // 2, dim=-1)
     q_pt = qkv[:, :, 0, :, :rotary_dim].detach().clone().requires_grad_(True)
     k_pt = qkv[:, :, 1, :, :rotary_dim].detach().clone().requires_grad_(True)
-    q_gptj = apply_rotary_pos_emb_gptj(q_pt, sincos_gptj, offset=seqlen_offset)
-    k_gptj = apply_rotary_pos_emb_gptj(k_pt, sincos_gptj, offset=seqlen_offset)
+    q_gptj = apply_rotary_pos_emb_gptj(q_pt, sin_gptj, cos_gptj)
+    k_gptj = apply_rotary_pos_emb_gptj(k_pt, sin_gptj, cos_gptj)
+
     out = rotary(qkv, seqlen_offset=seqlen_offset)
-    assert torch.allclose(rotary._cos_cached, sincos_gptj[1], rtol=rtol, atol=atol)
-    assert torch.allclose(rotary._sin_cached, sincos_gptj[0], rtol=rtol, atol=atol)
+    assert torch.allclose(rotary._cos_cached[seqlen_offset:], cos_gptj, rtol=rtol, atol=atol)
+    assert torch.allclose(rotary._sin_cached[seqlen_offset:], sin_gptj, rtol=rtol, atol=atol)
     assert torch.allclose(q_gptj, out[:, :, 0, :, :rotary_dim], rtol=rtol, atol=atol)
     assert torch.allclose(k_gptj, out[:, :, 1, :, :rotary_dim], rtol=rtol, atol=atol)
     assert torch.equal(out[:, :, 0:2, :, rotary_dim:], qkv_og[:, :, 0:2, :, rotary_dim:])
