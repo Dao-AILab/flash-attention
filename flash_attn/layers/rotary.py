@@ -1,7 +1,7 @@
 # Copyright (c) 2023, Tri Dao.
 
 import math
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Literal
 
 import torch
 from einops import rearrange, repeat
@@ -223,7 +223,6 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
             sin_k = sin if sin_k is None else sin_k
             dq, dk = dqkv[..., 0, :, :], dqkv[..., 1, :, :]
             apply_rotary(
-
                 dq,
                 cos,
                 sin,
@@ -384,20 +383,17 @@ class RotaryEmbedding(torch.nn.Module):
     .. _RoFormer: https://arxiv.org/abs/2104.09864
     .. _repo: https://github.com/ZhuiyiTechnology/roformer
     .. _GPT-NeoX: https://github.com/EleutherAI/gpt-neox
-
-    If scale_base is not None, this implements XPos (Sun et al., https://arxiv.org/abs/2212.10554).
-    A recommended value for scale_base is 512: https://github.com/HazyResearch/flash-attention/issues/96
-    Reference: https://github.com/sunyt32/torchscale/blob/main/torchscale/component/xpos_relative_position.py
     """
 
     def __init__(
         self,
         dim: int,
-        base=10000.0,
-        interleaved=False,
-        scale_base=None,
-        pos_idx_in_fp32=True,
-        device=None,
+        base: float = 10000.0,
+        interleaved: bool = False,
+        scale_factor: float = None,
+        scale_type: Optional[Literal["linear", "dynamic"]] = None,
+        pos_idx_in_fp32: bool = True,
+        device: Optional[torch.device] = None,
     ):
         """
         interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead
@@ -421,13 +417,8 @@ class RotaryEmbedding(torch.nn.Module):
         inv_freq = self._compute_inv_freq(device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.interleaved = interleaved
-        self.scale_base = scale_base
-        scale = (
-            (torch.arange(0, dim, 2, device=device, dtype=torch.float32) + 0.4 * dim) / (1.4 * dim)
-            if scale_base is not None
-            else None
-        )
-        self.register_buffer("scale", scale, persistent=False)
+        self.scale_factor = scale_factor
+        self.scale_type = scale_type
 
         self._seq_len_cached = 0
         self._cos_cached = None
@@ -469,23 +460,35 @@ class RotaryEmbedding(torch.nn.Module):
             else:
                 t = torch.arange(seqlen, device=device, dtype=self.inv_freq.dtype)
                 inv_freq = self.inv_freq
+            if self.scale_factor is not None:
+                if self.scale_type == "linear":
+                    t = t / self.scale_factor
+                elif self.scale_type == "dynamic":
+                    base = self.base * (
+                        (self.scale_factor * seqlen / self._seq_len_cached)
+                        - (self.scale_factor - 1)
+                    ) ** (self.dim / (self.dim - 2))
+                    inv_freq = 1.0 / (
+                        base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
+                    )
+                    self.register_buffer("inv_freq", inv_freq, persistent=False)
+                else:
+                    raise NotImplementedError("Unsupported scale type", self.scale_type)
             # Don't do einsum, it converts fp32 to fp16 under AMP
             # freqs = torch.einsum("i,j->ij", t, self.inv_freq)
             freqs = torch.outer(t, inv_freq)
-            if self.scale is None:
-                self._cos_cached = torch.cos(freqs).to(dtype)
-                self._sin_cached = torch.sin(freqs).to(dtype)
-            else:
-                power = (
-                    torch.arange(seqlen, dtype=self.scale.dtype, device=self.scale.device)
-                    - seqlen // 2
-                ) / self.scale_base
-                scale = self.scale.to(device=power.device) ** rearrange(power, "s -> s 1")
-                # We want the multiplication by scale to happen in fp32
-                self._cos_cached = (torch.cos(freqs) * scale).to(dtype)
-                self._sin_cached = (torch.sin(freqs) * scale).to(dtype)
-                self._cos_k_cached = (torch.cos(freqs) / scale).to(dtype)
-                self._sin_k_cached = (torch.sin(freqs) / scale).to(dtype)
+            self._cos_cached = torch.cos(freqs).to(dtype)
+            self._sin_cached = torch.sin(freqs).to(dtype)
+            # power = (
+            #     torch.arange(seqlen, dtype=self.scale.dtype, device=self.scale.device)
+            #     - seqlen // 2
+            # ) / self.scale_base
+            # scale = self.scale.to(device=power.device) ** rearrange(power, "s -> s 1")
+            # # We want the multiplication by scale to happen in fp32
+            # self._cos_cached = (torch.cos(freqs) * scale).to(dtype)
+            # self._sin_cached = (torch.sin(freqs) * scale).to(dtype)
+            # self._cos_k_cached = (torch.cos(freqs) / scale).to(dtype)
+            # self._sin_k_cached = (torch.sin(freqs) / scale).to(dtype)
 
     def forward(
         self,
@@ -511,28 +514,15 @@ class RotaryEmbedding(torch.nn.Module):
         max_offset = seqlen_offset if isinstance(seqlen_offset, int) else int(max(seqlen_offset))
         self._update_cos_sin_cache(seqlen + max_offset, device=qkv.device, dtype=qkv.dtype)
         if kv is None:
-            if self.scale is None:
-                return apply_rotary_emb_qkv_(
-                    qkv,
-                    self._cos_cached,
-                    self._sin_cached,
-                    interleaved=self.interleaved,
-                    seqlen_offsets=seqlen_offset,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
-                )
-            else:
-                return apply_rotary_emb_qkv_(
-                    qkv,
-                    self._cos_cached,
-                    self._sin_cached,
-                    self._cos_k_cached,
-                    self._sin_k_cached,
-                    interleaved=self.interleaved,
-                    seqlen_offsets=seqlen_offset,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
-                )
+            return apply_rotary_emb_qkv_(
+                qkv,
+                self._cos_cached,
+                self._sin_cached,
+                interleaved=self.interleaved,
+                seqlen_offsets=seqlen_offset,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
         else:
             q = qkv
             q = apply_rotary_emb_func(
@@ -545,24 +535,13 @@ class RotaryEmbedding(torch.nn.Module):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )
-            if self.scale is None:
-                kv = apply_rotary_emb_kv_(
-                    kv,
-                    self._cos_cached,
-                    self._sin_cached,
-                    interleaved=self.interleaved,
-                    seqlen_offsets=seqlen_offset,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
-                )
-            else:
-                kv = apply_rotary_emb_kv_(
-                    kv,
-                    self._cos_k_cached,
-                    self._sin_k_cached,
-                    interleaved=self.interleaved,
-                    seqlen_offsets=seqlen_offset,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
-                )
+            kv = apply_rotary_emb_kv_(
+                kv,
+                self._cos_cached,
+                self._sin_cached,
+                interleaved=self.interleaved,
+                seqlen_offsets=seqlen_offset,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
             return q, kv
