@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 # from flash_attn.utils.benchmark import benchmark_forward, benchmark_backward, benchmark_combined, benchmark_all, benchmark_fwd_bwd, pytorch_profiler
-from src.utils.benchmark import benchmark_forward, benchmark_backward, benchmark_combined, benchmark_all, benchmark_fwd_bwd, pytorch_profiler
+from flash_attn.utils.benchmark import benchmark_forward, benchmark_backward, benchmark_combined, benchmark_all, benchmark_fwd_bwd, pytorch_profiler
 from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
 # # from flash_attn.triton.fused_attention import attention as attention
 # from flash_attn.flash_attn_triton import flash_attn_qkvpacked_func
