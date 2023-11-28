@@ -81,6 +81,9 @@ struct Flash_fwd_params : public Qkv_params {
     // array of length b holding the length of KV cache.
     int * __restrict__ k_cache_seqlens;
 
+    // If provided, the actual length of each k sequence.
+    int * __restrict__ seqused_k;
+
     int *__restrict__ blockmask;
 
     // The K_new and V_new matrices.

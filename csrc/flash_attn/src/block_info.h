@@ -18,7 +18,7 @@ struct BlockInfo {
         , sum_s_knew(!Varlen || params.cu_seqlens_knew == nullptr ? -1 : params.cu_seqlens_knew[bidb])
         , actual_seqlen_q(!Varlen || params.cu_seqlens_q == nullptr ? params.seqlen_q : params.cu_seqlens_q[bidb + 1] - sum_s_q)
         , seqlen_k_cache(!Varlen || (params.cu_seqlens_k == nullptr && params.k_cache_seqlens == nullptr) ? params.seqlen_k : (params.k_cache_seqlens == nullptr ? params.cu_seqlens_k[bidb + 1] - sum_s_k : params.k_cache_seqlens[bidb]))
-        , actual_seqlen_k(seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : (params.cu_seqlens_knew == nullptr? params.seqlen_knew : params.cu_seqlens_knew[bidb + 1] - sum_s_knew)))
+        , actual_seqlen_k(params.seqused_k ? params.seqused_k[bidb] : seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : (params.cu_seqlens_knew == nullptr? params.seqlen_knew : params.cu_seqlens_knew[bidb + 1] - sum_s_knew)))
         {
         }
 

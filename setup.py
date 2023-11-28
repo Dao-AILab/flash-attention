@@ -1,4 +1,5 @@
-# Adapted from https://github.com/NVIDIA/apex/blob/master/setup.py
+# Copyright (c) 2023, Tri Dao.
+
 import sys
 import warnings
 import os
@@ -43,8 +44,6 @@ FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
-# For CI, we want the option to not add "--threads 4" to nvcc, since the runner can OOM
-FORCE_SINGLE_THREAD = os.getenv("FLASH_ATTENTION_FORCE_SINGLE_THREAD", "FALSE") == "TRUE"
 
 
 def get_platform():
@@ -84,9 +83,7 @@ def check_if_cuda_home_none(global_option: str) -> None:
 
 
 def append_nvcc_threads(nvcc_extra_args):
-    if not FORCE_SINGLE_THREAD:
-        return nvcc_extra_args + ["--threads", "4"]
-    return nvcc_extra_args
+    return nvcc_extra_args + ["--threads", "4"]
 
 
 cmdclass = {}
@@ -233,9 +230,9 @@ def get_wheel_url():
     # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
     torch_cuda_version = parse(torch.version.cuda)
     torch_version_raw = parse(torch.__version__)
-    # Workaround for nvcc 12.1 segfaults when compiling with Pytorch 2.1
-    if torch_version_raw.major == 2 and torch_version_raw.minor == 1 and torch_cuda_version.major == 12:
-        torch_cuda_version = parse("12.2")
+    # For CUDA 11, we only compile for CUDA 11.8, and for CUDA 12 we only compile for CUDA 12.2
+    # to save CI time. Minor versions should be compatible.
+    torch_cuda_version = parse("11.8") if torch_cuda_version.major == 11 else parse("12.2")
     python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
     platform_name = get_platform()
     flash_version = get_package_version()
