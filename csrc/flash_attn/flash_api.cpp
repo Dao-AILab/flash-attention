@@ -412,11 +412,11 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         CHECK_DEVICE(alibi_slopes);
         TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
         CHECK_SHAPE(alibi_slopes, batch_size, num_heads);
-        params.is_alibi = true;
+        params.has_alibi = true;
         params.alibi_slopes_ptr = alibi_slopes.data_ptr();
         params.alibi_slopes_batch_stride = alibi_slopes.stride(0);
     } else {
-        params.is_alibi = false;
+        params.has_alibi = false;
     }
 
     if (seqlen_k > 0) {
@@ -599,11 +599,11 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
         CHECK_DEVICE(alibi_slopes);
         TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
         CHECK_SHAPE(alibi_slopes, batch_size, num_heads);
-        params.is_alibi = true;
+        params.has_alibi = true;
         params.alibi_slopes_ptr = alibi_slopes.data_ptr();
         params.alibi_slopes_batch_stride = alibi_slopes.stride(0);
     } else {
-        params.is_alibi = false;
+        params.has_alibi = false;
     }
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -835,11 +835,11 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         CHECK_DEVICE(alibi_slopes);
         TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
         CHECK_SHAPE(alibi_slopes, batch_size, num_heads);
-        params.is_alibi = true;
+        params.has_alibi = true;
         params.alibi_slopes_ptr = alibi_slopes.data_ptr();
         params.alibi_slopes_batch_stride = alibi_slopes.stride(0);
     } else {
-        params.is_alibi = false;
+        params.has_alibi = false;
     }
 
     if (seqlen_q > 0) {
@@ -1081,11 +1081,11 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         CHECK_DEVICE(alibi_slopes);
         TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
         CHECK_SHAPE(alibi_slopes, batch_size, num_heads);
-        params.is_alibi = true;
+        params.has_alibi = true;
         params.alibi_slopes_ptr = alibi_slopes.data_ptr();
         params.alibi_slopes_batch_stride = alibi_slopes.stride(0);
     } else {
-        params.is_alibi = false;
+        params.has_alibi = false;
     }
 
     launch(params, stream, /*configure=*/false);
@@ -1332,11 +1332,11 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         CHECK_DEVICE(alibi_slopes);
         TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
         CHECK_SHAPE(alibi_slopes, batch_size, num_heads);
-        params.is_alibi = true;
+        params.has_alibi = true;
         params.alibi_slopes_ptr = alibi_slopes.data_ptr();
         params.alibi_slopes_batch_stride = alibi_slopes.stride(0);
     } else {
-        params.is_alibi = false;
+        params.has_alibi = false;
     }
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
