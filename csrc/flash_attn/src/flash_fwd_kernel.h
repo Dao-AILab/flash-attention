@@ -346,9 +346,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     // add by JXGuo
-    printf("[compute_attn_1rowblock] before clear2, acc_o(0) = %d, tidx = %d, m_block = %d\n", acc_o(0), tidx, m_block);
+    printf("[compute_attn_1rowblock] before clear2, acc_o(0) = %d, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
     clear(acc_o);
-    printf("[compute_attn_1rowblock] after clear2, acc_o(0) = %d, tidx = %d, m_block = %d\n", acc_o(0), tidx, m_block);
+    printf("[compute_attn_1rowblock] after clear2, acc_o(0) = %d, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
 
     clear(acc_o);
 
@@ -551,9 +551,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     // add by JXGuo
-    printf("[compute_attn_1rowblock] before clear2, acc_o(0) = %d, tidx = %d, m_block = %d\n", acc_o(0), tidx, m_block);
+    printf("[compute_attn_1rowblock] before clear2, acc_o(0) = %d, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
     clear(acc_o);
-    printf("[compute_attn_1rowblock] after clear2, acc_o(0) = %d, tidx = %d, m_block = %d\n", acc_o(0), tidx, m_block);
+    printf("[compute_attn_1rowblock] after clear2, acc_o(0) = %d, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
 
     // Epilogue
 
