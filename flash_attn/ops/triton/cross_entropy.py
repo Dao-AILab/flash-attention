@@ -43,7 +43,7 @@ def cross_entropy_fwd_kernel(
 ):
     row_idx = tl.program_id(0)
     col_block_idx = tl.program_id(1)
-    logits_ptr = logits_ptr + row_idx * logits_row_stride
+    logits_ptr = logits_ptr + row_idx * logits_row_stride.to(tl.int64)
     col_offsets = col_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     label_idx = tl.load(labels_ptr + row_idx)
     logits = tl.load(logits_ptr + col_offsets, mask=col_offsets < n_cols, other=-float("inf")).to(
@@ -107,8 +107,8 @@ def cross_entropy_bwd_kernel(
 ):
     row_idx = tl.program_id(0)
     col_block_idx = tl.program_id(1)
-    logits_ptr = logits_ptr + row_idx * logits_row_stride
-    dlogits_ptr = dlogits_ptr + row_idx * dlogits_row_stride
+    logits_ptr = logits_ptr + row_idx * logits_row_stride.to(tl.int64)
+    dlogits_ptr = dlogits_ptr + row_idx * dlogits_row_stride.to(tl.int64)
     col_offsets = col_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     label_idx = tl.load(labels_ptr + row_idx)
     if label_idx != ignored_index:
@@ -196,6 +196,9 @@ class CrossEntropyLoss(torch.autograd.Function):
             # -0.9 * predicted logit - 0.1 * sum logit / total_classes.
             # For labels not in the vocab of this partition, losses contains
             # -0.1 * sum logit / total_classes.
+            if n_splits > 1:
+                lse = torch.logsumexp(lse, dim=0)
+                losses = losses.sum(dim=0)
             if world_size > 1:
                 lse_allgather = torch.empty(world_size, n_rows, dtype=lse.dtype, device=lse.device)
                 torch.distributed.all_gather_into_tensor(lse_allgather, lse, group=process_group)
@@ -204,9 +207,6 @@ class CrossEntropyLoss(torch.autograd.Function):
                 )
                 lse = torch.logsumexp(lse_allgather, dim=0)
                 handle_losses.wait()
-            else:
-                lse = torch.logsumexp(lse, dim=0)
-                losses = losses.sum(dim=0)
             # After the allreduce, if there's no smoothing, the total losses are - predicted_logit,
             # we just have to add the (global) lse.
             # If there's smoothing=0.1, the total losses are
