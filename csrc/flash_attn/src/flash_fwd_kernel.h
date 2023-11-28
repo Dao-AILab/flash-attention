@@ -104,7 +104,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
 
     // add by JXGuo
-    if (tidx == 0) {printf("[compute_attn_1rowblock] tidx = 0, Is_causal =  ");}
+    // if (tidx == 0) {printf("[compute_attn_1rowblock] tidx = 0, Is_causal =  ");}
 
 
     if (Is_causal || Is_local) { // add by JXGuo: blocksparse is not supported for causal
@@ -345,6 +345,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         params.rng_state[1] = std::get<1>(seeds);
     }
 
+    // add by JXGuo
+    printf("[compute_attn_1rowblock] before clear2, acc_o(0) = %d, tidx = %d, m_block = %d\n", acc_o(0), tidx, m_block);
+    clear(acc_o);
+    printf("[compute_attn_1rowblock] after clear2, acc_o(0) = %d, tidx = %d, m_block = %d\n", acc_o(0), tidx, m_block);
+
     clear(acc_o);
 
     // For performance reason, we separate out two kinds of iterations:
@@ -478,10 +483,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // add by JXGuo
         printf("[compute_attn_1rowblock] in loop, mask_val = %d, m_block = %d\n", mask_val, m_block);
         
-        // printf("mask_val = %d\n", mask_val);
-        if (mask_val == -1) continue;
+        if (mask_val == -1) break;
         
-        // printf("[compute_attn_1rowblock] in loop, escape, mask_val = %d\n", mask_val);
+        printf("[compute_attn_1rowblock] in loop, escape, mask_val = %d\n", mask_val);
 
 
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -545,6 +549,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V); 
         // add by JXGuo: 此处进行了 P V^T 的矩阵乘法，算出的是 
     }
+
+    // add by JXGuo
+    printf("[compute_attn_1rowblock] before clear2, acc_o(0) = %d, tidx = %d, m_block = %d\n", acc_o(0), tidx, m_block);
+    clear(acc_o);
+    printf("[compute_attn_1rowblock] after clear2, acc_o(0) = %d, tidx = %d, m_block = %d\n", acc_o(0), tidx, m_block);
 
     // Epilogue
 
@@ -1186,7 +1195,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params) {
     // add by JXGuo
-    // printf("[compute_attn] blockIdx.x = %d, blockIdx.y = %d, blockIdx.z = %d\n", blockIdx.x, blockIdx.y, blockIdx.z);
+    printf("[compute_attn] blockIdx.x = %d, blockIdx.y = %d, blockIdx.z = %d\n", blockIdx.x, blockIdx.y, blockIdx.z);
     const int m_block = blockIdx.x;
     // The block index for the batch.
     const int bidb = blockIdx.y;
