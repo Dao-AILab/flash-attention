@@ -12,7 +12,11 @@
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Return_softmax>
 __global__ void flash_fwd_kernel(Flash_fwd_params params) {
+    // add by JXGuo
+    // printf("[flash_fwd_kernel] start\n");
     static_assert(!(Is_causal && Is_local));  // If Is_local is true, Is_causal should be false
+    // // add by JXGuo
+    // printf("[flash_fwd_kernel] launch compute_attn\n");
     flash::compute_attn<Kernel_traits, Is_dropout, Is_causal, Is_local, Is_even_MN, Is_even_K, Return_softmax>(params);
 }
 
@@ -29,30 +33,60 @@ __global__ void flash_fwd_splitkv_combine_kernel(Flash_fwd_params params) {
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+    // add by JXGuo
+    printf("[run_flash_fwd] start\n");
+
+    // add by JXGuo
+    printf("[run_flash_fwd] checkpoint-1 \n");
+    
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
     // printf("smem_size = %d\n", smem_size);
+
+    // add by JXGuo
+    printf("[run_flash_fwd] checkpoint0 \n");
+
+
 
     // Work-around for gcc 7. It doesn't like nested BOOL_SWITCH.
     // https://github.com/kokkos/kokkos-kernels/issues/349
     // https://github.com/HazyResearch/flash-attention/issues/21
 
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+
+    // add by JXGuo
+    printf("[run_flash_fwd] num_m_block = %d, params.seqlen_q = %d, kBlockM = %d \n", num_m_block, params.seqlen_q, Kernel_traits::kBlockM);
+
     dim3 grid(num_m_block, params.b, params.h);
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
     const bool return_softmax = params.p_ptr != nullptr;
+
+    // // add by JXGuo
+    // printf("[run_flash_fwd] checkpoint1 \n");
+
     BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
+        // // add by JXGuo
+        // printf("[run_flash_fwd] checkpoint2 \n");
+
         BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
-            BOOL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !Is_causal, Is_local, [&] {
+            // // add by JXGuo
+            // printf("[run_flash_fwd] checkpoint3 \n");
+
+            BOOL_SWITCH(params.window_size_left >= 0 || params.window_size_right >= 0, Is_local, [&] {
+                // // add by JXGuo
+                // printf("[run_flash_fwd] checkpoint4 \n");
+
                 BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
                     // Will only return softmax if dropout, to reduce compilation time.
                     // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
                     // If return_softmax, set IsEvenMNConst to false to reduce number of templates
                     // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
                     // If Is_local, set Is_causal to false
-                    auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local && !Is_causal, IsEvenMNConst && IsEvenKConst && !Is_local && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, ReturnSoftmaxConst && Is_dropout>;
-                    // printf("IsEvenMNConst = %d, IsEvenKConst = %d, Is_local = %d, Is_causal = %d, ReturnSoftmaxConst = %d, Is_dropout = %d\n", int(IsEvenMNConst), int(IsEvenKConst), int(Is_local), int(Is_causal), int(ReturnSoftmaxConst), int(Is_dropout));
-                    // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, true, true, false>;
+
+                    // add by JXGuo
+                    printf("[run_flash_fwd] launch flash_fwd_kernel\n");
+
+                    auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal && !Is_local, Is_local, IsEvenMNConst && IsEvenKConst && !Is_local && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, ReturnSoftmaxConst && Is_dropout>;
                     if (smem_size >= 48 * 1024) {
                         C10_CUDA_CHECK(cudaFuncSetAttribute(
                             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -81,13 +115,13 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
             BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
-                BOOL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !Is_causal, Is_local, [&] {
+                BOOL_SWITCH(params.window_size_left >= 0 || params.window_size_right >= 0, Is_local, [&] {
                     BOOL_SWITCH(params.num_splits > 1, Split, [&] {
                         BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV, [&] {
                             // If Append_KV, then we must have seqlen_offsets, which means cu_seqlens_k != nullptr.
                             // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
                             // If Is_local, set Is_causal to false
-                            auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, Is_local && !Is_causal, IsEvenMNConst && !Append_KV && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Split, Append_KV>;
+                            auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal && !Is_local, Is_local, IsEvenMNConst && !Append_KV && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Split, Append_KV>;
                             // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, true, Split, Append_KV>;
                             // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, IsEvenKConst>;
                             if (smem_size >= 48 * 1024) {
@@ -141,6 +175,8 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream)
 
 template<typename T>
 void run_mha_fwd_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
+    // add by JXGuo
+    printf("[run_mha_fwd_hdim32] start\n");
     constexpr static int Headdim = 32;
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -339,6 +375,42 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
             // 96 KB
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        });
+    });
+}
+
+
+// add by JXGuo
+template<typename T>
+void run_mha_fwd_block_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
+    // add by JXGuo
+    printf("[run_mha_fwd_block_hdim32] start\n");
+    constexpr static int Headdim = 32;
+    BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        });
+    });
+}
+
+template<typename T>
+void run_mha_fwd_block_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 64;
+    BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+            if constexpr(!Is_dropout) {
+                // Using 8 warps is 18% slower for seqlen=2k, 2 warps is 5% slower
+                // Using block size (64 x 256) is 27% slower for seqlen=2k
+                // Using block size (256 x 64) is 85% slower for seqlen=2k, because of register spilling
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
+            } else {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
+                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            }
         });
     });
 }

@@ -224,7 +224,7 @@ inline __device__ void apply_dropout(Tensor<Engine, Layout> &tensor, uint8_t p_d
     auto encode_dropout = [](bool keep, T val) {
         return keep ? val : (encode_dropout_in_sign_bit ? -val : T(0));
     };
-    static_assert(decltype(size<2>(tensor))::value % 2 == 0);
+    static_assert(decltype(size<2>(tensor))::value % 2 == 0); // add by JXGuo: 用于检查tensor的第二个维度大小是否为偶数
     const uint16_t p_dropout_8bit_in_uint16_t = uint16_t(p_dropout_in_uint8_t);
     const uint32_t p_dropout_8bit_in_uint32_t = (uint32_t(p_dropout_8bit_in_uint16_t) << 16) | uint32_t(p_dropout_8bit_in_uint16_t);
     // if (cute::thread0()) { printf("threshold2 = 0x%x\n", p_dropout_8bit_in_uint32_t); }

@@ -1,9 +1,9 @@
 # Adapted from https://github.com/mlcommons/training_results_v1.1/blob/main/NVIDIA/benchmarks/bert/implementations/pytorch/fmha.py
-import flash_attn_cuda
+import flash_attn_2_cuda
 import torch
 import torch.nn as nn
 
-
+# modified by JXGuo
 def convert_blockmask(blockmask, causal):
     """Convert from the 0-1 format to the format used by the CUDA code.
     0 means the block is skipped.
@@ -22,7 +22,10 @@ def convert_blockmask(blockmask, causal):
     nrow, ncol = blockmask.shape
     # Sort does not support bool on CUDA
     blockmask = blockmask.to(dtype=torch.uint8)
-    nonzero_val, nonzero_sorted_rowidx = blockmask.sort(dim=0, stable=True, descending=True)
+    nonzero_val, nonzero_sorted_rowidx = blockmask.sort(dim=0, stable=True, ascending=True)
+    print("nonzero_val: ", nonzero_val)
+    print("nonzero_sorted_rowidx: ", nonzero_sorted_rowidx)
+    
     nonzero_unsorted_rowidx = nonzero_sorted_rowidx.argsort(dim=0)
     last_nonzero_col_per_row = blockmask.sort(dim=-1, stable=True).indices[:, -1]
     last_nonzero_col_per_row_after_sort = nonzero_unsorted_rowidx[
@@ -33,16 +36,48 @@ def convert_blockmask(blockmask, causal):
         torch.arange(nrow, device=blockmask.device), first_nonzero_col_per_row
     ]
     nonzero_idx = nonzero_sorted_rowidx * 4
-    nonzero_idx[last_nonzero_col_per_row_after_sort, last_nonzero_col_per_row] += 2
-    nonzero_idx[first_nonzero_col_per_row_after_sort, first_nonzero_col_per_row] += 1
+    nonzero_idx[last_nonzero_col_per_row_after_sort, last_nonzero_col_per_row] += 1
+    nonzero_idx[first_nonzero_col_per_row_after_sort, first_nonzero_col_per_row] += 2
     nonzero_idx[nonzero_val == 0] = -1
+    return nonzero_idx.T.contiguous().to(dtype=torch.int32)
+
+
+def convert_blockmask_reverse(blockmask, causal):
+    assert not causal
+    # TD [2022-05-13]: The indexing and sorting is very tricky
+    nrow, ncol = blockmask.shape
+    # Sort does not support bool on CUDA
+    blockmask = blockmask.to(dtype=torch.uint8)
+    nonzero_val, nonzero_sorted_rowidx = blockmask.sort(dim=0, stable=True, descending=False)
+    # print("nonzero_val: ", nonzero_val)
+    # print("nonzero_sorted_rowidx: ", nonzero_sorted_rowidx)
+    
+    nonzero_unsorted_rowidx = nonzero_sorted_rowidx.argsort(dim=0)
+    last_nonzero_col_per_row = blockmask.sort(dim=-1, stable=True).indices[:, -1]
+    last_nonzero_col_per_row_after_sort = nonzero_unsorted_rowidx[
+        torch.arange(nrow, device=blockmask.device), last_nonzero_col_per_row
+    ]
+    first_nonzero_col_per_row = blockmask.sort(dim=-1, stable=True, descending=True).indices[:, 0]
+    first_nonzero_col_per_row_after_sort = nonzero_unsorted_rowidx[
+        torch.arange(nrow, device=blockmask.device), first_nonzero_col_per_row
+    ]
+    nonzero_idx = nonzero_sorted_rowidx * 4
+    nonzero_idx[last_nonzero_col_per_row_after_sort, last_nonzero_col_per_row] += 1
+    nonzero_idx[first_nonzero_col_per_row_after_sort, first_nonzero_col_per_row] += 2
+    nonzero_idx[nonzero_val == 0] = -1
+    
+    # print ("nonzero_idx: ", nonzero_idx)
+    
+    nonzero_idx = torch.flip(nonzero_idx, dims=[0])
+    # print("nonzero_idx: ", nonzero_idx)
+    
     return nonzero_idx.T.contiguous().to(dtype=torch.int32)
 
 
 def _flash_blocksparse_attn_forward(
     qkv, cu_seqlens, blockmask, dropout_p, max_s, softmax_scale, causal, return_softmax
 ):
-    context, softmax_lse, *rest = flash_attn_cuda.fwd_block(
+    context, softmax_lse, *rest = flash_attn_2_cuda.fwd_block(
         qkv, cu_seqlens, blockmask, dropout_p, max_s, softmax_scale, causal, return_softmax, None
     )
     # if context.isnan().any() or softmax_lse.isnan().any():
@@ -64,23 +99,24 @@ def _flash_blocksparse_attn_backward(
     softmax_scale,
     causal,
 ):
-    dqkv, dp, softmax_d = flash_attn_cuda.bwd_block(
-        dout,
-        qkv,
-        out,
-        S_dmask,
-        softmax_lse,
-        cu_seqlens,
-        blockmask,
-        dropout_p,
-        softmax_scale,
-        max_s,
-        causal,
-        None,
-    )
-    # if dqkv.isnan().any() or softmax_d.isnan().any():
-    #     breakpoint()
-    return dqkv
+    # dqkv, dp, softmax_d = flash_attn_2_cuda.bwd_block(
+    #     dout,
+    #     qkv,
+    #     out,
+    #     S_dmask,
+    #     softmax_lse,
+    #     cu_seqlens,
+    #     blockmask,
+    #     dropout_p,
+    #     softmax_scale,
+    #     max_s,
+    #     causal,
+    #     None,
+    # )
+    # # if dqkv.isnan().any() or softmax_d.isnan().any():
+    # #     breakpoint()
+    # return dqkv
+    return None
 
 
 class FlashBlocksparseAttnFun(torch.autograd.Function):

@@ -182,6 +182,11 @@ if not SKIP_CUDA_BUILD:
                 "csrc/flash_attn/src/flash_fwd_split_hdim224_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_sm80.cu",
+                # add by JXGuo
+                "csrc/flash_attn/src/flash_fwd_block_hdim32_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_block_hdim32_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_block_hdim64_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_block_hdim64_bf16_sm80.cu",
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"] + generator_flag,

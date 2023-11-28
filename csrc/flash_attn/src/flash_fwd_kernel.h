@@ -15,6 +15,9 @@
 #include "utils.h"
 #include "softmax.h"
 
+// add by JXGuo
+#include "flash_blockmask.h"
+
 namespace flash {
 
 using namespace cute;
@@ -72,7 +75,7 @@ inline __device__ void write_softmax_to_gmem(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
-inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
+inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) { // bidb: blockidx.y, bidh: blockidx.z
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -93,9 +96,18 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
+
+    
+
+
     const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
-    if (Is_causal || Is_local) {
+
+    // add by JXGuo
+    if (tidx == 0) {printf("[compute_attn_1rowblock] tidx = 0, Is_causal =  ");}
+
+
+    if (Is_causal || Is_local) { // add by JXGuo: blocksparse is not supported for causal
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
         // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
@@ -117,7 +129,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
         Tensor gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.o_ptr) + row_offset_o),
                                 Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                                make_stride(params.o_row_stride, _1{}));
+                                make_stride(params.o_row_stride, _1{})); 
+                                // add by JXGuo: create a tensor in global memory; params.o_row_stride 指定了张量的行步长，
         Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
                                   Shape<Int<kBlockM>>{}, Stride<_1>{});
 
@@ -162,6 +175,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
         + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
 
+    // add by JXGuo: allocate memory in global memory
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
                             make_stride(params.q_row_stride, _1{}));
@@ -185,8 +199,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor sVtNoSwizzle = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
+    /*
+    用于从全局内存（Global Memory）中复制数据到共享内存（Shared Memory）的缓冲区
+    */
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
+    /*
+    这里创建了一个名为gmem_thr_copy_QKV的局部变量，它是gmem_tiled_copy_QKV对象的一个线程切片，用于在GPU线程之间分配对全局内存的访问
+    */
     typename Kernel_traits::GmemTiledCopyP gmem_tiled_copy_P;
+    /*
+    用于从全局内存中复制数据到共享内存的缓冲区，通常用于存储P（Positional Encoding）相关的数据
+    */
     auto gmem_thr_copy_P = gmem_tiled_copy_P.get_thread_slice(tidx);
 
     Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
@@ -222,6 +245,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
     Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+
+    // add by JXGuo: 没有完全看懂 todo
 
     // TODO: this might need to change if we change the mma instruction in SM70
     Tensor scores_max = make_tensor<ElementAccum>(Shape<Int<2 * size<1>(acc_o)>>{});
@@ -292,7 +317,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         __syncthreads();
     }
 
-    int n_block = n_block_max - 1;
+    // add by JXGuo: checkpoint
+
+    int n_block = n_block_max - 1; // add by JXGuo: n_block_max is the number of blocks in the row
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
@@ -331,6 +358,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     constexpr int n_masking_steps = (!Is_causal && !Is_local)
         ? 1
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
+
+    // add by JXGuo: blocksparse is not supported for causal, so will not enter this loop
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -437,8 +466,24 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
     }
 
+    
+
+    // add by JXGuo: this is the loop
+    Blockmask blockmask(params, m_block);
+    // int block_row_idx = 0;
+    int mask_val = -1;// for test
+
     // These are the iterations where we don't need masking on S
     for (; n_block >= n_block_min; --n_block) {
+        // add by JXGuo
+        printf("[compute_attn_1rowblock] in loop, mask_val = %d, m_block = %d\n", mask_val, m_block);
+        
+        // printf("mask_val = %d\n", mask_val);
+        if (mask_val == -1) continue;
+        
+        // printf("[compute_attn_1rowblock] in loop, escape, mask_val = %d\n", mask_val);
+
+
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
         flash::cp_async_wait<0>();
@@ -1133,6 +1178,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params) {
+    // add by JXGuo
+    // printf("[compute_attn] blockIdx.x = %d, blockIdx.y = %d, blockIdx.z = %d\n", blockIdx.x, blockIdx.y, blockIdx.z);
     const int m_block = blockIdx.x;
     // The block index for the batch.
     const int bidb = blockIdx.y;
