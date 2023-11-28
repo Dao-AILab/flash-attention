@@ -1,3 +1,5 @@
+# Copyright (c) 2023, Tri Dao.
+
 from typing import Optional, Union
 
 import torch
