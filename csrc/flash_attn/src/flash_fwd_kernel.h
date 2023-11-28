@@ -26,7 +26,7 @@ using namespace cute;
 
 template<bool Is_first, bool Check_inf=false, typename Tensor0, typename Tensor1, typename Tensor2>
 inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, Tensor1 &scores_sum,
-                                         Tensor2 &acc_o, float softmax_scale_log2) {
+                                         Tensor2 &acc_o, float softmax_scale_log2) { // add by JXGuo: 该函数用于合并论文中的 rowsum，rowmax，scores 即为论文中的 S
     if (Is_first) {
         flash::template reduce_max</*zero_init=*/true>(scores, scores_max);
         flash::scale_apply_exp2(scores, scores_max, softmax_scale_log2);
@@ -249,8 +249,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // add by JXGuo: 没有完全看懂 todo
 
     // TODO: this might need to change if we change the mma instruction in SM70
-    Tensor scores_max = make_tensor<ElementAccum>(Shape<Int<2 * size<1>(acc_o)>>{});
-    Tensor scores_sum = make_fragment_like(scores_max);
+    Tensor scores_max = make_tensor<ElementAccum>(Shape<Int<2 * size<1>(acc_o)>>{}); // add by JXGuo: 为什么要 2* ？目前猜测是原论文中的 m^{(1)} 和 m^{(2)}
+    Tensor scores_sum = make_fragment_like(scores_max); // add by JXGuo: 目前猜测是原论文中的 l^{(1)} 和 l^{(2)}
 
     //
     // PREDICATES
@@ -362,7 +362,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // add by JXGuo: blocksparse is not supported for causal, so will not enter this loop
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
-        Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+        Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N) // add by JXGuo: 猜测是 softmax 中间值
         clear(acc_s);
         flash::cp_async_wait<0>();
         __syncthreads();
@@ -496,11 +496,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
-        );
+        ); // add by JXGuo: 此处进行了 Q K^T 的矩阵乘法
 
         flash::cp_async_wait<0>();
         __syncthreads();
-        if (n_block > n_block_min) {
+        if (n_block > n_block_min) { // add by JXGuo: 并不理解 ，todo
             // Advance gK
             tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
@@ -542,22 +542,29 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                                  block_row_idx, block_col_idx, kNWarps);
         }
 
-        flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V); 
+        // add by JXGuo: 此处进行了 P V^T 的矩阵乘法，算出的是 
     }
 
     // Epilogue
 
     // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
     Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
-    Tensor lse = make_fragment_like(scores_sum);
+    Tensor lse = make_fragment_like(scores_sum);  // add by JXGuo: lse 指 Log Sum Exp，是 softmax 的中间值
     #pragma unroll
     for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
         float sum = scores_sum(mi);
         float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
-        lse(mi) = (sum == 0.f || sum != sum) ? INFINITY : scores_max(mi) * params.scale_softmax + __logf(sum);
+        /* add by JXGuo
+        首先，条件 (sum == 0.f || sum != sum) 在判断 sum 是否等于0或者是否为NaN（Not a Number）。
+        如果条件成立（即sum等于0或为NaN），则表达式的结果为1.0。
+        如果条件不成立（即sum不等于0且不是NaN），则表达式的结果为1.0除以sum的值。
+        inv_sum 即为行 exp sum 的倒数
+        */
+        lse(mi) = (sum == 0.f || sum != sum) ? INFINITY : scores_max(mi) * params.scale_softmax + __logf(sum); // add by JXGuo: 此处对应论文中计算 L_i，用于输出 logsumexp L
         float scale = !Is_dropout ? inv_sum : inv_sum * params.rp_dropout;
         #pragma unroll
-        for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scale; }
+        for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scale; } // add by JXGuo: 对应论文中计算 O_i
     }
 
     // if (cute::thread0()) { print(acc_o_rowcol); }
@@ -581,7 +588,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
     Tensor gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.o_ptr) + row_offset_o),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                            make_stride(params.o_row_stride, _1{}));
+                            make_stride(params.o_row_stride, _1{})); // add by JXGuo: gO 即为 O_i 写到 global memory 中的空间
     Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
                               Shape<Int<kBlockM>>{}, Stride<_1>{});
 
