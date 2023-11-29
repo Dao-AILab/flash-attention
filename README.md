@@ -211,19 +211,21 @@ To run the tests:
 pytest -q -s tests/test_flash_attn.py
 ```
 
-## AMD GPU/ROCm Support
-
-To install (requiring ROCm, and MI210 or MI250 GPU):
-### 1. You can compile from source
-#### i. Launch a ROCm PyTorch docker (recommended): E.g. 
+# AMD GPU/ROCm Support
+## Prerequisite
+- ROCm 5.4+
+- PyTorch 1.12.1+
+- MI200 & MI300 GPUs
+## Method 1: Build from Source
+### i. Launch a ROCm PyTorch docker (recommended): E.g. 
 ```bash
 docker run -it --device /dev/dri --device /dev/kfd --network host --ipc host --privileged --cap-add SYS_PTRACE --group-add video --security-opt seccomp=unconfined rocm/pytorch:rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1
 ```
-#### ii. Clone the repo with submodules
+### ii. Clone the repo with submodules
 ```bash
 git clone --recursive https://github.com/ROCmSoftwarePlatform/flash-attention.git
 ```
-#### iii. (optional): Build for the desired GPU architecture(s) by setting the enviroment variable (semicolon seperated). We currently only support the following options. If you do not specify, defaultly it will build for your native device architecture:
+### iii. (optional): Build for the desired GPU architecture(s) by setting the enviroment variable (semicolon seperated). We currently only support the following options. If you do not specify, defaultly it will build for your native device architecture:
 To manually target for MI200 series:
 ```bash
 export GPU_ARCHS="gfx90a"
@@ -232,7 +234,7 @@ To manually target for MI300 series:
 ```bash
 export GPU_ARCHS="gfx940;gfx941;gfx942"
 ```
-#### iii. Build from source
+### iii. Build from source
 ```bash
 $ cd flash-attention
 $ export PYTHON_SITE_PACKAGES=$(python -c 'import site; print(site.getsitepackages()[0])')
@@ -240,12 +242,12 @@ $ patch "${PYTHON_SITE_PACKAGES}/torch/utils/hipify/hipify_python.py" hipify_pat
 $ pip install .
 ```
 
-### 2. You can also use the Dockerfile to build the Flash-Attention in one shot:
-#### Build and Run the Container with Flash-Attention
+## Method 2: Use the Docker building script to build the Flash-Attention in one shot:
+### Build and Run the Container with Flash-Attention
 ```bash
 bash ./build_and_run.sh
 ```
-#### Optional Arguments:
+### Optional Arguments:
 By default, the **rocm/pytorch:latest** image will be the base image, but you can override this with any valid tags from DockerHub. For example:
 ```bash
 tag="rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1"
@@ -267,7 +269,7 @@ Additionally, you can build the Flash-Attention in unit test mode by setting"
 unit-test=true
 ```
 
-#### Example Command:
+### Example Command:
 The following command will build the Flash-Attention in non-unit-test mode for MI200s and MI300X with the base docker rocm/pytorch:rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1 with max-jobs=128 for ninja:
 ```bash
 bash ./build_and_run.sh tag="rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1" gpu-archs="gfx90a;gfx941" max-jobs=128
@@ -321,8 +323,8 @@ Flash2 fwd: 61.03 TFLOPs/s, bwd: 51.99 TFLOPs/s, fwd + bwd: 54.29 TFLOPs/s
 Pytorch fwd: 11.48 TFLOPs/s, bwd: 27.39 TFLOPs/s, fwd + bwd: 19.62 TFLOPs/s
 ```
 
-### Unit Test Mode
-#### How to build
+## Unit Test Mode
+### How to build
 
 For passing unit tests compile flash-attention from source which may take a while:
 ```bash
@@ -346,7 +348,7 @@ Unit tests results(MI250, deterministic on, unit test mode on, RTN):
 ```
 
 FlashAttention currently supports:
-1. MI200 GPUs (MI210, MI250).
+1. MI200 & MI300 GPUs (MI210, MI250, MI300A, MI300X).
 2. fp16 and bf16.
 3. Head dimensions up to 128 (e.g., 32, 40, 59, ..., 128).
 
