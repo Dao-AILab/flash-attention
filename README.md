@@ -234,7 +234,7 @@ To manually target for MI300 series:
 ```bash
 export GPU_ARCHS="gfx940;gfx941;gfx942"
 ```
-### iii. Build from source
+### iv. Build from source
 ```bash
 $ cd flash-attention
 $ export PYTHON_SITE_PACKAGES=$(python -c 'import site; print(site.getsitepackages()[0])')
