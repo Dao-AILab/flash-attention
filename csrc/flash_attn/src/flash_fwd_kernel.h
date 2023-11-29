@@ -98,8 +98,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 
     
-
-
     const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
 
@@ -346,9 +344,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     // add by JXGuo
-    printf("[compute_attn_1rowblock] before clear1, acc_o(0) = %d, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
+    printf("[compute_attn_1rowblock] before clear1, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
     clear(acc_o);
-    printf("[compute_attn_1rowblock] after clear1, acc_o(0) = %d, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
+    printf("[compute_attn_1rowblock] after clear1, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
 
     clear(acc_o);
 
@@ -365,113 +363,114 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
 
     // add by JXGuo: blocksparse is not supported for causal, so will not enter this loop
-    // #pragma unroll
-    // for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
-    //     Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N) // add by JXGuo: 猜测是 softmax 中间值
-    //     clear(acc_s);
-    //     flash::cp_async_wait<0>();
-    //     __syncthreads();
+    #pragma unroll
+    for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
+        Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N) // add by JXGuo: 猜测是 softmax 中间值
+        clear(acc_s);
+        flash::cp_async_wait<0>();
+        __syncthreads();
 
-    //     // Advance gV
-    //     if (masking_step > 0) {
-    //         tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
-    //         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
-    //     } else {
-    //         // Clear the smem tiles to account for predicated off loads
-    //         flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
-    //             gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
-    //         );
-    //     }
-    //     cute::cp_async_fence();
+        // Advance gV
+        if (masking_step > 0) {
+            tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+            flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+        } else {
+            // Clear the smem tiles to account for predicated off loads
+            flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+                gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
+            );
+        }
+        cute::cp_async_fence();
 
-    //     flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
-    //         acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
-    //         smem_thr_copy_Q, smem_thr_copy_K
-    //     );
-    //     // if (cute::thread0()) { print(acc_s); }
+        flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+            smem_thr_copy_Q, smem_thr_copy_K
+        );
+        // if (cute::thread0()) { print(acc_s); }
 
-    //     // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
-    //     Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
-    //     // if (cute::thread0()) { print_tensor(scores); }
-    //     // We don't put the masking before the matmul S = Q K^T because we don't clear sK
-    //     // for rows outside actual_seqlen_k. So those rows could have Inf / NaN, and the matmul
-    //     // can produce Inf / NaN.
-    //     if (!Is_causal && !Is_local) {
-    //         if (!Is_even_MN) { flash::apply_mask(scores, binfo.actual_seqlen_k - n_block * kBlockN); }
-    //     } else {
-    //         // Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});    // (BLK_M,BLK_N) -> (blk_m,blk_n)
-    //         // Tensor taccScS = thr_mma.partition_C(caccS);                           // (MMA,MMA_M,MMA_N)
-    //         // static_assert(decltype(size<0>(taccScS))::value == 4);
-    //         // // Convert to ((2, 2), MMA_M, MMA_N) then take only the row indices.
-    //         // Tensor idx_row = logical_divide(taccScS, Shape<_2>{})(make_coord(0, _), _, 0);
-    //         // Tensor idx_rowcol = make_tensor(taccScS.data(), flash::convert_layout_acc_rowcol(taccScS.layout()));
-    //         // flash::apply_mask_causal_w_idx(scores, idx_rowcol, n_block * kBlockN, binfo.actual_seqlen_k,
-    //         //                               m_block * kBlockM);
-    //         // Idk why it's get<1> and not get<0> of the stride.
-    //         // if (cute::thread0()) { print(idx_row.layout()); print(stride<1>(idx_row)); printf("stride = %d \n", get<1>(stride<1>(idx_row))); }
-    //         // I can't get the stride from idx_row
-    //         flash::apply_mask_local</*HasWSLeft=*/Is_local>(
-    //             scores, n_block * kBlockN, binfo.actual_seqlen_k,
-    //             // m_block * kBlockM + get<0>(idx_row(0)),
-    //             m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-    //             binfo.actual_seqlen_q, kNWarps * 16,
-    //             params.window_size_left, params.window_size_right
-    //             // m_block * kBlockM + (tidx / 32) * 16, kNWarps * 16
-    //             // m_block * kBlockM + (tidx / 32) * (kBlockM / kNWarps), 16
-    //         );
-    //         // if (cute::thread0()) { print_tensor(scores); }
-    //     }
+        // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
+        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        // if (cute::thread0()) { print_tensor(scores); }
+        // We don't put the masking before the matmul S = Q K^T because we don't clear sK
+        // for rows outside actual_seqlen_k. So those rows could have Inf / NaN, and the matmul
+        // can produce Inf / NaN.
+        if (!Is_causal && !Is_local) {
+            if (!Is_even_MN) { flash::apply_mask(scores, binfo.actual_seqlen_k - n_block * kBlockN); }
+        } else {
+            // Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});    // (BLK_M,BLK_N) -> (blk_m,blk_n)
+            // Tensor taccScS = thr_mma.partition_C(caccS);                           // (MMA,MMA_M,MMA_N)
+            // static_assert(decltype(size<0>(taccScS))::value == 4);
+            // // Convert to ((2, 2), MMA_M, MMA_N) then take only the row indices.
+            // Tensor idx_row = logical_divide(taccScS, Shape<_2>{})(make_coord(0, _), _, 0);
+            // Tensor idx_rowcol = make_tensor(taccScS.data(), flash::convert_layout_acc_rowcol(taccScS.layout()));
+            // flash::apply_mask_causal_w_idx(scores, idx_rowcol, n_block * kBlockN, binfo.actual_seqlen_k,
+            //                               m_block * kBlockM);
+            // Idk why it's get<1> and not get<0> of the stride.
+            // if (cute::thread0()) { print(idx_row.layout()); print(stride<1>(idx_row)); printf("stride = %d \n", get<1>(stride<1>(idx_row))); }
+            // I can't get the stride from idx_row
+            flash::apply_mask_local</*HasWSLeft=*/Is_local>(
+                scores, n_block * kBlockN, binfo.actual_seqlen_k,
+                // m_block * kBlockM + get<0>(idx_row(0)),
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q, kNWarps * 16,
+                params.window_size_left, params.window_size_right
+                // m_block * kBlockM + (tidx / 32) * 16, kNWarps * 16
+                // m_block * kBlockM + (tidx / 32) * (kBlockM / kNWarps), 16
+            );
+            // if (cute::thread0()) { print_tensor(scores); }
+        }
 
-    //     flash::cp_async_wait<0>();
-    //     __syncthreads();
-    //     if (n_block > n_block_min) {
-    //         // Advance gK
-    //         tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
-    //         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
-    //         // This cp_async_fence needs to be in the if block, otherwise the synchronization
-    //         // isn't right and we get race conditions.
-    //         cute::cp_async_fence();
-    //     }
+        flash::cp_async_wait<0>();
+        __syncthreads();
+        if (n_block > n_block_min) {
+            // Advance gK
+            tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+            // This cp_async_fence needs to be in the if block, otherwise the synchronization
+            // isn't right and we get race conditions.
+            cute::cp_async_fence();
+        }
 
-    //     // TODO: when we have key_padding_mask we'll need to Check_inf
-    //     masking_step == 0
-    //         ? softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2)
-    //         : softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
+        // TODO: when we have key_padding_mask we'll need to Check_inf
+        masking_step == 0
+            ? softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2)
+            : softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
 
-    //     // Convert scores from fp32 to fp16/bf16
-    //     Tensor rP = flash::convert_type<Element>(scores);
-    //     // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
-    //     // if using m16n8k16 or ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
-    //     Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-    //     int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
-    //     int block_col_idx = n_block * (kBlockN / 32);
-    //     if (Return_softmax) {
-    //         Tensor tOrP_copy = make_fragment_like(tOrP);
-    //         cute::copy(tOrP, tOrP_copy);
-    //         flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-    //             tOrP_copy, params.p_dropout_in_uint8_t, seed, offset,
-    //             block_row_idx, block_col_idx, kNWarps
-    //         );
-    //         flash::write_softmax_to_gmem(tOrP_copy, tPgP, gmem_tiled_copy_P);
-    //         tPgP.data() = tPgP.data() + (-kBlockN);
-    //     }
-    //     if (Is_dropout) {
-    //         flash::apply_dropout(tOrP, params.p_dropout_in_uint8_t, seed, offset,
-    //                              block_row_idx, block_col_idx, kNWarps);
-    //     }
-    //     // if (cute::thread0()) { print(tOrP); }
+        // Convert scores from fp32 to fp16/bf16
+        Tensor rP = flash::convert_type<Element>(scores);
+        // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
+        // if using m16n8k16 or ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
+        Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMma>(rP.layout()));
+        int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
+        int block_col_idx = n_block * (kBlockN / 32);
+        if (Return_softmax) {
+            Tensor tOrP_copy = make_fragment_like(tOrP);
+            cute::copy(tOrP, tOrP_copy);
+            flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                tOrP_copy, params.p_dropout_in_uint8_t, seed, offset,
+                block_row_idx, block_col_idx, kNWarps
+            );
+            flash::write_softmax_to_gmem(tOrP_copy, tPgP, gmem_tiled_copy_P);
+            tPgP.data() = tPgP.data() + (-kBlockN);
+        }
+        if (Is_dropout) {
+            flash::apply_dropout(tOrP, params.p_dropout_in_uint8_t, seed, offset,
+                                 block_row_idx, block_col_idx, kNWarps);
+        }
+        // if (cute::thread0()) { print(tOrP); }
 
-    //     flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
-    //     // if (cute::thread0()) { print(scores); }
+        flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        // if (cute::thread0()) { print(scores); }
 
-    //     // This check is at the end of the loop since we always have at least 1 iteration
-    //     if (n_masking_steps > 1 && n_block <= n_block_min) {
-    //         --n_block;
-    //         break;
-    //     }
-    // }
+        // This check is at the end of the loop since we always have at least 1 iteration
+        if (n_masking_steps > 1 && n_block <= n_block_min) {
+            --n_block;
+            break;
+        }
+    }
 
-    
+    // add by JXGuo
+    printf("[compute_attn_1rowblock] after loop, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
 
     // add by JXGuo: this is the loop
     Blockmask blockmask(params, m_block);
@@ -551,9 +550,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     // add by JXGuo
-    printf("[compute_attn_1rowblock] before clear2, acc_o(0) = %d, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
-    clear(acc_o);
-    printf("[compute_attn_1rowblock] after clear2, acc_o(0) = %d, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
+    printf("[compute_attn_1rowblock] before clear2, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
+    // clear(acc_o);
+    printf("[compute_attn_1rowblock] after clear2, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
 
     // Epilogue
 
