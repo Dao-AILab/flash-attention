@@ -244,6 +244,7 @@ $ pip install .
 
 ## Method 2: Use the Docker building script to build the Flash-Attention in one shot:
 ### Build and Run the Container with Flash-Attention
+This command will build Flash-Attention based on rocm/pytorch:latest for the AMD GPUs detected on your machine. 
 ```bash
 bash ./build_and_run.sh
 ```
@@ -269,7 +270,7 @@ Additionally, you can build the Flash-Attention in unit test mode by setting:
 unit-test=true
 ```
 
-### Example Command:
+### Example Command with specified configs:
 The following command will build the Flash-Attention in non-unit-test mode for MI200s and MI300X with the base docker rocm/pytorch:rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1 with max-jobs=128 for ninja:
 ```bash
 bash ./build_and_run.sh tag="rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1" gpu-archs="gfx90a;gfx941" max-jobs=128
