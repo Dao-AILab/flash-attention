@@ -264,7 +264,7 @@ If you encountered RAM issues, you can lower the MAX_JOBS environment for ninja 
 ```bash
 max-jobs=4
 ```
-Additionally, you can build the Flash-Attention in unit test mode by setting"
+Additionally, you can build the Flash-Attention in unit test mode by setting:
 ```bash
 unit-test=true
 ```
