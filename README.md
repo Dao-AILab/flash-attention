@@ -215,13 +215,24 @@ pytest -q -s tests/test_flash_attn.py
 
 To install (requiring ROCm, and MI210 or MI250 GPU):
 ### 1. You can compile from source
-#### i. Launch docker rocm/pytorch:rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1
-#### ii. Clone the repo
-#### iv. (optional): Build for the desired GPU architecture(s) by setting the enviroment variable (comma seperated). We currently only support the following options. If you do not specify, defaultly it will build for your native device architecture:
+#### i. Launch a ROCm PyTorch docker (recommended): E.g. 
 ```bash
-export GPU_ARCHS="gfx90a,gfx940,gfx941,gfx942"
+docker run -it --device /dev/dri --device /dev/kfd --network host --ipc host --privileged --cap-add SYS_PTRACE --group-add video --security-opt seccomp=unconfined rocm/pytorch:rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1
 ```
-#### iv. Build from source
+#### ii. Clone the repo with submodules
+```bash
+git clone --recursive https://github.com/ROCmSoftwarePlatform/flash-attention.git
+```
+#### iii. (optional): Build for the desired GPU architecture(s) by setting the enviroment variable (semicolon seperated). We currently only support the following options. If you do not specify, defaultly it will build for your native device architecture:
+To manually target for MI200 series:
+```bash
+export GPU_ARCHS="gfx90a"
+```
+To manually target for MI300 series:
+```bash
+export GPU_ARCHS="gfx940;gfx941;gfx942"
+```
+#### iii. Build from source
 ```bash
 $ cd flash-attention
 $ export PYTHON_SITE_PACKAGES=$(python -c 'import site; print(site.getsitepackages()[0])')
