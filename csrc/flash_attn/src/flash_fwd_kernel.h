@@ -581,7 +581,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_blocked_KV, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
 
     using Element = typename Kernel_traits::Element;
@@ -668,11 +668,12 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
         + m_block * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
     // We move K and V to the last block.
+    const int *block_table = Is_blocked_KV ? params.block_table + bidb * params.block_table_batch_stride : nullptr;
     const int bidb_cache = params.cache_batch_idx == nullptr ? bidb : params.cache_batch_idx[bidb];
-    const index_t row_offset_k = binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
-        + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
-    const index_t row_offset_v = binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache)
-        + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
+    const index_t row_offset_k = Is_blocked_KV ? static_cast<int64_t>(block_table[n_block_max - 1]) * params.k_batch_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
+        : binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache) + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
+    const index_t row_offset_v = Is_blocked_KV ? static_cast<int64_t>(block_table[n_block_max - 1]) * params.v_batch_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride
+        : binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache) + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
 
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -814,7 +815,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             flash::copy_w_min_idx<Is_even_K>(
                 tVgVnew, tVgV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN, binfo.seqlen_k_cache - n_block * kBlockN
             );
-            tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+            if (Is_blocked_KV) {
+                if (n_block > n_block_copy_min) { tVgV.data() = tVgV.data() + static_cast<int64_t>(block_table[n_block - 1] - block_table[n_block]) * params.v_batch_stride; }
+            } else {
+                tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+            }
             tVgVnew.data() = tVgVnew.data() + (-int(kBlockN * params.vnew_row_stride));
             if (params.rotary_dim == 0) {
                 flash::copy_w_min_idx<Is_even_K>(
@@ -840,14 +845,23 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
                 }
             }
-            tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            if (Is_blocked_KV) {
+                if (n_block > n_block_copy_min) { tKgK.data() = tKgK.data() + static_cast<int64_t>(block_table[n_block - 1] - block_table[n_block]) * params.k_batch_stride; }
+            } else {
+                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            }
             tKgKnew.data() = tKgKnew.data() + (-int(kBlockN * params.knew_row_stride));
         }
         // Need this before we can read in K again, so that we'll see the updated K values.
         __syncthreads();
         if (n_block_max > n_block_copy_min) {
-            tKgK.data() = tKgK.data() + (n_block_max - n_block_copy_min) * kBlockN * params.k_row_stride;
-            tVgV.data() = tVgV.data() + (n_block_max - n_block_copy_min) * kBlockN * params.v_row_stride;
+            if (Is_blocked_KV) {
+                tKgK.data() = tKgK.data() + static_cast<int64_t>(block_table[n_block_max - 1] - block_table[n_block_copy_min]) * params.k_batch_stride;
+                tVgV.data() = tVgV.data() + static_cast<int64_t>(block_table[n_block_max - 1] - block_table[n_block_copy_min]) * params.v_batch_stride;
+            } else {
+                tKgK.data() = tKgK.data() + (n_block_max - n_block_copy_min) * kBlockN * params.k_row_stride;
+                tVgV.data() = tVgV.data() + (n_block_max - n_block_copy_min) * kBlockN * params.v_row_stride;
+            }
         }
     }
 
@@ -923,7 +937,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // Advance gV
         if (masking_step > 0) {
-            tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+            if (Is_blocked_KV) {
+                tVgV.data() = tVgV.data() + static_cast<int64_t>(block_table[n_block] - block_table[n_block + 1]) * params.v_batch_stride;
+            } else {
+                tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+            }
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
         } else {
             // Clear the smem tiles to account for predicated off loads
@@ -962,7 +980,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         if (n_block > n_block_min) {
             // Advance gK
-            tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            if (Is_blocked_KV) {
+                tKgK.data() = tKgK.data() + static_cast<int64_t>(block_table[n_block - 1] - block_table[n_block]) * params.k_batch_stride;
+            } else {
+                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            }
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
@@ -998,7 +1020,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         flash::cp_async_wait<0>();
         __syncthreads();
         // Advance gV
-        tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+        if (Is_blocked_KV) {
+            tVgV.data() = tVgV.data() + static_cast<int64_t>(block_table[n_block] - block_table[n_block + 1]) * params.v_batch_stride;
+        } else {
+            tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+        }
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
         cute::cp_async_fence();
 
@@ -1011,7 +1037,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         __syncthreads();
         if (n_block > n_block_min) {
             // Advance gK
-            tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            if (Is_blocked_KV) {
+                tKgK.data() = tKgK.data() + static_cast<int64_t>(block_table[n_block - 1] - block_table[n_block]) * params.k_batch_stride;
+            } else {
+                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            }
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
@@ -1152,7 +1182,7 @@ inline __device__ void compute_attn(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_blocked_KV, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_splitkv(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1161,7 +1191,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
-    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Is_even_MN, Is_even_K, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_blocked_KV, Is_causal, Is_local, Is_even_MN, Is_even_K, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

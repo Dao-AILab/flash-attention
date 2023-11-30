@@ -98,6 +98,11 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ rotary_cos_ptr;
     void * __restrict__ rotary_sin_ptr;
 
+    // The block table.
+    int *__restrict__ block_table;
+    int block_size;
+    index_t block_table_batch_stride;
+
     // The indices to index into the KV cache.
     int *__restrict__ cache_batch_idx;
 
