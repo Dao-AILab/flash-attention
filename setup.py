@@ -189,10 +189,10 @@ if not SKIP_CUDA_BUILD:
                 "csrc/flash_attn/src/flash_fwd_block_hdim64_bf16_sm80.cu",
             ],
             extra_compile_args={
-                "cxx": ["-O0", "-std=c++17"] + generator_flag,
+                "cxx": ["-O3", "-std=c++17"] + generator_flag,
                 "nvcc": append_nvcc_threads(
                     [
-                        "-O0",
+                        "-O3",
                         "-std=c++17",
                         "-U__CUDA_NO_HALF_OPERATORS__",
                         "-U__CUDA_NO_HALF_CONVERSIONS__",

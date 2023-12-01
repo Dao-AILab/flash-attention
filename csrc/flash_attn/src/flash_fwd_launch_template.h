@@ -56,9 +56,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // add by JXGuo
     printf("[run_flash_fwd] num_m_block = %d, params.seqlen_q = %d, kBlockM = %d \n", num_m_block, params.seqlen_q, Kernel_traits::kBlockM);
 
-    dim3 grid(num_m_block, params.b, params.h);
-    const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
-    const bool is_even_K = params.d == Kernel_traits::kHeadDim;
+    dim3 grid(num_m_block, params.b, params.h);// add by JXGuo: params.b is batch_size, params.h is num_heads, num_m_block is the number of block rows
+    const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0; // add by JXGuo: the block size fit the seq length properly
+    const bool is_even_K = params.d == Kernel_traits::kHeadDim; // add by JXGuo: params.d is the head dim, Kernel_traits::kHeadDim is the head dim of the kernel
     const bool return_softmax = params.p_ptr != nullptr;
 
     // // add by JXGuo
@@ -388,6 +388,7 @@ void run_mha_fwd_block_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 32;
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+            printf("[run_mha_fwd_block_hdim32] is_causal = %d\n", (int)Is_causal);
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
         });
     });

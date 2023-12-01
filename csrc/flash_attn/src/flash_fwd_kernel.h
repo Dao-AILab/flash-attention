@@ -96,13 +96,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
-
+    // add by JXGuo: is_local = true 表示使用 Sliding window attention
     
-    const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
-    int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
-
-    // add by JXGuo
-    // if (tidx == 0) {printf("[compute_attn_1rowblock] tidx = 0, Is_causal =  ");}
+    const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN); // add by JXGuo: 推到放在了笔记里，见附录1
+    int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);  // add by JXGuo: 向上取整
 
 
     if (Is_causal || Is_local) { // add by JXGuo: blocksparse is not supported for causal
@@ -112,11 +109,26 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         //     printf("m_block = %d, n_block_max = %d\n", m_block, n_block_max);
         // }
     }
+
+    // add by JXGuo: add blocksparse support
+    const bool Is_blocksparse = params.blockmask == nullptr ? false : true;
+    printf("[compute_attn_1rowblock] Is_blocksparse = %d\n", (int)Is_blocksparse);
+    Blockmask blockmask(params, m_block);
+    int mask_val_step = 0;
+    int mask_val = blockmask.mask_val(mask_val_step);
+    int block_row_index = n_block_max - 1;
+    if(mask_val == -1){ //add by JXGuo: 此处处理全为-1的情况，即不需要计算的情况
+        n_block_max = n_block_min;
+    }
+
     // We exit early and write 0 to gO and gLSE. This also covers the case where actual_seqlen_k == 0.
     // Otherwise we might read OOB elements from gK and gV.
-    if ((Is_causal || Is_local || !Is_even_MN) && n_block_max <= n_block_min) {
+    if ((Is_causal || Is_local || !Is_even_MN || Is_blocksparse) && n_block_max <= n_block_min) {
         // Save seed and offset for backward. If we don't have this here, the 0-th thread block might
         // exit early and no one saves the rng state.
+
+        // add by JXGuo: in exit branch
+        printf("[compute_attn_1rowblock] in exit branch\n");
         if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
             auto seeds = at::cuda::philox::unpack(params.philox_args);
             params.rng_state[0] = std::get<0>(seeds);
@@ -165,7 +177,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
         + m_block * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
-    // We move K and V to the last block.
+    // We move K and V to the last block. // add by JXGuo: 此处留出了最后一个 block 的空间
     const index_t row_offset_k = binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)
         + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
     const index_t row_offset_v = binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)
@@ -348,7 +360,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     clear(acc_o);
     printf("[compute_attn_1rowblock] after clear1, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
 
-    clear(acc_o);
+    
+
+    int block_row_idx_next = mask_val / 4;
+    bool last_block_skip = false;
+    if block_row_idx_next < n_block{
+        last_block_skip = true;
+        n_block = block_row_idx_next;
+    }
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
@@ -362,9 +381,15 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         ? 1
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
 
-    // add by JXGuo: blocksparse is not supported for causal, so will not enter this loop
+    
+
+
+
+    // add by JXGuo
+    printf("[compute_attn_1rowblock] before loop, n_masking_steps = %d\n", n_masking_steps);
+
     #pragma unroll
-    for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
+    for (int masking_step = last_block_skip ? n_masking_steps : 0; masking_step < n_masking_steps; ++masking_step, --n_block) { // add by JXGuo: 此循环在处理最后一到两个 block，因为最后的一到两个block可能是补出来的
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N) // add by JXGuo: 猜测是 softmax 中间值
         clear(acc_s);
         flash::cp_async_wait<0>();
@@ -385,7 +410,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
-        );
+        ); // add by JXGuo: 计算 S = Q K^T
         // if (cute::thread0()) { print(acc_s); }
 
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
@@ -473,18 +498,21 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     printf("[compute_attn_1rowblock] after loop, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
 
     // add by JXGuo: this is the loop
-    Blockmask blockmask(params, m_block);
+    // Blockmask blockmask(params, m_block);
     // int block_row_idx = 0;
-    int mask_val = -1;// for test
+    // int mask_val = -1;// for test
+
+    // add by JXGuo: add blocksparse support
+    bool is_last_block = 
 
     // These are the iterations where we don't need masking on S
     for (; n_block >= n_block_min; --n_block) {
         // add by JXGuo
-        printf("[compute_attn_1rowblock] in loop, mask_val = %d, m_block = %d\n", mask_val, m_block);
+        // printf("[compute_attn_1rowblock] in loop, mask_val = %d, m_block = %d\n", mask_val, m_block);
         
-        if (mask_val == -1) break;
+        // if (mask_val == -1) break;
         
-        printf("[compute_attn_1rowblock] in loop, escape, mask_val = %d\n", mask_val);
+        // printf("[compute_attn_1rowblock] in loop, escape, mask_val = %d\n", mask_val);
 
 
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
