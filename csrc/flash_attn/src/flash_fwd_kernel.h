@@ -101,8 +101,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN); // add by JXGuo: 推到放在了笔记里，见附录1
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);  // add by JXGuo: 向上取整
 
+    printf("[compute_attn_1rowblock] n_block_min = %d, n_block_max = %d, actual_seqlen_k = %d, kBlockN = %d\n", n_block_min, n_block_max, binfo.actual_seqlen_k, kBlockN);
 
     if (Is_causal || Is_local) { // add by JXGuo: blocksparse is not supported for causal
+        printf("[compute_attn_1rowblock] in branch, n_block_min = %d, n_block_max = %d\n", n_block_min, n_block_max);
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
         // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
@@ -110,14 +112,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // }
     }
 
+    printf("[compute_attn_1rowblock] n_block_min = %d, n_block_max = %d\n", n_block_min, n_block_max);
+
     // add by JXGuo: add blocksparse support
-    const bool Is_blocksparse = params.blockmask == nullptr ? false : true;
-    printf("[compute_attn_1rowblock] Is_blocksparse = %d\n", (int)Is_blocksparse);
     Blockmask blockmask(params, m_block);
-    int mask_val_step = 0;
-    int mask_val = blockmask.mask_val(mask_val_step);
-    int block_row_index = n_block_max - 1;
-    if(mask_val == -1){ //add by JXGuo: 此处处理全为-1的情况，即不需要计算的情况
+    bool Is_blocksparse = blockmask.Is_blocksparse;
+    // Is_blocparse = false; // add by JXGuo: for test
+    printf("[compute_attn_1rowblock] Is_blocksparse = %d\n", (int)Is_blocksparse);
+    if(Is_blocksparse && blockmask.mask_val(0) == -1){ //add by JXGuo: 此处处理全为-1的情况，即不需要计算的情况
         n_block_max = n_block_min;
     }
 
@@ -330,6 +332,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // add by JXGuo: checkpoint
 
     int n_block = n_block_max - 1; // add by JXGuo: n_block_max is the number of blocks in the row
+    printf("[compute_attn_1rowblock] n_block = %d, n_block_max = %d, n_block_min = %d\n", n_block, n_block_max, n_block_min);
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
@@ -356,18 +359,31 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     // add by JXGuo
-    printf("[compute_attn_1rowblock] before clear1, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
+    // printf("[compute_attn_1rowblock] before clear1, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
     clear(acc_o);
-    printf("[compute_attn_1rowblock] after clear1, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
+    // printf("[compute_attn_1rowblock] after clear1, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
 
     
 
-    int block_row_idx_next = mask_val / 4;
+    int mask_block_idx = 0;
+    int mask_val = blockmask.mask_val(mask_block_idx);
+    int block_col_idx = n_block;
+    int next_block_col_idx = mask_val / 4;
+    bool is_last_block = false;
     bool last_block_skip = false;
-    if block_row_idx_next < n_block{
+    if (Is_blocksparse){
+        if (next_block_col_idx < n_block){// add by JXGuo: 最后一个块不用算
         last_block_skip = true;
-        n_block = block_row_idx_next;
+        is_last_block = false;
+        }else { // add by JXGuo: 最后一个块需要算
+            is_last_block = mask_val & 0x2; // 用于处理最后一个block就是blockmask的最后一个块的情况
+            mask_block_idx++;
+            mask_val = blockmask.mask_val(mask_block_idx);
+            next_block_col_idx = mask_val / 4;
+        }
     }
+    
+    printf("[compute_attn_1rowblock] before processing last block, is_last_block = %d, last_block_skip = %d, mask_block_idx = %d, mask_val = %d, next_block_col_idx = %d, n_block = %d\n", (int)is_last_block, (int)last_block_skip, mask_block_idx, mask_val, next_block_col_idx, n_block);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
@@ -381,12 +397,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         ? 1
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
 
-    
-
-
 
     // add by JXGuo
-    printf("[compute_attn_1rowblock] before loop, n_masking_steps = %d\n", n_masking_steps);
+    printf("[compute_attn_1rowblock] before loop, n_masking_steps = %d, n_block = %d\n", n_masking_steps, n_block);
 
     #pragma unroll
     for (int masking_step = last_block_skip ? n_masking_steps : 0; masking_step < n_masking_steps; ++masking_step, --n_block) { // add by JXGuo: 此循环在处理最后一到两个 block，因为最后的一到两个block可能是补出来的
@@ -495,7 +508,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     // add by JXGuo
-    printf("[compute_attn_1rowblock] after loop, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
+    // printf("[compute_attn_1rowblock] after loop, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
 
     // add by JXGuo: this is the loop
     // Blockmask blockmask(params, m_block);
@@ -503,84 +516,165 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // int mask_val = -1;// for test
 
     // add by JXGuo: add blocksparse support
-    bool is_last_block = 
-
-    // These are the iterations where we don't need masking on S
-    for (; n_block >= n_block_min; --n_block) {
-        // add by JXGuo
-        // printf("[compute_attn_1rowblock] in loop, mask_val = %d, m_block = %d\n", mask_val, m_block);
-        
-        // if (mask_val == -1) break;
-        
-        // printf("[compute_attn_1rowblock] in loop, escape, mask_val = %d\n", mask_val);
-
-
-        Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
-        clear(acc_s);
-        flash::cp_async_wait<0>();
-        __syncthreads();
-        // Advance gV
-        tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
-        flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
-        cute::cp_async_fence();
-
-        flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
-            smem_thr_copy_Q, smem_thr_copy_K
-        ); // add by JXGuo: 此处进行了 Q K^T 的矩阵乘法
-
-        flash::cp_async_wait<0>();
-        __syncthreads();
-        if (n_block > n_block_min) { // add by JXGuo: 并不理解 ，todo
-            // Advance gK
-            tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
-            flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
-            // isn't right and we get race conditions.
+    if (Is_blocksparse) {
+        for (n_block = next_block_col_idx; n_block >= n_block_min && !is_last_block; n_block = next_block_col_idx){
+            printf("[compute_attn_1rowblock] Is_blocksparse = true, in loop, mask_val = %d, n_block = %d, is_last_block = %d, tidx = %d, m_block = %d\n", mask_val, n_block, (int)is_last_block, tidx, m_block);
+            // is_last_block = mask_val & 0x2;
+            if (!is_last_block){
+                mask_block_idx++;
+                if(mask_block_idx > n_block_max - 1 || blockmask.mask_val(mask_block_idx) == -1){
+                    is_last_block = true;
+                }else{
+                    mask_val = blockmask.mask_val(mask_block_idx);
+                    next_block_col_idx = mask_val / 4;
+                }
+            }
+            
+            
+            // the following code is the same as below
+            Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+            clear(acc_s);
+            flash::cp_async_wait<0>();
+            __syncthreads();
+            // Advance gV
+            tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+            flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
             cute::cp_async_fence();
-        }
 
-        // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
-        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
-        if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
-            flash::apply_mask_local(
-                scores, n_block * kBlockN, binfo.actual_seqlen_k,
-                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-                binfo.actual_seqlen_q, kNWarps * 16,
-                params.window_size_left, params.window_size_right
-            );
-        }
-        softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
+            flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K
+            ); // add by JXGuo: 此处进行了 Q K^T 的矩阵乘法
 
-        Tensor rP = flash::convert_type<Element>(scores);
-        // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
-        // if using m16n8k16 or ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
-        Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-        int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
-        int block_col_idx = n_block * (kBlockN / 32);
-        if (Return_softmax) {
-            Tensor tOrP_copy = make_fragment_like(tOrP);
-            cute::copy(tOrP, tOrP_copy);
-            flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                tOrP_copy, params.p_dropout_in_uint8_t, seed, offset,
-                block_row_idx, block_col_idx, kNWarps
-            );
-            flash::write_softmax_to_gmem(tOrP_copy, tPgP, gmem_tiled_copy_P);
-            tPgP.data() = tPgP.data() + (-kBlockN);
-        }
-        if (Is_dropout) {
-            flash::apply_dropout(tOrP, params.p_dropout_in_uint8_t, seed, offset,
-                                 block_row_idx, block_col_idx, kNWarps);
-        }
+            flash::cp_async_wait<0>();
+            __syncthreads();
+            if (n_block > n_block_min) { // add by JXGuo: 并不理解 ，todo
+                // Advance gK
+                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+                flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+                // This cp_async_fence needs to be in the if block, otherwise the synchronization
+                // isn't right and we get race conditions.
+                cute::cp_async_fence();
+            }
 
-        flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V); 
-        // add by JXGuo: 此处进行了 P V^T 的矩阵乘法，算出的是 
+            // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
+            Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+            if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
+                flash::apply_mask_local(
+                    scores, n_block * kBlockN, binfo.actual_seqlen_k,
+                    m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                    binfo.actual_seqlen_q, kNWarps * 16,
+                    params.window_size_left, params.window_size_right
+                );
+            }
+            softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
+
+            Tensor rP = flash::convert_type<Element>(scores);
+            // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
+            // if using m16n8k16 or ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
+            Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMma>(rP.layout()));
+            int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
+            int block_col_idx = n_block * (kBlockN / 32);
+            if (Return_softmax) {
+                Tensor tOrP_copy = make_fragment_like(tOrP);
+                cute::copy(tOrP, tOrP_copy);
+                flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                    tOrP_copy, params.p_dropout_in_uint8_t, seed, offset,
+                    block_row_idx, block_col_idx, kNWarps
+                );
+                flash::write_softmax_to_gmem(tOrP_copy, tPgP, gmem_tiled_copy_P);
+                tPgP.data() = tPgP.data() + (-kBlockN);
+            }
+            if (Is_dropout) {
+                flash::apply_dropout(tOrP, params.p_dropout_in_uint8_t, seed, offset,
+                                    block_row_idx, block_col_idx, kNWarps);
+            }
+
+            flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V); 
+            // add by JXGuo: 此处进行了 P V^T 的矩阵乘法，算出的是 
+        }
+    }else{
+        // These are the iterations where we don't need masking on S
+        for (; n_block >= n_block_min; --n_block) {
+            // add by JXGuo
+            // printf("[compute_attn_1rowblock] in loop, mask_val = %d, m_block = %d\n", mask_val, m_block);
+            
+            // if (mask_val == -1) break;
+            
+            // printf("[compute_attn_1rowblock] in loop, escape, mask_val = %d\n", mask_val);
+
+            printf("[compute_attn_1rowblock] Is_blocksparse = flase, in loop, n_block = %d, tidx = %d, m_block = %d\n", n_block, tidx, m_block);
+
+            Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+            clear(acc_s);
+            flash::cp_async_wait<0>();
+            __syncthreads();
+            // Advance gV
+            tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+            flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+            cute::cp_async_fence();
+
+            flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K
+            ); // add by JXGuo: 此处进行了 Q K^T 的矩阵乘法
+
+            flash::cp_async_wait<0>();
+            __syncthreads();
+            if (n_block > n_block_min) { // add by JXGuo: 并不理解 ，todo
+                // Advance gK
+                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+                flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+                // This cp_async_fence needs to be in the if block, otherwise the synchronization
+                // isn't right and we get race conditions.
+                cute::cp_async_fence();
+            }
+
+            // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
+            Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+            if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
+                flash::apply_mask_local(
+                    scores, n_block * kBlockN, binfo.actual_seqlen_k,
+                    m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                    binfo.actual_seqlen_q, kNWarps * 16,
+                    params.window_size_left, params.window_size_right
+                );
+            }
+            softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
+
+            Tensor rP = flash::convert_type<Element>(scores);
+            // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
+            // if using m16n8k16 or ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
+            Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMma>(rP.layout()));
+            int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
+            int block_col_idx = n_block * (kBlockN / 32);
+            if (Return_softmax) {
+                Tensor tOrP_copy = make_fragment_like(tOrP);
+                cute::copy(tOrP, tOrP_copy);
+                flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                    tOrP_copy, params.p_dropout_in_uint8_t, seed, offset,
+                    block_row_idx, block_col_idx, kNWarps
+                );
+                flash::write_softmax_to_gmem(tOrP_copy, tPgP, gmem_tiled_copy_P);
+                tPgP.data() = tPgP.data() + (-kBlockN);
+            }
+            if (Is_dropout) {
+                flash::apply_dropout(tOrP, params.p_dropout_in_uint8_t, seed, offset,
+                                    block_row_idx, block_col_idx, kNWarps);
+            }
+
+            flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V); 
+            // add by JXGuo: 此处进行了 P V^T 的矩阵乘法，算出的是 
+        }
     }
 
+
+    
+
     // add by JXGuo
-    printf("[compute_attn_1rowblock] before clear2, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
+    // printf("[compute_attn_1rowblock] before clear2, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
     // clear(acc_o);
-    printf("[compute_attn_1rowblock] after clear2, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
+    // printf("[compute_attn_1rowblock] after clear2, acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
 
     // Epilogue
 

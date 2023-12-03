@@ -62,8 +62,8 @@ def convert_blockmask_reverse(blockmask, causal):
         torch.arange(nrow, device=blockmask.device), first_nonzero_col_per_row
     ]
     nonzero_idx = nonzero_sorted_rowidx * 4
-    nonzero_idx[last_nonzero_col_per_row_after_sort, last_nonzero_col_per_row] += 1
-    nonzero_idx[first_nonzero_col_per_row_after_sort, first_nonzero_col_per_row] += 2
+    nonzero_idx[last_nonzero_col_per_row_after_sort, last_nonzero_col_per_row] += 2
+    nonzero_idx[first_nonzero_col_per_row_after_sort, first_nonzero_col_per_row] += 1
     nonzero_idx[nonzero_val == 0] = -1
     
     # print ("nonzero_idx: ", nonzero_idx)

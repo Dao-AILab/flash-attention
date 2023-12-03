@@ -32,16 +32,22 @@ namespace flash {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Blockmask {
+    
 
     template<typename Params>
-    __device__ Blockmask(const Params &params, int loop_step_idx) :
-        blockmask_ptr(params.blockmask + loop_step_idx * params.seqlen_q / 64) {
+    __device__ Blockmask(const Params &params, int loop_step_idx) {
+        Is_blocksparse = params.blockmask != nullptr;
+        blockmask_ptr = Is_blocksparse ? params.blockmask + loop_step_idx * params.seqlen_q / 64 : nullptr;
     }
 
     __device__ int mask_val(int block_row_idx) const {
+        if (!Is_blocksparse) {
+            return -2;
+        }
         return blockmask_ptr[block_row_idx];
     }
 
+    bool Is_blocksparse = false;
     const int *blockmask_ptr;
 };
 
