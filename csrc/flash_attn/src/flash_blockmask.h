@@ -42,7 +42,7 @@ struct Blockmask {
 
     __device__ int mask_val(int block_row_idx) const {
         if (!Is_blocksparse) {
-            return -2;
+            return -1;
         }
         return blockmask_ptr[block_row_idx];
     }
