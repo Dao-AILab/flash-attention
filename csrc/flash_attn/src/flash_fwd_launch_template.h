@@ -415,3 +415,40 @@ void run_mha_fwd_block_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
         });
     });
 }
+
+template<typename T>
+void run_mha_fwd_block_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 128;
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    bool is_sm8x = dprops->major == 8 && dprops->minor > 0;
+    BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+            if constexpr(!Is_dropout) {
+                // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
+                // and 128 x 32 (48 KB smem) is the fastest for non-causal since we get 2 CTAs per SM.
+                if (is_sm8x) {
+                    if constexpr(!Is_causal) {
+                        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                    } else {
+                        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                    }
+                } else {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                }
+                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
+                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                // Using 8 warps (128 x 128 and 256 x 64) is 28% slower for seqlen=2k
+                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                // 1st ones are good for H100, A100
+                // 2nd one is good for A6000 bc we get slightly better occupancy
+            } else {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
+            }
+        });
+    });
+}

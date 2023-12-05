@@ -385,13 +385,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
         cute::cp_async_fence();
 
-        // if(!is_skip){
+        if(!is_skip){
             flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
                 acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
                 smem_thr_copy_Q, smem_thr_copy_K
             );
             // if (cute::thread0()) { print(acc_s); }
-        // }
+        }
         
         
         
@@ -483,7 +483,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
         // if (cute::thread0()) { print(tOrP); }
 
-        flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        if(!is_skip){
+            flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        }
+        
         // if (cute::thread0()) { print(scores); }
 
         // This check is at the end of the loop since we always have at least 1 iteration
@@ -521,10 +524,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 
         // add by JXGuo: todo: add skip
-        flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
-            smem_thr_copy_Q, smem_thr_copy_K
-        );
+        if(!is_skip){
+           flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K
+            ); 
+        }
+        
 
         flash::cp_async_wait<0>();
         __syncthreads();
@@ -583,7 +589,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 
         // add by JXGuo: todo: add skip
-        flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        if(!is_skip){
+            flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        }
     }
 
     // Epilogue
