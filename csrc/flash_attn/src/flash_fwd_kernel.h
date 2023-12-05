@@ -112,13 +112,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // }
     }
 
-    printf("[compute_attn_1rowblock] n_block_min = %d, n_block_max = %d\n", n_block_min, n_block_max);
+    printf("[compute_attn_1rowblock] n_block_min = %d, n_block_max = %d, m_block = %d\n", n_block_min, n_block_max, m_block);
 
     // add by JXGuo: add blocksparse support
     Blockmask blockmask(params, m_block);
     bool Is_blocksparse = blockmask.Is_blocksparse;
     // Is_blocparse = false; // add by JXGuo: for test
-    printf("[compute_attn_1rowblock] Is_blocksparse = %d\n", (int)Is_blocksparse);
+    printf("[compute_attn_1rowblock] Is_blocksparse = %d, m_block = %d, mask_val(0) = %d\n", (int)Is_blocksparse, m_block, blockmask.mask_val(0));
     if(Is_blocksparse && blockmask.mask_val(0) == -1){ //add by JXGuo: 此处处理全为-1的情况，即不需要计算的情况
         n_block_max = n_block_min;
     }
@@ -376,14 +376,15 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         last_block_skip = true;
         is_last_block = false;
         }else { // add by JXGuo: 最后一个块需要算
-            is_last_block = mask_val & 0x2; // 用于处理最后一个block就是blockmask的最后一个块的情况
             mask_block_idx++;
             mask_val = blockmask.mask_val(mask_block_idx);
-            next_block_col_idx = mask_val / 4;
+            is_last_block = mask_block_idx > n_block_max || mask_val == -1; // 用于处理最后一个block就是blockmask的最后一个块的情况
+            
+            next_block_col_idx = is_last_block ? -1: mask_val / 4;
         }
     }
     
-    printf("[compute_attn_1rowblock] before processing last block, is_last_block = %d, last_block_skip = %d, mask_block_idx = %d, mask_val = %d, next_block_col_idx = %d, n_block = %d\n", (int)is_last_block, (int)last_block_skip, mask_block_idx, mask_val, next_block_col_idx, n_block);
+    printf("[compute_attn_1rowblock] before processing last block, is_last_block = %d, last_block_skip = %d, mask_block_idx = %d, mask_val = %d, next_block_col_idx = %d, n_block = %d, m_block = %d\n", (int)is_last_block, (int)last_block_skip, mask_block_idx, mask_val, next_block_col_idx, n_block, m_block);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
@@ -399,10 +400,15 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 
     // add by JXGuo
-    printf("[compute_attn_1rowblock] before loop, n_masking_steps = %d, n_block = %d\n", n_masking_steps, n_block);
+    printf("[compute_attn_1rowblock] before loop, n_masking_steps = %d, n_block = %d, m_block = %d\n", n_masking_steps, n_block, m_block);
 
     #pragma unroll
-    for (int masking_step = last_block_skip ? n_masking_steps : 0; masking_step < n_masking_steps; ++masking_step, --n_block) { // add by JXGuo: 此循环在处理最后一到两个 block，因为最后的一到两个block可能是补出来的
+    for (int masking_step = 0; masking_step < n_masking_steps && !(Is_blocksparse && last_block_skip); ++masking_step, --n_block) { // add by JXGuo: 此循环在处理最后一到两个 block，因为最后的一到两个block可能是补出来的
+
+        // add by JXGuo
+        printf("[compute_attn_1rowblock] process last block, masking_step = %d, n_block = %d, m_block = %d, last_block_skip = %d\n", masking_step, n_block, m_block, (int)last_block_skip);
+
+
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N) // add by JXGuo: 猜测是 softmax 中间值
         clear(acc_s);
         flash::cp_async_wait<0>();
@@ -428,6 +434,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+
+        // add by JXGuo
+        // if (Is_blocksparse && last_block_skip && masking_step == 0){
+        //     clear(scores);
+        // }
+        
+
         // if (cute::thread0()) { print_tensor(scores); }
         // We don't put the masking before the matmul S = Q K^T because we don't clear sK
         // for rows outside actual_seqlen_k. So those rows could have Inf / NaN, and the matmul
@@ -457,6 +470,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             );
             // if (cute::thread0()) { print_tensor(scores); }
         }
+
+        //add by JXGuo
+        // if (Is_blocksparse && last_block_skip && masking_step == 0){
+        //     flash::apply_mask(scores, 0);
+        // }
 
         flash::cp_async_wait<0>();
         __syncthreads();
@@ -516,7 +534,21 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // int mask_val = -1;// for test
 
     // add by JXGuo: add blocksparse support
+    printf("[compute_attn_1rowblock] before final loop, next_block_col_idx = %d, n_block = %d, is_last_block = %d, tidx = %d, m_block = %d\n", next_block_col_idx, n_block, (int)is_last_block, tidx, m_block);
     if (Is_blocksparse) {
+        if (last_block_skip){
+            printf("[compute_attn_1rowblock] acc_o(0) = %f, threadIdx.x = %d, m_block = %d\n", acc_o(0), threadIdx.x, m_block);
+            Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N) // add by JXGuo: 猜测是 softmax 中间值
+            clear(acc_s);
+            Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+            flash::apply_mask(scores, 0);
+            softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2); 
+            clear(acc_o);
+        }
+        
+
+
+
         for (n_block = next_block_col_idx; n_block >= n_block_min && !is_last_block; n_block = next_block_col_idx){
             printf("[compute_attn_1rowblock] Is_blocksparse = true, in loop, mask_val = %d, n_block = %d, is_last_block = %d, tidx = %d, m_block = %d\n", mask_val, n_block, (int)is_last_block, tidx, m_block);
             // is_last_block = mask_val & 0x2;
@@ -575,6 +607,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMma>(rP.layout()));
             int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
             int block_col_idx = n_block * (kBlockN / 32);
+
+            // add by JXGuo
+            // printf("[compute_attn_1rowblock] in loop, mask_val = %d, n_block = %d, tidx = %d, m_block = %d, block_row_idx = %d, block_col_idx = %d\n", mask_val, n_block, tidx, m_block, block_row_idx, block_col_idx);
+
             if (Return_softmax) {
                 Tensor tOrP_copy = make_fragment_like(tOrP);
                 cute::copy(tOrP, tOrP_copy);

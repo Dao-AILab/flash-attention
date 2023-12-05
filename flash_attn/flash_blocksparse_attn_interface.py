@@ -44,34 +44,17 @@ def convert_blockmask(blockmask, causal):
 
 def convert_blockmask_reverse(blockmask, causal):
     assert not causal
-    # TD [2022-05-13]: The indexing and sorting is very tricky
-    nrow, ncol = blockmask.shape
+    # nrow, ncol = blockmask.shape
     # Sort does not support bool on CUDA
     blockmask = blockmask.to(dtype=torch.uint8)
-    nonzero_val, nonzero_sorted_rowidx = blockmask.sort(dim=0, stable=True, descending=False)
-    # print("nonzero_val: ", nonzero_val)
-    # print("nonzero_sorted_rowidx: ", nonzero_sorted_rowidx)
+    nonzero_val, nonzero_sorted_rowidx = blockmask.sort(dim=1, stable=True, descending=False)
     
-    nonzero_unsorted_rowidx = nonzero_sorted_rowidx.argsort(dim=0)
-    last_nonzero_col_per_row = blockmask.sort(dim=-1, stable=True).indices[:, -1]
-    last_nonzero_col_per_row_after_sort = nonzero_unsorted_rowidx[
-        torch.arange(nrow, device=blockmask.device), last_nonzero_col_per_row
-    ]
-    first_nonzero_col_per_row = blockmask.sort(dim=-1, stable=True, descending=True).indices[:, 0]
-    first_nonzero_col_per_row_after_sort = nonzero_unsorted_rowidx[
-        torch.arange(nrow, device=blockmask.device), first_nonzero_col_per_row
-    ]
     nonzero_idx = nonzero_sorted_rowidx * 4
-    nonzero_idx[last_nonzero_col_per_row_after_sort, last_nonzero_col_per_row] += 2
-    nonzero_idx[first_nonzero_col_per_row_after_sort, first_nonzero_col_per_row] += 1
     nonzero_idx[nonzero_val == 0] = -1
-    
-    # print ("nonzero_idx: ", nonzero_idx)
-    
-    nonzero_idx = torch.flip(nonzero_idx, dims=[0])
+    nonzero_idx = torch.flip(nonzero_idx, dims=[1])
     # print("nonzero_idx: ", nonzero_idx)
     
-    return nonzero_idx.T.contiguous().to(dtype=torch.int32)
+    return nonzero_idx.contiguous().to(dtype=torch.int32)
 
 
 def _flash_blocksparse_attn_forward(
