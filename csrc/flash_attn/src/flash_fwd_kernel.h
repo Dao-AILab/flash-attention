@@ -109,7 +109,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     
     Blockmask blockmask(params, m_block);
     bool Is_blocksparse = blockmask.Is_blocksparse;
-    if(Is_blocksparse && blockmask.mask_val(0) == -1){ //add by JXGuo: 此处处理全为-1的情况，即不需要计算的情况
+    if(Is_blocksparse && blockmask.mask_val(0) == -1){ //add by JXGuo: deal with the case that need no calculation
         n_block_max = n_block_min;
     }
 
@@ -585,7 +585,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             flash::apply_dropout(tOrP, params.p_dropout_in_uint8_t, seed, offset,
                                  block_row_idx, block_col_idx, kNWarps);
         }
-
 
         if(!is_skip){
             flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
