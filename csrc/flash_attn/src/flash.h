@@ -175,5 +175,5 @@ template<typename T, int Headdim> void run_mha_fwd_splitkv_dispatch(Flash_fwd_pa
 
 template<typename T, int Headdim> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream, const bool configure);
 
-// add by JXGuo
+
 template<typename T, int Headdim> void run_mha_fwd_block_(Flash_fwd_params &params, cudaStream_t stream);

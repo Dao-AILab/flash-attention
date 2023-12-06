@@ -195,34 +195,21 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     FP16_SWITCH(!params.is_bf16, [&] {
         FWD_HEADDIM_SWITCH(params.d, [&] {
             if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
-                // add by JXGuo
-                printf("[run_mha_fwd] run_mha_fwd_ \n");
-                printf("[run_mha_fwd] kHeadDim = %d \n", kHeadDim);
                 run_mha_fwd_<elem_type, kHeadDim>(params, stream);
             } else {
-                // add by JXGuo
-                printf("[run_mha_fwd] run_mha_fwd_splitkv_dispatch \n");
                 run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim>(params, stream);
             }
         });
     });
 }
 
-// add by JXGuo
+
 void run_mha_fwd_block(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
     FP16_SWITCH(!params.is_bf16, [&] {
         FWD_BLOCK_HEADDIM_SWITCH(params.d, [&] {
-            if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
-                // add by JXGuo
-                printf("[run_mha_fwd_block] run_mha_fwd_block_ \n");
-                printf("[run_mha_fwd_block] kHeadDim = %d \n", kHeadDim);
+            if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 
                 run_mha_fwd_block_<elem_type, kHeadDim>(params, stream);
             }
-            //  else {
-            //     // add by JXGuo
-            //     printf("[run_mha_fwd] run_mha_fwd_splitkv_dispatch, this branch is illegal\n");
-            //     // run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim>(params, stream);
-            // }
         });
     });
 }
@@ -1318,7 +1305,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
 
 
-// add by JXGuo
+
 std::vector<at::Tensor>
 mha_fwd_block(const at::Tensor &q,         
 // total_q x num_heads x head_size, total := \sum_{i=0}^{b} s_i
@@ -1336,8 +1323,6 @@ mha_fwd_block(const at::Tensor &q,
               const bool is_causal,
               const bool return_softmax,
               c10::optional<at::Generator> gen_){
-    // add by JXGuo
-    printf("[mha_fwd_block] start\n");
     auto dprops = at::cuda::getCurrentDeviceProperties();
     // bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
@@ -1487,7 +1472,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bwd", &mha_bwd, "Backward pass");
     m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
     m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
-
-    // add by JXGuo
+  
     m.def("fwd_block", &mha_fwd_block, "Forward pass, with blockmask");
 }

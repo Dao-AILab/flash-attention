@@ -65,7 +65,7 @@
     }                                      \
   }()
 
-// add by JXGuo
+
 #define FWD_BLOCK_HEADDIM_SWITCH(HEADDIM, ...)\
   [&] {                                       \
     if (HEADDIM <= 32) {                      \

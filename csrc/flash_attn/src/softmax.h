@@ -116,18 +116,18 @@ inline __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &tensor, Tens
 }
 
 
-// add by JXGuo: todo 目前还不完全理解这个函数的作用
+
 
 template <typename Engine, typename Layout>
 inline __device__ void apply_mask(Tensor<Engine, Layout> &tensor, const int max_seqlen_k,
                                   const int col_idx_offset_ = 0) {
-    // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N)) // add by JXGuo: 此处基本理解了
+    // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
     static_assert(Layout::rank == 2, "Only support 2D Tensor");
     const int lane_id = threadIdx.x % 32;
     const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
     #pragma unroll
     for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-        const int col_idx_base = col_idx_offset + nj * 8; // add by JXGuo: 为什么乘8不是乘4
+        const int col_idx_base = col_idx_offset + nj * 8;
         #pragma unroll
         for (int j = 0; j < size<1, 0>(tensor); ++j) {
             const int col_idx = col_idx_base + j;
@@ -227,7 +227,7 @@ inline __device__ void apply_dropout(Tensor<Engine, Layout> &tensor, uint8_t p_d
     auto encode_dropout = [](bool keep, T val) {
         return keep ? val : (encode_dropout_in_sign_bit ? -val : T(0));
     };
-    static_assert(decltype(size<2>(tensor))::value % 2 == 0); // add by JXGuo: 用于检查tensor的第二个维度大小是否为偶数
+    static_assert(decltype(size<2>(tensor))::value % 2 == 0);
     const uint16_t p_dropout_8bit_in_uint16_t = uint16_t(p_dropout_in_uint8_t);
     const uint32_t p_dropout_8bit_in_uint32_t = (uint32_t(p_dropout_8bit_in_uint16_t) << 16) | uint32_t(p_dropout_8bit_in_uint16_t);
     // if (cute::thread0()) { printf("threshold2 = 0x%x\n", p_dropout_8bit_in_uint32_t); }

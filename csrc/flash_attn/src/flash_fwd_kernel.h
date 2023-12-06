@@ -15,7 +15,7 @@
 #include "utils.h"
 #include "softmax.h"
 
-// add by JXGuo
+
 #include "flash_blockmask.h"
 
 namespace flash {
@@ -106,7 +106,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // }
     }
 
-    // add by JXGuo: add blocksparse support
+    
     Blockmask blockmask(params, m_block);
     bool Is_blocksparse = blockmask.Is_blocksparse;
     if(Is_blocksparse && blockmask.mask_val(0) == -1){ //add by JXGuo: 此处处理全为-1的情况，即不需要计算的情况
@@ -523,7 +523,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         cute::cp_async_fence();
 
 
-        // add by JXGuo: todo: add skip
         if(!is_skip){
            flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
                 acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -588,7 +587,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
 
-        // add by JXGuo: todo: add skip
         if(!is_skip){
             flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         }
