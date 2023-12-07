@@ -1,3 +1,5 @@
+# Copyright (c) 2023, Tri Dao.
+
 from typing import Optional, Union
 
 import torch
@@ -86,6 +88,7 @@ def _flash_attn_varlen_forward(
         None,
         cu_seqlens_q,
         cu_seqlens_k,
+        None,
         max_seqlen_q,
         max_seqlen_k,
         dropout_p,
