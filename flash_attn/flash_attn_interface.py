@@ -224,7 +224,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
-        ctx.bias_requires_grad = attn_bias.requires_grad
+        ctx.bias_requires_grad = attn_bias.requires_grad if attn_bias is not None else None
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -349,7 +349,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
-        ctx.bias_requires_grad = attn_bias.requires_grad
+        ctx.bias_requires_grad = attn_bias.requires_grad if attn_bias is not None else None
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -484,7 +484,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
-        ctx.bias_requires_grad = attn_bias.requires_grad
+        ctx.bias_requires_grad = attn_bias.requires_grad if attn_bias is not None else None
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
