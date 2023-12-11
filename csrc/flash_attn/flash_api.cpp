@@ -149,6 +149,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                       void *dsoftmax_sum_d,
                       float p_dropout,
                       float softmax_scale,
+                      bool is_mlm,
                       int window_size_left,
                       int window_size_right) {
 
@@ -447,6 +448,7 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
                const float softmax_scale,
                const bool zero_tensors,
                const bool is_causal,
+               const bool is_mlm,
                const int window_size_left,
                int window_size_right,
                const bool return_softmax,
@@ -638,6 +640,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         const float p_dropout,         // probability to drop
         const float softmax_scale,
         const bool is_causal,
+        const bool is_mlm,
         const int window_size_left,
         int window_size_right,
         c10::optional<at::Generator> gen_,
@@ -790,6 +793,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      softmax_d.data_ptr(),
                      p_dropout,
                      softmax_scale,
+                     is_mlm,
                      window_size_left,
                      window_size_right);
 
@@ -854,6 +858,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const float softmax_scale,
                const bool zero_tensors,
                const bool is_causal,
+               const bool is_mlm,
                const int window_size_left,
                int window_size_right,
                c10::optional<at::Generator> gen_,
@@ -1022,6 +1027,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      softmax_d.data_ptr(),
                      p_dropout,
                      softmax_scale,
+                     is_mlm,
                      window_size_left,
                      window_size_right);
 
@@ -1074,6 +1080,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
                 const float softmax_scale,
                 bool is_causal,
+                bool is_mlm,
                 const int window_size_left,
                 int window_size_right,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2

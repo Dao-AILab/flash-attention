@@ -1,0 +1,266 @@
+// Template
+const int row_idx = row_idx_base + i * 8;
+const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
+const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    #pragma unroll
+    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+        const int col_idx = col_idx_base + j;
+        if (col_idx >= col_idx_limit_right || (HasWSLeft && col_idx < col_idx_limit_left)) {
+            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+        }
+    }
+}
+---
+// Case 1: negation of zero window
+// Assumptions
+const bool HasWSLeft = true
+const int window_size_left = 0
+const int window_size_right = 0
+---
+// Case 1: negation of zero window
+// Substitute assumptions
+const int row_idx = row_idx_base + i * 8;
+const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q);
+const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q);
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    #pragma unroll
+    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+        const int col_idx = col_idx_base + j;
+        if (col_idx < col_idx_limit_left || col_idx_limit_right <= col_idx) {
+            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+        }
+    }
+}
+---
+// Case 1: negation of zero window
+// In this case we want to negate the inner loop
+const int row_idx = row_idx_base + i * 8;
+const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q);
+const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q);
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    #pragma unroll
+    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+        const int col_idx = col_idx_base + j;
+        if (col_idx_limit_left <= col_idx && col_idx < col_idx_limit_right) {
+            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+        }
+    }
+}
+---
+// Case 1: negation of zero window
+// Substitute limit constants
+const int row_idx = row_idx_base + i * 8;
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    #pragma unroll
+    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+        const int col_idx = col_idx_base + j;
+        if (std::max(0, row_idx + max_seqlen_k - max_seqlen_q) <= col_idx && col_idx < std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q)) {
+            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+        }
+    }
+}
+---
+// Case 1: negation of zero window
+// Variable col_idx is always positive
+const int row_idx = row_idx_base + i * 8;
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    #pragma unroll
+    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+        const int col_idx = col_idx_base + j;
+        if (row_idx + max_seqlen_k - max_seqlen_q <= col_idx && col_idx < std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q)) {
+            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+        }
+    }
+}
+---
+// Case 1: negation of zero window
+// Assume bound col_idx < max_seqlen_k
+const int row_idx = row_idx_base + i * 8;
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    #pragma unroll
+    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+        const int col_idx = col_idx_base + j;
+        if (row_idx + max_seqlen_k - max_seqlen_q <= col_idx && col_idx < row_idx + 1 + max_seqlen_k - max_seqlen_q) {
+            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+        }
+    }
+}
+---
+// Case 1: col_idx < max_seqlen_k
+// Equality
+const int row_idx = row_idx_base + i * 8;
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    #pragma unroll
+    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+        const int col_idx = col_idx_base + j;
+        if (col_idx == row_idx + max_seqlen_k - max_seqlen_q) {
+            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+        }
+    }
+}
+---
+// Case 1: col_idx < max_seqlen_k
+// Substitute col_idx
+const int row_idx = row_idx_base + i * 8;
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    #pragma unroll
+    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+        if (col_idx_base + j == row_idx + max_seqlen_k - max_seqlen_q) {
+            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+        }
+    }
+}
+---
+// Case 1: col_idx < max_seqlen_k
+// Isolate j
+const int row_idx = row_idx_base + i * 8;
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    #pragma unroll
+    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+        if (j == row_idx + max_seqlen_k - max_seqlen_q - col_idx_base) {
+            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+        }
+    }
+}
+---
+// Case 1: col_idx < max_seqlen_k
+// Only one case to check for j
+const int row_idx = row_idx_base + i * 8;
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    const int j = row_idx + max_seqlen_k - max_seqlen_q - col_idx_base;
+    if (0 <= j && j < size<1, 0>(tensor)) {
+        tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+    }
+}
+---
+// Case 2: non-negative - infinite window
+// Assumptions
+const bool HasWSLeft = true
+const int window_size_left = INT_MAX
+const int window_size_right = INT_MAX
+---
+// Case 2: non-negative - infinite window
+// Substitute assumptions
+const int row_idx = row_idx_base + i * 8;
+const int col_idx_limit_left = 0;
+const int col_idx_limit_right = max_seqlen_k;
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    #pragma unroll
+    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+        const int col_idx = col_idx_base + j;
+        if (col_idx >= col_idx_limit_right || col_idx < col_idx_limit_left) {
+            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+        }
+    }
+}
+---
+// Case 2: non-negative - infinite window
+// Substitute limit constants
+const int row_idx = row_idx_base + i * 8;
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    #pragma unroll
+    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+        const int col_idx = col_idx_base + j;
+        if (col_idx < 0 || col_idx >= max_seqlen_k) {
+            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+        }
+    }
+}
+---
+// Case 2: non-negative - infinite window
+// Variable col_idx is always positive
+const int row_idx = row_idx_base + i * 8;
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    #pragma unroll
+    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+        const int col_idx = col_idx_base + j;
+        if (col_idx >= max_seqlen_k) {
+            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+        }
+    }
+}
+---
+// Case 2: non-negative - infinite window
+// Isolate j
+const int row_idx = row_idx_base + i * 8;
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    #pragma unroll
+    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+        if (j >= max_seqlen_k - col_idx_base) {
+            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+        }
+    }
+}
+---
+// Case 2: non-negative - infinite window
+// Unify bounds to max of them
+const int row_idx = row_idx_base + i * 8;
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    #pragma unroll
+    for (int j = std::max(0, max_seqlen_k - col_idx_base); j < size<1, 0>(tensor); ++j) {
+        tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+    }
+}
+---
+// Union of Case 1 + Case 2
+const int row_idx = row_idx_base + i * 8;
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    const int j1 = row_idx + max_seqlen_k - max_seqlen_q - col_idx_base;
+    if (0 <= j1 && j1 < size<1, 0>(tensor)) {
+        tensor(make_coord(i, mi), make_coord(j1, nj)) = -INFINITY;
+    }
+    #pragma unroll
+    for (int j2 = std::max(0, max_seqlen_k - col_idx_base); j2 < size<1, 0>(tensor); ++j2) {
+        tensor(make_coord(i, mi), make_coord(j2, nj)) = -INFINITY;
+    }
+}
+---
+// Union of Case 1 + Case 2
+// Fewer calculations
+const int row_idx = row_idx_base + i * 8;
+#pragma unroll
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    const int col_idx_limit = max_seqlen_k - col_idx_base;
+    const int j1 = col_idx_limit + row_idx - max_seqlen_q;
+    if (0 <= j1 && j1 < size<1, 0>(tensor)) {
+        tensor(make_coord(i, mi), make_coord(j1, nj)) = -INFINITY;
+    }
+    #pragma unroll
+    for (int j2 = std::max(0, col_idx_limit); j2 < size<1, 0>(tensor); ++j2) {
+        tensor(make_coord(i, mi), make_coord(j2, nj)) = -INFINITY;
+    }
+}
