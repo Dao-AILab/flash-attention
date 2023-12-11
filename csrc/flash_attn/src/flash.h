@@ -169,6 +169,10 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
     // The pointer to the softmax d sum.
     void *__restrict__ dsoftmax_sum;
+    // The pointer to the workspace needed by semaphore.
+    int *workspace;
+
+    bool is_deterministic;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -9,6 +9,7 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
+#include "flash_semaphore.h"
 
 #include "block_info.h"
 #include "kernel_traits.h"
@@ -422,7 +423,7 @@ inline __device__ void convert_dKV(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Seq_parallel=false, bool Is_deterministic=false, typename Params>
 inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -790,6 +791,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     clear(acc_dv);
     clear(acc_dk);
 
+    // Construct the semaphore.
+    FlashSemaphore semaphore(tidx);
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
         clear(acc_s);
@@ -992,8 +995,24 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             } else {
                 // if (cute::thread0()) { print(acc_dq.layout()); printf("\n"); print(acc_dq_reshaped.layout()); printf("\n"); print(tdQgdQaccum.layout()); printf("\n"); }
                 CUTE_STATIC_ASSERT_V(size(acc_dq) == size(tdQgdQaccum));
-                #pragma unroll
-                for (int i = 0; i < size(acc_dq); ++i) { atomicAdd(&tdQgdQaccum(i), acc_dq(i)); }
+                if (Is_deterministic) {
+                    int storage_id = (bidb * cute::ceil_div(params.seqlen_q_rounded, kBlockM) + m_block) * params.h + bidh;
+                    // Fetch the synchronization lock initially but do not block.
+                    semaphore.fetch(params.workspace + storage_id);
+                    semaphore.wait(params.workspace + storage_id, blockIdx.x);
+
+                    #pragma unroll
+                    for (int i = 0; i < size(acc_dq); ++i) { atomicAdd(&tdQgdQaccum(i), acc_dq(i)); }
+                    // If the workspace data is not initialized to zero,
+                    // then this commented-out code needs to be executed.
+                    // if (blockIdx.x == (gridDim.x - 1)) { //
+                    //     semaphore.release(params.workspace + storage_id, 0);
+                    // } else {
+                        semaphore.release(params.workspace + storage_id, blockIdx.x + 1); 
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < size(acc_dq); ++i) { atomicAdd(&tdQgdQaccum(i), acc_dq(i)); }
+                }
             }
         } else {
             #pragma unroll
@@ -1563,7 +1582,7 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Is_deterministic, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     const int n_block = blockIdx.x;
@@ -1572,7 +1591,7 @@ inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
     // The block index for the head.
     const int bidh = blockIdx.z;
 
-    compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+    compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true, Is_deterministic>(params, bidb, bidh, n_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
