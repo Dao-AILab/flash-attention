@@ -868,7 +868,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 AtomLayoutMS * 16,
                 params.scale_softmax
             );
-            __syncthreads();
         }
 
         // if (cute::thread(32, 0)) { print(scores); }
@@ -1094,7 +1093,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         if (copy_dS) {
             Tensor cdS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});    // (BLK_M,BLK_N) -> (blk_m,blk_n)
             Tensor tdScdS = gmem_thr_copy_dS.partition_D(cdS);
-            
+
             #pragma unroll
             for (int m = 0; m < size<1>(tdScdS); ++m) {
                 if (Is_even_MN || get<0>(tdScdS(0, m, 0)) < binfo.actual_seqlen_q - m_block * kBlockM) {
@@ -1527,7 +1526,6 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
                 AtomLayoutMS * 16,
                 params.scale_softmax
             );
-            __syncthreads();
         }
         // We don't need to mask out the elements beyond actual_seqlen_k, because acc_s would
         // be some finite value for those indices. In the end when we multiply with K to get dQ,

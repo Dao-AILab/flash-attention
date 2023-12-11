@@ -401,7 +401,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 kNWarps * 16,
                 params.scale_softmax
             );
-            __syncthreads();
         }
 
         // if (cute::thread0()) { print_tensor(scores); }
@@ -543,7 +542,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 kNWarps * 16,
                 params.scale_softmax
             );
-            __syncthreads();
         }
 
         if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
