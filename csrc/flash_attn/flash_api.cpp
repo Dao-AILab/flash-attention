@@ -629,17 +629,19 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream, const bool confi
 }
 
 // Return workspace size of dQ
-inline size_t workspace_size_dQ(const int blockM, Flash_bwd_params &params) {
-    const int num_m_block = (params.seqlen_q_rounded + blockM - 1) / blockM;
-    return params.b * params.h * num_m_block;
+inline size_t workspace_size_dQ(const int blockM, const int batch_size, const int head_size, const int seqlen_q) {
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int seqlen_q_round = round_multiple(seqlen_q, 128);
+    const int num_m_block = (seqlen_q + blockM - 1) / blockM;
+    return batch_size * head_size * num_m_block;
 }
 
-size_t mha_bwd_workspace_size(const int blockM, Flash_bwd_params &params) {
-    return workspace_size_dQ(blockM, params);
+size_t mha_bwd_workspace_size(const int blockM, const int batch_size, const int head_size, const int seqlen_q) {
+    return workspace_size_dQ(blockM, batch_size, head_size, seqlen_q);
 }
 
-size_t get_mha_bwd_workspace_size_hdim32(Flash_bwd_params &params) {
-    return mha_bwd_workspace_size(128, params);
+size_t get_mha_bwd_workspace_size_hdim32(const int batch_size, const int head_size, const int seqlen_q) {
+    return mha_bwd_workspace_size(128, batch_size, head_size, seqlen_q);
     /*
     constexpr static int Headdim = 32;
     int device;
@@ -649,14 +651,14 @@ size_t get_mha_bwd_workspace_size_hdim32(Flash_bwd_params &params) {
         &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
 
     if (max_smem_per_block >= 2 * ((3 * 128 + 2 * 128) * Headdim + 2 * 128 * 128)) { // 104 KB
-        return mha_bwd_workspace_size(128, params);
+        return mha_bwd_workspace_size(128, batch_size, head_size, seqlen_q);
     } else {  // 96 KB
-        return mha_bwd_workspace_size(128, params);
+        return mha_bwd_workspace_size(128, batch_size, head_size, seqlen_q);
     }
     */
 }
 
-size_t get_mha_bwd_workspace_size_hdim64(Flash_bwd_params &params) {
+size_t get_mha_bwd_workspace_size_hdim64(const int batch_size, const int head_size, const int seqlen_q) {
     // constexpr static int Headdim = 64;
     int device;
     cudaGetDevice(&device);
@@ -665,14 +667,14 @@ size_t get_mha_bwd_workspace_size_hdim64(Flash_bwd_params &params) {
         &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
 
     if (max_smem_per_block >= 144 * 1024) {
-        return mha_bwd_workspace_size(128, params);
+        return mha_bwd_workspace_size(128, batch_size, head_size, seqlen_q);
     } else {
-        return mha_bwd_workspace_size(64, params);
+        return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     }
 }
 
-size_t get_mha_bwd_workspace_size_hdim96(Flash_bwd_params &params) {
-    return mha_bwd_workspace_size(64, params);
+size_t get_mha_bwd_workspace_size_hdim96(const int batch_size, const int head_size, const int seqlen_q) {
+    return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     /*
     constexpr static int Headdim = 96;
     int device;
@@ -683,15 +685,15 @@ size_t get_mha_bwd_workspace_size_hdim96(Flash_bwd_params &params) {
     // printf("max_smem_per_block = %d\n", max_smem_per_block);
 
     if (max_smem_per_block >= 116 * 1024) {
-        return mha_bwd_workspace_size(64, params);
+        return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     } else {
-        return mha_bwd_workspace_size(64, params);
+        return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     }
     */
 }
 
-size_t get_mha_bwd_workspace_size_hdim128(Flash_bwd_params &params) {
-    return mha_bwd_workspace_size(64, params);
+size_t get_mha_bwd_workspace_size_hdim128(const int batch_size, const int head_size, const int seqlen_q) {
+    return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     /*
     constexpr static int Headdim = 128;
     int device;
@@ -701,15 +703,15 @@ size_t get_mha_bwd_workspace_size_hdim128(Flash_bwd_params &params) {
         &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
 
     if (max_smem_per_block >= 144 * 1024) {
-        return mha_bwd_workspace_size(64, params);
+        return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     } else {
-        return mha_bwd_workspace_size(64, params);
+        return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     }
     */
 }
 
-size_t get_mha_bwd_workspace_size_hdim160(Flash_bwd_params &params) {
-    return mha_bwd_workspace_size(64, params);
+size_t get_mha_bwd_workspace_size_hdim160(const int batch_size, const int head_size, const int seqlen_q) {
+    return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     /*
     constexpr static int Headdim = 160;
     int device;
@@ -719,15 +721,15 @@ size_t get_mha_bwd_workspace_size_hdim160(Flash_bwd_params &params) {
         &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
 
     if (max_smem_per_block >= 116 * 1024) {
-        return mha_bwd_workspace_size(64, params);
+        return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     } else {
-        return mha_bwd_workspace_size(64, params);
+        return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     }
     */
 }
 
-size_t get_mha_bwd_workspace_size_hdim192(Flash_bwd_params &params) {
-    return mha_bwd_workspace_size(64, params);
+size_t get_mha_bwd_workspace_size_hdim192(const int batch_size, const int head_size, const int seqlen_q) {
+    return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     /*
     constexpr static int Headdim = 192;
     int device;
@@ -736,20 +738,20 @@ size_t get_mha_bwd_workspace_size_hdim192(Flash_bwd_params &params) {
     cudaError status_ = cudaDeviceGetAttribute(
         &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
     if (max_smem_per_block >= 136 * 1024) {
-        return mha_bwd_workspace_size(64, params);
+        return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     } else {
-        return mha_bwd_workspace_size(64, params);
+        return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     }
     */
 }
 
-size_t get_mha_bwd_workspace_size_hdim224(Flash_bwd_params &params) {
+size_t get_mha_bwd_workspace_size_hdim224(const int batch_size, const int head_size, const int seqlen_q) {
     // constexpr static int Headdim = 224;
-    return mha_bwd_workspace_size(64, params);
+    return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
 }
 
-size_t get_mha_bwd_workspace_size_hdim256(Flash_bwd_params &params) {
-    return mha_bwd_workspace_size(64, params);
+size_t get_mha_bwd_workspace_size_hdim256(const int batch_size, const int head_size, const int seqlen_q) {
+    return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     /*
     constexpr static int Headdim = 256;
     int device;
@@ -758,30 +760,30 @@ size_t get_mha_bwd_workspace_size_hdim256(Flash_bwd_params &params) {
     cudaError status_ = cudaDeviceGetAttribute(
         &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
     if (max_smem_per_block >= 176 * 1024) {  // H100
-        return mha_bwd_workspace_size(64, params);
+        return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     } else {  // A100, we don't do double buffering to save smem
-        return mha_bwd_workspace_size(64, params);
+        return mha_bwd_workspace_size(64, batch_size, head_size, seqlen_q);
     }
     */
 }
 
-size_t get_mha_bwd_workspace_size(Flash_bwd_params &params) {
-    if (params.d <= 32) {
-        return get_mha_bwd_workspace_size_hdim32(params);
-    } else if (params.d <= 64) {
-        return get_mha_bwd_workspace_size_hdim64(params);
-    } else if (params.d <= 96) {
-        return get_mha_bwd_workspace_size_hdim96(params);
-    } else if (params.d <= 128) {
-        return get_mha_bwd_workspace_size_hdim128(params);
-    } else if (params.d <= 160) {
-        return get_mha_bwd_workspace_size_hdim160(params);
-    } else if (params.d <= 192) {
-        return get_mha_bwd_workspace_size_hdim192(params);
-    } else if (params.d <= 224) {
-        return get_mha_bwd_workspace_size_hdim224(params);
-    } else if (params.d <= 256) {
-        return get_mha_bwd_workspace_size_hdim256(params);
+size_t get_mha_bwd_workspace_size(const int batch_size, const int num_heads, const int seqlen_q, const int head_size) {
+    if (head_size <= 32) {
+        return get_mha_bwd_workspace_size_hdim32(batch_size, num_heads, seqlen_q);
+    } else if (head_size <= 64) {
+        return get_mha_bwd_workspace_size_hdim64(batch_size, num_heads, seqlen_q);
+    } else if (head_size <= 96) {
+        return get_mha_bwd_workspace_size_hdim96(batch_size, num_heads, seqlen_q);
+    } else if (head_size <= 128) {
+        return get_mha_bwd_workspace_size_hdim128(batch_size, num_heads, seqlen_q);
+    } else if (head_size <= 160) {
+        return get_mha_bwd_workspace_size_hdim160(batch_size, num_heads, seqlen_q);
+    } else if (head_size <= 192) {
+        return get_mha_bwd_workspace_size_hdim192(batch_size, num_heads, seqlen_q);
+    } else if (head_size <= 224) {
+        return get_mha_bwd_workspace_size_hdim224(batch_size, num_heads, seqlen_q);
+    } else if (head_size <= 256) {
+        return get_mha_bwd_workspace_size_hdim256(batch_size, num_heads, seqlen_q);
     }
 }
 
@@ -964,7 +966,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
             workspace = workspace_.value();
         } else {
             TORCH_WARN("If is_deterministic is true, extra workspace needed.");
-            size_t workspace_size = get_mha_bwd_workspace_size(params);
+            size_t workspace_size = get_mha_bwd_workspace_size(batch_size, num_heads, seqlen_q_rounded, head_size);
             workspace = torch::zeros({workspace_size}, opts.dtype(at::kInt));
         }
         params.workspace = static_cast<int *>(workspace.data_ptr());
@@ -1213,7 +1215,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
             workspace = workspace_.value();
         } else {
             TORCH_WARN("If is_deterministic is true, extra workspace needed.");
-            size_t workspace_size = get_mha_bwd_workspace_size(params);
+            size_t workspace_size = get_mha_bwd_workspace_size(batch_size, num_heads, seqlen_q_rounded, head_size);
             workspace = torch::zeros({workspace_size}, opts.dtype(at::kInt));
         }
         params.workspace = static_cast<int *>(workspace.data_ptr());

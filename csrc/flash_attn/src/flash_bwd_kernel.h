@@ -997,7 +997,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 // if (cute::thread0()) { print(acc_dq.layout()); printf("\n"); print(acc_dq_reshaped.layout()); printf("\n"); print(tdQgdQaccum.layout()); printf("\n"); }
                 CUTE_STATIC_ASSERT_V(size(acc_dq) == size(tdQgdQaccum));
                 if (Is_deterministic) {
-                    int storage_id = (bidb * cute::ceil_div(params.seqlen_q_rounded, kBlockM) + m_block) * params.h + bidh;
+                    int storage_id = (bidb * m_block_max + m_block) * params.h + bidh;
                     // Fetch the synchronization lock initially but do not block.
                     semaphore.fetch(params.workspace + storage_id);
                     semaphore.wait(params.workspace + storage_id, blockIdx.x);

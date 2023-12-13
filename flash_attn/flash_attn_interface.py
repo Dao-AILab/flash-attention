@@ -1104,5 +1104,5 @@ def flash_attn_with_kvcache(
     )
     return out
 
-def flash_get_bwd_workspace_size():
-    return flash_attn_cuda.get_bwd_workspace_size()
+def flash_get_bwd_workspace_size_func(b, n, s, h):
+    return flash_attn_cuda.get_bwd_workspace_size(b, n, s, h)
