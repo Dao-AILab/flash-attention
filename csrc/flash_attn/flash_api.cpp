@@ -639,6 +639,8 @@ size_t mha_bwd_workspace_size(const int blockM, Flash_bwd_params &params) {
 }
 
 size_t get_mha_bwd_workspace_size_hdim32(Flash_bwd_params &params) {
+    return mha_bwd_workspace_size(128, params);
+    /*
     constexpr static int Headdim = 32;
     int device;
     cudaGetDevice(&device);
@@ -651,6 +653,7 @@ size_t get_mha_bwd_workspace_size_hdim32(Flash_bwd_params &params) {
     } else {  // 96 KB
         return mha_bwd_workspace_size(128, params);
     }
+    */
 }
 
 size_t get_mha_bwd_workspace_size_hdim64(Flash_bwd_params &params) {
@@ -669,7 +672,9 @@ size_t get_mha_bwd_workspace_size_hdim64(Flash_bwd_params &params) {
 }
 
 size_t get_mha_bwd_workspace_size_hdim96(Flash_bwd_params &params) {
-    // constexpr static int Headdim = 96;
+    return mha_bwd_workspace_size(64, params);
+    /*
+    constexpr static int Headdim = 96;
     int device;
     cudaGetDevice(&device);
     int max_smem_per_block;
@@ -682,10 +687,13 @@ size_t get_mha_bwd_workspace_size_hdim96(Flash_bwd_params &params) {
     } else {
         return mha_bwd_workspace_size(64, params);
     }
+    */
 }
 
 size_t get_mha_bwd_workspace_size_hdim128(Flash_bwd_params &params) {
-    // constexpr static int Headdim = 128;
+    return mha_bwd_workspace_size(64, params);
+    /*
+    constexpr static int Headdim = 128;
     int device;
     cudaGetDevice(&device);
     int max_smem_per_block;
@@ -697,10 +705,13 @@ size_t get_mha_bwd_workspace_size_hdim128(Flash_bwd_params &params) {
     } else {
         return mha_bwd_workspace_size(64, params);
     }
+    */
 }
 
 size_t get_mha_bwd_workspace_size_hdim160(Flash_bwd_params &params) {
-    // constexpr static int Headdim = 160;
+    return mha_bwd_workspace_size(64, params);
+    /*
+    constexpr static int Headdim = 160;
     int device;
     cudaGetDevice(&device);
     int max_smem_per_block;
@@ -712,10 +723,13 @@ size_t get_mha_bwd_workspace_size_hdim160(Flash_bwd_params &params) {
     } else {
         return mha_bwd_workspace_size(64, params);
     }
+    */
 }
 
 size_t get_mha_bwd_workspace_size_hdim192(Flash_bwd_params &params) {
-    // constexpr static int Headdim = 192;
+    return mha_bwd_workspace_size(64, params);
+    /*
+    constexpr static int Headdim = 192;
     int device;
     cudaGetDevice(&device);
     int max_smem_per_block;
@@ -726,6 +740,7 @@ size_t get_mha_bwd_workspace_size_hdim192(Flash_bwd_params &params) {
     } else {
         return mha_bwd_workspace_size(64, params);
     }
+    */
 }
 
 size_t get_mha_bwd_workspace_size_hdim224(Flash_bwd_params &params) {
@@ -734,7 +749,9 @@ size_t get_mha_bwd_workspace_size_hdim224(Flash_bwd_params &params) {
 }
 
 size_t get_mha_bwd_workspace_size_hdim256(Flash_bwd_params &params) {
-    // constexpr static int Headdim = 256;
+    return mha_bwd_workspace_size(64, params);
+    /*
+    constexpr static int Headdim = 256;
     int device;
     cudaGetDevice(&device);
     int max_smem_per_block;
@@ -745,6 +762,7 @@ size_t get_mha_bwd_workspace_size_hdim256(Flash_bwd_params &params) {
     } else {  // A100, we don't do double buffering to save smem
         return mha_bwd_workspace_size(64, params);
     }
+    */
 }
 
 size_t get_mha_bwd_workspace_size(Flash_bwd_params &params) {
