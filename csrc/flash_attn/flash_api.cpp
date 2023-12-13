@@ -956,11 +956,17 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      window_size_right,
                      is_deterministic);
 
-    if(is_deterministic) {
+    if (is_deterministic) {
         // TODO: workaround this limitation later
-        TORCH_CHECK(workspace_.has_value(), "If Is_deterministic is true, extra workspace needed.");
         TORCH_CHECK(window_size_left == -1 && window_size_right <= 0, "If Is_deterministic is true, Is_local should be false.");
-        at::Tensor workspace = workspace_.value();
+        at::Tensor workspace;
+        if (workspace_.has_value()) {
+            workspace = workspace_.value();
+        } else {
+            TORCH_WARN("If is_deterministic is true, extra workspace needed.");
+            size_t workspace_size = get_mha_bwd_workspace_size(params);
+            workspace = torch::zeros({workspace_size}, opts.dtype(at::kInt));
+        }
         params.workspace = static_cast<int *>(workspace.data_ptr());
     }
 
@@ -1199,11 +1205,17 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      window_size_right,
                      is_deterministic);
 
-    if(is_deterministic) {
+    if (is_deterministic) {
         // TODO: workaround this limitation later
-        TORCH_CHECK(workspace_.has_value(), "If Is_deterministic is true, extra workspace needed.");
         TORCH_CHECK(window_size_left == -1 && window_size_right <= 0, "If Is_deterministic is true, Is_local should be false.");
-        at::Tensor workspace = workspace_.value();
+        at::Tensor workspace;
+        if (workspace_.has_value()) {
+            workspace = workspace_.value();
+        } else {
+            TORCH_WARN("If is_deterministic is true, extra workspace needed.");
+            size_t workspace_size = get_mha_bwd_workspace_size(params);
+            workspace = torch::zeros({workspace_size}, opts.dtype(at::kInt));
+        }
         params.workspace = static_cast<int *>(workspace.data_ptr());
     }
 
