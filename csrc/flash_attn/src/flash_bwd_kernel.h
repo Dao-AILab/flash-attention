@@ -674,6 +674,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     // Otherwise we get wrong result for the case where we don't enter the for loop.
     // And we might read OOB elements from gQ and gdO.
     // This also covers the case where actual_seqlen_q == 0
+
     if ((Is_local || !Is_even_MN) && m_block < m_block_min) {
         const index_t row_offset_dk = binfo.k_offset(params.dk_batch_stride, params.dk_row_stride, bidb)
           + n_block * kBlockN * params.dk_row_stride + bidh * params.dk_head_stride;
@@ -1005,10 +1006,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                     for (int i = 0; i < size(acc_dq); ++i) { atomicAdd(&tdQgdQaccum(i), acc_dq(i)); }
                     // If the workspace data is not initialized to zero,
                     // then this commented-out code needs to be executed.
-                    // if (blockIdx.x == (gridDim.x - 1)) { //
+                    // if (blockIdx.x == (gridDim.x - 1)) {
                     //     semaphore.release(params.workspace + storage_id, 0);
                     // } else {
-                        semaphore.release(params.workspace + storage_id, blockIdx.x + 1); 
+                        semaphore.release(params.workspace + storage_id, blockIdx.x + 1);
+                    // }
                 } else {
                     #pragma unroll
                     for (int i = 0; i < size(acc_dq); ++i) { atomicAdd(&tdQgdQaccum(i), acc_dq(i)); }

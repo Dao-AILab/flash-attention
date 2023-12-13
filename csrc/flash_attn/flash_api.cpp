@@ -795,6 +795,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         c10::optional<at::Tensor> &dq_,   // batch_size x seqlen_q x num_heads x head_size
         c10::optional<at::Tensor> &dk_,   // batch_size x seqlen_k x num_heads_k x head_size
         c10::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
+        c10::optional<at::Tensor> &workspace_,   // b x h x s / blockM
         const float p_dropout,         // probability to drop
         const float softmax_scale,
         const bool is_causal,
@@ -955,12 +956,11 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      window_size_right,
                      is_deterministic);
 
-    at::Tensor workspace;
     if(is_deterministic) {
         // TODO: workaround this limitation later
+        TORCH_CHECK(workspace_.has_value(), "If Is_deterministic is true, extra workspace needed.");
         TORCH_CHECK(window_size_left == -1 && window_size_right <= 0, "If Is_deterministic is true, Is_local should be false.");
-        size_t workspace_size = get_mha_bwd_workspace_size(params);
-        workspace = torch::zeros({workspace_size}, opts.dtype(at::kInt));
+        at::Tensor workspace = workspace_.value();
         params.workspace = static_cast<int *>(workspace.data_ptr());
     }
 
@@ -1017,6 +1017,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                c10::optional<at::Tensor> &dq_,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                c10::optional<at::Tensor> &dk_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                c10::optional<at::Tensor> &dv_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               c10::optional<at::Tensor> &workspace_,   // b x h x s / blockM
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
                const int max_seqlen_q,
@@ -1198,12 +1199,11 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      window_size_right,
                      is_deterministic);
 
-    at::Tensor workspace;
     if(is_deterministic) {
         // TODO: workaround this limitation later
-        TORCH_CHECK(window_size_left == -1 && window_size_right <=0, "If Is_deterministic is true, Is_local should be false.");
-        size_t workspace_size = get_mha_bwd_workspace_size(params);
-        workspace = torch::zeros({workspace_size}, opts.dtype(at::kInt));
+        TORCH_CHECK(workspace_.has_value(), "If Is_deterministic is true, extra workspace needed.");
+        TORCH_CHECK(window_size_left == -1 && window_size_right <= 0, "If Is_deterministic is true, Is_local should be false.");
+        at::Tensor workspace = workspace_.value();
         params.workspace = static_cast<int *>(workspace.data_ptr());
     }
 
@@ -1494,4 +1494,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bwd", &mha_bwd, "Backward pass");
     m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
     m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
+    m.def("get_bwd_workspace_size", &get_mha_bwd_workspace_size, "Backward pass, get extra workspace size");
 }

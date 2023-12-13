@@ -117,11 +117,14 @@ def _flash_attn_backward(
     causal,
     window_size,
     rng_state=None,
+    workspace=None,
     deterministic=False,
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    if workspace != None:
+        workspace = workspace.zero_()
     dq, dk, dv, softmax_d, = flash_attn_cuda.bwd(
         dout,
         q,
@@ -132,6 +135,7 @@ def _flash_attn_backward(
         dq,
         dk,
         dv,
+        workspace,
         dropout_p,
         softmax_scale,
         causal,
@@ -163,11 +167,14 @@ def _flash_attn_varlen_backward(
     causal,
     window_size,
     rng_state=None,
+    workspace=None,
     deterministic=False,
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    if workspace != None:
+        workspace = workspace.zero_()
     dq, dk, dv, softmax_d, = flash_attn_cuda.varlen_bwd(
         dout,
         q,
@@ -178,6 +185,7 @@ def _flash_attn_varlen_backward(
         dq,
         dk,
         dv,
+        workspace,
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
@@ -199,7 +207,7 @@ def _flash_attn_varlen_backward(
 
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, qkv, dropout_p, softmax_scale, causal, window_size, return_softmax, deterministic):
+    def forward(ctx, qkv, dropout_p, softmax_scale, causal, window_size, return_softmax, workspace, deterministic):
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
         out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
@@ -217,6 +225,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.workspace = workspace
         ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
@@ -240,6 +249,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             rng_state=rng_state,
+            workspace=ctx.workspace,
             deterministic=ctx.deterministic,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
@@ -258,6 +268,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         causal,
         window_size,
         return_softmax,
+        workspace,
         deterministic,
     ):
         if softmax_scale is None:
@@ -282,6 +293,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.workspace = workspace
         ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
@@ -309,6 +321,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             rng_state=rng_state,
+            workspace=ctx.workspace,
             deterministic=ctx.deterministic,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
@@ -317,7 +330,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
 
 class FlashAttnKVPackedFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, kv, dropout_p, softmax_scale, causal, window_size, return_softmax, deterministic):
+    def forward(ctx, q, kv, dropout_p, softmax_scale, causal, window_size, return_softmax, workspace, deterministic):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
@@ -335,6 +348,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.workspace = workspace
         ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
@@ -359,6 +373,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             rng_state=rng_state,
+            workspace=ctx.workspace,
             deterministic=ctx.deterministic,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
@@ -381,6 +396,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         causal,
         window_size,
         return_softmax,
+        workspace,
         deterministic,
     ):
         if softmax_scale is None:
@@ -408,6 +424,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.workspace = workspace
         ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
@@ -436,6 +453,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             rng_state=rng_state,
+            workspace=ctx.workspace,
             deterministic=ctx.deterministic,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
@@ -445,7 +463,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
 
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, dropout_p, softmax_scale, causal, window_size, return_softmax, deterministic):
+    def forward(ctx, q, k, v, dropout_p, softmax_scale, causal, window_size, return_softmax, workspace, deterministic):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
@@ -463,6 +481,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.workspace = workspace
         ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
@@ -485,6 +504,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             rng_state=rng_state,
+            workspace=ctx.workspace,
             deterministic=ctx.deterministic,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
@@ -509,6 +529,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         causal,
         window_size,
         return_softmax,
+        workspace,
         deterministic,
     ):
         if softmax_scale is None:
@@ -536,6 +557,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.workspace = workspace
         ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
@@ -562,6 +584,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             rng_state=rng_state,
+            workspace=ctx.workspace,
             deterministic=ctx.deterministic,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
@@ -577,6 +600,7 @@ def flash_attn_qkvpacked_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     return_attn_probs=False,
+    workspace=None,
     deterministic=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -609,7 +633,7 @@ def flash_attn_qkvpacked_func(
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     return FlashAttnQKVPackedFunc.apply(
-        qkv, dropout_p, softmax_scale, causal, window_size, return_attn_probs, deterministic
+        qkv, dropout_p, softmax_scale, causal, window_size, return_attn_probs, workspace, deterministic
     )
 
 
@@ -621,6 +645,7 @@ def flash_attn_kvpacked_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     return_attn_probs=False,
+    workspace=None,
     deterministic=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -669,7 +694,7 @@ def flash_attn_kvpacked_func(
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     return FlashAttnKVPackedFunc.apply(
-        q, kv, dropout_p, softmax_scale, causal, window_size, return_attn_probs, deterministic
+        q, kv, dropout_p, softmax_scale, causal, window_size, return_attn_probs, workspace, deterministic
     )
 
 
@@ -682,6 +707,7 @@ def flash_attn_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     return_attn_probs=False,
+    workspace=None,
     deterministic=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -728,7 +754,7 @@ def flash_attn_func(
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     return FlashAttnFunc.apply(
-        q, k, v, dropout_p, softmax_scale, causal, window_size, return_attn_probs, deterministic
+        q, k, v, dropout_p, softmax_scale, causal, window_size, return_attn_probs, workspace, deterministic
     )
 
 
@@ -741,6 +767,7 @@ def flash_attn_varlen_qkvpacked_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     return_attn_probs=False,
+    workspace=None,
     deterministic=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -784,6 +811,7 @@ def flash_attn_varlen_qkvpacked_func(
         causal,
         window_size,
         return_attn_probs,
+        workspace,
         deterministic,
     )
 
@@ -800,6 +828,7 @@ def flash_attn_varlen_kvpacked_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     return_attn_probs=False,
+    workspace=None,
     deterministic=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -865,6 +894,7 @@ def flash_attn_varlen_kvpacked_func(
         causal,
         window_size,
         return_attn_probs,
+        workspace,
         deterministic,
     )
 
@@ -882,6 +912,7 @@ def flash_attn_varlen_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     return_attn_probs=False,
+    workspace=None,
     deterministic=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -946,6 +977,7 @@ def flash_attn_varlen_func(
         causal,
         window_size,
         return_attn_probs,
+        workspace,
         deterministic,
     )
 
@@ -1071,3 +1103,6 @@ def flash_attn_with_kvcache(
         num_splits,
     )
     return out
+
+def flash_get_bwd_workspace_size():
+    return flash_attn_cuda.get_bwd_workspace_size()
