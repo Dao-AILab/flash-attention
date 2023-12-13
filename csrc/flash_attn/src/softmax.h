@@ -115,7 +115,7 @@ inline __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &tensor, Tens
     }
 }
 
-template <typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+template <bool Is_Even_NM, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 inline __device__ void apply_attn_bias(Tensor<Engine0, Layout0> &tensor,
                                    Tensor<Engine1, Layout1> &bias_fragment,
                                    const int col_idx_offset_,
@@ -142,7 +142,7 @@ inline __device__ void apply_attn_bias(Tensor<Engine0, Layout0> &tensor,
                 #pragma unroll
                 for (int j = 0; j < size<1, 0>(tensor); ++j) {
                     const int col_idx = col_idx_base + j;
-                    if (col_idx < max_seqlen_k && row_idx < max_seqlen_q) {
+                    if (Is_Even_NM || (col_idx < max_seqlen_k && row_idx < max_seqlen_q)) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) += (bias_fragment(make_coord(i, mi), make_coord(j, nj)) / softmax_scale);
                     }
                 }

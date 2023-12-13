@@ -392,7 +392,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor bias_fragment = make_tensor(tBrB.data(), flash::convert_layout_acc_rowcol(tBrB.layout()));
 
         if (Has_attn_bias) {
-            flash::apply_attn_bias(
+            flash::apply_attn_bias<Is_even_MN>(
                 scores, bias_fragment,
                 n_block * kBlockN,
                 binfo.actual_seqlen_k,
@@ -533,7 +533,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor bias_fragment = make_tensor(tBrB.data(), flash::convert_layout_acc_rowcol(tBrB.layout()));
 
         if (Has_attn_bias) {
-            flash::apply_attn_bias(
+            flash::apply_attn_bias<Is_even_MN>(
                 scores, bias_fragment,
                 n_block * kBlockN,
                 binfo.actual_seqlen_k,
