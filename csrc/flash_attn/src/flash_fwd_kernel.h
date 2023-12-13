@@ -866,7 +866,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     }
 
     // Read Q from gmem to smem, optionally apply rotary embedding.
-    Tensor tQrQ = make_fragment_like(tQgQ);
+    // Tensor tQrQ = make_fragment_like(tQgQ);
     if (!Append_KV || params.rotary_dim == 0) {
         // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
         flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,

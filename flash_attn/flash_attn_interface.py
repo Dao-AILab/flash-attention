@@ -1051,8 +1051,10 @@ def get_kvcache_block_size(head_dim):
         return 256
     elif head_dim <= 128:
         return 128
-    else:
+    elif head_dim <= 256:
         return 64
+    else:
+        return 32
 
 
 def flash_attn_with_blocked_kvcache(
