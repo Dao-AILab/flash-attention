@@ -45,20 +45,38 @@ SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 
+def get_system():
+    """
+    Returns the system name as used in wheel filenames.
+    """
+    if platform.system() == "Windows":
+        "win"
+    elif platform.system() == "Darwin":
+        mac_version = ".".join(platform.mac_ver()[0].split(".")[:1])
+        f"macos_{mac_version}"
+    elif platform.system() == "Linux":
+        "linux"
+    else:
+        raise ValueError("Unsupported system: {}".format(platform.system()))
+
+
+def get_arch():
+    """
+    Returns the system name as used in wheel filenames.
+    """
+    if platform.machine() == "x86_64":
+        "x86_64"
+    elif platform.machine() == "arm64" or platform.machine() == "aarch64":
+        "aarch64"
+    else:
+        raise ValueError("Unsupported arch: {}".format(platform.machine()))
+
 
 def get_platform():
     """
     Returns the platform name as used in wheel filenames.
     """
-    if sys.platform.startswith("linux"):
-        return "linux_x86_64"
-    elif sys.platform == "darwin":
-        mac_version = ".".join(platform.mac_ver()[0].split(".")[:2])
-        return f"macosx_{mac_version}_x86_64"
-    elif sys.platform == "win32":
-        return "win_amd64"
-    else:
-        raise ValueError("Unsupported platform: {}".format(sys.platform))
+    f"{get_system()}_{get_arch()}"
 
 
 def get_cuda_bare_metal_version(cuda_dir):
