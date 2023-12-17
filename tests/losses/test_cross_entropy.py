@@ -30,8 +30,8 @@ def test_cross_entropy_loss(
     rtol, atol = (1e-5, 1e-6) if dtype == torch.float32 else (1e-3, 1e-4)
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 8
-    seqlen = 128
+    batch_size = 1 if dtype == torch.float32 else 4  # Otherwise OOM
+    seqlen = 4096 if lse_square_scale == 0.0 and logit_scale == 1.0 else 1024  # Otherwise OOM
     x_pt = torch.randn(
         batch_size * seqlen, vocab_size, device=device, dtype=dtype, requires_grad=True
     )
@@ -47,9 +47,10 @@ def test_cross_entropy_loss(
         inplace_backward=inplace_backward,
     )
     out = model(x, y)
-    out_pt = model_pt(x_pt.float() * logit_scale, y)
+    x_pt_scaled = (x_pt.float() * logit_scale) if logit_scale != 1.0 else x_pt.float()
+    out_pt = model_pt(x_pt_scaled, y)
     if lse_square_scale > 0.0:
-        lse_pt = torch.logsumexp(x_pt.float() * logit_scale, dim=-1)
+        lse_pt = torch.logsumexp(x_pt_scaled, dim=-1)
         out_pt += lse_square_scale * (lse_pt[y != -100] ** 2).mean()
     assert torch.allclose(out, out_pt, rtol=1e-5, atol=1e-6)
 
