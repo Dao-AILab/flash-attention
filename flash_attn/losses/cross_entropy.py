@@ -12,6 +12,7 @@ class CrossEntropyLoss(nn.Module):
         ignore_index=-100,
         reduction="mean",
         label_smoothing=0.0,
+        logit_scale=1.0,
         lse_square_scale=0.0,
         inplace_backward=False,
         process_group=None,
@@ -33,6 +34,7 @@ class CrossEntropyLoss(nn.Module):
         self.ignore_index = ignore_index
         self.reduction = reduction
         self.label_smoothing = label_smoothing
+        self.logit_scale = logit_scale
         self.lse_square_scale = lse_square_scale
         self.inplace_backward = inplace_backward
         self.process_group = process_group
@@ -50,6 +52,7 @@ class CrossEntropyLoss(nn.Module):
             input,
             target,
             label_smoothing=self.label_smoothing,
+            logit_scale=self.logit_scale,
             lse_square_scale=self.lse_square_scale,
             ignored_index=self.ignore_index,
             inplace_backward=self.inplace_backward,
