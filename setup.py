@@ -93,7 +93,7 @@ ext_modules = []
 # files included in the source distribution, in case the user compiles from source.
 subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
-if not SKIP_CUDA_BUILD:
+if True:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
@@ -256,7 +256,7 @@ class CachedWheelsCommand(_bdist_wheel):
     """
 
     def run(self):
-        if FORCE_BUILD:
+        if True:
             return super().run()
 
         wheel_url, wheel_filename = get_wheel_url()

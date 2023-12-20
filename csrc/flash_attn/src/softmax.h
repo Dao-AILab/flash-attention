@@ -179,6 +179,39 @@ inline __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor, const in
 }
 
 template <typename Engine, typename Layout>
+inline __device__ void apply_mask_bidirectional_mlm(Tensor<Engine, Layout> &tensor, const int col_idx_offset_,
+                                         const int max_seqlen_k, const int row_idx_offset_,
+                                         const int max_seqlen_q, const int warp_row_stride) {
+    // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
+    static_assert(Layout::rank == 2, "Only support 2D Tensor");
+    const int lane_id = threadIdx.x % 32;
+    // const int row_idx_offset = row_idx_offset_ + lane_id / 4;
+    const int row_idx_offset = row_idx_offset_;
+    const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+    #pragma unroll
+    for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+        const int row_idx_base = row_idx_offset + mi * warp_row_stride;
+        #pragma unroll
+        for (int i = 0; i < size<0, 0>(tensor); ++i) {
+            const int row_idx = row_idx_base + i * 8;
+            #pragma unroll
+            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+                const int col_idx_base = col_idx_offset + nj * 8;
+                const int col_idx_limit = max_seqlen_k - col_idx_base;
+                const int j1 = col_idx_limit + row_idx - max_seqlen_q;
+                if (0 <= j1 && j1 < size<1, 0>(tensor)) {
+                    tensor(make_coord(i, mi), make_coord(j1, nj)) = -INFINITY;
+                }
+                #pragma unroll
+                for (int j2 = std::max(0, col_idx_limit); j2 < size<1, 0>(tensor); ++j2) {
+                    tensor(make_coord(i, mi), make_coord(j2, nj)) = -INFINITY;
+                }
+            }
+        }
+    }
+}
+
+template <typename Engine, typename Layout>
 inline __device__ void apply_mask_causal(Tensor<Engine, Layout> &tensor, const int col_idx_offset_,
                                          const int max_seqlen_k, const int row_idx_offset_,
                                          const int max_seqlen_q, const int warp_row_stride) {

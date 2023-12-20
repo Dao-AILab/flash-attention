@@ -73,6 +73,7 @@ def _flash_attn_varlen_forward(
     dropout_p,
     softmax_scale,
     causal,
+    masked_language_model,
     window_size,
     return_softmax,
 ):
@@ -92,6 +93,7 @@ def _flash_attn_varlen_forward(
         softmax_scale,
         False,
         causal,
+        masked_language_model,
         window_size[0],
         window_size[1],
         return_softmax,
@@ -159,6 +161,7 @@ def _flash_attn_varlen_backward(
     dropout_p,
     softmax_scale,
     causal,
+    masked_language_model,
     window_size,
     rng_state=None,
 ):
@@ -183,6 +186,7 @@ def _flash_attn_varlen_backward(
         softmax_scale,
         False,
         causal,
+        masked_language_model,
         window_size[0],
         window_size[1],
         None,
@@ -250,6 +254,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         dropout_p,
         softmax_scale,
         causal,
+        masked_language_model,
         window_size,
         return_softmax,
     ):
@@ -266,6 +271,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             dropout_p,
             softmax_scale,
             causal=causal,
+            masked_language_model=masked_language_model,
             window_size=window_size,
             return_softmax=return_softmax and dropout_p > 0,
         )
@@ -274,6 +280,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         ctx.max_seqlen = max_seqlen
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.masked_language_model = masked_language_model
         ctx.window_size = window_size
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
@@ -299,6 +306,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             ctx.dropout_p,
             ctx.softmax_scale,
             ctx.causal,
+            ctx.masked_language_model,
             ctx.window_size,
             rng_state=rng_state,
         )
@@ -368,6 +376,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         dropout_p,
         softmax_scale,
         causal,
+        masked_language_model,
         window_size,
         return_softmax,
     ):
@@ -384,6 +393,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             dropout_p,
             softmax_scale,
             causal=causal,
+            masked_language_model=masked_language_model,
             window_size=window_size,
             return_softmax=return_softmax and dropout_p > 0,
         )
@@ -395,6 +405,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         ctx.max_seqlen_k = max_seqlen_k
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.masked_language_model = masked_language_model,
         ctx.window_size = window_size
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
@@ -421,6 +432,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             ctx.dropout_p,
             ctx.softmax_scale,
             ctx.causal,
+            ctx.masked_language_model,
             ctx.window_size,
             rng_state=rng_state,
         )
@@ -491,6 +503,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dropout_p,
         softmax_scale,
         causal,
+        masked_language_model,
         window_size,
         return_softmax,
     ):
@@ -507,6 +520,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             dropout_p,
             softmax_scale,
             causal=causal,
+            masked_language_model=masked_language_model,
             window_size=window_size,
             return_softmax=return_softmax and dropout_p > 0,
         )
@@ -518,6 +532,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.max_seqlen_k = max_seqlen_k
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.masked_language_model = masked_language_model
         ctx.window_size = window_size
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
@@ -542,6 +557,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.dropout_p,
             ctx.softmax_scale,
             ctx.causal,
+            ctx.masked_language_model,
             ctx.window_size,
             rng_state=rng_state,
         )
@@ -717,6 +733,7 @@ def flash_attn_varlen_qkvpacked_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
+    masked_language_model=False,
     window_size=(-1, -1),  # -1 means infinite context window
     return_attn_probs=False,
 ):
@@ -759,6 +776,7 @@ def flash_attn_varlen_qkvpacked_func(
         dropout_p,
         softmax_scale,
         causal,
+        masked_language_model,
         window_size,
         return_attn_probs,
     )
@@ -774,6 +792,7 @@ def flash_attn_varlen_kvpacked_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
+    masked_language_model=False,
     window_size=(-1, -1),  # -1 means infinite context window
     return_attn_probs=False,
 ):
@@ -838,6 +857,7 @@ def flash_attn_varlen_kvpacked_func(
         dropout_p,
         softmax_scale,
         causal,
+        masked_language_model,
         window_size,
         return_attn_probs,
     )
@@ -854,6 +874,7 @@ def flash_attn_varlen_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
+    masked_language_model=False,
     window_size=(-1, -1),  # -1 means infinite context window
     return_attn_probs=False,
 ):
@@ -917,6 +938,7 @@ def flash_attn_varlen_func(
         dropout_p,
         softmax_scale,
         causal,
+        masked_language_model,
         window_size,
         return_attn_probs,
     )
