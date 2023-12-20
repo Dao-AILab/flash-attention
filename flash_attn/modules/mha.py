@@ -189,7 +189,7 @@ class SelfAttention(nn.Module):
         self.softmax_scale = softmax_scale
         self.drop = nn.Dropout(attention_dropout)
 
-    def forward(self, qkv, causal=None, key_padding_mask=None):
+    def forward(self, qkv, causal=None, key_padding_mask=None, return_attn_weights=False):
         """Implements the multihead softmax attention.
         Arguments
         ---------
@@ -220,7 +220,11 @@ class SelfAttention(nn.Module):
             scores = scores + causal_mask.to(dtype=scores.dtype)
         attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
         attention_drop = self.drop(attention)
-        output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
+        output = torch.einsum('bhts,bshd->bthd', attention_drop, v)
+
+        if return_attn_weights:
+            return output, attention
+
         return output
 
 
@@ -241,7 +245,7 @@ class CrossAttention(nn.Module):
         self.softmax_scale = softmax_scale
         self.drop = nn.Dropout(attention_dropout)
 
-    def forward(self, q, kv, causal=None, key_padding_mask=None):
+    def forward(self, q, kv, causal=None, key_padding_mask=None, return_attn_weights=False):
         """Implements the multihead softmax attention.
         Arguments
         ---------
@@ -282,7 +286,11 @@ class CrossAttention(nn.Module):
             scores = scores.masked_fill(causal_mask, -10000.0)
         attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
         attention_drop = self.drop(attention)
-        output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
+        output = torch.einsum('bhts,bshd->bthd', attention_drop, v)
+
+        if return_attn_weights:
+            return output, attention
+        
         return output
 
 
@@ -359,6 +367,8 @@ class MHA(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.cross_attn = cross_attn
+        self.dropout = dropout
+        self.softmax_scale = softmax_scale
         self.causal = causal
         self.layer_idx = layer_idx
         self.dwconv = dwconv
@@ -395,8 +405,7 @@ class MHA(nn.Module):
             LinearResidual if not fused_bias_fc else partial(FusedDense, return_residual=True)
         )
         wqkv_cls = linear_cls if not self.return_residual else linear_resid_cls
-        inner_attn_cls = FlashSelfAttention if use_flash_attn else SelfAttention
-        inner_cross_attn_cls = FlashCrossAttention if use_flash_attn else CrossAttention
+
         if not self.cross_attn:
             self.Wqkv = wqkv_cls(embed_dim, qkv_dim, bias=qkv_proj_bias, **factory_kwargs)
         else:
@@ -412,12 +421,9 @@ class MHA(nn.Module):
                     embed_dim, embed_dim, kernel_size=3, padding=2, groups=embed_dim
                 )
                 self.dwconv_kv = nn.Conv1d(kv_dim, kv_dim, kernel_size=3, padding=2, groups=kv_dim)
-        self.inner_attn = inner_attn_cls(
-            causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout
-        )
-        self.inner_cross_attn = inner_cross_attn_cls(
-            causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout
-        )
+        
+        self._init_attn_layers()
+
         self.out_proj = linear_cls(embed_dim, embed_dim, bias=out_proj_bias, **factory_kwargs)
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
@@ -432,6 +438,23 @@ class MHA(nn.Module):
             dtype=dtype,
             device=device,
         )
+
+    def _init_attn_layers(self):
+        inner_attn_cls = FlashSelfAttention if self.use_flash_attn else SelfAttention
+        inner_cross_attn_cls = FlashCrossAttention if self.use_flash_attn else CrossAttention
+
+        kwargs = dict(
+            causal=self.causal,
+            softmax_scale=self.softmax_scale,
+            attention_dropout=self.dropout
+        )
+
+        self.inner_attn = inner_attn_cls(**kwargs)
+        self.inner_cross_attn = inner_cross_attn_cls(**kwargs)
+    
+    def set_flash_attn(self, use_flash_attn):
+        self.use_flash_attn = use_flash_attn
+        self._init_attn_layers()
 
     def _update_kv_cache(self, kv, inference_params):
         """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
@@ -515,6 +538,7 @@ class MHA(nn.Module):
         max_seqlen=None,
         mixer_subset=None,
         inference_params=None,
+        return_attn_weights=False,
         **kwargs,
     ):
         """
@@ -533,6 +557,12 @@ class MHA(nn.Module):
                 before applying the query projection. Useful for e.g., ViT where we only care
                 about the CLS token in the last layer.
             inference_params: for generation. Adapted from Megatron-LM (and Apex)
+            return_attn_weights: whether to return the attention weights. Only applicable when
+                not using FlashAttention, i.e. module has been initiaLized with `use_flash_attn=False`
+                or `set_flash_attn(False)` has been called on an already initialized module.
+                Output will be `(output, attn_weights)` if `return_residual` is `False` and 
+                `((output, residual), attn_weights)` otherwise.
+
             https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
         """
         if cu_seqlens is not None:
@@ -555,6 +585,14 @@ class MHA(nn.Module):
             if self.use_flash_attn
             else {"key_padding_mask": key_padding_mask, **kwargs}
         )
+
+        if return_attn_weights:
+            assert not self.use_flash_attn, \
+                "Returning attention weights is not supported with FlashAttention. " \
+                "initialize the model with use_flash_attn=False or disable FlashAttention " \
+                "on an an already initialized module with set_flash_attn(False)"
+            kwargs["return_attn_weights"] = True
+
         seqlen_offset = (
             0
             if inference_params is None
@@ -589,15 +627,15 @@ class MHA(nn.Module):
                     )
                 if inference_params is None:
                     if not self.checkpointing:
-                        context = self.inner_attn(qkv, **kwargs)
+                        outputs = self.inner_attn(qkv, **kwargs)
                     else:
-                        context = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv, **kwargs)
+                        outputs = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv, **kwargs)
                 else:
-                    context = self._update_kvcache_attention(
+                    outputs = self._update_kvcache_attention(
                         qkv[:, :, 0], qkv[:, :, 1:], inference_params
                     )
             else:
-                context = self._apply_rotary_update_kvcache_attention(
+                outputs = self._apply_rotary_update_kvcache_attention(
                     qkv[:, :, 0], qkv[:, :, 1:], inference_params
                 )
         else:
@@ -640,17 +678,30 @@ class MHA(nn.Module):
                     )
                 if inference_params is None:
                     if not self.checkpointing:
-                        context = self.inner_cross_attn(q, kv, **kwargs)
+                        outputs = self.inner_cross_attn(q, kv, **kwargs)
                     else:
-                        context = torch.utils.checkpoint.checkpoint(
+                        outputs = torch.utils.checkpoint.checkpoint(
                             self.inner_cross_attn, q, kv, **kwargs
                         )
                 else:
-                    context = self._update_kvcache_attention(q, kv, inference_params)
+                    outputs = self._update_kvcache_attention(q, kv, inference_params)
             else:
-                context = self._apply_rotary_update_kvcache_attention(q, kv, inference_params)
+                outputs = self._apply_rotary_update_kvcache_attention(q, kv, inference_params)
+
+        if return_attn_weights:
+            context, attn_weights = outputs
+        else:
+            context = outputs
+
         out = self.out_proj(rearrange(context, "... h d -> ... (h d)"))
-        return out if not self.return_residual else (out, x)
+
+        if self.return_residual:
+            out = (out, x)
+        
+        if return_attn_weights:
+            return out, attn_weights
+        else:
+            return out
 
 
 class ParallelMHA(nn.Module):
