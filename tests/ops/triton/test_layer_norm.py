@@ -16,12 +16,14 @@ from flash_attn.ops.triton.layernorm import (
 is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 
 
+@pytest.mark.parametrize("dropout_p", [0.0, 0.27])
+# @pytest.mark.parametrize("dropout_p", [0.27])
 @pytest.mark.parametrize("prenorm", [True, False])
-# @pytest.mark.parametrize("prenorm", [True])
+# @pytest.mark.parametrize("prenorm", [False])
 @pytest.mark.parametrize("is_rms_norm", [False, True])
 # @pytest.mark.parametrize("is_rms_norm", [True])
 @pytest.mark.parametrize("has_residual", [True, False])
-# @pytest.mark.parametrize("has_residual", [False])
+# @pytest.mark.parametrize("has_residual", [True])
 @pytest.mark.parametrize(
     "weight_dtype", [torch.float32, torch.float16] + ([torch.bfloat16] if is_sm8x else [])
 )
@@ -31,11 +33,18 @@ is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
     [(torch.float16, torch.float16), (torch.float16, torch.float32), (torch.float32, torch.float32)]
     + ([(torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32)] if is_sm8x else []),
 )
-# @pytest.mark.parametrize("input_dtype,residual_dtype", [(torch.bfloat16, torch.float32)])
-@pytest.mark.parametrize("hidden_size", [192, 2048, 2560, 3000, 8192])
+# @pytest.mark.parametrize("input_dtype,residual_dtype", [(torch.float16, torch.float16)])
+@pytest.mark.parametrize("hidden_size", [192, 2048, 2560, 3000, 4096])
 # @pytest.mark.parametrize("hidden_size", [256])
 def test_layer_norm(
-    hidden_size, input_dtype, residual_dtype, weight_dtype, has_residual, is_rms_norm, prenorm
+    hidden_size,
+    input_dtype,
+    residual_dtype,
+    weight_dtype,
+    has_residual,
+    is_rms_norm,
+    prenorm,
+    dropout_p,
 ):
     device = "cuda"
     if any(x == torch.bfloat16 for x in [input_dtype, residual_dtype, weight_dtype]):
@@ -48,8 +57,6 @@ def test_layer_norm(
     torch.random.manual_seed(0)
     batch_size = 8
     seqlen = 512
-    # batch_size = 1
-    # seqlen = 1
     layer_norm_ref_fn = layer_norm_ref if not is_rms_norm else rms_norm_ref
     allclose = (
         lambda x, x_pt, x_ref, atol=atol: (x - x_ref).abs().max()
@@ -83,25 +90,46 @@ def test_layer_norm(
         bias,
         residual=res,
         eps=1e-6,
+        dropout_p=dropout_p,
         prenorm=prenorm,
         residual_in_fp32=residual_in_fp32,
         is_rms_norm=is_rms_norm,
+        return_dropout_mask=True,
     )
-    out_pt, *rest_pt = layer_norm_ref_fn(
-        x0_pt, weight_pt, bias_pt, residual=res_pt, eps=1e-6, prenorm=prenorm
+    dropout_mask = rest[-1] if dropout_p > 0.0 else None
+    out_pt = layer_norm_ref_fn(
+        x0_pt,
+        weight_pt,
+        bias_pt,
+        residual=res_pt,
+        eps=1e-6,
+        dropout_p=dropout_p,
+        prenorm=prenorm,
+        dropout_mask=dropout_mask,
     )
-    out_ref, *rest_ref = layer_norm_ref_fn(
-        x0_ref, weight_ref, bias_ref, residual=res_ref, eps=1e-6, prenorm=prenorm, upcast=True
+    out_ref = layer_norm_ref_fn(
+        x0_ref,
+        weight_ref,
+        bias_ref,
+        residual=res_ref,
+        eps=1e-6,
+        dropout_p=dropout_p,
+        prenorm=prenorm,
+        dropout_mask=dropout_mask,
+        upcast=True,
     )
     if prenorm:
         residual = rest[0]
-        residual_pt = rest_pt[0]
-        residual_ref = rest_ref[0]
+        out_pt, residual_pt = out_pt
+        out_ref, residual_ref = out_ref
     assert out.dtype == input_dtype
     if prenorm:
         assert residual.dtype == residual_dtype
         assert allclose(residual, residual_pt, residual_ref)
     assert allclose(out, out_pt, out_ref)
+    if dropout_mask is not None:
+        dropout_fraction = 1.0 - dropout_mask.float().mean()
+        assert abs(dropout_fraction - dropout_p) < 0.01
 
     g = torch.randn_like(out) / batch_size
     if not prenorm:
@@ -128,9 +156,9 @@ def test_layer_norm(
 # @pytest.mark.parametrize("has_residual", [False])
 @pytest.mark.parametrize("weight_dtype", [torch.float32])
 @pytest.mark.parametrize(
-"input_dtype,residual_dtype",
-[(torch.float16, torch.float16), (torch.float16, torch.float32)]
-+ ([(torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32)] if is_sm8x else []),
+    "input_dtype,residual_dtype",
+    [(torch.float16, torch.float16), (torch.float16, torch.float32)]
+    + ([(torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32)] if is_sm8x else []),
 )
 # @pytest.mark.parametrize("input_dtype,residual_dtype", [(torch.bfloat16, torch.float32)])
 @pytest.mark.parametrize("hidden_size", [192, 2048, 2560, 3000])
