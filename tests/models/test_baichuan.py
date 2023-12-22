@@ -2,8 +2,6 @@ import os
 import time
 from pathlib import Path
 
-current_dir = Path(__file__).parent.absolute()
-
 import torch
 import pytest
 
@@ -20,16 +18,12 @@ from flash_attn.models.baichuan import (
     remap_state_dict_hf_baichuan,
     baichuan_config_to_gpt2_config,
 )
-from flash_attn.models.baichuan import (
-    config_from_checkpoint,
-    state_dicts_from_checkpoint,
-)
 from flash_attn.utils.distributed import all_gather_raw
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 from flash_attn.utils.generation import update_graph_cache
 
 
-@pytest.mark.parametrize("model_name", ["baichuan-inc/Baichuan-7B"])
+@pytest.mark.parametrize("model_name", ["baichuan-inc/Baichuan-7B", "baichuan-inc/Baichuan-13B-Base"])
 def test_baichuan_state_dict(model_name):
     config = baichuan_config_to_gpt2_config(
         AutoConfig.from_pretrained(model_name, trust_remote_code=True)
@@ -45,7 +39,7 @@ def test_baichuan_state_dict(model_name):
         assert state_dict[k].shape == pretrained_state_dict[k].shape
 
 
-@pytest.mark.parametrize("model_name", ["baichuan-inc/Baichuan-7B"])
+@pytest.mark.parametrize("model_name", ["baichuan-inc/Baichuan-7B", "baichuan-inc/Baichuan-13B-Base"])
 def test_baichuan_optimized(model_name):
     """Check that our implementation of Baichuan (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
@@ -122,7 +116,7 @@ def test_baichuan_optimized(model_name):
 
 # torchrun --no_python --nproc_per_node=2 pytest -q -s tests/models/test_baichuan.py -k "test_baichuan_parallel_forward"
 @pytest.mark.parametrize("world_size", [2])
-@pytest.mark.parametrize("model_name", ["baichuan-inc/Baichuan-7B"])
+@pytest.mark.parametrize("model_name", ["baichuan-inc/Baichuan-7B", "baichuan-inc/Baichuan-13B-Base"])
 def test_baichuan_parallel_forward(model_name, world_size):
     """Check that our implementation of Baichuan (with all optimizations enabled) matches the
     HF implementation: the output of our forward pass in fp16 should be around the same as the HF
@@ -217,7 +211,7 @@ def test_baichuan_parallel_forward(model_name, world_size):
         ).abs().max().item()
 
 
-@pytest.mark.parametrize("model_name", ["baichuan-inc/Baichuan-7B"])
+@pytest.mark.parametrize("model_name", ["baichuan-inc/Baichuan-7B", "baichuan-inc/Baichuan-13B-Base"])
 def test_baichuan_generation(model_name):
     dtype = torch.float16
     device = "cuda"

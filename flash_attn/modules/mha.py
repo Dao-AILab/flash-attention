@@ -33,6 +33,23 @@ except ImportError:
     RotaryEmbedding = None
 
 
+# From https://github.com/ofirpress/attention_with_linear_biases/blob/4b92f28a005ead2567abe2359f633e73e08f3833/fairseq/models/transformer.py#L742
+def get_alibi_slopes(nheads):
+    def get_slopes_power_of_2(nheads):
+        start = 2 ** (-(2 ** -(math.log2(nheads) - 3)))
+        ratio = start
+        return [start * ratio**i for i in range(nheads)]
+
+    if math.log2(nheads).is_integer():
+        return get_slopes_power_of_2(nheads)
+    else:
+        closest_power_of_2 = 2 ** math.floor(math.log2(nheads))
+        return (
+            get_slopes_power_of_2(closest_power_of_2)
+            + get_alibi_slopes(2 * closest_power_of_2)[0::2][: nheads - closest_power_of_2]
+        )
+
+
 class FlashSelfAttention(nn.Module):
     """Implement the scaled dot product attention with softmax.
     Arguments
@@ -44,13 +61,14 @@ class FlashSelfAttention(nn.Module):
                            (default: 0.0)
     """
 
-    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0, alibi_slopes=None):
         super().__init__()
         assert flash_attn_varlen_qkvpacked_func is not None, "FlashAttention is not installed"
         assert flash_attn_qkvpacked_func is not None, "FlashAttention is not installed"
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.drop = nn.Dropout(attention_dropout)
+        self.register_buffer("alibi_slopes", alibi_slopes, persistent=False)
 
     def forward(self, qkv, causal=None, cu_seqlens=None, max_seqlen=None):
         """Implements the multihead softmax attention.
@@ -84,6 +102,7 @@ class FlashSelfAttention(nn.Module):
                 self.drop.p if self.training else 0.0,
                 softmax_scale=self.softmax_scale,
                 causal=causal,
+                alibi_slopes=self.alibi_slopes,
             )
         else:
             return flash_attn_qkvpacked_func(
@@ -91,6 +110,7 @@ class FlashSelfAttention(nn.Module):
                 self.drop.p if self.training else 0.0,
                 softmax_scale=self.softmax_scale,
                 causal=causal,
+                alibi_slopes=self.alibi_slopes,
             )
 
 
@@ -105,13 +125,14 @@ class FlashCrossAttention(nn.Module):
                            (default: 0.0)
     """
 
-    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0, alibi_slopes=None):
         super().__init__()
         assert flash_attn_varlen_kvpacked_func is not None, "FlashAttention is not installed"
         assert flash_attn_kvpacked_func is not None, "FlashAttention is not installed"
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.drop = nn.Dropout(attention_dropout)
+        self.register_buffer("alibi_slopes", alibi_slopes, persistent=False)
 
     def forward(
         self,
@@ -158,6 +179,7 @@ class FlashCrossAttention(nn.Module):
                 self.drop.p if self.training else 0.0,
                 softmax_scale=self.softmax_scale,
                 causal=causal,
+                alibi_slopes=self.alibi_slopes,
             )
         else:
             batch_size, seqlen_q = q.shape[0], q.shape[1]
@@ -169,6 +191,7 @@ class FlashCrossAttention(nn.Module):
                 self.drop.p if self.training else 0.0,
                 causal=causal,
                 softmax_scale=self.softmax_scale,
+                alibi_slopes=self.alibi_slopes,
             )
 
 
@@ -315,8 +338,8 @@ def _update_kv_cache(kv, inference_params, layer_idx):
     batch_end = batch_start + kv.shape[0]
     sequence_start = inference_params.seqlen_offset
     sequence_end = sequence_start + kv.shape[1]
-    assert batch_end <= (kv_cache.shape[0] if kv_cache is not None else v_cache.shape[0])
-    assert sequence_end <= (kv_cache.shape[1] if kv_cache is not None else v_cache.shape[2])
+    assert batch_end <= kv_cache.shape[0]
+    assert sequence_end <= kv_cache.shape[1]
     assert kv_cache is not None
     kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
     return kv_cache[batch_start:batch_end, :sequence_end, ...]
@@ -342,6 +365,7 @@ class MHA(nn.Module):
         rotary_emb_base=10000.0,
         rotary_emb_scale_base=None,
         rotary_emb_interleaved=False,
+        use_alibi=False,
         fused_bias_fc=False,
         use_flash_attn=False,
         return_residual=False,
@@ -366,6 +390,11 @@ class MHA(nn.Module):
         self.use_flash_attn = use_flash_attn
         self.return_residual = return_residual
         self.checkpointing = checkpointing
+        if use_alibi:
+            assert use_flash_attn, "ALiBi code path requires flash_attn"
+            alibi_slopes = torch.tensor(get_alibi_slopes(num_heads), device=device)
+        else:
+            alibi_slopes = None
 
         self.num_heads = num_heads
         self.num_heads_kv = num_heads_kv if num_heads_kv is not None else num_heads
@@ -395,8 +424,16 @@ class MHA(nn.Module):
             LinearResidual if not fused_bias_fc else partial(FusedDense, return_residual=True)
         )
         wqkv_cls = linear_cls if not self.return_residual else linear_resid_cls
-        inner_attn_cls = FlashSelfAttention if use_flash_attn else SelfAttention
-        inner_cross_attn_cls = FlashCrossAttention if use_flash_attn else CrossAttention
+        inner_attn_cls = (
+            partial(FlashSelfAttention, alibi_slopes=alibi_slopes)
+            if use_flash_attn
+            else SelfAttention
+        )
+        inner_cross_attn_cls = (
+            partial(FlashCrossAttention, alibi_slopes=alibi_slopes)
+            if use_flash_attn
+            else CrossAttention
+        )
         if not self.cross_attn:
             self.Wqkv = wqkv_cls(embed_dim, qkv_dim, bias=qkv_proj_bias, **factory_kwargs)
         else:
@@ -413,7 +450,9 @@ class MHA(nn.Module):
                 )
                 self.dwconv_kv = nn.Conv1d(kv_dim, kv_dim, kernel_size=3, padding=2, groups=kv_dim)
         self.inner_attn = inner_attn_cls(
-            causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout
+            causal=causal,
+            softmax_scale=softmax_scale,
+            attention_dropout=dropout,
         )
         self.inner_cross_attn = inner_cross_attn_cls(
             causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout
@@ -672,6 +711,7 @@ class ParallelMHA(nn.Module):
         rotary_emb_base=10000.0,
         rotary_emb_scale_base=None,
         rotary_emb_interleaved=False,
+        use_alibi=False,
         use_flash_attn=False,
         checkpointing=False,
         sequence_parallel=True,
@@ -707,6 +747,18 @@ class ParallelMHA(nn.Module):
         self.head_dim = self.embed_dim // num_heads
         qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
 
+        if use_alibi:
+            assert use_flash_attn, "ALiBi code path requires flash_attn"
+            num_heads_local = math.ceil(self.num_heads / self.world_size)
+            alibi_slopes = torch.tensor(
+                get_alibi_slopes(num_heads)[
+                    self.local_rank * num_heads_local : (self.local_rank + 1) * num_heads_local
+                ],
+                device=device,
+            )
+        else:
+            alibi_slopes = None
+
         if self.rotary_emb_dim > 0:
             assert RotaryEmbedding is not None, "rotary_emb is not installed"
             self.rotary_emb = RotaryEmbedding(
@@ -728,8 +780,16 @@ class ParallelMHA(nn.Module):
             multiple_of=self.head_dim * (self.num_heads // self.num_heads_kv + 2),
             **factory_kwargs,
         )
-        inner_attn_cls = FlashSelfAttention if use_flash_attn else SelfAttention
-        inner_cross_attn_cls = FlashCrossAttention if use_flash_attn else CrossAttention
+        inner_attn_cls = (
+            partial(FlashSelfAttention, alibi_slopes=alibi_slopes)
+            if use_flash_attn
+            else SelfAttention
+        )
+        inner_cross_attn_cls = (
+            partial(FlashCrossAttention, alibi_slopes=alibi_slopes)
+            if use_flash_attn
+            else CrossAttention
+        )
         self.inner_attn = inner_attn_cls(
             causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout
         )
