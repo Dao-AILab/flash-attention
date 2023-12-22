@@ -131,10 +131,6 @@ struct Flash_fwd_params : public Qkv_params {
 
     int num_splits;  // For split-KV version
 
-    // float alibi_start;
-    // float alibi_ratio;
-
-    bool has_alibi;
     void * __restrict__ alibi_slopes_ptr;
     index_t alibi_slopes_batch_stride;
 };

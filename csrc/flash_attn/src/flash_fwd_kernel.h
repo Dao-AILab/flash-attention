@@ -322,27 +322,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     clear(acc_o);
 
+    float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
     // We need masking on S for the very last block when K and V has length not multiple of kBlockN.
     // We also need masking on S if it's causal, for the last ceil_div(kBlockM, kBlockN) blocks.
     // We will have at least 1 "masking" iteration.
-
-    float alibi_slope = 0.0f;
-    if (Has_alibi) {
-        Tensor gAS = make_tensor(
-        make_gmem_ptr(
-            reinterpret_cast<ElementAccum *>(params.alibi_slopes_ptr) 
-            + bidb * params.alibi_slopes_batch_stride + bidh
-        ),
-        Shape<_1>{});
-        Tensor rAS = make_fragment_like(gAS);
-        cute::copy(gAS, rAS);
-        alibi_slope = rAS(0);
-        // if (m_block == 0 && tidx == 0) {
-        //     printf("%d,%d,%f\n", bidb, bidh, alibi_slope);
-        // }
-    }
 
     // If not even_N, then seqlen_k might end in the middle of a block. In that case we need to
     // mask 2 blocks (e.g. when kBlockM == kBlockN), not just 1.
@@ -382,14 +368,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // can produce Inf / NaN.
 
         if (Has_alibi) {
-            flash::apply_alibi(
+            flash::apply_alibi<Is_causal>(
                 scores, 
                 n_block * kBlockN, 
                 binfo.actual_seqlen_k,
                 m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
                 binfo.actual_seqlen_q, 
                 kNWarps * 16,
-                bidh, params.scale_softmax, 
                 alibi_slope
             );
         }
@@ -500,14 +485,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         
         if (Has_alibi) {
-            flash::apply_alibi(
+            flash::apply_alibi<Is_causal>(
                 scores, 
                 n_block * kBlockN, 
                 binfo.actual_seqlen_k,
                 m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
                 binfo.actual_seqlen_q, 
                 kNWarps * 16,
-                bidh, params.scale_softmax, 
                 alibi_slope
             );
         }
@@ -950,27 +934,13 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     clear(acc_o);
 
+    float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
     // We need masking on S for the very last block when K and V has length not multiple of kBlockN.
     // We also need masking on S if it's causal, for the last ceil_div(kBlockM, kBlockN) blocks.
     // We will have at least 1 "masking" iteration.
-
-    float alibi_slope = 0.0f;
-    if (Has_alibi) {
-        Tensor gAS = make_tensor(
-        make_gmem_ptr(
-            reinterpret_cast<ElementAccum *>(params.alibi_slopes_ptr) 
-            + bidb * params.alibi_slopes_batch_stride + bidh
-        ),
-        Shape<_1>{});
-        Tensor rAS = make_fragment_like(gAS);
-        cute::copy(gAS, rAS);
-        alibi_slope = rAS(0);
-        // if (m_block == 0 && tidx == 0) {
-        //     printf("%d,%d,%f\n", bidb, bidh, alibi_slope);
-        // }
-    }
 
     // If not even_N, then seqlen_k might end in the middle of a block. In that case we need to
     // mask 2 blocks (e.g. when kBlockM == kBlockN), not just 1.
@@ -1006,14 +976,13 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (Has_alibi) {
-            flash::apply_alibi(
+            flash::apply_alibi<Is_causal>(
                 scores, 
                 n_block * kBlockN, 
                 binfo.actual_seqlen_k,
                 m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
                 binfo.actual_seqlen_q, 
                 kNWarps * 16,
-                bidh, params.scale_softmax, 
                 alibi_slope
             );
         }
@@ -1099,14 +1068,13 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (Has_alibi) {
-            flash::apply_alibi(
+            flash::apply_alibi<Is_causal>(
                 scores, 
                 n_block * kBlockN, 
                 binfo.actual_seqlen_k,
                 m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
                 binfo.actual_seqlen_q, 
                 kNWarps * 16,
-                bidh, params.scale_softmax, 
                 alibi_slope
             );
         }

@@ -141,14 +141,12 @@ inline __device__ void apply_mask(Tensor<Engine, Layout> &tensor, const int max_
 
 template <bool HasWSLeft=true, typename Engine, typename Layout>
 inline __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor, const int col_idx_offset_,
-                                        const int max_seqlen_k, const int row_idx_offset_,
+                                        const int max_seqlen_k, const int row_idx_offset,
                                         const int max_seqlen_q, const int warp_row_stride,
                                         const int window_size_left, const int window_size_right) {
     // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
     static_assert(Layout::rank == 2, "Only support 2D Tensor");
     const int lane_id = threadIdx.x % 32;
-    // const int row_idx_offset = row_idx_offset_ + lane_id / 4;
-    const int row_idx_offset = row_idx_offset_;
     const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
     #pragma unroll
     for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
@@ -180,17 +178,17 @@ inline __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor, const in
 
 template <typename Engine, typename Layout>
 inline __device__ void apply_mask_causal(Tensor<Engine, Layout> &tensor, const int col_idx_offset_,
-                                         const int max_seqlen_k, const int row_idx_offset_,
+                                         const int max_seqlen_k, const int row_idx_offset,
                                          const int max_seqlen_q, const int warp_row_stride) {
     // Causal masking is equivalent to local masking with window_size_left = infinity and window_size_right = 0
-    apply_mask_local</*HasWSLeft=*/false>(tensor, col_idx_offset_, max_seqlen_k, row_idx_offset_,
+    apply_mask_local</*HasWSLeft=*/false>(tensor, col_idx_offset_, max_seqlen_k, row_idx_offset,
                                           max_seqlen_q, warp_row_stride, -1, 0);
 }
 
 template <typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 inline __device__ void apply_mask_causal_w_idx(
     Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> const &idx_rowcol,
-    const int col_idx_offset_, const int max_seqlen_k, const int row_idx_offset_)
+    const int col_idx_offset_, const int max_seqlen_k, const int row_idx_offset)
 {
     // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
@@ -199,7 +197,7 @@ inline __device__ void apply_mask_causal_w_idx(
     CUTE_STATIC_ASSERT_V(size<1>(tensor) == size<1>(idx_rowcol));
     #pragma unroll
     for (int mi = 0; mi < size<0>(tensor); ++mi) {
-        const int col_idx_limit = std::min(max_seqlen_k, 1 + row_idx_offset_ + get<0>(idx_rowcol(mi, 0)));
+        const int col_idx_limit = std::min(max_seqlen_k, 1 + row_idx_offset + get<0>(idx_rowcol(mi, 0)));
         #pragma unroll
         for (int ni = 0; ni < size<1, 1>(tensor); ++ni) {
             if (col_idx_offset_ + get<1>(idx_rowcol(0, ni)) >= col_idx_limit) {

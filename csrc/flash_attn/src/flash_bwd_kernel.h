@@ -753,8 +753,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     #pragma unroll
     for (int mi = 0; mi < size(lse); ++mi) {
         const int row = get<0>(taccScS_row(mi));
-        lse(mi) = Is_even_MN || row < binfo.actual_seqlen_q - m_block * kBlockM ? gLSE(row) : 0;
+        lse(mi) = Is_even_MN || row < binfo.actual_seqlen_q - m_block * kBlockM ? gLSE(row) : INFINITY;
     }
+    // We want LSE = inf if the row is OOB. In that case Q would be zero, K would be zero,
+    // and scores would be zero. With LSE = 0, probs will be all 1's, and when we multiply
+    // with V (which would be zero), we're fine. However, with ALiBi, we might modify these
+    // scores, and probs can become NaN. Instead if we set LSE = inf for OOB rows, probs are always 0.
 
     // Tensor tKrK = make_fragment_like(tKsK);
     // // cute::copy(gmem_tiled_copy_QKV, tKgK(_, _, _, 0), tKrK);
@@ -792,18 +796,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     clear(acc_dv);
     clear(acc_dk);
 
-    float alibi_slope = 0.0f;
-    if (Has_alibi) {
-        Tensor gAS = make_tensor(
-        make_gmem_ptr(
-            reinterpret_cast<ElementAccum *>(params.alibi_slopes_ptr) 
-            + bidb * params.alibi_slopes_batch_stride + bidh
-        ),
-        Shape<_1>{});
-        Tensor rAS = make_fragment_like(gAS);
-        cute::copy(gAS, rAS);
-        alibi_slope = rAS(0);
-    }
+    float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
 
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
@@ -830,18 +823,17 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // if (cute::thread(32, 0)) { print(scores); }
 
         if (Has_alibi) {
-            flash::apply_alibi(
+            flash::apply_alibi<Is_causal>(
                 scores, 
                 n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                 binfo.actual_seqlen_k, 
                 m_block * kBlockM + get<0>(taccScS_row(0)),
                 binfo.actual_seqlen_q, 
                 AtomLayoutMS * 16,
-                bidh, params.scale_softmax, 
                 alibi_slope
             );
         }
-        
+
         // TD [2023-07-29]: I was thinking that we don't need to mask out the elements beyond
         // actual_seqlen_k, because acc_s would be some finite value for those indices.
         // In the end when we multiply with K to get dQ, the corresponding values of K would be 0,
@@ -1403,18 +1395,7 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
 
     clear(acc_dq);
 
-    float alibi_slope = 0.0f;
-    if (Has_alibi) {
-        Tensor gAS = make_tensor(
-        make_gmem_ptr(
-            reinterpret_cast<ElementAccum *>(params.alibi_slopes_ptr) 
-            + bidb * params.alibi_slopes_batch_stride + bidh
-        ),
-        Shape<_1>{});
-        Tensor rAS = make_fragment_like(gAS);
-        cute::copy(gAS, rAS);
-        alibi_slope = rAS(0);
-    }
+    float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
 
     for (; n_block >= 0; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M_SdP, MMA_N)
@@ -1429,14 +1410,13 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (Has_alibi) {
-            flash::apply_alibi(
+            flash::apply_alibi<Is_causal>(
                 scores, 
                 n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                 binfo.actual_seqlen_k, 
                 m_block * kBlockM + get<0>(taccScS_row(0)),
                 binfo.actual_seqlen_q, 
                 AtomLayoutMS * 16,
-                bidh, params.scale_softmax, 
                 alibi_slope
             );
         }

@@ -45,7 +45,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
             BOOL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !Is_causal, Is_local, [&] {
                 BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
-                    BOOL_SWITCH(params.has_alibi, Has_alibi, [&] {
+                    BOOL_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, [&] {
                         // Will only return softmax if dropout, to reduce compilation time.
                         // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
                         // If return_softmax, set IsEvenMNConst to false to reduce number of templates
@@ -86,7 +86,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 BOOL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !Is_causal, Is_local, [&] {
                     BOOL_SWITCH(params.num_splits > 1, Split, [&] {
                         BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV, [&] {
-                            BOOL_SWITCH(params.has_alibi, Has_alibi, [&] {
+                            BOOL_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, [&] {
                                 // If Append_KV, then we must have seqlen_offsets, which means cu_seqlens_k != nullptr.
                                 // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
                                 // If Is_local, set Is_causal to false
