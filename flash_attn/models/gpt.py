@@ -32,7 +32,12 @@ from flash_attn.modules.mlp import (
     ParallelMLP,
 )
 from flash_attn.ops.activations import sqrelu_fwd
-from flash_attn.utils.distributed import all_gather_raw, get_dim_for_local_rank, sync_shared_params
+from flash_attn.utils.distributed import (
+    all_gather,
+    all_gather_raw,
+    get_dim_for_local_rank,
+    sync_shared_params,
+)
 from flash_attn.utils.generation import GenerationMixin
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 
@@ -355,9 +360,8 @@ class GPTPreTrainedModel(nn.Module):
             state_dict = remap_state_dict_hf_gpt2(state_dict, config)
         elif model_name.startswith("facebook/opt"):
             state_dict = remap_state_dict_hf_opt(state_dict, config)
-        elif (
-            model_name.startswith("EleutherAI/gpt-j-")
-            or model_name.startswith("togethercomputer/GPT-JT-")
+        elif model_name.startswith("EleutherAI/gpt-j-") or model_name.startswith(
+            "togethercomputer/GPT-JT-"
         ):
             state_dict = remap_state_dict_hf_gptj(state_dict, config)
         elif (
@@ -621,6 +625,7 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
                 sequence_parallel=getattr(config, "sequence_parallel", True),
                 **factory_kwargs,
             )
+        self.norm_head = getattr(config, "norm_head", False)
         # Initialize weights and apply final processing
         self.apply(
             partial(
@@ -662,7 +667,13 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
             hidden_states = hidden_states[:, -num_last_tokens:]
         if self.project_out is not None:
             hidden_states = self.project_out(hidden_states)
-        lm_logits = self.lm_head(hidden_states)
+        if not self.norm_head:
+            lm_logits = self.lm_head(hidden_states)
+        else:
+            lm_head_weight = F.normalize(self.lm_head.weight)
+            if isinstance(self.lm_head, ColumnParallelLinear) and self.lm_head.sequence_parallel:
+                hidden_states = all_gather(hidden_states, self.lm_head.process_group)
+            lm_logits = F.linear(hidden_states, lm_head_weight, bias=self.lm_head.bias)
         # During inference, we want the full logit for sampling
         if isinstance(self.lm_head, ColumnParallelLinear) and inference_params is not None:
             lm_logits, _ = all_gather_raw(lm_logits, self.lm_head.process_group)

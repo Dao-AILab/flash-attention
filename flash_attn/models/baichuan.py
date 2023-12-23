@@ -116,6 +116,9 @@ def remap_state_dict_hf_baichuan(state_dict, config):
 def baichuan_config_to_gpt2_config(baichuan_config: PretrainedConfig) -> GPT2Config:
     # HACK: the config doesn't have say whether it's rotary or alibi.
     # So we have to infer from the hidden size (7B -> rotary, 13B -> alibi).
+    # HACK: the config doesn't have say whether it uses norm head.
+    # So we have to infer from the vocab size
+    # (v1, vocab size 64k, no norm head; v2, vocab size 128k, norm head).
     use_rotary = baichuan_config.hidden_size < 5000
     return GPT2Config(
         vocab_size=baichuan_config.vocab_size,
@@ -141,6 +144,7 @@ def baichuan_config_to_gpt2_config(baichuan_config: PretrainedConfig) -> GPT2Con
         use_alibi=not use_rotary,
         use_flash_attn=not use_rotary,  # Alibi code path requires flash_attn
         tie_word_embeddings=False,
+        norm_head=baichuan_config.vocab_size > 70000,
         qkv_proj_bias=False,
         out_proj_bias=False,
         mlp_fc1_bias=False,
