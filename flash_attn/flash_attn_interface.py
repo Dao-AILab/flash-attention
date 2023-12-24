@@ -122,6 +122,7 @@ def _flash_attn_backward(
     causal,
     window_size,
     alibi_slopes,
+    deterministic,
     rng_state=None,
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
@@ -143,6 +144,7 @@ def _flash_attn_backward(
         causal,
         window_size[0],
         window_size[1],
+        deterministic,
         None,
         rng_state,
     )
@@ -168,6 +170,7 @@ def _flash_attn_varlen_backward(
     causal,
     window_size,
     alibi_slopes,
+    deterministic,
     rng_state=None,
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
@@ -194,6 +197,7 @@ def _flash_attn_varlen_backward(
         causal,
         window_size[0],
         window_size[1],
+        deterministic,
         None,
         rng_state,
     )
@@ -205,7 +209,15 @@ def _flash_attn_varlen_backward(
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, qkv, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_softmax
+        ctx,
+        qkv,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        alibi_slopes,
+        deterministic,
+        return_softmax,
     ):
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
@@ -226,6 +238,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -248,10 +261,11 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             ctx.alibi_slopes,
+            ctx.deterministic,
             rng_state=rng_state,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None
+        return dqkv, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
@@ -266,6 +280,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         causal,
         window_size,
         alibi_slopes,
+        deterministic,
         return_softmax,
     ):
         if softmax_scale is None:
@@ -292,6 +307,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -318,16 +334,26 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             ctx.alibi_slopes,
+            ctx.deterministic,
             rng_state=rng_state,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None, None, None
+        return dqkv, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, q, kv, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_softmax
+        ctx,
+        q,
+        kv,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        alibi_slopes,
+        deterministic,
+        return_softmax,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -348,6 +374,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -371,11 +398,12 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             ctx.alibi_slopes,
+            ctx.deterministic,
             rng_state=rng_state,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., : dout.shape[-1]]
-        return dq, dkv, None, None, None, None, None, None
+        return dq, dkv, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
@@ -393,6 +421,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         causal,
         window_size,
         alibi_slopes,
+        deterministic,
         return_softmax,
     ):
         if softmax_scale is None:
@@ -422,6 +451,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -449,17 +479,28 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             ctx.alibi_slopes,
+            ctx.deterministic,
             rng_state=rng_state,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., : dout.shape[-1]]
-        return dq, dkv, None, None, None, None, None, None, None, None, None, None
+        return dq, dkv, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_softmax
+        ctx,
+        q,
+        k,
+        v,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        alibi_slopes,
+        deterministic,
+        return_softmax,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -480,6 +521,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -501,12 +543,13 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             ctx.alibi_slopes,
+            ctx.deterministic,
             rng_state=rng_state,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -525,6 +568,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         causal,
         window_size,
         alibi_slopes,
+        deterministic,
         return_softmax,
     ):
         if softmax_scale is None:
@@ -554,6 +598,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -579,12 +624,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             ctx.alibi_slopes,
+            ctx.deterministic,
             rng_state=rng_state,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -594,6 +640,7 @@ def flash_attn_qkvpacked_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     alibi_slopes=None,
+    deterministic=False,
     return_attn_probs=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -615,6 +662,8 @@ def flash_attn_qkvpacked_func(
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of (-alibi_slope * |i - j|) is added to
             the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
@@ -628,7 +677,14 @@ def flash_attn_qkvpacked_func(
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     return FlashAttnQKVPackedFunc.apply(
-        qkv, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_attn_probs
+        qkv,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
     )
 
 
@@ -640,6 +696,7 @@ def flash_attn_kvpacked_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     alibi_slopes=None,
+    deterministic=False,
     return_attn_probs=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -678,6 +735,8 @@ def flash_attn_kvpacked_func(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
@@ -691,7 +750,15 @@ def flash_attn_kvpacked_func(
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     return FlashAttnKVPackedFunc.apply(
-        q, kv, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_attn_probs
+        q,
+        kv,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
     )
 
 
@@ -704,6 +771,7 @@ def flash_attn_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     alibi_slopes=None,
+    deterministic=False,
     return_attn_probs=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -740,6 +808,8 @@ def flash_attn_func(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
@@ -753,7 +823,16 @@ def flash_attn_func(
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     return FlashAttnFunc.apply(
-        q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_attn_probs
+        q,
+        k,
+        v,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
     )
 
 
@@ -766,6 +845,7 @@ def flash_attn_varlen_qkvpacked_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     alibi_slopes=None,
+    deterministic=False,
     return_attn_probs=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -790,6 +870,8 @@ def flash_attn_varlen_qkvpacked_func(
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of (-alibi_slope * |i - j|)
             is added to the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
@@ -811,6 +893,7 @@ def flash_attn_varlen_qkvpacked_func(
         causal,
         window_size,
         alibi_slopes,
+        deterministic,
         return_attn_probs,
     )
 
@@ -827,6 +910,7 @@ def flash_attn_varlen_kvpacked_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     alibi_slopes=None,
+    deterministic=False,
     return_attn_probs=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -871,6 +955,8 @@ def flash_attn_varlen_kvpacked_func(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
@@ -895,6 +981,7 @@ def flash_attn_varlen_kvpacked_func(
         causal,
         window_size,
         alibi_slopes,
+        deterministic,
         return_attn_probs,
     )
 
@@ -912,6 +999,7 @@ def flash_attn_varlen_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     alibi_slopes=None,
+    deterministic=False,
     return_attn_probs=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -954,6 +1042,8 @@ def flash_attn_varlen_func(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
@@ -979,6 +1069,7 @@ def flash_attn_varlen_func(
         causal,
         window_size,
         alibi_slopes,
+        deterministic,
         return_attn_probs,
     )
 

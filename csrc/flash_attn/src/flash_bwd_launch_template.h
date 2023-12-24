@@ -35,8 +35,8 @@ __global__ void flash_bwd_dq_dk_dv_loop_seqq_parallel_kernel(Flash_bwd_params pa
 }
 
 template<typename Kernel_traits>
-__global__ void flash_bwd_convert_dq_kernel(Flash_bwd_params params) {
-    flash::convert_dQ<Kernel_traits>(params);
+__global__ void flash_bwd_convert_dq_kernel(Flash_bwd_params params, const int nsplits) {
+    flash::convert_dQ<Kernel_traits>(params, nsplits);
 }
 
 template<typename Kernel_traits>
@@ -49,9 +49,18 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream, 
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid_m(num_m_block, params.b, params.h);
     const int num_n_block = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
-    dim3 grid_n(num_n_block, params.b, params.h);
+    int gridDimx = num_n_block;
+    if (params.deterministic) {
+        auto dprops = at::cuda::getCurrentDeviceProperties();
+        gridDimx = (dprops->multiProcessorCount + params.b * params.h - 1) / (params.b * params.h);
+    }
+    dim3 grid_n(gridDimx, params.b, params.h);
 
-    flash_bwd_dot_do_o_kernel<true, Kernel_traits><<<grid_m, Kernel_traits::kNThreads, 0, stream>>>(params);
+    if (!params.deterministic) {
+        flash_bwd_dot_do_o_kernel<true, Kernel_traits><<<grid_m, Kernel_traits::kNThreads, 0, stream>>>(params);
+    } else {
+        flash_bwd_dot_do_o_kernel<false, Kernel_traits><<<grid_m, Kernel_traits::kNThreads, 0, stream>>>(params);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     // We want to specialize to is_even_MN and not just is_even_M, since in the case where N is not
@@ -69,6 +78,7 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream, 
                         // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
                         // If Is_local, set Is_causal to false
                         auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst>;
+                        // auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, false, Is_causal, false, false, true, true>;
                         if (smem_size_dq_dk_dv >= 48 * 1024)  {
                             C10_CUDA_CHECK(cudaFuncSetAttribute(
                                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
@@ -86,7 +96,7 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream, 
         C10_CUDA_CHECK(cudaFuncSetAttribute(
             kernel_dq, cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel_traits::kSmemdQSize));
     }
-    kernel_dq<<<grid_m, Kernel_traits::kNThreads, Kernel_traits::kSmemdQSize, stream>>>(params);
+    kernel_dq<<<grid_m, Kernel_traits::kNThreads, Kernel_traits::kSmemdQSize, stream>>>(params, !params.deterministic ? 1 : gridDimx);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

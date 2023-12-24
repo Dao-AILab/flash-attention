@@ -150,7 +150,8 @@ void set_params_dgrad(Flash_bwd_params &params,
                       float p_dropout,
                       float softmax_scale,
                       int window_size_left,
-                      int window_size_right) {
+                      int window_size_right,
+                      bool deterministic) {
 
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
@@ -192,6 +193,8 @@ void set_params_dgrad(Flash_bwd_params &params,
 
     // Softmax sum
     params.dsoftmax_sum = dsoftmax_sum_d;
+
+    params.deterministic = deterministic;
 }
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
@@ -618,8 +621,14 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
         params.alibi_slopes_ptr = nullptr;
     }
 
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    run_mha_fwd(params, stream);
+    if (max_seqlen_k > 0) {
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        run_mha_fwd(params, stream);
+    } else {
+        // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
+        out.zero_();
+        softmax_lse.fill_(std::numeric_limits<float>::infinity());
+    }
 
     at::Tensor out_padded = out;
     if (head_size_og % 8 != 0) {
@@ -668,6 +677,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         const bool is_causal,
         const int window_size_left,
         int window_size_right,
+        const bool deterministic,
         c10::optional<at::Generator> gen_,
         c10::optional<at::Tensor> &rng_state) {
 
@@ -783,7 +793,12 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     at::Tensor dq_accum;
     at::Tensor dk_accum, dv_accum;
     if (loop) {
-        dq_accum = torch::empty({batch_size, seqlen_q_rounded, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
+        if (!deterministic) {
+            dq_accum = torch::empty({batch_size, seqlen_q_rounded, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
+        } else {
+            const int nsplits = (dprops->multiProcessorCount + batch_size * num_heads - 1) / (batch_size * num_heads);
+            dq_accum = torch::zeros({nsplits, batch_size, seqlen_q_rounded, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
+        }
         // dk_accum = torch::empty({batch_size, num_heads_k, seqlen_k_rounded, head_size_rounded}, opts.dtype(at::kFloat));
         // dv_accum = torch::empty({batch_size, num_heads_k, seqlen_k_rounded, head_size_rounded}, opts.dtype(at::kFloat));
     }
@@ -819,7 +834,9 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     deterministic);
+    params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
 
     auto launch = &run_mha_bwd;
     // launch(params, stream, /*configure=*/true);
@@ -857,8 +874,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         launch(params, stream, /*configure=*/false);
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
-        dk.zero_();
-        dv.zero_();
+        dk_expanded.zero_();
+        dv_expanded.zero_();
         softmax_d.zero_();
     }
 
@@ -897,6 +914,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const bool is_causal,
                const int window_size_left,
                int window_size_right,
+               const bool deterministic,
                c10::optional<at::Generator> gen_,
                c10::optional<at::Tensor> &rng_state) {
 
@@ -1025,7 +1043,12 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         // cu_seqlens[i + 1] * 128 * i - 1. This ensures that the i-th sequence and (i + 1)-th sequence will
         // be at least 128 apart. It's ok for us to do atomicAdds up to 128 rows beyond what we're normally
         // allowed to do. So we won't have to do any bound checking, and performance should stay the same.
-        dq_accum = torch::empty({total_q + 128 * batch_size, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
+        if (!deterministic) {
+            dq_accum = torch::empty({total_q + 128 * batch_size, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
+        } else {
+            const int nsplits = (dprops->multiProcessorCount + batch_size * num_heads - 1) / (batch_size * num_heads);
+            dq_accum = torch::zeros({nsplits, total_q + 128 * batch_size, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
+        }
     }
 
     at::Tensor dk_expanded, dv_expanded;
@@ -1064,7 +1087,9 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     deterministic);
+    params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
 
     auto launch = &run_mha_bwd;
     // launch(params, stream, /*configure=*/true);
@@ -1098,7 +1123,14 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         params.alibi_slopes_ptr = nullptr;
     }
 
-    launch(params, stream, /*configure=*/false);
+    if (max_seqlen_q > 0) {
+        launch(params, stream, /*configure=*/false);
+    } else {
+        // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
+        dk_expanded.zero_();
+        dv_expanded.zero_();
+        softmax_d.zero_();
+    }
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {

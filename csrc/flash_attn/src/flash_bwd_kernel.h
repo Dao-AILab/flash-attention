@@ -230,7 +230,7 @@ inline __device__ void clear_dKVaccum(const Params &params) {
 // Convert dQ from dQaccum (in float) to fp16/bf16.
 // This is used in the case where we want to parallelize the backward across seqlen_k.
 template<typename Kernel_traits, typename Params>
-inline __device__ void convert_dQ(const Params &params) {
+inline __device__ void convert_dQ(const Params &params, const int nsplits) {
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
@@ -285,11 +285,15 @@ inline __device__ void convert_dQ(const Params &params) {
     CUTE_STATIC_ASSERT_V(size(acc_dq) == size(tdQgdQaccum));
 
     Tensor tdQrdQaccum = make_fragment_like(tdQgdQaccum);
-    cute::copy(gmem_tiled_copy_dQaccum, tdQgdQaccum, tdQrdQaccum);
-    #pragma unroll
-    for (int i = 0; i < size(acc_dq); ++i) {
-        acc_dq(i) = tdQrdQaccum(i) * params.scale_softmax_rp_dropout;
+    clear(acc_dq);
+    for (int s = 0; s < nsplits; ++s) {
+        cute::copy(gmem_tiled_copy_dQaccum, tdQgdQaccum, tdQrdQaccum);
+        #pragma unroll
+        for (int i = 0; i < size(acc_dq); ++i) { acc_dq(i) += tdQrdQaccum(i); }
+        tdQgdQaccum.data() = tdQgdQaccum.data() + params.dq_accum_split_stride;
     }
+    #pragma unroll
+    for (int i = 0; i < size(acc_dq); ++i) { acc_dq(i) *= params.scale_softmax_rp_dropout; }
     // Convert acc_dq from fp32 to fp16
     Tensor rdQ = flash::convert_type<Element>(acc_dq);
     Tensor taccdQrdQ = smem_thr_copy_dQ.retile_S(rdQ);  // ((Atom,AtomNum), MMA_N, MMA_N)
@@ -466,7 +470,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     const index_t row_offset_dq = binfo.q_offset(params.dq_batch_stride, params.dq_row_stride, bidb)
         + (m_block_max - 1) * kBlockM * params.dq_row_stride + bidh * params.dq_head_stride;
     const index_t row_offset_dq_accum = binfo.q_offset(params.seqlen_q_rounded * params.h * params.d_rounded, params.h * params.d_rounded, bidb)
-        + ((m_block_max - 1) * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128 * bidb)) * params.h * params.d_rounded + bidh * params.d_rounded;
+        + ((m_block_max - 1) * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128 * bidb)) * params.h * params.d_rounded + bidh * params.d_rounded
+        // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
+        + (!params.deterministic ? 0 : blockIdx.x * params.dq_accum_split_stride);
     const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q
         + (m_block_max - 1) * kBlockM;
     const index_t row_offset_dpsum = (bidb * params.h + bidh) * params.seqlen_q_rounded
@@ -715,7 +721,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         tdKsQt.data() = tdKsQt.data() + size(sQ);
     }
 
-    if (!Is_first && !Seq_parallel) { __syncthreads(); }
+    if ((!Is_first && !Seq_parallel) || params.deterministic) { __syncthreads(); }
 
     if (Kernel_traits::Is_V_in_regs) {
         // Clear the smem tiles to account for predicated off loads
@@ -1604,13 +1610,15 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
-    const int n_block = blockIdx.x;
     // The block index for the batch.
     const int bidb = blockIdx.y;
     // The block index for the head.
     const int bidh = blockIdx.z;
 
-    compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+    // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
+    for (int n_block = blockIdx.x; n_block < (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN; n_block += gridDim.x) {
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

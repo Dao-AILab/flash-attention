@@ -83,7 +83,7 @@ from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
 
 ```python
 flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
-                          window_size=(-1, -1), alibi_slopes=None):
+                          window_size=(-1, -1), alibi_slopes=None, deterministic=False):
 """dropout_p should be set to 0.0 during evaluation
 If Q, K, V are already stacked into 1 tensor, this function will be faster than
 calling flash_attn_func on Q, K, V since the backward pass avoids explicit concatenation
@@ -99,6 +99,8 @@ Arguments:
     window_size: (left, right). If not (-1, -1), implements sliding window local attention.
     alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of (-alibi_slope * |i - j|) is added to
         the attention score of query i and key j.
+    deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+        which is slightly slower and uses more memory. The forward pass is always deterministic.
 Return:
     out: (batch_size, seqlen, nheads, headdim).
 """
@@ -106,7 +108,7 @@ Return:
 
 ```python
 flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
-                window_size=(-1, -1), alibi_slopes=None):
+                window_size=(-1, -1), alibi_slopes=None, deterministic=False):
 """dropout_p should be set to 0.0 during evaluation
 Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
 than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
@@ -128,6 +130,8 @@ Arguments:
     alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
         (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
         is added to the attention score of query i and key j.
+    deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+        which is slightly slower and uses more memory. The forward pass is always deterministic.
 Return:
     out: (batch_size, seqlen, nheads, headdim).
 """
@@ -269,9 +273,11 @@ Implement sliding window attention (i.e., local attention). Thanks to [Mistral
 AI](https://mistral.ai/) and in particular Timothée Lacroix for this
 contribution. Sliding window was used in the [Mistral 7B](https://mistral.ai/news/announcing-mistral-7b/) model.
 
-### 2.4: ALiBi (attention with linear bias)
+### 2.4: ALiBi (attention with linear bias), deterministic backward pass.
 
 Implement ALiBi (Press et el., 2021). Thanks to Sanghun Cho from Kakao Brain for this contribution.
+
+Implement deterministic backward pass. Thanks to engineers from [Meituan](www.meituan.com) for this contribution.
 
 ## Performance
 
