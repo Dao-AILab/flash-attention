@@ -207,6 +207,18 @@ def flash_attn_with_kvcache(
 To see how these functions are used in a multi-head attention layer (which
 includes QKV projection, output projection), see the MHA [implementation](https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/modules/mha.py).
 
+## FlashAttention and FlashAttention2 Animations
+
+Explore the inner workings of attention mechanisms with this animated series! These visualizations illustrate the implementation of three attention algorithms, Standard Attention, Flash Attention, and Flash Attention 2. For short sequences, the animations provide an intuition for the algorithms. As the sequence length increases, it becomes evident that, asymptotically, both Flash Attention and Flash Attention 2 exhibit superior IO performance.
+
+| Sequence Length  | Standard Attention | Flash Attention | Flash Attention 2 |
+| --- | -------- | -------- | -------- |
+| Short   | <a href="https://www.youtube.com/watch?v=-EF-KIscwJw"> <img src="https://img.youtube.com/vi/-EF-KIscwJw/0.jpg" alt="Standard Attention on Short Sequence Length" width="200" height="auto"> </a> | <a href="https://www.youtube.com/watch?v=cq3jQ-Bbmzs"> <img src="https://img.youtube.com/vi/cq3jQ-Bbmzs/0.jpg" alt="Flash Attention on Short Sequence Length" width="200" height="auto"> </a>   |     <a href="https://www.youtube.com/watch?v=fevDHL1scYE"> <img src="https://img.youtube.com/vi/fevDHL1scYE/0.jpg" alt="Flash Attention 2 on Short Sequence Length" width="200" height="auto"> </a>
+       |
+| Medium | <a href="https://www.youtube.com/watch?v=82czr_lbkpk"> <img src="https://img.youtube.com/vi/82czr_lbkpk/0.jpg" alt="Standard Attention on Medium Sequence Length" width="200" height="auto"></a>| <a href="https://www.youtube.com/watch?v=KLWn1cZQE64"> <img src="https://img.youtube.com/vi/KLWn1cZQE64/0.jpg" alt="Flash Attention on Medium Sequence Length" width="200" height="auto"> </a>     | <a href="https://www.youtube.com/watch?v=gvTNH2k3iGk"> <img src="https://img.youtube.com/vi/gvTNH2k3iGk/0.jpg" alt="Flash Attention 2 on Medium Sequence Length" width="200" height="auto"> </a>   |
+| Long   | <a href="https://www.youtube.com/watch?v=ofetLDziJfo"> <img src="https://img.youtube.com/vi/ofetLDziJfo/0.jpg" alt="Standard Attention on Long Sequence Length" width="200" height="auto">  </a> | <a href="https://www.youtube.com/watch?v=rGt7jGbAnOQ"> <img src="https://img.youtube.com/vi/rGt7jGbAnOQ/0.jpg" alt="Flash Attention on Long Sequence Length" width="200" height="auto"> </a>   | <a href="https://www.youtube.com/watch?v=LX8NYcpTxh8"> <img src="https://img.youtube.com/vi/LX8NYcpTxh8/0.jpg" alt="Flash Attention 2 on Long Sequence Length" width="200" height="auto"> </a>    |
+
+
 ## Changelog
 
 ### 2.0: Complete rewrite, 2x faster
