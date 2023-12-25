@@ -1,4 +1,4 @@
-# Copyright (c) 2023, GGGGGGXY.
+# Copyright (c) 2023, GGGGGGXY, Tri Dao.
 
 import math
 import json
@@ -14,7 +14,6 @@ from einops import rearrange
 from transformers import GPT2Config, AutoConfig, PretrainedConfig
 
 
-# only support Baichuan-7B now
 def remap_state_dict_hf_baichuan(state_dict, config):
     def key_mapping_layers(key):
         return re.sub(r"^model.", "transformer.", key)

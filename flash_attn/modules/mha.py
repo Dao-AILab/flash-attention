@@ -501,6 +501,7 @@ class MHA(nn.Module):
             if inference_params.lengths_per_sample is not None
             else inference_params.seqlen_offset
         )
+        alibi_slopes = getattr(self.inner_cross_attn, "alibi_slopes", None)
         context = flash_attn_with_kvcache(
             q,
             kv_cache[:, :, 0],
@@ -513,6 +514,7 @@ class MHA(nn.Module):
             softmax_scale=self.inner_cross_attn.softmax_scale,
             causal=self.inner_cross_attn.causal,
             rotary_interleaved=self.rotary_emb.interleaved if self.rotary_emb_dim > 0 else False,
+            alibi_slopes=alibi_slopes,
         )
         return context
 
@@ -534,6 +536,7 @@ class MHA(nn.Module):
                 if inference_params.lengths_per_sample is not None
                 else inference_params.seqlen_offset
             )
+            alibi_slopes = getattr(self.inner_cross_attn, "alibi_slopes", None)
             return flash_attn_with_kvcache(
                 q,
                 kv_cache[:, :, 0],
@@ -543,6 +546,7 @@ class MHA(nn.Module):
                 cache_seqlens=cache_seqlens,
                 softmax_scale=self.inner_cross_attn.softmax_scale,
                 causal=self.inner_cross_attn.causal,
+                alibi_slopes=alibi_slopes,
             )
 
     def forward(
@@ -847,6 +851,7 @@ class ParallelMHA(nn.Module):
             if inference_params.lengths_per_sample is not None
             else inference_params.seqlen_offset
         )
+        alibi_slopes = getattr(self.inner_cross_attn, "alibi_slopes", None)
         context = flash_attn_with_kvcache(
             q,
             kv_cache[:, :, 0],
@@ -859,6 +864,7 @@ class ParallelMHA(nn.Module):
             softmax_scale=self.inner_cross_attn.softmax_scale,
             causal=self.inner_cross_attn.causal,
             rotary_interleaved=self.rotary_emb.interleaved if self.rotary_emb_dim > 0 else False,
+            alibi_slopes=alibi_slopes,
         )
         return context
 
@@ -876,6 +882,7 @@ class ParallelMHA(nn.Module):
                 if inference_params.lengths_per_sample is not None
                 else inference_params.seqlen_offset
             )
+            alibi_slopes = getattr(self.inner_cross_attn, "alibi_slopes", None)
             context = flash_attn_with_kvcache(
                 q,
                 kv_cache[:, :, 0],
@@ -885,6 +892,7 @@ class ParallelMHA(nn.Module):
                 cache_seqlens=cache_seqlens,
                 softmax_scale=self.inner_cross_attn.softmax_scale,
                 causal=self.inner_cross_attn.causal,
+                alibi_slopes=alibi_slopes,
             )
             return context
 

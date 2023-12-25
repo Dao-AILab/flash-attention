@@ -1,3 +1,4 @@
+# Copyright (c) 2023, Tri Dao.
 import os
 import time
 from pathlib import Path
