@@ -396,7 +396,9 @@ def _init_weights(
     mup_init_scale = math.sqrt(mup_width_scale)
     if isinstance(module, nn.Linear):
         nn.init.normal_(module.weight, std=initializer_range * mup_init_scale)
-        module.weight._optim = {"lr_multiplier": mup_width_scale}
+        optim_cfg = getattr(module.weight, "_optim", {})
+        optim_cfg.update({"lr_multiplier": mup_width_scale})
+        setattr(module.weight, "_optim", optim_cfg)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Embedding):
