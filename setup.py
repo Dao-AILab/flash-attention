@@ -50,12 +50,6 @@ def get_system():
     Returns the system name as used in wheel filenames.
     """
     if platform.system() == "Windows":
-        "win"
-    elif platform.system() == "Darwin":
-        mac_version = ".".join(platform.mac_ver()[0].split(".")[:1])
-        f"macos_{mac_version}"
-    elif platform.system() == "Linux":
-    if platform.system() == "Windows":
         return "win"
     elif platform.system() == "Darwin":
         mac_version = ".".join(platform.mac_ver()[0].split(".")[:1])
