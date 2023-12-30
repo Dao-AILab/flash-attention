@@ -76,7 +76,7 @@ def get_platform():
     """
     Returns the platform name as used in wheel filenames.
     """
-    f"{get_system()}_{get_arch()}"
+    return f"{get_system()}_{get_arch()}"
 
 
 def get_cuda_bare_metal_version(cuda_dir):
