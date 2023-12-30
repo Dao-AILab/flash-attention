@@ -55,7 +55,13 @@ def get_system():
         mac_version = ".".join(platform.mac_ver()[0].split(".")[:1])
         f"macos_{mac_version}"
     elif platform.system() == "Linux":
-        "linux"
+    if platform.system() == "Windows":
+        return "win"
+    elif platform.system() == "Darwin":
+        mac_version = ".".join(platform.mac_ver()[0].split(".")[:1])
+        return f"macos_{mac_version}"
+    elif platform.system() == "Linux":
+        return "linux"
     else:
         raise ValueError("Unsupported system: {}".format(platform.system()))
 
