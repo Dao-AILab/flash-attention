@@ -65,9 +65,9 @@ def get_arch():
     Returns the system name as used in wheel filenames.
     """
     if platform.machine() == "x86_64":
-        "x86_64"
+        return "x86_64"
     elif platform.machine() == "arm64" or platform.machine() == "aarch64":
-        "aarch64"
+        return "aarch64"
     else:
         raise ValueError("Unsupported arch: {}".format(platform.machine()))
 
