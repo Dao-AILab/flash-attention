@@ -184,7 +184,7 @@ class FlashCrossAttention(nn.Module):
                 softmax_scale=self.softmax_scale,
                 causal=causal,
                 alibi_slopes=self.alibi_slopes,
-                deterministic = self.deterministic,
+                deterministic=self.deterministic,
             )
         else:
             batch_size, seqlen_q = q.shape[0], q.shape[1]
@@ -197,7 +197,7 @@ class FlashCrossAttention(nn.Module):
                 causal=causal,
                 softmax_scale=self.softmax_scale,
                 alibi_slopes=self.alibi_slopes,
-                deterministic = self.deterministic,
+                deterministic=self.deterministic,
             )
 
 
