@@ -1,4 +1,4 @@
-# Copyright (c) 2023, Tri Dao.
+# Copyright (c) 2024, Tri Dao.
 
 import pytest
 import torch
@@ -16,14 +16,16 @@ from flash_attn.ops.triton.layernorm import (
 is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 
 
+@pytest.mark.parametrize("has_rowscale", [False, True])
+# @pytest.mark.parametrize("has_rowscale", [True])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.27])
-# @pytest.mark.parametrize("dropout_p", [0.27])
+# @pytest.mark.parametrize("dropout_p", [0.0])
 @pytest.mark.parametrize("prenorm", [True, False])
-# @pytest.mark.parametrize("prenorm", [False])
+# @pytest.mark.parametrize("prenorm", [True])
 @pytest.mark.parametrize("is_rms_norm", [False, True])
 # @pytest.mark.parametrize("is_rms_norm", [True])
 @pytest.mark.parametrize("has_residual", [True, False])
-# @pytest.mark.parametrize("has_residual", [True])
+# @pytest.mark.parametrize("has_residual", [False])
 @pytest.mark.parametrize(
     "weight_dtype", [torch.float32, torch.float16] + ([torch.bfloat16] if is_sm8x else [])
 )
@@ -45,6 +47,7 @@ def test_layer_norm(
     is_rms_norm,
     prenorm,
     dropout_p,
+    has_rowscale,
 ):
     device = "cuda"
     if any(x == torch.bfloat16 for x in [input_dtype, residual_dtype, weight_dtype]):
@@ -60,7 +63,8 @@ def test_layer_norm(
     layer_norm_ref_fn = layer_norm_ref if not is_rms_norm else rms_norm_ref
     allclose = (
         lambda x, x_pt, x_ref, atol=atol: (x - x_ref).abs().max()
-        <= 2 * (x_pt - x_ref).abs().max() + atol
+        # Sometimes x0_pt.grad is NaN
+        <= 2 * (x_pt[~x_pt.isnan()] - x_ref[~x_pt.isnan()]).abs().max() + atol
     )
     x0 = torch.randn(
         batch_size, seqlen, hidden_size, device=device, dtype=input_dtype, requires_grad=True
@@ -83,6 +87,8 @@ def test_layer_norm(
     bias_pt = bias.detach().clone().requires_grad_() if bias is not None else None
     bias_ref = bias.detach().clone().requires_grad_() if bias is not None else None
 
+    rowscale = torch.randn(batch_size, seqlen, dtype=input_dtype, device=device) if has_rowscale else None
+
     residual_in_fp32 = (not has_residual) and residual_dtype == torch.float32
     out, *rest = layer_norm_fn(
         x0,
@@ -91,6 +97,7 @@ def test_layer_norm(
         residual=res,
         eps=1e-6,
         dropout_p=dropout_p,
+        rowscale=rowscale,
         prenorm=prenorm,
         residual_in_fp32=residual_in_fp32,
         is_rms_norm=is_rms_norm,
@@ -104,6 +111,7 @@ def test_layer_norm(
         residual=res_pt,
         eps=1e-6,
         dropout_p=dropout_p,
+        rowscale=rowscale,
         prenorm=prenorm,
         dropout_mask=dropout_mask,
     )
@@ -114,6 +122,7 @@ def test_layer_norm(
         residual=res_ref,
         eps=1e-6,
         dropout_p=dropout_p,
+        rowscale=rowscale,
         prenorm=prenorm,
         dropout_mask=dropout_mask,
         upcast=True,
