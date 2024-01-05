@@ -14,3 +14,7 @@ This extension has only been tested on A100s.
 ```sh
 cd csrc/layer_norm && pip install .
 ```
+
+As of 2024-01-05, this extension is no longer used in the FlashAttention repo.
+We've instead switched to a Triton-based
+[implementation](https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/ops/triton/layer_norm.py).

@@ -1,4 +1,4 @@
-# Copyright (c) 2023, Tri Dao.
+# Copyright (c) 2024, Tri Dao.
 
 import logging
 import math
@@ -47,29 +47,14 @@ except ImportError:
     ColumnParallelLinear = None
 
 try:
-    from flash_attn.ops.layer_norm import dropout_add_layer_norm
-except ImportError:
-    dropout_add_layer_norm = None
-
-try:
-    from flash_attn.ops.layer_norm import dropout_add_layer_norm_parallel_residual
-except ImportError:
-    dropout_add_layer_norm_parallel_residual = None
-
-try:
-    from flash_attn.ops.rms_norm import RMSNorm, dropout_add_rms_norm
-except ImportError:
-    RMSNorm, dropout_add_rms_norm = None, None
-
-try:
-    from flash_attn.ops.rms_norm import dropout_add_rms_norm_parallel_residual
-except ImportError:
-    dropout_add_rms_norm_parallel_residual = None
-
-try:
     from flash_attn.ops.triton.mlp import FusedDenseSqreluDense
 except ImportError:
     FusedDenseSqreluDense = None
+
+try:
+    from flash_attn.ops.triton.layer_norm import layer_norm_fn, RMSNorm
+except ImportError:
+    layer_norm_fn, RMSNorm = None, None
 
 logger = logging.getLogger(__name__)
 
@@ -481,13 +466,15 @@ class GPTModel(GPTPreTrainedModel):
                 for i in range(config.num_hidden_layers)
             ]
         )
+        rotary_emb_fraction = getattr(config, "rotary_emb_fraction", 0.0)
+        if rotary_emb_fraction > 0.0:  # Tie all the RotaryEmbedding modules to share the same cos/sin cache
+            for layer in self.layers[1:]:
+                layer.mixer.rotary_emb = self.layers[0].mixer.rotary_emb
 
         self.fused_dropout_add_ln = getattr(config, "fused_dropout_add_ln", False)
         if self.fused_dropout_add_ln:
-            if (not self.parallel_block and dropout_add_layer_norm is None) or (
-                self.parallel_block and dropout_add_layer_norm_parallel_residual is None
-            ):
-                raise ImportError("dropout_layer_norm is not installed")
+            if layer_norm_fn is None:
+                raise ImportError("Triton is not installed")
         if self.prenorm:
             self.drop_f = nn.Dropout(config.resid_pdrop)
             norm_cls = nn.LayerNorm if not use_rms_norm else RMSNorm
@@ -571,41 +558,17 @@ class GPTModel(GPTPreTrainedModel):
                 hidden_states = self.ln_f(residual.to(dtype=self.ln_f.weight.dtype))
             else:
                 # Set prenorm=False here since we don't need the residual
-                if not self.parallel_block:
-                    fused_add_norm_fn = (
-                        dropout_add_rms_norm
-                        if isinstance(self.ln_f, RMSNorm)
-                        else dropout_add_layer_norm
-                    )
-                    hidden_states = fused_add_norm_fn(
-                        hidden_states,
-                        residual,
-                        self.ln_f.weight,
-                        self.ln_f.bias,
-                        self.drop_f.p if self.training else 0.0,
-                        self.ln_f.eps,
-                        prenorm=False,
-                        residual_in_fp32=self.residual_in_fp32,
-                    )
-                else:
-                    fused_add_norm_fn = (
-                        dropout_add_rms_norm_parallel_residual
-                        if isinstance(self.ln_f, RMSNorm)
-                        else dropout_add_layer_norm_parallel_residual
-                    )
-                    hidden_states, _ = fused_add_norm_fn(
-                        hidden_states,
-                        hidden_states2,
-                        residual,
-                        self.ln_f.weight,
-                        self.ln_f.bias,
-                        None,
-                        None,
-                        self.drop_f.p if self.training else 0.0,
-                        self.ln_f.eps,
-                        prenorm=False,
-                        residual_in_fp32=self.residual_in_fp32,
-                    )
+                hidden_states = layer_norm_fn(
+                    hidden_states,
+                    self.ln_f.weight,
+                    self.ln_f.bias,
+                    residual=residual,
+                    x1=None if not self.parallel_block else hidden_states2,
+                    eps=self.ln_f.eps,
+                    dropout_p=self.drop_f.p if self.training else 0.0,
+                    prenorm=False,
+                    is_rms_norm=isinstance(self.ln_f, RMSNorm)
+                )
         return hidden_states
 
 
