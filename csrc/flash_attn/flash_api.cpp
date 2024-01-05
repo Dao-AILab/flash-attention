@@ -527,14 +527,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int total_k = k.size(0);
     const int num_heads_k = k.size(1);
 
-    if (max_seqlen_q == 1) { is_causal = false; }  // causal=true is the same as causal=false in this case
+    if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }  // causal=true is the same as causal=false in this case
     if (is_causal) { window_size_right = 0; }
 
     void *cu_seqlens_q_d = cu_seqlens_q.data_ptr();
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
-    const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && head_size_og % 8 == 0;
+    const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
     if (seqlenq_ngroups_swapped) {
         const int ngroups = num_heads / num_heads_k;
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size_og});
@@ -689,7 +689,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         out = out.reshape(size_before).transpose(1, 2).reshape(size_after);
         out_padded = out_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
         q_padded = q_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
-        softmax_lse = softmax_lse.reshape({batch_size, max_seqlen_q, num_heads_k, 1}).transpose(1, 2).reshape({batch_size, num_heads_k * max_seqlen_q, 1});
+        softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * max_seqlen_q, 1});
     }
 
     return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
