@@ -275,7 +275,7 @@ contribution. Sliding window was used in the [Mistral 7B](https://mistral.ai/new
 
 ### 2.4: ALiBi (attention with linear bias), deterministic backward pass.
 
-Implement ALiBi (Press et el., 2021). Thanks to Sanghun Cho from Kakao Brain for this contribution.
+Implement ALiBi (Press et al., 2021). Thanks to Sanghun Cho from Kakao Brain for this contribution.
 
 Implement deterministic backward pass. Thanks to engineers from [Meituan](www.meituan.com) for this contribution.
 
