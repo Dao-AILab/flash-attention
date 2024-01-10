@@ -14,24 +14,6 @@ on:
 
 jobs:
 
-  setup_release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Get the tag version
-        id: extract_branch
-        run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
-        shell: bash
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.extract_branch.outputs.branch }}
-          release_name: ${{ steps.extract_branch.outputs.branch }}
-
   build_wheels:
     name: Build Wheel
     needs: setup_release
@@ -172,25 +154,6 @@ jobs:
         id: extract_branch
         run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
 
-      - name: Get Release with tag
-        id: get_current_release
-        uses: joutvhu/get-release@v1
-        with:
-          tag_name: ${{ steps.extract_branch.outputs.branch }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Release Asset
-        id: upload_release_asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.get_current_release.outputs.upload_url }}
-          asset_path: ./dist/${{env.wheel_name}}
-          asset_name: ${{env.wheel_name}}
-          asset_content_type: application/*
-
   publish_package:
     name: Publish package
     needs: [build_wheels]
@@ -215,10 +178,3 @@ jobs:
           FLASH_ATTENTION_SKIP_CUDA_BUILD: "TRUE"
         run: |
           python setup.py sdist --dist-dir=dist
-
-      - name: Deploy
-        env:
-          TWINE_USERNAME: "__token__"
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          python -m twine upload dist/*

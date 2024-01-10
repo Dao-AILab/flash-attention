@@ -59,6 +59,12 @@ struct Flash_fwd_params : public Qkv_params {
     index_t o_row_stride;
     index_t o_head_stride;
 
+    // Attention mask
+    void * __restrict__ attn_mask_ptr;
+    index_t attn_mask_batch_stride;
+    index_t attn_mask_head_stride;
+    index_t attn_mask_q_stride;
+
     // The pointer to the P matrix.
     void * __restrict__ p_ptr;
 

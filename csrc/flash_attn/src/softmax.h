@@ -115,6 +115,44 @@ inline __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &tensor, Tens
     }
 }
 
+template <typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+inline __device__ void apply_attn_mask(Tensor<Engine0, Layout0> &tensor,
+                                   Tensor<Engine1, Layout1> &mask_fragment,
+                                   const int col_idx_offset_,
+                                   const int max_seqlen_k,
+                                   const int row_idx_offset_,
+                                   const int max_seqlen_q,
+                                   const int warp_row_stride) {
+    // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
+    static_assert(Layout0::rank == 2, "Only support 2D Tensor");
+    const int lane_id = threadIdx.x % 32;
+    const int row_idx_offset = row_idx_offset_;
+    const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+
+    #pragma unroll
+    for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+        const int row_idx_base = row_idx_offset + mi * warp_row_stride;
+        #pragma unroll
+        for (int i = 0; i < size<0, 0>(tensor); ++i) {
+            const int row_idx = row_idx_base + i * 8;
+            #pragma unroll
+            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+                const int col_idx_base = col_idx_offset + nj * 8;
+                #pragma unroll
+                for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                    const int col_idx = col_idx_base + j;
+                    if (col_idx < max_seqlen_k && row_idx < max_seqlen_q) {
+                        auto mask  = mask_fragment(make_coord(i, mi), make_coord(j, nj));
+                        if(mask < 0.5){
+                            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 template <typename Engine, typename Layout>
 inline __device__ void apply_mask(Tensor<Engine, Layout> &tensor, const int max_seqlen_k,
                                   const int col_idx_offset_ = 0) {

@@ -422,7 +422,7 @@ inline __device__ void convert_dKV(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_attn_mask, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
 inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -578,6 +578,25 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor acc_dk = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
     Tensor acc_dv = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
 
+    // Attention mask
+    // Move linear index to the last block: skip batch, head, queries, and keys.
+    const index_t row_offset_attn_mask = bidb * params.attn_mask_batch_stride +
+        + bidh * params.attn_mask_head_stride + ((m_block_max - 1) * kBlockM) * params.attn_mask_q_stride
+        + n_block * kBlockN;
+    Tensor gM = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.attn_mask_ptr) + row_offset_attn_mask),
+                    Shape<Int<kBlockM>, Int<kBlockN>>{},
+                    make_stride(params.attn_mask_q_stride, _1{})); // (BLK_M,BLK_N)
+    Tensor sM = make_tensor(sP.data() + size(sP), typename Kernel_traits::SmemLayoutM{});
+
+    // TODO(cyprien): Understand this properly. For now just cargo-culting.
+    typename Kernel_traits::GmemTiledCopyM gmem_tiled_copy_M;
+    auto gmem_thr_copy_M = gmem_tiled_copy_M.get_thread_slice(tidx);
+
+    Tensor tMgM = gmem_thr_copy_M.partition_S(gM);
+    Tensor tMsM = gmem_thr_copy_M.partition_D(sM);
+
+    Tensor tMrM = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});
+
     //
     // Copy Atom retiling
     //
@@ -630,6 +649,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     auto smem_thr_copy_dQ = smem_tiled_copy_dQ.get_thread_slice(tidx);
     Tensor taccdQsdQ = smem_thr_copy_dQ.partition_D(sdQ);  // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
+    // TODO(cyprien): Understand this properly. For now just cargo-culting.
+    auto smem_tiled_copy_M = make_tiled_copy_C_warpcontiguousN<MMA_N_SdP>(typename Kernel_traits::SmemCopyAtomPdS{}, tiled_mma_sdp);
+    auto smem_thr_copy_M = smem_tiled_copy_M.get_thread_slice(tidx);
+    Tensor tSsM = smem_thr_copy_M.partition_S(sM);
+    Tensor tMrM_copy_view = smem_thr_copy_M.retile_D(tMrM);
+
     //
     // PREDICATES
     //
@@ -672,7 +697,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     // We might need to exit early and write 0 to dK and dV for those blocks.
     // Otherwise we get wrong result for the case where we don't enter the for loop.
     // And we might read OOB elements from gQ and gdO.
-    if (Is_local && m_block < m_block_min) {
+    // This also covers the case where actual_seqlen_q == 0
+    if ((Is_local || !Is_even_MN) && m_block < m_block_min) {
         const index_t row_offset_dk = binfo.k_offset(params.dk_batch_stride, params.dk_row_stride, bidb)
           + n_block * kBlockN * params.dk_row_stride + bidh * params.dk_head_stride;
         const index_t row_offset_dv = binfo.k_offset(params.dv_batch_stride, params.dv_row_stride, bidb)
@@ -768,6 +794,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     }
     flash::cp_async_fence();
 
+    if (Has_attn_mask) {
+        cute::copy(gmem_tiled_copy_M, tMgM, tMsM);
+        cute::cp_async_fence();
+    }
+
     // if (cute::thread0()) { print(tdOgdO.layout()); printf("\n"); print(tdOrdO); print(tdOrO); }
     if (Is_first) {
         cute::copy(tdOrdO, tdOsdO);
@@ -806,11 +837,30 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         //     cute::copy(smem_tiled_copy_KV, tSsK(_, _, k), tSrK_copy_view(_, _, k));
         // }
         // if (cute::thread0()) { print(tSrK); }
+
+        if (Has_attn_mask) {
+            cute::copy(smem_tiled_copy_M, tSsM, tMrM_copy_view);
+        }
+
         flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
                     smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
 
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (col=(2, MMA_N), row=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        Tensor mask_fragment = make_tensor(tMrM.data(), flash::convert_layout_acc_rowcol(tMrM.layout()));
+
+        if (Has_attn_mask) {
+            // TODO(cyprien): Understand row_offset and col_offset properly. For now just cargo-culting.
+            flash::apply_attn_mask(
+                scores, mask_fragment,
+                n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + get<0>(taccScS_row(0)),
+                binfo.actual_seqlen_q,
+                AtomLayoutMS * 16
+            );
+        }
+
         // if (cute::thread(32, 0)) { print(scores); }
         // TD [2023-07-29]: I was thinking that we don't need to mask out the elements beyond
         // actual_seqlen_k, because acc_s would be some finite value for those indices.
@@ -967,6 +1017,13 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_dO, tdOgdO, tdOsdO, tQcQ, tQpQ);
                 flash::cp_async_fence();
             }
+
+            if (Has_attn_mask) {
+                // Advance gM
+                tMgM.data() = tMgM.data() + (-int(kBlockM * params.attn_mask_q_stride));
+                cute::copy(gmem_tiled_copy_M, tMgM, tMsM);
+                cute::cp_async_fence();
+            }
         }
 
         flash::gemm(acc_dq, tdQrdS, tdQrKt, tdQsdS, tdQsKt, tiled_mma_dq,
@@ -1113,7 +1170,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_N, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Has_attn_mask, bool Is_even_N, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -1248,6 +1305,25 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
 
     Tensor acc_dq = partition_fragment_C(tiled_mma_dq, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M_SdP, MMA_K
 
+    // Attention mask
+    // Move linear index to the last block: skip batch, head, queries, and keys.
+    const index_t row_offset_attn_mask = bidb * params.attn_mask_batch_stride +
+        + bidh * params.attn_mask_head_stride + (m_block * kBlockM) * params.attn_mask_q_stride
+        + (n_block_max - 1) * kBlockN;
+    Tensor gM = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.attn_mask_ptr) + row_offset_attn_mask),
+                    Shape<Int<kBlockM>, Int<kBlockN>>{},
+                    make_stride(params.attn_mask_q_stride, _1{})); // (BLK_M,BLK_N)
+    Tensor sM = make_tensor(sP.data() + size(sP), typename Kernel_traits::SmemLayoutM{});
+
+    // TODO(cyprien): Understand this properly. For now just cargo-culting.
+    typename Kernel_traits::GmemTiledCopyM gmem_tiled_copy_M;
+    auto gmem_thr_copy_M = gmem_tiled_copy_M.get_thread_slice(tidx);
+
+    Tensor tMgM = gmem_thr_copy_M.partition_S(gM);
+    Tensor tMsM = gmem_thr_copy_M.partition_D(sM);
+
+    Tensor tMrM = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});
+
     //
     // Copy Atom retiling
     //
@@ -1286,6 +1362,11 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
     auto smem_tiled_copy_Kt = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma_dq);
     auto smem_thr_copy_Kt = smem_tiled_copy_Kt.get_thread_slice(tidx);
     Tensor tdQsKt = smem_thr_copy_Kt.partition_S(sKt);
+
+    auto smem_tiled_copy_M = make_tiled_copy_C_warpcontiguousN<MMA_N_SdP>(typename Kernel_traits::SmemCopyAtomPdS{}, tiled_mma_sdp);
+    auto smem_thr_copy_M = smem_tiled_copy_M.get_thread_slice(tidx);
+    Tensor tSsM = smem_thr_copy_M.partition_S(sM);
+    Tensor tMrM_copy_view = smem_thr_copy_M.retile_D(tMrM);
 
     //
     // PREDICATES
@@ -1343,6 +1424,11 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
         gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
     );
 
+    if (Has_attn_mask) {
+        cute::copy(gmem_tiled_copy_M, tMgM, tMsM);
+        cute::cp_async_fence();
+    }
+
     Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});    // (BLK_M,BLK_N) -> (blk_m,blk_n)
     Tensor taccScS = thr_mma_sdp.partition_C(caccS);                           // (MMA,MMA_N,MMA_N)
     static_assert(decltype(size<0>(taccScS))::value == 4);
@@ -1378,11 +1464,27 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
         flash::cp_async_wait<0>();
         __syncthreads();
 
+        if (Has_attn_mask) {
+            cute::copy(smem_tiled_copy_M, tSsM, tMrM_copy_view);
+        }
+
         flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
                     smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
 
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (col=(2, MMA_N), row=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        Tensor mask_fragment = make_tensor(tMrM.data(), flash::convert_layout_acc_rowcol(tMrM.layout()));
+
+        if (Has_attn_mask) {
+            flash::apply_attn_mask(
+                scores, mask_fragment,
+                n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + get<0>(taccScS_row(0)),
+                binfo.actual_seqlen_q,
+                AtomLayoutMS * 16
+            );
+        }
         // We don't need to mask out the elements beyond actual_seqlen_k, because acc_s would
         // be some finite value for those indices. In the end when we multiply with K to get dQ,
         // the corresponding values of K would be 0, so the result would still be correct.
@@ -1459,6 +1561,12 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
+
+            if (Has_attn_mask) {
+                tMgM.data() = tMgM.data() + (-kBlockN);
+                cute::copy(gmem_tiled_copy_M, tMgM, tMsM);
+                cute::cp_async_fence();
+            }
         }
 
         Tensor acc_dv = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
@@ -1535,7 +1643,7 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_M, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Has_attn_mask, bool Is_even_M, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv(const Params &params) {
 
     // The block index for the batch.
@@ -1549,20 +1657,20 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 
     const int n_block_max = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
     if (n_block_max == 1) {
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, true, true>(params, bidb, bidh, 0);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_attn_mask, Is_even_M, Is_even_K, true, true>(params, bidb, bidh, 0);
     } else {
         // Iterating backward from n_block_max - 1 to 0 might save 1 register
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, true, false>(params, bidb, bidh, n_block_max - 1);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_attn_mask, Is_even_M, Is_even_K, true, false>(params, bidb, bidh, n_block_max - 1);
         for (int n_block = n_block_max - 2; n_block > 0; n_block--) {
-            compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, false, false>(params, bidb, bidh, n_block);
+            compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_attn_mask, Is_even_M, Is_even_K, false, false>(params, bidb, bidh, n_block);
         }
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, false, true>(params, bidb, bidh, 0);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_attn_mask, Is_even_M, Is_even_K, false, true>(params, bidb, bidh, 0);
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_attn_mask, bool Is_even_MN, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     const int n_block = blockIdx.x;
@@ -1571,12 +1679,12 @@ inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
     // The block index for the head.
     const int bidh = blockIdx.z;
 
-    compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+    compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_attn_mask, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_N, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Has_attn_mask, bool Is_even_N, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv_seqq_parallel(const Params &params) {
 
     const int m_block = blockIdx.x;
@@ -1585,7 +1693,7 @@ inline __device__ void compute_dq_dk_dv_seqq_parallel(const Params &params) {
     // The block index for the head.
     const int bidh = blockIdx.z;
 
-    compute_dq_dk_dv_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_even_N, Is_even_K>(params, bidb, bidh, m_block);
+    compute_dq_dk_dv_1rowblock<Kernel_traits, Is_dropout, Is_causal, Has_attn_mask, Is_even_N, Is_even_K>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

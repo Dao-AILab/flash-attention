@@ -71,7 +71,7 @@ inline __device__ void write_softmax_to_gmem(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_attn_mask, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -205,6 +205,22 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
 
+    // Attention mask
+    const index_t row_offset_attn_mask = bidb * params.attn_mask_batch_stride +
+        + bidh * params.attn_mask_head_stride + (m_block * kBlockM) * params.attn_mask_q_stride
+        + (n_block_max - 1) * kBlockN;
+    Tensor gMask = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.attn_mask_ptr) + row_offset_attn_mask),
+                    Shape<Int<kBlockM>, Int<kBlockN>>{},
+                    make_stride(params.attn_mask_q_stride, _1{})); // (BLK_M,BLK_N)
+    Tensor sMask = make_tensor(sV.data() + size(sV), typename Kernel_traits::SmemLayoutM{});
+
+    // TODO(cyprien): Understand this properly. For now just cargo-culting.
+    typename Kernel_traits::GmemTiledCopyM gmem_tiled_copy_M;
+    auto gmem_thr_copy_M = gmem_tiled_copy_M.get_thread_slice(tidx);
+
+    Tensor tSgM = gmem_thr_copy_M.partition_S(gMask);
+    Tensor tMsM = gmem_thr_copy_M.partition_D(sMask);
+
     //
     // Copy Atom retiling
     //
@@ -222,6 +238,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
     Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+
+    auto smem_tiled_copy_M = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomM{}, tiled_mma);
+    auto smem_thr_copy_M = smem_tiled_copy_M.get_thread_slice(tidx);
+    Tensor tSsMask = smem_thr_copy_M.partition_S(sMask);
+    Tensor tMrM = thr_mma.partition_fragment_C(sMask);
+    Tensor tMrM_copy_view = smem_thr_copy_M.retile_D(tMrM);
 
     // TODO: this might need to change if we change the mma instruction in SM70
     Tensor scores_max = make_tensor<ElementAccum>(Shape<Int<2 * size<1>(acc_o)>>{});
@@ -296,6 +318,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
+
+    if (Has_attn_mask) {
+        cute::copy(gmem_tiled_copy_M, tSgM, tMsM);
+    }
+
     cute::cp_async_fence();
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z < 2) { print(tKgK); }
     // __syncthreads();
@@ -348,6 +375,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
             );
         }
+
+        if (Has_attn_mask) {
+            cute::copy(smem_tiled_copy_M, tSsMask, tMrM_copy_view);
+        }
+
         cute::cp_async_fence();
 
         flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
@@ -358,6 +390,20 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        Tensor mask_fragment = make_tensor(tMrM.data(), flash::convert_layout_acc_rowcol(tMrM.layout()));
+
+        if (Has_attn_mask) {
+            // TODO(cyprien): Understand row_offset and col_offset properly. For now just cargo-culting.
+            flash::apply_attn_mask(
+                scores, mask_fragment,
+                n_block * kBlockN,
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q,
+                kNWarps * 16
+            );
+        }
+
         // if (cute::thread0()) { print_tensor(scores); }
         // We don't put the masking before the matmul S = Q K^T because we don't clear sK
         // for rows outside actual_seqlen_k. So those rows could have Inf / NaN, and the matmul
@@ -394,6 +440,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             // Advance gK
             tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+
+            //Advance gMask
+            if (Has_attn_mask) {
+                tSgM.data() = tSgM.data() + (-kBlockN);
+                cute::copy(gmem_tiled_copy_M, tSgM, tMsM);
+            }
+
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
@@ -446,6 +499,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // Advance gV
         tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+
+        if (Has_attn_mask) {
+            cute::copy(smem_tiled_copy_M, tSsMask, tMrM_copy_view);
+        }
+
         cute::cp_async_fence();
 
         flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
@@ -462,10 +520,31 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
+
+            //Advance gMask
+            if (Has_attn_mask) {
+                tSgM.data() = tSgM.data() + (-kBlockN);
+                cute::copy(gmem_tiled_copy_M, tSgM, tMsM);
+                cute::cp_async_fence();
+            }
         }
 
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        Tensor mask_fragment = make_tensor(tMrM.data(), flash::convert_layout_acc_rowcol(tMrM.layout()));
+
+        if (Has_attn_mask) {
+            // TODO(cyprien): Understand row_offset and col_offset properly. For now just cargo-culting.
+            flash::apply_attn_mask(
+                scores, mask_fragment,
+                n_block * kBlockN,
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q,
+                kNWarps * 16
+            );
+        }
+
         if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
             flash::apply_mask_local(
                 scores, n_block * kBlockN, binfo.actual_seqlen_k,
@@ -1131,7 +1210,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_attn_mask, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1147,7 +1226,7 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Is_even_MN, Is_even_K, Return_softmax>(params, bidb, bidh, m_block);
+    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_attn_mask, Is_even_MN, Is_even_K, Return_softmax>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -41,7 +41,11 @@ void set_params_fprop(Flash_fwd_params &params,
                       float p_dropout,
                       float softmax_scale,
                       int window_size_left,
-                      int window_size_right) {
+                      int window_size_right,
+                      void* attn_mask,
+                      uint32_t attn_mask_batch_stride,
+                      uint32_t attn_mask_head_stride,
+                      uint32_t attn_mask_q_stride) {
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -62,6 +66,12 @@ void set_params_fprop(Flash_fwd_params &params,
     params.o_ptr = out.data_ptr();
     params.o_row_stride = out.stride(-3);
     params.o_head_stride = out.stride(-2);
+
+    // Attention mask
+    params.attn_mask_ptr = attn_mask;
+    params.attn_mask_batch_stride = attn_mask_batch_stride;
+    params.attn_mask_head_stride = attn_mask_head_stride;
+    params.attn_mask_q_stride = attn_mask_q_stride;
 
     if (cu_seqlens_q_d == nullptr) {
         params.q_batch_stride = q.stride(0);
@@ -148,7 +158,11 @@ void set_params_dgrad(Flash_bwd_params &params,
                       float p_dropout,
                       float softmax_scale,
                       int window_size_left,
-                      int window_size_right) {
+                      int window_size_right,
+                      void* attn_mask,
+                      uint32_t attn_mask_batch_stride,
+                      uint32_t attn_mask_head_stride,
+                      uint32_t attn_mask_q_stride) {
 
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
@@ -160,7 +174,11 @@ void set_params_dgrad(Flash_bwd_params &params,
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     attn_mask,
+                     attn_mask_batch_stride,
+                     attn_mask_head_stride,
+                     attn_mask_q_stride);
 
     // Set the pointers and strides.
     params.do_ptr = dout.data_ptr();
@@ -255,6 +273,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         bool is_causal,
         const int window_size_left,
         int window_size_right,
+        const c10::optional<at::Tensor> &attn_mask, // batch_size x num_heads_k x seqlen_q x seqlen_k
         const bool return_softmax,
         c10::optional<at::Generator> gen_) {
 
@@ -309,6 +328,30 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size_og);
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_og);
+
+    // Attention mask 
+    uint32_t attn_mask_batch_stride = 0;
+    uint32_t attn_mask_head_stride = 0;
+    uint32_t attn_mask_q_stride = 0;
+    at::Tensor attn_mask_padded;
+
+    if (attn_mask.has_value()) {
+        TORCH_CHECK(attn_mask.value().is_cuda(), "Input tensor must be on CUDA device");
+        TORCH_CHECK(attn_mask.value().stride(-1) == 1, "Input tensor must have contiguous last dimension");
+        TORCH_CHECK(attn_mask.value().dtype() == q_dtype, "attention mask and query must have the same dtype");
+        CHECK_SHAPE(attn_mask.value(), batch_size, num_heads, seqlen_q, seqlen_k);
+
+        // Attention mask: we pad to a multiple of 8.
+        if ((seqlen_q % 8 != 0) || (seqlen_k % 8 != 0)) {
+            attn_mask_padded = torch::nn::functional::pad(attn_mask.value(), torch::nn::functional::PadFuncOptions({0, 8 - seqlen_k % 8, 0, 8 - seqlen_q % 8}));
+        } else {
+            attn_mask_padded = attn_mask.value();
+        }
+
+        attn_mask_batch_stride = attn_mask_padded.stride(0);
+        attn_mask_head_stride = attn_mask_padded.stride(1);
+        attn_mask_q_stride = attn_mask_padded.stride(2);
+    }
 
     at::Tensor q_padded, k_padded, v_padded;
     if (head_size_og % 8 != 0) {
@@ -368,7 +411,11 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     attn_mask ? attn_mask_padded.data_ptr() : nullptr,
+                     attn_mask_batch_stride,
+                     attn_mask_head_stride,
+                     attn_mask_q_stride);
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
     const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
@@ -420,7 +467,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         q_padded = q_padded.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
-    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
+    return {out, q_padded, k_padded, v_padded, out_padded, attn_mask_padded, softmax_lse, p, rng_state};
 }
 
 std::vector<at::Tensor>
@@ -553,7 +600,11 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     /*attn_mask*/nullptr,  // TODO(cyprien): support varlen.
+                     /*attn_mask_batch_stride*/0,
+                     /*attn_mask_head_stride*/0,
+                     /*attn_mask_q_stride*/0);
 
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
@@ -621,6 +672,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         const bool is_causal,
         const int window_size_left,
         int window_size_right,
+        const c10::optional<at::Tensor> &attn_mask,
         c10::optional<at::Generator> gen_,
         c10::optional<at::Tensor> &rng_state) {
 
@@ -686,6 +738,25 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
     CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size);
     CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size_og);
+
+    // Attention mask
+    uint32_t attn_mask_batch_stride = 0;
+    uint32_t attn_mask_head_stride = 0;
+    uint32_t attn_mask_q_stride = 0;
+
+    if (attn_mask.has_value()) {
+        TORCH_CHECK(attn_mask.value().is_cuda(), "Input tensor must be on CUDA device");
+        TORCH_CHECK(attn_mask.value().stride(-1) == 1, "Input tensor must have contiguous last dimension");
+        TORCH_CHECK(attn_mask.value().dtype() == q_dtype, "attention mask and query must have the same dtype");
+
+        const int seqlen_q_round8 = round_multiple(seqlen_q, 8);
+        const int seqlen_k_round8 = round_multiple(seqlen_k, 8);
+        CHECK_SHAPE(attn_mask.value(), batch_size, num_heads, seqlen_q_round8, seqlen_k_round8);
+
+        attn_mask_batch_stride = attn_mask.value().stride(0);
+        attn_mask_head_stride = attn_mask.value().stride(1);
+        attn_mask_q_stride = attn_mask.value().stride(2);
+    }
 
     at::Tensor dq, dk, dv;
     if (dq_.has_value()) {
@@ -772,7 +843,11 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     attn_mask ? attn_mask->data_ptr() : nullptr,
+                     attn_mask_batch_stride,
+                     attn_mask_head_stride,
+                     attn_mask_q_stride);
 
     auto launch = &run_mha_bwd;
     // launch(params, stream, /*configure=*/true);
@@ -794,7 +869,14 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         params.rng_state[1] = std::get<1>(seeds);
     }
 
-    launch(params, stream, /*configure=*/false);
+    if (seqlen_q > 0) {
+        launch(params, stream, /*configure=*/false);
+    } else {
+        // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
+        dk.zero_();
+        dv.zero_();
+        softmax_d.zero_();
+    }
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
@@ -997,7 +1079,11 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     /*attn_mask*/nullptr,
+                     /*attn_mask_batch_stride*/0,
+                     /*attn_mask_head_stride*/0,
+                     /*attn_mask_q_stride*/0); 
 
     auto launch = &run_mha_bwd;
     // launch(params, stream, /*configure=*/true);
@@ -1159,7 +1245,11 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      /*p_dropout=*/0.f,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     /*attn_mask*/nullptr,  // TODO(cyprien): support varlen.
+                     /*attn_mask_batch_stride*/0,
+                     /*attn_mask_head_stride*/0,
+                     /*attn_mask_q_stride*/0);
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {
