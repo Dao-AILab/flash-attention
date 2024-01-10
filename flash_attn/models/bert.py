@@ -40,9 +40,10 @@ except ImportError:
     FusedDense = None
 
 try:
-    from flash_attn.ops.layer_norm import dropout_add_layer_norm, layer_norm
+    from flash_attn.ops.triton.layer_norm import layer_norm_fn
 except ImportError:
-    dropout_add_layer_norm, layer_norm = None, None
+    layer_norm_fn = None
+
 
 try:
     from flash_attn.losses.cross_entropy import CrossEntropyLoss
@@ -237,8 +238,8 @@ class BertPredictionHeadTransform(nn.Module):
         if fused_bias_fc and FusedDense is None:
             raise ImportError("fused_dense is not installed")
         self.fused_dropout_add_ln = getattr(config, "fused_dropout_add_ln", False)
-        if self.fused_dropout_add_ln and layer_norm is None:
-            raise ImportError("dropout_add_layer_norm is not installed")
+        if self.fused_dropout_add_ln and layer_norm_fn is None:
+            raise ImportError("Triton is not installed")
         linear_cls = nn.Linear if not fused_bias_fc else FusedDense
         self.dense = linear_cls(config.hidden_size, config.hidden_size)
         approximate = (
@@ -255,8 +256,8 @@ class BertPredictionHeadTransform(nn.Module):
         if not self.fused_dropout_add_ln:
             hidden_states = self.layer_norm(hidden_states)
         else:
-            hidden_states = layer_norm(
-                hidden_states, self.layer_norm.weight, self.layer_norm.bias, self.layer_norm.eps
+            hidden_states = layer_norm_fn(
+                hidden_states, self.layer_norm.weight, self.layer_norm.bias, eps=self.layer_norm.eps
             )
         return hidden_states
 
@@ -345,8 +346,8 @@ class BertModel(BertPreTrainedModel):
                 config.vocab_size % self.pad_vocab_size_multiple
             )
         self.fused_dropout_add_ln = getattr(config, "fused_dropout_add_ln", False)
-        if self.fused_dropout_add_ln and layer_norm is None:
-            raise ImportError("dropout_add_layer_norm is not installed")
+        if self.fused_dropout_add_ln and layer_norm_fn is None:
+            raise ImportError("Triton is not installed")
         assert config.hidden_act in ["gelu", "gelu_new", "gelu_fast", "gelu_pytorch_tanh"]
 
         self.embeddings = BertEmbeddings(
@@ -384,8 +385,8 @@ class BertModel(BertPreTrainedModel):
         if not self.fused_dropout_add_ln:
             hidden_states = self.emb_ln(hidden_states)
         else:
-            hidden_states = layer_norm(
-                hidden_states, self.emb_ln.weight, self.emb_ln.bias, self.emb_ln.eps
+            hidden_states = layer_norm_fn(
+                hidden_states, self.emb_ln.weight, self.emb_ln.bias, eps=self.emb_ln.eps
             )
         hidden_states = self.emb_drop(hidden_states)
 

@@ -15,6 +15,8 @@
 #include "utils.h"
 #include "softmax.h"
 
+#include "alibi.h"
+
 namespace flash {
 
 using namespace cute;
@@ -71,7 +73,7 @@ inline __device__ void write_softmax_to_gmem(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -320,6 +322,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     clear(acc_o);
 
+    float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
     // We need masking on S for the very last block when K and V has length not multiple of kBlockN.
@@ -362,6 +366,19 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // We don't put the masking before the matmul S = Q K^T because we don't clear sK
         // for rows outside actual_seqlen_k. So those rows could have Inf / NaN, and the matmul
         // can produce Inf / NaN.
+
+        if (Has_alibi) {
+            flash::apply_alibi<Is_causal>(
+                scores, 
+                n_block * kBlockN, 
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q, 
+                kNWarps * 16,
+                alibi_slope
+            );
+        }
+
         if (!Is_causal && !Is_local) {
             if (!Is_even_MN) { flash::apply_mask(scores, binfo.actual_seqlen_k - n_block * kBlockN); }
         } else {
@@ -466,6 +483,19 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        
+        if (Has_alibi) {
+            flash::apply_alibi<Is_causal>(
+                scores, 
+                n_block * kBlockN, 
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q, 
+                kNWarps * 16,
+                alibi_slope
+            );
+        }
+        
         if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
             flash::apply_mask_local(
                 scores, n_block * kBlockN, binfo.actual_seqlen_k,
@@ -474,6 +504,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 params.window_size_left, params.window_size_right
             );
         }
+
         softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
 
         Tensor rP = flash::convert_type<Element>(scores);
@@ -581,7 +612,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
 
     using Element = typename Kernel_traits::Element;
@@ -903,6 +934,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     clear(acc_o);
 
+    float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
     // We need masking on S for the very last block when K and V has length not multiple of kBlockN.
@@ -941,6 +974,19 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+
+        if (Has_alibi) {
+            flash::apply_alibi<Is_causal>(
+                scores, 
+                n_block * kBlockN, 
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q, 
+                kNWarps * 16,
+                alibi_slope
+            );
+        }
+
         // if (cute::thread0()) { print(scores); }
         // We don't put the masking before the matmul S = Q K^T because we don't clear sK
         // for rows outside actual_seqlen_k. So those rows could have Inf / NaN, and the matmul
@@ -1020,6 +1066,19 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+
+        if (Has_alibi) {
+            flash::apply_alibi<Is_causal>(
+                scores, 
+                n_block * kBlockN, 
+                binfo.actual_seqlen_k,
+                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                binfo.actual_seqlen_q, 
+                kNWarps * 16,
+                alibi_slope
+            );
+        }
+
         if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
             flash::apply_mask_local(
                 scores, n_block * kBlockN, binfo.actual_seqlen_k,
@@ -1131,7 +1190,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1147,12 +1206,12 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Is_even_MN, Is_even_K, Return_softmax>(params, bidb, bidh, m_block);
+    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Return_softmax>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_splitkv(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1161,7 +1220,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
-    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Is_even_MN, Is_even_K, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

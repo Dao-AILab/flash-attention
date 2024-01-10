@@ -15,6 +15,8 @@
 #include "utils.h"
 #include "softmax.h"
 
+#include "alibi.h"
+
 namespace flash {
 
 using namespace cute;
@@ -228,7 +230,7 @@ inline __device__ void clear_dKVaccum(const Params &params) {
 // Convert dQ from dQaccum (in float) to fp16/bf16.
 // This is used in the case where we want to parallelize the backward across seqlen_k.
 template<typename Kernel_traits, typename Params>
-inline __device__ void convert_dQ(const Params &params) {
+inline __device__ void convert_dQ(const Params &params, const int nsplits) {
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
@@ -283,11 +285,15 @@ inline __device__ void convert_dQ(const Params &params) {
     CUTE_STATIC_ASSERT_V(size(acc_dq) == size(tdQgdQaccum));
 
     Tensor tdQrdQaccum = make_fragment_like(tdQgdQaccum);
-    cute::copy(gmem_tiled_copy_dQaccum, tdQgdQaccum, tdQrdQaccum);
-    #pragma unroll
-    for (int i = 0; i < size(acc_dq); ++i) {
-        acc_dq(i) = tdQrdQaccum(i) * params.scale_softmax_rp_dropout;
+    clear(acc_dq);
+    for (int s = 0; s < nsplits; ++s) {
+        cute::copy(gmem_tiled_copy_dQaccum, tdQgdQaccum, tdQrdQaccum);
+        #pragma unroll
+        for (int i = 0; i < size(acc_dq); ++i) { acc_dq(i) += tdQrdQaccum(i); }
+        tdQgdQaccum.data() = tdQgdQaccum.data() + params.dq_accum_split_stride;
     }
+    #pragma unroll
+    for (int i = 0; i < size(acc_dq); ++i) { acc_dq(i) *= params.scale_softmax_rp_dropout; }
     // Convert acc_dq from fp32 to fp16
     Tensor rdQ = flash::convert_type<Element>(acc_dq);
     Tensor taccdQrdQ = smem_thr_copy_dQ.retile_S(rdQ);  // ((Atom,AtomNum), MMA_N, MMA_N)
@@ -422,7 +428,7 @@ inline __device__ void convert_dKV(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
 inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -464,7 +470,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     const index_t row_offset_dq = binfo.q_offset(params.dq_batch_stride, params.dq_row_stride, bidb)
         + (m_block_max - 1) * kBlockM * params.dq_row_stride + bidh * params.dq_head_stride;
     const index_t row_offset_dq_accum = binfo.q_offset(params.seqlen_q_rounded * params.h * params.d_rounded, params.h * params.d_rounded, bidb)
-        + ((m_block_max - 1) * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128 * bidb)) * params.h * params.d_rounded + bidh * params.d_rounded;
+        + ((m_block_max - 1) * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128 * bidb)) * params.h * params.d_rounded + bidh * params.d_rounded
+        // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
+        + (!params.deterministic ? 0 : blockIdx.x * params.dq_accum_split_stride);
     const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q
         + (m_block_max - 1) * kBlockM;
     const index_t row_offset_dpsum = (bidb * params.h + bidh) * params.seqlen_q_rounded
@@ -713,7 +721,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         tdKsQt.data() = tdKsQt.data() + size(sQ);
     }
 
-    if (!Is_first && !Seq_parallel) { __syncthreads(); }
+    if ((!Is_first && !Seq_parallel) || params.deterministic) { __syncthreads(); }
 
     if (Kernel_traits::Is_V_in_regs) {
         // Clear the smem tiles to account for predicated off loads
@@ -751,8 +759,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     #pragma unroll
     for (int mi = 0; mi < size(lse); ++mi) {
         const int row = get<0>(taccScS_row(mi));
-        lse(mi) = Is_even_MN || row < binfo.actual_seqlen_q - m_block * kBlockM ? gLSE(row) : 0;
+        lse(mi) = Is_even_MN || row < binfo.actual_seqlen_q - m_block * kBlockM ? gLSE(row) : INFINITY;
     }
+    // We want LSE = inf if the row is OOB. In that case Q would be zero, K would be zero,
+    // and scores would be zero. With LSE = 0, probs will be all 1's, and when we multiply
+    // with V (which would be zero), we're fine. However, with ALiBi, we might modify these
+    // scores, and probs can become NaN. Instead if we set LSE = inf for OOB rows, probs are always 0.
 
     // Tensor tKrK = make_fragment_like(tKsK);
     // // cute::copy(gmem_tiled_copy_QKV, tKgK(_, _, _, 0), tKrK);
@@ -790,6 +802,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     clear(acc_dv);
     clear(acc_dk);
 
+    float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
         clear(acc_s);
@@ -813,6 +827,19 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (col=(2, MMA_N), row=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         // if (cute::thread(32, 0)) { print(scores); }
+
+        if (Has_alibi) {
+            flash::apply_alibi<Is_causal>(
+                scores, 
+                n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                binfo.actual_seqlen_k, 
+                m_block * kBlockM + get<0>(taccScS_row(0)),
+                binfo.actual_seqlen_q, 
+                AtomLayoutMS * 16,
+                alibi_slope
+            );
+        }
+
         // TD [2023-07-29]: I was thinking that we don't need to mask out the elements beyond
         // actual_seqlen_k, because acc_s would be some finite value for those indices.
         // In the end when we multiply with K to get dQ, the corresponding values of K would be 0,
@@ -849,6 +876,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             }
 
         }
+
         // if (cute::thread(32, 0)) { print(scores); }
         // Compute the exponential value.
         flash::scale_apply_exp2</*scale_max=*/false>(scores, lse, params.scale_softmax_log2);
@@ -1114,7 +1142,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_N, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Has_alibi, bool Is_even_N, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -1373,6 +1401,8 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
 
     clear(acc_dq);
 
+    float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+
     for (; n_block >= 0; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M_SdP, MMA_N)
         clear(acc_s);
@@ -1384,6 +1414,19 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
 
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (col=(2, MMA_N), row=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+
+        if (Has_alibi) {
+            flash::apply_alibi<Is_causal>(
+                scores, 
+                n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                binfo.actual_seqlen_k, 
+                m_block * kBlockM + get<0>(taccScS_row(0)),
+                binfo.actual_seqlen_q, 
+                AtomLayoutMS * 16,
+                alibi_slope
+            );
+        }
+
         // We don't need to mask out the elements beyond actual_seqlen_k, because acc_s would
         // be some finite value for those indices. In the end when we multiply with K to get dQ,
         // the corresponding values of K would be 0, so the result would still be correct.
@@ -1394,6 +1437,7 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
                                      binfo.actual_seqlen_q,
                                      AtomLayoutMS * 16);
         }
+
         // Compute the exponential value.
         flash::scale_apply_exp2</*scale_max=*/false>(scores, lse, params.scale_softmax_log2);
         if (Is_dropout) {
@@ -1536,7 +1580,7 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_M, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Has_alibi, bool Is_even_M, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv(const Params &params) {
 
     // The block index for the batch.
@@ -1550,34 +1594,36 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 
     const int n_block_max = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
     if (n_block_max == 1) {
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, true, true>(params, bidb, bidh, 0);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, true, true>(params, bidb, bidh, 0);
     } else {
         // Iterating backward from n_block_max - 1 to 0 might save 1 register
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, true, false>(params, bidb, bidh, n_block_max - 1);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, true, false>(params, bidb, bidh, n_block_max - 1);
         for (int n_block = n_block_max - 2; n_block > 0; n_block--) {
-            compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, false, false>(params, bidb, bidh, n_block);
+            compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, false, false>(params, bidb, bidh, n_block);
         }
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, false, true>(params, bidb, bidh, 0);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, false, true>(params, bidb, bidh, 0);
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Is_even_MN, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
-    const int n_block = blockIdx.x;
     // The block index for the batch.
     const int bidb = blockIdx.y;
     // The block index for the head.
     const int bidh = blockIdx.z;
 
-    compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+    // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
+    for (int n_block = blockIdx.x; n_block < (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN; n_block += gridDim.x) {
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_N, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Has_alibi, bool Is_even_N, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv_seqq_parallel(const Params &params) {
 
     const int m_block = blockIdx.x;
@@ -1586,7 +1632,7 @@ inline __device__ void compute_dq_dk_dv_seqq_parallel(const Params &params) {
     // The block index for the head.
     const int bidh = blockIdx.z;
 
-    compute_dq_dk_dv_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_even_N, Is_even_K>(params, bidb, bidh, m_block);
+    compute_dq_dk_dv_1rowblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_N, Is_even_K>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

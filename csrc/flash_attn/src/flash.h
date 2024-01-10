@@ -130,6 +130,9 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_rotary_interleaved;
 
     int num_splits;  // For split-KV version
+
+    void * __restrict__ alibi_slopes_ptr;
+    index_t alibi_slopes_batch_stride;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -169,6 +172,9 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
     // The pointer to the softmax d sum.
     void *__restrict__ dsoftmax_sum;
+
+    bool deterministic;
+    index_t dq_accum_split_stride;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

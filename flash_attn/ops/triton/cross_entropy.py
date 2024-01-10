@@ -29,6 +29,7 @@ def cross_entropy_fwd_kernel(
     logits_ptr,
     labels_ptr,
     smoothing,
+    logit_scale,
     lse_square_scale,
     ignored_index,
     total_classes,
@@ -48,7 +49,7 @@ def cross_entropy_fwd_kernel(
     label_idx = tl.load(labels_ptr + row_idx)
     logits = tl.load(logits_ptr + col_offsets, mask=col_offsets < n_cols, other=-float("inf")).to(
         tl.float32
-    )
+    ) * logit_scale
     max_logits = tl.max(logits, 0)
     if HAS_SMOOTHING:
         sum_logits = tl.sum(tl.where(col_offsets < n_cols, logits, 0.0), 0)
@@ -61,7 +62,7 @@ def cross_entropy_fwd_kernel(
         if label_idx >= col_block_idx * BLOCK_SIZE and label_idx < min(
             n_cols, (col_block_idx + 1) * BLOCK_SIZE
         ):
-            logits_label = tl.load(logits_ptr + label_idx)
+            logits_label = tl.load(logits_ptr + label_idx) * logit_scale
             if HAS_SMOOTHING:
                 loss = (
                     (lse if not SPLIT else 0.0)
@@ -94,6 +95,7 @@ def cross_entropy_bwd_kernel(
     lse_ptr,
     labels_ptr,
     smoothing,
+    logit_scale,
     lse_square_scale,
     ignored_index,
     total_classes,
@@ -117,7 +119,7 @@ def cross_entropy_bwd_kernel(
         dloss = 0.0
     logits = tl.load(logits_ptr + col_offsets, mask=col_offsets < n_cols, other=-float("inf")).to(
         tl.float32
-    )
+    ) * logit_scale
     lse = tl.load(lse_ptr + row_idx)
     probs = tl.exp(logits - lse)
     probs += 2.0 * lse_square_scale * lse * probs
@@ -128,16 +130,18 @@ def cross_entropy_bwd_kernel(
         probs = tl.where(col_offsets == label_idx, probs - (1 - smoothing), probs) - smooth_negative
     else:
         probs = tl.where(col_offsets == label_idx, probs - 1.0, probs)
-    tl.store(dlogits_ptr + col_offsets, dloss * probs, mask=col_offsets < n_cols)
+    tl.store(dlogits_ptr + col_offsets, (dloss * logit_scale) * probs, mask=col_offsets < n_cols)
 
 
 class CrossEntropyLoss(torch.autograd.Function):
+
     @staticmethod
     def forward(
         ctx,
         logits,
         labels,
-        smoothing,
+        smoothing=0.0,
+        logit_scale=1.0,
         lse_square_scale=0.0,
         ignored_index=-100,
         inplace_backward=False,
@@ -177,6 +181,7 @@ class CrossEntropyLoss(torch.autograd.Function):
                 logits,
                 labels,
                 smoothing,
+                logit_scale,
                 lse_square_scale,
                 ignored_index,
                 total_classes,
@@ -219,6 +224,7 @@ class CrossEntropyLoss(torch.autograd.Function):
 
         ctx.save_for_backward(logits, lse, labels)
         ctx.smoothing = smoothing
+        ctx.logit_scale = logit_scale
         ctx.lse_square_scale = lse_square_scale
         ctx.ignored_index = ignored_index
         ctx.total_classes = total_classes
@@ -244,6 +250,7 @@ class CrossEntropyLoss(torch.autograd.Function):
                 lse,
                 labels,
                 ctx.smoothing,
+                ctx.logit_scale,
                 ctx.lse_square_scale,
                 ctx.ignored_index,
                 ctx.total_classes,
@@ -262,6 +269,7 @@ def cross_entropy_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     label_smoothing: float = 0.0,
+    logit_scale: float = 1.0,
     lse_square_scale: float = 0.0,
     ignored_index=-100,
     inplace_backward: bool = False,
@@ -272,6 +280,7 @@ def cross_entropy_loss(
         logits: (batch, vocab_size)
         labels: (batch,)
         label_smoothing: float
+        logit_scale: float. Multiply logits by this scale before calculating the loss.
         lse_square_scale: float. If > 0, we add lse_square_scale * lse(logits) ^ 2 to the loss.
             This is also referred to as "z-loss".
         ignored_index: int. If labels == ignored_index, the loss is set to 0.0.
@@ -286,6 +295,7 @@ def cross_entropy_loss(
         logits,
         labels,
         label_smoothing,
+        logit_scale,
         lse_square_scale,
         ignored_index,
         inplace_backward,
