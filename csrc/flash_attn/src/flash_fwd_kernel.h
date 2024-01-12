@@ -369,11 +369,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         if (Has_alibi) {
             flash::apply_alibi<Is_causal>(
-                scores, 
-                n_block * kBlockN, 
+                scores,
+                n_block * kBlockN,
                 binfo.actual_seqlen_k,
                 m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-                binfo.actual_seqlen_q, 
+                binfo.actual_seqlen_q,
                 kNWarps * 16,
                 alibi_slope
             );
@@ -444,7 +444,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
         // if (cute::thread0()) { print(tOrP); }
 
-        flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         // if (cute::thread0()) { print(scores); }
 
         // This check is at the end of the loop since we always have at least 1 iteration
@@ -483,19 +483,19 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
-        
+
         if (Has_alibi) {
             flash::apply_alibi<Is_causal>(
-                scores, 
-                n_block * kBlockN, 
+                scores,
+                n_block * kBlockN,
                 binfo.actual_seqlen_k,
                 m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-                binfo.actual_seqlen_q, 
+                binfo.actual_seqlen_q,
                 kNWarps * 16,
                 alibi_slope
             );
         }
-        
+
         if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
             flash::apply_mask_local(
                 scores, n_block * kBlockN, binfo.actual_seqlen_k,
@@ -528,7 +528,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                                  block_row_idx, block_col_idx, kNWarps);
         }
 
-        flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 
     // Epilogue
@@ -977,11 +977,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         if (Has_alibi) {
             flash::apply_alibi<Is_causal>(
-                scores, 
-                n_block * kBlockN, 
+                scores,
+                n_block * kBlockN,
                 binfo.actual_seqlen_k,
                 m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-                binfo.actual_seqlen_q, 
+                binfo.actual_seqlen_q,
                 kNWarps * 16,
                 alibi_slope
             );
@@ -1027,7 +1027,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // if using m16n8k16 or ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMma>(rP.layout()));
 
-        flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         // if (cute::thread0()) { print(scores); }
 
         // This check is at the end of the loop since we always have at least 1 iteration
@@ -1069,11 +1069,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         if (Has_alibi) {
             flash::apply_alibi<Is_causal>(
-                scores, 
-                n_block * kBlockN, 
+                scores,
+                n_block * kBlockN,
                 binfo.actual_seqlen_k,
                 m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-                binfo.actual_seqlen_q, 
+                binfo.actual_seqlen_q,
                 kNWarps * 16,
                 alibi_slope
             );
@@ -1094,7 +1094,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // if using m16n8k16 or ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMma>(rP.layout()));
 
-        flash::gemm_A_in_regs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 
     // Epilogue
