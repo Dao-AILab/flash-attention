@@ -26,6 +26,7 @@ if "all_gather_into_tensor" not in dir(torch.distributed):
 def cross_entropy_fwd_kernel(
     loss_ptr,  # data ptrs
     lse_ptr,
+    z_loss_ptr,
     logits_ptr,
     labels_ptr,
     smoothing,
@@ -57,6 +58,7 @@ def cross_entropy_fwd_kernel(
     tl.store(lse_ptr + col_block_idx * n_rows + row_idx, lse)
     if label_idx == ignored_index:
         loss = 0.0
+        z_loss = 0.0
     else:
         label_idx -= class_start_idx
         if label_idx >= col_block_idx * BLOCK_SIZE and label_idx < min(
@@ -78,8 +80,13 @@ def cross_entropy_fwd_kernel(
             else:
                 loss = 0.0
         if not SPLIT:
-            loss += lse_square_scale * lse * lse
+            z_loss = lse_square_scale * lse * lse
+            loss += z_loss
+        else:
+            z_loss = 0.0
     tl.store(loss_ptr + col_block_idx * n_rows + row_idx, loss)
+    if not SPLIT:
+        tl.store(z_loss_ptr + col_block_idx * n_rows + row_idx, z_loss)
 
 
 @triton.heuristics(
@@ -172,12 +179,14 @@ class CrossEntropyLoss(torch.autograd.Function):
         loss_shape = (n_splits, n_rows) if n_splits > 1 else (n_rows,)
         losses = torch.empty(*loss_shape, dtype=torch.float, device=logits.device)
         lse = torch.empty(*loss_shape, dtype=torch.float, device=logits.device)
+        z_losses = torch.empty(*loss_shape, dtype=torch.float, device=logits.device)
         # Need this, otherwise Triton tries to launch from cuda:0 and we get
         # ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
         with torch.cuda.device(logits.device.index):
             cross_entropy_fwd_kernel[(n_rows, n_splits)](
                 losses,  # data ptrs
                 lse,
+                z_losses,
                 logits,
                 labels,
                 smoothing,
@@ -219,10 +228,15 @@ class CrossEntropyLoss(torch.autograd.Function):
             # Again, we just have to add the (global) lse.
             losses += lse
             if lse_square_scale != 0.0:
-                losses += lse_square_scale * lse.square()
+                z_losses = lse_square_scale * lse.square()
+                z_losses.masked_fill_(labels == ignored_index, 0.0)
+                losses += z_losses
+            else:
+                z_losses = torch.zeros_like(losses)
             losses.masked_fill_(labels == ignored_index, 0.0)
 
         ctx.save_for_backward(logits, lse, labels)
+        ctx.mark_non_differentiable(z_losses)
         ctx.smoothing = smoothing
         ctx.logit_scale = logit_scale
         ctx.lse_square_scale = lse_square_scale
@@ -230,10 +244,13 @@ class CrossEntropyLoss(torch.autograd.Function):
         ctx.total_classes = total_classes
         ctx.class_start_idx = class_start_idx
         ctx.inplace_backward = inplace_backward
-        return losses
+
+        return losses, z_losses
 
     @staticmethod
-    def backward(ctx, grad_losses):
+    def backward(ctx, grad_losses, grad_z_losses):
+        del grad_z_losses  # z_losses are only for logging.
+
         logits, lse, labels = ctx.saved_tensors
         dlogits = logits if ctx.inplace_backward else torch.empty_like(logits)
         n_rows, n_cols = logits.shape
@@ -262,8 +279,7 @@ class CrossEntropyLoss(torch.autograd.Function):
                 BLOCK_SIZE=BLOCK_SIZE,  # constants
                 num_warps=num_warps,
             )
-        return dlogits, None, None, None, None, None, None, None
-
+        return dlogits, None, None, None, None, None, None, None, None
 
 def cross_entropy_loss(
     logits: torch.Tensor,
@@ -287,9 +303,10 @@ def cross_entropy_loss(
         inplace_backward: bool. If True, we do the backward pass in-place by modifying the logits.
             This saves memory.
         process_group: if not None, we're doing Tensor Parallel: each process is responsible for
-        one part of the vocab. The loss will be aggregated across processes.
+            one part of the vocab. The loss will be aggregated across processes.
     Returns:
         losses: (batch,), float
+        z_losses: (batch,), float
     """
     return CrossEntropyLoss.apply(
         logits,
