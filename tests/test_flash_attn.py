@@ -14,7 +14,7 @@ from flash_attn import (
     flash_attn_with_kvcache,
 )
 from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn.flash_attn_interface import _get_block_size
+from flash_attn.flash_attn_interface import _get_block_size_n
 from flash_attn.layers.rotary import apply_rotary_emb
 
 MAX_HEADDIM_SM8x = 192
@@ -406,29 +406,7 @@ def convert_flash_attn_S_to_softmax(
     if causal:
         window_size = (window_size[0], 0)
     seqlen_q_rounded, seqlen_k_rounded = S.shape[-2:]
-    warps_n = 4
-    blocksize_m, blocksize_n = _get_block_size(S.device, head_dim, is_dropout, causal)
-    nblocks_n = (seqlen_k_rounded + blocksize_n - 1) // blocksize_n
-    nblocks_m = (seqlen_q_rounded + blocksize_m - 1) // blocksize_m
-    mmas_n = (blocksize_n + 16 - 1) // 16
-    S_flat = rearrange(
-        S,
-        "b h (nblocks_m blocksize_m) (nblocks_n blocksize_n) -> b h nblocks_m nblocks_n (blocksize_m blocksize_n)",
-        blocksize_m=blocksize_m,
-        blocksize_n=blocksize_n,
-    )
-    S_converted = rearrange(
-        S_flat,
-        "b h nblocks_m nblocks_n (mmas_n mmas_m warps_n eight four c2 c1 c0) -> b h (nblocks_m mmas_m warps_n c1 eight) (nblocks_n mmas_n c2 four c0)",
-        mmas_n=mmas_n,
-        warps_n=warps_n,
-        eight=8,
-        c0=2,
-        c1=2,
-        c2=2,
-        four=4,
-    )
-
+    S_converted = S
     if window_size[0] >= 0 or window_size[1] >= 0:
         local_mask = construct_local_mask(
             seqlen_q,
@@ -443,7 +421,7 @@ def convert_flash_attn_S_to_softmax(
             (0, seqlen_k_rounded - seqlen_k, 0, seqlen_q_rounded - seqlen_q),
             value=True,
         )
-        S_converted.masked_fill_(local_mask, 0.0)
+        S_converted = S_converted.masked_fill(local_mask, 0.0)
 
     # Need to zero out things not in attention_mask in case S was initialized with random values
     # and some of those values aren't overwritten.
@@ -504,7 +482,7 @@ def normalize_flash_attn_S(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias.to(dtype=scores.dtype)
-    _, block_size_n = _get_block_size(scores.device, head_dim, is_dropout, causal)
+    block_size_n = _get_block_size_n(scores.device, head_dim, is_dropout, causal)
     scores_block = scores.split(block_size_n, dim=-1)
     lse_block = torch.stack([torch.logsumexp(s, dim=-1) for s in scores_block], dim=-1)
     lse = torch.logsumexp(lse_block, dim=-1)

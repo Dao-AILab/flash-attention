@@ -56,23 +56,6 @@ inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, T
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename TiledCopy>
-inline __device__ void write_softmax_to_gmem(
-    Tensor<Engine0, Layout0> const &tOrP, Tensor<Engine1, Layout1> &tPgP, TiledCopy gmem_tiled_copy_P
-) {
-    // Reshape tOrP from (8, MMA_M, MMA_N) to (8, MMA_M * MMA_N)
-    Layout l = tOrP.layout();
-    Tensor tPrP = make_tensor(tOrP.data(), make_layout(get<0>(l), make_layout(get<1>(l), get<2>(l))));
-    CUTE_STATIC_ASSERT_V(size<2>(tPgP) == _1{});
-    CUTE_STATIC_ASSERT_V(size<1>(tPrP) == size<1>(tPgP));
-    #pragma unroll
-    for (int mi = 0; mi < size<1>(tPrP); ++mi) {
-        cute::copy(gmem_tiled_copy_P, tPrP(_, mi), tPgP(_, mi, 0));
-    }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
@@ -92,6 +75,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     constexpr int kNWarps = Kernel_traits::kNWarps;
     constexpr int MMA_M = kBlockM / decltype(size<0>(typename Kernel_traits::TiledMma::TiledShape_MNK{}))::value;
 
+    auto seeds = at::cuda::philox::unpack(params.philox_args);
+    unsigned long long seed = std::get<0>(seeds);
+    unsigned long long offset = std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + tidx % 32;
+
+    // Save seed and offset for backward, before any early exiting. Otherwise the 0-th thread block might
+    // exit early and no one saves the rng states.
+    if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
+        params.rng_state[0] = seed;
+        params.rng_state[1] = std::get<1>(seeds);
+    }
+
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
@@ -107,13 +101,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // We exit early and write 0 to gO and gLSE. This also covers the case where actual_seqlen_k == 0.
     // Otherwise we might read OOB elements from gK and gV.
     if ((Is_causal || Is_local || !Is_even_MN) && n_block_max <= n_block_min) {
-        // Save seed and offset for backward. If we don't have this here, the 0-th thread block might
-        // exit early and no one saves the rng state.
-        if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
-            auto seeds = at::cuda::philox::unpack(params.philox_args);
-            params.rng_state[0] = std::get<0>(seeds);
-            params.rng_state[1] = std::get<1>(seeds);
-        }
         const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
             + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
         const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
@@ -188,8 +175,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
-    typename Kernel_traits::GmemTiledCopyP gmem_tiled_copy_P;
-    auto gmem_thr_copy_P = gmem_tiled_copy_P.get_thread_slice(tidx);
 
     Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
     Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
@@ -197,13 +182,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
     Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K)
     Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
-    Tensor tPgP = gmem_thr_copy_P.partition_D(gP);
 
     typename Kernel_traits::TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tidx);
     Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
     Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
     Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
+
+    Tensor tSgS  = thr_mma.partition_C(gP);
 
     Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
 
@@ -308,16 +294,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
         CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
         cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
-    }
-
-    auto seeds = at::cuda::philox::unpack(params.philox_args);
-    unsigned long long seed = std::get<0>(seeds);
-    unsigned long long offset = std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + tidx % 32;
-
-    // Save seed and offset for backward.
-    if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
-        params.rng_state[0] = seed;
-        params.rng_state[1] = std::get<1>(seeds);
     }
 
     clear(acc_o);
@@ -429,14 +405,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
         int block_col_idx = n_block * (kBlockN / 32);
         if (Return_softmax) {
-            Tensor tOrP_copy = make_fragment_like(tOrP);
-            cute::copy(tOrP, tOrP_copy);
+            Tensor acc_s_f16 = flash::convert_type<Element>(acc_s);
+            Tensor tOrPdrop = make_tensor(acc_s_f16.data(), tOrP.layout());
             flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                tOrP_copy, params.p_dropout_in_uint8_t, seed, offset,
+                tOrPdrop, params.p_dropout_in_uint8_t, seed, offset,
                 block_row_idx, block_col_idx, kNWarps
             );
-            flash::write_softmax_to_gmem(tOrP_copy, tPgP, gmem_tiled_copy_P);
-            tPgP.data() = tPgP.data() + (-kBlockN);
+            cute::copy(acc_s_f16, tSgS);
+            tSgS.data() = tSgS.data() + (-kBlockN);
         }
         if (Is_dropout) {
             flash::apply_dropout(tOrP, params.p_dropout_in_uint8_t, seed, offset,
@@ -514,14 +490,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
         int block_col_idx = n_block * (kBlockN / 32);
         if (Return_softmax) {
-            Tensor tOrP_copy = make_fragment_like(tOrP);
-            cute::copy(tOrP, tOrP_copy);
+            Tensor acc_s_f16 = flash::convert_type<Element>(acc_s);
+            Tensor tOrPdrop = make_tensor(acc_s_f16.data(), tOrP.layout());
             flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                tOrP_copy, params.p_dropout_in_uint8_t, seed, offset,
+                tOrPdrop, params.p_dropout_in_uint8_t, seed, offset,
                 block_row_idx, block_col_idx, kNWarps
             );
-            flash::write_softmax_to_gmem(tOrP_copy, tPgP, gmem_tiled_copy_P);
-            tPgP.data() = tPgP.data() + (-kBlockN);
+            cute::copy(acc_s_f16, tSgS);
+            tSgS.data() = tSgS.data() + (-kBlockN);
         }
         if (Is_dropout) {
             flash::apply_dropout(tOrP, params.p_dropout_in_uint8_t, seed, offset,

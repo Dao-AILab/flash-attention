@@ -12,7 +12,7 @@ import flash_attn_2_cuda as flash_attn_cuda
 # isort: on
 
 
-def _get_block_size(device, head_dim, is_dropout, is_causal):
+def _get_block_size_n(device, head_dim, is_dropout, is_causal):
     # This should match the block sizes in the CUDA kernel
     assert head_dim <= 256
     major, minor = torch.cuda.get_device_capability(device)
@@ -20,27 +20,27 @@ def _get_block_size(device, head_dim, is_dropout, is_causal):
     is_sm80 = major == 8 and minor == 0
     is_sm90 = major == 9 and minor == 0
     if head_dim <= 32:
-        return 128, 128
+        return 128
     if head_dim <= 64:
-        return (128, 128) if not is_dropout else (128, 64)
+        return 128 if not is_dropout else 64
     elif head_dim <= 96:
-        return (64, 64) if (is_sm8x and is_causal) else (128, 64)
+        return 64
     elif head_dim <= 128:
         if is_sm8x:
-            return (64, 64) if (not is_dropout and is_causal) else (128, 32)
+            return 64 if (not is_dropout and is_causal) else 32
         else:
-            return 128, (64 if not is_dropout else 32)
+            return 64 if not is_dropout else 32
     elif head_dim <= 160:
         if is_sm8x:
-            return (128, 64) if not is_causal else (64, 64)
+            return 64
         else:
-            return 128, 32
+            return 32
     elif head_dim <= 192:
-        return (128, 64) if not is_dropout else (64, 64)
+        return 64
     elif head_dim <= 224:
-        return (128, 64) if (is_sm80 or is_sm90) else (64, 64)
+        return 64
     elif head_dim <= 256:
-        return (128, 64) if is_sm80 else (64, 64)
+        return 64
 
 
 def _flash_attn_forward(
