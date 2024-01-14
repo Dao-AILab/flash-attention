@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2023, Tri Dao.
+ * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
 #pragma once
@@ -14,6 +14,7 @@
 #include "kernel_traits.h"
 #include "utils.h"
 #include "softmax.h"
+#include "mask.h"
 #include "dropout.h"
 
 #include "alibi.h"
