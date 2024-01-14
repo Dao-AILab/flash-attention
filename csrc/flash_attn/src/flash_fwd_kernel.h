@@ -14,6 +14,7 @@
 #include "kernel_traits.h"
 #include "utils.h"
 #include "softmax.h"
+#include "dropout.h"
 
 #include "alibi.h"
 
@@ -75,15 +76,15 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     constexpr int kNWarps = Kernel_traits::kNWarps;
     constexpr int MMA_M = kBlockM / decltype(size<0>(typename Kernel_traits::TiledMma::TiledShape_MNK{}))::value;
 
-    auto seeds = at::cuda::philox::unpack(params.philox_args);
-    unsigned long long seed = std::get<0>(seeds);
-    unsigned long long offset = std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + tidx % 32;
+    auto seed_offset = at::cuda::philox::unpack(params.philox_args);
+    flash::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
+                           bidb, bidh, tidx, params.h);
 
     // Save seed and offset for backward, before any early exiting. Otherwise the 0-th thread block might
     // exit early and no one saves the rng states.
     if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
-        params.rng_state[0] = seed;
-        params.rng_state[1] = std::get<1>(seeds);
+        params.rng_state[0] = std::get<0>(seed_offset);
+        params.rng_state[1] = std::get<1>(seed_offset);
     }
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
@@ -404,16 +405,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         if (Return_softmax) {
             Tensor acc_s_f16 = flash::convert_type<Element>(acc_s);
             Tensor acc_s_f16_drop = make_tensor(acc_s_f16.data(), rP.layout());
-            flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                acc_s_f16_drop, params.p_dropout_in_uint8_t, seed, offset,
-                block_row_idx, block_col_idx, kNWarps
+            dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                acc_s_f16_drop, block_row_idx, block_col_idx, kNWarps
             );
             cute::copy(acc_s_f16, tSgS);
             tSgS.data() = tSgS.data() + (-kBlockN);
         }
         if (Is_dropout) {
-            flash::apply_dropout(rP, params.p_dropout_in_uint8_t, seed, offset,
-                                 block_row_idx, block_col_idx, kNWarps);
+            dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
         }
 
         // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
@@ -489,16 +488,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         if (Return_softmax) {
             Tensor acc_s_f16 = flash::convert_type<Element>(acc_s);
             Tensor acc_s_f16_drop = make_tensor(acc_s_f16.data(), rP.layout());
-            flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                acc_s_f16_drop, params.p_dropout_in_uint8_t, seed, offset,
-                block_row_idx, block_col_idx, kNWarps
+            dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                acc_s_f16_drop, block_row_idx, block_col_idx, kNWarps
             );
             cute::copy(acc_s_f16, tSgS);
             tSgS.data() = tSgS.data() + (-kBlockN);
         }
         if (Is_dropout) {
-            flash::apply_dropout(rP, params.p_dropout_in_uint8_t, seed, offset,
-                                 block_row_idx, block_col_idx, kNWarps);
+            dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
         }
 
         // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)

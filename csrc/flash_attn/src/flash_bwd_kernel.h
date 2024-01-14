@@ -14,6 +14,7 @@
 #include "kernel_traits.h"
 #include "utils.h"
 #include "softmax.h"
+#include "dropout.h"
 
 #include "alibi.h"
 
@@ -796,8 +797,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         cute::copy(smem_tiled_copy_KV, tdPsV, tdPrV_copy_view);
     }
 
-    auto seed = params.rng_state[0];
-    auto offset = params.rng_state[1] + (bidb * params.h + bidh) * 32 + tidx % 32;
+    flash::Dropout dropout(params.rng_state[0], params.rng_state[1], params.p_dropout_in_uint8_t,
+                           bidb, bidh, tidx, params.h);
 
     clear(acc_dv);
     clear(acc_dk);
@@ -886,9 +887,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             // Need col to be multiples of 32, since we're doing dropout with block of 16 x 32
             static_assert(MMA_N_SdP % 2 == 0);
             int block_col_idx = n_block * (kBlockN / 32) + (warp_id / AtomLayoutMS) * (MMA_N_SdP / 2);
-            flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                scores, params.p_dropout_in_uint8_t, seed, offset,
-                block_row_idx, block_col_idx, AtomLayoutMS
+            dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                scores, block_row_idx, block_col_idx, AtomLayoutMS
             );
         }
         // Convert scores from fp32 to fp16/bf16
@@ -1395,8 +1395,8 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
     #pragma unroll
     for (int mi = 0; mi < size(dP_sum); ++mi) { dP_sum(mi) = sdPsum(get<0>(taccScS_row(mi))); }
 
-    auto seed = params.rng_state[0];
-    auto offset = params.rng_state[1] + (bidb * params.h + bidh) * 32 + tidx % 32;
+    flash::Dropout dropout(params.rng_state[0], params.rng_state[1], params.p_dropout_in_uint8_t,
+                           bidb, bidh, tidx, params.h);
 
     clear(acc_dq);
 
@@ -1445,9 +1445,8 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
             // Need col to be multiples of 32, since we're doing dropout with block of 16 x 32
             static_assert(MMA_N_SdP % 2 == 0);
             int block_col_idx = n_block * (kBlockN / 32) + (warp_id / AtomLayoutMS) * (MMA_N_SdP / 2);
-            flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                scores, params.p_dropout_in_uint8_t, seed, offset,
-                block_row_idx, block_col_idx, AtomLayoutMS
+            dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                scores, block_row_idx, block_col_idx, AtomLayoutMS
             );
         }
         // Convert scores from fp32 to fp16/bf16
