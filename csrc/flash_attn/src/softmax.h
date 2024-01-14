@@ -1,5 +1,5 @@
 /******************************************************************************
- * Copyright (c) 2023, Tri Dao.
+ * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
 #pragma once
@@ -114,5 +114,38 @@ inline __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &tensor, Tens
         sum(mi) = Allreduce<4>::run(sum(mi), sum_op);
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<bool Is_first, bool Check_inf=false, typename Tensor0, typename Tensor1, typename Tensor2>
+inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, Tensor1 &scores_sum,
+                                         Tensor2 &acc_o, float softmax_scale_log2) {
+    if (Is_first) {
+        flash::template reduce_max</*zero_init=*/true>(scores, scores_max);
+        flash::scale_apply_exp2(scores, scores_max, softmax_scale_log2);
+        flash::reduce_sum(scores, scores_sum);
+    } else {
+        Tensor scores_max_prev = make_fragment_like(scores_max);
+        cute::copy(scores_max, scores_max_prev);
+        flash::template reduce_max</*zero_init=*/false>(scores, scores_max);
+        // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
+        Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+        #pragma unroll
+        for (int mi = 0; mi < size(scores_max); ++mi) {
+            float scores_max_cur = !Check_inf
+                ? scores_max(mi)
+                : (scores_max(mi) == -INFINITY ? 0.0f : scores_max(mi));
+            float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+            scores_sum(mi) *= scores_scale;
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
+        }
+        flash::scale_apply_exp2(scores, scores_max, softmax_scale_log2);
+        Tensor scores_sum_cur = make_fragment_like(scores_sum);
+        flash::reduce_sum(scores, scores_sum_cur);
+        #pragma unroll
+        for (int mi = 0; mi < size(scores_sum); ++mi) { scores_sum(mi) += scores_sum_cur(mi); }
+    }
+};
 
 }  // namespace flash
