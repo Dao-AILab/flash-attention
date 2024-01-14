@@ -545,7 +545,7 @@ def get_dropout_fraction(
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("deterministic", [False, True])
-# @pytest.mark.parametrize("deterministic", [True])
+# @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [False])
 @pytest.mark.parametrize("local", [False, True])

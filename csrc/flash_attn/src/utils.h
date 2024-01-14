@@ -211,6 +211,20 @@ inline __device__ auto convert_layout_rowcol_Aregs(Layout rowcol_layout) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Convert rowcol_layout from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
+template<typename Layout>
+inline __device__ auto convert_layout_rowcol_dropout(Layout rowcol_layout) {
+    using X = Underscore;
+    static_assert(decltype(size<0, 0>(rowcol_layout))::value == 2);
+    static_assert(decltype(size<1, 0>(rowcol_layout))::value == 2);
+    auto l = logical_divide(rowcol_layout, Shape<X, Shape<X, Int<2>>>{});  // ((2, MMA_M), (2, (2, MMA_N / 2)))
+    return make_layout(make_layout(get<1, 0>(l), get<0, 0>(l), get<1, 1, 0>(l)),
+                       get<0, 1>(l),
+                       get<1, 1, 1>(l));
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename To_type, typename Engine, typename Layout>
 inline __device__ auto convert_type(Tensor<Engine, Layout> const &tensor) {
     using From_type = typename Engine::value_type;

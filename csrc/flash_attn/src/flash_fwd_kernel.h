@@ -399,27 +399,27 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Convert scores from fp32 to fp16/bf16
         Tensor rP = flash::convert_type<Element>(scores);
-        // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
-        // if using m16n8k16 or ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
-        Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMma>(rP.layout()));
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
         int block_col_idx = n_block * (kBlockN / 32);
         if (Return_softmax) {
             Tensor acc_s_f16 = flash::convert_type<Element>(acc_s);
-            Tensor tOrPdrop = make_tensor(acc_s_f16.data(), tOrP.layout());
+            Tensor acc_s_f16_drop = make_tensor(acc_s_f16.data(), rP.layout());
             flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                tOrPdrop, params.p_dropout_in_uint8_t, seed, offset,
+                acc_s_f16_drop, params.p_dropout_in_uint8_t, seed, offset,
                 block_row_idx, block_col_idx, kNWarps
             );
             cute::copy(acc_s_f16, tSgS);
             tSgS.data() = tSgS.data() + (-kBlockN);
         }
         if (Is_dropout) {
-            flash::apply_dropout(tOrP, params.p_dropout_in_uint8_t, seed, offset,
+            flash::apply_dropout(rP, params.p_dropout_in_uint8_t, seed, offset,
                                  block_row_idx, block_col_idx, kNWarps);
         }
-        // if (cute::thread0()) { print(tOrP); }
 
+        // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
+        // if using m16n8k16 or ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
+        Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMma>(rP.layout()));
+        // if (cute::thread0()) { print(tOrP); }
         flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         // if (cute::thread0()) { print(scores); }
 
@@ -484,26 +484,26 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
 
         Tensor rP = flash::convert_type<Element>(scores);
-        // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
-        // if using m16n8k16 or ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
-        Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMma>(rP.layout()));
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
         int block_col_idx = n_block * (kBlockN / 32);
         if (Return_softmax) {
             Tensor acc_s_f16 = flash::convert_type<Element>(acc_s);
-            Tensor tOrPdrop = make_tensor(acc_s_f16.data(), tOrP.layout());
+            Tensor acc_s_f16_drop = make_tensor(acc_s_f16.data(), rP.layout());
             flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                tOrPdrop, params.p_dropout_in_uint8_t, seed, offset,
+                acc_s_f16_drop, params.p_dropout_in_uint8_t, seed, offset,
                 block_row_idx, block_col_idx, kNWarps
             );
             cute::copy(acc_s_f16, tSgS);
             tSgS.data() = tSgS.data() + (-kBlockN);
         }
         if (Is_dropout) {
-            flash::apply_dropout(tOrP, params.p_dropout_in_uint8_t, seed, offset,
+            flash::apply_dropout(rP, params.p_dropout_in_uint8_t, seed, offset,
                                  block_row_idx, block_col_idx, kNWarps);
         }
 
+        // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
+        // if using m16n8k16 or ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
+        Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMma>(rP.layout()));
         flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 

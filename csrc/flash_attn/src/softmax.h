@@ -213,10 +213,12 @@ inline __device__ void apply_mask_causal_w_idx(
 }
 
 template <bool encode_dropout_in_sign_bit=false, typename Engine, typename Layout>
-inline __device__ void apply_dropout(Tensor<Engine, Layout> &tensor, uint8_t p_dropout_in_uint8_t,
+inline __device__ void apply_dropout(Tensor<Engine, Layout> &tensor_, uint8_t p_dropout_in_uint8_t,
                                      unsigned long long seed, unsigned long long offset,
                                      int block_row_start, int block_col_start,
                                      int block_row_stride) {
+    // tensor_ has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
+    Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_rowcol_dropout(tensor_.layout()));
     // tensor has shape (8, MMA_M, MMA_N / 2)
     using T = typename Engine::value_type;
     auto encode_dropout = [](bool keep, T val) {
