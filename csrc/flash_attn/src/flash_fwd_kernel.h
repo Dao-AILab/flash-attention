@@ -267,7 +267,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     clear(acc_o);
 
-    float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+    const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+    flash::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
@@ -313,15 +314,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // can produce Inf / NaN.
 
         if (Has_alibi) {
-            flash::apply_alibi<Is_causal>(
-                scores,
-                n_block * kBlockN,
-                binfo.actual_seqlen_k,
-                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-                binfo.actual_seqlen_q,
-                kNWarps * 16,
-                alibi_slope
-            );
+            alibi.apply_alibi(scores, n_block * kBlockN,
+                              m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16);
         }
 
         if (!Is_causal && !Is_local) {
@@ -428,15 +422,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (Has_alibi) {
-            flash::apply_alibi<Is_causal>(
-                scores,
-                n_block * kBlockN,
-                binfo.actual_seqlen_k,
-                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-                binfo.actual_seqlen_q,
-                kNWarps * 16,
-                alibi_slope
-            );
+            alibi.apply_alibi(scores, n_block * kBlockN,
+                              m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16);
         }
 
         if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {
@@ -875,7 +862,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     clear(acc_o);
 
-    float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+    const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+    flash::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
@@ -917,15 +905,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (Has_alibi) {
-            flash::apply_alibi<Is_causal>(
-                scores,
-                n_block * kBlockN,
-                binfo.actual_seqlen_k,
-                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-                binfo.actual_seqlen_q,
-                kNWarps * 16,
-                alibi_slope
-            );
+            alibi.apply_alibi(scores, n_block * kBlockN,
+                              m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16);
         }
 
         // if (cute::thread0()) { print(scores); }
@@ -1009,15 +990,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (Has_alibi) {
-            flash::apply_alibi<Is_causal>(
-                scores,
-                n_block * kBlockN,
-                binfo.actual_seqlen_k,
-                m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-                binfo.actual_seqlen_q,
-                kNWarps * 16,
-                alibi_slope
-            );
+            alibi.apply_alibi(scores, n_block * kBlockN,
+                              m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16);
         }
 
         if (Is_local && n_block * kBlockN < (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right) {

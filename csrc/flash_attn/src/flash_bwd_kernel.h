@@ -448,7 +448,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     clear(acc_dv);
     clear(acc_dk);
 
-    float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+    const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+    flash::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
 
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
@@ -475,15 +476,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // if (cute::thread(32, 0)) { print(scores); }
 
         if (Has_alibi) {
-            flash::apply_alibi<Is_causal>(
-                scores, 
-                n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                binfo.actual_seqlen_k, 
-                m_block * kBlockM + get<0>(taccScS_row(0)),
-                binfo.actual_seqlen_q, 
-                AtomLayoutMS * 16,
-                alibi_slope
-            );
+            alibi.apply_alibi(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                              m_block * kBlockM + get<0>(taccScS_row(0)), AtomLayoutMS * 16);
         }
 
         // TD [2023-07-29]: I was thinking that we don't need to mask out the elements beyond
