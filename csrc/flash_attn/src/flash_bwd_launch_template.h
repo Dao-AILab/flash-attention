@@ -8,6 +8,7 @@
 
 #include "static_switch.h"
 #include "flash.h"
+#include "flash_bwd_preprocess_kernel.h"
 #include "flash_bwd_kernel.h"
 
 template<bool Clear_dQaccum=true, typename Kernel_traits>
