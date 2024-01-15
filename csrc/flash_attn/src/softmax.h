@@ -117,35 +117,64 @@ inline __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &tensor, Tens
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<bool Is_first, bool Check_inf=false, typename Tensor0, typename Tensor1, typename Tensor2>
-inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, Tensor1 &scores_sum,
-                                         Tensor2 &acc_o, float softmax_scale_log2) {
-    if (Is_first) {
-        flash::template reduce_max</*zero_init=*/true>(scores, scores_max);
-        flash::scale_apply_exp2(scores, scores_max, softmax_scale_log2);
-        flash::reduce_sum(scores, scores_sum);
-    } else {
-        Tensor scores_max_prev = make_fragment_like(scores_max);
-        cute::copy(scores_max, scores_max_prev);
-        flash::template reduce_max</*zero_init=*/false>(scores, scores_max);
-        // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
-        Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
-        #pragma unroll
-        for (int mi = 0; mi < size(scores_max); ++mi) {
-            float scores_max_cur = !Check_inf
-                ? scores_max(mi)
-                : (scores_max(mi) == -INFINITY ? 0.0f : scores_max(mi));
-            float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
-            scores_sum(mi) *= scores_scale;
+template <int kNRows>
+struct Softmax {
+
+    using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
+    TensorT row_max, row_sum;
+
+    inline __device__ Softmax() {};
+
+    template<bool Is_first, bool Check_inf=false, typename Tensor0, typename Tensor1>
+    inline __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2) {
+        // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
+        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        static_assert(decltype(size<0>(scores))::value == kNRows);
+        if (Is_first) {
+            flash::template reduce_max</*zero_init=*/true>(scores, row_max);
+            flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            flash::reduce_sum(scores, row_sum);
+        } else {
+            Tensor scores_max_prev = make_fragment_like(row_max);
+            cute::copy(row_max, scores_max_prev);
+            flash::template reduce_max</*zero_init=*/false>(scores, row_max);
+            // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
+            Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+            static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
             #pragma unroll
-            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
+            for (int mi = 0; mi < size(row_max); ++mi) {
+                float scores_max_cur = !Check_inf
+                    ? row_max(mi)
+                    : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
+                float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+                row_sum(mi) *= scores_scale;
+                #pragma unroll
+                for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
+            }
+            flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            Tensor scores_sum_cur = make_fragment_like(row_sum);
+            flash::reduce_sum(scores, scores_sum_cur);
+            #pragma unroll
+            for (int mi = 0; mi < size(row_sum); ++mi) { row_sum(mi) += scores_sum_cur(mi); }
         }
-        flash::scale_apply_exp2(scores, scores_max, softmax_scale_log2);
-        Tensor scores_sum_cur = make_fragment_like(scores_sum);
-        flash::reduce_sum(scores, scores_sum_cur);
+    };
+
+    template<bool Is_dropout=false, bool Split=false, typename Tensor0>
+    inline __device__ TensorT normalize_softmax_lse(Tensor0 &acc_o, float softmax_scale, float rp_dropout=1.0) {
+        TensorT lse = make_fragment_like(row_sum);
+        Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+        static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
         #pragma unroll
-        for (int mi = 0; mi < size(scores_sum); ++mi) { scores_sum(mi) += scores_sum_cur(mi); }
-    }
+        for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
+            float sum = row_sum(mi);
+            float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
+            lse(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : row_max(mi) * softmax_scale + __logf(sum);
+            float scale = !Is_dropout ? inv_sum : inv_sum * rp_dropout;
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scale; }
+        }
+        return lse;
+    };
 };
 
 }  // namespace flash
