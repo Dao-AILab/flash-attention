@@ -666,7 +666,7 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
         return CausalLMOutput(logits=lm_logits)
 
-    def load_state_dict(self, state_dict, strict=True):
+    def load_state_dict(self, state_dict, strict=True, **hf_kwargs):
         # Remapping from our checkpoints that used a different ordering of layers in the block
         # Previous: Attn / MLP -> Dropout -> Add -> LN
         # Current: Dropout -> Add -> LN -> Attn / MLP
@@ -690,7 +690,7 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
             ln_bias = state_dict.pop("transformer.ln_0.bias")
             state_dict[f"transformer.layers.0.norm1.weight"] = ln_weight
             state_dict[f"transformer.layers.0.norm1.bias"] = ln_bias
-        return super().load_state_dict(state_dict, strict=strict)
+        return super().load_state_dict(state_dict, strict=strict, **hf_kwargs)
 
 
 def shard_state_dict_tp(state_dict, config, world_size, rank):
