@@ -16,8 +16,7 @@
 #include "softmax.h"
 #include "mask.h"
 #include "dropout.h"
-
-#include "alibi.h"
+#include "rotary.h"
 
 namespace flash {
 
@@ -222,16 +221,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // Prologue
 
-    Tensor tQrQ = make_fragment_like(tQgQ);
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
                                        binfo.actual_seqlen_q - m_block * kBlockM);
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
 
-    // // Copy rmem to smem
-    // // copy(tQrQ, tQsQ);
-    // flash::cp_async_wait<0>();
-    // __syncthreads();
     // // if (cute::thread(1, 0)) { print(tQsQ); }
     // // Tensor sQNoSwizzle = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)), typename Kernel_traits::SmemLayoutQNoSwizzle{});
     // // if (cute::thread0()) { print(sQNoSwizzle); }
@@ -744,7 +738,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     }
 
     // Read Q from gmem to smem, optionally apply rotary embedding.
-    Tensor tQrQ = make_fragment_like(tQgQ);
     if (!Append_KV || params.rotary_dim == 0) {
         // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
         flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
