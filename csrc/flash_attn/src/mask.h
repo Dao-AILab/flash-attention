@@ -11,7 +11,7 @@ namespace flash {
 using namespace cute;
 
 template <typename Engine, typename Layout>
-inline __device__ void apply_mask(Tensor<Engine, Layout> &tensor, const int max_seqlen_k,
+__forceinline__ __device__ void apply_mask(Tensor<Engine, Layout> &tensor, const int max_seqlen_k,
                                   const int col_idx_offset_ = 0) {
     // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
     static_assert(Layout::rank == 2, "Only support 2D Tensor");
@@ -35,7 +35,7 @@ inline __device__ void apply_mask(Tensor<Engine, Layout> &tensor, const int max_
 }
 
 template <bool HasWSLeft=true, typename Engine, typename Layout>
-inline __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor, const int col_idx_offset_,
+__forceinline__ __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor, const int col_idx_offset_,
                                         const int max_seqlen_k, const int row_idx_offset,
                                         const int max_seqlen_q, const int warp_row_stride,
                                         const int window_size_left, const int window_size_right) {
@@ -72,7 +72,7 @@ inline __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor, const in
 }
 
 template <typename Engine, typename Layout>
-inline __device__ void apply_mask_causal(Tensor<Engine, Layout> &tensor, const int col_idx_offset_,
+__forceinline__ __device__ void apply_mask_causal(Tensor<Engine, Layout> &tensor, const int col_idx_offset_,
                                          const int max_seqlen_k, const int row_idx_offset,
                                          const int max_seqlen_q, const int warp_row_stride) {
     // Causal masking is equivalent to local masking with window_size_left = infinity and window_size_right = 0
@@ -81,7 +81,7 @@ inline __device__ void apply_mask_causal(Tensor<Engine, Layout> &tensor, const i
 }
 
 template <typename Engine0, typename Layout0, typename Engine1, typename Layout1>
-inline __device__ void apply_mask_causal_w_idx(
+__forceinline__ __device__ void apply_mask_causal_w_idx(
     Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> const &idx_rowcol,
     const int col_idx_offset_, const int max_seqlen_k, const int row_idx_offset)
 {

@@ -12,33 +12,33 @@
 #include "flash_bwd_kernel.h"
 
 template<bool Clear_dQaccum=true, typename Kernel_traits>
-__global__ void flash_bwd_dot_do_o_kernel(Flash_bwd_params params) {
+__global__ void flash_bwd_dot_do_o_kernel(const Flash_bwd_params params) {
     flash::compute_dot_do_o<Clear_dQaccum, Kernel_traits>(params);
 }
 
 template<typename Kernel_traits>
-__global__ void flash_bwd_clear_dkvaccum_kernel(Flash_bwd_params params) {
+__global__ void flash_bwd_clear_dkvaccum_kernel(const Flash_bwd_params params) {
     flash::clear_dKVaccum<Kernel_traits>(params);
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Has_alibi, bool Is_even_M, bool Is_even_K>
-__global__ void flash_bwd_dq_dk_dv_loop_kernel(Flash_bwd_params params) {
+__global__ void flash_bwd_dq_dk_dv_loop_kernel(__grid_constant__ const Flash_bwd_params params) {
     flash::compute_dq_dk_dv<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K>(params);
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K>
-__global__ void flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel(Flash_bwd_params params) {
+__global__ void flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel(__grid_constant__ const Flash_bwd_params params) {
     static_assert(!(Is_causal && Is_local));  // If Is_local is true, Is_causal should be false
     flash::compute_dq_dk_dv_seqk_parallel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K>(params);
 }
 
 template<typename Kernel_traits>
-__global__ void flash_bwd_convert_dq_kernel(Flash_bwd_params params, const int nsplits) {
+__global__ void flash_bwd_convert_dq_kernel(const Flash_bwd_params params, const int nsplits) {
     flash::convert_dQ<Kernel_traits>(params, nsplits);
 }
 
 template<typename Kernel_traits>
-__global__ void flash_bwd_convert_dkv_kernel(Flash_bwd_params params) {
+__global__ void flash_bwd_convert_dkv_kernel(const Flash_bwd_params params) {
     flash::convert_dKV<Kernel_traits>(params);
 }
 

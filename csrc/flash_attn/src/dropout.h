@@ -14,7 +14,7 @@ struct Dropout {
     const unsigned long long seed, offset;
     const uint8_t p_dropout_in_uint8_t;
 
-    inline __device__ Dropout(const unsigned long long seed, const unsigned long long offset,
+    __forceinline__ __device__ Dropout(const unsigned long long seed, const unsigned long long offset,
                               const uint8_t p_dropout_in_uint8_t,
                               const int bid, const int hid, const int tid, const int nheads)
             : seed(seed)
@@ -23,7 +23,7 @@ struct Dropout {
     }
 
     template <bool encode_dropout_in_sign_bit=false, typename Engine, typename Layout>
-    inline __device__ void apply_dropout(Tensor<Engine, Layout> &tensor_,
+    __forceinline__ __device__ void apply_dropout(Tensor<Engine, Layout> &tensor_,
                                          int block_row_start, int block_col_start, int block_row_stride) {
         // tensor_ has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_rowcol_dropout(tensor_.layout()));

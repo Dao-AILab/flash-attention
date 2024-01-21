@@ -9,7 +9,7 @@ struct ull2 {
     unsigned long long y;
 };
 
-inline __device__ uint2 mulhilo32(const unsigned int a, const unsigned int b) {
+__forceinline__ __device__ uint2 mulhilo32(const unsigned int a, const unsigned int b) {
     uint2 *res;
     unsigned long long tmp;
     asm ("mul.wide.u32 %0, %1, %2;\n\t"
@@ -19,7 +19,7 @@ inline __device__ uint2 mulhilo32(const unsigned int a, const unsigned int b) {
     return *res;
 }
 
-inline __device__ uint4 philox_single_round(const uint4 ctr, const uint2 key) {
+__forceinline__ __device__ uint4 philox_single_round(const uint4 ctr, const uint2 key) {
     constexpr unsigned long kPhiloxSA = 0xD2511F53;
     constexpr unsigned long kPhiloxSB = 0xCD9E8D57;
     uint2 res0 = mulhilo32(kPhiloxSA, ctr.x);
@@ -28,7 +28,7 @@ inline __device__ uint4 philox_single_round(const uint4 ctr, const uint2 key) {
     return ret;
 }
 
-inline __device__ uint4 philox(unsigned long long seed,
+__forceinline__ __device__ uint4 philox(unsigned long long seed,
                                unsigned long long subsequence,
                                unsigned long long offset) {
     constexpr unsigned long kPhilox10A = 0x9E3779B9;
