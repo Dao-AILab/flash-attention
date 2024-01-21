@@ -527,16 +527,16 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             static_assert(MMA_N_SdP % 2 == 0);
             int block_col_idx = n_block * (kBlockN / 32) + (warp_id / AtomLayoutMS) * (MMA_N_SdP / 2);
             dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                scores, block_row_idx, block_col_idx, AtomLayoutMS
+                acc_s, block_row_idx, block_col_idx, AtomLayoutMS
             );
         }
         // Convert scores from fp32 to fp16/bf16
         Tensor rP = !Is_dropout
-            ? flash::convert_type<Element>(scores)
-            : flash::convert_type_relu<Element>(scores);
-        // Reshape rP from (nrow=(2, MMA_N), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_N, MMA_N / 2)
-        // if using m16n8k16 or ((2, 2, 1), MMA_N, MMA_N) if using m16n8k8.
-        Tensor tPrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<Kernel_traits::TiledMmaSdP>(rP.layout()));
+            ? flash::convert_type<Element>(acc_s)
+            : flash::convert_type_relu<Element>(acc_s);
+        // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_N, MMA_N / 2)
+        // if using m16n8k16 or (4, MMA_N, MMA_N) if using m16n8k8.
+        Tensor tPrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMmaSdP>(rP.layout()));
         Tensor tPaP = smem_thr_copy_PdS.retile_S(tPrP);     // ((Atom,AtomNum), MMA_N, MMA_N)
         cute::copy(smem_tiled_copy_PdS, tPaP, tPsP);
         // if (cute::thread0()) { print(tPaP); }

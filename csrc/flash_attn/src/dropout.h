@@ -25,9 +25,8 @@ struct Dropout {
     template <bool encode_dropout_in_sign_bit=false, typename Engine, typename Layout>
     __forceinline__ __device__ void apply_dropout(Tensor<Engine, Layout> &tensor_,
                                          int block_row_start, int block_col_start, int block_row_stride) {
-        // tensor_ has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
-        Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_rowcol_dropout(tensor_.layout()));
-        // tensor has shape (8, MMA_M, MMA_N / 2)
+        // convert shape from (4, MMA_M, MMA_N) to (8, MMA_M, MMA_N / 2)
+        Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_dropout(tensor_.layout()));
         using T = typename Engine::value_type;
         auto encode_dropout = [](bool keep, T val) {
             return keep ? val : (encode_dropout_in_sign_bit ? -val : T(0));

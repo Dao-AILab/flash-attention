@@ -193,34 +193,33 @@ __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Convert rowcol_layout from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
-// if using m16n8k16, or to ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
+// Convert acc_layout from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
+// if using m16n8k16, or to (4, MMA_M, MMA_N) if using m16n8k8.
 template<typename MMA_traits, typename Layout>
-__forceinline__ __device__ auto convert_layout_rowcol_Aregs(Layout rowcol_layout) {
+__forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
     using X = Underscore;
-    static_assert(decltype(size<0, 0>(rowcol_layout))::value == 2);
-    static_assert(decltype(size<1, 0>(rowcol_layout))::value == 2);
+    static_assert(decltype(size<0>(acc_layout))::value == 4);
+    static_assert(decltype(rank(acc_layout))::value == 3);
     constexpr int mma_shape_K = get<2>(typename MMA_traits::Shape_MNK{});
     static_assert(mma_shape_K == 8 || mma_shape_K == 16);
-    constexpr int MMA_N_divisor = mma_shape_K == 8 ? 1 : 2;
-    auto l = logical_divide(rowcol_layout, Shape<X, Shape<X, Int<MMA_N_divisor>>>{});  // ((2, MMA_M), (2, (2, MMA_N / 2)))
-    return make_layout(make_layout(get<1, 0>(l), get<0, 0>(l), get<1, 1, 0>(l)),
-                       get<0, 1>(l),
-                       get<1, 1, 1>(l));
+    if constexpr (mma_shape_K == 8) {
+        return acc_layout;
+    } else {
+        auto l = logical_divide(acc_layout, Shape<X, X, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
+        return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
+    }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Convert rowcol_layout from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
+// Convert acc_layout from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
 template<typename Layout>
-__forceinline__ __device__ auto convert_layout_rowcol_dropout(Layout rowcol_layout) {
+__forceinline__ __device__ auto convert_layout_acc_dropout(Layout acc_layout) {
     using X = Underscore;
-    static_assert(decltype(size<0, 0>(rowcol_layout))::value == 2);
-    static_assert(decltype(size<1, 0>(rowcol_layout))::value == 2);
-    auto l = logical_divide(rowcol_layout, Shape<X, Shape<X, Int<2>>>{});  // ((2, MMA_M), (2, (2, MMA_N / 2)))
-    return make_layout(make_layout(get<1, 0>(l), get<0, 0>(l), get<1, 1, 0>(l)),
-                       get<0, 1>(l),
-                       get<1, 1, 1>(l));
+    static_assert(decltype(size<0>(acc_layout))::value == 4);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    auto l = logical_divide(acc_layout, Shape<X, X, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
+    return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
