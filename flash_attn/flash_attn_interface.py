@@ -120,6 +120,7 @@ def _flash_attn_backward(
     causal,
     window_size,
     attn_bias,
+    attn_bias_require_grad,
     ds,
     rng_state=None,
 ):
@@ -129,7 +130,7 @@ def _flash_attn_backward(
     if attn_bias is not None:
         attn_bias = maybe_contiguous(attn_bias)
 
-    dq, dk, dv, softmax_d, = flash_attn_cuda.bwd(
+    dq, dk, dv, ds, softmax_d, = flash_attn_cuda.bwd(
         dout,
         q,
         k,
@@ -145,11 +146,12 @@ def _flash_attn_backward(
         window_size[0],
         window_size[1],
         attn_bias,
+        attn_bias_require_grad,
         ds,
         None,
         rng_state,
     )
-    return dq, dk, dv, softmax_d
+    return dq, dk, dv, ds, softmax_d
 
 
 def _flash_attn_varlen_backward(
@@ -252,6 +254,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             attn_bias,
+            ctx.bias_requires_grad,
             ds,
             rng_state=rng_state,
         )
@@ -378,6 +381,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             attn_bias,
+            ctx.bias_requires_grad,
             ds,
             rng_state=rng_state,
         )
@@ -511,6 +515,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             attn_bias,
+            ctx.bias_requires_grad,
             ds,
             rng_state=rng_state,
         )
