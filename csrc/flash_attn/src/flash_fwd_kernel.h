@@ -559,10 +559,17 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         + m_block * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
     // We move K and V to the last block.
     const int bidb_cache = params.cache_batch_idx == nullptr ? bidb : params.cache_batch_idx[bidb];
-    const index_t row_offset_k = binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
-        + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
-    const index_t row_offset_v = binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache)
-        + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
+    const int *block_table = params.block_table == nullptr ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
+    const int block_table_idx = block_table == nullptr ? 0 : (n_block_max - 1) * kBlockN / params.page_block_size;
+    const int block_table_offset = block_table == nullptr ? 0 : (n_block_max - 1) * kBlockN - block_table_idx * params.page_block_size;
+    const index_t row_offset_k = block_table == nullptr
+        ? binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
+          + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
+        : block_table[block_table_idx] * params.k_batch_stride + block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
+    const index_t row_offset_v = block_table == nullptr
+        ? binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache)
+          + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride
+        : block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
 
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -695,11 +702,12 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         Tensor tVgVnew = gmem_thr_copy_QKV.partition_S(gVnew);  // (VCPY, VCPY_N, VCPY_K)
 
         const int n_block_copy_min = std::max(n_block_min, binfo.seqlen_k_cache / kBlockN);
+        auto tKgK_data = tKgK.data();
+        auto tVgV_data = tVgV.data();
         for (int n_block = n_block_max - 1; n_block >= n_block_copy_min; n_block--) {
             flash::copy_w_min_idx<Is_even_K>(
                 tVgVnew, tVgV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN, binfo.seqlen_k_cache - n_block * kBlockN
             );
-            tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
             tVgVnew.data() = tVgVnew.data() + (-int(kBlockN * params.vnew_row_stride));
             if (params.rotary_dim == 0) {
                 flash::copy_w_min_idx<Is_even_K>(
@@ -725,15 +733,27 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
                 }
             }
-            tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             tKgKnew.data() = tKgKnew.data() + (-int(kBlockN * params.knew_row_stride));
+            if (block_table == nullptr) {
+                tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            } else {
+                if (n_block > n_block_copy_min) {
+                    const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
+                    const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
+                    const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
+                    const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
+                    const int table_diff = block_table[block_table_idx_next] - block_table[block_table_idx_cur];
+                    const int offset_diff = block_table_offset_next - block_table_offset_cur;
+                    tVgV.data() = tVgV.data() + table_diff * params.v_batch_stride + offset_diff * params.v_row_stride;
+                    tKgK.data() = tKgK.data() + table_diff * params.k_batch_stride + offset_diff * params.k_row_stride;
+                }
+            }
         }
         // Need this before we can read in K again, so that we'll see the updated K values.
         __syncthreads();
-        if (n_block_max > n_block_copy_min) {
-            tKgK.data() = tKgK.data() + (n_block_max - n_block_copy_min) * kBlockN * params.k_row_stride;
-            tVgV.data() = tVgV.data() + (n_block_max - n_block_copy_min) * kBlockN * params.v_row_stride;
-        }
+        tKgK.data() = tKgK_data;
+        tVgV.data() = tVgV_data;
     }
 
     // Read Q from gmem to smem, optionally apply rotary embedding.
@@ -812,7 +832,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // Advance gV
         if (masking_step > 0) {
-            tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+            if (block_table == nullptr) {
+                tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+            } else {
+                const int block_table_idx_cur = (n_block + 1) * kBlockN / params.page_block_size;
+                const int block_table_offset_cur = (n_block + 1) * kBlockN - block_table_idx_cur * params.page_block_size;
+                const int block_table_idx_next = n_block * kBlockN / params.page_block_size;
+                const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
+                tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
+            }
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
         } else {
             // Clear the smem tiles to account for predicated off loads
@@ -839,7 +867,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         if (n_block > n_block_min) {
             // Advance gK
-            tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            if (block_table == nullptr) {
+                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            } else {
+                const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
+                const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
+                const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
+                const int block_table_offset_next =(n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
+                tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+            }
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
@@ -874,7 +910,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         flash::cp_async_wait<0>();
         __syncthreads();
         // Advance gV
-        tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+        if (block_table == nullptr) {
+            tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+        } else {
+            const int block_table_idx_cur = (n_block + 1) * kBlockN / params.page_block_size;
+            const int block_table_offset_cur = (n_block + 1) * kBlockN - block_table_idx_cur * params.page_block_size;
+            const int block_table_idx_next = n_block * kBlockN / params.page_block_size;
+            const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
+            tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
+        }
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
         cute::cp_async_fence();
 
@@ -887,7 +931,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         __syncthreads();
         if (n_block > n_block_min) {
             // Advance gK
-            tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            if (block_table == nullptr) {
+                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            } else {
+                const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
+                const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
+                const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
+                const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
+                tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+            }
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
