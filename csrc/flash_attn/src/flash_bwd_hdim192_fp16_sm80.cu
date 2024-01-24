@@ -5,6 +5,6 @@
 #include "flash_bwd_launch_template.h"
 
 template<>
-void run_mha_bwd_<cutlass::half_t, 192>(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {
-    run_mha_bwd_hdim192<cutlass::half_t>(params, stream, configure);
+void run_mha_bwd_<cutlass::half_t, 192>(Flash_bwd_params &params, cudaStream_t stream) {
+    run_mha_bwd_hdim192<cutlass::half_t>(params, stream);
 }

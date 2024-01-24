@@ -19,6 +19,8 @@ is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 # @pytest.mark.parametrize("inplace_backward", [False])
 @pytest.mark.parametrize("lse_square_scale", [0.0, 1e-2])
 # @pytest.mark.parametrize("lse_square_scale", [0.0])
+@pytest.mark.parametrize("logit_scale", [0.7])
+# @pytest.mark.parametrize("logit_scale", [1.0])
 @pytest.mark.parametrize("smoothing", [0.0, 0.9])
 # @pytest.mark.parametrize("smoothing", [0.0])
 @pytest.mark.parametrize("vocab_size", [50264, 256 * 1024])  # test vocab larger than 64k for split
@@ -26,7 +28,7 @@ is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 # @pytest.mark.parametrize("world_size", [1, 2])
 @pytest.mark.parametrize("world_size", [2])
 def test_cross_entropy_loss_parallel(
-    vocab_size, world_size, smoothing, lse_square_scale, inplace_backward, dtype
+    vocab_size, world_size, smoothing, logit_scale, lse_square_scale, inplace_backward, dtype
 ):
     assert vocab_size % world_size == 0
     rtol, atol = (
@@ -59,15 +61,16 @@ def test_cross_entropy_loss_parallel(
     model_pt = torch.nn.CrossEntropyLoss(label_smoothing=smoothing, reduction="none")
     model = CrossEntropyLoss(
         label_smoothing=smoothing,
+        logit_scale=logit_scale,
         reduction="none",
         lse_square_scale=lse_square_scale,
         inplace_backward=inplace_backward,
         process_group=parallel_state.get_tensor_model_parallel_group(),
     )
     out = model(x, y)
-    out_pt = model_pt(x_pt.float(), y)
+    out_pt = model_pt(x_pt.float() * logit_scale, y)
     if lse_square_scale > 0.0:
-        lse_pt = torch.logsumexp(x_pt.float(), dim=-1)
+        lse_pt = torch.logsumexp(x_pt.float() * logit_scale, dim=-1)
         out_pt += lse_square_scale * lse_pt.square()
         out_pt.masked_fill_(y == -100, 0.0)
     assert torch.allclose(out, out_pt, rtol=1e-5, atol=1e-6)

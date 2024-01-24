@@ -36,7 +36,7 @@
     }                                        \
   }()
 
-#define FWD_HEADDIM_SWITCH(HEADDIM, ...)   \
+#define HEADDIM_SWITCH(HEADDIM, ...)   \
   [&] {                                    \
     if (HEADDIM <= 32) {                   \
       constexpr static int kHeadDim = 32;  \

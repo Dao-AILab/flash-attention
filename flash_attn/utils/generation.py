@@ -591,10 +591,6 @@ def allocate_inference_cache(
     dtype=torch.float16,
 ):
     assert dtype in [torch.float16, torch.bfloat16, torch.float32]
-    packsize = 4 if dtype == torch.float32 else 8
-    assert headdim % packsize == 0
-    k_cache_shape = (max_batch_size, nheads, headdim // packsize, max_seqlen, packsize)
-    v_cache_shape = (max_batch_size, nheads, max_seqlen, headdim)
     kv_cache_shape = (max_batch_size, max_seqlen, 2, nheads, headdim)
     if isinstance(layers, int):
         layers = range(layers)
