@@ -26,7 +26,7 @@ jobs:
     strategy:
       matrix:
         pyver: ["3.8", "3.9", "3.10", "3.11"]
-        cuda: ["12.1.1"]
+        cuda: ["12.2.2"]
     defaults:
       run:
         shell: pwsh
