@@ -212,7 +212,7 @@ def rename_cpp_to_hip(cpp_files):
 # Defining a function to validate the GPU architectures and update them if necessary
 def validate_and_update_archs(archs):
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942"]
+    allowed_archs = ["native", "gfx90a", "gfx908", "gfx940", "gfx941", "gfx942"]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
