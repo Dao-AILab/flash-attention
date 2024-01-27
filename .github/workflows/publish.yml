@@ -124,7 +124,11 @@ jobs:
           # We want to figure out the CUDA version to download pytorch
           # e.g. we can have system CUDA version being 11.7 but if torch==1.12 then we need to download the wheel from cu116
           # This code is ugly, maybe there's a better way to do this.
-          export TORCH_CUDA_VERSION=$(python -c "import os; minv = {'1.12': 113, '1.13': 116, '2.0': 117, '2.1': 118, '2.2': 118}[os.environ['MATRIX_TORCH_VERSION']]; maxv = {'1.12': 116, '1.13': 117, '2.0': 118, '2.1': 121, '2.2': 121}[os.environ['MATRIX_TORCH_VERSION']]; print(max(min(int(os.environ['MATRIX_CUDA_VERSION']), maxv), minv))")
+          export TORCH_CUDA_VERSION=$(python -c "import os; \
+            minv = {'1.12': 113, '1.13': 116, '2.0': 117, '2.1': 118, '2.2': 118, '2.3': 118}[os.environ['MATRIX_TORCH_VERSION']]; \
+            maxv = {'1.12': 116, '1.13': 117, '2.0': 118, '2.1': 121, '2.2': 121, '2.3': 121}[os.environ['MATRIX_TORCH_VERSION']]; \
+            print(max(min(int(os.environ['MATRIX_CUDA_VERSION']), maxv), minv))" \
+          )
           if [[ ${{ matrix.torch-version }} == *"dev"* ]]; then
             pip install --no-cache-dir --pre torch==${{ matrix.torch-version }} --index-url https://download.pytorch.org/whl/nightly/cu${TORCH_CUDA_VERSION}
           else
