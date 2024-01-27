@@ -76,6 +76,10 @@ struct Flash_fwd_params : public Qkv_params {
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
+    int * __restrict__ cu_seqlens_knew;
+
+    // array of length b holding the length of KV cache.
+    int * __restrict__ k_cache_seqlens;
 
     // If provided, the actual length of each k sequence.
     int * __restrict__ seqused_k;
@@ -127,10 +131,6 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool is_bf16;
     bool is_causal;
-
-    // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
-    // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.
-    bool is_seqlens_k_cumulative;
 
     bool is_rotary_interleaved;
 

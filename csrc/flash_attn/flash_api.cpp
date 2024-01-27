@@ -78,6 +78,8 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
+    params.k_cache_seqlens = nullptr;
+    params.cu_seqlens_knew = nullptr;
     params.seqused_k = static_cast<int *>(seqused_k);
 
     // P = softmax(QK^T)
@@ -121,8 +123,6 @@ void set_params_fprop(Flash_fwd_params &params,
     if (window_size_left >= 0 && window_size_right < 0) { window_size_right = seqlen_k; }
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
-
-    params.is_seqlens_k_cumulative = true;
 }
 
 void set_params_dgrad(Flash_bwd_params &params,
@@ -1387,9 +1387,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         CHECK_DEVICE(seqlens_k);
         CHECK_CONTIGUOUS(seqlens_k);
         CHECK_SHAPE(seqlens_k, batch_size);
-        params.cu_seqlens_k = static_cast<int *>(seqlens_k.data_ptr());
+        params.k_cache_seqlens = static_cast<int *>(seqlens_k.data_ptr());
     }
-    params.is_seqlens_k_cumulative = !(seqlens_k_.has_value());
 
     if (rotary_cos_.has_value()) {
         TORCH_CHECK(k_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
@@ -1470,6 +1469,233 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     return {out, softmax_lse};
 }
 
+std::vector<at::Tensor>
+mha_varlen_fwd_kvcache(at::Tensor &q,                 // total_q x num_heads x head_size
+                       const at::Tensor &cu_seqlens_q,  // b+1
+                       const int max_seqlen_q,
+                       const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size
+                       const at::Tensor &vcache,            // batch_size_c x seqlen_k x num_heads_k x head_size
+                       c10::optional<const at::Tensor> &k_, // total_k x num_heads_k x head_size
+                       c10::optional<const at::Tensor> &v_, // total_k x num_heads_k x head_size
+                       c10::optional<const at::Tensor> &cu_seqlens_knew_, // batch_size_c + 1, indexing k_/v_
+                       c10::optional<const at::Tensor> &seqlens_k_, // batch_size, indexing cache
+                       c10::optional<const at::Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
+                       c10::optional<const at::Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
+                       c10::optional<const at::Tensor> &cache_batch_idx_, // indices to index into the KV cache
+                       c10::optional<at::Tensor> &out_,             // total_q x num_heads x head_size
+                       const float softmax_scale,
+                       bool is_causal,
+                       const int window_size_left,
+                       int window_size_right,
+                       bool is_rotary_interleaved   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
+                       ) {
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    // bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
+    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    TORCH_CHECK(is_sm90 || is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
+    // We will support Turing in the near future
+    // TORCH_CHECK(is_sm90 || is_sm8x || is_sm75, "FlashAttention only supports Turing GPUs or newer.");
+
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention only support fp16 and bf16 data type");
+    if (q_dtype == torch::kBFloat16) {
+        TORCH_CHECK(is_sm90 || is_sm8x, "bfloat16 is only supported on Ampere GPUs or newer");
+    }
+    TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
+
+    CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
+    CHECK_DEVICE(cu_seqlens_q);
+
+    TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(kcache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(vcache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    CHECK_CONTIGUOUS(cu_seqlens_q);
+
+    const auto sizes = q.sizes();
+
+    const int total_q = sizes[0];
+    const int batch_size = cu_seqlens_q.numel() - 1;
+    int num_heads = sizes[1];
+    const int head_size_og = sizes[2];
+    const int max_seqlen_k = kcache.size(1);
+    const int num_heads_k = kcache.size(2);
+    const int batch_size_c = kcache.size(0);
+    TORCH_CHECK(batch_size > 0, "batch size must be postive");
+    TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
+    TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    if (is_causal) { window_size_right = 0; }
+
+    CHECK_SHAPE(q, total_q, num_heads, head_size_og);
+    CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+    CHECK_SHAPE(kcache, batch_size_c, max_seqlen_k, num_heads_k, head_size_og);
+    CHECK_SHAPE(vcache, batch_size_c, max_seqlen_k, num_heads_k, head_size_og);
+
+    at::Tensor q_padded, kcache_padded, vcache_padded;
+    if (head_size_og % 8 != 0) {
+        q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        kcache_padded = torch::nn::functional::pad(kcache, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        vcache_padded = torch::nn::functional::pad(vcache, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+    } else {
+        q_padded = q;
+        kcache_padded = kcache;
+        vcache_padded = vcache;
+    }
+
+    at::Tensor out;
+    if (out_.has_value()) {
+        out = out_.value();
+        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        CHECK_DEVICE(out);
+        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        CHECK_SHAPE(out, total_q, num_heads, head_size_og);
+        if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
+    } else {
+        out = torch::empty_like(q_padded);
+    }
+
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int head_size = round_multiple(head_size_og, 8);
+    const int head_size_rounded = round_multiple(head_size, 32);
+    const int seqlen_q_rounded = round_multiple(max_seqlen_q, 128);
+    const int seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
+
+    // Otherwise the kernel will be launched from cuda:0 device
+    // Cast to char to avoid compiler warning about narrowing
+    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+
+    auto opts = q.options();
+
+    auto softmax_lse = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+
+    Flash_fwd_params params;
+    set_params_fprop(params,
+                     batch_size,
+                     max_seqlen_q, max_seqlen_k,
+                     seqlen_q_rounded, seqlen_k_rounded,
+                     num_heads, num_heads_k,
+                     head_size, head_size_rounded,
+                     q_padded, kcache_padded, vcache_padded, out,
+                     cu_seqlens_q.data_ptr(),
+                     /*cu_seqlens_k_d=*/nullptr,
+                     /*seqused_k=*/nullptr,
+                     /*p_ptr=*/nullptr,
+                     softmax_lse.data_ptr(),
+                     /*p_dropout=*/0.f,
+                     softmax_scale,
+                     window_size_left,
+                     window_size_right);
+    params.k_batch_stride = kcache_padded.stride(0);
+    params.v_batch_stride = vcache_padded.stride(0);
+
+    at::Tensor k, v, k_padded, v_padded;
+    if (k_.has_value()) {
+        TORCH_CHECK(v_.has_value(), "If key is supplied, value must also be passed in");
+        TORCH_CHECK(cu_seqlens_knew_.has_value(), "If key is supplied, cu_seqlens_k must also be passed in");
+        TORCH_CHECK(seqlens_k_.has_value(), "If key is supplied, seqlens_k must also be passed in");
+        TORCH_CHECK(max_seqlen_q <= max_seqlen_k, "If key is supplied, it must have seqlen <= the seqlen of the KV cache");
+        k = k_.value();
+        v = v_.value();
+        TORCH_CHECK(k.dtype() == q_dtype, "Key must have the same dtype as query");
+        TORCH_CHECK(v.dtype() == q_dtype, "Value must have the same dtype as query");
+        CHECK_DEVICE(k); CHECK_DEVICE(v);
+        TORCH_CHECK(k.stride(-1) == 1, "Key tensor must have contiguous last dimension");
+        TORCH_CHECK(v.stride(-1) == 1, "Value tensor must have contiguous last dimension");
+        int total_k = k.size(0);
+        CHECK_SHAPE(k, total_k, num_heads_k, head_size_og);
+        CHECK_SHAPE(v, total_k, num_heads_k, head_size_og);
+        if (head_size_og % 8 != 0) {
+            k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+            v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        } else {
+            k_padded = k;
+            v_padded = v;
+        }
+        params.seqlen_knew = max_seqlen_k;
+        params.knew_ptr = k_padded.data_ptr();
+        params.vnew_ptr = v_padded.data_ptr();
+        // All stride are in elements, not bytes.
+        params.knew_row_stride = k_padded.stride(-3);
+        params.vnew_row_stride = v_padded.stride(-3);
+        params.knew_head_stride = k_padded.stride(-2);
+        params.vnew_head_stride = v_padded.stride(-2);
+    }
+
+    if (seqlens_k_.has_value()) {
+        auto seqlens_k = seqlens_k_.value();
+        TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqlens_k must have dtype int32");
+        CHECK_DEVICE(seqlens_k);
+        CHECK_CONTIGUOUS(seqlens_k);
+        CHECK_SHAPE(seqlens_k, batch_size);
+        params.k_cache_seqlens = static_cast<int *>(seqlens_k.data_ptr());
+    }
+
+    if (cu_seqlens_knew_.has_value()) {
+        auto cu_seqlens_knew = cu_seqlens_knew_.value();
+        TORCH_CHECK(cu_seqlens_knew.dtype() == torch::kInt32, "cu_seqlens_knew must have dtype int32");
+        CHECK_DEVICE(cu_seqlens_knew);
+        CHECK_CONTIGUOUS(cu_seqlens_knew);
+        TORCH_CHECK(cu_seqlens_knew.numel() - 1 == batch_size, "cu_seqlens_knew must have batch_size + 1 elements");
+        params.cu_seqlens_knew = static_cast<int *>(cu_seqlens_knew.data_ptr());
+    }
+
+    if (rotary_cos_.has_value()) {
+        TORCH_CHECK(k_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
+        auto rotary_cos = rotary_cos_.value();
+        CHECK_DEVICE(rotary_cos);
+        params.rotary_dim = rotary_cos.size(1) * 2;
+        TORCH_CHECK(params.rotary_dim <= head_size, "rotary_dim must be <= headdim");
+        TORCH_CHECK(params.rotary_dim % 16 == 0, "Only rotary dimensions divisible by 16 are currently supported");
+        const int seqlen_ro = rotary_cos.size(0);
+        TORCH_CHECK(seqlen_ro >= max_seqlen_k, "cos/sin seqlen must be at least the seqlen of KV cache");
+        CHECK_SHAPE(rotary_cos, seqlen_ro, params.rotary_dim / 2);
+        CHECK_CONTIGUOUS(rotary_cos);
+        TORCH_CHECK(rotary_cos.scalar_type() == q_dtype, "rotary_cos must have the same dtype as query");
+
+        TORCH_CHECK(rotary_sin_.has_value(), "If rotary cos is provided, rotary sin must also be provided");
+        auto rotary_sin = rotary_sin_.value();
+        CHECK_DEVICE(rotary_sin);
+        CHECK_SHAPE(rotary_sin, seqlen_ro, params.rotary_dim / 2);
+        CHECK_CONTIGUOUS(rotary_sin);
+        TORCH_CHECK(rotary_sin.scalar_type() == q_dtype, "rotary_cos must have the same dtype as query");
+        params.rotary_cos_ptr = rotary_cos.data_ptr();
+        params.rotary_sin_ptr = rotary_sin.data_ptr();
+        params.is_rotary_interleaved = is_rotary_interleaved;
+    } else {
+        params.rotary_dim = 0;
+    }
+
+    if (cache_batch_idx_.has_value()) {
+        auto cache_batch_idx = cache_batch_idx_.value();
+        CHECK_DEVICE(cache_batch_idx);
+        CHECK_CONTIGUOUS(cache_batch_idx);
+        TORCH_CHECK(cache_batch_idx.scalar_type() == torch::kInt32, "cache_batch_idx must have dtype int32");
+        params.cache_batch_idx = reinterpret_cast<int *>(cache_batch_idx.data_ptr());
+    }
+
+    params.num_splits = 1;
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx
+    run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value());
+
+    if (head_size_og % 8 != 0) {
+        out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+        if (out_.has_value()) { out_.value().copy_(out); }
+        if (k_.has_value()) {
+            // It's expensive to copy the KV cache here for the case where head size not divisible by 8,
+            // but we don't expect to get this case in practice. This is just so that the code works for that case.
+            kcache.copy_(kcache_padded.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)}));
+            vcache.copy_(vcache_padded.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)}));
+        }
+    }
+    return {out, softmax_lse};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");
@@ -1477,4 +1703,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bwd", &mha_bwd, "Backward pass");
     m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
     m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
+    m.def("varlen_fwd_kvcache", &mha_varlen_fwd_kvcache, "Forward pass (variable length), with KV-cache");
 }

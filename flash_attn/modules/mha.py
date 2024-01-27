@@ -902,17 +902,35 @@ class ParallelMHA(nn.Module):
             )
             return context
 
-    def forward(self, x, seqlen=None, inference_params=None, **kwargs):
+    def forward(
+        self, x, seqlen=None, inference_params=None, cu_seqlens=None, max_seqlen=None, **kwargs
+    ):
         """
         Arguments:
-            x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim) if seqlen=None.
-                If seqlen is not None, x is (batch * seqlen, hidden_dim). This is so that when we
+            x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim) if seqlen=None and cu_seqlens=None.
+               (seqlen, hidden_dim) if cu_seqlens not None, seqlen equal cu_seqlens[-1].
+                If seqlen is not None and cu_seqlens=None, x is (batch * seqlen, hidden_dim). This is so that when we
                 split x during sequence parallel, we split the batch * seqlen dimension
                 (in case batch is small).
+            cu_seqlens: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+                of the sequences in the batch, used to index into x. Only applicable when using
+                FlashAttention.
+            max_seqlen: int. Maximum sequence length in the batch.
         """
+        if cu_seqlens is not None:
+            assert max_seqlen is not None
+            assert seqlen is None
+            assert self.use_flash_attn
+        if inference_params is not None:
+            assert cu_seqlens is None and max_seqlen is None
         qkv = self.Wqkv(x)
         if seqlen is not None:
             qkv = rearrange(qkv, "(b s) ... -> b s ...", s=seqlen)
+        kwargs = (
+            {"cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen, **kwargs}
+            if self.use_flash_attn
+            else kwargs
+        )
         seqlen_offset = (
             0
             if inference_params is None
@@ -922,9 +940,11 @@ class ParallelMHA(nn.Module):
                 else inference_params.seqlen_offset
             )
         )
-        rotary_max_seqlen = inference_params.max_seqlen if inference_params is not None else None
+        rotary_max_seqlen = (
+            inference_params.max_sequence_len if inference_params is not None else max_seqlen
+        )
         if self.num_heads_kv == self.num_heads:
-            qkv = rearrange(qkv, "b s (three h d) -> b s three h d", three=3, d=self.head_dim)
+            qkv = rearrange(qkv, "... (three h d) -> ... three h d", three=3, d=self.head_dim)
             if (
                 inference_params is None
                 or inference_params.seqlen_offset == 0
@@ -933,7 +953,10 @@ class ParallelMHA(nn.Module):
             ):
                 if self.rotary_emb_dim > 0:
                     qkv = self.rotary_emb(
-                        qkv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
+                        qkv,
+                        seqlen_offset=seqlen_offset,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=rotary_max_seqlen,
                     )
                 if inference_params is None:
                     if not self.checkpointing:
@@ -968,7 +991,11 @@ class ParallelMHA(nn.Module):
             ):
                 if self.rotary_emb_dim > 0:
                     q, kv = self.rotary_emb(
-                        q, kv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
+                        q,
+                        kv,
+                        seqlen_offset=seqlen_offset,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=rotary_max_seqlen,
                     )
                 if inference_params is None:
                     if not self.checkpointing:
@@ -981,7 +1008,7 @@ class ParallelMHA(nn.Module):
                     context = self._update_kvcache_attention(q, kv, inference_params)
             else:
                 context = self._apply_rotary_update_kvcache_attention(q, kv, inference_params)
-        context = rearrange(context, "b s h d -> b s (h d)")
+        context = rearrange(context, "... h d -> ... (h d)")
         if seqlen is not None:
             context = rearrange(context, "b s d -> (b s) d")
         out = self.out_proj(context)
