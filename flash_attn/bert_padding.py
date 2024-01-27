@@ -102,7 +102,7 @@ def unpad_input(hidden_states, attention_mask):
         attention_mask: (batch, seqlen), bool / int, 1 means valid and 0 means not valid.
     Return:
         hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
-        indicies: (total_nnz), the indices of non-masked tokens from the flattened input sequence.
+        indices: (total_nnz), the indices of non-masked tokens from the flattened input sequence.
         cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
         max_seqlen_in_batch: int
     """
@@ -171,7 +171,7 @@ def unpad_input_for_concatenated_sequences(hidden_states, attention_mask_in_leng
         attention_mask_in_length: (batch, seqlen), int, a nonzero number (e.g., 1, 2, 3, etc.) means length of concatenated sequence in b-th batch, and 0 means none.
     Return:
         hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
-        indicies: (total_nnz), the indices of non-masked tokens from the flattened input sequence.
+        indices: (total_nnz), the indices of non-masked tokens from the flattened input sequence.
         cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
         max_seqlen_in_batch: int
     """
