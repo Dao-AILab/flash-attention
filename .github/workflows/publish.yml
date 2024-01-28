@@ -52,6 +52,7 @@ jobs:
           # when building without C++11 ABI and using it on nvcr images.
           cxx11_abi: ['FALSE', 'TRUE']
           exclude:
+            # see https://github.com/pytorch/pytorch/blob/main/RELEASE.md#release-compatibility-matrix
             # Pytorch <= 1.12 does not support Python 3.11
             - torch-version: '1.12.1'
               python-version: '3.11'
@@ -123,11 +124,12 @@ jobs:
           pip install lit
           # We want to figure out the CUDA version to download pytorch
           # e.g. we can have system CUDA version being 11.7 but if torch==1.12 then we need to download the wheel from cu116
+          # see https://github.com/pytorch/pytorch/blob/main/RELEASE.md#release-compatibility-matrix
           # This code is ugly, maybe there's a better way to do this.
-          export TORCH_CUDA_VERSION=$(python -c "import os; \
-            minv = {'1.12': 113, '1.13': 116, '2.0': 117, '2.1': 118, '2.2': 118, '2.3': 118}[os.environ['MATRIX_TORCH_VERSION']]; \
-            maxv = {'1.12': 116, '1.13': 117, '2.0': 118, '2.1': 121, '2.2': 121, '2.3': 121}[os.environ['MATRIX_TORCH_VERSION']]; \
-            print(max(min(int(os.environ['MATRIX_CUDA_VERSION']), maxv), minv))" \
+          export TORCH_CUDA_VERSION=$(python -c "from os import environ as env; \
+            minv = {'1.12': 113, '1.13': 116, '2.0': 117, '2.1': 118, '2.2': 118, '2.3': 118}[env['MATRIX_TORCH_VERSION']]; \
+            maxv = {'1.12': 116, '1.13': 117, '2.0': 118, '2.1': 121, '2.2': 121, '2.3': 121}[env['MATRIX_TORCH_VERSION']]; \
+            print(max(min(int(env['MATRIX_CUDA_VERSION']), maxv), minv))" \
           )
           if [[ ${{ matrix.torch-version }} == *"dev"* ]]; then
             pip install --no-cache-dir --pre torch==${{ matrix.torch-version }} --index-url https://download.pytorch.org/whl/nightly/cu${TORCH_CUDA_VERSION}
