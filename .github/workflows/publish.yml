@@ -44,7 +44,7 @@ jobs:
           # manylinux docker image, but I haven't figured out how to install CUDA on manylinux.
           os: [ubuntu-20.04]
           python-version: ['3.7', '3.8', '3.9', '3.10', '3.11']
-          torch-version: ['1.12.1', '1.13.1', '2.0.1', '2.1.2', '2.2.0.dev20231130', '2.3.0.dev20240126']
+          torch-version: ['1.12.1', '1.13.1', '2.0.1', '2.1.2', '2.2.0.dev20231106', '2.3.0.dev20240126']
           cuda-version: ['11.8.0', '12.2.2']
           # We need separate wheels that either uses C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI) or not.
           # Pytorch wheels currently don't use it, but nvcr images have Pytorch compiled with C++11 ABI.
@@ -61,7 +61,7 @@ jobs:
               python-version: '3.7'
             - torch-version: '2.1.2'
               python-version: '3.7'
-            - torch-version: '2.2.0.dev20231130'
+            - torch-version: '2.2.0.dev20231106'
               python-version: '3.7'
             - torch-version: '2.3.0.dev20240126'
               python-version: '3.7'
@@ -86,6 +86,7 @@ jobs:
         run: |
           echo "MATRIX_CUDA_VERSION=$(echo ${{ matrix.cuda-version }} | awk -F \. {'print $1 $2'})" >> $GITHUB_ENV
           echo "MATRIX_TORCH_VERSION=$(echo ${{ matrix.torch-version }} | awk -F \. {'print $1 "." $2'})" >> $GITHUB_ENV
+          echo "MATRIX_PYTHON_VERSION=$(echo ${{ matrix.python-version }} | awk -F \. {'print $1 $2'})" >> $GITHUB_ENV
 
       - name: Free up disk space
         if: ${{ runner.os == 'Linux' }}
@@ -132,7 +133,9 @@ jobs:
             print(max(min(int(env['MATRIX_CUDA_VERSION']), maxv), minv))" \
           )
           if [[ ${{ matrix.torch-version }} == *"dev"* ]]; then
-            pip install --no-cache-dir --pre torch==${{ matrix.torch-version }} --index-url https://download.pytorch.org/whl/nightly/cu${TORCH_CUDA_VERSION}
+            # --no-deps because we can't install old versions of pytorch-triton
+            pip install typing-extensions jinja2
+            pip install --no-cache-dir --no-deps --pre https://download.pytorch.org/whl/nightly/cu${TORCH_CUDA_VERSION}/torch-${{ matrix.torch-version }}%2Bcu${TORCH_CUDA_VERSION}-cp${MATRIX_PYTHON_VERSION}-cp${MATRIX_PYTHON_VERSION}-linux_x86_64.whl
           else
             pip install --no-cache-dir torch==${{ matrix.torch-version }} --index-url https://download.pytorch.org/whl/cu${TORCH_CUDA_VERSION}
           fi
