@@ -1,4 +1,4 @@
-# Copyright (c) 2023, Tri Dao.
+# Copyright (c) 2024, Tri Dao.
 
 import logging
 import math
@@ -32,7 +32,12 @@ from flash_attn.modules.mlp import (
     ParallelMLP,
 )
 from flash_attn.ops.activations import sqrelu_fwd
-from flash_attn.utils.distributed import all_gather_raw, get_dim_for_local_rank, sync_shared_params
+from flash_attn.utils.distributed import (
+    all_gather,
+    all_gather_raw,
+    get_dim_for_local_rank,
+    sync_shared_params,
+)
 from flash_attn.utils.generation import GenerationMixin
 from flash_attn.utils.pretrained import state_dict_from_pretrained
 
@@ -42,29 +47,14 @@ except ImportError:
     ColumnParallelLinear = None
 
 try:
-    from flash_attn.ops.layer_norm import dropout_add_layer_norm
-except ImportError:
-    dropout_add_layer_norm = None
-
-try:
-    from flash_attn.ops.layer_norm import dropout_add_layer_norm_parallel_residual
-except ImportError:
-    dropout_add_layer_norm_parallel_residual = None
-
-try:
-    from flash_attn.ops.rms_norm import RMSNorm, dropout_add_rms_norm
-except ImportError:
-    RMSNorm, dropout_add_rms_norm = None, None
-
-try:
-    from flash_attn.ops.rms_norm import dropout_add_rms_norm_parallel_residual
-except ImportError:
-    dropout_add_rms_norm_parallel_residual = None
-
-try:
     from flash_attn.ops.triton.mlp import FusedDenseSqreluDense
 except ImportError:
     FusedDenseSqreluDense = None
+
+try:
+    from flash_attn.ops.triton.layer_norm import layer_norm_fn, RMSNorm
+except ImportError:
+    layer_norm_fn, RMSNorm = None, None
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +62,9 @@ logger = logging.getLogger(__name__)
 def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dtype=None):
     factory_kwargs = {"device": device, "dtype": dtype}
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-    softmax_scale = 1.0 if not config.scale_attn_weights else head_dim ** (-0.5)
+    attn_scale_power = 0.5 if not getattr(config, "mup_scale_qk_dot_by_d", False) else 1.0
+    softmax_scale = 1.0 if not config.scale_attn_weights else (head_dim ** (-attn_scale_power))
+    softmax_scale *= getattr(config, "mup_attn_multiplier", 1.0)
     if config.scale_attn_by_inverse_layer_idx:
         assert layer_idx is not None
         softmax_scale /= float(layer_idx + 1)
@@ -85,6 +77,7 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
     rotary_emb_base = getattr(config, "rotary_emb_base", 10000.0)
     rotary_emb_scale_base = getattr(config, "rotary_emb_scale_base", None)
     rotary_emb_interleaved = getattr(config, "rotary_emb_interleaved", False)
+    use_alibi = getattr(config, "use_alibi", False)
     use_flash_attn = getattr(config, "use_flash_attn", False)
     fused_bias_fc = getattr(config, "fused_bias_fc", False)
     if not fused_bias_fc:
@@ -116,6 +109,7 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
         rotary_emb_base=rotary_emb_base,
         rotary_emb_scale_base=rotary_emb_scale_base,
         rotary_emb_interleaved=rotary_emb_interleaved,
+        use_alibi=use_alibi,
         use_flash_attn=use_flash_attn,
         **serial_kwargs,
         **parallel_kwargs,
@@ -172,12 +166,14 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
                 if process_group is not None
                 else {}
             )
+            mlp_multiple_of = getattr(config, "mlp_multiple_of", 128)
             mlp_cls = partial(
                 mlp_cls,
                 hidden_features=config.n_inner,
                 activation=activation,
                 bias1=mlp_fc1_bias,
                 bias2=mlp_fc2_bias,
+                multiple_of=mlp_multiple_of,
                 **parallel_kwargs,
                 **factory_kwargs,
             )
@@ -353,9 +349,8 @@ class GPTPreTrainedModel(nn.Module):
             state_dict = remap_state_dict_hf_gpt2(state_dict, config)
         elif model_name.startswith("facebook/opt"):
             state_dict = remap_state_dict_hf_opt(state_dict, config)
-        elif (
-            model_name.startswith("EleutherAI/gpt-j-")
-            or model_name.startswith("togethercomputer/GPT-JT-")
+        elif model_name.startswith("EleutherAI/gpt-j-") or model_name.startswith(
+            "togethercomputer/GPT-JT-"
         ):
             state_dict = remap_state_dict_hf_gptj(state_dict, config)
         elif (
@@ -380,9 +375,15 @@ class GPTPreTrainedModel(nn.Module):
 
 
 # https://github.com/huggingface/transformers/blob/c28d04e9e252a1a099944e325685f14d242ecdcd/src/transformers/models/gpt2/modeling_gpt2.py#L454
-def _init_weights(module, n_layer, initializer_range=0.02, rescale_prenorm_residual=True):
+def _init_weights(
+    module, n_layer, initializer_range=0.02, mup_width_scale=1.0, rescale_prenorm_residual=True
+):
+    mup_init_scale = math.sqrt(mup_width_scale)
     if isinstance(module, nn.Linear):
-        nn.init.normal_(module.weight, std=initializer_range)
+        nn.init.normal_(module.weight, std=initializer_range * mup_init_scale)
+        optim_cfg = getattr(module.weight, "_optim", {})
+        optim_cfg.update({"lr_multiplier": mup_width_scale})
+        setattr(module.weight, "_optim", optim_cfg)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Embedding):
@@ -398,7 +399,9 @@ def _init_weights(module, n_layer, initializer_range=0.02, rescale_prenorm_resid
         for name, p in module.named_parameters():
             if name in ["out_proj.weight", "fc2.weight"]:
                 # Special Scaled Initialization --> There are 2 Layer Norms per Transformer Block
-                nn.init.normal_(p, mean=0.0, std=initializer_range / math.sqrt(2 * n_layer))
+                nn.init.normal_(
+                    p, mean=0.0, std=initializer_range * mup_init_scale / math.sqrt(2 * n_layer)
+                )
 
 
 class GPTModel(GPTPreTrainedModel):
@@ -423,6 +426,7 @@ class GPTModel(GPTPreTrainedModel):
         vocab_size = (
             math.ceil(config.vocab_size / pad_vocab_size_multiple) * pad_vocab_size_multiple
         )
+        self.embeddings_multiplier = getattr(config, "mup_embeddings_multiplier", 1.0)
         # TD [2022-07-30]: Force residual in fp32, seems to make fp16 training more stable
         self.residual_in_fp32 = getattr(config, "residual_in_fp32", False)
         # These 2 options are for OPT-350m
@@ -462,13 +466,15 @@ class GPTModel(GPTPreTrainedModel):
                 for i in range(config.num_hidden_layers)
             ]
         )
+        rotary_emb_fraction = getattr(config, "rotary_emb_fraction", 0.0)
+        if rotary_emb_fraction > 0.0:  # Tie all the RotaryEmbedding modules to share the same cos/sin cache
+            for layer in self.layers[1:]:
+                layer.mixer.rotary_emb = self.layers[0].mixer.rotary_emb
 
         self.fused_dropout_add_ln = getattr(config, "fused_dropout_add_ln", False)
         if self.fused_dropout_add_ln:
-            if (not self.parallel_block and dropout_add_layer_norm is None) or (
-                self.parallel_block and dropout_add_layer_norm_parallel_residual is None
-            ):
-                raise ImportError("dropout_layer_norm is not installed")
+            if layer_norm_fn is None:
+                raise ImportError("Triton is not installed")
         if self.prenorm:
             self.drop_f = nn.Dropout(config.resid_pdrop)
             norm_cls = nn.LayerNorm if not use_rms_norm else RMSNorm
@@ -488,6 +494,7 @@ class GPTModel(GPTPreTrainedModel):
                 _init_weights,
                 n_layer=config.num_hidden_layers,
                 initializer_range=config.initializer_range,
+                mup_width_scale=getattr(config, "mup_width_scale", 1.0),
             )
         )
         self.tie_weights()
@@ -512,6 +519,8 @@ class GPTModel(GPTPreTrainedModel):
             else {}
         )
         hidden_states = self.embeddings(input_ids, position_ids=position_ids, **embedding_kwargs)
+        if self.embeddings_multiplier != 1.0:
+            hidden_states = hidden_states * self.embeddings_multiplier
         if self.parallel_block:
             hidden_states2 = None
         residual = None
@@ -549,41 +558,17 @@ class GPTModel(GPTPreTrainedModel):
                 hidden_states = self.ln_f(residual.to(dtype=self.ln_f.weight.dtype))
             else:
                 # Set prenorm=False here since we don't need the residual
-                if not self.parallel_block:
-                    fused_add_norm_fn = (
-                        dropout_add_rms_norm
-                        if isinstance(self.ln_f, RMSNorm)
-                        else dropout_add_layer_norm
-                    )
-                    hidden_states = fused_add_norm_fn(
-                        hidden_states,
-                        residual,
-                        self.ln_f.weight,
-                        self.ln_f.bias,
-                        self.drop_f.p if self.training else 0.0,
-                        self.ln_f.eps,
-                        prenorm=False,
-                        residual_in_fp32=self.residual_in_fp32,
-                    )
-                else:
-                    fused_add_norm_fn = (
-                        dropout_add_rms_norm_parallel_residual
-                        if isinstance(self.ln_f, RMSNorm)
-                        else dropout_add_layer_norm_parallel_residual
-                    )
-                    hidden_states, _ = fused_add_norm_fn(
-                        hidden_states,
-                        hidden_states2,
-                        residual,
-                        self.ln_f.weight,
-                        self.ln_f.bias,
-                        None,
-                        None,
-                        self.drop_f.p if self.training else 0.0,
-                        self.ln_f.eps,
-                        prenorm=False,
-                        residual_in_fp32=self.residual_in_fp32,
-                    )
+                hidden_states = layer_norm_fn(
+                    hidden_states,
+                    self.ln_f.weight,
+                    self.ln_f.bias,
+                    residual=residual,
+                    x1=None if not self.parallel_block else hidden_states2,
+                    eps=self.ln_f.eps,
+                    dropout_p=self.drop_f.p if self.training else 0.0,
+                    prenorm=False,
+                    is_rms_norm=isinstance(self.ln_f, RMSNorm)
+                )
         return hidden_states
 
 
@@ -606,6 +591,9 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
             self.project_out = nn.Linear(config.n_embd, embed_dim, bias=False, **factory_kwargs)
         else:
             self.project_out = None
+        mup_width_scale = getattr(config, "mup_width_scale", 1.0)
+        mup_output_multiplier = getattr(config, "mup_output_multiplier", 1.0)
+        self.output_scale = mup_output_multiplier * mup_width_scale
         if process_group is None:
             self.lm_head = nn.Linear(embed_dim, vocab_size, bias=lm_head_bias, **factory_kwargs)
         else:
@@ -619,12 +607,14 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
                 sequence_parallel=getattr(config, "sequence_parallel", True),
                 **factory_kwargs,
             )
+        self.norm_head = getattr(config, "norm_head", False)
         # Initialize weights and apply final processing
         self.apply(
             partial(
                 _init_weights,
                 n_layer=config.num_hidden_layers,
                 initializer_range=config.initializer_range,
+                mup_width_scale=mup_width_scale,
             )
         )
         self.tie_weights()
@@ -660,7 +650,15 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
             hidden_states = hidden_states[:, -num_last_tokens:]
         if self.project_out is not None:
             hidden_states = self.project_out(hidden_states)
-        lm_logits = self.lm_head(hidden_states)
+        if self.output_scale != 1.0:
+            hidden_states = hidden_states * self.output_scale
+        if not self.norm_head:
+            lm_logits = self.lm_head(hidden_states)
+        else:
+            lm_head_weight = F.normalize(self.lm_head.weight)
+            if isinstance(self.lm_head, ColumnParallelLinear) and self.lm_head.sequence_parallel:
+                hidden_states = all_gather(hidden_states, self.lm_head.process_group)
+            lm_logits = F.linear(hidden_states, lm_head_weight, bias=self.lm_head.bias)
         # During inference, we want the full logit for sampling
         if isinstance(self.lm_head, ColumnParallelLinear) and inference_params is not None:
             lm_logits, _ = all_gather_raw(lm_logits, self.lm_head.process_group)

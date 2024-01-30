@@ -1,4 +1,4 @@
-# Copyright (c) 2023, GGGGGGXY.
+# Copyright (c) 2023, GGGGGGXY, Tri Dao.
 
 import math
 import json
@@ -14,7 +14,6 @@ from einops import rearrange
 from transformers import GPT2Config, AutoConfig, PretrainedConfig
 
 
-# only support Baichuan-7B now
 def remap_state_dict_hf_baichuan(state_dict, config):
     def key_mapping_layers(key):
         return re.sub(r"^model.", "transformer.", key)
@@ -109,29 +108,17 @@ def remap_state_dict_hf_baichuan(state_dict, config):
     state_dict = OrderedDict((key_mapping_attn(k), v) for k, v in state_dict.items())
     for l in range(config.n_layer):
         # pop rotary_emb.inv_freq from state dict
-        state_dict.pop(f"transformer.layers.{l}.self_attn.rotary_emb.inv_freq")
+        state_dict.pop(f"transformer.layers.{l}.self_attn.rotary_emb.inv_freq", None)
     return state_dict
 
 
-def config_from_checkpoint(checkpoint_path: str, model_name: str) -> PretrainedConfig:
-    """Load a BaiChuanConfig from a checkpoint path."""
-    config = AutoConfig.from_pretrained(
-        Path(checkpoint_path) / model_name, trust_remote_code=True
-    )
-    return config
-
-
-def state_dicts_from_checkpoint(checkpoint_path: str, model_name: str) -> dict:
-    # Need to sort, otherwise we mess up the ordering and the weights are wrong
-    return [
-        torch.load(path, map_location="cpu")
-        for path in sorted(
-            (Path(checkpoint_path) / model_name).glob("pytorch_model*.bin")
-        )
-    ]
-
-
 def baichuan_config_to_gpt2_config(baichuan_config: PretrainedConfig) -> GPT2Config:
+    # HACK: the config doesn't have say whether it's rotary or alibi.
+    # So we have to infer from the hidden size (7B -> rotary, 13B -> alibi).
+    # HACK: the config doesn't have say whether it uses norm head.
+    # So we have to infer from the vocab size
+    # (v1, vocab size 64k, no norm head; v2, vocab size 128k, norm head).
+    use_rotary = baichuan_config.hidden_size < 5000
     return GPT2Config(
         vocab_size=baichuan_config.vocab_size,
         n_positions=0,  # No absolute position embedding
@@ -151,9 +138,12 @@ def baichuan_config_to_gpt2_config(baichuan_config: PretrainedConfig) -> GPT2Con
         # These are new arguments not in the original GPT2Config
         pad_token_id=baichuan_config.pad_token_id,  # Idk if this does anything
         rms_norm=True,
-        rotary_emb_fraction=1.0,
+        rotary_emb_fraction=1.0 if use_rotary else 0.0,
         rotary_emb_interleaved=False,
+        use_alibi=not use_rotary,
+        use_flash_attn=not use_rotary,  # Alibi code path requires flash_attn
         tie_word_embeddings=False,
+        norm_head=baichuan_config.vocab_size > 70000,
         qkv_proj_bias=False,
         out_proj_bias=False,
         mlp_fc1_bias=False,

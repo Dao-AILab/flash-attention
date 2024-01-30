@@ -27,7 +27,7 @@ def remap_state_dict_hf_gpt_neox(state_dict, config):
     state_dict["transformer.embeddings.word_embeddings.weight"] = F.pad(
         word_embeddings, (0, 0, 0, vocab_size - word_embeddings.shape[0])
     )
-    if getattr(config, "tie_word_embeddings"):
+    if getattr(config, "tie_word_embeddings", False):
         state_dict["lm_head.weight"] = state_dict["transformer.embeddings.word_embeddings.weight"]
     else:
         output_embeddings = state_dict.pop("embed_out.weight")

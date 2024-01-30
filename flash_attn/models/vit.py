@@ -20,9 +20,9 @@ from flash_attn.modules.mha import MHA
 from flash_attn.modules.mlp import FusedMLP, Mlp
 
 try:
-    from flash_attn.ops.layer_norm import dropout_add_layer_norm
+    from flash_attn.ops.triton.layer_norm import layer_norm_fn
 except ImportError:
-    dropout_add_layer_norm = None
+    layer_norm_fn = None
 
 
 def create_mixer_cls(
@@ -229,8 +229,8 @@ class VisionTransformer(nn.Module):
         self.norm = norm_layer(embed_dim)
 
         self.fused_dropout_add_ln = fused_dropout_add_ln
-        if self.fused_dropout_add_ln and dropout_add_layer_norm is None:
-            raise ImportError("dropout_add_layer_norm is not installed")
+        if self.fused_dropout_add_ln and layer_norm_fn is None:
+            raise ImportError("Triton is not installed")
 
         # Classifier Head
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
@@ -302,16 +302,15 @@ class VisionTransformer(nn.Module):
                     )
                 )
             # Set prenorm=False here since we don't need to the residual
-            hidden_states = dropout_add_layer_norm(
+            hidden_states = layer_norm_fn(
                 hidden_states,
-                residual,
                 self.norm.weight,
                 self.norm.bias,
-                self.dropout.p if self.training else 0.0,
-                self.norm.eps,
+                residual=residual,
+                eps=self.norm.eps,
+                dropout_p=self.dropout.p if self.training else 0.0,
                 rowscale=rowscale,
                 prenorm=False,
-                residual_in_fp32=True,
             )
         return hidden_states
 
