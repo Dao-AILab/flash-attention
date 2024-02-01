@@ -14,7 +14,7 @@ if(NOT CUDA_VERSION VERSION_GREATER_EQUAL "11.6")
   message(FATAL_ERROR "CUDA version must be at least 11.6")
 endif()
 
-set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-std=c++17;-O3;-U__CUDA_NO_HALF_OPERATORS__;-U__CUDA_NO_HALF_CONVERSIONS__;-U__CUDA_NO_HALF2_OPERATORS__;-U__CUDA_NO_BFLOAT16_CONVERSIONS__;--expt-relaxed-constexpr;--expt-extended-lambda;--use_fast_math;--threads;24;-gencode;arch=compute_80,code=sm_80;-gencode;arch=compute_90,code=sm_90;)
+set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-std=c++17;-O3;-U__CUDA_NO_HALF_OPERATORS__;-U__CUDA_NO_HALF_CONVERSIONS__;-U__CUDA_NO_HALF2_OPERATORS__;-U__CUDA_NO_BFLOAT16_CONVERSIONS__;--expt-relaxed-constexpr;--expt-extended-lambda;--use_fast_math;--threads;24;-gencode;arch=compute_80,code=sm_80;)
 
 if(CUDA_VERSION VERSION_GREATER "11.8")
   set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-gencode;arch=compute_90,code=sm_90)
