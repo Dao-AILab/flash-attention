@@ -28,6 +28,8 @@ Please cite and credit FlashAttention if you use it.
 
 ## Installation and features
 
+For C++ compilation, see [here](#c-compilation)
+
 Requirements:
 - CUDA 11.6 and above.
 - PyTorch 1.12 and above.
@@ -72,6 +74,36 @@ FlashAttention-2 currently supports:
 2. Datatype fp16 and bf16 (bf16 requires Ampere, Ada, or Hopper GPUs).
 3. All head dimensions up to 256. Head dim > 192 backward requires A100/A800 or H100/H800.
 
+## C++ Compilation
+
+You can build the Flash Attention and the cuda binaries into a C++ library both on Windows and Linux.
+ 
+### Linux
+
+```bash
+cd flash-attention
+mkdir build
+cd build
+cmake ..
+make -j 1
+```
+
+### Windows
+
+```
+cd flash-attention
+mkdir build
+cd build
+cmake .. -DLIBTORCH_PATH=/path/to/libtorch
+```
+
+The path to libtorch should be to an unzipped directory containing the C++ LibTorch package, downloadable from pytorch.org. 
+
+This will create a visual studio solution file called "FlashAttention.sln". Open the project, and compile in Release mode. The 5 core Flash Attention functions (`mha_fwd`, `mha_varlen_fwd`, `mha_bwd`, `mha_varlen_bwd`, `mha_fwd_kvcache`) are all available in the exported library, and you can just need to include the api header at the top of the file:
+
+```cpp
+#include <flash_api.h>
+```
 
 ## How to use FlashAttention
 

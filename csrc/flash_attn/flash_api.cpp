@@ -3,20 +3,11 @@
  ******************************************************************************/
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
-#include <torch/python.h>
-#include <torch/nn/functional.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-
-#include <cutlass/numeric_types.h>
-
-#include "flash.h"
-#include "static_switch.h"
+#include <flash_api.h>
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
-
 
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
@@ -696,8 +687,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
 
     if (seqlenq_ngroups_swapped) {
-        long size_before[] = {batch_size, max_seqlen_q, num_heads_k, head_size_og};
-        long size_after[] = {batch_size, num_heads_k * max_seqlen_q, head_size_og};
+        at::IntArrayRef size_before({ batch_size, max_seqlen_q, num_heads_k, head_size_og });
+        at::IntArrayRef size_after({ batch_size, num_heads_k * max_seqlen_q, head_size_og });
         out = out.reshape(size_before).transpose(1, 2).reshape(size_after);
         out_padded = out_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
         q_padded = q_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
@@ -1459,6 +1450,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     return {out, softmax_lse};
 }
 
+#ifndef NOT_PY_BUILD
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");
@@ -1467,3 +1459,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
     m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
 }
+#endif
