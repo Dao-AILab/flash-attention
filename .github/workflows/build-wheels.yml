@@ -21,12 +21,13 @@ permissions:
 
 jobs:
   build_wheels:
-    name: Build wheels for Python ${{ matrix.pyver }} and CUDA ${{ matrix.cuda }}
+    name: Build wheels for Python ${{ matrix.pyver }}, CUDA ${{ matrix.cuda }}, and Torch ${{ matrix.torchver }}
     runs-on: windows-latest
     strategy:
       matrix:
         pyver: ["3.8", "3.9", "3.10", "3.11"]
         cuda: ["12.2.2"]
+        torchver: ["2.1.2", "2.2.0"]
     defaults:
       run:
         shell: pwsh
@@ -67,7 +68,7 @@ jobs:
           if (!(mamba list cuda)[-1].contains('cuda')) {sleep -s 10; mamba install -y 'cuda' $cudaChannels.TrimEnd().Split()}
           if (!(mamba list cuda)[-1].contains('cuda')) {throw 'CUDA Toolkit failed to install!'}
           
-          python -m pip install --upgrade build setuptools wheel packaging ninja torch==2.1.0 --extra-index-url "https://download.pytorch.org/whl/cu$cudaVersionPytorch"
+          python -m pip install --upgrade build setuptools wheel packaging ninja torch==${{ matrix.torchver }} --extra-index-url "https://download.pytorch.org/whl/cu$cudaVersionPytorch"
 
       - name: Build Wheel
         id: build-wheel
@@ -85,7 +86,7 @@ jobs:
           python -m build -n --wheel
           
           $wheel = (gi '.\dist\*.whl')[0]
-          $wheelname = $wheel.name.replace("flash_attn-$packageVersion-","flash_attn-$packageVersion+cu$cudaVersion"+"torch2.1cxx11abiFALSE-")
+          $wheelname = $wheel.name.replace("flash_attn-$packageVersion-","flash_attn-$packageVersion+cu$cudaVersion"+"torch${{ matrix.torchver }}cxx11abiFALSE-")
           Move-Item $wheel.fullname ".\dist\$wheelname"
 
       - uses: actions/upload-artifact@v3
