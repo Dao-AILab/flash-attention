@@ -78,6 +78,7 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
     rotary_emb_scale_base = getattr(config, "rotary_emb_scale_base", None)
     rotary_emb_interleaved = getattr(config, "rotary_emb_interleaved", False)
     use_alibi = getattr(config, "use_alibi", False)
+    window_size = getattr(config, "window_size", (-1, -1))
     use_flash_attn = getattr(config, "use_flash_attn", False)
     fused_bias_fc = getattr(config, "fused_bias_fc", False)
     if not fused_bias_fc:
@@ -110,6 +111,7 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
         rotary_emb_scale_base=rotary_emb_scale_base,
         rotary_emb_interleaved=rotary_emb_interleaved,
         use_alibi=use_alibi,
+        window_size=window_size,
         use_flash_attn=use_flash_attn,
         **serial_kwargs,
         **parallel_kwargs,
