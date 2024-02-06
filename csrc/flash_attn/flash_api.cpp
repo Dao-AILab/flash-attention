@@ -696,8 +696,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
 
     if (seqlenq_ngroups_swapped) {
-        long size_before[] = {batch_size, max_seqlen_q, num_heads_k, head_size_og};
-        long size_after[] = {batch_size, num_heads_k * max_seqlen_q, head_size_og};
+        int64_t size_before[] = {batch_size, max_seqlen_q, num_heads_k, head_size_og};
+        int64_t size_after[] = {batch_size, num_heads_k * max_seqlen_q, head_size_og};
         out = out.reshape(size_before).transpose(1, 2).reshape(size_after);
         out_padded = out_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
         q_padded = q_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
