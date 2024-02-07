@@ -38,8 +38,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: 'Dao-AILab/flash-attention'
-          ref: ${{ inputs.version }}
           submodules: 'recursive'
 
       - uses: actions/setup-python@v4
