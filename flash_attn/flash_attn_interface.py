@@ -228,8 +228,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         causal,
         window_size,
         alibi_slopes,
-        attn_bias,
         deterministic,
+        attn_bias,
         return_softmax,
     ):
         if softmax_scale is None:
@@ -290,7 +290,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
         if ds is not None:
             ds = ds[...,: q.shape[1], : k.shape[1]]
-        return dqkv, None, None, None, None, None, ds, None
+        return dqkv, None, None, None, None, None, None, ds, None
 
 
 class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
@@ -442,7 +442,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         if ds is not None:
             ds = ds[...,: q.shape[1], : k.shape[1]]
 
-        return dq, dkv, None, None, None, None, None, ds, None
+        return dq, dkv, None, None, None, None, None, None, ds, None
 
 
 class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
@@ -602,7 +602,7 @@ class FlashAttnFunc(torch.autograd.Function):
         if ds is not None:
             ds = ds[..., : q.shape[1], : k.shape[1]]
 
-        return dq, dk, dv, None, None, None, None, None, ds, None
+        return dq, dk, dv, None, None, None, None, None, None, ds, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):

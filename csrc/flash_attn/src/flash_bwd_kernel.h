@@ -528,12 +528,14 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         }
 
         if (Has_attn_bias) {
-            flash::apply_attn_bias(
+            flash::apply_attn_bias<Is_even_MN>(
                 scores, bias_fragment,
                 n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                 m_block * kBlockM + get<0>(taccScS_row(0)),
                 AtomLayoutMS * 16,
-                params.scale_softmax
+                params.scale_softmax,
+                binfo.actual_seqlen_q,
+                binfo.actual_seqlen_k
             );
         }
 
