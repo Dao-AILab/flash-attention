@@ -18,6 +18,7 @@
 #include "dropout.h"
 
 #include "alibi.h"
+#include "attn_bias.h"
 
 namespace flash {
 
@@ -246,7 +247,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                             Shape<Int<kBlockM>, Int<kBlockN>>{},
                             make_stride(params.attn_bias_q_stride, _1{}));
 
-    bool copy_dS = (Has_attn_bias && (params.attn_ds_ptr != nullptr));
+    const bool copy_dS = (Has_attn_bias && (params.attn_ds_ptr != nullptr));
 
     typename Kernel_traits::GmemTiledCopyB gmem_tiled_copy_B;
     auto gmem_thr_copy_B = gmem_tiled_copy_B.get_thread_slice(tidx);
@@ -490,6 +491,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     flash::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
+    flash::AttnBias<Is_even_MN, kBlockM, kBlockN> attn_bias(binfo.actual_seqlen_k, binfo.actual_seqlen_q);
 
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
@@ -528,14 +530,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         }
 
         if (Has_attn_bias) {
-            flash::apply_attn_bias<Is_even_MN>(
+            attn_bias.apply_attn_bias(
                 scores, bias_fragment,
                 n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                 m_block * kBlockM + get<0>(taccScS_row(0)),
                 AtomLayoutMS * 16,
-                params.scale_softmax,
-                binfo.actual_seqlen_q,
-                binfo.actual_seqlen_k
+                params.scale_softmax
             );
         }
 
@@ -758,20 +758,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         }
 
         if (copy_dS) {
-            Tensor cdS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});    // (BLK_M,BLK_N) -> (blk_m,blk_n)
-            Tensor tdScdS = gmem_thr_copy_dS.partition_D(cdS);
-
-            #pragma unroll
-            for (int m = 0; m < size<1>(tdScdS); ++m) {
-                if (Is_even_MN || get<0>(tdScdS(0, m, 0)) < binfo.actual_seqlen_q - m_block * kBlockM) {
-                    #pragma unroll
-                    for (int n = 0; n < size<2>(tdScdS); ++n) {
-                        if (Is_even_MN || get<1>(tdScdS(0, 0, n)) < binfo.actual_seqlen_k - n_block * kBlockN) {
-                            cute::copy(gmem_tiled_copy_dS, tBsdS(_, m, n), tBgdS(_, m, n));
-                        }
-                    }
-                }
-            }
+            attn_bias.copy_ds(tBgdS, tBsdS,
+                                gmem_tiled_copy_dS,
+                                gmem_thr_copy_dS,
+                                m_block, n_block,
+                                use_atomic_add);
 
             if (m_block > m_block_min) {
                 tBgdS.data() = tBgdS.data() + (-int(kBlockM * params.attn_bias_q_stride));

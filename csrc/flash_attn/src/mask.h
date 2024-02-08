@@ -107,41 +107,6 @@ __forceinline__ __device__ void apply_mask_causal_w_idx(
     }
 }
 
-template <bool Is_even_MN, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
-inline __device__ void apply_attn_bias(Tensor<Engine0, Layout0> &tensor,
-                                   Tensor<Engine1, Layout1> &bias,
-                                   const int col_idx_offset_,
-                                   const int row_idx_offset,
-                                   const int warp_row_stride,
-                                   const float softmax_scale,
-                                   const int max_seqlen_q,
-                                   const int max_seqlen_k) {
-    // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
-    //static_assert(Layout::rank == 2, "Only support 2D Tensor");
-    const int lane_id = threadIdx.x % 32;
-    const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
-
-    #pragma unroll
-    for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
-        const int row_idx_base = row_idx_offset + mi * warp_row_stride;
-        #pragma unroll
-        for (int i = 0; i < size<0, 0>(tensor); ++i) {
-            const int row_idx = row_idx_base + i * 8;
-            #pragma unroll
-            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-                const int col_idx_base = col_idx_offset + nj * 8;
-                #pragma unroll
-                for (int j = 0; j < size<1, 0>(tensor); ++j) {
-                    const int col_idx = col_idx_base + j;
-                    if (Is_even_MN || (col_idx < max_seqlen_k && row_idx < max_seqlen_q)) {
-                        tensor(make_coord(i, mi), make_coord(j, nj)) += bias(make_coord(i, mi), make_coord(j, nj)) / softmax_scale;
-                     }
-                }
-            }
-        }
-    }
-}
-
 template <bool Is_causal, bool Is_local, bool Has_alibi, bool Has_attn_bias>
 struct Mask {
 
