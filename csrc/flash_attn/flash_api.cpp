@@ -2,20 +2,7 @@
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
-// Include (<torch/python.h> or <torch/all.h>) and <torch/nn/functional.h> headers instead of torch/extension.h since we don't need all of the torch headers.
-#ifndef PY_BUILD
-#include <torch/all.h>
-#else
-#include <torch/python.h>
-#endif
-#include <torch/nn/functional.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-
-#include <cutlass/numeric_types.h>
-
-#include "flash.h"
-#include "static_switch.h"
+#include "flash_api.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
@@ -1461,14 +1448,3 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
     return {out, softmax_lse};
 }
-
-#ifdef PY_BUILD
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FlashAttention";
-    m.def("fwd", &mha_fwd, "Forward pass");
-    m.def("varlen_fwd", &mha_varlen_fwd, "Forward pass (variable length)");
-    m.def("bwd", &mha_bwd, "Backward pass");
-    m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
-    m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
-}
-#endif
