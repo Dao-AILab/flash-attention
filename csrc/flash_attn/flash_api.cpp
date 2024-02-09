@@ -3,7 +3,11 @@
  ******************************************************************************/
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
+#ifdef CXX_BUILD
+#include <torch/all.h>
+#else
 #include <torch/python.h>
+#endif
 #include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -16,7 +20,6 @@
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
-
 
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
@@ -1459,6 +1462,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     return {out, softmax_lse};
 }
 
+#ifndef CXX_BUILD
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");
@@ -1467,3 +1471,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
     m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
 }
+#endif
