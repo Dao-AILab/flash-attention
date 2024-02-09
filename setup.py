@@ -184,7 +184,7 @@ if not SKIP_CUDA_BUILD:
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_sm80.cu",
             ],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"] + generator_flag,
+                "cxx": ["-O3", "-std=c++17", "-DPY_BUILD"] + generator_flag,
                 "nvcc": append_nvcc_threads(
                     [
                         "-O3",

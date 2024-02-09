@@ -87,6 +87,5 @@ cuda_add_library(flash_attn SHARED
     csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_sm80.cu
 )
 
-target_compile_definitions(flash_attn PRIVATE CXX_BUILD)
 target_link_libraries(flash_attn "${TORCH_LIBRARIES}")
 

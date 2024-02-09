@@ -2,8 +2,8 @@
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
-// Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
-#ifdef CXX_BUILD
+// Include (<torch/python.h> or <torch/all.h>) and <torch/nn/functional.h> headers instead of torch/extension.h since we don't need all of the torch headers.
+#ifndef PY_BUILD
 #include <torch/all.h>
 #else
 #include <torch/python.h>
@@ -1462,7 +1462,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     return {out, softmax_lse};
 }
 
-#ifndef CXX_BUILD
+#ifdef PY_BUILD
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");
