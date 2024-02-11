@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "debug.h"
+
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -298,16 +300,17 @@ template <typename Kernel_traits>
 __forceinline__ __device__
 int init_thread_kv_page_slice_offset(const int tidx, const int n_block_max, const int page_block_size, 
                             const int* block_table, const int page_stride, const int row_stride) {
-    // base col of thread's slice relative to the block
-    const int col_offset = tidx % Kernel_traits::kGmemThreadsPerRow * Kernel_traits::kGmemElemsPerLoad;
-    // base row of thread's slice relative to the block
-    const int block_row_offset = tidx / Kernel_traits::kGmemThreadsPerRow * Kernel_traits::kGmemRowsPerThread;
-    // base col of thread's slice relative to the entire tensor
-    const int global_row_offset = block_row_offset + (n_block_max - 1) * Kernel_traits::kBlockN;
-    // base row of thread's slice relative to the page
+    constexpr int kGmemThreadsPerRow = Kernel_traits::kGmemThreadsPerRow;
+    constexpr int kGmemRowsPerThread = Kernel_traits::kGmemRowsPerThread;
+    constexpr int kGmemElemsPerLoad = Kernel_traits::kGmemElemsPerLoad;
+    constexpr int kBlockN = Kernel_traits::kBlockN;
+    
+    const int col_offset = tidx % kGmemThreadsPerRow * kGmemElemsPerLoad;
+    const int block_row_offset = tidx / kGmemThreadsPerRow * kGmemRowsPerThread;
+    const int global_row_offset = block_row_offset + (n_block_max - 1) * kBlockN;
     const int page_offset = global_row_offset % page_block_size;
-
     const int virtual_page_idx = global_row_offset / page_block_size;
+    KIN_PRINT(printf("%d", virtual_page_idx))
 
     return block_table[virtual_page_idx] * page_stride 
         + page_offset * row_stride 
