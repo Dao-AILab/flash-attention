@@ -328,12 +328,11 @@ int advance_thread_kv_page_slice_offset(const int tidx, const int n_block, const
     constexpr int kGmemElemsPerLoad = Kernel_traits::kGmemElemsPerLoad;
     constexpr int kBlockN = Kernel_traits::kBlockN;
     
-    // base row of thread's slice relative to the block
     const int block_row_offset = tidx / kGmemThreadsPerRow * kGmemRowsPerThread;
-    // base col of thread's slice relative to the entire tensor
+
     const int global_row_offset_cur = block_row_offset + n_block * kBlockN;
     const int global_row_offset_next = block_row_offset + (n_block - 1) * kBlockN;
-    // base row of thread's slice relative to the page
+    
     const int page_offset_cur = global_row_offset_cur % page_block_size;
     const int page_offset_next = global_row_offset_next % page_block_size;
 
