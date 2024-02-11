@@ -18,8 +18,6 @@
 #include "dropout.h"
 #include "rotary.h"
 
-#include "debug.h"
-
 namespace flash {
 
 using namespace cute;
@@ -491,10 +489,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kNWarps = Kernel_traits::kNWarps;
-#if 1
-    KIN_PRINT(print_traits<Kernel_traits>())
-    KIN_PRINT(print_flash_fwd_params(params))
-#endif
 
     using GmemTiledCopyO = std::conditional_t<
         !Split,
@@ -619,21 +613,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         tVgV.data() = gV.data() + flash::init_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max, params.page_block_size,
             block_table, params.v_batch_stride, params.v_row_stride);
     }
-#if 1
-    // KIN_PRINT([&]() {
-    //     for (int i = 0; i < n_block_max; i++) {
-    //         printf("%d ", block_table[i]);
-    //     }
-    // }())
-    // if (tidx == 8) fill(tKgK, 1.f * tidx);
-    // if (thread0()) {
-    //     gK.data() = tKgK.data();
-    // }
-    // KIN_PRINT(print_tensor(tKgK))
-    // KIN_PRINT(print_tensor(gK))
-    // KIN_PRINT(print_tensor(tKgK__shadow))
-    // KIN_PRINT(print_tensor(gK__shadow))
-#endif
 
     typename Kernel_traits::TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tidx);

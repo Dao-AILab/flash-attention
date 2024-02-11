@@ -4,8 +4,6 @@
 
 #pragma once
 
-#include "debug.h"
-
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
