@@ -624,13 +624,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     const index_t row_offset_k = block_table == nullptr
         ? binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
           + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
-        : init_thread_kv_page_slice_offset<Kernel_traits>(tidx, bidh / params.h_h_k_ratio, n_block_max, params.page_block_size, block_table, 
-            params.k_batch_stride, params.k_row_stride, params.k_head_stride);
+        : (bidh / params.h_h_k_ratio) * params.k_head_stride; // block addresses are later resolved per-thread
     const index_t row_offset_v = block_table == nullptr
         ? binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache)
           + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride
-        : init_thread_kv_page_slice_offset<Kernel_traits>(tidx, bidh / params.h_h_k_ratio, n_block_max, params.page_block_size, block_table, 
-            params.v_batch_stride, params.v_row_stride, params.v_head_stride);
+        : (bidh / params.h_h_k_ratio) * params.v_head_stride;
 
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -667,6 +665,14 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor tKsK = gmem_thr_copy_KV.partition_D(sK);
     Tensor tVgV = gmem_thr_copy_KV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K)
     Tensor tVsV = gmem_thr_copy_KV.partition_D(sV);
+
+    if (block_table != nullptr) {
+        tKgK.data() = gV.data() + flash::init_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max, params.page_block_size,
+            block_table, params.k_batch_stride, params.k_row_stride);
+        tVgV.data() = gV.data() + flash::init_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max, params.page_block_size, 
+            block_table, params.v_batch_stride, params.v_row_stride);
+    }
+
 #if 1
     KIN_PRINT(print(tKgK.layout()))
     KIN_PRINT(print(tKsK.layout()))
@@ -850,9 +856,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                     // const int offset_diff = block_table_offset_next - block_table_offset_cur;
                     // tVgV.data() = tVgV.data() + table_diff * params.v_batch_stride + offset_diff * params.v_row_stride;
                     // tKgK.data() = tKgK.data() + table_diff * params.k_batch_stride + offset_diff * params.k_row_stride;
-                    tVgV.data() = tVgV.data() + advance_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, block_table,
+                    tVgV.data() = tVgV.data() + flash::advance_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, block_table,
                         params.v_batch_stride, params.v_row_stride);
-                    tKgK.data() = tKgK.data() + advance_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, block_table,
+                    tKgK.data() = tKgK.data() + flash::advance_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, block_table,
                         params.k_batch_stride, params.k_row_stride);
                 }
             }
@@ -977,7 +983,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             if (block_table == nullptr) {
                 tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             } else {
-                tKgK.data() = tKgK.data() + advance_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, block_table,
+                tKgK.data() = tKgK.data() + flash::advance_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, block_table,
                     params.k_batch_stride, params.k_row_stride);
             }
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
@@ -1017,7 +1023,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         if (block_table == nullptr) {
             tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
         } else {
-            tVgV.data() = tVgV.data() + advance_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, 
+            tVgV.data() = tVgV.data() + flash::advance_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, 
                 block_table, params.v_batch_stride, params.v_row_stride);
         }
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
@@ -1035,7 +1041,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             if (block_table == nullptr) {
                 tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             } else {
-                tKgK.data() = tKgK.data() + advance_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, 
+                tKgK.data() = tKgK.data() + flash::advance_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, 
                     block_table, params.k_batch_stride, params.k_row_stride);            
             }
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);

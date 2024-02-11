@@ -292,11 +292,12 @@ void cp_async_wait() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// resolves initial base address of a slice of a paged kv copy from gmem
+// resolves initial base offset of a slice of a paged kv copy from gmem.
+// assumes that the tensor has already been positioned at the correct head.
 template <typename Kernel_traits>
 __forceinline__ __device__
-int init_thread_kv_page_slice_offset(const int tidx, const int hidx, const int n_block_max, const int page_block_size, 
-                            const int* block_table, const int page_stride, const int row_stride, const int head_stride) {
+int init_thread_kv_page_slice_offset(const int tidx, const int n_block_max, const int page_block_size, 
+                            const int* block_table, const int page_stride, const int row_stride) {
     // base col of thread's slice relative to the block
     const int col_offset = tidx % Kernel_traits::kGmemThreadsPerRow * Kernel_traits::kGmemElemsPerLoad;
     // base row of thread's slice relative to the block
@@ -310,7 +311,6 @@ int init_thread_kv_page_slice_offset(const int tidx, const int hidx, const int n
 
     return block_table[virtual_page_idx] * page_stride 
         + page_offset * row_stride 
-        + hidx * head_stride
         + col_offset;
 }
  
@@ -321,6 +321,7 @@ template <typename Kernel_traits>
 __forceinline__ __device__
 int advance_thread_kv_page_slice_offset(const int tidx, const int n_block, const int page_block_size, 
                             const int* block_table, const int page_stride, const int row_stride) {
+    return 0;
     // base row of thread's slice relative to the block
     const int block_row_offset = tidx / Kernel_traits::kGmemThreadsPerRow * Kernel_traits::kGmemRowsPerThread;
     // base col of thread's slice relative to the entire tensor
