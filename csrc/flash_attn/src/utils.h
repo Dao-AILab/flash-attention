@@ -310,7 +310,6 @@ int init_thread_kv_page_slice_offset(const int tidx, const int n_block_max, cons
     const int global_row_offset = block_row_offset + (n_block_max - 1) * kBlockN;
     const int page_offset = global_row_offset % page_block_size;
     const int virtual_page_idx = global_row_offset / page_block_size;
-    KIN_PRINT(printf("%d", virtual_page_idx))
 
     return block_table[virtual_page_idx] * page_stride 
         + page_offset * row_stride 
@@ -324,12 +323,16 @@ template <typename Kernel_traits>
 __forceinline__ __device__
 int advance_thread_kv_page_slice_offset(const int tidx, const int n_block, const int page_block_size, 
                             const int* block_table, const int page_stride, const int row_stride) {
-    return 0;
+    constexpr int kGmemThreadsPerRow = Kernel_traits::kGmemThreadsPerRow;
+    constexpr int kGmemRowsPerThread = Kernel_traits::kGmemRowsPerThread;
+    constexpr int kGmemElemsPerLoad = Kernel_traits::kGmemElemsPerLoad;
+    constexpr int kBlockN = Kernel_traits::kBlockN;
+    
     // base row of thread's slice relative to the block
-    const int block_row_offset = tidx / Kernel_traits::kGmemThreadsPerRow * Kernel_traits::kGmemRowsPerThread;
+    const int block_row_offset = tidx / kGmemThreadsPerRow * kGmemRowsPerThread;
     // base col of thread's slice relative to the entire tensor
-    const int global_row_offset_cur = block_row_offset + n_block * Kernel_traits::kBlockN;
-    const int global_row_offset_next = block_row_offset + (n_block - 1) * Kernel_traits::kBlockN;
+    const int global_row_offset_cur = block_row_offset + n_block * kBlockN;
+    const int global_row_offset_next = block_row_offset + (n_block - 1) * kBlockN;
     // base row of thread's slice relative to the page
     const int page_offset_cur = global_row_offset_cur % page_block_size;
     const int page_offset_next = global_row_offset_next % page_block_size;
