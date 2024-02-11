@@ -292,6 +292,55 @@ void cp_async_wait() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// resolves initial base address of a slice of a paged kv copy from gmem
+template <typename Kernel_traits>
+__forceinline__ __device__
+int init_thread_kv_page_slice_offset(const int tidx, const int hidx, const int n_block_max, const int page_block_size, 
+                            const int* block_table, const int page_stride, const int row_stride, const int head_stride) {
+    // base col of thread's slice relative to the block
+    const int col_offset = tidx % Kernel_traits::kGmemThreadsPerRow * Kernel_traits::kGmemElemsPerLoad;
+    // base row of thread's slice relative to the block
+    const int block_row_offset = tidx / Kernel_traits::kGmemThreadsPerRow * Kernel_traits::kGmemRowsPerThread;
+    // base col of thread's slice relative to the entire tensor
+    const int global_row_offset = block_row_offset + (n_block_max - 1) * Kernel_traits::kBlockN;
+    // base row of thread's slice relative to the page
+    const int page_offset = global_row_offset % page_block_size;
+
+    const int virtual_page_idx = global_row_offset / page_block_size;
+
+    return block_table[virtual_page_idx] * page_stride 
+        + page_offset * row_stride 
+        + hidx * head_stride
+        + col_offset;
+}
+ 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// advances base address of a slice of a paged copy from gmem
+template <typename Kernel_traits>
+__forceinline__ __device__
+int advance_thread_kv_page_slice_offset(const int tidx, const int n_block, const int page_block_size, 
+                            const int* block_table, const int page_stride, const int row_stride) {
+    // base row of thread's slice relative to the block
+    const int block_row_offset = tidx / Kernel_traits::kGmemThreadsPerRow * Kernel_traits::kGmemRowsPerThread;
+    // base col of thread's slice relative to the entire tensor
+    const int global_row_offset_cur = block_row_offset + n_block * Kernel_traits::kBlockN;
+    const int global_row_offset_next = block_row_offset + (n_block - 1) * Kernel_traits::kBlockN;
+    // base row of thread's slice relative to the page
+    const int page_offset_cur = global_row_offset_cur % page_block_size;
+    const int page_offset_next = global_row_offset_next % page_block_size;
+
+    const int virtual_page_idx_cur = global_row_offset_cur / page_block_size;
+    const int virtual_page_idx_next = global_row_offset_next / page_block_size;
+
+    const int table_diff = block_table[virtual_page_idx_next] - block_table[virtual_page_idx_cur];
+    const int offset_diff = page_offset_next - page_offset_cur;
+
+    return table_diff * page_stride + offset_diff * row_stride;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
           typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
           typename Engine2, typename Layout2, typename Engine3, typename Layout3>
