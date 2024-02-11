@@ -3,18 +3,18 @@
 
 #pragma once
 
-#define KIN_PRINT(tag, statement) \
+#define KIN_PRINT(statement) \
     if (thread0()) { \
-        printf("\n[kin:start:%s]\n", tag); \
+        printf("\n[kin:start:%s]\n", #statement); \
         statement; \
-        printf("\n[kin:end:%s]\n", tag); \
+        printf("\n[kin:end:%s]\n", #statement); \
     }
 
-#define KIN_PRINT_BOOL(tag, BOOL) \
+#define KIN_PRINT_BOOL(BOOL) \
     if (thread0()) { \
-        printf("\n[kin:start:%s]\n", tag); \
+        printf("\n[kin:start:%s]\n", #BOOL); \
         printf("%s", BOOL ? "true" : "false"); \
-        printf("\n[kin:end:%s]\n", tag); \
+        printf("\n[kin:end:%s]\n", #BOOL); \
     }
 
 template<typename Kernel_traits>
@@ -36,7 +36,17 @@ print_traits() {
     printf("Kernel_traits::kSmemQSize        : %d\n", Kernel_traits::kSmemQSize );
     printf("Kernel_traits::kSmemKVSize       : %d\n", Kernel_traits::kSmemKVSize );
     printf("Kernel_traits::kSmemSize         : %d\n", Kernel_traits::kSmemSize );
+    printf("Kernel_traits::kGmemRowsPerThread: %d\n", Kernel_traits::kGmemRowsPerThread );
     printf("Kernel_traits::kGmemElemsPerLoad : %d\n", Kernel_traits::kGmemElemsPerLoad );
+
+    // cute object
+    printf("Kernel_traits::GmemLayoutAtom    : ");
+    cute::print(Kernel_traits::GmemLayoutAtom());
+    printf("\n");
+    printf("Kernel_traits::GmemTiledCopyQKV  :\n");
+    cute::print(Kernel_traits::GmemTiledCopyQKV());
+    printf("\n");
+    
 }
 
 template<typename BlockInfo>
