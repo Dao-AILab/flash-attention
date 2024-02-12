@@ -421,7 +421,12 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         TORCH_CHECK(attn_bias.value().is_cuda(), "Input tensor must be on CUDA device");
         TORCH_CHECK(attn_bias.value().stride(-1) == 1, "Input tensor must have contiguous last dimension");
         TORCH_CHECK(attn_bias.value().dtype() == q_dtype, "attention bias and query must have the same dtype");
-        CHECK_SHAPE(attn_bias.value(), batch_size, num_heads, seqlen_q, seqlen_k);
+
+        auto bias_sizes = attn_bias.value().sizes();
+        TORCH_CHECK((bias_sizes[0] == batch_size) || (bias_sizes[0] == 1), "First dimension of the bias should be 1 or batch size");
+        TORCH_CHECK((bias_sizes[1] == num_heads) || (bias_sizes[1] == 1), "First dimension of the bias should be 1 or num_heads");
+        TORCH_CHECK((bias_sizes[2] == seqlen_q) && (bias_sizes[3] == seqlen_k), "Last dimensions of bias should be seqlen_q and seqlen_k");
+        //CHECK_SHAPE(attn_bias.value(), batch_size, num_heads, seqlen_q, seqlen_k);
 
         if ((seqlen_q % 8 != 0) || (seqlen_k % 8 != 0)) {
             attn_bias_padded = torch::nn::functional::pad(attn_bias.value(), torch::nn::functional::PadFuncOptions({0, 8 - seqlen_k % 8, 0, 8 - seqlen_q % 8}));
@@ -432,6 +437,14 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         attn_bias_batch_stride = attn_bias_padded.stride(0);
         attn_bias_head_stride = attn_bias_padded.stride(1);
         attn_bias_q_stride = attn_bias_padded.stride(2);
+
+        // Trick to support bias shape like (1, 1, seqlen_q, seqlen_k)
+        if ((bias_sizes[0] == 1) && (batch_size != 1)) {
+            attn_bias_batch_stride = 0;
+        }
+        if ((bias_sizes[1] == 1) && (num_heads != 1)) {
+            attn_bias_head_stride = 0;
+        }
     }
 
     at::Tensor q_padded, k_padded, v_padded;
@@ -880,11 +893,24 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
 
         const int seqlen_q_round8 = round_multiple(seqlen_q, 8);
         const int seqlen_k_round8 = round_multiple(seqlen_k, 8);
-        CHECK_SHAPE(attn_bias.value(), batch_size, num_heads, seqlen_q_round8, seqlen_k_round8);
+
+        auto bias_sizes = attn_bias.value().sizes();
+        TORCH_CHECK((bias_sizes[0] == batch_size) || (bias_sizes[0] == 1), "First dimension of the bias should be 1 or batch size");
+        TORCH_CHECK((bias_sizes[1] == num_heads) || (bias_sizes[1] == 1), "First dimension of the bias should be 1 or num_heads");
+        TORCH_CHECK((bias_sizes[2] == seqlen_q_round8) && (bias_sizes[3] == seqlen_k_round8), "Last dimensions of bias should be seqlen_q and seqlen_k");
+        //CHECK_SHAPE(attn_bias.value(), batch_size, num_heads, seqlen_q_round8, seqlen_k_round8);
 
         attn_bias_batch_stride = attn_bias.value().stride(0);
         attn_bias_head_stride = attn_bias.value().stride(1);
         attn_bias_q_stride = attn_bias.value().stride(2);
+
+        // Trick to support bias shape like (1, 1, seqlen_q, seqlen_k)
+        if ((bias_sizes[0] == 1) && (batch_size != 1)) {
+            attn_bias_batch_stride = 0;
+        }
+        if ((bias_sizes[1] == 1) && (num_heads != 1)) {
+            attn_bias_head_stride = 0;
+        }
 
         if (attn_bias_require_grad) {
             if (ds_.has_value()) {
@@ -892,12 +918,15 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                 TORCH_CHECK(ds.dtype() == q_dtype, "ds must have the same dtype as q");
                 CHECK_DEVICE(ds);
                 TORCH_CHECK(ds.stride(-1) == 1, "ds must have contiguous last dimension");
-                CHECK_SHAPE(ds, batch_size, num_heads, seqlen_q_round8, seqlen_k_round8);
+                CHECK_SHAPE(ds, bias_sizes[0], bias_sizes[1], seqlen_q_round8, seqlen_k_round8);
 
-                ds.zero_();
                 TORCH_CHECK(ds.is_contiguous());
             } else {
                 ds = torch::empty_like(attn_bias.value());
+            }
+
+            if (is_causal || ((attn_bias_batch_stride == 0) || (attn_bias_head_stride == 0))) {
+                    ds.zero_();
             }
         }
     }

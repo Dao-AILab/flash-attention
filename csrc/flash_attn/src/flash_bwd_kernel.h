@@ -241,13 +241,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor gB = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.attn_bias_ptr) + row_offset_attn_bias),
                     Shape<Int<kBlockM>, Int<kBlockN>>{},
                     make_stride(params.attn_bias_q_stride, _1{})); // (BLK_M,BLK_N)
-    Tensor sB = make_tensor(sP.data() + size(sP), typename Kernel_traits::SmemLayoutB{});
+    Tensor sB = make_tensor(sdS.data(), typename Kernel_traits::SmemLayoutB{});
 
     Tensor gdS = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.attn_ds_ptr) + row_offset_attn_bias),
                             Shape<Int<kBlockM>, Int<kBlockN>>{},
                             make_stride(params.attn_bias_q_stride, _1{}));
-
-    const bool copy_dS = (Has_attn_bias && (params.attn_ds_ptr != nullptr));
 
     typename Kernel_traits::GmemTiledCopyB gmem_tiled_copy_B;
     auto gmem_thr_copy_B = gmem_tiled_copy_B.get_thread_slice(tidx);
@@ -463,11 +461,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     }
     flash::cp_async_fence();
 
-    if (Has_attn_bias) {
-        cute::copy(gmem_tiled_copy_B, tBgB, tBsB);
-        cute::cp_async_fence();
-    }
-
     // if (cute::thread0()) { print(tdOgdO.layout()); printf("\n"); print(tdOrdO); print(tdOrO); }
     if (Is_first) {
         cute::copy(tdOrdO, tdOsdO);
@@ -488,6 +481,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     clear(acc_dv);
     clear(acc_dk);
+
+    if (Has_attn_bias) {
+        cute::copy(gmem_tiled_copy_B, tBgB, tBsB);
+        cute::cp_async_fence();
+    }
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     flash::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
@@ -694,13 +692,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_dO, tdOgdO, tdOsdO, tQcQ, tQpQ);
                 flash::cp_async_fence();
             }
-
-            if (Has_attn_bias) {
-                // Advance gB
-                tBgB.data() = tBgB.data() + (-int(kBlockM * params.attn_bias_q_stride));
-                cute::copy(gmem_tiled_copy_B, tBgB, tBsB);
-                cute::cp_async_fence();
-            }
         }
 
         flash::gemm(acc_dq, tdQrdS, tdQrKt, tdQsdS, tdQsKt, tiled_mma_dq,
@@ -757,15 +748,26 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                                                         Kernel_traits::kNThreads / (Kernel_traits::kGmemThreadsPerRow), params.p_dropout);
         }
 
-        if (copy_dS) {
-            attn_bias.copy_ds(tBgdS, tBsdS,
-                                gmem_tiled_copy_dS,
-                                gmem_thr_copy_dS,
-                                m_block, n_block,
-                                use_atomic_add);
+        if (Has_attn_bias) {
+            if (params.attn_ds_ptr != nullptr) {
+                attn_bias.copy_ds(tBgdS, tBsdS, caccS,
+                                    gmem_tiled_copy_dS,
+                                    gmem_thr_copy_dS,
+                                    m_block, n_block,
+                                    (params.attn_bias_batch_stride == 0) || (params.attn_bias_head_stride == 0));
 
+                if (m_block > m_block_min) {
+                    tBgdS.data() = tBgdS.data() + (-int(kBlockM * params.attn_bias_q_stride));
+                }
+            }
+
+            // syncthreads as we copy B on the same memory as dS
+            __syncthreads();
             if (m_block > m_block_min) {
-                tBgdS.data() = tBgdS.data() + (-int(kBlockM * params.attn_bias_q_stride));
+                // Advance gB
+                tBgB.data() = tBgB.data() + (-int(kBlockM * params.attn_bias_q_stride));
+                cute::copy(gmem_tiled_copy_B, tBgB, tBsB);
+                cute::cp_async_fence();
             }
         }
 
