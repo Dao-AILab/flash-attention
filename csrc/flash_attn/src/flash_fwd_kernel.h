@@ -597,10 +597,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     Tensor tQgQ = gmem_thr_copy_Q.partition_S(gQ);
     Tensor tQsQ = gmem_thr_copy_Q.partition_D(sQ);
-    Tensor tKgK = gmem_thr_copy_KV.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K)
-    Tensor tKsK = gmem_thr_copy_KV.partition_D(sK);
-    Tensor tVgV = gmem_thr_copy_KV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K)
-    Tensor tVsV = gmem_thr_copy_KV.partition_D(sV);
+    Tensor tKgK_ = gmem_thr_copy_KV.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K)
+    Tensor tKsK_ = gmem_thr_copy_KV.partition_D(sK);
+    Tensor tVgV_ = gmem_thr_copy_KV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K)
+    Tensor tVsV_ = gmem_thr_copy_KV.partition_D(sV);
+
+    Tensor tKgK = make_tensor(tKgK_.data(), unsqueeze<2>(layout<0>(tKgK_.layout())));
+    Tensor tKsK = make_tensor(tKsK_.data(), unsqueeze<2>(layout<0>(tKsK_.layout())));
+    Tensor tVgV = make_tensor(tVgV_.data(), unsqueeze<2>(layout<0>(tVgV_.layout())));
+    Tensor tVsV = make_tensor(tVsV_.data(), unsqueeze<2>(layout<0>(tVsV_.layout())));
 
     if (block_table != nullptr) {
         tKgK.data() = gK.data() + flash::init_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max, params.page_block_size,
@@ -708,8 +713,13 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                                                 + row_offset_vnew - binfo.seqlen_k_cache * params.vnew_row_stride),
                                   Shape<Int<kBlockN>, Int<kHeadDim>>{},
                                   make_stride(params.vnew_row_stride, _1{}));
-        Tensor tKgKnew = gmem_thr_copy_KV.partition_S(gKnew);  // (KCPY, KCPY_N, KCPY_K)
-        Tensor tVgVnew = gmem_thr_copy_KV.partition_S(gVnew);  // (VCPY, VCPY_N, VCPY_K)
+        typename Kernel_traits::GmemTiledCopyQKVPaged gmem_tiled_copy_KV_new;
+        auto gmem_thr_copy_KV_new = gmem_tiled_copy_KV_new.get_thread_slice(tidx);
+        Tensor tKgKnew_ = gmem_thr_copy_KV_new.partition_S(gKnew);  // (KCPY, KCPY_N, KCPY_K)
+        Tensor tVgVnew_ = gmem_thr_copy_KV_new.partition_S(gVnew);  // (VCPY, VCPY_N, VCPY_K)
+
+        auto tKgKnew = make_tensor(tKgKnew_.data(), unsqueeze<2>(layout<0>(tKgKnew_.layout())));
+        auto tVgVnew = make_tensor(tVgVnew_.data(), unsqueeze<2>(layout<0>(tVgVnew_.layout())));
 
         const int n_block_copy_min = std::max(n_block_min, binfo.seqlen_k_cache / kBlockN);
         auto tKgK_data = tKgK.data();

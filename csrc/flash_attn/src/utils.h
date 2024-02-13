@@ -323,7 +323,6 @@ int advance_thread_kv_page_slice_offset(const int tidx, const int n_block, const
                             const int* block_table, const int page_stride, const int row_stride) {
     constexpr int kGmemThreadsPerRow = Kernel_traits::kGmemThreadsPerRow;
     constexpr int kGmemRowsPerThread = Kernel_traits::kGmemRowsPerThread;
-    constexpr int kGmemElemsPerLoad = Kernel_traits::kGmemElemsPerLoad;
     constexpr int kBlockN = Kernel_traits::kBlockN;
     
     const int block_row_offset = tidx / kGmemThreadsPerRow * kGmemRowsPerThread;
@@ -341,6 +340,14 @@ int advance_thread_kv_page_slice_offset(const int tidx, const int n_block, const
     const int offset_diff = page_offset_next - page_offset_cur;
 
     return table_diff * page_stride + offset_diff * row_stride;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <int N, class Shape, class Stride>
+__forceinline__ __device__ constexpr auto unsqueeze(Layout<Shape, Stride> l) {
+    return make_layout(insert<N>(l.shape(), Int<1>{}),
+                       insert<N>(l.stride(), Int<0>{}));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
