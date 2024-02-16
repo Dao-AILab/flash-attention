@@ -680,8 +680,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
         params.block_table_batch_stride = block_table.stride(0);
-        params.k_batch_stride = k.stride(0);
-        params.v_batch_stride = v.stride(0);
+        params.k_batch_stride = k_padded.stride(0);
+        params.v_batch_stride = v_padded.stride(0);
     }
     params.page_block_size = page_block_size;
     if (seqlenq_ngroups_swapped) {

@@ -1545,7 +1545,9 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
 # TODO: add smaller page sizes when https://github.com/Dao-AILab/flash-attention/pull/824 is merged
 @pytest.mark.parametrize("paged_kv_block_size", [None, 256, 512])
 # @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 128)])
-def test_flash_attn_varlen_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, dtype):
+def test_flash_attn_varlen_causal(
+    seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, dtype
+):
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
@@ -1563,11 +1565,17 @@ def test_flash_attn_varlen_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, page
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
 
     if paged_kv_block_size is None:
-        k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
-        v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+        k = torch.randn(
+            batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True
+        )
+        v = torch.randn(
+            batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True
+        )
         block_table = None
     else:
-        k, v, block_table, k_cache_paged, v_cache_paged, num_blocks = _generate_block_kvcache(seqlen_k, paged_kv_block_size, batch_size, nheads, d, device, dtype)
+        k, v, block_table, k_cache_paged, v_cache_paged, num_blocks = _generate_block_kvcache(
+            seqlen_k, paged_kv_block_size, batch_size, nheads, d, device, dtype
+        )
     query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random")
     key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode="random")
     (
@@ -1896,7 +1904,16 @@ def test_flash_attn_kvcache(
         v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
         block_table = None
     else:
-        k_cache, v_cache, block_table, k_cache_paged, v_cache_paged, num_blocks = _generate_block_kvcache(seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype)
+        (
+            k_cache,
+            v_cache,
+            block_table,
+            k_cache_paged,
+            v_cache_paged,
+            num_blocks,
+        ) = _generate_block_kvcache(
+            seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype
+        )
     cache_seqlens = torch.randint(
         0 if new_kv else 1,
         # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
