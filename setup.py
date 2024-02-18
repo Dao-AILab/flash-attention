@@ -282,6 +282,26 @@ class CachedWheelsCommand(_bdist_wheel):
             super().run()
 
 
+class NinjaBuildExtension(BuildExtension):
+    def __init__(self, *args, **kwargs) -> None:
+        # do not override env MAX_JOBS if already exists
+        if not os.environ.get("MAX_JOBS"):
+            import psutil
+
+            # calculate the maximum allowed NUM_JOBS based on cores
+            max_num_jobs_cores = max(1, os.cpu_count() // 2)
+
+            # calculate the maximum allowed NUM_JOBS based on free memory
+            free_memory_gb = psutil.virtual_memory().available / (1024 ** 3)  # free memory in GB
+            max_num_jobs_memory = int(free_memory_gb / 9)  # each JOB peak memory cost is ~8-9GB when threads = 4
+
+            # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
+            max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
+            os.environ["MAX_JOBS"] = str(max_jobs)
+
+        super().__init__(*args, **kwargs)
+
+
 setup(
     name=PACKAGE_NAME,
     version=get_package_version(),
@@ -309,7 +329,7 @@ setup(
         "Operating System :: Unix",
     ],
     ext_modules=ext_modules,
-    cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": BuildExtension}
+    cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": NinjaBuildExtension}
     if ext_modules
     else {
         "bdist_wheel": CachedWheelsCommand,
@@ -320,5 +340,8 @@ setup(
         "einops",
         "packaging",
         "ninja",
+    ],
+    setup_requires=[
+        "psutil"
     ],
 )
