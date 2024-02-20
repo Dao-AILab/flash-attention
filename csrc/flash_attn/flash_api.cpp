@@ -424,7 +424,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
 
         auto bias_sizes = attn_bias.value().sizes();
         TORCH_CHECK((bias_sizes[0] == batch_size) || (bias_sizes[0] == 1), "First dimension of the bias should be 1 or batch size");
-        TORCH_CHECK((bias_sizes[1] == num_heads) || (bias_sizes[1] == 1), "First dimension of the bias should be 1 or num_heads");
+        TORCH_CHECK((bias_sizes[1] == num_heads) || (bias_sizes[1] == 1), "Second dimension of the bias should be 1 or num_heads");
         TORCH_CHECK((bias_sizes[2] == seqlen_q) && (bias_sizes[3] == seqlen_k), "Last dimensions of bias should be seqlen_q and seqlen_k");
         //CHECK_SHAPE(attn_bias.value(), batch_size, num_heads, seqlen_q, seqlen_k);
 
