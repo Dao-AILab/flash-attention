@@ -196,6 +196,7 @@ if not SKIP_CUDA_BUILD:
                         "--expt-relaxed-constexpr",
                         "--expt-extended-lambda",
                         "--use_fast_math",
+                        "-DFLASHATTENTION_DISABLE_ALIBI",
                         # "--ptxas-options=-v",
                         # "--ptxas-options=-O2",
                         # "-lineinfo",
