@@ -46,7 +46,7 @@ void set_params_fprop(Flash_fwd_params &params,
                       bool seqlenq_ngroups_swapped=false) {
 
     // Reset the parameters
-    memset(&params, 0, sizeof(params));
+    params = {};
 
     params.is_bf16 = q.dtype() == torch::kBFloat16;
 
