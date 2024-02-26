@@ -158,9 +158,7 @@ struct Flash_fwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<DefaultCopy, ElementAccum>{},
                         GmemLayoutAtomOaccum{},
                         Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
-    // using GmemLayoutAtomRotcossin = GmemLayoutAtom;
-    using GmemLayoutAtomRotcossin = Layout<Shape <Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
-                                  Stride<Int<kGmemThreadsPerRow>, _1>>;
+    using GmemLayoutAtomRotcossin = GmemLayoutAtom;
     using GmemTiledCopyRotcossin = decltype(
         make_tiled_copy(Copy_Atom<UniversalCopy<uint64_t>, Element>{},
                         GmemLayoutAtomRotcossin{},
