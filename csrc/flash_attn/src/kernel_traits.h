@@ -158,7 +158,9 @@ struct Flash_fwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<DefaultCopy, ElementAccum>{},
                         GmemLayoutAtomOaccum{},
                         Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
-    using GmemLayoutAtomRotcossin = GmemLayoutAtom;
+    // using GmemLayoutAtomRotcossin = GmemLayoutAtom;
+    using GmemLayoutAtomRotcossin = Layout<Shape <Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
+                                  Stride<Int<kGmemThreadsPerRow>, _1>>;
     using GmemTiledCopyRotcossin = decltype(
         make_tiled_copy(Copy_Atom<UniversalCopy<uint64_t>, Element>{},
                         GmemLayoutAtomRotcossin{},
@@ -167,6 +169,14 @@ struct Flash_fwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<DefaultCopy, Element>{},
                         GmemLayoutAtomRotcossin{},
                         Layout<Shape < _1, _8>>{}));  // Val layout, 8 vals per load
+    using GmemTiledCopyRotcossinPaged = decltype(
+        make_tiled_copy(Copy_Atom<UniversalCopy<uint64_t>, Element>{},
+                        GmemLayoutAtomRotcossin{},
+                        Layout<Shape<Int<kGmemRowsPerThread>, _4>, Stride<_4, _1>>{}));  // Val layout, 4 vals per load
+    using GmemTiledCopyRotcossinContPaged = decltype(
+        make_tiled_copy(Copy_Atom<DefaultCopy, Element>{},
+                        GmemLayoutAtomRotcossin{},
+                        Layout<Shape<Int<kGmemRowsPerThread>, _8>, Stride<_8, _1>>{}));  // Val layout, 8 vals per load
 };
 
 // Is_V_in_regs is an option to reduce smem usage, but will increase register pressue.

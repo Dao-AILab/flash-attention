@@ -652,7 +652,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // Repeat the partitioning with identity layouts
     Tensor tQcQ = gmem_thr_copy_Q.partition_S(cQ);       // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
-    Tensor tKVcKV = gmem_thr_copy_KV.partition_S(cKV);   // (BCPY,BCPY_N,BCPY_K) -> (blk_n,blk_k)
+    Tensor tKVcKV_ = gmem_thr_copy_KV.partition_S(cKV);   // (BCPY,BCPY_N,BCPY_K) -> (blk_n,blk_k)
+    Tensor tKVcKV = make_tensor(tKVcKV_.data(), reshape_thread_tile(tKVcKV_.layout()));
 
     // Allocate predicate tensors for k
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
@@ -669,11 +670,12 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // Prologue
 
     // Copy from Knew to K, optionally apply rotary embedding.
-    typename Kernel_traits::GmemTiledCopyRotcossin gmem_tiled_copy_rotary;
-    auto gmem_thr_copy_rotary = gmem_tiled_copy_rotary.get_thread_slice(tidx);
-    typename Kernel_traits::GmemTiledCopyRotcossinCont gmem_tiled_copy_rotary_cont;
-    auto gmem_thr_copy_rotary_cont = gmem_tiled_copy_rotary_cont.get_thread_slice(tidx);
     if constexpr (Append_KV) {
+        typename Kernel_traits::GmemTiledCopyRotcossinPaged gmem_tiled_copy_rotary;
+        auto gmem_thr_copy_rotary = gmem_tiled_copy_rotary.get_thread_slice(tidx);
+        typename Kernel_traits::GmemTiledCopyRotcossinContPaged gmem_tiled_copy_rotary_cont;
+        auto gmem_thr_copy_rotary_cont = gmem_tiled_copy_rotary_cont.get_thread_slice(tidx);
+        
         // Even if we have MQA / GQA, all threadblocks responsible for the same KV head are writing to
         // gmem. Technically it's a race condition, but they all write the same content anyway, and it's safe.
         // We want to do this so that all threadblocks can proceed right after they finish writing the KV cache.
@@ -690,10 +692,17 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
                                       Shape<Int<kBlockN>, Int<kHeadDim>>{},
                                       make_stride(params.rotary_dim / 2, _1{}));
-        Tensor tRgCos = gmem_thr_copy_rotary.partition_S(gCos);
-        Tensor tRgSin = gmem_thr_copy_rotary.partition_S(gSin);
-        Tensor tRgCosCont = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
-        Tensor tRgSinCont = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
+                                      
+        Tensor tRgCos_ = gmem_thr_copy_rotary.partition_S(gCos);
+        Tensor tRgSin_ = gmem_thr_copy_rotary.partition_S(gSin);
+        Tensor tRgCosCont_ = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
+        Tensor tRgSinCont_ = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
+
+        Tensor tRgCos = make_tensor(tRgCos_.data(), reshape_thread_tile(tRgCos_.layout()));
+        Tensor tRgSin = make_tensor(tRgSin_.data(), reshape_thread_tile(tRgSin_.layout()));
+        Tensor tRgCosCont = make_tensor(tRgCosCont_.data(), reshape_flatten_thread_tile(tRgCosCont_.layout()));
+        Tensor tRgSinCont = make_tensor(tRgSinCont_.data(), reshape_flatten_thread_tile(tRgSinCont_.layout()));
+
         // if (cute::thread(0, 0)) { printf("rotary_cos_ptr = %p, gCos.data() = %p, tRgCos.data() = %p, rotary_dim = %d\n", params.rotary_cos_ptr, gCos.data(), tRgCos.data(), params.rotary_dim); }
         // if (cute::thread(8, 0)) { print_tensor(gCos); }
         // if (cute::thread(0, 0)) { print_tensor(tRgCos); }
@@ -779,6 +788,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
                                            binfo.actual_seqlen_q - m_block * kBlockM);
     } else {
+        typename Kernel_traits::GmemTiledCopyRotcossin gmem_tiled_copy_rotary;
+        auto gmem_thr_copy_rotary = gmem_tiled_copy_rotary.get_thread_slice(tidx);
+        typename Kernel_traits::GmemTiledCopyRotcossinCont gmem_tiled_copy_rotary_cont;
+        auto gmem_thr_copy_rotary_cont = gmem_tiled_copy_rotary_cont.get_thread_slice(tidx);
         const index_t row_offset_cossin = (binfo.seqlen_k_cache + (Is_causal || Is_local ? m_block * kBlockM : 0)) * (params.rotary_dim / 2);
         // If not causal, all the queries get the same the cos/sin, taken at location seqlen_k_cache.
         // We do this by setting the row stride of gCos / gSin to 0.

@@ -344,7 +344,7 @@ int advance_thread_kv_page_slice_offset(const int tidx, const int n_block, const
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// somewhat unorthodox reshape function. Given a tuple ((v1, v2), m, k), returns (v1, v2, k),         
+// Layout reshape function. Given a layout with modes ((v1, v2), m, k), returns (v1, v2, k),         
 // where v2 may be a tuple itself, in the case of swizzled smem-backed thread tiles. This ensures
 // that paged and non-paged copies result in equivalently shaped, if not necessarily strided, tensors.
 template <class Shape, class Stride>
@@ -352,6 +352,17 @@ __forceinline__ __device__
 auto reshape_thread_tile(Layout<Shape, Stride> l) {
     return make_layout(append(get<0>(l.shape()), get<2>(l.shape())),
                         append(get<0>(l.stride()), get<2>(l.stride())));
+}
+
+// reshapes and flattens the thread tile layout. A separate function is needed for the case where
+// one of the modes of l is a layout itself and must be flattened, as opposed to keeping it intact
+// for the case of swizzled layouts
+template <class Shape, class Stride>
+__forceinline__ __device__
+auto reshape_flatten_thread_tile(Layout<Shape, Stride> l) {
+    auto mode_0 = filter(flatten(get<0>(l)));
+    return make_layout(append(mode_0.shape(), get<2>(l.shape())),
+                        append(mode_0.stride(), get<2>(l.stride())));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
