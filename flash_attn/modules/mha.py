@@ -234,11 +234,25 @@ class SelfAttention(nn.Module):
                            (default: 0.0)
     """
 
-    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0, alibi_slopes=None):
         super().__init__()
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.drop = nn.Dropout(attention_dropout)
+        self.alibi_slopes = self.register_buffer('alibi_slopes', alibi_slopes, persistent=False)
+        if alibi_slopes is not None:
+            self.alibi_tensor = self.register_buffer('alibi_tensor', self._build_alibi_tensor(16), persistent=False)
+        else:
+            self.alibi_tensor = None
+
+    def _build_alibi_tensor(self, seqlen):
+        context_position = torch.arange(seqlen, device=self.alibi_slopes.device)[:, None]
+        memory_position = torch.arange(seqlen, device=self.alibi_slopes.device)[None, :]
+        # distance tensor is of shape (seqlen, seqlen)
+        distance = torch.abs(memory_position - context_position)
+        # alibi tensor is of shape (1, H, seqlen, seqlen)
+        alibi_tensor = (distance[None, ...] * self.alibi_tensor[:, None, None])[None, ...]
+        return alibi_tensor
 
     def forward(self, qkv, causal=None, key_padding_mask=None):
         """Implements the multihead softmax attention.
@@ -261,6 +275,11 @@ class SelfAttention(nn.Module):
             padding_mask.masked_fill_(key_padding_mask, 0.0)
             # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
             scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
+        if self.alibi_slopes is not None:
+            if seqlen > self.alibi_tensor.shape[-1]:
+                self.alibi_tensor = self._build_alibi_tensor(seqlen).to(scores.device)
+            cropped_alibi = self.alibi_slopes[..., :seqlen, :seqlen].to(scores.device)
+            scores = scores - cropped_alibi
         if causal:
             # "triu_tril_cuda_template" not implemented for 'BFloat16'
             # So we have to construct the mask in float
@@ -420,7 +439,7 @@ class MHA(nn.Module):
         self.return_residual = return_residual
         self.checkpointing = checkpointing
         if use_alibi:
-            assert use_flash_attn, "ALiBi code path requires flash_attn"
+            assert not cross_attn or use_flash_attn, "ALiBi code path requires self-attention or cross-attention with flash_attn"
             alibi_slopes = torch.tensor(get_alibi_slopes(num_heads), device=device)
         else:
             alibi_slopes = None
@@ -458,7 +477,7 @@ class MHA(nn.Module):
         inner_attn_cls = (
             partial(FlashSelfAttention, alibi_slopes=alibi_slopes, window_size=window_size)
             if use_flash_attn
-            else SelfAttention
+            else partial(SelfAttention, alibi_slopes=alibi_slopes)
         )
         inner_cross_attn_cls = (
             partial(FlashCrossAttention, alibi_slopes=alibi_slopes, window_size=window_size)
