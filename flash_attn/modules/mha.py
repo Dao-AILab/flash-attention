@@ -239,19 +239,19 @@ class SelfAttention(nn.Module):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.drop = nn.Dropout(attention_dropout)
-        self.alibi_slopes = self.register_buffer('alibi_slopes', alibi_slopes, persistent=False)
+        self.register_buffer('alibi_slopes', alibi_slopes, persistent=False)
         if alibi_slopes is not None:
-            self.alibi_tensor = self.register_buffer('alibi_tensor', self._build_alibi_tensor(16), persistent=False)
+            self.register_buffer('linear_biases', self._build_linear_biases(16), persistent=False)
         else:
             self.alibi_tensor = None
 
-    def _build_alibi_tensor(self, seqlen):
+    def _build_linear_biases(self, seqlen):
         context_position = torch.arange(seqlen, device=self.alibi_slopes.device)[:, None]
         memory_position = torch.arange(seqlen, device=self.alibi_slopes.device)[None, :]
         # distance tensor is of shape (seqlen, seqlen)
         distance = torch.abs(memory_position - context_position)
         # alibi tensor is of shape (1, H, seqlen, seqlen)
-        alibi_tensor = (distance[None, ...] * self.alibi_tensor[:, None, None])[None, ...]
+        alibi_tensor = (distance[None, ...] * self.alibi_slopes[:, None, None])[None, ...]
         return alibi_tensor
 
     def forward(self, qkv, causal=None, key_padding_mask=None):
@@ -276,10 +276,10 @@ class SelfAttention(nn.Module):
             # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
             scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
         if self.alibi_slopes is not None:
-            if seqlen > self.alibi_tensor.shape[-1]:
-                self.alibi_tensor = self._build_alibi_tensor(seqlen).to(scores.device)
-            cropped_alibi = self.alibi_slopes[..., :seqlen, :seqlen].to(scores.device)
-            scores = scores - cropped_alibi
+            if seqlen > self.linear_biases.shape[-1]:
+                self.linear_biases = self._build_linear_biases(seqlen).to(scores.device)
+            cropped_biases = self.linear_biases[..., :seqlen, :seqlen].to(scores.device)
+            scores = scores - cropped_biases
         if causal:
             # "triu_tril_cuda_template" not implemented for 'BFloat16'
             # So we have to construct the mask in float
