@@ -277,8 +277,8 @@ class SelfAttention(nn.Module):
             scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
         if self.alibi_slopes is not None:
             if seqlen > self.linear_biases.shape[-1]:
-                self.linear_biases = self._build_linear_biases(seqlen).to(scores.device)
-            cropped_biases = self.linear_biases[..., :seqlen, :seqlen].to(scores.device)
+                self.linear_biases = self._build_linear_biases(seqlen)
+            cropped_biases = self.linear_biases[..., :seqlen, :seqlen]
             scores = scores - cropped_biases
         if causal:
             # "triu_tril_cuda_template" not implemented for 'BFloat16'
