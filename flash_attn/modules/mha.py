@@ -243,7 +243,7 @@ class SelfAttention(nn.Module):
         if alibi_slopes is not None:
             self.register_buffer('linear_biases', self._build_linear_biases(16), persistent=False)
         else:
-            self.alibi_tensor = None
+            self.linear_biases = None
 
     def _build_linear_biases(self, seqlen):
         context_position = torch.arange(seqlen, device=self.alibi_slopes.device)[:, None]
@@ -251,8 +251,8 @@ class SelfAttention(nn.Module):
         # distance tensor is of shape (seqlen, seqlen)
         distance = torch.abs(memory_position - context_position)
         # alibi tensor is of shape (1, H, seqlen, seqlen)
-        alibi_tensor = (distance[None, ...] * self.alibi_slopes[:, None, None])[None, ...]
-        return alibi_tensor
+        linear_biases = (distance[None, ...] * self.alibi_slopes[:, None, None])[None, ...]
+        return linear_biases
 
     def forward(self, qkv, causal=None, key_padding_mask=None):
         """Implements the multihead softmax attention.
