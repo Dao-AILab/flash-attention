@@ -4,7 +4,7 @@
 
 #include <torch/python.h>
 #include <ATen/native/TensorIterator.h>
-#include <ATen/native/cuda/Loops.cuh>
+#include <ATen/native/hip/Loops.cuh>
 
 void apply_rotary_cuda(const torch::Tensor x1, const torch::Tensor x2,
                        const torch::Tensor cos, const torch::Tensor sin,
