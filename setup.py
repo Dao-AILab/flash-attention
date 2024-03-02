@@ -45,20 +45,38 @@ SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 
+def get_system():
+    """
+    Returns the system name as used in wheel filenames.
+    """
+    if platform.system() == "Windows":
+        return "win"
+    elif platform.system() == "Darwin":
+        mac_version = ".".join(platform.mac_ver()[0].split(".")[:1])
+        return f"macos_{mac_version}"
+    elif platform.system() == "Linux":
+        return "linux"
+    else:
+        raise ValueError("Unsupported system: {}".format(platform.system()))
+
+
+def get_arch():
+    """
+    Returns the system name as used in wheel filenames.
+    """
+    if platform.machine() == "x86_64":
+        return "x86_64"
+    elif platform.machine() == "arm64" or platform.machine() == "aarch64":
+        return "aarch64"
+    else:
+        raise ValueError("Unsupported arch: {}".format(platform.machine()))
+
 
 def get_platform():
     """
     Returns the platform name as used in wheel filenames.
     """
-    if sys.platform.startswith("linux"):
-        return "linux_x86_64"
-    elif sys.platform == "darwin":
-        mac_version = ".".join(platform.mac_ver()[0].split(".")[:2])
-        return f"macosx_{mac_version}_x86_64"
-    elif sys.platform == "win32":
-        return "win_amd64"
-    else:
-        raise ValueError("Unsupported platform: {}".format(sys.platform))
+    return f"{get_system()}_{get_arch()}"
 
 
 def get_cuda_bare_metal_version(cuda_dir):
@@ -115,14 +133,17 @@ if not SKIP_CUDA_BUILD:
                 "FlashAttention is only supported on CUDA 11.6 and above.  "
                 "Note: make sure nvcc has a supported version by running nvcc -V."
             )
-    # cc_flag.append("-gencode")
-    # cc_flag.append("arch=compute_75,code=sm_75")
-    cc_flag.append("-gencode")
-    cc_flag.append("arch=compute_80,code=sm_80")
-    if CUDA_HOME is not None:
+
+    cuda_gencode = os.getenv("CUDA_GENCODE")
+    if not cuda_gencode:
         if bare_metal_version >= Version("11.8"):
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_90,code=sm_90")
+            cuda_gencode = "arch=compute_90,code=sm_90"
+        else:
+            cuda_gencode = "arch=compute_80,code=sm_80"
+
+    print(f"\n\nCUDA -gencode {cuda_gencode}\n\n")
+    cc_flag.append("-gencode")
+    cc_flag.append(cuda_gencode)
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
