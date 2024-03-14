@@ -55,6 +55,7 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr bool Has_cp_async = Base::Has_cp_async;
     using SmemCopyAtom = typename Base::SmemCopyAtom;
     using SmemCopyAtomTransposed = typename Base::SmemCopyAtomTransposed;
+    using SmemCopyAtomB = Copy_Atom<DefaultCopy, elem_type>;
 
     static constexpr bool Share_Q_K_smem = Share_Q_K_smem_;
     static constexpr bool Is_Q_in_regs = Is_Q_in_regs_ || Share_Q_K_smem;
@@ -89,6 +90,16 @@ struct Flash_fwd_kernel_traits : public Base {
         SmemLayoutAtomQ{},
         Shape<Int<kBlockN>, Int<kHeadDim>>{}));
 
+    static constexpr int kBBlockN = kBlockN % 64 == 0 ? 64 : 32;
+    static constexpr int kBSwizzle = kBBlockN == 32 ? 2 : 3;
+    using SmemLayoutAtomB = decltype(
+        composition(Swizzle<kBSwizzle, 3, 3>{},
+                    Layout<Shape<Int<8>, Int<kBBlockN>>,
+                           Stride<Int<kBBlockN>, _1>>{}));
+    using SmemLayoutB = decltype(tile_to_shape(
+        SmemLayoutAtomB{},
+        make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
+
     // https://github.com/ColfaxResearch/cutlass-kernels/blob/a222587e6d59b93ba704853d3946fb686d8b8892/src/fmha/fmha_forward.cu#L434
     using SmemLayoutVtransposed = decltype(
         composition(SmemLayoutKV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
@@ -106,7 +117,8 @@ struct Flash_fwd_kernel_traits : public Base {
 
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
     static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
-    static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
+    static constexpr int kSmemBSize = size(SmemLayoutB{}) * sizeof(Element);
+    static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize + kSmemBSize;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
@@ -134,6 +146,16 @@ struct Flash_fwd_kernel_traits : public Base {
     using GmemTiledCopyO = decltype(
         make_tiled_copy(Copy_Atom<DefaultCopy, Element>{},
                         GmemLayoutAtom{},
+                        Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
+
+    static constexpr int kGmemThreadsPerRowB = kBlockN / kGmemElemsPerLoad;
+    static_assert(kNThreads % kGmemThreadsPerRowB == 0, "kNThreads must be a multiple of kGmemThreadsPerRowP");
+    using GmemLayoutAtomB = Layout<Shape <Int<kNThreads / kGmemThreadsPerRowB>, Int<kGmemThreadsPerRowB>>,
+                                   Stride<Int<kGmemThreadsPerRowB>, _1>>;
+
+    using GmemTiledCopyB = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct, elem_type>{},
+                        GmemLayoutAtomB{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
 
     using GmemLayoutAtomOaccum = std::conditional_t<
@@ -224,6 +246,16 @@ struct Flash_bwd_kernel_traits : public Base {
         SmemLayoutAtomKV{},
         make_shape(Int<kBlockN>{}, Int<kHeadDim>{})));
 
+    static constexpr int kBBlockN = kBlockN % 64 == 0 ? 64 : 32;
+    static constexpr int kBSwizzle = kBBlockN == 32 ? 2 : 3;
+    using SmemLayoutAtomB = decltype(
+        composition(Swizzle<kBSwizzle, 3, 3>{},
+                    Layout<Shape<Int<8>, Int<kBBlockN>>,
+                           Stride<Int<kBBlockN>, _1>>{}));
+    using SmemLayoutB = decltype(tile_to_shape(
+        SmemLayoutAtomB{},
+        make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
+
     using SmemLayoutKtransposed = decltype(
         composition(SmemLayoutKV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
     using SmemLayoutKtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutKtransposed{}));
@@ -280,6 +312,7 @@ struct Flash_bwd_kernel_traits : public Base {
     static constexpr int kSmemdSSize = size(SmemLayoutPdS{}) * sizeof(Element);
     static constexpr int kSmemPSize = size(SmemLayoutPdS{}) * sizeof(Element);
     static constexpr int kSmemdQSize = size(SmemLayoutdQ{}) * sizeof(Element);
+    static constexpr int kSmemBSize = size(SmemLayoutB{}) * sizeof(Element);
     static constexpr int kSmemSize = kSmemQdOSize
         + (!Is_V_in_regs
            ? kSmemKVSize + kSmemdSSize + std::max(kSmemPSize, kSmemdQSize)
@@ -287,7 +320,7 @@ struct Flash_bwd_kernel_traits : public Base {
     static constexpr int kSmemSize1colblock = kSmemQdOSize
         + (!Is_V_in_regs
            ? kSmemKVSize + kSmemdSSize + kSmemPSize
-           : std::max(kSmemKVSize, kSmemKVSize / 2 + kSmemdSSize + kSmemPSize));
+           : std::max(kSmemKVSize, kSmemKVSize / 2 + kSmemdSSize + kSmemPSize)) ;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
@@ -321,6 +354,21 @@ struct Flash_bwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<DefaultCopy, elem_type>{},
                         GmemLayoutAtom{},
                         Layout<Shape < _1, _8>>{}));  // Val layout, 8 vals per store
+
+    static constexpr int kGmemThreadsPerRowB = kBlockN / kGmemElemsPerLoad;
+    static_assert(kNThreads % kGmemThreadsPerRowB == 0, "kNThreads must be a multiple of kGmemThreadsPerRowP");
+    using GmemLayoutAtomB = Layout<Shape <Int<kNThreads / kGmemThreadsPerRowB>, Int<kGmemThreadsPerRowB>>,
+                                   Stride<Int<kGmemThreadsPerRowB>, _1>>;
+
+    using GmemTiledCopyB = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct, elem_type>{},
+                        GmemLayoutAtomB{},
+                        Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
+    using GmemTiledCopydS = decltype(
+        make_tiled_copy(Copy_Atom<DefaultCopy, elem_type>{},
+                        GmemLayoutAtomB{},
+                        Layout<Shape < _1, _8>>{}));  // Val layout, 8 vals per store
+
     using GmemLayoutAtomdQaccum = std::conditional_t<
         kBlockKSmem == 32,
         Layout<Shape <_32, _8>,  // Thread layout, 8 threads per row

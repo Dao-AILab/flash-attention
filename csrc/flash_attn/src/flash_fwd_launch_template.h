@@ -10,15 +10,15 @@
 #include "flash.h"
 #include "flash_fwd_kernel.h"
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Return_softmax>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Has_attn_bias, bool Is_even_MN, bool Is_even_K, bool Return_softmax>
 __global__ void flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     static_assert(!(Is_causal && Is_local));  // If Is_local is true, Is_causal should be false
-    flash::compute_attn<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Return_softmax>(params);
+    flash::compute_attn<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Has_attn_bias, Is_even_MN, Is_even_K, Return_softmax>(params);
 }
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Has_attn_bias, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV>
 __global__ void flash_fwd_splitkv_kernel(__grid_constant__ const Flash_fwd_params params) {
-    flash::compute_attn_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Split, Append_KV>(params);
+    flash::compute_attn_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Has_attn_bias, Is_even_MN, Is_even_K, Split, Append_KV>(params);
 }
 
 template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K>
@@ -46,25 +46,27 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             LOCAL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !Is_causal, Is_local, [&] {
                 BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
                     ALIBI_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, [&] {
-                        // Will only return softmax if dropout, to reduce compilation time.
-                        // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
-                        // If return_softmax, set IsEvenMNConst to false to reduce number of templates
-                        // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
-                        // If Is_local, set Is_causal to false
-                        auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, ReturnSoftmaxConst && Is_dropout>;
-                        // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, false, true, true, false>;
-                        // printf("IsEvenMNConst = %d, IsEvenKConst = %d, Is_local = %d, Is_causal = %d, ReturnSoftmaxConst = %d, Is_dropout = %d\n", int(IsEvenMNConst), int(IsEvenKConst), int(Is_local), int(Is_causal), int(ReturnSoftmaxConst), int(Is_dropout));
-                        // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, true, true, false>;
-                        if (smem_size >= 48 * 1024) {
-                            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-                        }
-                        // int ctas_per_sm;
-                        // cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                        //     &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
-                        // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
-                        kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
-                        C10_CUDA_KERNEL_LAUNCH_CHECK();
+                        ATTN_BIAS_SWITCH(params.attn_bias_ptr != nullptr, Has_attn_bias, [&] {
+                            // Will only return softmax if dropout, to reduce compilation time.
+                            // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
+                            // If return_softmax, set IsEvenMNConst to false to reduce number of templates
+                            // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
+                            // If Is_local, set Is_causal to false
+                            auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local && !Is_causal, Has_alibi, Has_attn_bias, IsEvenMNConst && IsEvenKConst && !Is_local && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, ReturnSoftmaxConst && Is_dropout>;
+                            // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, false, true, true, false>;
+                            // printf("IsEvenMNConst = %d, IsEvenKConst = %d, Is_local = %d, Is_causal = %d, ReturnSoftmaxConst = %d, Is_dropout = %d\n", int(IsEvenMNConst), int(IsEvenKConst), int(Is_local), int(Is_causal), int(ReturnSoftmaxConst), int(Is_dropout));
+                            // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, true, true, false>;
+                            if (smem_size >= 48 * 1024) {
+                                C10_CUDA_CHECK(cudaFuncSetAttribute(
+                                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                            }
+                            // int ctas_per_sm;
+                            // cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                            //     &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
+                            // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
+                            kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+                            C10_CUDA_KERNEL_LAUNCH_CHECK();
+                        });
                     });
                 });
             });
@@ -91,7 +93,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 // If Append_KV, then we must have seqlen_offsets, which means cu_seqlens_k != nullptr.
                                 // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
                                 // If Is_local, set Is_causal to false
-                                auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && !Append_KV && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Split, Append_KV>;
+                                auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, Is_local && !Is_causal, Has_alibi, false, IsEvenMNConst && !Append_KV && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Split, Append_KV>;
                                 // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, true, Split, Append_KV>;
                                 // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, IsEvenKConst>;
                                 if (smem_size >= 48 * 1024) {
@@ -163,7 +165,11 @@ void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
                 // Using 8 warps is 18% slower for seqlen=2k, 2 warps is 5% slower
                 // Using block size (64 x 256) is 27% slower for seqlen=2k
                 // Using block size (256 x 64) is 85% slower for seqlen=2k, because of register spilling
-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                if (params.attn_bias_ptr != nullptr) {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                } else {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                }
                 // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
                 // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
             } else {

@@ -107,39 +107,43 @@ __forceinline__ __device__ void apply_mask_causal_w_idx(
     }
 }
 
-template <bool Is_causal, bool Is_local, bool Has_alibi>
+template <bool Is_causal, bool Is_local, bool Has_alibi, bool Has_attn_bias>
 struct Mask {
 
     const int max_seqlen_k, max_seqlen_q;
     const int window_size_left, window_size_right;
-    const float alibi_slope;
+    const float alibi_slope, softmax_scale;
 
     __forceinline__ __device__ Mask(const int max_seqlen_k, const int max_seqlen_q,
                                     const int window_size_left, const int window_size_right,
-                                    const float alibi_slope=0.f)
+                                    const float softmax_scale, const float alibi_slope=0.f)
         : max_seqlen_k(max_seqlen_k)
         , max_seqlen_q(max_seqlen_q)
         , window_size_left(window_size_left)
         , window_size_right(window_size_right)
-        , alibi_slope(!Has_alibi ? 0.0 : alibi_slope) {
+        , alibi_slope(!Has_alibi ? 0.0 : alibi_slope)
+        , softmax_scale(softmax_scale) {
     };
 
     // Causal_mask: whether this particular iteration needs causal masking
-    template <bool Causal_mask=false, bool Is_even_MN=true, typename Engine, typename Layout>
-    __forceinline__ __device__ void apply_mask(Tensor<Engine, Layout> &tensor_,
+    template <bool Causal_mask=false, bool Is_even_MN=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+    __forceinline__ __device__ void apply_mask(Tensor<Engine0, Layout0> &tensor_,
+                                               Tensor<Engine1, Layout1> &bias_,
                                                const int col_idx_offset_,
                                                const int row_idx_offset,
                                                const int warp_row_stride) {
         static_assert(!(Causal_mask && Is_local), "Cannot be both causal and local");
-        static_assert(Layout::rank == 3, "Only support 3D Tensor");
+        //static_assert(Layout::rank == 3, "Only support 3D Tensor");
         static_assert(decltype(size<0>(tensor_))::value == 4, "First dimension must be 4");
-        static constexpr bool Need_masking = Has_alibi || Causal_mask || Is_local || !Is_even_MN;
+        static constexpr bool Need_masking = Has_attn_bias || Has_alibi || Causal_mask || Is_local || !Is_even_MN;
         // if (cute::thread0()) { printf("Has_alibi = %d, Causal_mask=%d, Is_local=%d, Is_even_MN = %d, Need_masking = %d\n", Has_alibi, Causal_mask, Is_local, Is_even_MN, Need_masking); }
         if constexpr (Need_masking) {
             // Reshape tensor_ from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
             Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_rowcol(tensor_.layout()));
+            Tensor bias = make_tensor(bias_.data(), flash::convert_layout_acc_rowcol(bias_.layout()));
+
             // Do we need both row and column indices, or just column incides?
-            static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
+            static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask && !Has_attn_bias;
             const int lane_id = threadIdx.x % 32;
             const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
             if constexpr (Col_idx_only) {
@@ -182,6 +186,11 @@ struct Mask {
                                     } else {
                                         tensor(make_coord(i, mi), make_coord(j, nj)) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
 
+                                    }
+                                }
+                                if constexpr (Has_attn_bias) {
+                                    if (Is_even_MN || (col_idx < max_seqlen_k && row_idx < max_seqlen_q)) {
+                                        tensor(make_coord(i, mi), make_coord(j, nj)) += bias(make_coord(i, mi), make_coord(j, nj)) / softmax_scale;
                                     }
                                 }
                                 if constexpr (Causal_mask) {

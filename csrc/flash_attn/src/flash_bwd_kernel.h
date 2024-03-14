@@ -18,6 +18,7 @@
 #include "dropout.h"
 
 #include "alibi.h"
+#include "attn_bias.h"
 
 namespace flash {
 
@@ -76,7 +77,7 @@ make_tiled_copy_C_warpcontiguousN(Copy_Atom<Args...> const& copy_atom,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Has_attn_bias, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
 inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -233,6 +234,33 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor acc_dk = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
     Tensor acc_dv = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
 
+    // Attention biases
+    const index_t row_offset_attn_bias = bidb * params.attn_bias_batch_stride +
+        + bidh * params.attn_bias_head_stride + ((m_block_max - 1) * kBlockM) * params.attn_bias_q_stride
+        + n_block * kBlockN;
+    Tensor gB = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.attn_bias_ptr) + row_offset_attn_bias),
+                    Shape<Int<kBlockM>, Int<kBlockN>>{},
+                    make_stride(params.attn_bias_q_stride, _1{})); // (BLK_M,BLK_N)
+    Tensor sB = make_tensor(sdS.data(), typename Kernel_traits::SmemLayoutB{});
+
+    Tensor gdS = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.attn_ds_ptr) + row_offset_attn_bias),
+                            Shape<Int<kBlockM>, Int<kBlockN>>{},
+                            make_stride(params.attn_bias_q_stride, _1{}));
+
+    typename Kernel_traits::GmemTiledCopyB gmem_tiled_copy_B;
+    auto gmem_thr_copy_B = gmem_tiled_copy_B.get_thread_slice(tidx);
+
+    Tensor tBgB = gmem_thr_copy_B.partition_S(gB);
+    Tensor tBsB = gmem_thr_copy_B.partition_D(sB);
+
+    Tensor tBrB = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});
+
+    typename Kernel_traits::GmemTiledCopydS gmem_tiled_copy_dS;
+    auto gmem_thr_copy_dS = gmem_tiled_copy_dS.get_thread_slice(tidx);
+
+    Tensor tBsdS = gmem_thr_copy_dS.partition_S(sdS);
+    Tensor tBgdS = gmem_thr_copy_dS.partition_D(gdS);
+
     //
     // Copy Atom retiling
     //
@@ -284,6 +312,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     auto smem_tiled_copy_dQ = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomdQ{}, tiled_mma_dq);
     auto smem_thr_copy_dQ = smem_tiled_copy_dQ.get_thread_slice(tidx);
     Tensor taccdQsdQ = smem_thr_copy_dQ.partition_D(sdQ);  // ((Atom,AtomNum),PIPE_M,PIPE_N)
+
+    auto smem_tiled_copy_B = make_tiled_copy_C_warpcontiguousN<MMA_N_SdP>(typename Kernel_traits::SmemCopyAtomPdS{}, tiled_mma_sdp);
+    auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(tidx);
+    Tensor tSsB = smem_thr_copy_B.partition_S(sB);
+    Tensor tBrB_copy_view = smem_thr_copy_B.retile_D(tBrB);
 
     //
     // PREDICATES
@@ -449,8 +482,14 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     clear(acc_dv);
     clear(acc_dk);
 
+    if (Has_attn_bias) {
+        cute::copy(gmem_tiled_copy_B, tBgB, tBsB);
+        cute::cp_async_fence();
+    }
+
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     flash::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
+    flash::AttnBias<Is_even_MN, kBlockM, kBlockN> attn_bias(binfo.actual_seqlen_k, binfo.actual_seqlen_q);
 
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
@@ -469,16 +508,33 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         //     cute::copy(smem_tiled_copy_KV, tSsK(_, _, k), tSrK_copy_view(_, _, k));
         // }
         // if (cute::thread0()) { print(tSrK); }
+
+        if (Has_attn_bias) {
+            cute::copy(smem_tiled_copy_B, tSsB, tBrB_copy_view);
+        }
+
         flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
                     smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
 
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (col=(2, MMA_N), row=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        Tensor bias_fragment = make_tensor(tBrB.data(), flash::convert_layout_acc_rowcol(tBrB.layout()));
+
         // if (cute::thread(32, 0)) { print(scores); }
 
         if (Has_alibi) {
             alibi.apply_alibi(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                               m_block * kBlockM + get<0>(taccScS_row(0)), AtomLayoutMS * 16);
+        }
+
+        if (Has_attn_bias) {
+            attn_bias.apply_attn_bias(
+                scores, bias_fragment,
+                n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                m_block * kBlockM + get<0>(taccScS_row(0)),
+                AtomLayoutMS * 16,
+                params.scale_softmax
+            );
         }
 
         // TD [2023-07-29]: I was thinking that we don't need to mask out the elements beyond
@@ -531,6 +587,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 acc_s, block_row_idx, block_col_idx, AtomLayoutMS
             );
         }
+
         // Convert scores from fp32 to fp16/bf16
         Tensor rP = !Is_dropout
             ? flash::convert_type<Element>(acc_s)
@@ -691,6 +748,29 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                                                         Kernel_traits::kNThreads / (Kernel_traits::kGmemThreadsPerRow), params.p_dropout);
         }
 
+        if (Has_attn_bias) {
+            if (params.attn_ds_ptr != nullptr) {
+                attn_bias.copy_ds(tBgdS, tBsdS, caccS,
+                                    gmem_tiled_copy_dS,
+                                    gmem_thr_copy_dS,
+                                    m_block, n_block,
+                                    (params.attn_bias_batch_stride == 0) || (params.attn_bias_head_stride == 0));
+
+                if (m_block > m_block_min) {
+                    tBgdS.data() = tBgdS.data() + (-int(kBlockM * params.attn_bias_q_stride));
+                }
+            }
+
+            // syncthreads as we copy B on the same memory as dS
+            __syncthreads();
+            if (m_block > m_block_min) {
+                // Advance gB
+                tBgB.data() = tBgB.data() + (-int(kBlockM * params.attn_bias_q_stride));
+                cute::copy(gmem_tiled_copy_B, tBgB, tBsB);
+                cute::cp_async_fence();
+            }
+        }
+
         if (Is_last) {
             __syncthreads();
             Tensor tdQrdQ = make_tensor<Element>(shape(tdQgdQ));
@@ -781,7 +861,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Has_alibi, bool Is_even_M, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Has_alibi, bool Has_attn_bias, bool Is_even_M, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv(const Params &params) {
 
     // The block index for the batch.
@@ -795,20 +875,20 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 
     const int n_block_max = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
     if (n_block_max == 1) {
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, true, true>(params, bidb, bidh, 0);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Has_attn_bias, Is_even_M, Is_even_K, true, true>(params, bidb, bidh, 0);
     } else {
         // Iterating backward from n_block_max - 1 to 0 might save 1 register
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, true, false>(params, bidb, bidh, n_block_max - 1);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Has_attn_bias, Is_even_M, Is_even_K, true, false>(params, bidb, bidh, n_block_max - 1);
         for (int n_block = n_block_max - 2; n_block > 0; n_block--) {
-            compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, false, false>(params, bidb, bidh, n_block);
+            compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Has_attn_bias, Is_even_M, Is_even_K, false, false>(params, bidb, bidh, n_block);
         }
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, false, true>(params, bidb, bidh, 0);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Has_attn_bias, Is_even_M, Is_even_K, false, true>(params, bidb, bidh, 0);
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Has_attn_bias, bool Is_even_MN, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     // The block index for the batch.
@@ -818,7 +898,7 @@ inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
     for (int n_block = blockIdx.x; n_block < (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN; n_block += gridDim.x) {
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Has_attn_bias, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
     }
 }
 
