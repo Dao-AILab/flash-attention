@@ -483,8 +483,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     clear(acc_dk);
 
     if (Has_attn_bias) {
+        // syncing here due to race condition
+        __syncthreads();
         cute::copy(gmem_tiled_copy_B, tBgB, tBsB);
-        cute::cp_async_fence();
     }
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
