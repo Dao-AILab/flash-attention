@@ -966,7 +966,7 @@ def remap_state_dict_hf_gpt2(state_dict, config):
 
     # Attention
     for d in range(config.num_hidden_layers):
-        state_dict.pop(f"h.{d}.attn.bias")  # We don't store this bias
+        state_dict.pop(f"h.{d}.attn.bias", None)  # We don't store this bias
         Wqkv = state_dict.pop(f"h.{d}.attn.c_attn.weight")
         state_dict[f"transformer.layers.{d}.mixer.Wqkv.weight"] = Wqkv.t()
         Wout = state_dict.pop(f"h.{d}.attn.c_proj.weight")
