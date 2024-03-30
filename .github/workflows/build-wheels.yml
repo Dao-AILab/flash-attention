@@ -66,7 +66,7 @@ jobs:
           if (!(mamba list cuda)[-1].contains('cuda')) {sleep -s 10; mamba install -y 'cuda' $cudaChannels.TrimEnd().Split()}
           if (!(mamba list cuda)[-1].contains('cuda')) {throw 'CUDA Toolkit failed to install!'}
           
-          python -m pip install --upgrade build setuptools wheel packaging ninja torch==${{ matrix.torchver }} --extra-index-url "https://download.pytorch.org/whl/cu121"
+          python -m pip install --upgrade build setuptools wheel packaging ninja torch==${{ matrix.torchver }} psutil --extra-index-url "https://download.pytorch.org/whl/cu121"
 
       - name: Build Wheel
         id: build-wheel
