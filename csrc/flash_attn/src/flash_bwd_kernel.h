@@ -137,9 +137,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor gdO = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.do_ptr) + row_offset_do),
                              Shape<Int<kBlockM>, Int<kHeadDim>>{},
                              make_stride(params.do_row_stride, _1{}));
-    Tensor gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.o_ptr) + row_offset_o),
-                            Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                            make_stride(params.o_row_stride, _1{}));
+    // Tensor gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.o_ptr) + row_offset_o),
+    //                         Shape<Int<kBlockM>, Int<kHeadDim>>{},
+    //                         make_stride(params.o_row_stride, _1{}));
+
     Tensor gdQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.dq_ptr) + row_offset_dq),
                              Shape<Int<kBlockM>, Int<kHeadDim>>{},
                              make_stride(params.dq_row_stride, _1{}));
@@ -197,7 +198,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
     Tensor tdOgdO = gmem_thr_copy_dO.partition_S(gdO);
     Tensor tdOsdO = gmem_thr_copy_dO.partition_D(sdO);
-    Tensor tdOgO = gmem_thr_copy_dO.partition_S(gO);
+    // Tensor tdOgO = gmem_thr_copy_dO.partition_S(gO);
     Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K)
     Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
     Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K)
@@ -379,7 +380,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     }
 
     Tensor tdOrdO = make_fragment_like(tdOgdO);
-    Tensor tdOrO = make_fragment_like(tdOgO);
+    // Tensor tdOrO = make_fragment_like(tdOgO);
     if (!Is_first) {
         // Clear the smem tiles to account for predicated off loads
         flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
@@ -389,9 +390,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
             gmem_tiled_copy_dO, tdOgdO, tdOrdO, tQcQ, tQpQ, binfo.actual_seqlen_q - m_block * kBlockM
         );
-        flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
-            gmem_tiled_copy_dO, tdOgO, tdOrO, tQcQ, tQpQ, binfo.actual_seqlen_q - m_block * kBlockM
-        );
+        // flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+        //     gmem_tiled_copy_dO, tdOgO, tdOrO, tQcQ, tQpQ, binfo.actual_seqlen_q - m_block * kBlockM
+        // );
     }
     flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
         gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ, binfo.actual_seqlen_q - m_block * kBlockM
@@ -429,11 +430,13 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     flash::cp_async_fence();
 
     // if (cute::thread0()) { print(tdOgdO.layout()); printf("\n"); print(tdOrdO); print(tdOrO); }
-    if (Is_first) {
-        cute::copy(tdOrdO, tdOsdO);
-        dot_do_o<Kernel_traits::kGmemThreadsPerRow>(tdOrdO, tdOrO, gdPsum,
-                                                    Kernel_traits::kNThreads / (Kernel_traits::kGmemThreadsPerRow), params.p_dropout);
-    }
+
+    // if (Is_first) {
+        
+    //     cute::copy(tdOrdO, tdOsdO);
+    //     dot_do_o<Kernel_traits::kGmemThreadsPerRow>(tdOrdO, tdOrO, gdPsum,
+    //                                                 Kernel_traits::kNThreads / (Kernel_traits::kGmemThreadsPerRow), params.p_dropout);
+    // }
 
     if (Kernel_traits::Is_V_in_regs) {
         cute::cp_async_wait<1>();
@@ -628,9 +631,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             // Advance gdO
             tdOgdO.data() = tdOgdO.data() + (-int(kBlockM * params.do_row_stride));
             if (Is_first) {
-                tdOgO.data() = tdOgO.data() + (-int(kBlockM * params.o_row_stride));
+                // tdOgO.data() = tdOgO.data() + (-int(kBlockM * params.o_row_stride));
                 flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_dO, tdOgdO, tdOrdO, tQcQ, tQpQ);
-                flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_dO, tdOgO, tdOrO, tQcQ, tQpQ);
+                // flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_dO, tdOgO, tdOrO, tQcQ, tQpQ);
             } else {
                 flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_dO, tdOgdO, tdOsdO, tQcQ, tQpQ);
                 flash::cp_async_fence();
@@ -685,11 +688,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             flash::cp_async_fence();
         }
 
-        if (Is_first && m_block > m_block_min) {
-            cute::copy(tdOrdO, tdOsdO);
-            dot_do_o<Kernel_traits::kGmemThreadsPerRow>(tdOrdO, tdOrO, gdPsum,
-                                                        Kernel_traits::kNThreads / (Kernel_traits::kGmemThreadsPerRow), params.p_dropout);
-        }
+        // if (Is_first && m_block > m_block_min) {
+            // cute::copy(tdOrdO, tdOsdO);
+            // dot_do_o<Kernel_traits::kGmemThreadsPerRow>(tdOrdO, tdOrO, gdPsum,
+                                                        // Kernel_traits::kNThreads / (Kernel_traits::kGmemThreadsPerRow), params.p_dropout);
+        // }
 
         if (Is_last) {
             __syncthreads();

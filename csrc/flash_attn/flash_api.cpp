@@ -722,6 +722,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         const at::Tensor &v,   // batch_size x seqlen_k x num_heads_k x head_size
         const at::Tensor &out,   // batch_size x seqlen_q x num_heads x head_size
         const at::Tensor &softmax_lse,     // b x h x seqlen_q
+        c10::optional<at::Tensor> &softmax_d_,     // b x h x seqlen_q
         c10::optional<at::Tensor> &dq_,   // batch_size x seqlen_q x num_heads x head_size
         c10::optional<at::Tensor> &dk_,   // batch_size x seqlen_k x num_heads_k x head_size
         c10::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
@@ -849,7 +850,17 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
-    auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
+    bool has_softmax_d = softmax_d_.has_value();
+    at::Tensor softmax_d;
+    if (! has_softmax_d){
+        softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
+    } else{
+        softmax_d = softmax_d_.value();
+        TORCH_CHECK(softmax_d.dtype() == torch::kFloat32, "softmax_d must have dtype float32");
+        CHECK_DEVICE(softmax_d);
+        TORCH_CHECK(softmax_d.stride(-1) == 1, "softmax_d must have contiguous last dimension");
+        CHECK_SHAPE(softmax_d, batch_size, num_heads, seqlen_q_rounded);
+    }
     at::Tensor dq_accum;
     at::Tensor dk_accum, dv_accum;
     if (loop) {
@@ -896,6 +907,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      window_size_left,
                      window_size_right,
                      deterministic);
+    params.has_softmax_d = has_softmax_d;
     params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
 
     auto launch = &run_mha_bwd;

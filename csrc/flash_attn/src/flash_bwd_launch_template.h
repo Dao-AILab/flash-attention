@@ -53,11 +53,12 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) 
         gridDimx = (dprops->multiProcessorCount + params.b * params.h - 1) / (params.b * params.h);
     }
     dim3 grid_n(gridDimx, params.b, params.h);
-
-    if (!params.deterministic) {
-        flash_bwd_dot_do_o_kernel<true, Kernel_traits><<<grid_m, Kernel_traits::kNThreads, 0, stream>>>(params);
-    } else {
-        flash_bwd_dot_do_o_kernel<false, Kernel_traits><<<grid_m, Kernel_traits::kNThreads, 0, stream>>>(params);
+    if (! params.has_softmax_d){
+        if (! params.deterministic) {
+            flash_bwd_dot_do_o_kernel<true, Kernel_traits><<<grid_m, Kernel_traits::kNThreads, 0, stream>>>(params);
+        } else {
+            flash_bwd_dot_do_o_kernel<false, Kernel_traits><<<grid_m, Kernel_traits::kNThreads, 0, stream>>>(params);
+        }
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 

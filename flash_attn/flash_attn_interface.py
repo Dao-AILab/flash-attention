@@ -123,6 +123,7 @@ def _flash_attn_backward(
     window_size,
     alibi_slopes,
     deterministic,
+    softmax_d_=None,
     rng_state=None,
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
@@ -135,6 +136,7 @@ def _flash_attn_backward(
         v,
         out,
         softmax_lse,
+        softmax_d_,
         dq,
         dk,
         dv,
