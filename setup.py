@@ -51,7 +51,7 @@ def get_platform():
     Returns the platform name as used in wheel filenames.
     """
     if sys.platform.startswith("linux"):
-        return "linux_x86_64"
+        return f'linux_{platform.uname().machine}'
     elif sys.platform == "darwin":
         mac_version = ".".join(platform.mac_ver()[0].split(".")[:2])
         return f"macosx_{mac_version}_x86_64"
@@ -83,7 +83,8 @@ def check_if_cuda_home_none(global_option: str) -> None:
 
 
 def append_nvcc_threads(nvcc_extra_args):
-    return nvcc_extra_args + ["--threads", "4"]
+    nvcc_threads = os.getenv("NVCC_THREADS") or "4"
+    return nvcc_extra_args + ["--threads", nvcc_threads]
 
 
 cmdclass = {}
