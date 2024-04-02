@@ -126,12 +126,13 @@ def _flash_attn_backward(
     window_size,
     alibi_slopes,
     deterministic,
-    softmax_d_=None,
     rng_state=None,
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    if softmax_d is not None:
+        softmax_d = maybe_contiguous(x)
     dq, dk, dv, softmax_d, = flash_attn_cuda.bwd(
         dout,
         q,
@@ -139,7 +140,7 @@ def _flash_attn_backward(
         v,
         out,
         softmax_lse,
-        softmax_d_,
+        softmax_d,
         dq,
         dk,
         dv,
