@@ -8,15 +8,6 @@ import triton
 import triton.language as tl
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BLOCK_M": 2}),
-#         triton.Config({"BLOCK_M": 4}),
-#         triton.Config({"BLOCK_M": 8}),
-#         triton.Config({"BLOCK_M": 16}),
-#     ],
-#     key=["CACHE_KEY_SEQLEN", "BLOCK_K", "INTERLEAVED"],
-# )
 @triton.jit
 def rotary_kernel(
     OUT,  # Pointers to matrices
@@ -27,10 +18,8 @@ def rotary_kernel(
     SEQLEN_OFFSETS,  # this could be int or a pointer
     # Matrix dimensions
     seqlen,
-    nheads,
     rotary_dim,
     seqlen_ro,
-    CACHE_KEY_SEQLEN,
     # strides
     stride_out_batch,
     stride_out_seqlen,
@@ -218,10 +207,8 @@ def apply_rotary(
             cu_seqlens,
             seqlen_offsets,
             seqlen,  # shapes
-            nheads,
             rotary_dim,
             seqlen_ro,
-            seqlen // 128,  # key for triton cache (limit number of compilations)
             output.stride(0) if not is_varlen else 0,  # batch_strides if not varlen else 0
             output.stride(-3),  # seqlen_stride or total_seqlen_stride
             output.stride(-2),  # nheads_stride
