@@ -252,3 +252,40 @@ def test_rotary_emb_varlen_func(inplace, interleaved, rotary_fraction, seqlen_of
     assert torch.allclose(out, out_pt, rtol=rtol, atol=2 * atol)
     atol = ((x_pt.grad + 0.3 - 0.3) - x_pt.grad).abs().max().item()
     assert torch.allclose(x_grad, x_pt.grad, rtol=rtol, atol=2 * atol)
+
+
+def test_compilation_count():
+    batch_size = 1
+    headdim = 128
+    device = "cuda"
+    dtype = torch.float16
+    torch.manual_seed(42)
+
+    from triton.runtime.jit import JITFunction
+    from flash_attn.ops.triton.rotary import rotary_kernel
+    compilation_count = 0
+
+    def count_compilations(*args, **kwargs):
+        nonlocal compilation_count
+        compilation_count += 1
+
+    old_cache_func = JITFunction.cache_hook
+
+    try:
+        rotary_kernel.cache.clear()
+        JITFunction.cache_hook = count_compilations
+
+        for seqlen in (128, 256):
+            for nheads in (4, 32):
+                x = torch.randn(batch_size, seqlen, nheads, headdim, dtype=dtype, device=device)
+                x.requires_grad_()
+                cos, sin = generate_cos_sin(seqlen, headdim, device, dtype)
+                out = apply_rotary_emb(x, cos, sin)
+                out.backward(torch.randn_like(out))
+
+        # Only two kernels are expected to be compiled:
+        #   * for the forward pass (conjugate=False)
+        #   * for the backward pass (conjugate=True)
+        assert compilation_count == 2
+    finally:
+        JITFunction.cache_hook = old_cache_func
