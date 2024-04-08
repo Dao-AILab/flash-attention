@@ -791,11 +791,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
-    if (!softmax_d_.has_value()) {
-        TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
-        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size);
-        TORCH_CHECK(out.stride(-1) == 1, "out tensor must have contiguous last dimension");
-    }
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(out); CHECK_DEVICE(dout); CHECK_DEVICE(softmax_lse);
@@ -821,6 +816,12 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         TORCH_CHECK(is_sm80 || is_sm90, "FlashAttention backward for head dim 256 with dropout, or head dim 224 with/without dropout requires A100/A800 or H100/H800");
     }
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    if (!softmax_d_.has_value()) {
+        TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
+        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size);
+        TORCH_CHECK(out.stride(-1) == 1, "out tensor must have contiguous last dimension");
+    }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size_rounded = round_multiple(head_size, 32);
