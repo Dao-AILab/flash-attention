@@ -200,6 +200,11 @@ if not SKIP_CUDA_BUILD:
                         # "--ptxas-options=-v",
                         # "--ptxas-options=-O2",
                         # "-lineinfo",
+                        # "-DFLASHATTENTION_DISABLE_BACKWARD",
+                        # "-DFLASHATTENTION_DISABLE_DROPOUT",
+                        # "-DFLASHATTENTION_DISABLE_ALIBI",
+                        # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+                        # "-DFLASHATTENTION_DISABLE_LOCAL",
                     ]
                     + generator_flag
                     + cc_flag
