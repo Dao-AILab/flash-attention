@@ -53,7 +53,7 @@ jobs:
           cxx11_abi: ['FALSE', 'TRUE']
           exclude:
             # see https://github.com/pytorch/pytorch/blob/main/RELEASE.md#release-compatibility-matrix
-            # Pytorch <= 2.2 does not support Python 3.12
+            # Pytorch <= 2.1 does not support Python 3.12
             - torch-version: '1.12.1'
               python-version: '3.12'
             - torch-version: '1.13.1'
