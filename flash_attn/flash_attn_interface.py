@@ -132,7 +132,7 @@ def _flash_attn_backward(
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     if softmax_d is not None:
-        softmax_d = maybe_contiguous(x)
+        softmax_d = maybe_contiguous(softmax_d)
     dq, dk, dv, softmax_d, = flash_attn_cuda.bwd(
         dout,
         q,
