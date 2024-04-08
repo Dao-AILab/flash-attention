@@ -116,7 +116,6 @@ def _flash_attn_backward(
     v,
     out,
     softmax_lse,
-    softmax_d,
     dq,
     dk,
     dv,
@@ -127,6 +126,7 @@ def _flash_attn_backward(
     alibi_slopes,
     deterministic,
     rng_state=None,
+    softmax_d=None,
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
@@ -259,7 +259,6 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             v,
             out,
             softmax_lse,
-            None,
             dqkv[:, :, 0],
             dqkv[:, :, 1],
             dqkv[:, :, 2],
@@ -270,6 +269,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state=rng_state,
+            softmax_d=None,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
         return dqkv, None, None, None, None, None, None, None
@@ -398,7 +398,6 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             v,
             out,
             softmax_lse,
-            None,
             dq,
             dkv[:, :, 0],
             dkv[:, :, 1],
@@ -409,6 +408,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state=rng_state,
+            softmax_d=None,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., : dout.shape[-1]]
@@ -545,7 +545,6 @@ class FlashAttnFunc(torch.autograd.Function):
             v,
             out,
             softmax_lse,
-            None,
             dq,
             dk,
             dv,
@@ -556,6 +555,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state=rng_state,
+            softmax_d=None,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
