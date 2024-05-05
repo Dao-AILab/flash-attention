@@ -344,10 +344,10 @@ setup(
     install_requires=[
         "torch",
         "einops",
-        "packaging",
-        "ninja",
     ],
     setup_requires=[
-        "psutil"
+        "packaging",
+        "psutil",
+        "ninja",
     ],
 )
