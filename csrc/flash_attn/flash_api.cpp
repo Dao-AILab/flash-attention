@@ -295,6 +295,27 @@ void set_params_splitkv(Flash_fwd_params &params, const int batch_size,
     }
 }
 
+void set_params_rpe_bias(Flash_fwd_params &params, c10::optional<at::Tensor> &rpe_weights_, const int rpe_max_distance, int num_heads) {
+    #ifdef FLASHATTENTION_DISABLE_RPE_BIAS
+        TORCH_CHECK(!rpe_weights_.has_value(), "This flash attention build does not support RPE biases.");
+        params.rpe_weights_ptr = nullptr;
+    #else
+        if (rpe_weights_.has_value()) {
+            auto rpe_weights = rpe_weights_.value();
+            auto rpe_sizes = rpe_weights.sizes();
+            TORCH_CHECK(rpe_weights.dtype() == torch::kFloat32, "RPE weights must have dtype fp32");
+            CHECK_DEVICE(rpe_weights);
+            TORCH_CHECK(rpe_weights.stride(-1) == 1, "RPE weights tensor must have contiguous last dimension");
+            TORCH_CHECK(rpe_sizes[1] == torch::IntArrayRef({num_heads}));
+            params.rpe_weights_ptr = rpe_weights.data_ptr();
+            params.rpe_num_buckets = rpe_sizes[0];
+            params.rpe_max_distance = rpe_max_distance;
+        } else {
+            params.rpe_weights_ptr = nullptr;
+        }
+    #endif
+}
+
 void set_params_alibi(Flash_fwd_params &params, c10::optional<at::Tensor> &alibi_slopes_, int batch_size, int num_heads){
 #ifdef FLASHATTENTION_DISABLE_ALIBI
     TORCH_CHECK(!alibi_slopes_.has_value(), "This flash attention build does not support alibi.");
@@ -320,6 +341,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x head_size
         c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
         c10::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+        c10::optional<at::Tensor> &rpe_weights_, // num_buckets x num_heads
+        const int rpe_max_distance,
         const float p_dropout,
         const float softmax_scale,
         bool is_causal,
@@ -471,6 +494,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+    set_params_rpe_bias(params, rpe_weights_, rpe_max_distance, num_heads);
 
     if (seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -764,6 +788,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         c10::optional<at::Tensor> &dk_,   // batch_size x seqlen_k x num_heads_k x head_size
         c10::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
         c10::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+        c10::optional<at::Tensor> &rpe_weights_, // num_buckets x num_heads
+        const int rpe_max_distance,
         const float p_dropout,         // probability to drop
         const float softmax_scale,
         const bool is_causal,
@@ -956,6 +982,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+    set_params_rpe_bias(params, rpe_weights_, rpe_max_distance, num_heads);
 
     if (seqlen_q > 0) {
         launch(params, stream);

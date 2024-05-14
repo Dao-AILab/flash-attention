@@ -44,7 +44,7 @@ def _get_block_size_n(device, head_dim, is_dropout, is_causal):
 
 
 def _flash_attn_forward(
-    q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_softmax
+    q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes, rpe_weights, rpe_max_distance, return_softmax
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -54,6 +54,8 @@ def _flash_attn_forward(
         v,
         None,
         alibi_slopes,
+        rpe_weights,
+        rpe_max_distance,
         dropout_p,
         softmax_scale,
         causal,
@@ -503,6 +505,8 @@ class FlashAttnFunc(torch.autograd.Function):
         causal,
         window_size,
         alibi_slopes,
+        rpe_weights,
+        rpe_max_distance,
         deterministic,
         return_softmax,
     ):
@@ -517,6 +521,8 @@ class FlashAttnFunc(torch.autograd.Function):
             causal=causal,
             window_size=window_size,
             alibi_slopes=alibi_slopes,
+            rpe_weights=rpe_weights,
+            rpe_max_distance=rpe_max_distance,
             return_softmax=return_softmax and dropout_p > 0,
         )
         ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -777,6 +783,8 @@ def flash_attn_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     alibi_slopes=None,
+    rpe_weights=None,
+    rpe_max_distance=128,
     deterministic=False,
     return_attn_probs=False,
 ):
@@ -837,6 +845,8 @@ def flash_attn_func(
         causal,
         window_size,
         alibi_slopes,
+        rpe_weights,
+        rpe_max_distance,
         deterministic,
         return_attn_probs,
     )

@@ -138,6 +138,10 @@ struct Flash_fwd_params : public Qkv_params {
 
     void * __restrict__ alibi_slopes_ptr;
     index_t alibi_slopes_batch_stride;
+
+    void * __restrict__ rpe_weights_ptr;
+    int rpe_num_buckets;
+    int rpe_max_distance;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

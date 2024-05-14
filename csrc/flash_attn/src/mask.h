@@ -107,21 +107,26 @@ __forceinline__ __device__ void apply_mask_causal_w_idx(
     }
 }
 
-template <bool Is_causal, bool Is_local, bool Has_alibi>
+template <bool Is_causal, bool Is_local, bool Has_alibi, bool Has_rpe_bias>
 struct Mask {
 
     const int max_seqlen_k, max_seqlen_q;
     const int window_size_left, window_size_right;
     const float alibi_slope;
+    const int rpe_offset;
+    const int rpe_max_length;
 
     __forceinline__ __device__ Mask(const int max_seqlen_k, const int max_seqlen_q,
                                     const int window_size_left, const int window_size_right,
-                                    const float alibi_slope=0.f)
+                                    const float alibi_slope=0.f, const int rpe_offset=0,
+                                    const int rpe_max_length=0)
         : max_seqlen_k(max_seqlen_k)
         , max_seqlen_q(max_seqlen_q)
         , window_size_left(window_size_left)
         , window_size_right(window_size_right)
-        , alibi_slope(!Has_alibi ? 0.0 : alibi_slope) {
+        , alibi_slope(!Has_alibi ? 0.0 : alibi_slope)
+        , rpe_offset(rpe_offset)
+        , rpe_max_length(rpe_max_length) {
     };
 
     // Causal_mask: whether this particular iteration needs causal masking
@@ -129,19 +134,22 @@ struct Mask {
     __forceinline__ __device__ void apply_mask(Tensor<Engine, Layout> &tensor_,
                                                const int col_idx_offset_,
                                                const int row_idx_offset,
-                                               const int warp_row_stride) {
+                                               const int warp_row_stride,
+                                               const float *rpe_weights
+                                               ) {
         static_assert(!(Causal_mask && Is_local), "Cannot be both causal and local");
         static_assert(Layout::rank == 3, "Only support 3D Tensor");
         static_assert(decltype(size<0>(tensor_))::value == 4, "First dimension must be 4");
-        static constexpr bool Need_masking = Has_alibi || Causal_mask || Is_local || !Is_even_MN;
-        // if (cute::thread0()) { printf("Has_alibi = %d, Causal_mask=%d, Is_local=%d, Is_even_MN = %d, Need_masking = %d\n", Has_alibi, Causal_mask, Is_local, Is_even_MN, Need_masking); }
+        static constexpr bool Need_masking = Has_alibi || Causal_mask || Is_local || !Is_even_MN || Has_rpe_bias;
+        //if (cute::thread0()) { printf("Has_alibi = %d, Causal_mask=%d, Is_local=%d, Is_even_MN = %d, Need_masking = %d\n", Has_alibi, Causal_mask, Is_local, Is_even_MN, Need_masking); }
         if constexpr (Need_masking) {
             // Reshape tensor_ from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
             Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_rowcol(tensor_.layout()));
             // Do we need both row and column indices, or just column incides?
-            static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
+            static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask && !Has_rpe_bias;
             const int lane_id = threadIdx.x % 32;
             const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+            const int row_idx_offset_ = row_idx_offset - (threadIdx.x / 32) * 16 - lane_id / 4;
             if constexpr (Col_idx_only) {
                 #pragma unroll
                 for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
@@ -176,6 +184,10 @@ struct Mask {
                             #pragma unroll
                             for (int j = 0; j < size<1, 0>(tensor); ++j) {
                                 const int col_idx = col_idx_base + j;
+                                if constexpr (Has_rpe_bias) {
+                                    const int adj_relative_position = std::min((col_idx - col_idx_offset_) - (row_idx - row_idx_offset_), rpe_max_length);
+                                    tensor(make_coord(i, mi), make_coord(j, nj)) += rpe_weights[adj_relative_position + rpe_offset];
+                                }
                                 if constexpr (Has_alibi) {
                                     if constexpr (Is_causal) {
                                         tensor(make_coord(i, mi), make_coord(j, nj)) += alibi_slope * col_idx;

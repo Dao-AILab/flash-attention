@@ -104,9 +104,13 @@ struct Flash_fwd_kernel_traits : public Base {
     using SmemCopyAtomO = Copy_Atom<DefaultCopy, Element>;
     using SmemCopyAtomOaccum = Copy_Atom<DefaultCopy, ElementAccum>;
 
+    //using SmemLayoutRPE = Layout<Shape<Int<kBlockM + kBlockN - 1>>>;
+
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
     static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
-    static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
+    static constexpr int kSmemRPESize = (kBlockM + kBlockN - 1) * 4;
+    static constexpr int kSmemQKVSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
+    static constexpr int kSmemSize = kSmemQKVSize + kSmemRPESize;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
