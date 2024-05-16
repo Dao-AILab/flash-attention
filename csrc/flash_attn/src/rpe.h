@@ -40,13 +40,10 @@ struct RPE {
         const int max_exact = num_buckets / 2;
         const int rel_pos_base = n_block * kBlockN - m_block * kBlockM;
 
-        constexpr int rpe_elem_per_thread = cute::ceil_div((kBlockN + kBlockM - 1), kNThreads);
-        const int thread_slice = tidx * rpe_elem_per_thread;
-
         #pragma unroll
-        for(int i = 0; (i < rpe_elem_per_thread) && ((thread_slice + i) < kBlockM + kBlockN - 1); i++) {
+        for(int i = 0; i < kBlockM + kBlockN - 1; i += kNThreads) {
 
-            int relative_position = rel_pos_base + thread_slice + i - (kBlockM-1);
+            int relative_position = rel_pos_base + tidx + i - (kBlockM-1);
             int relative_bucket = 0;
 
             if constexpr (!Is_causal) {
@@ -66,7 +63,7 @@ struct RPE {
                 relative_bucket = relative_bucket + relative_position;
             }
 
-            srpe[thread_slice + i] = grpe[relative_bucket * num_heads + bidh] / scale_softmax;
+            srpe[tidx + i] = grpe[relative_bucket] / scale_softmax;
         }
     }
 

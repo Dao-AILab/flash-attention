@@ -268,7 +268,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     //Tensor rpe_weights = make_tensor(make_smem_ptr(reinterpret_cast<cutlass::tfloat32_t*>(smem_ + Kernel_traits::kSmemQKVSize)), typename Kernel_traits::SmemLayoutRPE{});
     flash::RPE<Is_causal, kBlockM, kBlockN, Kernel_traits::kNThreads> rpe(params.rpe_num_buckets, params.rpe_max_distance, params.h, params.scale_softmax);
     float *smem_rpe_weights = reinterpret_cast<float *>(smem_ + Kernel_traits::kSmemQKVSize);
-    float *gmem_rpe_weights = reinterpret_cast<float*>(params.rpe_weights_ptr);
+    float *gmem_rpe_weights = reinterpret_cast<float*>(params.rpe_weights_ptr) + bidh * params.rpe_num_buckets;
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     flash::Mask<Is_causal, Is_local, Has_alibi, Has_rpe_bias> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q,

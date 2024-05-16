@@ -306,9 +306,9 @@ void set_params_rpe_bias(Flash_fwd_params &params, c10::optional<at::Tensor> &rp
             TORCH_CHECK(rpe_weights.dtype() == torch::kFloat32, "RPE weights must have dtype fp32");
             CHECK_DEVICE(rpe_weights);
             TORCH_CHECK(rpe_weights.stride(-1) == 1, "RPE weights tensor must have contiguous last dimension");
-            TORCH_CHECK(rpe_sizes[1] == torch::IntArrayRef({num_heads}));
+            TORCH_CHECK(rpe_sizes[0] == torch::IntArrayRef({num_heads}));
             params.rpe_weights_ptr = rpe_weights.data_ptr();
-            params.rpe_num_buckets = rpe_sizes[0];
+            params.rpe_num_buckets = rpe_sizes[1];
             params.rpe_max_distance = rpe_max_distance;
         } else {
             params.rpe_weights_ptr = nullptr;
