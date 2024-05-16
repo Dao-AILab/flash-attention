@@ -833,7 +833,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // Array for RPE iases
     flash::RPE<Is_causal, kBlockM, kBlockN, Kernel_traits::kNThreads> rpe(params.rpe_num_buckets, params.rpe_max_distance, params.h, params.scale_softmax);
     float *smem_rpe_weights = reinterpret_cast<float *>(smem_ + Kernel_traits::kSmemQKVSize);
-    float *gmem_rpe_weights = reinterpret_cast<float*>(params.rpe_weights_ptr);
+    float *gmem_rpe_weights = reinterpret_cast<float*>(params.rpe_weights_ptr) + bidh * params.rpe_num_buckets;
 
 
     const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
