@@ -652,6 +652,8 @@ def flash_attn_qkvpacked_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     alibi_slopes=None,
+    rpe_weights=None,
+    rpe_max_distance=128,
     deterministic=False,
     return_attn_probs=False,
 ):
@@ -695,6 +697,8 @@ def flash_attn_qkvpacked_func(
         causal,
         window_size,
         alibi_slopes,
+        rpe_weights,
+        rpe_max_distance,
         deterministic,
         return_attn_probs,
     )
@@ -708,6 +712,8 @@ def flash_attn_kvpacked_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     alibi_slopes=None,
+    rpe_weights=None,
+    rpe_max_distance=128,
     deterministic=False,
     return_attn_probs=False,
 ):
@@ -769,6 +775,8 @@ def flash_attn_kvpacked_func(
         causal,
         window_size,
         alibi_slopes,
+        rpe_weights,
+        rpe_max_distance,
         deterministic,
         return_attn_probs,
     )
@@ -1108,6 +1116,8 @@ def flash_attn_with_kvcache(
     window_size=(-1, -1),  # -1 means infinite context window
     rotary_interleaved=True,
     alibi_slopes=None,
+    rpe_weights=None,
+    rpe_max_distance=128,
     num_splits=0,
 ):
     """
@@ -1216,6 +1226,8 @@ def flash_attn_with_kvcache(
         cache_batch_idx,
         block_table,
         alibi_slopes,
+        rpe_weights,
+        rpe_max_distance,
         None,
         softmax_scale,
         causal,
