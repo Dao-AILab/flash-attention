@@ -992,18 +992,20 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     #else
         set_params_rpe_bias(params, rpe_weights_, rpe_max_distance, num_heads);
 
-        if (drpe_weights_.has_value()) {
-            drpe_weights = drpe_weights_.value();
-            auto drpe_sizes = drpe_weights.sizes();
-            TORCH_CHECK(drpe_weights.dtype() == torch::kFloat32, "dRPE weights must have dtype fp32");
-            CHECK_DEVICE(drpe_weights);
-            TORCH_CHECK(drpe_weights.stride(-1) == 1, "dRPE weights tensor must have contiguous last dimension");
-            TORCH_CHECK(drpe_sizes[1] == params.rpe_num_buckets, "dRPE tensor should be the same size as RPE");
-            TORCH_CHECK(drpe_sizes[0] == torch::IntArrayRef({num_heads}));
-            params.drpe_weights_ptr = drpe_weights.data_ptr();
-        } else {
-            drpe_weights = torch::zeros_like(rpe_weights_.value());
-            params.drpe_weights_ptr = drpe_weights.data_ptr();
+        if (rpe_weights_.has_value()) {
+            if (drpe_weights_.has_value()) {
+                drpe_weights = drpe_weights_.value();
+                auto drpe_sizes = drpe_weights.sizes();
+                TORCH_CHECK(drpe_weights.dtype() == torch::kFloat32, "dRPE weights must have dtype fp32");
+                CHECK_DEVICE(drpe_weights);
+                TORCH_CHECK(drpe_weights.stride(-1) == 1, "dRPE weights tensor must have contiguous last dimension");
+                TORCH_CHECK(drpe_sizes[1] == params.rpe_num_buckets, "dRPE tensor should be the same size as RPE");
+                TORCH_CHECK(drpe_sizes[0] == torch::IntArrayRef({num_heads}));
+                params.drpe_weights_ptr = drpe_weights.data_ptr();
+            } else {
+                drpe_weights = torch::zeros_like(rpe_weights_.value());
+                params.drpe_weights_ptr = drpe_weights.data_ptr();
+            }
         }
     #endif
 
