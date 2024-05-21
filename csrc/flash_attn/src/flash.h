@@ -182,6 +182,9 @@ struct Flash_bwd_params : public Flash_fwd_params {
     // The pointer to the softmax d sum.
     void *__restrict__ dsoftmax_sum;
 
+    // Pointer to drpe_weights
+    void *__restrict__ drpe_weights_ptr;
+
     bool deterministic;
     index_t dq_accum_split_stride;
 };

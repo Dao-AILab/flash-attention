@@ -266,7 +266,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // RPE biases
     //Tensor rpe_weights = make_tensor(make_smem_ptr(reinterpret_cast<cutlass::tfloat32_t*>(smem_ + Kernel_traits::kSmemQKVSize)), typename Kernel_traits::SmemLayoutRPE{});
-    flash::RPE<Is_causal, kBlockM, kBlockN, Kernel_traits::kNThreads> rpe(params.rpe_num_buckets, params.rpe_max_distance, params.h, params.scale_softmax);
+    flash::RPE<Is_causal, kBlockM, kBlockN, Kernel_traits::kNThreads, false> rpe(params.rpe_num_buckets, params.rpe_max_distance, params.h, params.scale_softmax);
     float *smem_rpe_weights = reinterpret_cast<float *>(smem_ + Kernel_traits::kSmemQKVSize);
     float *gmem_rpe_weights = reinterpret_cast<float*>(params.rpe_weights_ptr) + bidh * params.rpe_num_buckets;
 
@@ -295,7 +295,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Load RPE biases
         if (Has_rpe_bias) {
-            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, bidh, tidx);
+            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx, nullptr);
             __syncthreads();
         }
 
@@ -376,7 +376,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Load RPE biases
         if (Has_rpe_bias) {
-            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, bidh, tidx);
+            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx, nullptr);
             __syncthreads();
         }
 
@@ -831,7 +831,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     flash::Softmax<2 * size<1>(acc_o)> softmax;
 
     // Array for RPE iases
-    flash::RPE<Is_causal, kBlockM, kBlockN, Kernel_traits::kNThreads> rpe(params.rpe_num_buckets, params.rpe_max_distance, params.h, params.scale_softmax);
+    flash::RPE<Is_causal, kBlockM, kBlockN, Kernel_traits::kNThreads, false> rpe(params.rpe_num_buckets, params.rpe_max_distance, params.h, params.scale_softmax);
     float *smem_rpe_weights = reinterpret_cast<float *>(smem_ + Kernel_traits::kSmemQKVSize);
     float *gmem_rpe_weights = reinterpret_cast<float*>(params.rpe_weights_ptr) + bidh * params.rpe_num_buckets;
 
@@ -861,7 +861,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // Load RPE biases
         if (Has_rpe_bias) {
-            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, bidh, tidx);
+            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx, nullptr);
             __syncthreads();
         }
 
@@ -947,7 +947,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // Load RPE biases
         if (Has_rpe_bias) {
-            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, bidh, tidx);
+            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx, nullptr);
             __syncthreads();
         }
 

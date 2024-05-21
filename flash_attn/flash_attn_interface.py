@@ -126,13 +126,16 @@ def _flash_attn_backward(
     causal,
     window_size,
     alibi_slopes,
+    rpe_weights,
+    drpe_weights,
+    rpe_max_distance,
     deterministic,
     rng_state=None,
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    dq, dk, dv, softmax_d, = flash_attn_cuda.bwd(
+    dq, dk, dv, drpe_weights, softmax_d, = flash_attn_cuda.bwd(
         dout,
         q,
         k,
@@ -143,6 +146,9 @@ def _flash_attn_backward(
         dk,
         dv,
         alibi_slopes,
+        rpe_weights,
+        drpe_weights,
+        rpe_max_distance,
         dropout_p,
         softmax_scale,
         causal,
@@ -152,7 +158,7 @@ def _flash_attn_backward(
         None,
         rng_state,
     )
-    return dq, dk, dv, softmax_d
+    return dq, dk, dv, drpe_weights, softmax_d
 
 
 def _flash_attn_varlen_backward(
@@ -220,6 +226,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         causal,
         window_size,
         alibi_slopes,
+        rpe_weights,
+        rpe_max_distance,
         deterministic,
         return_softmax,
     ):
@@ -234,22 +242,30 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             causal=causal,
             window_size=window_size,
             alibi_slopes=alibi_slopes,
+            rpe_weights=rpe_weights,
+            rpe_max_distance=rpe_max_distance,
             return_softmax=return_softmax and dropout_p > 0,
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+        ctx.save_for_backward(q, k, v, rpe_weights, out_padded, softmax_lse, rng_state)
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.alibi_slopes = alibi_slopes
+        ctx.rpe_max_distance = rpe_max_distance
         ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+        q, k, v, rpe_weights, out, softmax_lse, rng_state = ctx.saved_tensors
         qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
         dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
+
+        drpe_weights = None
+        if rpe_weights is not None:
+            drpe_weights = torch.zeros_like(rpe_weights)
+
         _flash_attn_backward(
             dout,
             q,
@@ -265,11 +281,15 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             ctx.alibi_slopes,
+            rpe_weights,
+            drpe_weights,
+            ctx.rpe_max_distance,
             ctx.deterministic,
             rng_state=rng_state,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None, None
+
+        return dqkv, None, None, None, None, None, drpe_weights, None, None, None
 
 
 class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
@@ -357,6 +377,8 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         causal,
         window_size,
         alibi_slopes,
+        rpe_weights,
+        rpe_max_distance,
         deterministic,
         return_softmax,
     ):
@@ -371,23 +393,31 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             causal=causal,
             window_size=window_size,
             alibi_slopes=alibi_slopes,
+            rpe_weights=rpe_weights,
+            rpe_max_distance=rpe_max_distance,
             return_softmax=return_softmax and dropout_p > 0,
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+        ctx.save_for_backward(q, k, v, rpe_weights, out_padded, softmax_lse, rng_state)
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.alibi_slopes = alibi_slopes
+        ctx.rpe_max_distance = rpe_max_distance
         ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+        q, k, v, rpe_weights, out, softmax_lse, rng_state = ctx.saved_tensors
         dq = torch.empty_like(q)
         kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
         dkv = torch.empty(kv_shape, dtype=k.dtype, device=k.device)
+
+        drpe_weights = None
+        if rpe_weights is not None:
+            drpe_weights = torch.zeros_like(rpe_weights)
+
         _flash_attn_backward(
             dout,
             q,
@@ -403,12 +433,16 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             ctx.alibi_slopes,
+            rpe_weights,
+            drpe_weights,
+            ctx.rpe_max_distance,
             ctx.deterministic,
             rng_state=rng_state,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., : dout.shape[-1]]
-        return dq, dkv, None, None, None, None, None, None, None
+
+        return dq, dkv, None, None, None, None, None, drpe_weights, None, None, None
 
 
 class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
@@ -525,19 +559,25 @@ class FlashAttnFunc(torch.autograd.Function):
             rpe_max_distance=rpe_max_distance,
             return_softmax=return_softmax and dropout_p > 0,
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+        ctx.save_for_backward(q, k, v, rpe_weights, out_padded, softmax_lse, rng_state)
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.alibi_slopes = alibi_slopes
+        ctx.rpe_max_distance = rpe_max_distance
         ctx.deterministic = deterministic
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+        q, k, v, rpe_weights, out, softmax_lse, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+        drpe_weights = None
+        if rpe_weights is not None:
+            drpe_weights = torch.zeros_like(rpe_weights)
+
         _flash_attn_backward(
             dout,
             q,
@@ -553,13 +593,17 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.window_size,
             ctx.alibi_slopes,
+            rpe_weights,
+            drpe_weights,
+            ctx.rpe_max_distance,
             ctx.deterministic,
             rng_state=rng_state,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None
+
+        return dq, dk, dv, None, None, None, None, None, drpe_weights, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -1005,6 +1049,8 @@ def flash_attn_varlen_kvpacked_func(
         causal,
         window_size,
         alibi_slopes,
+        rpe_weights,
+        rpe_max_distance,
         deterministic,
         return_attn_probs,
     )

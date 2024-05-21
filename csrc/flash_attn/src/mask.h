@@ -185,8 +185,8 @@ struct Mask {
                             for (int j = 0; j < size<1, 0>(tensor); ++j) {
                                 const int col_idx = col_idx_base + j;
                                 if constexpr (Has_rpe_bias) {
-                                    const int adj_relative_position = std::min((col_idx - col_idx_offset_) - (row_idx - row_idx_offset_), rpe_max_length);
-                                    tensor(make_coord(i, mi), make_coord(j, nj)) += rpe_weights[adj_relative_position + rpe_offset];
+                                    const int adj_relative_position = std::min((col_idx - col_idx_offset_) - (row_idx - row_idx_offset_) + rpe_offset, rpe_max_length);
+                                    tensor(make_coord(i, mi), make_coord(j, nj)) += rpe_weights[adj_relative_position];
                                 }
                                 if constexpr (Has_alibi) {
                                     if constexpr (Is_causal) {

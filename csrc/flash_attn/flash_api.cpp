@@ -341,7 +341,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x head_size
         c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
         c10::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
-        c10::optional<at::Tensor> &rpe_weights_, // num_buckets x num_heads
+        c10::optional<at::Tensor> &rpe_weights_, // num_heads x num_buckets
         const int rpe_max_distance,
         const float p_dropout,
         const float softmax_scale,
@@ -788,7 +788,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         c10::optional<at::Tensor> &dk_,   // batch_size x seqlen_k x num_heads_k x head_size
         c10::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
         c10::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
-        c10::optional<at::Tensor> &rpe_weights_, // num_buckets x num_heads
+        c10::optional<at::Tensor> &rpe_weights_, // num_heads x num_buckets
+        c10::optional<at::Tensor> &drpe_weights_, // num_heads x num_buckets
         const int rpe_max_distance,
         const float p_dropout,         // probability to drop
         const float softmax_scale,
@@ -982,7 +983,29 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
-    set_params_rpe_bias(params, rpe_weights_, rpe_max_distance, num_heads);
+
+    at::Tensor drpe_weights;
+    #ifdef FLASHATTENTION_DISABLE_RPE_BIAS
+        TORCH_CHECK(!rpe_weights_.has_value(), "This flash attention build does not support RPE biases.");
+        params.rpe_weights_ptr = nullptr;
+        params.drpe_weights_ptr = nullptr;
+    #else
+        set_params_rpe_bias(params, rpe_weights_, rpe_max_distance, num_heads);
+
+        if (drpe_weights_.has_value()) {
+            drpe_weights = drpe_weights_.value();
+            auto drpe_sizes = drpe_weights.sizes();
+            TORCH_CHECK(drpe_weights.dtype() == torch::kFloat32, "dRPE weights must have dtype fp32");
+            CHECK_DEVICE(drpe_weights);
+            TORCH_CHECK(drpe_weights.stride(-1) == 1, "dRPE weights tensor must have contiguous last dimension");
+            TORCH_CHECK(drpe_sizes[1] == params.rpe_num_buckets, "dRPE tensor should be the same size as RPE");
+            TORCH_CHECK(drpe_sizes[0] == torch::IntArrayRef({num_heads}));
+            params.drpe_weights_ptr = drpe_weights.data_ptr();
+        } else {
+            drpe_weights = torch::zeros_like(rpe_weights_.value());
+            params.drpe_weights_ptr = drpe_weights.data_ptr();
+        }
+    #endif
 
     if (seqlen_q > 0) {
         launch(params, stream);
@@ -1004,7 +1027,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
     }
 
-    return { dq, dk, dv, softmax_d };
+    return { dq, dk, dv, drpe_weights, softmax_d };
 }
 
 std::vector<at::Tensor>
