@@ -4,8 +4,6 @@ from typing import Tuple, Optional, Union
 
 import torch
 
-from einops import rearrange
-
 import triton
 import triton.language as tl
 
