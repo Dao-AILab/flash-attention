@@ -131,6 +131,17 @@ struct Flash_fwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+
+    // from how many rows does each thread have to fetch
+    static constexpr int kGmemRowsPerThread = kBlockN / (kNThreads / kGmemThreadsPerRow);
+    // Here we assign a contiguous tile to each thread, rather than a 1x8 row every 
+    // (kNThreads / kGmemThreadsPerRow) rows, ensuring that the elements assigned to each thread
+    // do not cross a page boundary. This way, each thread need only fetch 1 page index per
+    // mainloop iteration. R>udimentary testing shows no slowdown.
+    using GmemTiledCopyQKVPaged = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
+                        GmemLayoutAtom{},
+                        Layout<Shape<Int<kGmemRowsPerThread>, _8>, Stride<_8, _1>>{}));
     using GmemTiledCopyO = decltype(
         make_tiled_copy(Copy_Atom<DefaultCopy, Element>{},
                         GmemLayoutAtom{},
@@ -156,6 +167,14 @@ struct Flash_fwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<DefaultCopy, Element>{},
                         GmemLayoutAtomRotcossin{},
                         Layout<Shape < _1, _8>>{}));  // Val layout, 8 vals per load
+    using GmemTiledCopyRotcossinPaged = decltype(
+        make_tiled_copy(Copy_Atom<UniversalCopy<uint64_t>, Element>{},
+                        GmemLayoutAtomRotcossin{},
+                        Layout<Shape<Int<kGmemRowsPerThread>, _4>, Stride<_4, _1>>{}));  // Val layout, 4 vals per load
+    using GmemTiledCopyRotcossinContPaged = decltype(
+        make_tiled_copy(Copy_Atom<DefaultCopy, Element>{},
+                        GmemLayoutAtomRotcossin{},
+                        Layout<Shape<Int<kGmemRowsPerThread>, _8>, Stride<_8, _1>>{}));  // Val layout, 8 vals per load
 };
 
 // Is_V_in_regs is an option to reduce smem usage, but will increase register pressue.
