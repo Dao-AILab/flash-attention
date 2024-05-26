@@ -171,11 +171,10 @@ jobs:
           pip install ninja packaging wheel
           export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
           export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+          export FLASH_ATTN_LOCAL_VERSION=cu${MATRIX_CUDA_VERSION}torch${MATRIX_TORCH_VERSION}cxx11abi${{ matrix.cxx11_abi }}
           # Limit MAX_JOBS otherwise the github runner goes OOM
           MAX_JOBS=2 FLASH_ATTENTION_FORCE_BUILD="TRUE" FLASH_ATTENTION_FORCE_CXX11_ABI=${{ matrix.cxx11_abi}} python setup.py bdist_wheel --dist-dir=dist
-          tmpname=cu${MATRIX_CUDA_VERSION}torch${MATRIX_TORCH_VERSION}cxx11abi${{ matrix.cxx11_abi }}
-          wheel_name=$(ls dist/*whl | xargs -n 1 basename | sed "s/-/+$tmpname-/2")
-          ls dist/*whl |xargs -I {} mv {} dist/${wheel_name}
+          wheel_name=$(ls dist/*whl)
           echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
 
       - name: Log Built Wheels
