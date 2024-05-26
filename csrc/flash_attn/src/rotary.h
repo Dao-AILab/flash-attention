@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include <cute/algorithm/copy.hpp>
+#include <cute/tensor.hpp>
 
 #include "utils.h"
 
