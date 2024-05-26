@@ -760,6 +760,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         const at::Tensor &v,   // batch_size x seqlen_k x num_heads_k x head_size
         const at::Tensor &out,   // batch_size x seqlen_q x num_heads x head_size
         const at::Tensor &softmax_lse,     // b x h x seqlen_q
+        c10::optional<at::Tensor> &softmax_d_,     // b x h x seqlen_q
         c10::optional<at::Tensor> &dq_,   // batch_size x seqlen_q x num_heads x head_size
         c10::optional<at::Tensor> &dk_,   // batch_size x seqlen_k x num_heads_k x head_size
         c10::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
@@ -797,7 +798,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     }
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
-    TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
     TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
@@ -806,7 +806,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-    TORCH_CHECK(out.stride(-1) == 1, "out tensor must have contiguous last dimension");
     TORCH_CHECK(dout.stride(-1) == 1, "dout tensor must have contiguous last dimension");
 
     const auto sizes = q.sizes();
@@ -826,6 +825,12 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     }
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
+    if (!softmax_d_.has_value()) {
+        TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
+        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size);
+        TORCH_CHECK(out.stride(-1) == 1, "out tensor must have contiguous last dimension");
+    }
+
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size_rounded = round_multiple(head_size, 32);
     const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
@@ -839,7 +844,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
-    CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size);
     CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size_og);
 
     at::Tensor dq, dk, dv;
@@ -887,7 +891,17 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
-    auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
+    bool has_softmax_d = softmax_d_.has_value();
+    at::Tensor softmax_d;
+    if (! has_softmax_d){
+        softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
+    } else{
+        softmax_d = softmax_d_.value();
+        TORCH_CHECK(softmax_d.dtype() == torch::kFloat32, "softmax_d must have dtype float32");
+        CHECK_DEVICE(softmax_d);
+        TORCH_CHECK(softmax_d.stride(-1) == 1, "softmax_d must have contiguous last dimension");
+        CHECK_SHAPE(softmax_d, batch_size, num_heads, seqlen_q_rounded);
+    }
     at::Tensor dq_accum;
     at::Tensor dk_accum, dv_accum;
     if (loop) {
@@ -934,6 +948,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      window_size_left,
                      window_size_right,
                      deterministic);
+    params.has_softmax_d = has_softmax_d;
     params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
 
     auto launch = &run_mha_bwd;
