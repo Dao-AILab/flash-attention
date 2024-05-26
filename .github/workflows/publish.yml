@@ -43,7 +43,7 @@ jobs:
           # Using ubuntu-20.04 instead of 22.04 for more compatibility (glibc). Ideally we'd use the
           # manylinux docker image, but I haven't figured out how to install CUDA on manylinux.
           os: [ubuntu-20.04]
-          python-version: ['3.7', '3.8', '3.9', '3.10', '3.11']
+          python-version: ['3.7', '3.8', '3.9', '3.10', '3.11', '3.12']
           torch-version: ['1.12.1', '1.13.1', '2.0.1', '2.1.2', '2.2.2', '2.3.0']
           cuda-version: ['11.8.0', '12.2.2']
           # We need separate wheels that either uses C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI) or not.
@@ -53,6 +53,15 @@ jobs:
           cxx11_abi: ['FALSE', 'TRUE']
           exclude:
             # see https://github.com/pytorch/pytorch/blob/main/RELEASE.md#release-compatibility-matrix
+            # Pytorch < 2.2 does not support Python 3.12
+            - torch-version: '1.12.1'
+              python-version: '3.12'
+            - torch-version: '1.13.1'
+              python-version: '3.12'
+            - torch-version: '2.0.1'
+              python-version: '3.12'
+            - torch-version: '2.1.2'
+              python-version: '3.12'
             # Pytorch <= 1.12 does not support Python 3.11
             - torch-version: '1.12.1'
               python-version: '3.11'
@@ -123,6 +132,8 @@ jobs:
           # If we don't install before installing Pytorch, we get error for torch 2.0.1
           # ERROR: Could not find a version that satisfies the requirement setuptools>=40.8.0 (from versions: none)
           pip install lit
+          # For some reason torch 2.2.0 on python 3.12 errors saying no setuptools
+          pip install setuptools
           # We want to figure out the CUDA version to download pytorch
           # e.g. we can have system CUDA version being 11.7 but if torch==1.12 then we need to download the wheel from cu116
           # see https://github.com/pytorch/pytorch/blob/main/RELEASE.md#release-compatibility-matrix
