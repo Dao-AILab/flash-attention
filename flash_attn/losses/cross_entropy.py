@@ -20,7 +20,7 @@ class CrossEntropyLoss(nn.Module):
     ):
         """
         Arguments:
-            ignored_index: int. If labels == ignored_index, the loss is set to 0.0.
+            ignore_index: int. If labels == ignore_index, the loss is set to 0.0.
             label_smoothing: float
             lse_square_scale: float. If > 0, we add lse_square_scale * lse(logits) ^ 2 to the loss.
                 This is also referred to as "z-loss".
@@ -60,7 +60,7 @@ class CrossEntropyLoss(nn.Module):
             label_smoothing=self.label_smoothing,
             logit_scale=self.logit_scale,
             lse_square_scale=self.lse_square_scale,
-            ignored_index=self.ignore_index,
+            ignore_index=self.ignore_index,
             inplace_backward=self.inplace_backward,
             process_group=self.process_group,
         )

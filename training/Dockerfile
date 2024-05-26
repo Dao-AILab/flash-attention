@@ -85,7 +85,7 @@ RUN pip install transformers==4.25.1 datasets==2.8.0 pytorch-lightning==1.8.6 tr
 RUN pip install git+https://github.com/mlcommons/logging.git@2.1.0
 
 # Install FlashAttention
-RUN pip install flash-attn==2.5.6
+RUN pip install flash-attn==2.5.8
 
 # Install CUDA extensions for fused dense
-RUN pip install git+https://github.com/HazyResearch/flash-attention@v2.5.6#subdirectory=csrc/fused_dense_lib
+RUN pip install git+https://github.com/HazyResearch/flash-attention@v2.5.8#subdirectory=csrc/fused_dense_lib

@@ -79,6 +79,7 @@ def _flash_attn_varlen_forward(
     window_size,
     alibi_slopes,
     return_softmax,
+    block_table,
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -90,6 +91,7 @@ def _flash_attn_varlen_forward(
         cu_seqlens_q,
         cu_seqlens_k,
         None,
+        block_table,
         alibi_slopes,
         max_seqlen_q,
         max_seqlen_k,
@@ -299,6 +301,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             window_size=window_size,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            block_table=None,
         )
         ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens, rng_state)
         ctx.dropout_p = dropout_p
@@ -440,6 +443,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             window_size=window_size,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            block_table=None,
         )
         ctx.save_for_backward(
             q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
@@ -570,6 +574,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         alibi_slopes,
         deterministic,
         return_softmax,
+        block_table,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -587,6 +592,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             window_size=window_size,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            block_table=block_table,
         )
         ctx.save_for_backward(
             q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
@@ -630,7 +636,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -1001,6 +1007,7 @@ def flash_attn_varlen_func(
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
+    block_table=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1071,6 +1078,7 @@ def flash_attn_varlen_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
+        block_table,
     )
 
 

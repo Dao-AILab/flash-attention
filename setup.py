@@ -51,7 +51,7 @@ def get_platform():
     Returns the platform name as used in wheel filenames.
     """
     if sys.platform.startswith("linux"):
-        return "linux_x86_64"
+        return f'linux_{platform.uname().machine}'
     elif sys.platform == "darwin":
         mac_version = ".".join(platform.mac_ver()[0].split(".")[:2])
         return f"macosx_{mac_version}_x86_64"
@@ -83,7 +83,8 @@ def check_if_cuda_home_none(global_option: str) -> None:
 
 
 def append_nvcc_threads(nvcc_extra_args):
-    return nvcc_extra_args + ["--threads", "4"]
+    nvcc_threads = os.getenv("NVCC_THREADS") or "4"
+    return nvcc_extra_args + ["--threads", nvcc_threads]
 
 
 cmdclass = {}
@@ -199,6 +200,11 @@ if not SKIP_CUDA_BUILD:
                         # "--ptxas-options=-v",
                         # "--ptxas-options=-O2",
                         # "-lineinfo",
+                        # "-DFLASHATTENTION_DISABLE_BACKWARD",
+                        # "-DFLASHATTENTION_DISABLE_DROPOUT",
+                        # "-DFLASHATTENTION_DISABLE_ALIBI",
+                        # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+                        # "-DFLASHATTENTION_DISABLE_LOCAL",
                     ]
                     + generator_flag
                     + cc_flag
@@ -276,7 +282,7 @@ class CachedWheelsCommand(_bdist_wheel):
             wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
             print("Raw wheel path", wheel_path)
             os.rename(wheel_filename, wheel_path)
-        except urllib.error.HTTPError:
+        except (urllib.error.HTTPError, urllib.error.URLError):
             print("Precompiled wheel not found. Building from source...")
             # If the wheel could not be downloaded, build from source
             super().run()
@@ -338,10 +344,10 @@ setup(
     install_requires=[
         "torch",
         "einops",
-        "packaging",
-        "ninja",
     ],
     setup_requires=[
-        "psutil"
+        "packaging",
+        "psutil",
+        "ninja",
     ],
 )
