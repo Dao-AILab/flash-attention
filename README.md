@@ -400,12 +400,13 @@ If you use this codebase, or otherwise found our work valuable, please cite:
 @inproceedings{dao2022flashattention,
   title={Flash{A}ttention: Fast and Memory-Efficient Exact Attention with {IO}-Awareness},
   author={Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
-  booktitle={Advances in Neural Information Processing Systems},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
   year={2022}
 }
-@article{dao2023flashattention2,
+@inproceedings{dao2023flashattention2,
   title={Flash{A}ttention-2: Faster Attention with Better Parallelism and Work Partitioning},
   author={Dao, Tri},
-  year={2023}
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2024}
 }
 ```
