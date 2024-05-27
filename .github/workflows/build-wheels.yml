@@ -4,14 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag of flash-attention to build: v2.3.4'
+        description: 'Version tag of flash-attention to build: (format: v2.3.4/v2.3.4.post1)'
         default: 'v2.3.4'
         required: true
         type: string
   workflow_call:
     inputs:
       version:
-        description: 'Version tag of flash-attention to build: v2.3.4'
+        description: 'Version tag of flash-attention to build (format: v2.3.4/v2.3.4.post1)'
         default: 'v2.3.4'
         required: true
         type: string
