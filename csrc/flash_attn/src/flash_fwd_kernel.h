@@ -25,15 +25,14 @@ using namespace cute;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
-//template<typename ElementAccum, int kBlockM, bool Is_even_MN>
 inline __device__ auto get_lse_tile(const Params &params, const int bidb, const int bidh, const int m_block, const BlockInfo</*Varlen=*/!Is_even_MN> &binfo) {
 
-        auto gmem_ptr_lse = make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lse_ptr) + (params.unpadded_lse ? binfo.q_offset(params.seqlen_q, 1, bidb): 0));
-        auto lse_shape = params.unpadded_lse? make_shape(1, params.h, params.total_q): make_shape(params.b, params.h, params.seqlen_q);
+        auto gmem_ptr_lse = make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lse_ptr) + (params.unpadded_lse ? binfo.q_offset(params.seqlen_q, 1, bidb) : 0));
+        auto lse_shape = params.unpadded_lse ? make_shape(1, params.h, params.total_q) : make_shape(params.b, params.h, params.seqlen_q);
         auto lse_layout = make_layout(lse_shape, LayoutRight{});
 
         Tensor mLSE = make_tensor(gmem_ptr_lse, lse_layout);
-        auto mLSE_slice = params.unpadded_lse? mLSE(0, bidh, _): mLSE(bidb, bidh, _);
+        auto mLSE_slice = params.unpadded_lse ? mLSE(0, bidh, _) : mLSE(bidb, bidh, _);
         return local_tile(mLSE_slice, Shape<Int<kBlockM>>{}, make_coord(m_block));
 }
 
@@ -143,7 +142,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                             make_stride(params.v_row_stride, params.v_head_stride, _1{}));
     Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
                            make_coord(_, 0));  // (kBlockN, kHeadDim, nblocksN)
-
     Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
                             Shape<Int<kBlockM>, Int<kBlockN>>{},
                             make_stride(params.seqlen_k_rounded, _1{}));
@@ -437,7 +435,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                             make_stride(params.o_row_stride, params.o_head_stride, _1{}));
     Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
-
     Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
 
     typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
@@ -997,7 +994,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
     const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
                                          + m_block * kBlockM) * params.d_rounded;
-    const index_t row_offset_lseaccum = Split || !params.unpadded_lse ? ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM: bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb)
+    const index_t row_offset_lseaccum = Split || !params.unpadded_lse ? ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM : bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb)
         + m_block * kBlockM;
 
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),

@@ -750,7 +750,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         q_padded = q_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
         auto lse_shape_output = unpadded_lse ? std::vector<long>{num_heads, total_q}: std::vector<long>{batch_size, num_heads, max_seqlen_q} ;
         if (unpadded_lse) {
-            softmax_lse = softmax_lse.reshape({num_heads, batch_size, max_seqlen_q}).transpose(1, 2).reshape({num_heads * max_seqlen_q, batch_size});  // To (H, B)
+            softmax_lse = softmax_lse.reshape({num_heads, batch_size, max_seqlen_q}).transpose(1, 2).reshape({num_heads * max_seqlen_q, batch_size});
         } else
          {
             softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * max_seqlen_q, 1});
@@ -1002,7 +1002,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const at::Tensor &k,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                const at::Tensor &v,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                const at::Tensor &out,   // total_q x num_heads x head_size
-               const at::Tensor &softmax_lse,     // h x total_q if unpadded_lse else b x h x s, softmax logsumexp
+               const at::Tensor &softmax_lse,    // h x total_q if unpadded_lse else b x h x s, softmax logsumexp
                c10::optional<at::Tensor> &dq_,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                c10::optional<at::Tensor> &dk_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                c10::optional<at::Tensor> &dv_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
