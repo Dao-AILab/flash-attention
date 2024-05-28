@@ -24,6 +24,20 @@ using namespace cute;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
+//template<typename ElementAccum, int kBlockM, bool Is_even_MN>
+inline __device__ auto get_lse_tile(const Params &params, const int bidb, const int bidh, const int m_block, const BlockInfo</*Varlen=*/!Is_even_MN> &binfo) {
+
+        auto gmem_ptr_lse = make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lse_ptr) + (params.unpadded_lse ? binfo.q_offset(params.seqlen_q, 1, bidb): 0));
+        auto lse_shape = params.unpadded_lse? make_shape(1, params.h, params.total_q): make_shape(params.b, params.h, params.seqlen_q);
+        auto lse_layout = make_layout(lse_shape, LayoutRight{});
+
+        Tensor mLSE = make_tensor(gmem_ptr_lse, lse_layout);
+        auto mLSE_slice = params.unpadded_lse? mLSE(0, bidh, _): mLSE(bidb, bidh, _);
+        return local_tile(mLSE_slice, Shape<Int<kBlockM>>{}, make_coord(m_block));
+}
+
+
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
@@ -74,10 +88,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                                 make_stride(params.o_row_stride, params.o_head_stride, _1{}));
         Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                               make_coord(m_block, 0));  // (kBlockM, kHeadDim)
-        Tensor mLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lse_ptr)),
-                                  make_shape(params.b, params.h, params.seqlen_q),
-                                  make_stride(params.h * params.seqlen_q, params.seqlen_q, _1{}));
-        Tensor gLSE = local_tile(mLSE(bidb, bidh, _), Shape<Int<kBlockM>>{}, make_coord(m_block));
+
+        Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
 
         typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
         auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
@@ -131,6 +143,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                             make_stride(params.v_row_stride, params.v_head_stride, _1{}));
     Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
                            make_coord(_, 0));  // (kBlockN, kHeadDim, nblocksN)
+
     Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
                             Shape<Int<kBlockM>, Int<kBlockN>>{},
                             make_stride(params.seqlen_k_rounded, _1{}));
@@ -424,10 +437,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                             make_stride(params.o_row_stride, params.o_head_stride, _1{}));
     Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
-    Tensor mLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lse_ptr)),
-                              make_shape(params.b, params.h, params.seqlen_q),
-                              make_stride(params.h * params.seqlen_q, params.seqlen_q, _1{}));
-    Tensor gLSE = local_tile(mLSE(bidb, bidh, _), Shape<Int<kBlockM>>{}, make_coord(m_block));
+
+    Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
 
     typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
     auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
@@ -986,7 +997,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
     const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
                                          + m_block * kBlockM) * params.d_rounded;
-    const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
+    const index_t row_offset_lseaccum = Split || !params.unpadded_lse ? ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM: bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb)
+        + m_block * kBlockM;
 
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -1096,8 +1108,29 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lseaccum_ptr) + row_offset_lse),
                                    Shape<Int<kMaxSplits>, Int<kBlockM>>{},
                                    make_stride(params.b * params.h * params.seqlen_q, _1{}));
+
+    // Remap row_offset_lse to {bidb, bidh, q_offset}
+    const index_t bidb = row_offset_lse / (params.seqlen_q * params.h);
+    const index_t bidh = (row_offset_lse / params.seqlen_q) % params.h;
+    const index_t q_offset = row_offset_lse % params.seqlen_q;
+
     Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
                               Shape<Int<kBlockM>>{}, Stride<_1>{});
+    // When LSE is unpadded, a block can cross the border between two sequences, hence the two tensors below.
+    Tensor gLSE_curr = gLSE;
+    Tensor gLSE_next = gLSE;
+    if (params.unpadded_lse) {
+        // (num_heads, batch_size, seqlen_q)
+        const index_t row_offset_lse_curr = bidh * params.total_q + bidb * params.seqlen_q + q_offset;
+        gLSE_curr = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse_curr),
+                                Shape<Int<kBlockM>>{}, Stride<_1>{});
+
+        // (batch_size, num_heads, seqlen_q)
+        const index_t row_offset_lse_next = (bidh + 1) * params.total_q + bidb * params.seqlen_q + 0;
+        gLSE_next = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse_next),
+                                Shape<Int<kBlockM>>{}, Stride<_1>{});
+    }
+
     constexpr int kNLsePerThread = (kMaxSplits * kBlockM + kNThreads - 1) / kNThreads;
 
     // Read the LSE values from gmem and store them in shared memory, then tranpose them.
@@ -1145,7 +1178,18 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     // lse_logsum is log(0.0) = -INFINITY and we get NaN when we do lse_accum(l) - lse_logsum.
     ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : logf(lse_sum) + lse_max;
     // if (bidx == 0 && tidx < 32) { printf("tidx = %d, lse = %f, lse_max = %f, lse_logsum = %f\n", tidx, lse_accum(0), lse_max, lse_logsum); }
-    if (tidx % kRowsPerLoadTranspose == 0 && tidx / kRowsPerLoadTranspose < kBlockM) { gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum; }
+    if (tidx % kRowsPerLoadTranspose == 0 && tidx / kRowsPerLoadTranspose < kBlockM) {
+        if (params.unpadded_lse) {
+        const index_t seq_q_idx = q_offset + (tidx / kRowsPerLoadTranspose);
+        if (seq_q_idx < params.seqlen_q) {
+            gLSE_curr(tidx / kRowsPerLoadTranspose) = lse_logsum;
+        } else {
+            gLSE_next(seq_q_idx - params.seqlen_q) = lse_logsum;
+        }
+        } else {
+            gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
+        }
+    }
     // Store the scales exp(lse - lse_logsum) in shared memory.
     #pragma unroll
     for (int l = 0; l < kNLsePerThread; ++l) {
