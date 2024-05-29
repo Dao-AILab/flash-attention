@@ -10,6 +10,7 @@
 fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
                                        std::string dtype,
                                        int head_size,
+                                       bool has_lse,
                                        bool enable_alibi)
 {
     return fmha_fwd_traits{head_size,
@@ -19,11 +20,12 @@ fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
                            true,  // is_v_rowmajor
                            mask.type,
                            enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
-                           true,   // has_lse
+                           has_lse,
                            false}; // do_fp8_static_quant
 }
 
-fmha_fwd_args get_ck_fmha_fwd_args(const mask_info &mask,
+fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
+                                   const mask_info &mask,
                                    // sizes
                                    const int b,
                                    const int seqlen_q,
@@ -37,7 +39,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(const mask_info &mask,
                                    const at::Tensor v,
                                    c10::optional<at::Tensor> &alibi_slopes_,
                                    at::Tensor out,
-                                   at::Tensor softmax_lse, // Could it be optional?
+                                   at::Tensor softmax_lse,
                                    float softmax_scale)
 {
     // q: (batch_size, seqlen_q, nheads, d)
@@ -57,7 +59,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(const mask_info &mask,
     ck_tile::index_t nhead_stride_k = k.stride(2);
     ck_tile::index_t nhead_stride_v = v.stride(2);
     ck_tile::index_t nhead_stride_o = out.stride(2);
-    ck_tile::index_t nhead_stride_lse = softmax_lse.stride(1);
+    ck_tile::index_t nhead_stride_lse = has_lse ? softmax_lse.stride(1) : 0;
 
     ck_tile::index_t batch_stride_q = q.stride(0);
     ck_tile::index_t batch_stride_k = k.stride(0);
@@ -65,7 +67,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(const mask_info &mask,
     ck_tile::index_t batch_stride_o = out.stride(0);
 
     ck_tile::index_t batch_stride_bias = 0;
-    ck_tile::index_t batch_stride_lse = softmax_lse.stride(0);
+    ck_tile::index_t batch_stride_lse = has_lse ? softmax_lse.stride(0) : 0;
 
     void *alibi_slopes_ptr = nullptr;
     ck_tile::index_t stride_alibi_slopes = 0;
@@ -84,7 +86,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(const mask_info &mask,
                          k.data_ptr(),
                          v.data_ptr(),
                          alibi_slopes_ptr, // bias
-                         softmax_lse.data_ptr(),
+                         has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
                          nullptr, // seqstart_q
                          nullptr, // seqstart_k
@@ -227,7 +229,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         v_padded = v;
     }
 
-    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    auto round_multiple = [](int x, int m)
+    { return (x + m - 1) / m * m; };
     const int head_size_8x = round_multiple(head_size_og, 8);
 
     at::Tensor out;
@@ -255,11 +258,12 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
 
     auto opts = q.options();
 
-    auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
-
-    // TODO - Support return_softmax
+    // TODO - return P if return_softmax == true
     at::Tensor p;
-    assert(return_softmax == false);
+
+    at::Tensor softmax_lse;
+    if (return_softmax)
+        softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
 
     // TODO - Support dropout
     assert(p_dropout == 0.f);
@@ -272,10 +276,11 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         ck_tile::stream_config stream_config{stream, false, 0, 0, 0};
 
         auto traits =
-            get_ck_fmha_fwd_traits(mask, q_dtype_str, head_size_8x, alibi_slopes_.has_value());
+            get_ck_fmha_fwd_traits(mask, q_dtype_str, head_size_8x, return_softmax, alibi_slopes_.has_value());
 
         auto args =
             get_ck_fmha_fwd_args(
+                return_softmax,
                 mask,
                 batch_size,
                 seqlen_q,
@@ -297,7 +302,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
         out.zero_();
-        softmax_lse.fill_(std::numeric_limits<float>::infinity());
+        if (return_softmax)
+            softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
     at::Tensor out_padded = out;
