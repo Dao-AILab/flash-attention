@@ -138,6 +138,10 @@ struct Flash_fwd_params : public Qkv_params {
 
     void * __restrict__ alibi_slopes_ptr;
     index_t alibi_slopes_batch_stride;
+
+    void * __restrict__ rpe_weights_ptr;
+    int rpe_num_buckets;
+    int rpe_max_distance;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -177,6 +181,9 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
     // The pointer to the softmax d sum.
     void *__restrict__ dsoftmax_sum;
+
+    // Pointer to drpe_weights
+    void *__restrict__ drpe_weights_ptr;
 
     bool deterministic;
     index_t dq_accum_split_stride;
