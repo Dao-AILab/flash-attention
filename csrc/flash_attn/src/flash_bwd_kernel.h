@@ -599,7 +599,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
         if (Has_rpe_bias) {
             rpe.store_ds(dS, gmem_drpe_weights, smem_relative_position,
-                binfo.actual_seqlen_k, binfo.actual_seqlen_q, m_block, n_block,
+                binfo.actual_seqlen_k, binfo.actual_seqlen_q, n_block, m_block,
                 n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                 m_block * kBlockM + get<0>(taccScS_row(0)),
                 AtomLayoutMS * 16);

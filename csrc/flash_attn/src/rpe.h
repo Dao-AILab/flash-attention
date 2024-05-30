@@ -83,8 +83,8 @@ struct RPE {
         static_assert(Layout::rank == 2, "Only support 2D Tensor");
         const int lane_id = threadIdx.x % 32;
         const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
-        const int row_block_offset = n_block * kBlockN;
-        const int col_block_offset = m_block * kBlockM;
+        const int col_block_offset = n_block * kBlockN;
+        const int row_block_offset = m_block * kBlockM;
         const int rpe_max_length = kBlockM + kBlockN - 1;
         const int rpe_offset = kBlockM - 1;
 
@@ -123,8 +123,8 @@ struct RPE {
         static_assert(Layout::rank == 2, "Only support 2D Tensor");
         const int lane_id = threadIdx.x % 32;
         const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
-        const int row_block_offset = n_block * kBlockN;
-        const int col_block_offset = m_block * kBlockM;
+        const int col_block_offset = n_block * kBlockN;
+        const int row_block_offset = m_block * kBlockM;
         const int rpe_offset = kBlockM - 1;
         const int rpe_max_length = kBlockM + kBlockN - 1;
 
