@@ -233,7 +233,7 @@ def attention_ref(
         window_size: (int, int), left and right window size
         upcast: whether to cast all inputs to fp32, do all computation in fp32, then cast
             output back to fp16/bf16.
-        reorder_ops: whether to change the order of operations (scaling k instead of scaling k, etc.)
+        reorder_ops: whether to change the order of operations (scaling k instead of scaling q, etc.)
             without changing the math. This is to estimate the numerical error from operation
             reordering.
     Output:
