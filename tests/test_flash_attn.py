@@ -1151,6 +1151,7 @@ def test_flash_attn_varlen_output(
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+
     if kvpacked:
         kv = torch.randn(
             batch_size, seqlen_k, 2, nheads_k, d, device=device, dtype=dtype, requires_grad=True
@@ -1545,9 +1546,8 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
 # TODO: add smaller page sizes when https://github.com/Dao-AILab/flash-attention/pull/824 is merged
 @pytest.mark.parametrize("paged_kv_block_size", [None, 256, 512])
 # @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 128)])
-@pytest.mark.parametrize("unpadded_lse", [False, True])
 def test_flash_attn_varlen_causal(
-    seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, unpadded_lse, dtype
+    seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, dtype
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
@@ -1564,6 +1564,7 @@ def test_flash_attn_varlen_causal(
     nheads = 9
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+
     if paged_kv_block_size is None:
         k = torch.randn(
             batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True
@@ -1605,7 +1606,6 @@ def test_flash_attn_varlen_causal(
         causal=causal,
         window_size=window_size,
         block_table=block_table,
-        unpadded_lse=unpadded_lse,
     )
     out = output_pad_fn(out_unpad)
     out_ref, attn_ref = attention_ref(
@@ -2408,11 +2408,8 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
         (1023, 1024),
     ],
 )
-@pytest.mark.parametrize("unpadded_lse", [False, True])
 # @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 128)])
-def test_flash_attn_varlen_deterministic(
-    seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, unpadded_lse, dtype
-):
+def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype):
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
@@ -2458,7 +2455,6 @@ def test_flash_attn_varlen_deterministic(
         causal=causal,
         window_size=window_size,
         deterministic=True,
-        unpadded_lse=unpadded_lse,
     )
 
     g = torch.randn_like(out)

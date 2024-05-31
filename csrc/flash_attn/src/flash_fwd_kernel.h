@@ -26,13 +26,18 @@ using namespace cute;
 
 template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
 inline __device__ auto get_lse_tile(const Params &params, const int bidb, const int bidh, const int m_block, const BlockInfo</*Varlen=*/!Is_even_MN> &binfo) {
+        const bool varlen_q = params.unpadded_lse && !params.seqlenq_ngroups_swapped;
+        auto lse_offset = varlen_q ? binfo.q_offset(params.seqlen_q, 1, bidb) : 0;
+        auto gmem_ptr_lse = make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lse_ptr) + lse_offset);
 
-        auto gmem_ptr_lse = make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lse_ptr) + (params.unpadded_lse ? binfo.q_offset(params.seqlen_q, 1, bidb) : 0));
-        auto lse_shape = params.unpadded_lse ? make_shape(1, params.h, params.total_q) : make_shape(params.b, params.h, params.seqlen_q);
-        auto lse_layout = make_layout(lse_shape, LayoutRight{});
+        auto lse_shape = varlen_q ? make_shape(1, params.h, params.total_q) : make_shape(params.b, params.h, params.seqlen_q);
+        auto lse_stride = params.seqlenq_ngroups_swapped ? make_stride(1, params.seqlen_q * params.b, params.b) : (
+            params.unpadded_lse ? make_stride(params.h * params.total_q, params.total_q, 1) :  make_stride(params.h * params.seqlen_q, params.seqlen_q, 1)
+            );
 
+        auto lse_layout =  make_layout(lse_shape, lse_stride);
         Tensor mLSE = make_tensor(gmem_ptr_lse, lse_layout);
-        auto mLSE_slice = params.unpadded_lse ? mLSE(0, bidh, _) : mLSE(bidb, bidh, _);
+        auto mLSE_slice = varlen_q ? mLSE(0, bidh, _) : mLSE(bidb, bidh, _);
         return local_tile(mLSE_slice, Shape<Int<kBlockM>>{}, make_coord(m_block));
 }
 
@@ -994,7 +999,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
     const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
                                          + m_block * kBlockM) * params.d_rounded;
-    const index_t row_offset_lseaccum = Split || !params.unpadded_lse ? ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM : bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb)
+    const index_t row_offset_lseaccum = Split || !params.unpadded_lse ? ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM : bidh * params.total_q + (params.seqlenq_ngroups_swapped && params.unpadded_lse ? params.seqlen_q * params.b + bidb : binfo.q_offset(params.seqlen_q, 1, bidb))
         + m_block * kBlockM;
 
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
@@ -1067,7 +1072,7 @@ inline __device__ void compute_attn(const Params &params) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
-inline __device__ void compute_attn_splitkv(const Params &params) {
+__forceinline__ __device__ void compute_attn_splitkv(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
     const int bidb = Split ? blockIdx.z / params.h : blockIdx.y;
@@ -1106,27 +1111,17 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
                                    Shape<Int<kMaxSplits>, Int<kBlockM>>{},
                                    make_stride(params.b * params.h * params.seqlen_q, _1{}));
 
-    // Remap row_offset_lse to {bidb, bidh, q_offset}
-    const index_t bidb = row_offset_lse / (params.seqlen_q * params.h);
-    const index_t bidh = (row_offset_lse / params.seqlen_q) % params.h;
-    const index_t q_offset = row_offset_lse % params.seqlen_q;
-
     Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
                               Shape<Int<kBlockM>>{}, Stride<_1>{});
-    // When LSE is unpadded, a block can cross the border between two sequences, hence the two tensors below.
-    Tensor gLSE_curr = gLSE;
-    Tensor gLSE_next = gLSE;
-    if (params.unpadded_lse) {
-        // (num_heads, batch_size, seqlen_q)
-        const index_t row_offset_lse_curr = bidh * params.total_q + bidb * params.seqlen_q + q_offset;
-        gLSE_curr = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse_curr),
-                                Shape<Int<kBlockM>>{}, Stride<_1>{});
 
-        // (batch_size, num_heads, seqlen_q)
-        const index_t row_offset_lse_next = (bidh + 1) * params.total_q + bidb * params.seqlen_q + 0;
-        gLSE_next = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse_next),
-                                Shape<Int<kBlockM>>{}, Stride<_1>{});
-    }
+    // Remap row_offset_lse to {bidb, bidh, q_offset}
+    Layout flat_layout = make_layout(params.b * params.h * params.seqlen_q);
+    Layout orig_layout = make_layout(make_shape(params.seqlen_q, params.h, params.b));
+    auto transposed_stride = params.seqlenq_ngroups_swapped ? make_stride(params.b, params.seqlen_q * params.b, 1) : make_stride(1, params.seqlen_q * params.b, params.seqlen_q);
+    Layout remapped_layout = make_layout(make_shape(params.seqlen_q, params.h, params.b), transposed_stride);
+    Layout final_layout = cute::composition(remapped_layout, cute::composition(orig_layout, flat_layout));
+
+    Tensor gLSE_unpadded = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr)), final_layout);
 
     constexpr int kNLsePerThread = (kMaxSplits * kBlockM + kNThreads - 1) / kNThreads;
 
@@ -1177,12 +1172,10 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     // if (bidx == 0 && tidx < 32) { printf("tidx = %d, lse = %f, lse_max = %f, lse_logsum = %f\n", tidx, lse_accum(0), lse_max, lse_logsum); }
     if (tidx % kRowsPerLoadTranspose == 0 && tidx / kRowsPerLoadTranspose < kBlockM) {
         if (params.unpadded_lse) {
-        const index_t seq_q_idx = q_offset + (tidx / kRowsPerLoadTranspose);
-        if (seq_q_idx < params.seqlen_q) {
-            gLSE_curr(tidx / kRowsPerLoadTranspose) = lse_logsum;
-        } else {
-            gLSE_next(seq_q_idx - params.seqlen_q) = lse_logsum;
-        }
+            const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
+            if (lse_offset < params.b * params.h * params.seqlen_q) {
+                gLSE_unpadded(lse_offset) = lse_logsum;
+            }
         } else {
             gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
         }
