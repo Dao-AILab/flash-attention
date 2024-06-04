@@ -12,6 +12,7 @@ from flash_attn import (
 
 from test_flash_attn import (
     attn_bias_from_alibi_slopes,
+    convert_flash_attn_S_to_softmax,
     generate_qkv,
     attention_qkvpacked_ref,
     generate_random_padding_mask
@@ -26,7 +27,7 @@ is_gfx94x = torch.cuda.get_device_capability("cuda") == (9, 4)
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 @pytest.mark.parametrize("seqlen", [97, 128, 200, 384, 768, 1024, 1025, 2048])
-@pytest.mark.parametrize("dropout_p", [0.0])
+@pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype):
     if d > 256:
         pytest.skip()
@@ -58,8 +59,19 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         return_attn_probs=True,
     )
     if dropout_p > 0.0:
-        # TODO
-        None
+        S_dmask = torch.floor(255.0 - 255.0 * dropout_p - S_dmask)
+        S_dmask_converted = convert_flash_attn_S_to_softmax(
+            S_dmask,
+            seqlen,
+            seqlen,
+            None,
+            None,
+            d,
+            dropout_p > 0.0,
+            causal=causal,
+            window_size=window_size,
+        )
+        dropout_mask = S_dmask_converted >= 0
     else:
         dropout_mask = None
 
