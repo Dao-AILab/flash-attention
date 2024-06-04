@@ -21,6 +21,7 @@ fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
                            mask.type,
                            enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
                            has_lse,
+                           false,
                            false}; // do_fp8_static_quant
 }
 
@@ -86,6 +87,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          k.data_ptr(),
                          v.data_ptr(),
                          alibi_slopes_ptr, // bias
+                         nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
                          nullptr, // seqstart_q
@@ -106,22 +108,28 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          stride_k,
                          stride_v,
                          stride_alibi_slopes,
+                         0,
                          stride_o,
                          nhead_stride_q,
                          nhead_stride_k,
                          nhead_stride_v,
                          0, // nhead_stride_bias, FA without bias
+                         0,
                          nhead_stride_lse,
                          nhead_stride_o,
                          batch_stride_q,
                          batch_stride_k,
                          batch_stride_v,
                          0, // batch_stride_bias, FA without bias
+                         0,
                          batch_stride_lse,
                          batch_stride_o,
                          mask.left,
                          mask.right,
-                         static_cast<ck_tile::index_t>(mask.type)};
+                         static_cast<ck_tile::index_t>(mask.type),
+                         0,
+                         false,
+                         {0, 0}};
 }
 
 std::vector<at::Tensor>
