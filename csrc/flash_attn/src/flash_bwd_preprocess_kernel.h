@@ -68,7 +68,8 @@ inline __device__ void compute_dot_do_o(const Params &params) {
     const int tidx = threadIdx.x;
 
     constexpr int kBlockM = Kernel_traits::kBlockM;
-    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    constexpr int kHeadDimQ = Kernel_traits::kHeadDimQ;
+    constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
 
     const BlockInfo binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
@@ -82,13 +83,13 @@ inline __device__ void compute_dot_do_o(const Params &params) {
     const index_t row_offset_dpsum = (bidb * params.h + bidh) * params.seqlen_q_rounded + m_block * kBlockM;
 
     Tensor gdO = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.do_ptr) + row_offset_do),
-                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                             Shape<Int<kBlockM>, Int<kHeadDimV>>{},
                              make_stride(params.do_row_stride, _1{}));
     Tensor gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.o_ptr) + row_offset_o),
-                            Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                            Shape<Int<kBlockM>, Int<kHeadDimV>>{},
                             make_stride(params.o_row_stride, _1{}));
     Tensor gdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dq_accum_ptr) + row_offset_dq_accum),
-                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                  Shape<Int<kBlockM>, Int<kHeadDimQ>>{},
                                   make_stride(params.h * params.d_rounded, _1{}));
     Tensor dP_sum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dsoftmax_sum) + row_offset_dpsum),
                                 Shape<Int<kBlockM>>{}, Stride<_1>{});
@@ -104,14 +105,14 @@ inline __device__ void compute_dot_do_o(const Params &params) {
     Tensor tdOgO = gmem_thr_copy_dO.partition_S(gO);
     Tensor tdQgdQaccum = gmem_thr_copy_dQaccum.partition_D(gdQaccum);
 
-    Tensor cdO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+    Tensor cdO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDimV>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
     Tensor tdOcdO = gmem_thr_copy_dO.partition_S(cdO);
 
     // Allocate predicate tensors for k
     Tensor tdOpdO = make_tensor<bool>(make_shape(size<2>(tdOgdO)));
     // Set predicates for k bounds
     #pragma unroll
-    for (int k = 0; k < size(tdOpdO); ++k) {tdOpdO(k) = get<1>(tdOcdO(0, 0, k)) < params.d;}
+    for (int k = 0; k < size(tdOpdO); ++k) {tdOpdO(k) = get<1>(tdOcdO(0, 0, k)) < params.d_value;}
 
     Tensor tdOrdO = make_fragment_like(tdOgdO);
     Tensor tdOrO = make_fragment_like(tdOgO);
@@ -124,8 +125,8 @@ inline __device__ void compute_dot_do_o(const Params &params) {
     // By right we need to scale dP up by 1/p_dropout, but instead we don't and only scale the final
     // results (dQ and dK) by 1/p_dropout. So we need to keep dP_sum scaled down by p_dropout here,
     // so that (dP - dP_sum) is on the same scale.
-    dot_do_o<Kernel_traits::kGmemThreadsPerRow>(tdOrdO, tdOrO, dP_sum,
-                                                Kernel_traits::kNThreads / (Kernel_traits::kGmemThreadsPerRow), params.p_dropout);
+    dot_do_o<Kernel_traits::kGmemThreadsPerRowV>(tdOrdO, tdOrO, dP_sum,
+                                                Kernel_traits::kNThreads / (Kernel_traits::kGmemThreadsPerRowV), params.p_dropout);
     if (Clear_dQaccum) {
         // We're actually not zero'ing out all of dQaccum, but only the part that we're going to
         // do atomicAdds on.
@@ -151,26 +152,32 @@ inline __device__ void clear_dKVaccum(const Params &params) {
     const int tidx = threadIdx.x;
 
     constexpr int kBlockN = Kernel_traits::kBlockN;
-    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    constexpr int kHeadDimQ = Kernel_traits::kHeadDimQ;
+    constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
 
     const BlockInfo binfo(params, bidb);
     if (n_block * kBlockN >= binfo.actual_seqlen_k) return;
 
-    const index_t row_offset_dkv_accum = ((bidb * params.h_k + bidh) * params.seqlen_k_rounded + n_block * kBlockN) * params.d_rounded;
+    const index_t row_offset_dk_accum = ((bidb * params.h_k + bidh) * params.seqlen_k_rounded + n_block * kBlockN) * params.d_rounded;
+    const index_t row_offset_dv_accum = ((bidb * params.h_k + bidh) * params.seqlen_k_rounded + n_block * kBlockN) * params.d_value_rounded;
 
-    Tensor gdKaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dk_accum_ptr) + row_offset_dkv_accum),
-                                  Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
-    Tensor gdVaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dv_accum_ptr) + row_offset_dkv_accum),
-                                  Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+    Tensor gdKaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dk_accum_ptr) + row_offset_dk_accum),
+                                  Shape<Int<kBlockN>, Int<kHeadDimQ>>{}, Stride<Int<kHeadDimQ>, _1>{});
+    Tensor gdVaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dv_accum_ptr) + row_offset_dv_accum),
+                                  Shape<Int<kBlockN>, Int<kHeadDimV>>{}, Stride<Int<kHeadDimV>, _1>{});
 
-    typename Kernel_traits::GmemTiledCopydQaccum gmem_tiled_copy_dKVaccum;
-    auto gmem_thr_copy_dKVaccum = gmem_tiled_copy_dKVaccum.get_thread_slice(tidx);
-    Tensor tdKgdKaccum = gmem_thr_copy_dKVaccum.partition_D(gdKaccum);
-    Tensor tdVgdVaccum = gmem_thr_copy_dKVaccum.partition_D(gdVaccum);
+    typename Kernel_traits::GmemTiledCopydQaccum gmem_tiled_copy_dKaccum;
+    typename Kernel_traits::GmemTiledCopydVaccum gmem_tiled_copy_dVaccum;
+    auto gmem_thr_copy_dKaccum = gmem_tiled_copy_dKaccum.get_thread_slice(tidx);
+    auto gmem_thr_copy_dVaccum = gmem_tiled_copy_dVaccum.get_thread_slice(tidx);
+    Tensor tdKgdKaccum = gmem_thr_copy_dKaccum.partition_D(gdKaccum);
+    Tensor tdVgdVaccum = gmem_thr_copy_dVaccum.partition_D(gdVaccum);
     Tensor zero = make_fragment_like(tdKgdKaccum);
+    Tensor zerov = make_fragment_like(tdVgdVaccum);
     clear(zero);
-    cute::copy(gmem_tiled_copy_dKVaccum, zero, tdKgdKaccum);
-    cute::copy(gmem_tiled_copy_dKVaccum, zero, tdVgdVaccum);
+    clear(zerov);
+    cute::copy(gmem_tiled_copy_dKaccum, zero, tdKgdKaccum);
+    cute::copy(gmem_tiled_copy_dVaccum, zerov, tdVgdVaccum);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -195,7 +202,7 @@ inline __device__ void convert_dQ(const Params &params, const int nsplits) {
     const int tidx = threadIdx.x;
 
     constexpr int kBlockM = Kernel_traits::kBlockM;
-    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    constexpr int kHeadDimQ = Kernel_traits::kHeadDimQ;
 
     const BlockInfo binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
@@ -206,10 +213,10 @@ inline __device__ void convert_dQ(const Params &params, const int nsplits) {
         + (m_block * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128 * bidb)) * params.h * params.d_rounded + bidh * params.d_rounded;
 
     Tensor gdQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.dq_ptr) + row_offset_dq),
-                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                             Shape<Int<kBlockM>, Int<kHeadDimQ>>{},
                              make_stride(params.dq_row_stride, _1{}));
     Tensor gdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dq_accum_ptr) + row_offset_dq_accum),
-                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                  Shape<Int<kBlockM>, Int<kHeadDimQ>>{},
                                   make_stride(params.h * params.d_rounded, _1{}));
 
     Tensor sdQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
@@ -229,7 +236,7 @@ inline __device__ void convert_dQ(const Params &params, const int nsplits) {
     Tensor tdQgdQ = gmem_thr_copy_dQ.partition_D(gdQ);
     Tensor tdQgdQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum);
 
-    Tensor acc_dq = partition_fragment_C(tiled_mma_dq, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
+    Tensor acc_dq = partition_fragment_C(tiled_mma_dq, Shape<Int<kBlockM>, Int<kHeadDimQ>>{});  // MMA, MMA_N, MMA_K
     CUTE_STATIC_ASSERT_V(size(acc_dq) == size(tdQgdQaccum));
 
     Tensor tdQrdQaccum = make_fragment_like(tdQgdQaccum);
@@ -250,7 +257,7 @@ inline __device__ void convert_dQ(const Params &params, const int nsplits) {
     Tensor tdQrdQ = make_tensor<Element>(shape(tdQgdQ));
     cute::copy(gmem_tiled_copy_dQ, tdQsdQ, tdQrdQ);
 
-    Tensor cdQ = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+    Tensor cdQ = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDimQ>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
     Tensor tdQcdQ = gmem_thr_copy_dQ.partition_D(cdQ);
     Tensor tdQpdQ = make_tensor<bool>(make_shape(size<2>(tdQgdQ)));
     #pragma unroll
@@ -283,7 +290,8 @@ inline __device__ void convert_dKV(const Params &params) {
     const int tidx = threadIdx.x;
 
     constexpr int kBlockN = Kernel_traits::kBlockN;
-    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    constexpr int kHeadDimQ = Kernel_traits::kHeadDimQ;
+    constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
 
     const BlockInfo binfo(params, bidb);
     if (n_block * kBlockN >= binfo.actual_seqlen_k) return;
@@ -292,46 +300,52 @@ inline __device__ void convert_dKV(const Params &params) {
         + n_block * kBlockN * params.dk_row_stride + bidh * params.dk_head_stride;
     const index_t row_offset_dv = binfo.k_offset(params.dv_batch_stride, params.dv_row_stride, bidb)
         + n_block * kBlockN * params.dv_row_stride + bidh * params.dv_head_stride;
-    const index_t row_offset_dkv_accum = ((bidb * params.h_k + bidh) * params.seqlen_k_rounded
+    const index_t row_offset_dk_accum = ((bidb * params.h_k + bidh) * params.seqlen_k_rounded
                                           + n_block * kBlockN) * params.d_rounded;
+    const index_t row_offset_dv_accum = ((bidb * params.h_k + bidh) * params.seqlen_k_rounded
+                                          + n_block * kBlockN) * params.d_value_rounded;
 
     Tensor gdK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.dk_ptr) + row_offset_dk),
-                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                             Shape<Int<kBlockN>, Int<kHeadDimQ>>{},
                              make_stride(params.dk_row_stride, _1{}));
     Tensor gdV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.dv_ptr) + row_offset_dv),
-                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                             Shape<Int<kBlockN>, Int<kHeadDimV>>{},
                              make_stride(params.dv_row_stride, _1{}));
-    Tensor gdKaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dk_accum_ptr) + row_offset_dkv_accum),
-                                  Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                                  Stride<Int<kHeadDim>, _1>{});
-    Tensor gdVaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dv_accum_ptr) + row_offset_dkv_accum),
-                                  Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                                  Stride<Int<kHeadDim>, _1>{});
+    Tensor gdKaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dk_accum_ptr) + row_offset_dk_accum),
+                                  Shape<Int<kBlockN>, Int<kHeadDimQ>>{},
+                                  Stride<Int<kHeadDimQ>, _1>{});
+    Tensor gdVaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dv_accum_ptr) + row_offset_dv_accum),
+                                  Shape<Int<kBlockN>, Int<kHeadDimV>>{},
+                                  Stride<Int<kHeadDimV>, _1>{});
 
     Tensor sdK = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
-                             typename Kernel_traits::SmemLayoutdKV{});
-    Tensor sdV = make_tensor(sdK.data() + size(sdK), typename Kernel_traits::SmemLayoutdKV{}); // (SMEM_N, SMEM_K)
+                             typename Kernel_traits::SmemLayoutdK{});
+    Tensor sdV = make_tensor(sdK.data() + size(sdK), typename Kernel_traits::SmemLayoutdV{}); // (SMEM_N, SMEM_K)
 
-    typename Kernel_traits::GmemTiledCopydQ gmem_tiled_copy_dKV;
-    auto gmem_thr_copy_dKV = gmem_tiled_copy_dKV.get_thread_slice(tidx);
+    typename Kernel_traits::GmemTiledCopydQ gmem_tiled_copy_dK;
+    typename Kernel_traits::GmemTiledCopydV gmem_tiled_copy_dV;
+    auto gmem_thr_copy_dK = gmem_tiled_copy_dK.get_thread_slice(tidx);
+    auto gmem_thr_copy_dV = gmem_tiled_copy_dV.get_thread_slice(tidx);
     typename Kernel_traits::GmemTiledCopydQaccumAtomicAdd gmem_tiled_copy_dKVaccum;
     auto gmem_thr_copy_dKVaccum = gmem_tiled_copy_dKVaccum.get_thread_slice(tidx);
 
     typename Kernel_traits::TiledMmadKV tiled_mma_dkv;
-    auto smem_tiled_copy_dKV = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomdKV{}, tiled_mma_dkv);
-    auto smem_thr_copy_dKV = smem_tiled_copy_dKV.get_thread_slice(tidx);
-    Tensor taccdKsdK = smem_thr_copy_dKV.partition_D(sdK);  // ((Atom,AtomNum),PIPE_M,PIPE_N)
-    Tensor taccdVsdV = smem_thr_copy_dKV.partition_D(sdV);  // ((Atom,AtomNum),PIPE_M,PIPE_N)
+    auto smem_tiled_copy_dK = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomdK{}, tiled_mma_dkv);
+    auto smem_tiled_copy_dV = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomdV{}, tiled_mma_dkv);
+    auto smem_thr_copy_dK = smem_tiled_copy_dK.get_thread_slice(tidx);
+    auto smem_thr_copy_dV = smem_tiled_copy_dV.get_thread_slice(tidx);
+    Tensor taccdKsdK = smem_thr_copy_dK.partition_D(sdK);  // ((Atom,AtomNum),PIPE_M,PIPE_N)
+    Tensor taccdVsdV = smem_thr_copy_dV.partition_D(sdV);  // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
-    Tensor tdKsdK = gmem_thr_copy_dKV.partition_S(sdK);    // ((Atom,AtomNum),ATOM_M,ATOM_N)
-    Tensor tdKgdK = gmem_thr_copy_dKV.partition_D(gdK);
-    Tensor tdVsdV = gmem_thr_copy_dKV.partition_S(sdV);    // ((Atom,AtomNum),ATOM_M,ATOM_N)
-    Tensor tdVgdV = gmem_thr_copy_dKV.partition_D(gdV);
+    Tensor tdKsdK = gmem_thr_copy_dK.partition_S(sdK);    // ((Atom,AtomNum),ATOM_M,ATOM_N)
+    Tensor tdKgdK = gmem_thr_copy_dK.partition_D(gdK);
+    Tensor tdVsdV = gmem_thr_copy_dV.partition_S(sdV);    // ((Atom,AtomNum),ATOM_M,ATOM_N)
+    Tensor tdVgdV = gmem_thr_copy_dV.partition_D(gdV);
     Tensor tdKgdKaccum = gmem_thr_copy_dKVaccum.partition_S(gdKaccum);
     Tensor tdVgdVaccum = gmem_thr_copy_dKVaccum.partition_S(gdVaccum);
 
-    Tensor acc_dk = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
-    Tensor acc_dv = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
+    Tensor acc_dk = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDimQ>>{});  // MMA, MMA_N, MMA_K
+    Tensor acc_dv = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDimV>>{});  // MMA, MMA_N, MMA_K
     CUTE_STATIC_ASSERT_V(size(acc_dk) == size(tdKgdKaccum));
     CUTE_STATIC_ASSERT_V(size(acc_dv) == size(tdVgdVaccum));
 
@@ -350,27 +364,32 @@ inline __device__ void convert_dKV(const Params &params) {
     // Convert acc_dk from fp32 to fp16
     Tensor rdK = flash::convert_type<Element>(acc_dk);
     Tensor rdV = flash::convert_type<Element>(acc_dv);
-    Tensor taccdKrdK = smem_thr_copy_dKV.retile_S(rdK);  // ((Atom,AtomNum), MMA_N, MMA_N)
-    Tensor taccdVrdV = smem_thr_copy_dKV.retile_S(rdV);  // ((Atom,AtomNum), MMA_N, MMA_N)
-    cute::copy(smem_tiled_copy_dKV, taccdKrdK, taccdKsdK);
-    cute::copy(smem_tiled_copy_dKV, taccdVrdV, taccdVsdV);
+    Tensor taccdKrdK = smem_thr_copy_dK.retile_S(rdK);  // ((Atom,AtomNum), MMA_N, MMA_N)
+    Tensor taccdVrdV = smem_thr_copy_dV.retile_S(rdV);  // ((Atom,AtomNum), MMA_N, MMA_N)
+    cute::copy(smem_tiled_copy_dK, taccdKrdK, taccdKsdK);
+    cute::copy(smem_tiled_copy_dV, taccdVrdV, taccdVsdV);
     __syncthreads();
     Tensor tdKrdK = make_tensor<Element>(shape(tdKgdK));
     Tensor tdVrdV = make_tensor<Element>(shape(tdVgdV));
-    cute::copy(gmem_tiled_copy_dKV, tdKsdK, tdKrdK);
-    cute::copy(gmem_tiled_copy_dKV, tdVsdV, tdVrdV);
+    cute::copy(gmem_tiled_copy_dK, tdKsdK, tdKrdK);
+    cute::copy(gmem_tiled_copy_dV, tdVsdV, tdVrdV);
 
-    Tensor cdKV = make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
-    Tensor tdKVcdKV = gmem_thr_copy_dKV.partition_D(cdKV);
-    Tensor tdKVpdKV = make_tensor<bool>(make_shape(size<2>(tdKgdK)));
+    Tensor cdK = make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDimQ>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+    Tensor cdV = make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDimV>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+    Tensor tdKcdK = gmem_thr_copy_dK.partition_D(cdK);
+    Tensor tdVcdV = gmem_thr_copy_dV.partition_D(cdV);
+    Tensor tdKpdK = make_tensor<bool>(make_shape(size<2>(tdKgdK)));
+    Tensor tdVpdV = make_tensor<bool>(make_shape(size<2>(tdVgdV)));
     #pragma unroll
-    for (int k = 0; k < size(tdKVpdKV); ++k) { tdKVpdKV(k) = get<1>(tdKVcdKV(0, 0, k)) < params.d; }
+    for (int k = 0; k < size(tdKpdK); ++k) { tdKpdK(k) = get<1>(tdKcdK(0, 0, k)) < params.d; }
+    #pragma unroll
+    for (int k = 0; k < size(tdVpdV); ++k) { tdVpdV(k) = get<1>(tdVcdV(0, 0, k)) < params.d_value; }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
     flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_dKV, tdKrdK, tdKgdK, tdKVcdKV, tdKVpdKV, binfo.actual_seqlen_k - n_block * kBlockN
+        gmem_tiled_copy_dK, tdKrdK, tdKgdK, tdKcdK, tdKpdK, binfo.actual_seqlen_k - n_block * kBlockN
     );
     flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_dKV, tdVrdV, tdVgdV, tdKVcdKV, tdKVpdKV, binfo.actual_seqlen_k - n_block * kBlockN
+        gmem_tiled_copy_dV, tdVrdV, tdVgdV, tdVcdV, tdVpdV, binfo.actual_seqlen_k - n_block * kBlockN
     );
 }
 

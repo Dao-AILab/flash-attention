@@ -77,31 +77,44 @@
     }                                        \
   }()
 
-#define HEADDIM_SWITCH(HEADDIM, ...)   \
-  [&] {                                    \
-    if (HEADDIM <= 32) {                   \
-      constexpr static int kHeadDim = 32;  \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 64) {            \
-      constexpr static int kHeadDim = 64;  \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 96) {            \
-      constexpr static int kHeadDim = 96;  \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 128) {           \
-      constexpr static int kHeadDim = 128; \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 160) {           \
-      constexpr static int kHeadDim = 160; \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 192) {           \
-      constexpr static int kHeadDim = 192; \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 224) {           \
-      constexpr static int kHeadDim = 224; \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 256) {           \
-      constexpr static int kHeadDim = 256; \
-      return __VA_ARGS__();                \
-    }                                      \
+#define HEADDIM_SWITCH(HEADDIMQ, HEADDIMV, ...)   \
+  [&] {                                       \
+    if (HEADDIMQ <= 32) {                     \
+      constexpr static int kHeadDimQ = 32;    \
+      constexpr static int kHeadDimV = 32;    \
+      return __VA_ARGS__();                   \
+    } else if (HEADDIMQ <= 64) {              \
+      constexpr static int kHeadDimQ = 64;    \
+      constexpr static int kHeadDimV = 64;    \
+      return __VA_ARGS__();                   \
+    } else if (HEADDIMQ <= 96) {              \
+      constexpr static int kHeadDimQ = 96;    \
+      constexpr static int kHeadDimV = 96;    \
+      return __VA_ARGS__();                   \
+    } else if (HEADDIMQ <= 128) {             \
+      constexpr static int kHeadDimQ = 128;   \
+      constexpr static int kHeadDimV = 128;   \
+      return __VA_ARGS__();                   \
+    } else if (HEADDIMQ <= 160) {             \
+      constexpr static int kHeadDimQ = 160;   \
+      constexpr static int kHeadDimV = 160;   \
+      return __VA_ARGS__();                   \
+    } else if (HEADDIMQ <= 192) {             \
+      constexpr static int kHeadDimQ = 192;   \
+      if (HEADDIMV <= 128) {                  \
+        constexpr static int kHeadDimV = 128; \
+        return __VA_ARGS__();                 \
+      } else if (HEADDIMV <= 192) {           \
+        constexpr static int kHeadDimV = 192; \
+        return __VA_ARGS__();                 \
+      }                                       \
+    } else if (HEADDIMQ <= 224) {             \
+      constexpr static int kHeadDimQ = 224;   \
+      constexpr static int kHeadDimV = 224;   \
+      return __VA_ARGS__();                   \
+    } else if (HEADDIMQ <= 256) {             \
+      constexpr static int kHeadDimQ = 256;   \
+      constexpr static int kHeadDimV = 256;   \
+      return __VA_ARGS__();                   \
+    }                                         \
   }()

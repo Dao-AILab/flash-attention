@@ -508,6 +508,8 @@ class FlashAttnFunc(torch.autograd.Function):
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
+
+        ctx.qk_headdim = q.shape[-1]
         out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q,
             k,
@@ -550,8 +552,9 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.deterministic,
             rng_state=rng_state,
         )
-        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : dout.shape[-1]]
+
+        dq = dq[..., : ctx.qk_headdim]  # We could have padded the head dimension
+        dk = dk[..., : ctx.qk_headdim]
         dv = dv[..., : dout.shape[-1]]
         return dq, dk, dv, None, None, None, None, None, None, None
 
@@ -578,6 +581,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
+        ctx.qk_headdim = q.shape[-1]
         out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
             q,
             k,
@@ -633,8 +637,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.deterministic,
             rng_state=rng_state,
         )
-        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : dout.shape[-1]]
+        dq = dq[..., : ctx.qk_headdim]  # We could have padded the head dimension
+        dk = dk[..., : ctx.qk_headdim]
         dv = dv[..., : dout.shape[-1]]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
 
