@@ -22,12 +22,12 @@ permissions:
 jobs:
   build_wheels:
     name: Build wheels for Python ${{ matrix.pyver }}, CUDA ${{ matrix.cuda }}, and Torch ${{ matrix.torchver }}
-    runs-on: windows-latest
+    runs-on: windows-2022
     strategy:
       matrix:
-        pyver: ["3.8", "3.9", "3.10", "3.11"]
+        pyver: ["3.8", "3.9", "3.10", "3.11", "3.12"]
         cuda: ["12.2.2"]
-        torchver: ["2.2.2", "2.3.0"]
+        torchver: ["2.2.2", "2.3.1"]
     defaults:
       run:
         shell: pwsh
@@ -44,6 +44,10 @@ jobs:
         with:
           python-version: ${{ matrix.pyver }}
 
+      - name: Install VS2022 BuildTools 17.9.7
+        run: choco install -y visualstudio2022buildtools --version=117.9.7.0 --params "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --installChannelUri https://aka.ms/vs/17/release/180911598_-255012421/channel"
+        if: runner.os == 'Windows'
+
       - name: Setup Mamba
         uses: conda-incubator/setup-miniconda@v2.2.0
         with:
@@ -57,12 +61,10 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          $cudaVersion = $env:CUDAVER
-          $cudaVersionPytorch = $env:CUDAVER.Remove($env:CUDAVER.LastIndexOf('.')).Replace('.','')
-          $cudaChannels = ''
-          $cudaNum = [int]$cudaVersion.substring($cudaVersion.LastIndexOf('.')+1)
-          while ($cudaNum -ge 0) { $cudaChannels += '-c nvidia/label/cuda-' + $cudaVersion.Remove($cudaVersion.LastIndexOf('.')+1) + $cudaNum + ' '; $cudaNum-- }
-          mamba install -y 'cuda' $cudaChannels.TrimEnd().Split()
+          $cudaVersion = '${{ matrix.cuda }}'
+          $cudaVersionPytorch = '${{ matrix.cuda }}'.Remove('${{ matrix.cuda }}'.LastIndexOf('.')).Replace('.','')
+
+          mamba install -y -c nvidia/label/cuda-$cudaVersion cuda-toolkit cuda-runtime
           if (!(mamba list cuda)[-1].contains('cuda')) {sleep -s 10; mamba install -y 'cuda' $cudaChannels.TrimEnd().Split()}
           if (!(mamba list cuda)[-1].contains('cuda')) {throw 'CUDA Toolkit failed to install!'}
           
@@ -71,6 +73,13 @@ jobs:
       - name: Build Wheel
         id: build-wheel
         run: |
+          # --- Spawn the VS shell
+          if ($IsWindows) {
+            Import-Module 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
+            Enter-VsDevShell -VsInstallPath 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools' -DevCmdArguments '-arch=x64 -host_arch=x64'
+            $env:DISTUTILS_USE_SDK=1
+          }
+
           $cudaVersion = $env:CUDAVER.Remove($env:CUDAVER.LastIndexOf('.')).Replace('.','')
           $packageVersion = $env:PCKGVER.TrimStart('v')
           
