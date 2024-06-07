@@ -59,7 +59,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         return_attn_probs=True,
     )
     if dropout_p > 0.0:
-        S_dmask = torch.floor(255.0 - 255.0 * dropout_p - S_dmask)
+        S_dmask = torch.floor(255.0 * (1 - dropout_p) - S_dmask)
         S_dmask_converted = convert_flash_attn_S_to_softmax(
             S_dmask,
             seqlen,
@@ -106,7 +106,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("d", [32, 59, 64, 80, 96, 128, 160, 192, 224, 256])
 @pytest.mark.parametrize("seqlen", [97, 128, 200, 257, 384, 512, 768, 1025, 2048])
-@pytest.mark.parametrize("dropout_p", [0.0])
+@pytest.mark.parametrize("dropout_p", [0, 0.17])
 def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype):
     if d > 256:
         pytest.skip()
@@ -148,10 +148,23 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi,
     )
     out = output_pad_fn(out_unpad)
     if dropout_p > 0.0:
-        # [nheads, total_q, max_seqlen_k]
-        # TODO - pad and rearrange p into [b, nheads, seqlen_q, seqlen_kv]
-        # S_dmask = rearrange(S_dmask, "h (b sq) sk -> b h sq sk", b=batch_size)
-        S_dmask = torch.floor(255.0 - 255.0 * dropout_p - S_dmask)
+        # pad + rearrange [nheads, total_q, max_seqlen_k] into [b, nheads, seqlen_q, seqlen_kv]
+        # TODO - move to c++ mha_varlen_fwd()
+        S_dmask = torch.floor(255.0 * (1 - dropout_p) - S_dmask)
+
+        seqlens = torch.roll(cu_seqlens, shifts = -1) - cu_seqlens
+        seqlens = seqlens[0:batch_size].tolist()
+
+        S_dmask = torch.split(S_dmask, seqlens, dim=1)
+
+        masks = ()
+        for mask in S_dmask:
+            mask = F.pad(mask, (0, 0, 0, seqlen - mask.shape[1])).unsqueeze(1)
+            masks = masks + (mask, )
+
+        S_dmask = torch.cat(masks, dim=1)
+        S_dmask = S_dmask.transpose(0, 1)
+
         S_dmask_converted = convert_flash_attn_S_to_softmax(
             S_dmask,
             seqlen,

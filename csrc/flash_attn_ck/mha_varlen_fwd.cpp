@@ -327,9 +327,10 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
     if (zero_tensors)
     {
         out.zero_();
+        softmax_lse.fill_(-std::numeric_limits<float>::infinity());
+
         if (return_dropout_randval)
         {
-            softmax_lse.fill_(-std::numeric_limits<float>::infinity());
             p.zero_();
         }
     }
@@ -372,8 +373,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
     {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
         out.zero_();
-        if (return_dropout_randval)
-            softmax_lse.fill_(std::numeric_limits<float>::infinity());
+        softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
     at::Tensor out_padded = out;
