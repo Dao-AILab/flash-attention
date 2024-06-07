@@ -99,7 +99,6 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
     # of a Pytorch implementation.
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
-
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("alibi", [False, True])
@@ -149,8 +148,23 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi,
     )
     out = output_pad_fn(out_unpad)
     if dropout_p > 0.0:
-        # TODO
-        None
+        # [nheads, total_q, max_seqlen_k]
+        # TODO - pad and rearrange p into [b, nheads, seqlen_q, seqlen_kv]
+        # S_dmask = rearrange(S_dmask, "h (b sq) sk -> b h sq sk", b=batch_size)
+        S_dmask = torch.floor(255.0 - 255.0 * dropout_p - S_dmask)
+        S_dmask_converted = convert_flash_attn_S_to_softmax(
+            S_dmask,
+            seqlen,
+            seqlen,
+            key_padding_mask,
+            key_padding_mask,
+            d,
+            dropout_p > 0.0,
+            causal=causal,
+            window_size=window_size,
+        )
+
+        dropout_mask = S_dmask_converted >= 0
     else:
         dropout_mask = None
 
