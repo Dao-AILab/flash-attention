@@ -99,6 +99,23 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
     # of a Pytorch implementation.
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
+
+def pad_rearrange_dropout_mask_hts_to_bhss(S_dmask, cu_seqlens, seqlen):
+    # pad + rearrange [nheads, total_q, max_seqlen_k] into [b, nheads, seqlen_q, seqlen_kv]
+    batch_size = cu_seqlens.numel() - 1
+    seqlens = torch.roll(cu_seqlens, shifts = -1) - cu_seqlens
+    seqlens = seqlens[0:batch_size].tolist()
+    S_dmask = torch.split(S_dmask, seqlens, dim=1)
+    masks = ()
+    for mask in S_dmask:
+        mask = F.pad(mask, (0, 0, 0, seqlen - mask.shape[1])).unsqueeze(1)
+        masks = masks + (mask, )
+    S_dmask = torch.cat(masks, dim=1)
+
+    S_dmask = S_dmask.transpose(0, 1)
+    return S_dmask
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("alibi", [False, True])
@@ -148,22 +165,9 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi,
     )
     out = output_pad_fn(out_unpad)
     if dropout_p > 0.0:
-        # pad + rearrange [nheads, total_q, max_seqlen_k] into [b, nheads, seqlen_q, seqlen_kv]
         # TODO - move to c++ mha_varlen_fwd()
         S_dmask = torch.floor(255.0 * (1 - dropout_p) - S_dmask)
-
-        seqlens = torch.roll(cu_seqlens, shifts = -1) - cu_seqlens
-        seqlens = seqlens[0:batch_size].tolist()
-
-        S_dmask = torch.split(S_dmask, seqlens, dim=1)
-
-        masks = ()
-        for mask in S_dmask:
-            mask = F.pad(mask, (0, 0, 0, seqlen - mask.shape[1])).unsqueeze(1)
-            masks = masks + (mask, )
-
-        S_dmask = torch.cat(masks, dim=1)
-        S_dmask = S_dmask.transpose(0, 1)
+        S_dmask = pad_rearrange_dropout_mask_hts_to_bhss(S_dmask, cu_seqlens, seqlen)
 
         S_dmask_converted = convert_flash_attn_S_to_softmax(
             S_dmask,
