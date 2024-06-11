@@ -20,6 +20,14 @@ from test_flash_attn import (
 
 is_gfx94x = torch.cuda.get_device_capability("cuda") == (9, 4)
 
+
+def ck_randval_to_dropout_mask(randval, p):
+    # If p = 0.3, randval in 255 * (0.7, 1.0] will be dropout
+    # randval in 255 * [0, 0.7] will be kept
+    # If return dropout_mask >=0, value will be kept
+    return torch.floor(255.0 * (1 - p) - randval)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("alibi", [False, True])
@@ -59,7 +67,8 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         return_attn_probs=True,
     )
     if dropout_p > 0.0:
-        S_dmask = torch.floor(255.0 * (1 - dropout_p) - S_dmask)
+        # TODO - move to c++ mha_varlen_fwd()
+        S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
         S_dmask_converted = convert_flash_attn_S_to_softmax(
             S_dmask,
             seqlen,
@@ -166,7 +175,7 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi,
     out = output_pad_fn(out_unpad)
     if dropout_p > 0.0:
         # TODO - move to c++ mha_varlen_fwd()
-        S_dmask = torch.floor(255.0 * (1 - dropout_p) - S_dmask)
+        S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
         S_dmask = pad_rearrange_dropout_mask_hts_to_bhss(S_dmask, cu_seqlens, seqlen)
 
         S_dmask_converted = convert_flash_attn_S_to_softmax(
