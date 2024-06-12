@@ -188,7 +188,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
 
     // TODO - Support paged_KV
     const bool paged_KV = block_table_.has_value();
-    TORCH_CHECK(!paged_KV "CK does not support paged_KV yet");
+    TORCH_CHECK(!paged_KV, "CK does not support paged_KV yet");
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -297,7 +297,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
     {
         out.zero_();
         softmax_lse.fill_(-std::numeric_limits<float>::infinity());
-        if (return_softmax) {p.zero_();}
+        if (return_dropout_randval) {p.zero_();}
     }
 
     uint64_t drop_seed = 1;
