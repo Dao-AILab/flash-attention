@@ -46,8 +46,6 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
     batch_size = 4
     nheads = 9
     window_size = (-1, -1) if not local else torch.randint(0, seqlen, (2,))
-    #Causal is the special case where window_size_right == 0 and window_size_left < 0.
-    window_size = (-1, 0) if causal else window_size
 
     qkv = torch.randn(
         batch_size, seqlen, 3, nheads, d, device=device, dtype=dtype, requires_grad=True
