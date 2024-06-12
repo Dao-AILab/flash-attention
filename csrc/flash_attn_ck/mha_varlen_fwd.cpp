@@ -87,8 +87,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
     void *alibi_slopes_ptr = nullptr;
     ck_tile::index_t stride_alibi_slopes = 0;
 
-    if (alibi_slopes_.has_value())
-    {
+    if (alibi_slopes_.has_value()) {
         auto alibi_slopes = alibi_slopes_.value();
         CHECK_DEVICE(alibi_slopes);
         TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
@@ -183,15 +182,13 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
 
     std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
 
-    CHECK_DEVICE(q);
-    CHECK_DEVICE(k);
-    CHECK_DEVICE(v);
+    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(cu_seqlens_q);
     CHECK_DEVICE(cu_seqlens_k);
 
     // TODO - Support paged_KV
     const bool paged_KV = block_table_.has_value();
-    assert(!paged_KV);
+    TORCH_CHECK(!paged_KV "CK does not support paged_KV yet");
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -208,46 +205,8 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
 
     const int max_num_blocks_per_seq = 0;
     const int num_blocks = 0;
-    const int page_block_size = 1;
 
-    TORCH_CHECK(batch_size > 0, "batch size must be postive");
-    TORCH_CHECK(head_size_og <= 256, "CK only supports head dimension at most 256");
-    TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
-
-    if (window_size_left >= max_seqlen_k)
-    {
-        window_size_left = -1;
-    }
-    if (window_size_right >= max_seqlen_k)
-    {
-        window_size_right = -1;
-    }
-
-    // causal=true is the same as causal=false in this case
-    if (max_seqlen_q == 1 && !alibi_slopes_.has_value())
-    {
-        is_causal = false;
-    }
-
-    mask_info mask;
-
-    if (is_causal)
-    {
-        // Causal is the special case where window_size_right == 0 and window_size_left < 0.
-        window_size_right = 0;
-        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0";
-        mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // casual
-    }
-    else if (window_size_left == -1 && window_size_right == -1)
-    {
-        mask = mask_info::decode("0", max_seqlen_q, max_seqlen_k); // no mask
-    }
-    else
-    {
-        // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
-        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right);
-        mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // local
-    }
+    if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }  // causal=true is the same as causal=false in this case
 
     // TODO
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
@@ -256,6 +215,30 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
     const int total_q = q.size(0);
     const int total_k = k.size(0);
 
+    TORCH_CHECK(batch_size > 0, "batch size must be postive");
+    TORCH_CHECK(head_size_og <= 256, "CK only supports head dimension at most 256");
+    TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    if (window_size_left >= max_seqlen_k) { window_size_left = -1; }
+    if (window_size_right >= max_seqlen_k) { window_size_right = -1; }
+
+    mask_info mask;
+
+    if (is_causal) {
+        // Causal is the special case where window_size_right == 0 and window_size_left < 0.
+        window_size_right = 0;
+        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0";
+        mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // casual
+    }
+    else if (window_size_left == -1 && window_size_right == -1) {
+        mask = mask_info::decode("0", max_seqlen_q, max_seqlen_k); // no mask
+    }
+    else {
+        // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
+        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right);
+        mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // local
+    }
+
     CHECK_SHAPE(q, total_q, num_heads, head_size_og);
     CHECK_SHAPE(k, total_k, num_heads_k, head_size_og);
     CHECK_SHAPE(v, total_k, num_heads_k, head_size_og);
@@ -263,41 +246,34 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
     CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
 
     at::Tensor q_padded, k_padded, v_padded;
-    if (head_size_og % 8 != 0)
-    {
+    if (head_size_og % 8 != 0) {
         q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
         k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
         v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
     }
-    else
-    {
+    else {
         q_padded = q;
         k_padded = k;
         v_padded = v;
     }
 
-    auto round_multiple = [](int x, int m)
-    { return (x + m - 1) / m * m; };
-    const int head_size_8x = round_multiple(head_size_og, 8);
-
     at::Tensor out;
-    if (out_.has_value())
-    {
+    if (out_.has_value()) {
         out = out_.value();
         TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, total_q, num_heads, head_size_og);
 
-        if (head_size_og % 8 != 0)
-        {
-            out = torch::empty_like(q_padded);
-        }
+        if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
     }
-    else
-    {
+    else {
         out = torch::empty_like(q_padded);
     }
+
+    auto round_multiple = [](int x, int m)
+    { return (x + m - 1) / m * m; };
+    const int head_size_8x = round_multiple(head_size_og, 8);
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
@@ -312,10 +288,16 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
     softmax_lse = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(torch::kFloat32));
 
     at::Tensor p;
-    if (return_dropout_randval)
-    {
+    if (return_dropout_randval) {
         TORCH_CHECK(has_dropout, "return_dropout_randval require p_dropout > 0");
         p = torch::empty({num_heads, total_q, max_seqlen_k}, opts.dtype(torch::kUInt8));
+    }
+
+    if (zero_tensors)
+    {
+        out.zero_();
+        softmax_lse.fill_(-std::numeric_limits<float>::infinity());
+        if (return_softmax) {p.zero_();}
     }
 
     uint64_t drop_seed = 1;
@@ -324,19 +306,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
     auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
     // TODO - assign seed & offset to rng_state
 
-    if (zero_tensors)
-    {
-        out.zero_();
-        softmax_lse.fill_(-std::numeric_limits<float>::infinity());
-
-        if (return_dropout_randval)
-        {
-            p.zero_();
-        }
-    }
-
-    if (max_seqlen_k > 0)
-    {
+    if (max_seqlen_k > 0) {
         auto stream = at::cuda::getCurrentHIPStream().stream();
         ck_tile::stream_config stream_config{stream, false, 0, 0, 0};
 
@@ -369,21 +339,16 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
 
         fmha_fwd(traits, args, stream_config);
     }
-    else
-    {
+    else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
         out.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
     at::Tensor out_padded = out;
-    if (head_size_og % 8 != 0)
-    {
+    if (head_size_og % 8 != 0) {
         out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-        if (out_.has_value())
-        {
-            out_.value().copy_(out);
-        }
+        if (out_.has_value()) { out_.value().copy_(out); }
     }
 
     return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};

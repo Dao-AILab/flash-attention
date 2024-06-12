@@ -282,7 +282,6 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
 
     check_if_rocm_home_none("flash_attn")
-    # Check, if CUDA11 is installed for compute capability 8.0
     cc_flag = []
 
     archs = os.getenv("GPU_ARCHS", "native").split(";")
