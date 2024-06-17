@@ -267,7 +267,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     if not os.path.exists("./build"):
         os.makedirs("build")
 
-    os.system(f"python3 {ck_dir}/example/ck_tile/01_fmha/generate.py --output_dir build --receipt 2")
+    os.system(f"python3 {ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --output_dir build --receipt 2")
+    os.system(f"python3 {ck_dir}/example/ck_tile/01_fmha/generate.py -d bwd --output_dir build --receipt 2")
 
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
@@ -297,15 +298,17 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
     fa_sources = ["csrc/flash_attn_ck/flash_api.cpp",
                   "csrc/flash_attn_ck/mha_fwd.cpp",
+                  "csrc/flash_attn_ck/mha_bwd.cpp",
                   "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
-        f"build/fmha_fwd*.cpp"
+        f"build/fmha_*wd*.cpp"
     )
 
     rename_cpp_to_cu(fa_sources)
 
     sources = ["csrc/flash_attn_ck/flash_api.cu",
                "csrc/flash_attn_ck/mha_fwd.cu",
-               "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_fwd*.cu")
+               "csrc/flash_attn_ck/mha_bwd.cu",
+               "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
     extra_compile_args = {
         "cxx": ["-O3", "-std=c++17"] + generator_flag,
         "nvcc":

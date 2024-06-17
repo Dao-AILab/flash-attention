@@ -39,9 +39,30 @@ mha_varlen_fwd(at::Tensor &q,                            // total_q x num_heads 
                const bool return_softmax,
                c10::optional<at::Generator> gen_);
 
+std::vector<at::Tensor>
+mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num_heads, x head_size_og
+        const at::Tensor &q,                      // batch_size x seqlen_q x num_heads x head_size
+        const at::Tensor &k,                      // batch_size x seqlen_k x num_heads_k x head_size
+        const at::Tensor &v,                      // batch_size x seqlen_k x num_heads_k x head_size
+        const at::Tensor &out,                    // batch_size x seqlen_q x num_heads x head_size
+        const at::Tensor &softmax_lse,            // b x h x seqlen_q
+        c10::optional<at::Tensor> &dq_,           // batch_size x seqlen_q x num_heads x head_size
+        c10::optional<at::Tensor> &dk_,           // batch_size x seqlen_k x num_heads_k x head_size
+        c10::optional<at::Tensor> &dv_,           // batch_size x seqlen_k x num_heads_k x head_size
+        c10::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+        const float p_dropout,                    // probability to drop
+        const float softmax_scale,
+        const bool is_causal,
+        int window_size_left,
+        int window_size_right,
+        const bool deterministic,
+        c10::optional<at::Generator> gen_,
+        c10::optional<at::Tensor> &rng_state);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");
     m.def("varlen_fwd", &mha_varlen_fwd, "Forward pass (variable length)");
+    m.def("bwd", &mha_bwd, "Backward pass");
 }
