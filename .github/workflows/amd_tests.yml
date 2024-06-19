@@ -1,0 +1,79 @@
+name: AMD Perf Kernel Tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main_perf]
+  merge_group:
+    branches: [main_perf]
+    types: [checks_requested]
+  push:
+    branches: [main_perf, micmelesse/upstream_pr]
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+  Runner-Preparation-AMD:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      matrix-HIP: ${{ steps.set-matrix.outputs.matrix-HIP }}
+    steps:
+      - name: Prepare runner matrix
+        id: set-matrix
+        run: |
+          if [ x"${{ github.repository }}" == x"ROCm/flash-attention" ]; then
+            echo '::set-output name=matrix-HIP::[["self-hosted", "rocm"]]'
+          else
+            echo '::set-output name=matrix-HIP::[["ubuntu-latest"]]'
+          fi
+
+  Integration-Tests-AMD:
+    needs: Runner-Preparation-AMD
+    if: needs.Runner-Preparation-AMD.outputs.matrix-HIP != ''
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: ${{fromJson(needs.Runner-Preparation-AMD.outputs.matrix-HIP)}}
+    container:
+      image: rocm/pytorch:rocm6.0.2_ubuntu22.04_py3.10_pytorch_2.1.2
+      options: --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --group-add video --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Triton
+        run: |
+          pip uninstall -y triton
+          pip install matplotlib pandas pytest
+          git clone https://github.com/triton-lang/triton
+          cd triton
+          git checkout 2e9f2c2d20601c24b91a4c32a7b97ad1f8a55d88 
+          pip install --verbose -e python
+          cd ..
+      - name: Build
+        run: |
+          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+          python setup.py install
+      - name: Flash Attention Tests Using Reference Impl
+        run: |
+          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+          export FLASH_ATTENTION_TRITON_AMD_REF=1
+          pytest tests/test_flash_attn_triton_amd.py
+      - name: Flash Attention Tests
+        run: |
+          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+          export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0
+          pytest tests/test_flash_attn_triton_amd.py
+      - name: AMD Kernel Tests
+        run: |
+          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+          export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0
+          pytest -v -s flash_attn/flash_attn_triton_amd/test.py
+      - name: AMD Kernel Bench
+        run: |
+          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+          python flash_attn/flash_attn_triton_amd/bench.py

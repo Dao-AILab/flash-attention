@@ -585,10 +585,10 @@ def get_dropout_fraction(
 @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128])
-# @pytest.mark.parametrize("d", [32])
+# @pytest.mark.parametrize("d", [64])
 # @pytest.mark.parametrize('seqlen', [128, 256, 384, 512, 768, 1024, 2048])
 @pytest.mark.parametrize("seqlen", [97, 128, 200, 384, 768, 1024, 1025, 2048])
-# @pytest.mark.parametrize("seqlen", [128])
+# @pytest.mark.parametrize("seqlen", [512])
 # @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 @pytest.mark.parametrize("dropout_p", [0.0])
 def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype):
@@ -746,7 +746,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32])
 @pytest.mark.parametrize("seqlen", [97, 128, 200, 257, 384, 512, 768, 1025, 2048])
-# @pytest.mark.parametrize('seqlen', [128])
+# @pytest.mark.parametrize('seqlen', [2])
 # @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 @pytest.mark.parametrize('dropout_p', [0.0])
 def test_flash_attn_varlen_qkvpacked(
