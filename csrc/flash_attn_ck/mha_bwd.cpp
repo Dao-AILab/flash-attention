@@ -181,7 +181,7 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         int window_size_left,
         int window_size_right,
         const bool deterministic,
-        c10::optional<at::Generator>,
+        c10::optional<at::Generator> gen_,
         c10::optional<at::Tensor> &rng_state)
 {
 #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -190,8 +190,7 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
     if (is_causal) { window_size_right = 0; }
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_gfx94x = dprops->major == 9 && dprops->minor == 4;
-    TORCH_CHECK(is_gfx94x,
-                "FlashAttention only supports AMD MI300 GPUs.");
+    TORCH_CHECK(is_gfx94x, "FlashAttention only supports AMD MI300 GPUs.");
 
     bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentHIPStream().stream();
@@ -294,13 +293,11 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         dout_padded = dout;
     }
 
-    // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
-
     // TODO - CK does not support dq_accum
 
     at::Tensor dk_expanded, dv_expanded;
@@ -312,9 +309,24 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         dv_expanded = dv;
     }
 
-    // TODO - get seed and offset from rng_state
-    uint64_t drop_seed = 1;
-    uint64_t drop_offset = 0;
+    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+        gen_, at::cuda::detail::getDefaultCUDAGenerator());
+
+    uint64_t drop_seed = 1, drop_offset = 0;
+    int64_t counter_offset = batch_size * num_heads * 64;
+
+    if (rng_state.has_value()) {
+        uint64_t* d = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
+        drop_seed = d[0];
+        drop_offset = d[1];
+    } else if(is_dropout) {
+        // See Note [Acquire lock when using random generators]
+        std::lock_guard<std::mutex> lock(gen->mutex_);
+        auto philox_args = gen->philox_cuda_state(counter_offset);
+        auto seed_offset = unpack(philox_args);
+        drop_seed = std::get<0>(seed_offset);
+        drop_offset = std::get<1>(seed_offset);
+    }
 
     if (seqlen_q > 0) {
         ck_tile::stream_config stream_config{stream, false, 0, 0, 0};

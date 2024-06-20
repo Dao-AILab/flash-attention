@@ -164,7 +164,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
                int window_size_left,
                int window_size_right,
                const bool return_dropout_randval,
-               c10::optional<at::Generator> /*gen_*/)
+               c10::optional<at::Generator> gen_)
 {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_gfx94x = dprops->major == 9 && dprops->minor == 4;
@@ -271,8 +271,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         out = torch::empty_like(q_padded);
     }
 
-    auto round_multiple = [](int x, int m)
-    { return (x + m - 1) / m * m; };
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size_8x = round_multiple(head_size_og, 8);
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -300,11 +299,24 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         if (return_dropout_randval) {p.zero_();}
     }
 
-    uint64_t drop_seed = 1;
-    uint64_t drop_offset = 0;
+    uint64_t drop_seed = 1, drop_offset = 0;
+    int64_t counter_offset = batch_size * num_heads * 64;
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
-    // TODO - assign seed & offset to rng_state
+
+    if (p_dropout > 0.0)  {
+        auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+            gen_, at::cuda::detail::getDefaultCUDAGenerator());
+        // See Note [Acquire lock when using random generators]
+        std::lock_guard<std::mutex> lock(gen->mutex_);
+        auto philox_args = gen->philox_cuda_state(counter_offset);
+        auto seed_offset = unpack(philox_args);
+        drop_seed = std::get<0>(seed_offset);
+        drop_offset = std::get<1>(seed_offset);
+    }
+
+    rng_state[0] = *(reinterpret_cast<int64_t*>(&drop_seed));
+    rng_state[1] = *(reinterpret_cast<int64_t*>(&drop_offset));
 
     if (max_seqlen_k > 0) {
         auto stream = at::cuda::getCurrentHIPStream().stream();
