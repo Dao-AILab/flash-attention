@@ -108,7 +108,6 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
     g = torch.randn_like(out)
-
     if d <= 128 and d % 2 == 0:
         (dqkv,) = torch.autograd.grad(out, qkv, g)
         (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g)
@@ -239,3 +238,22 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi,
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+
+    g = torch.randn_like(out)
+    if d <= 128 and d % 2 == 0:
+        (dqkv_unpad,) = torch.autograd.grad(out, qkv_unpad, g)
+        dqkv = dqkv_pad_fn(dqkv_unpad)
+        (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g)
+        (dqkv_pt,) = torch.autograd.grad(out_pt, qkv, g)
+        print(f"dQ max diff: {(dqkv[:, :, 0] - dqkv_ref[:, :, 0]).abs().max().item()}")
+        print(f"dK max diff: {(dqkv[:, :, 1] - dqkv_ref[:, :, 1]).abs().max().item()}")
+        print(f"dV max diff: {(dqkv[:, :, 2] - dqkv_ref[:, :, 2]).abs().max().item()}")
+        print(f"dQKV mean diff: {(dqkv - dqkv_ref).abs().mean().item()}")
+        print(f"dQ Pytorch max diff: {(dqkv_pt[:, :, 0] - dqkv_ref[:, :, 0]).abs().max().item()}")
+        print(f"dK Pytorch max diff: {(dqkv_pt[:, :, 1] - dqkv_ref[:, :, 1]).abs().max().item()}")
+        print(f"dV Pytorch max diff: {(dqkv_pt[:, :, 2] - dqkv_ref[:, :, 2]).abs().max().item()}")
+        print(f"dQKV Pytorch mean diff: {(dqkv_pt - dqkv_ref).abs().mean().item()}")
+
+        # TODO - use 5 times to check, wait for ck to change dq type to f32
+        assert (dqkv - dqkv_ref).abs().max().item() <= 5 * (dqkv_pt - dqkv_ref).abs().max().item()
+

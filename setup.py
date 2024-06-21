@@ -297,8 +297,9 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
     fa_sources = ["csrc/flash_attn_ck/flash_api.cpp",
-                  "csrc/flash_attn_ck/mha_fwd.cpp",
                   "csrc/flash_attn_ck/mha_bwd.cpp",
+                  "csrc/flash_attn_ck/mha_fwd.cpp",
+                  "csrc/flash_attn_ck/mha_varlen_bwd.cpp",
                   "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
         f"build/fmha_*wd*.cpp"
     )
@@ -306,8 +307,9 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     rename_cpp_to_cu(fa_sources)
 
     sources = ["csrc/flash_attn_ck/flash_api.cu",
-               "csrc/flash_attn_ck/mha_fwd.cu",
                "csrc/flash_attn_ck/mha_bwd.cu",
+               "csrc/flash_attn_ck/mha_fwd.cu",
+               "csrc/flash_attn_ck/mha_varlen_bwd.cu",
                "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
     extra_compile_args = {
         "cxx": ["-O3", "-std=c++17"] + generator_flag,
@@ -326,6 +328,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                 "-DCK_USE_XDL",
                 "-DUSE_PROF_API=1",
                 "-D__HIP_PLATFORM_HCC__=1",
+                # "-DFLASHATTENTION_DISABLE_BACKWARD",
             ]
             + generator_flag
             + cc_flag
