@@ -317,8 +317,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
         out.zero_();
-        if (return_dropout_randval)
-            softmax_lse.fill_(std::numeric_limits<float>::infinity());
+        softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
     at::Tensor out_padded = out;
