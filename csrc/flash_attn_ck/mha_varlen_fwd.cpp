@@ -80,8 +80,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
     ck_tile::index_t batch_stride_v = 0;
     ck_tile::index_t batch_stride_o = 0;
 
-    ck_tile::index_t batch_stride_bias = 0;
-    ck_tile::index_t batch_stride_lse = 0;
+    ck_tile::index_t batch_stride_lse = has_lse ? softmax_lse.stride(0) : 0;
     ck_tile::index_t batch_stride_randval = 0;
 
     void *alibi_slopes_ptr = nullptr;
@@ -105,7 +104,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          out.data_ptr(),
                          seqlens_q.data_ptr(), // seqstart_q
                          seqlens_k.data_ptr(), // seqstart_k
-                         nullptr,              // seqlen_kpads ?!!!!!!!!!!!!!!!!!!!!!!!!
+                         nullptr,              // seqlen_kpads
                          total_q,
                          total_k,
                          b,
@@ -323,7 +322,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         ck_tile::stream_config stream_config{stream, false, 0, 0, 0};
 
         auto traits =
-            get_ck_fmha_varlen_fwd_traits(mask, q_dtype_str, head_size_8x, has_dropout, return_dropout_randval, alibi_slopes_.has_value());
+            get_ck_fmha_varlen_fwd_traits(mask, q_dtype_str, head_size_8x, has_dropout, has_lse, alibi_slopes_.has_value());
 
         auto args =
             get_ck_fmha_varlen_fwd_args(
