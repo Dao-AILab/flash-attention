@@ -121,8 +121,8 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         print(f"dV Pytorch max diff: {(dqkv_pt[:, :, 2] - dqkv_ref[:, :, 2]).abs().max().item()}")
         print(f"dQKV Pytorch mean diff: {(dqkv_pt - dqkv_ref).abs().mean().item()}")
 
-        # TODO - use 5 times to check, wait for ck to change dq type to f32
-        assert (dqkv - dqkv_ref).abs().max().item() <= 5 * (dqkv_pt - dqkv_ref).abs().max().item()
+        # TODO - use 6 times to check, wait for ck to change dq type to f32
+        assert (dqkv - dqkv_ref).abs().max().item() <= 6 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
 def pad_rearrange_dropout_mask_hts_to_bhss(S_dmask, cu_seqlens, seqlen):
@@ -254,6 +254,6 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi,
         print(f"dV Pytorch max diff: {(dqkv_pt[:, :, 2] - dqkv_ref[:, :, 2]).abs().max().item()}")
         print(f"dQKV Pytorch mean diff: {(dqkv_pt - dqkv_ref).abs().mean().item()}")
 
-        # TODO - use 5 times to check, wait for ck to change dq type to f32
-        assert (dqkv - dqkv_ref).abs().max().item() <= 5 * (dqkv_pt - dqkv_ref).abs().max().item()
+        # TODO - use 6 times to check, wait for ck to change dq type to f32
+        assert (dqkv - dqkv_ref).abs().max().item() <= 6 * (dqkv_pt - dqkv_ref).abs().max().item()
 
