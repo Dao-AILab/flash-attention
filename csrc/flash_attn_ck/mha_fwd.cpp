@@ -259,7 +259,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     }
 
     uint64_t drop_seed = 1, drop_offset = 0;
-    int64_t counter_offset = batch_size * num_heads * 64;
+    int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
 

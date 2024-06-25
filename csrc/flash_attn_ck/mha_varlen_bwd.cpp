@@ -335,7 +335,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
     uint64_t drop_seed = 1, drop_offset = 0;
-    int64_t counter_offset = batch_size * num_heads * 64;
+    int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
 
     if (rng_state.has_value()) {
         uint64_t* d = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
