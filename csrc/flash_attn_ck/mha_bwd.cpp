@@ -320,7 +320,7 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         auto philox_args = gen->philox_cuda_state(counter_offset);
-        std::tie(drop_seed, drop_offset) = unpack(philox_args);
+        std::tie(drop_seed, drop_offset) = flash::unpack(philox_args);
     }
 
     if (seqlen_q > 0) {
