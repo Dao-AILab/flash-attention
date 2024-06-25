@@ -188,9 +188,6 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
     TORCH_CHECK(false, "This flash attention build does not support backward.");
 #endif
     if (is_causal) { window_size_right = 0; }
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_gfx94x = dprops->major == 9 && dprops->minor == 4;
-    TORCH_CHECK(is_gfx94x, "FlashAttention only supports AMD MI300 GPUs.");
 
     bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentHIPStream().stream();

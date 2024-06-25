@@ -154,11 +154,6 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         const bool return_dropout_randval,
         c10::optional<at::Generator> gen_)
 {
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_gfx94x = dprops->major == 9 && dprops->minor == 4;
-    TORCH_CHECK(is_gfx94x,
-                "FlashAttention only supports AMD MI300 GPUs.");
-
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
