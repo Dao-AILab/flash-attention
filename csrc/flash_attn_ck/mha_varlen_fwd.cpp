@@ -309,9 +309,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         auto philox_args = gen->philox_cuda_state(counter_offset);
-        auto seed_offset = unpack(philox_args);
-        drop_seed = std::get<0>(seed_offset);
-        drop_offset = std::get<1>(seed_offset);
+        std::tie(drop_seed, drop_offset) = unpack(philox_args);
     }
 
     rng_state[0] = *(reinterpret_cast<int64_t*>(&drop_seed));
