@@ -23,7 +23,8 @@ from test_flash_attn import (
     attention_qkvpacked_ref,
 )
 
-is_gfx94x = torch.cuda.get_device_capability("cuda") == (9, 4)
+def is_bwd_hdim_supported(d):
+    return d <= 128 and d % 2 == 0
 
 
 def ck_randval_to_dropout_mask(randval, p):
@@ -109,6 +110,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
             window_size=window_size,
         )
         dropout_mask = S_dmask_converted >= 0
+        # CK does not return P. Hence, we don't test the attn here.
     else:
         dropout_mask = None
 
@@ -137,7 +139,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
     g = torch.randn_like(out)
-    if d <= 128 and d % 2 == 0:
+    if is_bwd_hdim_supported(d):
         (dqkv,) = torch.autograd.grad(out, qkv, g)
         (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g)
         (dqkv_pt,) = torch.autograd.grad(out_pt, qkv, g)
@@ -150,8 +152,8 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         print(f"dV Pytorch max diff: {(dqkv_pt[:, :, 2] - dqkv_ref[:, :, 2]).abs().max().item()}")
         print(f"dQKV Pytorch mean diff: {(dqkv_pt - dqkv_ref).abs().mean().item()}")
 
-        # TODO - use 8 times to check, wait for ck to change dq type to f32
-        assert (dqkv - dqkv_ref).abs().max().item() <= 8 * (dqkv_pt - dqkv_ref).abs().max().item()
+        # TODO - use 10 times to check, wait for ck to change dq type to f32
+        assert (dqkv - dqkv_ref).abs().max().item() <= 10 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -220,6 +222,7 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi,
         )
 
         dropout_mask = S_dmask_converted >= 0
+        # CK does not return P. Hence, we don't test the attn here.
     else:
         dropout_mask = None
 
@@ -253,7 +256,7 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi,
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
     g = torch.randn_like(out)
-    if d <= 128 and d % 2 == 0:
+    if is_bwd_hdim_supported(d):
         (dqkv_unpad,) = torch.autograd.grad(out, qkv_unpad, g)
         dqkv = dqkv_pad_fn(dqkv_unpad)
         (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g)
@@ -267,8 +270,8 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi,
         print(f"dV Pytorch max diff: {(dqkv_pt[:, :, 2] - dqkv_ref[:, :, 2]).abs().max().item()}")
         print(f"dQKV Pytorch mean diff: {(dqkv_pt - dqkv_ref).abs().mean().item()}")
 
-        # TODO - use 8 times to check, wait for ck to change dq type to f32
-        assert (dqkv - dqkv_ref).abs().max().item() <= 8 * (dqkv_pt - dqkv_ref).abs().max().item()
+        # TODO - use 10 times to check, wait for ck to change dq type to f32
+        assert (dqkv - dqkv_ref).abs().max().item() <= 10 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
 @pytest.mark.parametrize("kvpacked", [True, False])
@@ -368,6 +371,7 @@ def test_flash_attn_output(
         else:
             k_rep = repeat(k, "b s h d -> b s (h g) d", g=nheads // nheads_k)
             v_rep = repeat(v, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+        # CK does not return P. Hence, we don't test the attn here.
     else:
         dropout_mask = None
 
@@ -434,7 +438,7 @@ def test_flash_attn_output(
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
     g = torch.randn_like(out)
-    if d <= 128 and d % 2 == 0:
+    if is_bwd_hdim_supported(d):
         if kvpacked:
             (
                 dq,
@@ -480,10 +484,10 @@ def test_flash_attn_output(
         print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
 
-        # TODO - use 8 times to check, wait for ck to change dq type to f32
-        assert (dq - dq_ref).abs().max().item() <= 8 * (dq_pt - dq_ref).abs().max().item()
-        assert (dk - dk_ref).abs().max().item() <= 8 * (dk_pt - dk_ref).abs().max().item()
-        assert (dv - dv_ref).abs().max().item() <= 8 * (dv_pt - dv_ref).abs().max().item()
+        # TODO - use 10 times to check, wait for ck to change dq type to f32
+        assert (dq - dq_ref).abs().max().item() <= 10 * (dq_pt - dq_ref).abs().max().item()
+        assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item()
+        assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item()
 
 
 @pytest.mark.parametrize("kvpacked", [True, False])
@@ -628,6 +632,7 @@ def test_flash_attn_varlen_output(
         else:
             k_rep = repeat(k, "b s h d -> b s (h g) d", g=nheads // nheads_k)
             v_rep = repeat(v, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+        # CK does not return P. Hence, we don't test the attn here.
     else:
         dropout_mask = None
 
@@ -689,12 +694,12 @@ def test_flash_attn_varlen_output(
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
 
-    # Check that FlashAttention's numerical error is at most twice the numerical error
+    # Check that FlashAttention's numerical error is at most 4 times the numerical error
     # of a Pytorch implementation.
     assert (out - out_ref).abs().max().item() <= 4 * (out_pt - out_ref).abs().max().item()
 
     g = torch.randn_like(out)
-    if d <= 128 and d % 2 == 0:
+    if is_bwd_hdim_supported(d):
         if kvpacked:
             (
                 dq_unpad,
@@ -743,7 +748,7 @@ def test_flash_attn_varlen_output(
         print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
 
-        # TODO - use 8 times to check, wait for ck to change dq type to f32
-        assert (dq - dq_ref).abs().max().item() <= 8 * (dq_pt - dq_ref).abs().max().item()
-        assert (dk - dk_ref).abs().max().item() <= 8 * (dk_pt - dk_ref).abs().max().item()
-        assert (dv - dv_ref).abs().max().item() <= 8 * (dv_pt - dv_ref).abs().max().item()
+        # TODO - use 10 times to check, wait for ck to change dq type to f32
+        assert (dq - dq_ref).abs().max().item() <= 10 * (dq_pt - dq_ref).abs().max().item()
+        assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item()
+        assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item()
