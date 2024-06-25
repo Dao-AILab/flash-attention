@@ -21,6 +21,8 @@
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+// Copy from PyTorch
+// https://github.com/pytorch/pytorch/blob/8b61daaf7349e9102117e1aeefaa51666d887547/aten/src/ATen/cuda/detail/UnpackRaw.cuh#L17
 static std::tuple<uint64_t, uint64_t> unpack(at::PhiloxCudaState arg) {
   if (arg.captured_) {
     // static_cast avoids "warning: invalid narrowing conversion from "long" to "unsigned long".
