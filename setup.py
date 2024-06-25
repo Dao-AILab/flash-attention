@@ -107,7 +107,7 @@ def rename_cpp_to_cu(cpp_files):
 
 def validate_and_update_archs(archs):
     # List of allowed architectures
-    allowed_archs = ["native", "gfx942"]
+    allowed_archs = ["native", "gfx942", "gfx90a"]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -296,21 +296,21 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
-    fa_sources = ["csrc/flash_attn_ck/flash_api.cpp",
-                  "csrc/flash_attn_ck/mha_bwd.cpp",
-                  "csrc/flash_attn_ck/mha_fwd.cpp",
-                  "csrc/flash_attn_ck/mha_varlen_bwd.cpp",
-                  "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
+    sources = ["csrc/flash_attn_ck/flash_api.cpp",
+               "csrc/flash_attn_ck/mha_bwd.cpp",
+               "csrc/flash_attn_ck/mha_fwd.cpp",
+               "csrc/flash_attn_ck/mha_varlen_bwd.cpp",
+               "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
         f"build/fmha_*wd*.cpp"
     )
 
-    rename_cpp_to_cu(fa_sources)
+    rename_cpp_to_cu(sources)
 
-    sources = ["csrc/flash_attn_ck/flash_api.cu",
-               "csrc/flash_attn_ck/mha_bwd.cu",
-               "csrc/flash_attn_ck/mha_fwd.cu",
-               "csrc/flash_attn_ck/mha_varlen_bwd.cu",
-               "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
+    renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
+                       "csrc/flash_attn_ck/mha_bwd.cu",
+                       "csrc/flash_attn_ck/mha_fwd.cu",
+                       "csrc/flash_attn_ck/mha_varlen_bwd.cu",
+                       "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
     extra_compile_args = {
         "cxx": ["-O3", "-std=c++17"] + generator_flag,
         "nvcc":
@@ -344,7 +344,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     ext_modules.append(
         CUDAExtension(
             name="flash_attn_2_cuda",
-            sources=sources,
+            sources=renamed_sources,
             extra_compile_args=extra_compile_args,
             include_dirs=include_dirs,
         )
