@@ -327,7 +327,7 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
     }
 
     if (seqlen_q > 0) {
-        ck_tile::stream_config stream_config{stream, false, 0, 0, 0};
+        ck_tile::stream_config stream_config{stream};
         dq.zero_(); // ck use atomic operation on dq
 
         auto traits =

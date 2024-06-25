@@ -352,7 +352,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     }
 
     if (max_seqlen_q > 0) {
-        ck_tile::stream_config stream_config{stream, false, 0, 0, 0};
+        ck_tile::stream_config stream_config{stream};
         dq.zero_(); // ck use atomic operation on dq
 
         auto traits =

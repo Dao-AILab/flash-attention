@@ -282,7 +282,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
 
     if (seqlen_k > 0) {
         auto stream = at::cuda::getCurrentHIPStream().stream();
-        ck_tile::stream_config stream_config{stream, false, 0, 0, 0};
+        ck_tile::stream_config stream_config{stream};
 
         auto traits =
             get_ck_fmha_fwd_traits(mask, q_dtype_str, head_size_8x, has_dropout, has_lse, alibi_slopes_.has_value());
