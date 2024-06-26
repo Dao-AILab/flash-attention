@@ -107,7 +107,7 @@ def rename_cpp_to_cu(cpp_files):
 
 def validate_and_update_archs(archs):
     # List of allowed architectures
-    allowed_archs = ["native", "gfx942", "gfx90a"]
+    allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942"]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
