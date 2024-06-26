@@ -76,7 +76,6 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
     ck_tile::index_t batch_stride_v = v.stride(0);
     ck_tile::index_t batch_stride_o = out.stride(0);
 
-    ck_tile::index_t batch_stride_bias = 0;
     ck_tile::index_t batch_stride_lse = has_lse ? softmax_lse.stride(0) : 0;
     ck_tile::index_t batch_stride_randval = has_dropout_randval ? dropout_randval.stride(0) : 0;
 
@@ -153,13 +152,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         int window_size_left,
         int window_size_right,
         const bool return_dropout_randval,
-        c10::optional<at::Generator> /*gen_*/)
+        c10::optional<at::Generator> gen_)
 {
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_gfx94x = dprops->major == 9 && dprops->minor == 4;
-    TORCH_CHECK(is_gfx94x,
-                "FlashAttention only supports AMD MI300 GPUs.");
-
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
@@ -264,15 +258,26 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         p = torch::empty({batch_size, num_heads, seqlen_q, seqlen_k}, opts.dtype(torch::kUInt8));
     }
 
-    uint64_t drop_seed = 1;
-    uint64_t drop_offset = 0;
+    uint64_t drop_seed = 1, drop_offset = 0;
+    int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
-    // TODO - assign seed & offset to rng_state
+
+    if (p_dropout > 0.0)  {
+        auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+            gen_, at::cuda::detail::getDefaultCUDAGenerator());
+        // See Note [Acquire lock when using random generators]
+        std::lock_guard<std::mutex> lock(gen->mutex_);
+        auto philox_args = gen->philox_cuda_state(counter_offset);
+        std::tie(drop_seed, drop_offset) = flash::unpack(philox_args);
+    }
+
+    rng_state[0] = *(reinterpret_cast<int64_t*>(&drop_seed));
+    rng_state[1] = *(reinterpret_cast<int64_t*>(&drop_offset));
 
     if (seqlen_k > 0) {
         auto stream = at::cuda::getCurrentHIPStream().stream();
-        ck_tile::stream_config stream_config{stream, false, 0, 0, 0};
+        ck_tile::stream_config stream_config{stream};
 
         auto traits =
             get_ck_fmha_fwd_traits(mask, q_dtype_str, head_size_8x, has_dropout, has_lse, alibi_slopes_.has_value());
@@ -305,8 +310,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
         out.zero_();
-        if (return_dropout_randval)
-            softmax_lse.fill_(std::numeric_limits<float>::infinity());
+        softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
     at::Tensor out_padded = out;
