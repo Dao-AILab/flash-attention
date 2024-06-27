@@ -1151,6 +1151,7 @@ def test_flash_attn_varlen_output(
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+
     if kvpacked:
         kv = torch.randn(
             batch_size, seqlen_k, 2, nheads_k, d, device=device, dtype=dtype, requires_grad=True
@@ -1918,9 +1919,11 @@ def test_flash_attn_kvcache(
     cache_seqlens = torch.randint(
         0 if new_kv else 1,
         # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
-        (seqlen_k - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)
-        if new_kv
-        else (seqlen_k + 1),
+        (
+            (seqlen_k - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)
+            if new_kv
+            else (seqlen_k + 1)
+        ),
         (batch_size,),
         dtype=torch.int32,
         device=device,

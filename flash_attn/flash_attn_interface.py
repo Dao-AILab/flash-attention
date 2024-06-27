@@ -130,7 +130,12 @@ def _flash_attn_backward(
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    dq, dk, dv, softmax_d, = flash_attn_cuda.bwd(
+    (
+        dq,
+        dk,
+        dv,
+        softmax_d,
+    ) = flash_attn_cuda.bwd(
         dout,
         q,
         k,
@@ -178,7 +183,12 @@ def _flash_attn_varlen_backward(
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    dq, dk, dv, softmax_d, = flash_attn_cuda.varlen_bwd(
+    (
+        dq,
+        dk,
+        dv,
+        softmax_d,
+    ) = flash_attn_cuda.varlen_bwd(
         dout,
         q,
         k,
@@ -883,7 +893,7 @@ def flash_attn_varlen_qkvpacked_func(
            (they might not have the right scaling).
     Return:
         out: (total, nheads, headdim).
-        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
+        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
         S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
@@ -968,7 +978,7 @@ def flash_attn_varlen_kvpacked_func(
            (they might not have the right scaling).
     Return:
         out: (total, nheads, headdim).
-        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
+        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
         S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
@@ -1056,7 +1066,7 @@ def flash_attn_varlen_func(
            (they might not have the right scaling).
     Return:
         out: (total, nheads, headdim).
-        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
+        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
         S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
