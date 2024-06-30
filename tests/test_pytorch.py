@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import time
-from flash_attn.flash_attn_interface import (
+from flash_attn import (
     flash_attn_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
@@ -25,7 +25,7 @@ query = torch.rand(32, 8, 128, 64, dtype=torch.float16, device="cuda")
 key = torch.rand(32, 8, 128, 64, dtype=torch.float16, device="cuda")
 value = torch.rand(32, 8, 128, 64, dtype=torch.float16, device="cuda")
 with torch.backends.cuda.sdp_kernel(enable_math=False):
-    output, weight_output = F.scaled_dot_product_attention(query,key,value)
+    output = F.scaled_dot_product_attention(query,key,value)
 
 print(output.shape)
 
