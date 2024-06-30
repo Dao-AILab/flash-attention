@@ -27,7 +27,16 @@ value = torch.rand(32, 8, 128, 64, dtype=torch.float16, device="cuda")
 with torch.backends.cuda.sdp_kernel(enable_math=False):
     output = F.scaled_dot_product_attention(query,key,value)
 
-print(output.shape)
+print(f"pytorch implementaion of flashAttention is output.shape")
+
+out, lse, S_dmask = flash_attn_func(
+            q,
+            k,
+            v,
+            deterministic=deterministic,
+            return_attn_probs=True,
+        )
+print(f"Tri version of flashAttention: \n out.shape")
 
 
 # Function to measure time and memory
