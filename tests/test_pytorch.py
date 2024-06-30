@@ -21,7 +21,7 @@ def benchmark_torch_function_in_microseconds(f, *args, **kwargs):
     )
     return t0.blocked_autorange().mean * 1e6
 
-def measure_time_and_memory(func, *args):
+def measure_time_and_memory(func, *args, **kwargs):
     torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
     output = func(*args)
