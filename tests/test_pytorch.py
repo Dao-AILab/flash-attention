@@ -46,7 +46,7 @@ with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
         measure_time_and_memory(F.scaled_dot_product_attention, q, k, v)
 
 print(f"pytorch implementaion of flashAttention \n {torch_output.shape}")
-print(f"pytorch implementaion time is \n {torch_time.shape}, memory use is {torch_mem}")
+print(f"pytorch implementaion time is \n {torch_time}, memory use is {torch_mem}")
 
 
 
@@ -56,7 +56,7 @@ tri_time, tri_mem, tri_output = \
 tri_out, tri_lse, tri_S_dmask = tri_output
 
 print(f"Tri version of flashAttention: \n {tri_out.shape}")
-print(f"Tri implementaion time is \n {tri_time.shape}, memory use is {tri_mem}")
+print(f"Tri implementaion time is \n {tri_time}, memory use is {tri_mem}")
 
 
 
