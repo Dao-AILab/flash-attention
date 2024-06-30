@@ -57,7 +57,7 @@ tri_time, tri_mem, tri_output = \
 print(f"Tri version of flashAttention: \n {tri_output.shape}")
 print(f"Tri implementaion time is \n {tri_time}, memory use is {tri_mem}")
 
-
-print(f"diff of output {torch_output - tri_output}")
+diff_output = (torch_output - tri_output).abs().max().item()
+print(f"diff of output {diff_output}")
 
 
