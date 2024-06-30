@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 import torch.utils.benchmark as benchmark
-
+import pdb
 import time
 from flash_attn import (
     flash_attn_func,
@@ -53,6 +53,7 @@ print(f"pytorch implementaion time is \n {torch_time}, memory use is {torch_mem}
 # test for tri version of flash-attention
 tri_time, tri_mem, tri_output = \
         measure_time_and_memory(flash_attn_func, q, k, v, deterministic=True, return_attn_probs=True,)
+pdb.set_trace()
 tri_out, tri_attention = tri_output
 
 print(f"Tri version of flashAttention: \n {tri_out.shape}")
