@@ -41,19 +41,19 @@ v = torch.rand(32, 8, 128, 64, dtype=torch.float16, device="cuda")
 
 # test for pytorch version of flash-attention
 with torch.backends.cuda.sdp_kernel(enable_math=False):
-    output = F.scaled_dot_product_attention(q,k,v)
+    torch_output = F.scaled_dot_product_attention(q,k,v)
 
-print(f"pytorch implementaion of flashAttention is output.shape")
+print(f"pytorch implementaion of flashAttention is {torch_output.shape}")
 
 
 # test for tri version of flash-attention
-out, lse, S_dmask = flash_attn_func(
+tri_out, tri_lse, tri_S_dmask = flash_attn_func(
             q,
             k,
             v,
             deterministic=True,
             return_attn_probs=True,
         )
-print(f"Tri version of flashAttention: \n out.shape")
+print(f"Tri version of flashAttention: \n {tri_out.shape}")
 
 
