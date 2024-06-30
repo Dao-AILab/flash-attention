@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 import torch.utils.benchmark as benchmark
 
 import time
@@ -40,10 +41,11 @@ k = torch.rand(32, 8, 128, 64, dtype=torch.float16, device="cuda")
 v = torch.rand(32, 8, 128, 64, dtype=torch.float16, device="cuda")
 
 # test for pytorch version of flash-attention
-with torch.backends.cuda.sdp_kernel(enable_math=False):
-    torch_output = F.scaled_dot_product_attention(q,k,v)
+with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+    torch_time, torch_mem, torch_output = \
+        measure_time_and_memory(F.scaled_dot_product_attention(), q, k, v)
 
-print(f"pytorch implementaion of flashAttention is {torch_output.shape}")
+print(f"pytorch implementaion of flashAttention \n {torch_output.shape}")
 
 
 # test for tri version of flash-attention
