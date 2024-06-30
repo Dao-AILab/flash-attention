@@ -33,7 +33,7 @@ out, lse, S_dmask = flash_attn_func(
             q,
             k,
             v,
-            deterministic=deterministic,
+            deterministic=True,
             return_attn_probs=True,
         )
 print(f"Tri version of flashAttention: \n out.shape")
