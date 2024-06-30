@@ -53,7 +53,7 @@ print(f"pytorch implementaion time is \n {torch_time}, memory use is {torch_mem}
 # test for tri version of flash-attention
 tri_time, tri_mem, tri_output = \
         measure_time_and_memory(flash_attn_func, q, k, v, deterministic=True, return_attn_probs=True,)
-tri_out, tri_lse, tri_S_dmask = tri_output
+tri_out, tri_attention = tri_output
 
 print(f"Tri version of flashAttention: \n {tri_out.shape}")
 print(f"Tri implementaion time is \n {tri_time}, memory use is {tri_mem}")
