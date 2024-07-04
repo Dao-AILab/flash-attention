@@ -25,6 +25,7 @@ from torch.utils.cpp_extension import (
     CUDAExtension,
     CUDA_HOME,
     ROCM_HOME,
+    IS_HIP_EXTENSION,
 )
 
 
@@ -34,6 +35,19 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
+
+BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
+
+if BUILD_TARGET == "auto":
+    if IS_HIP_EXTENSION:
+        IS_ROCM = True
+    else:
+        IS_ROCM = False
+else:
+    if BUILD_TARGET == "cuda":
+        IS_ROCM = False
+    elif BUILD_TARGET == "rocm":
+        IS_ROCM = True
 
 PACKAGE_NAME = "flash_attn"
 
@@ -118,24 +132,12 @@ def validate_and_update_archs(archs):
 cmdclass = {}
 ext_modules = []
 
-IS_ROCM = False
-if not SKIP_CUDA_BUILD:
-    if torch.cuda.is_available():
-        device_name = torch.cuda.get_device_name(0)
-        if "ROC" in device_name or "AMD" in device_name:  # AMD ROCm device
-            print("Detected ROCm device:", device_name)
-            IS_ROCM = True
-        elif "NVIDIA" in device_name:  # NVIDIA CUDA device
-            print("Detected CUDA device:", device_name)
-        else:
-            print("Unknown GPU device:", device_name)
-
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
-if not IS_ROCM:
-    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
-else:
+if IS_ROCM:
     subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"])
+else:
+    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 if not SKIP_CUDA_BUILD and not IS_ROCM:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
