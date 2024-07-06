@@ -1051,51 +1051,51 @@ def test_flash_attn_output(
 
     g = torch.randn_like(out)
     do_o = (g.float() * out.float()).sum(-1)
-    # if (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
-    #     if kvpacked:
-    #         (
-    #             dq,
-    #             dkv,
-    #         ) = torch.autograd.grad(out, (q, kv), g)
-    #         dk, dv = dkv.unbind(2)
-    #         (
-    #             dq_ref,
-    #             dkv_ref,
-    #         ) = torch.autograd.grad(out_ref, (q, kv), g)
-    #         dk_ref, dv_ref = dkv_ref.unbind(2)
-    #         (
-    #             dq_pt,
-    #             dkv_pt,
-    #         ) = torch.autograd.grad(out_pt, (q, kv), g)
-    #         dk_pt, dv_pt = dkv_pt.unbind(2)
-    #     else:
-    #         (
-    #             dq,
-    #             dk,
-    #             dv,
-    #         ) = torch.autograd.grad(out, (q, k, v), g)
-    #         (
-    #             dq_ref,
-    #             dk_ref,
-    #             dv_ref,
-    #         ) = torch.autograd.grad(out_ref, (q, k, v), g)
-    #         (
-    #             dq_pt,
-    #             dk_pt,
-    #             dv_pt,
-    #         ) = torch.autograd.grad(out_pt, (q, k, v), g)
-    #     print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
-    #     print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
-    #     print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
-    #     print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
-    #     print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
-    #     print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
-    #     print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
-    #     print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
-    #     print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
-    #     print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
-    #     print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
-    #     print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+    if (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
+        if kvpacked:
+            (
+                dq,
+                dkv,
+            ) = torch.autograd.grad(out, (q, kv), g)
+            dk, dv = dkv.unbind(2)
+            (
+                dq_ref,
+                dkv_ref,
+            ) = torch.autograd.grad(out_ref, (q, kv), g)
+            dk_ref, dv_ref = dkv_ref.unbind(2)
+            (
+                dq_pt,
+                dkv_pt,
+            ) = torch.autograd.grad(out_pt, (q, kv), g)
+            dk_pt, dv_pt = dkv_pt.unbind(2)
+        else:
+            (
+                dq,
+                dk,
+                dv,
+            ) = torch.autograd.grad(out, (q, k, v), g)
+            (
+                dq_ref,
+                dk_ref,
+                dv_ref,
+            ) = torch.autograd.grad(out_ref, (q, k, v), g)
+            (
+                dq_pt,
+                dk_pt,
+                dv_pt,
+            ) = torch.autograd.grad(out_pt, (q, k, v), g)
+        print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+        print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+        print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+        print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
+        print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
+        print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
+        print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+        print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+        print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+        print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
+        print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
+        print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
@@ -1107,10 +1107,10 @@ def test_flash_attn_output(
         if not alibi:
             assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.025)
 
-    # if (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
-    #     assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
-    #     assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
-    #     assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
+    if (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
+        assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
+        assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
+        assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
 
 
 @pytest.mark.parametrize("kvpacked", [True, False])
