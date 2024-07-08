@@ -25,6 +25,7 @@ from torch.utils.cpp_extension import (
     CUDAExtension,
     CUDA_HOME,
     ROCM_HOME,
+    IS_HIP_EXTENSION,
 )
 
 
@@ -34,6 +35,19 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
+
+BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
+
+if BUILD_TARGET == "auto":
+    if IS_HIP_EXTENSION:
+        IS_ROCM = True
+    else:
+        IS_ROCM = False
+else:
+    if BUILD_TARGET == "cuda":
+        IS_ROCM = False
+    elif BUILD_TARGET == "rocm":
+        IS_ROCM = True
 
 PACKAGE_NAME = "flash_attn"
 
@@ -118,24 +132,12 @@ def validate_and_update_archs(archs):
 cmdclass = {}
 ext_modules = []
 
-IS_ROCM = False
-if not SKIP_CUDA_BUILD:
-    if torch.cuda.is_available():
-        device_name = torch.cuda.get_device_name(0)
-        if "ROC" in device_name or "AMD" in device_name:  # AMD ROCm device
-            print("Detected ROCm device:", device_name)
-            IS_ROCM = True
-        elif "NVIDIA" in device_name:  # NVIDIA CUDA device
-            print("Detected CUDA device:", device_name)
-        else:
-            print("Unknown GPU device:", device_name)
-
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
-if not IS_ROCM:
-    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
-else:
+if IS_ROCM:
     subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"])
+else:
+    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 if not SKIP_CUDA_BUILD and not IS_ROCM:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
@@ -281,7 +283,6 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
         generator_flag = ["-DOLD_GENERATOR_PATH"]
 
-
     check_if_rocm_home_none("flash_attn")
     cc_flag = []
 
@@ -363,25 +364,33 @@ def get_package_version():
 
 
 def get_wheel_url():
-    # Determine the version numbers that will be used to determine the correct wheel
-    # We're using the CUDA version used to build torch, not the one currently installed
-    # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
-    torch_cuda_version = parse(torch.version.cuda)
     torch_version_raw = parse(torch.__version__)
-    # For CUDA 11, we only compile for CUDA 11.8, and for CUDA 12 we only compile for CUDA 12.2
-    # to save CI time. Minor versions should be compatible.
-    torch_cuda_version = parse("11.8") if torch_cuda_version.major == 11 else parse("12.2")
     python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
     platform_name = get_platform()
     flash_version = get_package_version()
-    # cuda_version = f"{cuda_version_raw.major}{cuda_version_raw.minor}"
-    cuda_version = f"{torch_cuda_version.major}{torch_cuda_version.minor}"
     torch_version = f"{torch_version_raw.major}.{torch_version_raw.minor}"
     cxx11_abi = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper()
 
-    # Determine wheel URL based on CUDA version, torch version, python version and OS
-    wheel_filename = f"{PACKAGE_NAME}-{flash_version}+cu{cuda_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
+    if IS_ROCM:
+        torch_hip_version = parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
+        hip_version = f"{torch_hip_version.major}{torch_hip_version.minor}"
+        wheel_filename = f"{PACKAGE_NAME}-{flash_version}+rocm{hip_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
+    else:
+        # Determine the version numbers that will be used to determine the correct wheel
+        # We're using the CUDA version used to build torch, not the one currently installed
+        # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
+        torch_cuda_version = parse(torch.version.cuda)
+        # For CUDA 11, we only compile for CUDA 11.8, and for CUDA 12 we only compile for CUDA 12.2
+        # to save CI time. Minor versions should be compatible.
+        torch_cuda_version = parse("11.8") if torch_cuda_version.major == 11 else parse("12.2")
+        # cuda_version = f"{cuda_version_raw.major}{cuda_version_raw.minor}"
+        cuda_version = f"{torch_cuda_version.major}{torch_cuda_version.minor}"
+
+        # Determine wheel URL based on CUDA version, torch version, python version and OS
+        wheel_filename = f"{PACKAGE_NAME}-{flash_version}+cu{cuda_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
+
     wheel_url = BASE_WHEEL_URL.format(tag_name=f"v{flash_version}", wheel_name=wheel_filename)
+
     return wheel_url, wheel_filename
 
 
