@@ -216,6 +216,7 @@ def attention_ref(
     dropout_mask=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite window size
+    softcap=0.0,
     upcast=True,
     reorder_ops=False,
 ):
@@ -253,6 +254,10 @@ def attention_ref(
         scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
     else:
         scores = torch.einsum("bthd,bshd->bhts", q, k / math.sqrt(d))
+    if softcap > 0:
+        scores /= softcap
+        scores = scores.tanh()
+        scores *= softcap
     if key_padding_mask is not None:
         scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
     if window_size[0] >= 0 or window_size[1] >= 0:
@@ -877,8 +882,9 @@ def test_flash_attn_varlen_qkvpacked(
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 # @pytest.mark.parametrize("dropout_p", [0.17])
+@pytest.mark.parametrize("softcap", [0.0, 50.0])
 def test_flash_attn_output(
-    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked
+    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
@@ -894,6 +900,9 @@ def test_flash_attn_output(
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    if softcap > 0:
+        # Ensure the values of qk are at least within softcap range.
+        q = q * softcap
     if kvpacked:
         kv = torch.randn(
             batch_size, seqlen_k, 2, nheads_k, d, device=device, dtype=dtype, requires_grad=True
@@ -918,6 +927,7 @@ def test_flash_attn_output(
             dropout_p,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             alibi_slopes=alibi_slopes,
             deterministic=deterministic,
             return_attn_probs=True,
@@ -930,6 +940,7 @@ def test_flash_attn_output(
             dropout_p,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             alibi_slopes=alibi_slopes,
             deterministic=deterministic,
             return_attn_probs=True,
@@ -984,6 +995,7 @@ def test_flash_attn_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
         )
         out_pt, attn_pt = attention_kvpacked_ref(
             q,
@@ -995,6 +1007,7 @@ def test_flash_attn_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             upcast=False,
             reorder_ops=True,
         )
@@ -1010,6 +1023,7 @@ def test_flash_attn_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
         )
         out_pt, attn_pt = attention_ref(
             q,
@@ -1022,6 +1036,7 @@ def test_flash_attn_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             upcast=False,
             reorder_ops=True,
         )
@@ -1133,9 +1148,10 @@ def test_flash_attn_output(
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
+@pytest.mark.parametrize("softcap", [0.0, 50.0])
 # @pytest.mark.parametrize('dropout_p', [0.0])
 def test_flash_attn_varlen_output(
-    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked
+    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
@@ -1151,6 +1167,9 @@ def test_flash_attn_varlen_output(
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    if softcap > 0:
+        # Ensure the values of qk are at least within softcap range.
+        q = q * softcap
 
     if kvpacked:
         kv = torch.randn(
@@ -1199,6 +1218,7 @@ def test_flash_attn_varlen_output(
             dropout_p,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             alibi_slopes=alibi_slopes,
             deterministic=deterministic,
             return_attn_probs=True,
@@ -1230,6 +1250,7 @@ def test_flash_attn_varlen_output(
             dropout_p,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             alibi_slopes=alibi_slopes,
             deterministic=deterministic,
             return_attn_probs=True,
@@ -1289,6 +1310,7 @@ def test_flash_attn_varlen_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
         )
         out_pt, attn_pt = attention_kvpacked_ref(
             q,
@@ -1300,6 +1322,7 @@ def test_flash_attn_varlen_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             upcast=False,
             reorder_ops=True,
         )
@@ -1315,6 +1338,7 @@ def test_flash_attn_varlen_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
         )
         out_pt, attn_pt = attention_ref(
             q,
@@ -1327,6 +1351,7 @@ def test_flash_attn_varlen_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             upcast=False,
             reorder_ops=True,
         )
