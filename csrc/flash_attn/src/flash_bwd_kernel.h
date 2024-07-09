@@ -23,6 +23,18 @@ namespace flash {
 
 using namespace cute;
 
+template <typename Engine, typename Layout>
+__forceinline__ __device__ void calculate_dtanh(Tensor<Engine, Layout> &tensor){
+    static_assert(Layout::rank == 2);
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(tensor); ++mi) {
+        #pragma unroll
+        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
+            tensor(mi, ni) = 1.f - (tensor(mi, ni) * tensor(mi, ni));
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int MMA_N,
@@ -471,9 +483,21 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
                     smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
 
+        if (params.softcap > 0.) {
+            flash::apply_softcap(acc_s, params.softcap);
+        }
+
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (row=(2, MMA_N), col=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         // if (cute::thread(32, 0)) { print(scores); }
+
+        const bool store_dtanh = true;  // toggles between the two ways of approaching backwards
+        Tensor dtanh = make_tensor_like(scores);
+
+        if (params.softcap > 0.) {
+            cute::copy(scores, dtanh);
+            calculate_dtanh(dtanh);
+        }
 
         if (Has_alibi) {
             alibi.apply_alibi(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
@@ -567,16 +591,34 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
         // Reshape acc_dp from (MMA=4, MMA_N, MMA_N) to (row=(2, MMA_N), col=(2, MMA_N))
         Tensor dS = make_tensor(acc_dp.data(), scores.layout());
-        auto pointwise_mult = [](float p, float dp, float d) {
-            return p * (!Is_dropout || p >= 0 ? dp - d : d);
-        };
-        #pragma unroll
-        for (int mi = 0; mi < size<0>(dS); ++mi) {
+
+        if (params.softcap > 0. && !store_dtanh) {
+            auto pointwise_mult = [](float p, float dp, float d, float m) {
+                return p * (!Is_dropout || p >= 0 ? dp - d : d) * m;
+            };
             #pragma unroll
-            for (int ni = 0; ni < size<1>(dS); ++ni) {
-                dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi));
+            for (int mi = 0; mi < size<0>(dS); ++mi) {
+                const float max_scaled = lse(mi) == -INFINITY ? 0.f : lse(mi) * float(M_LOG2E);
+                #pragma unroll
+                for (int ni = 0; ni < size<1>(dS); ++ni) {
+                    const float post_softcap_value = (log2f(max(scores(mi, ni), 1e-20)) + max_scaled) / params.scale_softmax_log2;
+                    const float dtanh = (1. - post_softcap_value * post_softcap_value);
+                    dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi), dtanh);
+                }
+            }
+        } else {
+            auto pointwise_mult = [](float p, float dp, float d, float m) {
+                return p * (!Is_dropout || p >= 0 ? dp - d : d) * m;
+            };
+            #pragma unroll
+            for (int mi = 0; mi < size<0>(dS); ++mi) {
+                #pragma unroll
+                for (int ni = 0; ni < size<1>(dS); ++ni) {
+                    dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi), (params.softcap > 0.f) ? dtanh(mi, ni) : 1.f);
+                }
             }
         }
+
         // if (cute::thread0()) { print(dS); }
 
         Tensor acc_dq = partition_fragment_C(tiled_mma_dq, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K

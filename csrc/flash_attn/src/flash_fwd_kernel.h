@@ -22,22 +22,6 @@ namespace flash {
 
 using namespace cute;
 
-template <typename Engine, typename Layout>
-__forceinline__ __device__ void apply_softcap(Tensor<Engine, Layout> &tensor, const float softcap){
-    static_assert(Layout::rank == 3, "Only support 3D Tensor");
-    static_assert(decltype(size<0>(tensor))::value == 4, "First dimension must be 4");
-    #pragma unroll
-    for (int i=0; i < size<0>(tensor); ++i){  // MMA
-        #pragma unroll
-        for (int mi=0; mi < size<1>(tensor); ++mi){
-            #pragma unroll
-            for (int nj=0; nj < size<2>(tensor); ++nj){
-                tensor(i, mi, nj) = cutlass::fast_tanh(tensor(i, mi, nj) * softcap );
-            }
-        }
-    }
-}
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
@@ -335,7 +319,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         );
         // if (cute::thread0()) { print(acc_s); }
         if constexpr (Is_softcap){
-            apply_softcap(acc_s, params.softcap);
+            flash::apply_softcap(acc_s, params.softcap);
         }
 
         mask.template apply_mask<Is_causal, Is_even_MN>(
@@ -401,7 +385,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             smem_thr_copy_Q, smem_thr_copy_K
         );
         if constexpr (Is_softcap){
-            apply_softcap(acc_s, params.softcap);
+            flash::apply_softcap(acc_s, params.softcap);
         }
 
         flash::cp_async_wait<0>();
@@ -893,7 +877,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         );
         // if (cute::thread0()) { print(acc_s); }
         if constexpr (Is_softcap){
-            apply_softcap(acc_s, params.softcap);
+            flash::apply_softcap(acc_s, params.softcap);
         }
 
 
@@ -968,7 +952,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             smem_thr_copy_Q, smem_thr_copy_K
         );
         if constexpr (Is_softcap){
-            apply_softcap(acc_s, params.softcap);
+            flash::apply_softcap(acc_s, params.softcap);
         }
 
         flash::cp_async_wait<0>();
