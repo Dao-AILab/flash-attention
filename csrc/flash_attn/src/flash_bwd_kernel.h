@@ -494,7 +494,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         const bool store_dtanh = true;  // toggles between the two ways of approaching backwards
         Tensor dtanh = make_tensor_like(scores);
 
-        if constexpr (Is_softcap) {
+        if (Is_softcap && store_dtanh) {
             cute::copy(scores, dtanh);
             calculate_dtanh(dtanh);
         }
