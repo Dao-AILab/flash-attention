@@ -88,7 +88,7 @@ make_tiled_copy_C_warpcontiguousN(Copy_Atom<Args...> const& copy_atom,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
 inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -483,7 +483,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
                     smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
 
-        if (params.softcap > 0.) {
+        if constexpr (Is_softcap) {
             flash::apply_softcap(acc_s, params.softcap);
         }
 
@@ -494,7 +494,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         const bool store_dtanh = true;  // toggles between the two ways of approaching backwards
         Tensor dtanh = make_tensor_like(scores);
 
-        if (params.softcap > 0.) {
+        if constexpr (Is_softcap) {
             cute::copy(scores, dtanh);
             calculate_dtanh(dtanh);
         }
@@ -592,7 +592,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // Reshape acc_dp from (MMA=4, MMA_N, MMA_N) to (row=(2, MMA_N), col=(2, MMA_N))
         Tensor dS = make_tensor(acc_dp.data(), scores.layout());
 
-        if (params.softcap > 0. && !store_dtanh) {
+        if (Is_softcap && !store_dtanh) {
             auto pointwise_mult = [](float p, float dp, float d, float m) {
                 return p * (!Is_dropout || p >= 0 ? dp - d : d) * m;
             };
@@ -614,7 +614,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             for (int mi = 0; mi < size<0>(dS); ++mi) {
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(dS); ++ni) {
-                    dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi), (params.softcap > 0.f) ? dtanh(mi, ni) : 1.f);
+                    dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi), Is_softcap ? dtanh(mi, ni) : 1.f);
                 }
             }
         }
@@ -849,7 +849,7 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     // The block index for the batch.
@@ -859,7 +859,7 @@ inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
     for (int n_block = blockIdx.x; n_block < (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN; n_block += gridDim.x) {
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
     }
 }
 
