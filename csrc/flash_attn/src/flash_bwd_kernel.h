@@ -491,10 +491,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         // if (cute::thread(32, 0)) { print(scores); }
 
-        const bool store_dtanh = true;  // toggles between the two ways of approaching backwards
         Tensor dtanh = make_tensor_like(scores);
 
-        if (Is_softcap && store_dtanh) {
+        if constexpr (Is_softcap) {
             cute::copy(scores, dtanh);
             calculate_dtanh(dtanh);
         }
@@ -592,30 +591,14 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // Reshape acc_dp from (MMA=4, MMA_N, MMA_N) to (row=(2, MMA_N), col=(2, MMA_N))
         Tensor dS = make_tensor(acc_dp.data(), scores.layout());
 
-        if (Is_softcap && !store_dtanh) {
-            auto pointwise_mult = [](float p, float dp, float d, float m) {
-                return p * (!Is_dropout || p >= 0 ? dp - d : d) * m;
-            };
+        auto pointwise_mult = [](float p, float dp, float d, float m) {
+            return p * (!Is_dropout || p >= 0 ? dp - d : d) * m;
+        };
+        #pragma unroll
+        for (int mi = 0; mi < size<0>(dS); ++mi) {
             #pragma unroll
-            for (int mi = 0; mi < size<0>(dS); ++mi) {
-                const float max_scaled = lse(mi) == -INFINITY ? 0.f : lse(mi) * float(M_LOG2E);
-                #pragma unroll
-                for (int ni = 0; ni < size<1>(dS); ++ni) {
-                    const float post_softcap_value = (log2f(max(scores(mi, ni), 1e-20)) + max_scaled) / params.scale_softmax_log2;
-                    const float dtanh = (1. - post_softcap_value * post_softcap_value);
-                    dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi), dtanh);
-                }
-            }
-        } else {
-            auto pointwise_mult = [](float p, float dp, float d, float m) {
-                return p * (!Is_dropout || p >= 0 ? dp - d : d) * m;
-            };
-            #pragma unroll
-            for (int mi = 0; mi < size<0>(dS); ++mi) {
-                #pragma unroll
-                for (int ni = 0; ni < size<1>(dS); ++ni) {
-                    dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi), Is_softcap ? dtanh(mi, ni) : 1.f);
-                }
+            for (int ni = 0; ni < size<1>(dS); ++ni) {
+                dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi), Is_softcap ? dtanh(mi, ni) : 1.f);
             }
         }
 
