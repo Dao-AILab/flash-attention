@@ -603,7 +603,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi), maybe_dtanh);
             }
         }
-
         // if (cute::thread0()) { print(dS); }
 
         Tensor acc_dq = partition_fragment_C(tiled_mma_dq, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
