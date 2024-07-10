@@ -106,9 +106,9 @@ void set_params_fprop(Flash_fwd_params &params,
     #endif
     if (softcap > 0.0) {
         params.softcap = softmax_scale / softcap;
-        params.scale_softmax =  softcap;
+        params.scale_softmax = softcap;
         params.scale_softmax_log2 = softcap * M_LOG2E;
-    }else{
+    } else{
         // Remove potential NaN
         params.softcap = 0.0;
         params.scale_softmax = softmax_scale;
