@@ -96,6 +96,8 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          v.data_ptr(),
                          alibi_slopes_ptr, // bias
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
+                         nullptr, // lse_acc
+                         nullptr, // o_acc
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
                          nullptr, // seqstart_q
@@ -109,6 +111,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          d,             // hdim_v
                          h,             // nhead
                          h_k,           // nhead_k
+                         1,             // num_splits
                          softmax_scale, // scale_s
                          1,             // scale_p
                          1,             // scale_o
@@ -117,6 +120,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          stride_v,
                          stride_alibi_slopes,
                          stride_randval,
+                         0, // stride_o_acc,
                          stride_o,
                          nhead_stride_q,
                          nhead_stride_k,
@@ -124,6 +128,8 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          0, // nhead_stride_bias, FA without bias
                          nhead_stride_randval,
                          nhead_stride_lse,
+                         0, // nhead_stride_lse_acc
+                         0, // nhead_stride_o_acc
                          nhead_stride_o,
                          batch_stride_q,
                          batch_stride_k,
@@ -131,7 +137,11 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          0, // batch_stride_bias, FA without bias
                          batch_stride_randval,
                          batch_stride_lse,
+                         0, // batch_stride_lse_acc
+                         0, // batch_stride_o_acc
                          batch_stride_o,
+                         0, // split_stride_lse_acc
+                         0, // split_stride_o_acc
                          mask.left,
                          mask.right,
                          static_cast<ck_tile::index_t>(mask.type),
