@@ -585,22 +585,21 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // Reshape acc_dp from (MMA=4, MMA_N, MMA_N) to (row=(2, MMA_N), col=(2, MMA_N))
         Tensor dS = make_tensor(acc_dp.data(), scores.layout());
 
-        auto pointwise_mult = [](float p, float dp, float d, float m) {
-            return p * (!Is_dropout || p >= 0 ? dp - d : d) * m;
+        auto pointwise_mult = [](float p, float dp, float d) {
+            return p * (!Is_dropout || p >= 0 ? dp - d : d);
         };
         #pragma unroll
         for (int mi = 0; mi < size<0>(dS); ++mi) {
             #pragma unroll
             for (int ni = 0; ni < size<1>(dS); ++ni) {
 
-                float maybe_dtanh;
+                float scaled_ds = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi));
+
                 if constexpr (Is_softcap) {
-                    maybe_dtanh = dtanh(mi, ni);
-                } else {
-                    maybe_dtanh = 1.f;
+                    scaled_ds *= dtanh(mi, ni);
                 }
 
-                dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi), maybe_dtanh);
+                dS(mi, ni) = scaled_ds;
             }
         }
         // if (cute::thread0()) { print(dS); }
