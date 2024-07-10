@@ -721,7 +721,7 @@ def flash_attn_qkvpacked_func(
         softmax_scale,
         causal,
         window_size,
-        softcapping,
+        softcap,
         alibi_slopes,
         deterministic,
         return_attn_probs,
