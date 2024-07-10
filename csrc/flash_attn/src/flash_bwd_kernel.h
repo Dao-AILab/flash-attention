@@ -605,13 +605,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             #pragma unroll
             for (int ni = 0; ni < size<1>(dS); ++ni) {
 
-                auto maybe_dtanh = ([&]{
-                    if constexpr (Is_softcap) {
-                        return dtanh(mi, ni);
-                    } else {
-                        return 1.f;
-                    }
-                })();
+                float maybe_dtanh;
+                if constexpr (Is_softcap) {
+                    maybe_dtanh = dtanh(mi, ni);
+                } else {
+                    maybe_dtanh = 1.f;
+                }
 
                 dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi), maybe_dtanh);
             }

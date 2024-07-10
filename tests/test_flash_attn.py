@@ -254,12 +254,10 @@ def attention_ref(
         scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
     else:
         scores = torch.einsum("bthd,bshd->bhts", q, k / math.sqrt(d))
-
     if softcap > 0:
-        scores = scores / softcap
+        scores /= softcap
         scores = scores.tanh()
-        scores = scores * softcap
-
+        scores *= softcap
     if key_padding_mask is not None:
         scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
     if window_size[0] >= 0 or window_size[1] >= 0:
@@ -845,21 +843,22 @@ def test_flash_attn_varlen_qkvpacked(
     if (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
-@pytest.mark.parametrize("kvpacked", [False])
+
+@pytest.mark.parametrize("kvpacked", [True, False])
 # @pytest.mark.parametrize("kvpacked", [False])
-@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16]))
+@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("deterministic", [True])
+@pytest.mark.parametrize("deterministic", [False, True])
 # @pytest.mark.parametrize("deterministic", [True])
-@pytest.mark.parametrize("alibi", [False])
+@pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [True])
-@pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("local", [False, True])
 # @pytest.mark.parametrize("local", [True])
-@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [True])
-@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("d", [32, 40, 59, 64, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
@@ -868,22 +867,22 @@ def test_flash_attn_varlen_qkvpacked(
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        # (113, 203),
-        # (128, 217),
-        # (113, 211),
-        # (108, 256),
-        # (256, 512),
-        # (512, 256),
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (512, 256),
         (1024, 1024),
-        # (1023, 1024),
-        # (1024, 1023),
-        # (2048, 2048),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
-@pytest.mark.parametrize("dropout_p", [0.0])
+@pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 # @pytest.mark.parametrize("dropout_p", [0.17])
-@pytest.mark.parametrize("softcap", [0.0, 0.125])
+@pytest.mark.parametrize("softcap", [0.0, 50.0])
 def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
@@ -946,7 +945,6 @@ def test_flash_attn_output(
             deterministic=deterministic,
             return_attn_probs=True,
         )
-
     if dropout_p > 0.0:
         S_dmask_converted = convert_flash_attn_S_to_softmax(
             S_dmask,
@@ -1110,9 +1108,9 @@ def test_flash_attn_output(
             assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.025)
 
     if (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
-        assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
         assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
+        assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
 
 
 @pytest.mark.parametrize("kvpacked", [True, False])
