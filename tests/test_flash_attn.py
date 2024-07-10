@@ -303,6 +303,7 @@ def attention_kvpacked_ref(
     dropout_mask=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite window size
+    softcap=0.0,
     upcast=True,
     reorder_ops=False,
 ):
@@ -318,6 +319,7 @@ def attention_kvpacked_ref(
         upcast=upcast,
         causal=causal,
         window_size=window_size,
+        softcap=softcap,
         reorder_ops=reorder_ops,
     )
 
@@ -330,6 +332,7 @@ def attention_qkvpacked_ref(
     dropout_mask=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite window size
+    softcap=0.0,
     upcast=True,
     reorder_ops=False,
 ):
@@ -345,6 +348,7 @@ def attention_qkvpacked_ref(
         upcast=upcast,
         causal=causal,
         window_size=window_size,
+        softcap=softcap,
         reorder_ops=reorder_ops,
     )
 
