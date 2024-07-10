@@ -80,8 +80,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
     ck_tile::index_t batch_stride_v = 0;
     ck_tile::index_t batch_stride_o = 0;
 
-    ck_tile::index_t batch_stride_bias = 0;
-    ck_tile::index_t batch_stride_lse = 0;
+    ck_tile::index_t batch_stride_lse = has_lse ? softmax_lse.stride(0) : 0;
     ck_tile::index_t batch_stride_randval = 0;
 
     void *alibi_slopes_ptr = nullptr;
@@ -105,7 +104,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          out.data_ptr(),
                          seqlens_q.data_ptr(), // seqstart_q
                          seqlens_k.data_ptr(), // seqstart_k
-                         nullptr,              // seqlen_kpads ?!!!!!!!!!!!!!!!!!!!!!!!!
+                         nullptr,              // seqlen_kpads
                          total_q,
                          total_k,
                          b,
@@ -164,13 +163,8 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
                int window_size_left,
                int window_size_right,
                const bool return_dropout_randval,
-               c10::optional<at::Generator> /*gen_*/)
+               c10::optional<at::Generator> gen_)
 {
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_gfx94x = dprops->major == 9 && dprops->minor == 4;
-    TORCH_CHECK(is_gfx94x,
-                "FlashAttention only supports AMD MI300 GPUs.");
-
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
@@ -271,8 +265,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         out = torch::empty_like(q_padded);
     }
 
-    auto round_multiple = [](int x, int m)
-    { return (x + m - 1) / m * m; };
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size_8x = round_multiple(head_size_og, 8);
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -300,18 +293,29 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         if (return_dropout_randval) {p.zero_();}
     }
 
-    uint64_t drop_seed = 1;
-    uint64_t drop_offset = 0;
+    uint64_t drop_seed = 1, drop_offset = 0;
+    int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
-    // TODO - assign seed & offset to rng_state
+
+    if (p_dropout > 0.0)  {
+        auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+            gen_, at::cuda::detail::getDefaultCUDAGenerator());
+        // See Note [Acquire lock when using random generators]
+        std::lock_guard<std::mutex> lock(gen->mutex_);
+        auto philox_args = gen->philox_cuda_state(counter_offset);
+        std::tie(drop_seed, drop_offset) = flash::unpack(philox_args);
+    }
+
+    rng_state[0] = *(reinterpret_cast<int64_t*>(&drop_seed));
+    rng_state[1] = *(reinterpret_cast<int64_t*>(&drop_offset));
 
     if (max_seqlen_k > 0) {
         auto stream = at::cuda::getCurrentHIPStream().stream();
-        ck_tile::stream_config stream_config{stream, false, 0, 0, 0};
+        ck_tile::stream_config stream_config{stream};
 
         auto traits =
-            get_ck_fmha_varlen_fwd_traits(mask, q_dtype_str, head_size_8x, has_dropout, return_dropout_randval, alibi_slopes_.has_value());
+            get_ck_fmha_varlen_fwd_traits(mask, q_dtype_str, head_size_8x, has_dropout, has_lse, alibi_slopes_.has_value());
 
         auto args =
             get_ck_fmha_varlen_fwd_args(

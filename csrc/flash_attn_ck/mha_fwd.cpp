@@ -76,7 +76,6 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
     ck_tile::index_t batch_stride_v = v.stride(0);
     ck_tile::index_t batch_stride_o = out.stride(0);
 
-    ck_tile::index_t batch_stride_bias = 0;
     ck_tile::index_t batch_stride_lse = has_lse ? softmax_lse.stride(0) : 0;
     ck_tile::index_t batch_stride_randval = has_dropout_randval ? dropout_randval.stride(0) : 0;
 
@@ -153,13 +152,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         int window_size_left,
         int window_size_right,
         const bool return_dropout_randval,
-        c10::optional<at::Generator> /*gen_*/)
+        c10::optional<at::Generator> gen_)
 {
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_gfx94x = dprops->major == 9 && dprops->minor == 4;
-    TORCH_CHECK(is_gfx94x,
-                "FlashAttention only supports AMD MI300 GPUs.");
-
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
@@ -209,9 +203,15 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // local
     }
 
-    // TODO
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
+    const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
+    const int ngroups = num_heads / num_heads_k;
+    if (seqlenq_ngroups_swapped) {
+        q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
+        seqlen_q = ngroups;
+        num_heads = num_heads_k;
+    }
 
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size_og);
@@ -236,7 +236,9 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, sizes[1], sizes[2], head_size_og);
-
+        if (seqlenq_ngroups_swapped) {
+            out = out.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
+        }
         if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
     }
     else {
@@ -264,15 +266,26 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         p = torch::empty({batch_size, num_heads, seqlen_q, seqlen_k}, opts.dtype(torch::kUInt8));
     }
 
-    uint64_t drop_seed = 1;
-    uint64_t drop_offset = 0;
+    uint64_t drop_seed = 1, drop_offset = 0;
+    int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
-    // TODO - assign seed & offset to rng_state
+
+    if (p_dropout > 0.0)  {
+        auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+            gen_, at::cuda::detail::getDefaultCUDAGenerator());
+        // See Note [Acquire lock when using random generators]
+        std::lock_guard<std::mutex> lock(gen->mutex_);
+        auto philox_args = gen->philox_cuda_state(counter_offset);
+        std::tie(drop_seed, drop_offset) = flash::unpack(philox_args);
+    }
+
+    rng_state[0] = *(reinterpret_cast<int64_t*>(&drop_seed));
+    rng_state[1] = *(reinterpret_cast<int64_t*>(&drop_offset));
 
     if (seqlen_k > 0) {
         auto stream = at::cuda::getCurrentHIPStream().stream();
-        ck_tile::stream_config stream_config{stream, false, 0, 0, 0};
+        ck_tile::stream_config stream_config{stream};
 
         auto traits =
             get_ck_fmha_fwd_traits(mask, q_dtype_str, head_size_8x, has_dropout, has_lse, alibi_slopes_.has_value());
@@ -305,8 +318,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
         out.zero_();
-        if (return_dropout_randval)
-            softmax_lse.fill_(std::numeric_limits<float>::infinity());
+        softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
     at::Tensor out_padded = out;
@@ -315,5 +327,11 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         if (out_.has_value()) { out_.value().copy_(out); }
     }
 
+    if (seqlenq_ngroups_swapped) {
+        out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
+        out_padded = out_padded.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
+        q_padded = q_padded.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
+        softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
+    }
     return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
 }
