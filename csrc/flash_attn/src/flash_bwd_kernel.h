@@ -491,12 +491,19 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         // if (cute::thread(32, 0)) { print(scores); }
 
-        Tensor dtanh = make_tensor_like(scores);
+        // Softcapping - calculating dTanh and scaling dS later with it
+        auto dtanh = ([&]{
+          if constexpr (Is_softcap) {
+            Tensor _dtanh = make_tensor_like(scores);
+            calculate_dtanh(scores, _dtanh);
+            return _dtanh;
+          }
+          else {
+            return nullptr;
+          }
+        }());
 
-        if constexpr (Is_softcap) {
-            calculate_dtanh(scores, dtanh);
-        }
-
+        // Alibi
         if (Has_alibi) {
             alibi.apply_alibi(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                               m_block * kBlockM + get<0>(taccScS_row(0)), AtomLayoutMS * 16);
@@ -597,7 +604,16 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         for (int mi = 0; mi < size<0>(dS); ++mi) {
             #pragma unroll
             for (int ni = 0; ni < size<1>(dS); ++ni) {
-                dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi), Is_softcap ? dtanh(mi, ni) : 1.f);
+
+                auto maybe_dtanh = ([&]{
+                    if constexpr (Is_softcap) {
+                        return dtanh(mi, ni);
+                    } else {
+                        return 1.f;
+                    }
+                })();
+
+                dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi), maybe_dtanh);
             }
         }
 
