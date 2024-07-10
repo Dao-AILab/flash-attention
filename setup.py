@@ -317,6 +317,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         "nvcc":
             [
                 "-O3","-std=c++17",
+                "-mllvm", "-enable-post-misched=0",
                 "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
                 "-fgpu-flush-denormals-to-zero",
                 "-DCK_ENABLE_BF16",
