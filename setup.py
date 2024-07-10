@@ -325,7 +325,7 @@ setup(
         )
     ),
     author="Tri Dao",
-    author_email="trid@cs.stanford.edu",
+    author_email="tri@tridao.me",
     description="Flash Attention: Fast and Memory-Efficient Exact Attention",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -341,7 +341,7 @@ setup(
     else {
         "bdist_wheel": CachedWheelsCommand,
     },
-    python_requires=">=3.7",
+    python_requires=">=3.8",
     install_requires=[
         "torch",
         "einops",
