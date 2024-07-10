@@ -23,18 +23,6 @@ namespace flash {
 
 using namespace cute;
 
-template <typename Engine0, typename Layout0, typename Engine1, typename Layout1>
-__forceinline__ __device__ void calculate_dtanh(Tensor<Engine0, Layout0> &src_tensor, Tensor<Engine1, Layout1> &dst_tensor){
-    static_assert(Layout0::rank == 2 && Layout1::rank == 2);
-    #pragma unroll
-    for (int mi = 0; mi < size<0>(src_tensor); ++mi) {
-        #pragma unroll
-        for (int ni = 0; ni < size<1>(src_tensor); ++ni) {
-            dst_tensor(mi, ni) = 1.f - (src_tensor(mi, ni) * src_tensor(mi, ni));
-        }
-    }
-}
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int MMA_N,
@@ -495,7 +483,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         auto dtanh = ([&]{
           if constexpr (Is_softcap) {
             Tensor _dtanh = make_tensor_like(scores);
-            calculate_dtanh(scores, _dtanh);
+            flash::calculate_dtanh(scores, _dtanh);
             return _dtanh;
           }
           else {

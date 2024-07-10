@@ -392,17 +392,17 @@ __forceinline__ __device__ void copy_w_min_idx(Tensor<Engine0, Layout0> const &S
 
 template <typename Engine, typename Layout>
 __forceinline__ __device__ void apply_softcap(Tensor<Engine, Layout> &tensor, const float softcap){
-    static_assert(Layout::rank == 3, "Only support 3D Tensor");
-    static_assert(decltype(size<0>(tensor))::value == 4, "First dimension must be 4");
     #pragma unroll
-    for (int i=0; i < size<0>(tensor); ++i){  // MMA
-        #pragma unroll
-        for (int mi=0; mi < size<1>(tensor); ++mi){
-            #pragma unroll
-            for (int nj=0; nj < size<2>(tensor); ++nj){
-                tensor(i, mi, nj) = cutlass::fast_tanh(tensor(i, mi, nj) * softcap );
-            }
-        }
+    for (int i = 0; i < size(tensor); ++i) {
+        tensor(i) = cutlass::fast_tanh(tensor(i) * softcap);
+    }
+}
+
+template <typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__forceinline__ __device__ void calculate_dtanh(Tensor<Engine0, Layout0> &src_tensor, Tensor<Engine1, Layout1> &dst_tensor){
+    #pragma unroll
+    for (int i = 0; i < size(src_tensor); ++i) {
+        dst_tensor(i) = 1.f - (src_tensor(i) * src_tensor(i));
     }
 }
 
