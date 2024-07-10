@@ -481,14 +481,14 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
         // Softcapping - calculating dTanh and scaling dS later with it
         auto dtanh = ([&]{
-          if constexpr (Is_softcap) {
-            Tensor _dtanh = make_tensor_like(scores);
-            flash::calculate_dtanh(scores, _dtanh);
-            return _dtanh;
-          }
-          else {
-            return nullptr;
-          }
+            if constexpr (Is_softcap) {
+                Tensor _dtanh = make_tensor_like(scores);
+                flash::calculate_dtanh(scores, _dtanh);
+                return _dtanh;
+            }
+            else {
+                return nullptr;
+            }
         }());
 
         // Alibi
