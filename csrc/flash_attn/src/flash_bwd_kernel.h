@@ -483,7 +483,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         auto dtanh = ([&]{
             if constexpr (Is_softcap) {
                 Tensor _dtanh = make_tensor_like(scores);
-                flash::calculate_dtanh(scores, _dtanh);
+                flash::calculate_dtanh(scores, _dtanh, params.softcap);
                 return _dtanh;
             }
             else {
