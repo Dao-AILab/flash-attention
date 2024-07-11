@@ -314,6 +314,11 @@ Implement deterministic backward pass. Thanks to engineers from [Meituan](www.me
 Support paged KV cache (i.e., [PagedAttention](https://arxiv.org/abs/2309.06180)).
 Thanks to @beginlner for this contribution.
 
+### 2.6: Softcapping.
+
+Support attention with softcapping, as used in Gemma-2 and Grok models.
+Thanks to @Narsil for this contribution.
+
 ## Performance
 
 We present expected speedup (combined forward + backward pass) and memory savings from using FlashAttention against PyTorch standard attention, depending on sequence length, on different GPUs (speedup depends on memory bandwidth - we see more speedup on slower GPU memory).
