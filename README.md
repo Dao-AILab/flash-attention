@@ -26,6 +26,42 @@ contains a partial list of places where FlashAttention is being used.
 FlashAttention and FlashAttention-2 are free to use and modify (see LICENSE).
 Please cite and credit FlashAttention if you use it.
 
+
+## FlashAttention-3 beta release
+FlashAttention-3 is optimized for Hopper GPUs (e.g. H100). 
+
+Blogpost: https://tridao.me/blog/2024/flash3/
+
+Paper: https://tridao.me/publications/flash3/flash3.pdf
+
+![FlashAttention-3 speedup on H100 80GB SXM5 with FP16](assets/flash3_fp16_fwd.png)
+
+This is a beta release for testing / benchmarking before we integrate that with
+the rest of the repo.
+
+Currently released:
+- FP16 forward and backward
+
+Coming soon in the next couple of days / next week:
+- BF16
+- Variable length (FP16, BF16)
+- FP8 forward.
+
+Requirements: H100 / H800 GPU, CUDA >= 12.3.
+
+To install:
+```sh
+cd hopper
+python setup.py install
+```
+To run the test:
+```sh
+export PYTHONPATH=$PWD
+pytest -q -s test_flash_attn.py
+```
+
+
+
 ## Installation and features
 
 Requirements:
