@@ -81,7 +81,8 @@ def _flash_attn_varlen_forward(
     softcap,
     alibi_slopes,
     return_softmax,
-    block_table,
+    block_table=None,
+    leftpad_k=None,
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -93,6 +94,7 @@ def _flash_attn_varlen_forward(
         cu_seqlens_q,
         cu_seqlens_k,
         None,
+        leftpad_k,
         block_table,
         alibi_slopes,
         max_seqlen_q,
@@ -1150,6 +1152,7 @@ def flash_attn_with_kvcache(
     rotary_sin=None,
     cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
     cache_batch_idx: Optional[torch.Tensor] = None,
+    cache_leftpad: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
     softmax_scale=None,
     causal=False,
@@ -1217,11 +1220,12 @@ def flash_attn_with_kvcache(
         rotary_sin [optional]: (seqlen_ro, rotary_dim / 2). Similar to rotary_cos.
         cache_seqlens: int, or (batch_size,), dtype torch.int32. The sequence lengths of the
             KV cache.
-        block_table [optional]: (batch_size, max_num_blocks_per_seq), dtype torch.int32.
         cache_batch_idx: (batch_size,), dtype torch.int32. The indices used to index into the KV cache.
             If None, we assume that the batch indices are [0, 1, 2, ..., batch_size - 1].
             If the indices are not distinct, and k and v are provided, the values updated in the cache
                  might come from any of the duplicate indices.
+        cache_leftpad: (batch_size,), dtype torch.int32. The index that the KV cache starts. If None, assume 0.
+        block_table [optional]: (batch_size, max_num_blocks_per_seq), dtype torch.int32.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
@@ -1269,6 +1273,7 @@ def flash_attn_with_kvcache(
         rotary_cos,
         rotary_sin,
         cache_batch_idx,
+        cache_leftpad,
         block_table,
         alibi_slopes,
         None,
