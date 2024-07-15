@@ -111,8 +111,11 @@ if not SKIP_CUDA_BUILD:
     sources = [
         "flash_api.cpp",
         "flash_fwd_hdim64_fp16_sm90.cu",
+        "flash_fwd_hdim64_bf16_sm90.cu",
         "flash_fwd_hdim128_fp16_sm90.cu",
+        "flash_fwd_hdim128_bf16_sm90.cu",
         "flash_fwd_hdim256_fp16_sm90.cu",
+        "flash_fwd_hdim256_bf16_sm90.cu",
         "flash_bwd_hdim64_fp16_sm90.cu",
         "flash_bwd_hdim128_fp16_sm90.cu",
         "flash_bwd_hdim256_fp16_sm90.cu",

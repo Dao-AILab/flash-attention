@@ -9,6 +9,7 @@
 
 #include "cutlass/gemm/collective/collective_builder.hpp"
 
+#include "named_barrier.hpp"
 #include "utils.h"
 
 namespace flash {
@@ -127,7 +128,7 @@ struct CollectiveEpilogueFwd {
         Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
         // Make sure all WGs have finished reading V
-        cutlass::arch::NamedBarrier::sync(NumMmaThreads, 0 /*id*/);
+        cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<int>(FwdNamedBarriers::ValueEmpty) /*id*/);
         cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
         cutlass::arch::fence_view_async_shared(); // ensure smem writes are visible to TMA
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp,

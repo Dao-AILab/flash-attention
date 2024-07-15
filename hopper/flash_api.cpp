@@ -99,8 +99,6 @@ void set_params_fprop(Flash_fwd_params &params,
     params.d = d;
     params.d_rounded = d_rounded;
 
-    params.head_divmod = cutlass::FastDivmod(int(h));
-
     // Set the different scale values.
     params.scale_softmax = softmax_scale;
     params.scale_softmax_log2 = softmax_scale * M_LOG2E;
@@ -225,12 +223,22 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
     if (!params.is_e4m3) {
-        if (params.d == 64) {
-            run_mha_fwd_<cutlass::half_t, 64>(params, stream);
-        } else if (params.d == 128) {
-            run_mha_fwd_<cutlass::half_t, 128>(params, stream);
+        if (params.is_bf16) {
+            if (params.d == 64) {
+                run_mha_fwd_<cutlass::bfloat16_t, 64>(params, stream);
+            } else if (params.d == 128) {
+                run_mha_fwd_<cutlass::bfloat16_t, 128>(params, stream);
+            } else {
+                run_mha_fwd_<cutlass::bfloat16_t, 256>(params, stream);
+            }
         } else {
-            run_mha_fwd_<cutlass::half_t, 256>(params, stream);
+            if (params.d == 64) {
+                run_mha_fwd_<cutlass::half_t, 64>(params, stream);
+            } else if (params.d == 128) {
+                run_mha_fwd_<cutlass::half_t, 128>(params, stream);
+            } else {
+                run_mha_fwd_<cutlass::half_t, 256>(params, stream);
+            }
         }
     } else {
         // run_mha_fwd_<cutlass::float_e4m3_t, 128>(params, stream);
@@ -250,9 +258,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     TORCH_CHECK(is_sm90, "FlashAttention only supports Hopper GPUs or newer.");
 
     auto q_dtype = q.dtype();
-    // TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-    TORCH_CHECK(q_dtype == torch::kFloat16,
-                "FlashAttention only support fp16 data type for now");
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention only support fp16 and bf16 data type for now");
     // TODO: will add e4m3 later
     // TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kFloat8_e4m3fn,
                 // "FlashAttention only support fp16 and bf16 data type");
@@ -278,10 +285,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     const int head_size_og = sizes[3];
     const int seqlen_k = k.size(1);
     const int num_heads_k = k.size(2);
-    TORCH_CHECK(batch_size > 0, "batch size must be postive");
+    TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
-    TORCH_CHECK(num_heads == num_heads_k, "We do not support MQA/GQA yet");
 
     TORCH_CHECK(head_size_og == 64 || head_size_og == 128 || head_size_og == 256, "Only support head size 64, 128, and 256 for now");
 
@@ -345,7 +351,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      /*window_size_left=*/-1,
                      /*window_size_right=*/is_causal ? 0 : -1);
 
-    auto tile_count_semaphore = is_causal ? torch::full({1}, 132, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
+    auto tile_count_semaphore = is_causal ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
 
     if (seqlen_k > 0) {
