@@ -151,6 +151,22 @@ if not SKIP_CUDA_BUILD:
                 "csrc/flash_attn/src/flash_fwd_hdim224_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim256_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim256_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim32_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim32_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim64_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim64_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim96_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim96_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim128_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim128_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim160_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim160_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim192_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim192_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim224_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim224_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim256_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim256_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim32_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim32_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim64_fp16_sm80.cu",
@@ -183,6 +199,22 @@ if not SKIP_CUDA_BUILD:
                 "csrc/flash_attn/src/flash_fwd_split_hdim224_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim32_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim32_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim64_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim64_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim96_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim96_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim128_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim160_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim160_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim192_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim192_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim224_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim224_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu",
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"] + generator_flag,
@@ -203,6 +235,7 @@ if not SKIP_CUDA_BUILD:
                         # "-DFLASHATTENTION_DISABLE_BACKWARD",
                         # "-DFLASHATTENTION_DISABLE_DROPOUT",
                         # "-DFLASHATTENTION_DISABLE_ALIBI",
+                        # "-DFLASHATTENTION_DISABLE_SOFTCAP",
                         # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
                         # "-DFLASHATTENTION_DISABLE_LOCAL",
                     ]
@@ -236,9 +269,9 @@ def get_wheel_url():
     # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
     torch_cuda_version = parse(torch.version.cuda)
     torch_version_raw = parse(torch.__version__)
-    # For CUDA 11, we only compile for CUDA 11.8, and for CUDA 12 we only compile for CUDA 12.2
+    # For CUDA 11, we only compile for CUDA 11.8, and for CUDA 12 we only compile for CUDA 12.3
     # to save CI time. Minor versions should be compatible.
-    torch_cuda_version = parse("11.8") if torch_cuda_version.major == 11 else parse("12.2")
+    torch_cuda_version = parse("11.8") if torch_cuda_version.major == 11 else parse("12.3")
     python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
     platform_name = get_platform()
     flash_version = get_package_version()
@@ -282,7 +315,7 @@ class CachedWheelsCommand(_bdist_wheel):
             wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
             print("Raw wheel path", wheel_path)
             os.rename(wheel_filename, wheel_path)
-        except urllib.error.HTTPError:
+        except (urllib.error.HTTPError, urllib.error.URLError):
             print("Precompiled wheel not found. Building from source...")
             # If the wheel could not be downloaded, build from source
             super().run()
@@ -324,7 +357,7 @@ setup(
         )
     ),
     author="Tri Dao",
-    author_email="trid@cs.stanford.edu",
+    author_email="tri@tridao.me",
     description="Flash Attention: Fast and Memory-Efficient Exact Attention",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -340,14 +373,14 @@ setup(
     else {
         "bdist_wheel": CachedWheelsCommand,
     },
-    python_requires=">=3.7",
+    python_requires=">=3.8",
     install_requires=[
         "torch",
         "einops",
-        "packaging",
-        "ninja",
     ],
     setup_requires=[
-        "psutil"
+        "packaging",
+        "psutil",
+        "ninja",
     ],
 )

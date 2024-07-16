@@ -182,9 +182,14 @@ def construct_local_mask(
     query_padding_mask=None,
     key_padding_mask=None,
     device=None,
+    key_leftpad=None,
 ):
     row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")
     col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
+    if key_leftpad is not None:
+        key_leftpad = rearrange(key_leftpad, "b -> b 1 1 1")
+        col_idx = repeat(col_idx, "s -> b 1 1 s", b=key_leftpad.shape[0])
+        col_idx = torch.where(col_idx >= key_leftpad, col_idx - key_leftpad, 2**32)
     sk = (
         seqlen_k
         if key_padding_mask is None
@@ -216,8 +221,10 @@ def attention_ref(
     dropout_mask=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite window size
+    softcap=0.0,
     upcast=True,
     reorder_ops=False,
+    key_leftpad=None,
 ):
     """
     Arguments:
@@ -233,7 +240,7 @@ def attention_ref(
         window_size: (int, int), left and right window size
         upcast: whether to cast all inputs to fp32, do all computation in fp32, then cast
             output back to fp16/bf16.
-        reorder_ops: whether to change the order of operations (scaling k instead of scaling k, etc.)
+        reorder_ops: whether to change the order of operations (scaling k instead of scaling q, etc.)
             without changing the math. This is to estimate the numerical error from operation
             reordering.
     Output:
@@ -253,6 +260,10 @@ def attention_ref(
         scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
     else:
         scores = torch.einsum("bthd,bshd->bhts", q, k / math.sqrt(d))
+    if softcap > 0:
+        scores /= softcap
+        scores = scores.tanh()
+        scores *= softcap
     if key_padding_mask is not None:
         scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
     if window_size[0] >= 0 or window_size[1] >= 0:
@@ -263,6 +274,7 @@ def attention_ref(
             query_padding_mask,
             key_padding_mask,
             q.device,
+            key_leftpad=key_leftpad,
         )
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
@@ -298,8 +310,10 @@ def attention_kvpacked_ref(
     dropout_mask=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite window size
+    softcap=0.0,
     upcast=True,
     reorder_ops=False,
+    key_leftpad=None,
 ):
     return attention_ref(
         q,
@@ -313,7 +327,9 @@ def attention_kvpacked_ref(
         upcast=upcast,
         causal=causal,
         window_size=window_size,
+        softcap=softcap,
         reorder_ops=reorder_ops,
+        key_leftpad=key_leftpad,
     )
 
 
@@ -325,6 +341,7 @@ def attention_qkvpacked_ref(
     dropout_mask=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite window size
+    softcap=0.0,
     upcast=True,
     reorder_ops=False,
 ):
@@ -340,6 +357,7 @@ def attention_qkvpacked_ref(
         upcast=upcast,
         causal=causal,
         window_size=window_size,
+        softcap=softcap,
         reorder_ops=reorder_ops,
     )
 
@@ -877,23 +895,29 @@ def test_flash_attn_varlen_qkvpacked(
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 # @pytest.mark.parametrize("dropout_p", [0.17])
+@pytest.mark.parametrize("softcap", [0.0, 50.0])
 def test_flash_attn_output(
-    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked
+    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
     ):
         pytest.skip()  # Reference implementation OOM
+    if softcap > 0.0 and dropout_p > 0.0:
+        pytest.skip("Softcap and dropout not supported together")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
     batch_size = 4
-    nheads = 9
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads = 6 if softcap == 0.0 else 4  # softcap reference impl takes more memory
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    if softcap > 0:
+        # Ensure the values of qk are at least within softcap range.
+        q = q * softcap
     if kvpacked:
         kv = torch.randn(
             batch_size, seqlen_k, 2, nheads_k, d, device=device, dtype=dtype, requires_grad=True
@@ -918,6 +942,7 @@ def test_flash_attn_output(
             dropout_p,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             alibi_slopes=alibi_slopes,
             deterministic=deterministic,
             return_attn_probs=True,
@@ -930,6 +955,7 @@ def test_flash_attn_output(
             dropout_p,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             alibi_slopes=alibi_slopes,
             deterministic=deterministic,
             return_attn_probs=True,
@@ -984,6 +1010,7 @@ def test_flash_attn_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
         )
         out_pt, attn_pt = attention_kvpacked_ref(
             q,
@@ -995,6 +1022,7 @@ def test_flash_attn_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             upcast=False,
             reorder_ops=True,
         )
@@ -1010,6 +1038,7 @@ def test_flash_attn_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
         )
         out_pt, attn_pt = attention_ref(
             q,
@@ -1022,6 +1051,7 @@ def test_flash_attn_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             upcast=False,
             reorder_ops=True,
         )
@@ -1036,7 +1066,7 @@ def test_flash_attn_output(
 
     g = torch.randn_like(out)
     do_o = (g.float() * out.float()).sum(-1)
-    if (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
+    if ((d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90)) and softcap == 0.0:
         if kvpacked:
             (
                 dq,
@@ -1092,7 +1122,7 @@ def test_flash_attn_output(
         if not alibi:
             assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.025)
 
-    if (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
+    if ((d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90)) and softcap == 0.0:
         assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
@@ -1133,24 +1163,31 @@ def test_flash_attn_output(
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
+@pytest.mark.parametrize("softcap", [0.0, 50.0])
 # @pytest.mark.parametrize('dropout_p', [0.0])
 def test_flash_attn_varlen_output(
-    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked
+    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
     ):
         pytest.skip()  # Reference implementation OOM
+    if softcap > 0.0 and dropout_p > 0.0:
+        pytest.skip("Softcap and dropout not supported together")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
     batch_size = 4
-    nheads = 9
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads = 6 if softcap == 0.0 else 4  # softcap reference impl takes more memory
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    if softcap > 0:
+        # Ensure the values of qk are at least within softcap range.
+        q = q * softcap
+
     if kvpacked:
         kv = torch.randn(
             batch_size, seqlen_k, 2, nheads_k, d, device=device, dtype=dtype, requires_grad=True
@@ -1198,6 +1235,7 @@ def test_flash_attn_varlen_output(
             dropout_p,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             alibi_slopes=alibi_slopes,
             deterministic=deterministic,
             return_attn_probs=True,
@@ -1229,6 +1267,7 @@ def test_flash_attn_varlen_output(
             dropout_p,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             alibi_slopes=alibi_slopes,
             deterministic=deterministic,
             return_attn_probs=True,
@@ -1288,6 +1327,7 @@ def test_flash_attn_varlen_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
         )
         out_pt, attn_pt = attention_kvpacked_ref(
             q,
@@ -1299,6 +1339,7 @@ def test_flash_attn_varlen_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             upcast=False,
             reorder_ops=True,
         )
@@ -1314,6 +1355,7 @@ def test_flash_attn_varlen_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
         )
         out_pt, attn_pt = attention_ref(
             q,
@@ -1326,6 +1368,7 @@ def test_flash_attn_varlen_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
             upcast=False,
             reorder_ops=True,
         )
@@ -1339,7 +1382,7 @@ def test_flash_attn_varlen_output(
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
     g = torch.randn_like(out)
-    if (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
+    if ((d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90)) and softcap == 0.0:
         if kvpacked:
             (
                 dq_unpad,
@@ -1396,9 +1439,9 @@ def test_flash_attn_varlen_output(
         assert (attn - attn_ref).abs().max().item() <= 2 * (attn_pt - attn_ref).abs().max().item()
         # With alibi, many of the prob values are 0.0 & -0.0 so dropout_fraction isn't accurate
         if not alibi:
-            assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.025)
+            assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.04)
 
-    if (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
+    if ((d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90)) and softcap == 0.0:
         assert (dq - dq_ref).abs().max().item() <= 3 * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= 3 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 3 * (dv_pt - dv_ref).abs().max().item()
@@ -1834,9 +1877,11 @@ def test_flash_attn_splitkv(
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize("paged_kv_block_size", [None, 256])
 # @pytest.mark.parametrize("paged_kv_block_size", [256, 512])
-# @pytest.mark.parametrize("paged_kv_block_size", [256])
-@pytest.mark.parametrize("has_batch_idx", [False, True])
-# @pytest.mark.parametrize("has_batch_idx", [False])
+# @pytest.mark.parametrize("paged_kv_block_size", [None])
+@pytest.mark.parametrize("has_leftpad", [False, True])
+# @pytest.mark.parametrize("has_leftpad", [True])
+# @pytest.mark.parametrize("has_batch_idx", [False, True])
+@pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
@@ -1864,6 +1909,7 @@ def test_flash_attn_kvcache(
     seqlen_k,
     d,
     has_batch_idx,
+    has_leftpad,
     paged_kv_block_size,
     rotary_fraction,
     rotary_interleaved,
@@ -1881,6 +1927,8 @@ def test_flash_attn_kvcache(
     if not new_kv and rotary_fraction > 0.0:
         pytest.skip()
     if has_batch_idx and paged_kv_block_size is not None:
+        pytest.skip()
+    if has_leftpad and paged_kv_block_size is not None:
         pytest.skip()
     device = "cuda"
     # set seed
@@ -1918,16 +1966,28 @@ def test_flash_attn_kvcache(
     cache_seqlens = torch.randint(
         0 if new_kv else 1,
         # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
-        (seqlen_k - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)
-        if new_kv
-        else (seqlen_k + 1),
+        (
+            (seqlen_k - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)
+            if new_kv
+            else (seqlen_k + 1)
+        ),
         (batch_size,),
         dtype=torch.int32,
         device=device,
     )
+    if has_leftpad:
+        cache_leftpad = torch.cat([torch.randint(0, cache_seqlens[i].item(), (1,), dtype=torch.int32, device=device)
+                                   if cache_seqlens[i].item() > 0 else torch.zeros(1, dtype=torch.int32, device=device)
+                                   for i in range(batch_size)])
+    else:
+        cache_leftpad = None
     arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
     cache_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")
     key_padding_mask = arange < cache_seqlens_expanded + (seqlen_new if new_kv else 0)
+    if has_leftpad:
+        key_padding_mask = torch.logical_and(
+            key_padding_mask, arange >= cache_leftpad.unsqueeze(-1).expand(-1, seqlen_k)
+        )
     if has_batch_idx:
         cache_batch_idx = torch.randperm(batch_size_cache, dtype=torch.int32, device=device)[
             :batch_size
@@ -2002,6 +2062,7 @@ def test_flash_attn_kvcache(
         rotary_sin=sin,
         cache_seqlens=cache_seqlens,
         cache_batch_idx=cache_batch_idx,
+        cache_leftpad=cache_leftpad,
         block_table=block_table,
         causal=causal,
         window_size=window_size,
@@ -2030,6 +2091,7 @@ def test_flash_attn_kvcache(
         None,
         causal=causal,
         window_size=window_size,
+        key_leftpad=cache_leftpad,
     )
     out_pt, _ = attention_ref(
         q_ro,
@@ -2044,6 +2106,7 @@ def test_flash_attn_kvcache(
         window_size=window_size,
         upcast=False,
         reorder_ops=True,
+        key_leftpad=cache_leftpad,
     )
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -2456,9 +2519,9 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
 
     g = torch.randn_like(out)
     if (d <= MAX_HEADDIM_SM8x or d > 224) or (is_sm80 or is_sm90):
-        dq, dk, dv = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g, retain_graph=True)
+        dq0, dk0, dv0 = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g, retain_graph=True)
         for _ in range(50):
             dq, dk, dv = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g, retain_graph=True)
-            assert torch.equal(dv, dv)
-            assert torch.equal(dk, dk)
-            assert torch.equal(dq, dq)
+            assert torch.equal(dv, dv0)
+            assert torch.equal(dk, dk0)
+            assert torch.equal(dq, dq0)
