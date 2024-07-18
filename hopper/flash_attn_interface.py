@@ -57,6 +57,83 @@ def _flash_attn_backward(
     )
     return dq, dk, dv, softmax_d
 
+def _flash_attn_varlen_forward(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    softmax_scale,
+    causal,
+):
+    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    out, q, k, v, out_padded, softmax_lse = _get_fa_module().varlen_fwd(
+        q,
+        k,
+        v,
+        None,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        None,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
+    )
+    # if out.isnan().any() or softmax_lse.isnan().any():
+    #     breakpoint()
+    return out, q, k, v, out_padded, softmax_lse
+
+
+def _flash_attn_varlen_backward(
+    dout,
+    q,
+    k,
+    v,
+    out,
+    softmax_lse,
+    dq,
+    dk,
+    dv,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    softmax_scale,
+    causal,
+):
+    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+    # dq, dk, dv are allocated by us so they should already be contiguous
+    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    (
+        dq,
+        dk,
+        dv,
+        softmax_d,
+    ) = _get_fa_module().varlen_bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
+    )
+    # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
+    #     breakpoint()
+    return dq, dk, dv, softmax_d
+
 
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
@@ -103,6 +180,71 @@ class FlashAttnFunc(torch.autograd.Function):
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
         return dq, dk, dv, None, None
+
+
+class FlashAttnVarlenFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
+    ):
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        out, q, k, v, out_padded, softmax_lse = _flash_attn_varlen_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale,
+            causal=causal,
+        )
+        ctx.save_for_backward(
+            q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k
+        )
+        ctx.max_seqlen_q = max_seqlen_q
+        ctx.max_seqlen_k = max_seqlen_k
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        return out, softmax_lse
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        # TODO: Uncomment these when var-seq-len is supported in bwd kernel.
+        # q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        # dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        # _flash_attn_varlen_backward(
+        #     dout,
+        #     q,
+        #     k,
+        #     v,
+        #     out,
+        #     softmax_lse,
+        #     dq,
+        #     dk,
+        #     dv,
+        #     cu_seqlens_q,
+        #     cu_seqlens_k,
+        #     ctx.max_seqlen_q,
+        #     ctx.max_seqlen_k,
+        #     ctx.softmax_scale,
+        #     ctx.causal,
+        # )
+        # dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
+        # dk = dk[..., : dout.shape[-1]]
+        # dv = dv[..., : dout.shape[-1]]
+        # return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_func(
@@ -164,6 +306,65 @@ def flash_attn_func(
         q,
         k,
         v,
+        softmax_scale,
+        causal,
+    )
+
+
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    softmax_scale=None,
+    causal=False,
+):
+    """
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
+    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
+    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
+    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+    Arguments:
+        q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
+        k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
+        v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into kv.
+        max_seqlen_q: int. Maximum query sequence length in the batch.
+        max_seqlen_k: int. Maximum key sequence length in the batch.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+    Return:
+        out: (total, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
+            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+            normalization factor).
+    """
+    return FlashAttnVarlenFunc.apply(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
         softmax_scale,
         causal,
     )

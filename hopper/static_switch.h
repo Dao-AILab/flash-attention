@@ -66,18 +66,14 @@
     }                                                                          \
   }()
 
-#define SEQLEN_SWITCH(USE_VAR_SEQ_LEN, SEQ_LEN_OUT_OF_BOUND_CHECK, ...)        \
+#define SEQLEN_SWITCH(USE_VAR_SEQ_LEN, NAME, ...)                              \
   [&] {                                                                        \
-    if (!USE_VAR_SEQ_LEN) {                                                    \
-      if (SEQ_LEN_OUT_OF_BOUND_CHECK) {                                        \
-        using kSeqLenTraitsType = FixedSeqLenTraits<true>;                     \
-        return __VA_ARGS__();                                                  \
-      } else {                                                                 \
-        using kSeqLenTraitsType = FixedSeqLenTraits<false>;                    \
-        return __VA_ARGS__();                                                  \
-      }                                                                        \
+    bool useSeqLen = USE_VAR_SEQ_LEN;                                          \
+    if (useSeqLen) {                                                           \
+      using NAME = flash::VarSeqLenTraits;                                     \
+      return __VA_ARGS__();                                                    \
     } else {                                                                   \
-      using kSeqLenTraitsType = VarSeqLenTraits;                               \
+      using NAME = flash::FixedSeqLenTraits;                                   \
       return __VA_ARGS__();                                                    \
     }                                                                          \
   }() 
