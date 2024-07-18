@@ -39,15 +39,20 @@ struct SharedStorageQKVOVt {
   struct {
     cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutQ>> smem_q;
     cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutK>> smem_k;
+    cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v;
     union {
-      struct {        
-        cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v;
         cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v_out;
-      };
-      struct {
         cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
-      };
     };
+    // union {
+    //   struct {        
+    //     cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v;
+    //     cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v_out;
+    //   };
+    //   struct {
+    //     cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
+    //   };
+    // };
   };
   struct {    
     cutlass::arch::ClusterTransactionBarrier barrier_Q;    
@@ -124,7 +129,7 @@ struct Flash_fwd_kernel_traits {
                         make_shape(get<2>(TileShape_MNK{}), get<1>(TileShape_MNK{}), Int<kStages>{}),
                         Step<_2, _1, _3>{})));
 
-    using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
+    using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, OutputType,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
     using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 2>(TileShape_MNK{})));
 
@@ -223,7 +228,7 @@ struct Flash_fwd_kernel_traits_fp8 {
         shape<1>(SmemLayoutDivideVt{}), shape<2>(SmemLayoutDivideVt{}), shape<3>(SmemLayoutDivideVt{})));
     using SmemLayoutTransposeVt = decltype(composition(SmemLayoutDivideVt{}, make_layout(FactoringShapeVt{})));
 
-    using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
+    using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, OutputType,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
     using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 2>(TileShape_MNK{})));
 
