@@ -432,10 +432,28 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor taccOrO = smem_thr_copy_O.retile_S(rO);        // ((Atom,AtomNum), MMA_M, MMA_N)
     Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
+    // Modified:
+    // write down tOrP together with acc_o 
+    Tensor rP = flash::convert_type<Element>(tOrP);
+    Tensor sP = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});    // (SMEM_M,SMEM_N)
+    // Partition sP to match the accumulator partitioning
+    auto smem_tiled_copy_P = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomP{}, tiled_mma);
+    auto smem_thr_copy_P = smem_tiled_copy_P.get_thread_slice(tidx);
+    Tensor ttOrPrP = smem_thr_copy_P.retile_S(rP);        // ((Atom,AtomNum), MMA_M, MMA_N)
+    Tensor ttOrPsP = smem_thr_copy_P.partition_D(sP);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
+    // Modified 
+
+
     // sO has the same size as sQ, so we don't need to sync here.
     if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
 
     cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
+    // Modified:
+    // might be wrong for shared memory
+    cute::copy(smem_tiled_copy_P, ttOrPrP, ttOrPsP);
+    // Modified
+
+    
 
     Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
                                           + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
