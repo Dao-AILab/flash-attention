@@ -312,9 +312,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
         // Initialize matmul objects.
         typename Ktraits::TiledMma1 tiled_mma1;
 
-        PipelineState smem_pipe_read_k, smem_pipe_read_vt;
-        // We don't need separate variables smem_pipe_release_k and smem_pipe_release_v
-        // (like in Cutlass's gemm) because the read and release pipeline states are always the same.
+        PipelineState smem_pipe_read, smem_pipe_release;        
 
         collective_mainloop.mma_init_fp8();
         scheduler.init_consumer();
@@ -340,13 +338,17 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             // collective_mainloop.mma(mainloop_params, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
             //                         tOrO, softmax, n_block_max, threadIdx.x - NumCopyThreads, work_idx, m_block, shared_storage);            
             collective_mainloop.mma_fp8(
-                mainloop_params, pipeline_k, pipeline_vt, smem_pipe_read_k,
-                smem_pipe_read_vt, tOrO, softmax, n_block_max,
+                mainloop_params, pipeline_k, pipeline_vt, smem_pipe_read,
+                smem_pipe_release, tOrO, softmax, n_block_max,
                 threadIdx.x - NumCopyThreads, work_idx, m_block,
                 shared_storage);
-
+        #ifdef COLUMN_PERMUTE
+            collective_epilogue.store_fp8(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
+                                      threadIdx.x - NumCopyThreads, block_coord);                
+        #else
             collective_epilogue.store(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
                                       threadIdx.x - NumCopyThreads, block_coord);                
+        #endif
             ++work_idx;
         }
         collective_epilogue.store_tail();

@@ -401,9 +401,9 @@ struct CollectiveMainloopFwd {
         if (warp_idx_in_warpgroup == 0 && lane_predicate) {
             pipeline_k.producer_acquire(smem_pipe_write_k);
             copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
-                tKgK(_, n_block), tKsK(_, smem_pipe_write_k.index()));            
+                tKgK(_, n_block), tKsK(_, smem_pipe_write_k.index()));                
         }
-        ++smem_pipe_write_k;
+        ++smem_pipe_write_k;        
 
         // Wait for the MMA warpgroups to say that smem_q is ready
         // for fp8, change from NumThreadsPerWarp to NumThreadsPerWarpGroup
@@ -412,24 +412,42 @@ struct CollectiveMainloopFwd {
         if (warp_idx_in_warpgroup == 0 && lane_predicate) {
             shared_storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
             copy(mainloop_params.tma_load_Q.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.barrier_Q), 0 /*mcast_mask*/), tQgQ, tQsQ);
+            // do first V load
+            pipeline_v.producer_acquire(smem_pipe_write_v);
+            copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
+                tVgV(_, n_block), tVsV(_, smem_pipe_write_v.index()));        
         }
 
         // Wait for warp 1 to signal that smem_v are ready and V can be copied from gmem
         // Need ClusterBarrier, not just NamedBarrier. Otherwise we might have CTA 0 finishing the
         // TMA store on O first, call TMA multicast load on V, before CTA 1 can finishing TMA store on O.
-                
-        shared_storage.barrier_O.wait((work_idx + 1) % 2);        
+
+        // NOTE: for fp8 can replace with NamedBarrier.
+           
+        shared_storage.barrier_O.wait((work_idx + 1) % 2);
+
+        pipeline_v.consumer_wait(smem_pipe_read_v);
+        pipeline_vt.producer_acquire(smem_pipe_write_v);
+        do_transpose_V(smem_pipe_read_v.index());
+        pipeline_vt.producer_commit(smem_pipe_write_v);
+        pipeline_v.consumer_release(smem_pipe_read_v);
+
+        ++smem_pipe_write_v;
+        ++smem_pipe_read_v;
+        --n_block;
 
         CUTLASS_PRAGMA_NO_UNROLL
-        for (; n_block > 0; --n_block) {
+        for (; n_block >= 0; --n_block) {
+            
             if (warp_idx_in_warpgroup == 0 && lane_predicate) {
                 pipeline_k.producer_acquire(smem_pipe_write_k);
                 copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
-                    tKgK(_, n_block - 1), tKsK(_, smem_pipe_write_k.index()));                
+                    tKgK(_, n_block), tKsK(_, smem_pipe_write_k.index()));
                 pipeline_v.producer_acquire(smem_pipe_write_v);
                 copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
-                    tVgV(_, n_block), tVsV(_, smem_pipe_write_v.index()));
+                    tVgV(_, n_block), tVsV(_, smem_pipe_write_v.index()));                
             }
+            
             pipeline_v.consumer_wait(smem_pipe_read_v);
             pipeline_vt.producer_acquire(smem_pipe_write_v);
             do_transpose_V(smem_pipe_read_v.index());
@@ -444,6 +462,7 @@ struct CollectiveMainloopFwd {
         // used with dynamic tile scheduler (causal)
         scheduler.prefetch_next_work(scheduler_params, work_tile_info);
         // n_block == 0
+#if 0        
         if (warp_idx_in_warpgroup == 0 && lane_predicate) {
             pipeline_v.producer_acquire(smem_pipe_write_v);
             copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
@@ -457,7 +476,7 @@ struct CollectiveMainloopFwd {
 
         ++smem_pipe_write_v;
         ++smem_pipe_read_v;
-
+#endif
         // used with dynamic tile scheduler (causal)
         scheduler.broadcast_next_work(work_tile_info);
     }
@@ -691,8 +710,8 @@ struct CollectiveMainloopFwd {
     mma_fp8(Params const& mainloop_params,
         MainloopPipeline pipeline_k,
         MainloopPipelineNoTMA pipeline_vt,
-        PipelineState& smem_pipe_read_k,
-        PipelineState& smem_pipe_read_vt,
+        PipelineState& smem_pipe_read,
+        PipelineState& smem_pipe_release,
         FrgTensorO& tOrO,
         Softmax& softmax,
         int n_block_count,
@@ -739,10 +758,10 @@ struct CollectiveMainloopFwd {
         // Allocate accumulator for S
         Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
         // first consumer wait for K
-        consumer_wait(pipeline_k, smem_pipe_read_k); 
+        consumer_wait(pipeline_k, smem_pipe_read); // wait K
         
         // warp_scheduler_barrier_sync(); // used for pingpong
-        flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
+        flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
         // warp_scheduler_barrier_arrive(); // used for pingpong
         
         // overlap first gemm with prior epilogue        
@@ -756,9 +775,7 @@ struct CollectiveMainloopFwd {
                 }
             }
         }        
-        warpgroup_wait<0>();
-        pipeline_k.consumer_release(smem_pipe_read_k);
-        ++smem_pipe_read_k;
+        warpgroup_wait<0>();        
 
 #if 0
         auto col_limit_causal = [&](int row, int n_block) {
@@ -791,10 +808,10 @@ struct CollectiveMainloopFwd {
         Tensor scores_scale = make_fragment_like(softmax.row_max);
         clear(scores_scale);
 
-        consumer_wait(pipeline_vt, smem_pipe_read_vt);
-        flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read_vt.index()), tOrO);
-        pipeline_vt.consumer_release(smem_pipe_read_vt);  // release V
-        ++smem_pipe_read_vt;
+        consumer_wait(pipeline_vt, smem_pipe_read); // wait V
+        flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);        
+        
+        ++smem_pipe_read; // advance pipeline state read
         --n_block;
 
 #if 0
@@ -829,15 +846,17 @@ struct CollectiveMainloopFwd {
             cute::copy(make_tensor(convert_type<Element>(tSrS).data(), convert_layout_acc_Aregs<typename Ktraits::TiledMma1>(tSrS.layout())), tOrP);
         }
 #endif
-
-        // Do simplest possible loop for validation
+        
         CUTLASS_PRAGMA_NO_UNROLL
         for (; n_block >= 0; --n_block) {            
 
             Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
-            consumer_wait(pipeline_k, smem_pipe_read_k);
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
-            pipeline_k.consumer_release(smem_pipe_read_k);  // release K
+            
+            pipeline_k.consumer_release(smem_pipe_release); // release K
+            consumer_wait(pipeline_k, smem_pipe_read); // wait K
+            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+            consumer_wait(pipeline_vt, smem_pipe_read); // wait V
+            warpgroup_wait<0>();            
 
             cute::copy(softmax.template max</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);
             softmax.rescale_o(tOrO, scores_scale);
@@ -845,58 +864,24 @@ struct CollectiveMainloopFwd {
             Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(), convert_layout_acc_Aregs_fp8(tSrS.layout()));
             permute_regs_A_to_C(tOrP);
 
-            consumer_wait(pipeline_vt, smem_pipe_read_vt);
-            flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read_vt.index()), tOrO);
-            pipeline_vt.consumer_release(smem_pipe_read_vt);  // release V
+            pipeline_vt.consumer_release(smem_pipe_release);  // release V
+            flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);            
             
-            ++smem_pipe_read_k;
-            ++smem_pipe_read_vt;
+            ++smem_pipe_read; // advance pipeline state read
+            ++smem_pipe_release; // advance pipeline state release
         }
 
-        // Tell warp 0 that smem_q is ready
+        pipeline_k.consumer_release(smem_pipe_release);  // release K
+        pipeline_vt.consumer_release(smem_pipe_release);  // release V
+        ++smem_pipe_release; // advance pipeline state release
+
+        // Tell warpgroup 0 that smem_q is ready
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
         
         cute::copy(softmax.template finalize</*Check_inf=*/Is_causal>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);
         softmax.rescale_o(tOrO, scores_scale);
         return;
 
-#if 0
-        #pragma unroll 1
-        for (; n_block > 0; --n_block) {
-            Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
-            consumer_wait(pipeline_k, smem_pipe_read_k);
-            warp_scheduler_barrier_sync();
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
-            softmax.rescale_o(tOrO, scores_scale);
-            consumer_wait(pipeline_vt, smem_pipe_read_v);
-            flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-            warp_scheduler_barrier_arrive();
-            warpgroup_wait<1>();
-            pipeline_k.consumer_release(smem_pipe_read_k);  // release K
-            // auto scores_scale = softmax.template max</*Is_first=*/false>(tSrS);
-            cute::copy(softmax.template max</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);
-            softmax.template online_softmax</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2);
-            warpgroup_wait<0>();
-            pipeline_vt.consumer_release(smem_pipe_read_v);  // release V
-            ++smem_pipe_read_k;
-            ++smem_pipe_read_v;
-            // softmax.rescale_o(tOrO, scores_scale);
-            cute::copy(make_tensor(convert_type<Element>(tSrS).data(), convert_layout_acc_Aregs<typename Ktraits::TiledMma1>(tSrS.layout())), tOrP);
-        }
-
-        // Tell warp 0 that smem_q is ready
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
-        softmax.rescale_o(tOrO, scores_scale);
-        consumer_wait(pipeline_vt, smem_pipe_read_v);
-        flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-        cute::copy(softmax.template finalize</*Check_inf=*/Is_causal>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);
-        warpgroup_wait<0>();
-        pipeline_vt.consumer_release(smem_pipe_read_v);  // release V, otherwise producers will hang
-        ++smem_pipe_read_v;
-
-        softmax.rescale_o(tOrO, scores_scale);
-        return;
-#endif
     }
 
 };
