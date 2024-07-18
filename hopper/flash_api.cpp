@@ -231,6 +231,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
     if (!params.is_e4m3) {
+        #if 0
         if (params.is_bf16) {
             if (params.d == 64) {
                 run_mha_fwd_<cutlass::bfloat16_t, 64>(params, stream);
@@ -248,8 +249,15 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
                 run_mha_fwd_<cutlass::half_t, 256>(params, stream);
             }
         }
+        #endif
     } else {
-        // run_mha_fwd_<cutlass::float_e4m3_t, 128>(params, stream);
+        if (params.d == 64) {
+            run_mha_fwd_<cutlass::float_e4m3_t, 64>(params, stream);
+        } else if (params.d == 128) {
+            run_mha_fwd_<cutlass::float_e4m3_t, 128>(params, stream);
+        } else if (params.d == 256) {
+            run_mha_fwd_<cutlass::float_e4m3_t, 256>(params, stream);
+        }        
     }
 }
 
@@ -266,12 +274,12 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     TORCH_CHECK(is_sm90, "FlashAttention only supports Hopper GPUs or newer.");
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type for now");
+    // TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+    //             "FlashAttention only support fp16 and bf16 data type for now");
     // TODO: will add e4m3 later
     // TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kFloat8_e4m3fn,
-                // "FlashAttention only support fp16 and bf16 data type");
-                // "FlashAttention only support fp16 and fp8 (e4m3) data type for now");
+    //             "FlashAttention only support fp16 and bf16 data type");
+    //             "FlashAttention only support fp16 and fp8 (e4m3) data type for now");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
@@ -317,13 +325,21 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        // TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        TORCH_CHECK(q_dtype == at::ScalarType::Float8_e4m3fn
+                    ? (out.dtype() == at::kHalf)
+                    : (out.dtype() == q_dtype),
+                "Output must have the same dtype as input dtype if dtype is "
+                "not fp8, or fp16 for fp8 input.");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_og);
         if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
     } else {
-        out = torch::empty_like(q_padded);
+        if (q_dtype == at::ScalarType::Float8_e4m3fn)
+            out = torch::empty_like(q_padded, at::kHalf);
+        else
+            out = torch::empty_like(q_padded);
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -534,13 +550,13 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     //         run_mha_bwd_<elem_type, kHeadDim>(params, stream);
     //     });
     // });
-    if (params.d == 64) {
-      run_mha_bwd_<cutlass::half_t, 64>(params, stream);
-    } else if (params.d == 128) {
-      run_mha_bwd_<cutlass::half_t, 128>(params, stream);
-    } else {
-      run_mha_bwd_<cutlass::half_t, 256>(params, stream);
-    }
+    // if (params.d == 64) {
+    //   run_mha_bwd_<cutlass::half_t, 64>(params, stream);
+    // } else if (params.d == 128) {
+    //   run_mha_bwd_<cutlass::half_t, 128>(params, stream);
+    // } else {
+    //   run_mha_bwd_<cutlass::half_t, 256>(params, stream);
+    // }
 }
 
 std::vector<at::Tensor>

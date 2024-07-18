@@ -20,7 +20,7 @@ using namespace cute;
 template <typename Ktraits, typename Seqlen_traits>
 struct CollectiveEpilogueFwd {
 
-    using Element = typename Ktraits::Element;
+    using Element = typename Ktraits::OutputType;    
     static constexpr int kBlockM = Ktraits::kBlockM;
     static constexpr int kBlockN = Ktraits::kBlockN;
     static constexpr int kHeadDim = Ktraits::kHeadDim;
