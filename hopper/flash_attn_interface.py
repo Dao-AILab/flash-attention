@@ -70,7 +70,7 @@ def _flash_attn_varlen_forward(
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse = _get_fa_module().varlen_fwd(
+    out, q, k, v, out_padded, softmax_lse = flashattn_hopper_cuda.varlen_fwd(
         q,
         k,
         v,

@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from einops import rearrange, repeat
-from flash_attn_interface import flash_attn_func
+from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
 from tests.test_util import generate_random_padding_mask, generate_qkv, construct_local_mask, attention_ref
 
 ABS_TOL = 5e-3
@@ -23,37 +23,37 @@ def print_diffs(out, out_ref):
             print(f"==== diff ==== {idx}, test: {e_o}, ref: {e_o_ref}")
 
 
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("mha_type", ["gqa"])
-# @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize("mha_type", ["gqa"])
+@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize("d", [64, 128, 256])
-@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [64, 128, 256])
+# @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
         (257, 1),
-        # (64, 128),
-        # (128, 128),
-        # (256, 256),
-        # (113, 203),
-        # (128, 217),
-        # (113, 211),
-        # (108, 256),
-        # (256, 512),
-        # (384, 256),
-        # (640, 128),
-        # (512, 256),
-        # (1024, 1024),
-        # (1023, 1024),
-        # (1024, 1023),
-        # (2048, 2048),
+        (64, 128),
+        (128, 128),
+        (256, 256),
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (384, 256),
+        (640, 128),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
@@ -65,12 +65,12 @@ def test_flash_attn_output(
     torch.random.manual_seed(0)
     # batch_size = 40
     # nheads = 16
-    # batch_size = 9
-    # nheads = 6
-    # nheads_kv = 6 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
-    nheads_kv = 2
     batch_size = 9
     nheads = 6
+    nheads_kv = 6 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    # nheads_kv = 2
+    # batch_size = 9
+    # nheads = 6
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True)
@@ -138,7 +138,7 @@ def test_flash_attn_output(
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
-    breakpoint()
+    # breakpoint()
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
     # if d <= 128:
@@ -149,10 +149,12 @@ def test_flash_attn_output(
 
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize('causal', [True])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-@pytest.mark.parametrize('d', [128])
+# @pytest.mark.parametrize('d', [128])
+@pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -161,12 +163,16 @@ def test_flash_attn_output(
         (2, 1),
         (511, 1),
         (3, 513),
+        (64, 128),
         (113, 203),
+        (128, 128),
         (128, 217),
         (113, 211),
         (108, 256),
         (256, 512),
+        (384, 256),
         (512, 256),
+        (640, 128),
         (1024, 1024),
         (1023, 1024),
         (1024, 1023),
@@ -175,7 +181,7 @@ def test_flash_attn_output(
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_varlen_output(
-    seqlen_q, seqlen_k, d, causal, dtype
+    seqlen_q, seqlen_k, d, causal, mha_type, dtype
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
@@ -185,14 +191,18 @@ def test_flash_attn_varlen_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 1
-    nheads = 1
+    # batch_size = 1
+    # nheads = 1
+    batch_size = 9
+    nheads = 6
+    nheads_kv = 6 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+ 
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(
-        batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True
+        batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True
     )
     v = torch.randn(
-        batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True
+        batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True
     )
 
     query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random")

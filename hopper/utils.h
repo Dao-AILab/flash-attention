@@ -223,7 +223,7 @@ __forceinline__ __device__ void write_tma(
         ElemO* O, const TMACopyO& tma_store_O,
         const LayoutO& layout_O, const TileShapeO& tile_shape_O,
         const SMemO& sO, int m_block, int bidh, int bidb,
-        const SeqLenTraits& seqlen_traits_o) {
+        const SeqLenTraits& seqlen_traits_o, int write_warp_idx) {
     Tensor mO = tma_store_O.get_tma_tensor(layout_O.shape());
     Tensor gO = seqlen_traits_o.get_local_tile_tensor(
         mO, tile_shape_O, bidh, bidb
@@ -234,7 +234,7 @@ __forceinline__ __device__ void write_tma(
 
     int const lane_predicate = cute::elect_one_sync();
     int const warp_idx = cutlass::canonical_warp_idx_sync();
-    if (warp_idx == NumCopyThreads / cutlass::NumThreadsPerWarp && lane_predicate) {
+    if (warp_idx == write_warp_idx && lane_predicate) {
         cute::copy(tma_store_O, tOsO, tOgO);
         tma_store_arrive();
     }
@@ -290,17 +290,17 @@ __forceinline__ __device__ void write_tiled(
 }
 
 template <bool IsTMACopy, int NumCopyThreads, typename ElemO, 
-          typename CopyO, typename LayoutO, typename TileShapeO, 
-          typename SMemO, typename SeqLenTraits>
+          typename TMACopyO, typename TiledCopyO, typename LayoutO, 
+          typename TileShapeO, typename SMemO, typename SeqLenTraits>
 __forceinline__ __device__ void write_O(
-        ElemO* O, const CopyO& copy_O,
+        ElemO* O, const TMACopyO& tma_copy_O, const TiledCopyO& tiled_copy_O,
         const LayoutO& layout_O, const TileShapeO& tile_shape_O,
         const SMemO& sO, int m_block, int bidh, int bidb,
-        const SeqLenTraits& seqlen_traits_o) {
+        const SeqLenTraits& seqlen_traits_o, int write_warp_idx) {
     if constexpr (IsTMACopy) {
-        write_tma<NumCopyThreads>(O, copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb, seqlen_traits_o);
+        write_tma<NumCopyThreads>(O, tma_copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb, seqlen_traits_o, write_warp_idx);
     } else {
-        write_tiled<NumCopyThreads>(O, copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb, seqlen_traits_o);
+        write_tiled<NumCopyThreads>(O, tiled_copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb, seqlen_traits_o);
     }
 }
 
