@@ -301,7 +301,7 @@ def test_flash_attn_output_fp8(
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=torch.float16, requires_grad=True)
     k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=torch.float16, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=torch.float16, requires_grad=True)
-    out, lse = flash_attn_func(q.to(dtype), k.to(dtype), v.to(dtype).transpose(1,3).clone(), causal=causal)
+    out, lse = flash_attn_func(q.to(dtype), k.to(dtype), v.to(dtype).transpose(1,3).contiguous().clone(), causal=causal)
     q = q.to(dtype).to(torch.float16)
     k = k.to(dtype).to(torch.float16)
     v = v.to(dtype).to(torch.float16)
