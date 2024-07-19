@@ -27,193 +27,303 @@ using namespace cute;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename T>
-struct MaxOp {
-__device__ __forceinline__ T operator()(T const & x, T const & y) { return x > y ? x : y; }
+template <typename T> struct MaxOp {
+  __device__ __forceinline__ T operator()(T const &x, T const &y) {
+    return x > y ? x : y;
+  }
 };
 
-template <>
-struct MaxOp<float> {
-// This is slightly faster
-__device__ __forceinline__ float operator()(float const &x, float const &y) { return max(x, y); }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template<typename T>
-struct SumOp {
-__device__ __forceinline__ T operator()(T const & x, T const & y) { return x + y; }
+template <> struct MaxOp<float> {
+  // This is slightly faster
+  __device__ __forceinline__ float operator()(float const &x, float const &y) {
+    return max(x, y);
+  }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<int THREADS>
-struct Allreduce {
-    static_assert(THREADS == 32 || THREADS == 16 || THREADS == 8 || THREADS == 4);
-    template<typename T, typename Operator>
-    static __device__ __forceinline__ T run(T x, Operator &op) {
-        constexpr int OFFSET = THREADS / 2;
-        x = op(x, __shfl_xor_sync(uint32_t(-1), x, OFFSET));
-        return Allreduce<OFFSET>::run(x, op);
-    }
+template <typename T> struct SumOp {
+  __device__ __forceinline__ T operator()(T const &x, T const &y) {
+    return x + y;
+  }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<>
-struct Allreduce<2> {
-template<typename T, typename Operator> 
-static __device__ __forceinline__ T run(T x, Operator &op) {
+template <int THREADS> struct Allreduce {
+  static_assert(THREADS == 32 || THREADS == 16 || THREADS == 8 || THREADS == 4);
+  template <typename T, typename Operator>
+  static __device__ __forceinline__ T run(T x, Operator &op) {
+    constexpr int OFFSET = THREADS / 2;
+    x = op(x, __shfl_xor_sync(uint32_t(-1), x, OFFSET));
+    return Allreduce<OFFSET>::run(x, op);
+  }
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <> struct Allreduce<2> {
+  template <typename T, typename Operator>
+  static __device__ __forceinline__ T run(T x, Operator &op) {
     x = op(x, __shfl_xor_sync(uint32_t(-1), x, 1));
     return x;
-}
+  }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
-// For SM90, convert acc_layout from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
-template<typename Layout>
+// For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M),
+// ncol=(2, MMA_N)) For SM90, convert acc_layout from ((2, 2, V), MMA_M, MMA_N)
+// to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
+template <typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
-    if constexpr (decltype(rank<0>(acc_layout))::value == 3) {  // SM90
-        static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
-        static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
-        static_assert(decltype(rank(acc_layout))::value == 3);
-        auto l = acc_layout;
-        return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<0, 2>(l), get<2>(l)));
-    } else {  // SM80
-        static_assert(decltype(size<0>(acc_layout))::value == 4);
-        static_assert(decltype(rank(acc_layout))::value == 3);
-        auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
-        return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
-    }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// For SM90, convert acc_layout from ((2, 2, V), MMA_N, MMA_M) to (nrow=(2, V, MMA_M), ncol=(2, MMA_N))
-template<typename Layout>
-__forceinline__ __device__ auto convert_layout_acc_transposed_rowcol(Layout acc_layout) {
+  if constexpr (decltype(rank<0>(acc_layout))::value == 3) { // SM90
     static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
     static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
     static_assert(decltype(rank(acc_layout))::value == 3);
     auto l = acc_layout;
-    return make_layout(make_layout(get<0, 0>(l), get<0, 2>(l), get<2>(l)), make_layout(get<0, 1>(l), get<1>(l)));
+    return make_layout(make_layout(get<0, 1>(l), get<1>(l)),
+                       make_layout(get<0, 0>(l), get<0, 2>(l), get<2>(l)));
+  } else { // SM80
+    static_assert(decltype(size<0>(acc_layout))::value == 4);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    auto l = logical_divide(acc_layout, Shape<_2>{}); // ((2, 2), MMA_M, MMA_N)
+    return make_layout(make_layout(get<0, 1>(l), get<1>(l)),
+                       make_layout(get<0, 0>(l), get<2>(l)));
+  }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
-// if using m16n8k16, or to (4, MMA_M, MMA_N) if using m16n8k8.
-// For SM90, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((2, 2, 2), MMA_M, (N / 16, MMA_N))
-template<typename MMA_traits, typename Layout>
+// For SM90, convert acc_layout from ((2, 2, V), MMA_N, MMA_M) to (nrow=(2, V,
+// MMA_M), ncol=(2, MMA_N))
+template <typename Layout>
+__forceinline__ __device__ auto
+convert_layout_acc_transposed_rowcol(Layout acc_layout) {
+  static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
+  static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
+  static_assert(decltype(rank(acc_layout))::value == 3);
+  auto l = acc_layout;
+  return make_layout(make_layout(get<0, 0>(l), get<0, 2>(l), get<2>(l)),
+                     make_layout(get<0, 1>(l), get<1>(l)));
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M,
+// MMA_N / 2) if using m16n8k16, or to (4, MMA_M, MMA_N) if using m16n8k8. For
+// SM90, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((2, 2, 2),
+// MMA_M, (N / 16, MMA_N))
+template <typename MMA_traits, typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
-    using X = Underscore;
-    if constexpr (decltype(rank<0>(acc_layout))::value == 3) {  // SM90
-        static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
-        static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
-        static_assert(decltype(rank(acc_layout))::value == 3);
-        static_assert(decltype(rank(get<0>(acc_layout)))::value == 3);
-        auto l = logical_divide(get<0>(acc_layout), Shape<X, X, _2>{});  // (2, 2, (2, N / 16)))
-        return make_layout(make_layout(get<0>(l), get<1>(l), get<2, 0>(l)), get<1>(acc_layout), make_layout(get<2, 1>(l), get<2>(acc_layout)));
-    } else {  // SM80
-        static_assert(decltype(size<0>(acc_layout))::value == 4);
-        static_assert(decltype(rank(acc_layout))::value == 3);
-        constexpr int mma_shape_K = get<2>(typename MMA_traits::Shape_MNK{});
-        static_assert(mma_shape_K == 8 || mma_shape_K == 16);
-        if constexpr (mma_shape_K == 8) {
-            return acc_layout;
-        } else {
-            auto l = logical_divide(acc_layout, Shape<X, X, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
-            return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
-        }
+  using X = Underscore;
+  if constexpr (decltype(rank<0>(acc_layout))::value == 3) { // SM90
+    static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
+    static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    static_assert(decltype(rank(get<0>(acc_layout)))::value == 3);
+    auto l = logical_divide(get<0>(acc_layout),
+                            Shape<X, X, _2>{}); // (2, 2, (2, N / 16)))
+    return make_layout(make_layout(get<0>(l), get<1>(l), get<2, 0>(l)),
+                       get<1>(acc_layout),
+                       make_layout(get<2, 1>(l), get<2>(acc_layout)));
+  } else { // SM80
+    static_assert(decltype(size<0>(acc_layout))::value == 4);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    constexpr int mma_shape_K = get<2>(typename MMA_traits::Shape_MNK{});
+    static_assert(mma_shape_K == 8 || mma_shape_K == 16);
+    if constexpr (mma_shape_K == 8) {
+      return acc_layout;
+    } else {
+      auto l = logical_divide(acc_layout,
+                              Shape<X, X, _2>{}); // (4, MMA_M, (2, MMA_N / 2)))
+      return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l),
+                         get<2, 1>(l));
     }
+  }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename To_type, typename Engine, typename Layout>
-__forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tensor) {
-    using From_type = typename Engine::value_type;
-    constexpr int numel = decltype(size(tensor))::value;
-    cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
-    // HACK: this requires tensor to be "contiguous"
-    auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
-    return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
-    // Tensor out = make_tensor_like<To_type>(tensor);
-    // cute::copy(make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout()), out);
-    // return out;
+__forceinline__ __device__ auto
+convert_type(Tensor<Engine, Layout> const &tensor) {
+  using From_type = typename Engine::value_type;
+  constexpr int numel = decltype(size(tensor))::value;
+  cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
+  // HACK: this requires tensor to be "contiguous"
+  auto frag =
+      convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(
+          tensor.data()));
+  return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+  // Tensor out = make_tensor_like<To_type>(tensor);
+  // cute::copy(make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout()),
+  // out); return out;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <bool zero_init=false, int wg_wait=0, bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1, typename Tensor2,
-          typename TiledMma>
-__forceinline__ __device__ void gemm(TiledMma &tiled_mma, Tensor0 const &tCrA, Tensor1 const &tCrB, Tensor2 &tCrC) {
-    constexpr bool Is_RS = !cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value;
-    // Need to cast away const on tCrA since warpgroup_fence_operand doesn't take const
-    if constexpr (Is_RS) { warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
-    warpgroup_fence_operand(tCrC);
-    if constexpr (arrive) {
-        warpgroup_arrive();
+template <bool zero_init = false, int wg_wait = 0, bool arrive = true,
+          bool commit = true, typename Tensor0, typename Tensor1,
+          typename Tensor2, typename TiledMma>
+__forceinline__ __device__ void gemm(TiledMma &tiled_mma, Tensor0 const &tCrA,
+                                     Tensor1 const &tCrB, Tensor2 &tCrC) {
+  constexpr bool Is_RS = !cute::is_base_of<cute::GMMA::DescriptorIterator,
+                                           typename TiledMma::FrgTypeA>::value;
+  // Need to cast away const on tCrA since warpgroup_fence_operand doesn't take
+  // const
+  if constexpr (Is_RS) {
+    warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA));
+  }
+  warpgroup_fence_operand(tCrC);
+  if constexpr (arrive) {
+    warpgroup_arrive();
+  }
+  if constexpr (zero_init) {
+    tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+    // Unroll the K mode manually to set scale D to 1
+    CUTLASS_PRAGMA_UNROLL
+    for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
+      cute::gemm(tiled_mma, tCrA(_, _, k_block), tCrB(_, _, k_block), tCrC);
+      tiled_mma.accumulate_ = GMMA::ScaleOut::One;
     }
-    if constexpr (zero_init) {
-        tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
-        // Unroll the K mode manually to set scale D to 1
-        CUTLASS_PRAGMA_UNROLL
-        for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
-          cute::gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCrC);
-          tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+  } else {
+    // cute::gemm(tiled_mma, tCrA, tCrB, tCrC);
+    // Unroll the K mode manually to set scale D to 1
+    CUTLASS_PRAGMA_UNROLL
+    for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
+      cute::gemm(tiled_mma, tCrA(_, _, k_block), tCrB(_, _, k_block), tCrC);
+      tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+    }
+  }
+  if constexpr (commit) {
+    warpgroup_commit_batch();
+  }
+  if constexpr (wg_wait >= 0) {
+    warpgroup_wait<wg_wait>();
+  }
+  warpgroup_fence_operand(tCrC);
+  if constexpr (Is_RS) {
+    warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA));
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <bool Is_even_MN = true, bool Is_even_K = true,
+          bool Clear_OOB_MN = false, bool Clear_OOB_K = true,
+          typename TiledCopy, typename Engine0, typename Layout0,
+          typename Engine1, typename Layout1, typename Engine2,
+          typename Layout2, typename Engine3, typename Layout3>
+__forceinline__ __device__ void
+copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const &S,
+     Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
+     Tensor<Engine3, Layout3> const &predicate_K, const int max_MN = 0) {
+  CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
+  CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
+  CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D)); // MMA
+  CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D)); // MMA_M
+  CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D)); // MMA_K
+  // There's no case where !Clear_OOB_K && Clear_OOB_MN
+  static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
+#pragma unroll
+  for (int m = 0; m < size<1>(S); ++m) {
+    if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
+#pragma unroll
+      for (int k = 0; k < size<2>(S); ++k) {
+        if (Is_even_K || predicate_K(k)) {
+          cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
+        } else if (Clear_OOB_K) {
+          cute::clear(D(_, m, k));
         }
+      }
+    } else if (Clear_OOB_MN) {
+      cute::clear(D(_, m, _));
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+//
+// Need this register byte permute/shuffle to match register layout of
+// (FP8 downcasted) accumulator of GEMM-I to FP8 operand A of GEMM-II.
+struct ReorgCFp8toAFp8 {
+  int selectorEx0;
+  int selectorEx1;
+  int selectorEx4;
+  int selectorEx5;
+  int upper_map[4] = {0, 3, 1, 2};
+  int lower_map[4] = {1, 2, 0, 3};
+
+  CUTLASS_DEVICE ReorgCFp8toAFp8() {
+    int laneId = cutlass::canonical_lane_idx();
+
+    if (laneId % 4 == 0 || laneId % 4 == 3) {
+      selectorEx0 = 0x3210;
+      selectorEx1 = 0x7654;
+      selectorEx4 = 0x5410;
+      selectorEx5 = 0x7632;
     } else {
-        // cute::gemm(tiled_mma, tCrA, tCrB, tCrC);
-        // Unroll the K mode manually to set scale D to 1
-        CUTLASS_PRAGMA_UNROLL
-        for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
-          cute::gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCrC);
-          tiled_mma.accumulate_ = GMMA::ScaleOut::One;
-        }
+      selectorEx0 = 0x7654;
+      selectorEx1 = 0x3210;
+      selectorEx4 = 0x1054;
+      selectorEx5 = 0x3276;
     }
-    if constexpr (commit) {
-        warpgroup_commit_batch();
+  }
+
+  template <typename Fragment> CUTLASS_DEVICE auto operator()(Fragment &accum) {
+
+    using namespace cute;
+
+    // First update `mi` to the max per-row
+    //
+    auto VT = shape<0>(accum); // number of vector elements per tile.
+    auto MT = shape<1>(accum); // number of tiles along M.
+    auto NT = shape<2>(accum); // number of tiles along N.
+
+    auto data = accum.data();
+    int n = 0;
+
+#pragma unroll
+    for (int i = 0; i < MT; ++i) {
+
+      // Traverse 2-rows + 2-cols (2x2) simultaneously.
+
+#pragma unroll
+      for (int k = 0; k < NT * size<2>(VT) / 2; ++k) {
+
+        auto upper = *reinterpret_cast<uint32_t *>(&data[n]);
+        auto lower = *reinterpret_cast<uint32_t *>(&data[n + 4]);
+
+        auto upper0 = __byte_perm(upper, lower, selectorEx0);
+        auto lower0 = __byte_perm(upper, lower, selectorEx1);
+        upper0 =
+            __shfl_sync(uint32_t(-1), upper0, upper_map[threadIdx.x % 4], 4);
+        lower0 =
+            __shfl_sync(uint32_t(-1), lower0, lower_map[threadIdx.x % 4], 4);
+
+        uint32_t *data_32bit = reinterpret_cast<uint32_t *>(&data[n]);
+        data_32bit[0] = __byte_perm(upper0, lower0, selectorEx4);
+        data_32bit[1] = __byte_perm(upper0, lower0, selectorEx5);
+        n += 8;
+      }
     }
-    if constexpr (wg_wait >= 0) { warpgroup_wait<wg_wait>(); }
-    warpgroup_fence_operand(tCrC);
-    if constexpr (Is_RS) { warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
-}
+  }
+};
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
+// Reshape Utility for converting the layout from accumulator of GEMM-I
+// to Operand A of GEMM-II.
+struct ReshapeTStoTP {
+  template <class FragmentC, class FragmentQ>
+  CUTLASS_DEVICE auto operator()(FragmentC &&tC, FragmentQ &&tQ) {
 
-template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
-          typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
-          typename Engine2, typename Layout2, typename Engine3, typename Layout3>
-__forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const &S,
-                            Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
-                            Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
-    CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
-    CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
-    CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
-    CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));                     // MMA_M
-    CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K
-    // There's no case where !Clear_OOB_K && Clear_OOB_MN
-    static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
-    #pragma unroll
-    for (int m = 0; m < size<1>(S); ++m) {
-        if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
-            #pragma unroll
-            for (int k = 0; k < size<2>(S); ++k) {
-                if (Is_even_K || predicate_K(k)) {
-                    cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
-                } else if (Clear_OOB_K) {
-                    cute::clear(D(_, m, k));
-                }
-            }
-        } else if (Clear_OOB_MN) {
-            cute::clear(D(_, m, _));
-        }
-    }
-}
+    // get the layout of one row of Q.
+    auto layoutQRow = make_layout_like(tQ(_, 0, _).layout());
+    // get the layout of  M dimension of C.
+    auto layoutCM = get<1>(tC.layout());
+    return make_layout(get<0>(layoutQRow), layoutCM, get<1>(layoutQRow));
+  }
+};
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-}  // namespace flash
+} // namespace flash

@@ -241,7 +241,13 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
             }
         }
     } else {
-        // run_mha_fwd_<cutlass::float_e4m3_t, 128>(params, stream);
+	    if (params.d == 64) {
+		    run_mha_fwd_<cutlass::float_e4m3_t, 64>(params, stream);
+	    } else if (params.d == 128) {
+		    run_mha_fwd_<cutlass::float_e4m3_t, 128>(params, stream);
+	    } else {
+		    run_mha_fwd_<cutlass::float_e4m3_t, 256>(params, stream);
+	    }
     }
 }
 
@@ -258,12 +264,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     TORCH_CHECK(is_sm90, "FlashAttention only supports Hopper GPUs or newer.");
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type for now");
-    // TODO: will add e4m3 later
-    // TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kFloat8_e4m3fn,
-                // "FlashAttention only support fp16 and bf16 data type");
-                // "FlashAttention only support fp16 and fp8 (e4m3) data type for now");
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || q_dtype == torch::kFloat8_e4m3fn,
+                "FlashAttention only support fp16, bf16 and fp8 (e4m3) data type for now");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
@@ -293,7 +295,11 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
 
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size_og);
+    if (q_dtype == torch::kFloat8_e4m3fn) {
+    CHECK_SHAPE(v, batch_size, head_size_og, num_heads_k, seqlen_k);
+    } else {
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_og);
+    }
 
     at::Tensor q_padded, k_padded, v_padded;
     if (head_size_og % 8 != 0) {
@@ -309,13 +315,13 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        //TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_og);
         if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
     } else {
-        out = torch::empty_like(q_padded);
+        out = q_dtype == torch::kFloat8_e4m3fn ? torch::empty_like(q_padded,  at::kHalf) : torch::empty_like(q_padded);
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };

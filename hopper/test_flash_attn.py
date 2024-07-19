@@ -250,3 +250,127 @@ def test_flash_attn_output(
     #     assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
     #     assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
     #     assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
+# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize("mha_type", ["gqa"])
+@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
+# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
+# @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
+# @pytest.mark.parametrize('d', [56, 80])
+@pytest.mark.parametrize("d", [64, 128, 256])
+#@pytest.mark.parametrize("d", [128])
+# @pytest.mark.parametrize("d", [256])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        #(64, 128),
+        (128, 128),
+        #(256, 256),
+        #(113, 203),
+        #(128, 217),
+        #(113, 211),
+        #(108, 256),
+        #(256, 512),
+        #(384, 256),
+        #(640, 128),
+        #(512, 256),
+        #(1024, 1024),
+        #(1023, 1024),
+        #(1024, 1023),
+        (2048, 2048),
+    ],
+)
+# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
+def test_flash_attn_output_fp8(
+    seqlen_q, seqlen_k, d, causal, mha_type, dtype
+):
+    device = "cuda"
+    # set seed
+    torch.random.manual_seed(0)
+    # batch_size = 40
+    # nheads = 16
+    batch_size = 9
+    nheads = 6
+    nheads_kv = 6 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    # batch_size = 1
+    # nheads = 1
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=torch.float16, requires_grad=True)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=torch.float16, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=torch.float16, requires_grad=True)
+    out, lse = flash_attn_func(q.to(dtype), k.to(dtype), v.to(dtype).transpose(1,3).clone(), causal=causal)
+    q = q.to(dtype).to(torch.float16)
+    k = k.to(dtype).to(torch.float16)
+    v = v.to(dtype).to(torch.float16)
+    out_ref, attn_ref = attention_ref(
+        q,
+        k,
+        v,
+        None,
+        None,
+        causal=causal,
+    )
+    out_pt, attn_pt = attention_ref(
+        q,
+        k,
+        v,
+        None,
+        None,
+        causal=causal,
+        upcast=False,
+        reorder_ops=True,
+    )
+
+    # qk = torch.einsum('bshd,bthd->bhst', q, k).float()
+    # m = qk.amax(-1, keepdim=True)
+    # s_tmp = torch.exp((qk - m) / math.sqrt(d))
+    # exp_sum = s_tmp.sum(-1)
+    # qk = torch.einsum('bthd,bshd->bhts', q.float() / math.sqrt(d), k.float())
+    # lse_ref = torch.logsumexp(qk, dim=-1)
+
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+    # if not causal:
+    #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+    # breakpoint()
+
+    # if d <= 128:
+    #     g = torch.randn_like(out)
+    #     do_o = (g.float() * out.float()).sum(-1)
+    #     dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
+    #     dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q, k, v), g)
+    #     dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q, k, v), g)
+    #     print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+    #     print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+    #     print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+    #     print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
+    #     print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
+    #     print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
+    #     print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+    #     print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+    #     print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+    #     print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
+    #     print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
+    #     print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+
+    # dS = torch.einsum('bthd,bshd->bhts', g.float(), v.float())
+    # P = torch.softmax(qk, -1)
+    # dP = P * (dS - do_o.unsqueeze(1))
+    # dQ = torch.einsum('bhts,bshd->bthd', dP, k.float())
+    # dV = torch.einsum('bhts,bthd->bshd', P, g.float())
+    # dK = torch.einsum('bhts,bthd->bshd', dP, q.float())
+    # breakpoint()
+
+    # Check that FlashAttention's numerical error is at most twice the numerical error
+    # of a Pytorch implementation.
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+
+    # if d <= 128:
+    #     assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
+    #     assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
+    #     assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()

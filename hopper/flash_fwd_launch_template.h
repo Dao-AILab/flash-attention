@@ -21,16 +21,15 @@
 template<typename Kernel_traits, bool Is_causal>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using Element = typename Kernel_traits::Element;
+    using ElementO = decltype(cute::conditional_return<is_same_v<Element, cutlass::float_e4m3_t>>(cutlass::half_t{}, Element{}));
     using TileShape_MNK = typename Kernel_traits::TileShape_MNK;
     using ClusterShape = typename Kernel_traits::ClusterShape_MNK;
 
     // print(typename Kernel_traits::SmemLayoutVt{}); printf("\n"); print(typename Kernel_traits::SmemLayoutVt_tmp{});
     using CollectiveMainloop = flash::CollectiveMainloopFwd<Kernel_traits, Is_causal>;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<Kernel_traits>;
-    using Scheduler = std::conditional_t<!Is_causal,
-        flash::StaticPersistentTileScheduler,
+    using Scheduler = std::conditional_t<!Is_causal, flash::StaticPersistentTileScheduler,
         flash::DynamicPersistentTileScheduler<Kernel_traits::kNThreads - cutlass::NumThreadsPerWarpGroup>>;
-        // flash::SingleTileScheduler>;
     typename CollectiveMainloop::Params mainloop_params =
         CollectiveMainloop::to_underlying_arguments({
             static_cast<Element const*>(params.q_ptr),
@@ -45,7 +44,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         });
     typename CollectiveEpilogue::Params epilogue_params =
         CollectiveEpilogue::to_underlying_arguments({
-            static_cast<Element*>(params.o_ptr),
+            static_cast<ElementO*>(params.o_ptr),
             {params.seqlen_q, params.d, params.h, params.b},  // shape_O
             {params.o_row_stride, _1{}, params.o_head_stride, params.o_batch_stride},  // stride_O
             static_cast<float*>(params.softmax_lse_ptr),
@@ -90,7 +89,7 @@ template<typename T>
 void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 192, 128, 16, 2, false, 1, T>, Is_causal>(params, stream);
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 192, 128, 16, 3, false, 1, T>, Is_causal>(params, stream);
     });
 }
 
@@ -100,7 +99,13 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         // Only use Cluster if number of tiles along seqlen_q is even
         BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, 128) % 2 == 0, UseCluster, [&] {
-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, Is_causal ? 128 : 176, 12, 2, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
+	    if constexpr (is_same_v<T, cutlass::float_e4m3_t>) {
+//            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 192, 128, 16, 3, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
+            //run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 192, 128, 16, 2, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 12, 4, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
+	    } else {
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 12, 2, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
+	    }
         });
     });
 }
@@ -111,7 +116,11 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         // Only use Cluster if number of tiles along seqlen_q is even
         BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, 128) % 2 == 0, UseCluster, [&] {
-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 80, 12, 2, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
+	    if constexpr (is_same_v<T, cutlass::float_e4m3_t>) {
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 12, 3, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream); 
+	    } else {
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 80, 12, 2, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream); 
+	    }
         });
     });
 }
