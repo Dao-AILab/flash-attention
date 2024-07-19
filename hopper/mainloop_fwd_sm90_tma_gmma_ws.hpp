@@ -472,9 +472,9 @@ struct CollectiveMainloopFwd {
         }
 
         softmax.template online_softmax</*Is_first=*/true>(tSrS, mainloop_params.softmax_scale_log2);
-	auto tSrSPrec = convert_type<Element>(tSrS);
+        auto tSrSPrec = convert_type<Element>(tSrS);
         if constexpr (is_same_v<Element, cutlass::float_e4m3_t>) {
-                  reg2reg(tSrSPrec);
+          reg2reg(tSrSPrec);
         }
         Tensor tOrP = make_tensor(tSrSPrec.data(), tOrPLayout);
         Tensor scores_scale = make_fragment_like(softmax.row_max);
@@ -508,9 +508,9 @@ struct CollectiveMainloopFwd {
             pipeline_v.consumer_release(smem_pipe_read_v);  // release V
             ++smem_pipe_read_k;
             ++smem_pipe_read_v;
-	    auto tSrSPrec = convert_type<Element>(tSrS);
+            auto tSrSPrec = convert_type<Element>(tSrS);
             if constexpr (is_same_v<Element, cutlass::float_e4m3_t>) {
-                  reg2reg(tSrSPrec);
+              reg2reg(tSrSPrec);
             }
             cute::copy(make_tensor(tSrSPrec.data(), tOrPLayout), tOrP);
         }
@@ -535,10 +535,10 @@ struct CollectiveMainloopFwd {
             ++smem_pipe_read_k;
             ++smem_pipe_read_v;
             // softmax.rescale_o(tOrO, scores_scale);
-	    auto tSrSPrec = convert_type<Element>(tSrS);
-	    if constexpr (is_same_v<Element, cutlass::float_e4m3_t>) {
-                  reg2reg(tSrSPrec);
-	    }
+            auto tSrSPrec = convert_type<Element>(tSrS);
+            if constexpr (is_same_v<Element, cutlass::float_e4m3_t>) {
+              reg2reg(tSrSPrec);
+            }
             cute::copy(make_tensor(tSrSPrec.data(), tOrPLayout), tOrP);
         }
         // Tell warp 0 that smem_q is ready
