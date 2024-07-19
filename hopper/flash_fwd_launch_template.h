@@ -103,6 +103,7 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
             //run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 192, 128, 16, 3, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
             //run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 192, 128, 16, 2, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 12, 4, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
+            //run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 12, 4, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
 	    } else {
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 12, 2, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
 	    }
