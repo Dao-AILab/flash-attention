@@ -304,29 +304,29 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     at::Tensor q_padded, k_padded, v_padded;
     if (q_dtype == torch::kFloat8_e4m3fn)
     {
-	    if (head_size_og % 16 != 0) {
-		    q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 16 - head_size_og % 16}));
-		    k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 16 - head_size_og % 16}));
-	    } else {
-		    q_padded = q;
-		    k_padded = k;
-	    }
-	    if (seqlen_k % 16 != 0) {
-		    v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 16 - seqlen_k % 16}));
-	    } else {
-		    v_padded = v;
-	    }
+      if (head_size_og % 16 != 0) {
+        q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 16 - head_size_og % 16}));
+        k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 16 - head_size_og % 16}));
+      } else {
+        q_padded = q;
+        k_padded = k;
+      }
+      if (seqlen_k % 16 != 0) {
+        v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 16 - seqlen_k % 16}));
+      } else {
+        v_padded = v;
+      }
     }
     else {
-	    if (head_size_og % 8 != 0) {
-		    q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-		    k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-		    v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-	    } else {
-		    q_padded = q;
-		    k_padded = k;
-		    v_padded = v;
-	    }
+      if (head_size_og % 8 != 0) {
+        q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+      } else {
+        q_padded = q;
+        k_padded = k;
+        v_padded = v;
+      }
     }
 
     at::Tensor out;
