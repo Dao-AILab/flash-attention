@@ -82,6 +82,11 @@ void set_params_fprop(Flash_fwd_params &params,
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
     params.seqused_k = static_cast<int *>(seqused_k);
 
+    TORCH_CHECK(
+        bool(params.cu_seqlens_q) == bool(params.cu_seqlens_k),
+        "cu_seqlens_q and cu_seqlens_k must be both null or non-null"
+    );
+
     // P = softmax(QK^T)
     params.p_ptr = p_d;
 

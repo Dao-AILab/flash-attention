@@ -17,7 +17,7 @@ from einops import rearrange, repeat
 # from flash_attn.utils.benchmark import benchmark_forward, benchmark_backward, benchmark_combined, benchmark_all, benchmark_fwd_bwd, pytorch_profiler
 from flash_attn.utils.benchmark import benchmark_forward, benchmark_backward, benchmark_combined, benchmark_all, benchmark_fwd_bwd, pytorch_profiler
 from flash_attn.flash_attn_interface import flash_attn_func
-from flash_attn_interface import flash_attn_func as flash_attn_func_v3
+from flash_attn_interface import flash_attn_func as flash_attn_func_v3, flash_attn_varlen_func as flash_attn_varlen_func_v3
 
 # Need to install triton nightly:
 # pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly
@@ -180,83 +180,94 @@ headdim = 256
 # for mode in ['fwd', 'bwd']:
 for mode in ['fwd']:
     for headdim in [64, 128, 256]:
-    # for headdim in [64]:
-        nheads = dim // headdim
-        # nheads = 24
-        # headdim = 64
-        # batch_size = 64
-        # seqlen = 512
-        # nheads = 8
-        # headdim = 128
-        nheads_kv = nheads
+    # for headdim in [128]:
+        for seqlen in [1024, 2048, 4096, 8192, 16384, 32768]:
+        # for seqlen in [8192]:
+            nheads = dim // headdim
+            # nheads = 24
+            # headdim = 64
+            # batch_size = 64
+            # seqlen = 512
+            # nheads = 8
+            # headdim = 128
+            nheads_kv = nheads
     
-        qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, device=device, dtype=dtype,
-                        requires_grad=True)
-        q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype, requires_grad=True)
-        k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype, requires_grad=True)
-        v = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype, requires_grad=True)
-        q_t = q.transpose(1, 2).contiguous().detach().requires_grad_()
-        k_t = k.transpose(1, 2).contiguous().detach().requires_grad_()
-        v_t = k.transpose(1, 2).contiguous().detach().requires_grad_()
-        grad = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
-        grad_t = grad.transpose(1, 2).contiguous()
+            qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, device=device, dtype=dtype,
+                            requires_grad=True)
+            q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype, requires_grad=True)
+            k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype, requires_grad=True)
+            v = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype, requires_grad=True)
+            q_t = q.transpose(1, 2).contiguous().detach().requires_grad_()
+            k_t = k.transpose(1, 2).contiguous().detach().requires_grad_()
+            v_t = k.transpose(1, 2).contiguous().detach().requires_grad_()
+            grad = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+            grad_t = grad.transpose(1, 2).contiguous()
     
-        bench_fn = benchmark_forward if mode == 'fwd' else partial(benchmark_backward, grad=grad)
+            bench_fn = benchmark_forward if mode == 'fwd' else partial(benchmark_backward, grad=grad)
 
-        for causal in [False, True]:
-        # for causal in [True]:
-            print(f"\n### {headdim = }, {causal = } ###")
-            if headdim <= 128 and cudnn is not None:
-                cudnn_sdpa_fwd, cudnn_sdpa_bwd = cudnn_sdpa_setup(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), grad.transpose(1, 2), causal=causal)
-            f = flops(batch_size, nheads, seqlen, seqlen, headdim, causal=causal, mode=mode)
-            _, m0 = bench_fn(flash_attn_func, q, k, v, dropout_p, causal=causal, repeats=repeats, verbose=verbose, desc='Fav2')
-            if mode == 'bwd':
-                ref_dv, v.grad = v.grad.clone(), None
-                ref_dk, k.grad = k.grad.clone(), None
-                ref_dq, q.grad = q.grad.clone(), None
-            # pytorch_profiler(flash_attn_func, q, k, v, dropout_p, causal=causal, backward=False)
-            if headdim <= 128:
-                if triton_attention is not None:
-                    time.sleep(1) # Sleep to avoid residual power throttling from the previous benchmark
-                    _, m3 = benchmark_backward(triton_attention, q_t, k_t, v_t, causal, 1 / math.sqrt(headdim), grad=grad_t, repeats=repeats, verbose=verbose, desc='Triton')
-                    # TODO: fix Triton numeric errors.
-                    # if mode == 'bwd':
-                    #     dv, v_t.grad = v_t.grad.clone(), None
-                    #     dk, k_t.grad = k_t.grad.clone(), None
-                    #     dq, q_t.grad = q_t.grad.clone(), None
-                    #     torch.testing.assert_close(ref_dv, dv.transpose(1, 2), atol=0.05, rtol=0.05)
-                    #     torch.testing.assert_close(ref_dk, dk.transpose(1, 2), atol=0.05, rtol=0.05)
-                    #     torch.testing.assert_close(ref_dq, dq.transpose(1, 2), atol=0.05, rtol=0.05)
-                if cudnn is not None:
-                    time.sleep(1) # Sleep to avoid residual power throttling from the previous benchmark
-                    if mode == 'fwd':
-                        _, m2 = benchmark_forward(cudnn_sdpa_fwd, repeats=repeats, verbose=verbose, desc='CuDNN')
-                    else:
-                        cudnn_sdpa_fwd()
-                        _, m2 = benchmark_forward(cudnn_sdpa_bwd, repeats=repeats, verbose=verbose, desc='CuDNN')
-                        dq, dk, dv = cudnn_sdpa_bwd()
-                        torch.testing.assert_close(ref_dv, dv.transpose(1, 2), atol=0.05, rtol=0.05)
-                        torch.testing.assert_close(ref_dk, dk.transpose(1, 2), atol=0.05, rtol=0.05)
-                        torch.testing.assert_close(ref_dq, dq.transpose(1, 2), atol=0.05, rtol=0.05)
-                    # pytorch_profiler(cudnn_sdpa, backward=False)
-            if headdim == 128 or mode == 'fwd':
-                time.sleep(1)
-                _, m1 = bench_fn(flash_attn_func_v3, q, k, v, causal=causal, repeats=repeats, verbose=verbose, desc='Fav3')
+            for causal in [False, True]:
+            # for causal in [True]:
+                print(f"\n### {headdim = }, {seqlen = }, {causal = } ###")
+                if headdim <= 128 and cudnn is not None:
+                    cudnn_sdpa_fwd, cudnn_sdpa_bwd = cudnn_sdpa_setup(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), grad.transpose(1, 2), causal=causal)
+                f = flops(batch_size, nheads, seqlen, seqlen, headdim, causal=causal, mode=mode)
+                _, m0 = bench_fn(flash_attn_func, q, k, v, dropout_p, causal=causal, repeats=repeats, verbose=verbose, desc='Fav2')
                 if mode == 'bwd':
-                    dv, v.grad = v.grad.clone(), None
-                    dk, k.grad = k.grad.clone(), None
-                    dq, q.grad = q.grad.clone(), None
-                    torch.testing.assert_close(ref_dv, dv, atol=0.05, rtol=0.05)
-                    torch.testing.assert_close(ref_dk, dk, atol=0.05, rtol=0.05)
-                    torch.testing.assert_close(ref_dq, dq, atol=0.05, rtol=0.05)
+                    ref_dv, v.grad = v.grad.clone(), None
+                    ref_dk, k.grad = k.grad.clone(), None
+                    ref_dq, q.grad = q.grad.clone(), None
+                # pytorch_profiler(flash_attn_func, q, k, v, dropout_p, causal=causal, backward=False)
+                if headdim <= 128:
+                    if triton_attention is not None:
+                        if mode == 'fwd':
+                            time.sleep(1) # Sleep to avoid residual power throttling from the previous benchmark
+                            _, m3 = benchmark_forward(triton_attention, q_t, k_t, v_t, causal, 1 / math.sqrt(headdim), repeats=repeats, verbose=verbose, desc='Triton')
+                        # TODO: fix Triton numeric errors.
+                        # if mode == 'bwd':
+                        #     dv, v_t.grad = v_t.grad.clone(), None
+                        #     dk, k_t.grad = k_t.grad.clone(), None
+                        #     dq, q_t.grad = q_t.grad.clone(), None
+                        #     torch.testing.assert_close(ref_dv, dv.transpose(1, 2), atol=0.05, rtol=0.05)
+                        #     torch.testing.assert_close(ref_dk, dk.transpose(1, 2), atol=0.05, rtol=0.05)
+                        #     torch.testing.assert_close(ref_dq, dq.transpose(1, 2), atol=0.05, rtol=0.05)
+                    if cudnn is not None:
+                        time.sleep(1) # Sleep to avoid residual power throttling from the previous benchmark
+                        if mode == 'fwd':
+                            _, m2 = benchmark_forward(cudnn_sdpa_fwd, repeats=repeats, verbose=verbose, desc='CuDNN')
+                        else:
+                            cudnn_sdpa_fwd()
+                            _, m2 = benchmark_forward(cudnn_sdpa_bwd, repeats=repeats, verbose=verbose, desc='CuDNN')
+                            dq, dk, dv = cudnn_sdpa_bwd()
+                            torch.testing.assert_close(ref_dv, dv.transpose(1, 2), atol=0.05, rtol=0.05)
+                            torch.testing.assert_close(ref_dk, dk.transpose(1, 2), atol=0.05, rtol=0.05)
+                            torch.testing.assert_close(ref_dq, dq.transpose(1, 2), atol=0.05, rtol=0.05)
+                        # pytorch_profiler(cudnn_sdpa, backward=False)
+                if headdim == 128 or mode == 'fwd':
+                    time.sleep(1)
+                    _, m1 = bench_fn(flash_attn_func_v3, q, k, v, causal=causal, repeats=repeats, verbose=verbose, desc='Fav3')
+                    q_var = q.reshape(-1, q.shape[-2], q.shape[-1])
+                    k_var = k.reshape(-1, k.shape[-2], k.shape[-1])
+                    v_var = v.reshape(-1, v.shape[-2], v.shape[-1])
+                    lens = torch.full([q.shape[0]], seqlen, dtype=torch.int32)
+                    cu_seqlens = torch.cat([torch.tensor([0], dtype=torch.int32), torch.cumsum(lens, dim=0, dtype=torch.int32)]).cuda()
+                    time.sleep(1)
+                    _, m1_var = bench_fn(flash_attn_varlen_func_v3, q_var, k_var, v_var, cu_seqlens, cu_seqlens, seqlen, seqlen, causal=causal, repeats=repeats, verbose=verbose, desc='Fav3 var len')
+                    if mode == 'bwd':
+                        dv, v.grad = v.grad.clone(), None
+                        dk, k.grad = k.grad.clone(), None
+                        dq, q.grad = q.grad.clone(), None
+                        torch.testing.assert_close(ref_dv, dv, atol=0.05, rtol=0.05)
+                        torch.testing.assert_close(ref_dk, dk, atol=0.05, rtol=0.05)
+                        torch.testing.assert_close(ref_dq, dq, atol=0.05, rtol=0.05)
  
-            # pytorch_profiler(flash_attn_func_v3, q, k, v, causal=causal, backward=False)
-            print(f'Fav2: {m0.mean * 1e3:.3f}ms, {(f / m0.mean * 1e-12):.1f} TFLOPS')
-            if headdim <= 128:
-                if triton_attention is not None:
-                    print(f'Triton: {m3.mean * 1e3:.3f}ms, {(f / m3.mean * 1e-12):.1f} TFLOPS')
-                if cudnn is not None:
-                    print(f'CuDNN: {m2.mean * 1e3:.3f}ms, {(f / m2.mean * 1e-12):.1f} TFLOPS')
-            if headdim == 128 or mode == 'fwd':
-                print(f'Fav3: {m1.mean * 1e3:.3f}ms, {(f / m1.mean * 1e-12):.1f} TFLOPS')
+                # pytorch_profiler(flash_attn_func_v3, q, k, v, causal=causal, backward=False)
+                print(f'Fav2: {m0.mean * 1e3:.3f}ms, {(f / m0.mean * 1e-12):.1f} TFLOPS')
+                if headdim <= 128:
+                    if triton_attention is not None:
+                        print(f'Triton: {m3.mean * 1e3:.3f}ms, {(f / m3.mean * 1e-12):.1f} TFLOPS')
+                    if cudnn is not None:
+                        print(f'CuDNN: {m2.mean * 1e3:.3f}ms, {(f / m2.mean * 1e-12):.1f} TFLOPS')
+                if headdim == 128 or mode == 'fwd':
+                    print(f'Fav3: {m1.mean * 1e3:.3f}ms, {(f / m1.mean * 1e-12):.1f} TFLOPS')
+                    print(f'Fav3 varlen: {m1_var.mean * 1e3:.3f}ms, {(f / m1_var.mean * 1e-12):.1f} TFLOPS')
     

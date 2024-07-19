@@ -24,33 +24,14 @@ struct CollectiveEpilogueFwd {
     static constexpr int kBlockM = Ktraits::kBlockM;
     static constexpr int kBlockN = Ktraits::kBlockN;
     static constexpr int kHeadDim = Ktraits::kHeadDim;
-    // using Element = Element_;
-    // static constexpr int kBlockM = kBlockM_;
-    // static constexpr int kBlockN = kBlockN_;
-    // static constexpr int kHeadDim = kHeadDim_;
     using TileShape_MNK = Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
 
-    // static constexpr int kNWarps = kNWarps_;
     static constexpr int kNWarps = Ktraits::kNWarps;
     static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
     static constexpr bool Is_WS = kNWarps >= 12;
 
     static constexpr int NumCopyThreads = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
     static constexpr int NumMmaThreads = kNThreads - NumCopyThreads;
-
-    using GmemTiledCopyOTMA = cute::SM90_TMA_STORE;
-
-    // These are for storing the output tensor without TMA (e.g., for setting output to zero)
-    static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
-    static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
-    static constexpr int kGmemThreadsPerRow = kHeadDim / kGmemElemsPerLoad;
-    static_assert(NumMmaThreads % kGmemThreadsPerRow == 0, "NumMmaThreads must be a multiple of kGmemThreadsPerRow");
-    using GmemLayoutAtom = Layout<Shape <Int<NumMmaThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
-                                  Stride<Int<kGmemThreadsPerRow>, _1>>;
-    using GmemTiledCopyO = decltype(
-        make_tiled_copy(Copy_Atom<DefaultCopy, Element>{},
-                        GmemLayoutAtom{},
-                        Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per store
 
     using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
@@ -59,10 +40,7 @@ struct CollectiveEpilogueFwd {
     using SmemCopyAtomO = Copy_Atom<cute::SM90_U32x4_STSM_N, Element>;
     using SharedStorage = cute::array_aligned<Element, cute::cosize_v<SmemLayoutO>>;
 
-    using ShapeO = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen_q, d, head, batch)
-    using StrideO = cute::Stride<int64_t, _1, int64_t, int64_t>;
-    using StrideLSE = cute::Stride<_1, int64_t, int64_t>;            // (seqlen_q, head, batch)
-
+    using GmemTiledCopyOTMA = cute::SM90_TMA_STORE;
     using TMA_O = decltype(make_tma_copy(
         GmemTiledCopyOTMA{},
         make_tensor(
@@ -74,12 +52,12 @@ struct CollectiveEpilogueFwd {
         select<0, 2>(TileShape_MNK{}),
         _1{}));  // no mcast for O
 
+    // These are for storing the output tensor without TMA (e.g., for setting output to zero and var-seq-len)
     static constexpr int kNumVecElem = ceil_div(128, sizeof_bits_v<Element>);
     static_assert(kHeadDim % kNumVecElem == 0);
     static constexpr int kNumThreadsPerRow = kHeadDim / kNumVecElem;
-    static constexpr int kNumThreads = (Is_WS ? (kNWarps - 4) : kNWarps) * 32;
-    static_assert(kNumThreads % kNumThreadsPerRow == 0);
-    static constexpr int kNumRows = kNumThreads / kNumThreadsPerRow;
+    static_assert(NumMmaThreads % kNumThreadsPerRow == 0);
+    static constexpr int kNumRows = NumMmaThreads / kNumThreadsPerRow;
     using TiledCopyOAtom = cute::Copy_Atom<cute::UniversalCopy<cutlass::uint128_t>, Element>;
     using TiledCopyOThrLayout = decltype(cute::make_layout(
         cute::make_shape(Int<kNumRows>{}, Int<kNumThreadsPerRow>{}),
@@ -92,11 +70,6 @@ struct CollectiveEpilogueFwd {
         TiledCopyOThrLayout{}, // Thr layout
         TiledCopyOValLayout{} // Val layout
     ));
-    // using StoreO = std::conditional_t<
-    //     Seqlen_traits::kUseVarSeqLen, 
-    //     TiledCopyO,
-    //     TMA_O
-    // >;
 
     // Host side kernel arguments
     struct Arguments {
@@ -162,20 +135,6 @@ struct CollectiveEpilogueFwd {
         cutlass::arch::fence_view_async_shared(); // ensure smem writes are visible to TMA
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp,
                                             cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-        int write_warp_idx = kNWarps - 1;
-        if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
-        // if (cutlass::canonical_warp_idx_sync() >= NumCopyThreads / cutlass::NumThreadsPerWarp) {
-            cutlass::arch::NamedBarrier::sync(
-                NumMmaThreads + cutlass::NumThreadsPerWarp, 
-                cutlass::arch::ReservedNamedBarriers::EpilogueBarrier
-            );
-        }
-        TiledCopyO gmem_tiled_copy_O;
-        flash::write_O<!Seqlen_traits::kUseVarSeqLen, NumCopyThreads>(
-            epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O, 
-            epilogue_params.layout_O, select<0, 2>(TileShape_MNK{}), sO, 
-            m_block, bidh, bidb, seqlen_traits_q, write_warp_idx
-        );
 
         Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.ptr_LSE), epilogue_params.layout_LSE);
         Tensor gLSE = seqlen_traits_q.get_lse_local_tile_tensor(
@@ -195,6 +154,20 @@ struct CollectiveEpilogueFwd {
                 if (row < seqlen_traits_q.actual_seq_len - m_block * kBlockM) { gLSE(row) = lse(mi); }
             }
         }
+
+        int write_warp_idx = kNWarps - 1;
+        if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
+            cutlass::arch::NamedBarrier::sync(
+                NumMmaThreads + cutlass::NumThreadsPerWarp, 
+                cutlass::arch::ReservedNamedBarriers::EpilogueBarrier
+            );
+        }
+        TiledCopyO gmem_tiled_copy_O;
+        flash::write_O<!Seqlen_traits::kUseVarSeqLen, NumCopyThreads>(
+            epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O, 
+            epilogue_params.layout_O, select<0, 2>(TileShape_MNK{}), sO, 
+            m_block, bidh, bidb, seqlen_traits_q, write_warp_idx
+        );
     }
 
     CUTLASS_DEVICE void
@@ -221,7 +194,7 @@ struct CollectiveEpilogueFwd {
         Tensor gLSE = seqlen_traits_q.get_lse_local_tile_tensor(
             mLSE, Shape<Int<kBlockM>>{}, bidh, bidb)(_, m_block);
 
-        GmemTiledCopyO gmem_tiled_copy_O;
+        TiledCopyO gmem_tiled_copy_O;
         auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
         Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
         Tensor tOrO = make_fragment_like(tOgO);

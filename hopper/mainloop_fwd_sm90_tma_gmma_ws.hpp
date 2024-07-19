@@ -21,7 +21,7 @@ namespace flash {
 
 using namespace cute;
 
-template <typename Ktraits, bool Is_causal, typename Seqlen_traits_Q, typename Seqlen_traits_K>
+template <typename Ktraits, bool Is_causal, typename Seqlen_traits>
 struct CollectiveMainloopFwd {
 
     using Element = typename Ktraits::Element;
@@ -68,8 +68,8 @@ struct CollectiveMainloopFwd {
         GmemTiledCopyQ{},
         make_tensor(
             make_gmem_ptr(static_cast<Element const*>(nullptr)), 
-            repeat_like(typename Seqlen_traits_Q::StrideT{}, int32_t(0)), 
-            typename Seqlen_traits_Q::StrideT{}
+            repeat_like(typename Seqlen_traits::StrideT{}, int32_t(0)), 
+            typename Seqlen_traits::StrideT{}
         ),
         SmemLayoutQ{},
         select<0, 2>(TileShape_MNK{}),
@@ -79,8 +79,8 @@ struct CollectiveMainloopFwd {
         GmemTiledCopyKV{},
         make_tensor(
             make_gmem_ptr(static_cast<Element const*>(nullptr)), 
-            repeat_like(typename Seqlen_traits_K::StrideT{}, int32_t(0)), 
-            typename Seqlen_traits_K::StrideT{}
+            repeat_like(typename Seqlen_traits::StrideT{}, int32_t(0)), 
+            typename Seqlen_traits::StrideT{}
         ),
         take<0, 2>(SmemLayoutK{}),
         select<1, 2>(TileShape_MNK{}),
@@ -100,19 +100,19 @@ struct CollectiveMainloopFwd {
     // Host side kernel arguments
     struct Arguments {
         Element const* ptr_Q;
-        typename Seqlen_traits_Q::LayoutT layout_Q;
+        typename Seqlen_traits::LayoutT layout_Q;
         Element const* ptr_K;
-        typename Seqlen_traits_K::LayoutT layout_K;
+        typename Seqlen_traits::LayoutT layout_K;
         Element const* ptr_V;
-        typename Seqlen_traits_K::LayoutT layout_V;
+        typename Seqlen_traits::LayoutT layout_V;
         float const softmax_scale_log2;
     };
 
     // Device side kernel params
     struct Params {
-        typename Seqlen_traits_Q::LayoutT layout_Q;
-        typename Seqlen_traits_K::LayoutT layout_K;
-        typename Seqlen_traits_K::LayoutT layout_V;
+        typename Seqlen_traits::LayoutT layout_Q;
+        typename Seqlen_traits::LayoutT layout_K;
+        typename Seqlen_traits::LayoutT layout_V;
         cutlass::FastDivmod qhead_per_khead_divmod;
         TMA_Q tma_load_Q;
         TMA_KV tma_load_K, tma_load_V;
@@ -160,8 +160,8 @@ struct CollectiveMainloopFwd {
     CUTLASS_DEVICE
     int get_n_block_max(
           Params const& mainloop_params, int m_block, 
-          const Seqlen_traits_Q& seqlen_traits_q,
-          const Seqlen_traits_K& seqlen_traits_k
+          const Seqlen_traits& seqlen_traits_q,
+          const Seqlen_traits& seqlen_traits_k
         ) {
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -188,8 +188,8 @@ struct CollectiveMainloopFwd {
          typename Scheduler::WorkTileInfo& work_tile_info,
          cute::tuple<int32_t, int32_t, int32_t> block_coord,
          int work_idx,
-         const Seqlen_traits_Q& seqlen_traits_q,
-         const Seqlen_traits_K& seqlen_traits_k
+         const Seqlen_traits& seqlen_traits_q,
+         const Seqlen_traits& seqlen_traits_k
          ) {
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
@@ -345,8 +345,8 @@ struct CollectiveMainloopFwd {
         int work_idx,
         int m_block,
         SharedStorage& shared_storage,
-        const Seqlen_traits_Q& seqlen_traits_q,
-        const Seqlen_traits_K& seqlen_traits_k
+        const Seqlen_traits& seqlen_traits_q,
+        const Seqlen_traits& seqlen_traits_k
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
 
