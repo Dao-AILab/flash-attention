@@ -17,7 +17,10 @@ enum class FwdNamedBarriers {
     TileCountSmemFull = 3,
     WarpSchedulerWG1 = 4,
     WarpSchedulerWG2 = 5,
-    WarpSchedulerWG3 = 6,
+    WarpSchedulerWG3 = 6    
+#ifdef NEW_FP8_EPI_BARRIER
+    OutEmpty = 7
+#endif
 };
 
 } // flash

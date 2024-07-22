@@ -68,7 +68,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // int smem_size_q = sizeof(decltype((typename Kernel_traits::SharedStorage{}).smem_q));
     // int smem_size_k = sizeof(decltype((typename Kernel_traits::SharedStorage{}).smem_k));
     // int smem_size_v = sizeof(decltype((typename Kernel_traits::SharedStorage{}).smem_v));
-    // printf("smem_size = %d, q = %d, k = %d, v = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v);
+    // int smem_size_o = sizeof(decltype((typename Kernel_traits::SharedStorage{}).smem_o));
+    // printf("smem_size = %d, q = %d, k = %d, v = %d, o = %d.\n", smem_size, smem_size_q, smem_size_k, smem_size_v, smem_size_o);
     if (smem_size >= 48 * 1024) {
        C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
@@ -140,7 +141,8 @@ void run_mha_fwd_hdim128_fp8(Flash_fwd_params &params, cudaStream_t stream) {
     //     });
     // });
     constexpr static bool Is_causal = false;
-    run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, 192, 128, 16, 4, false, 1, T>, Is_causal>(params, stream);
+    // run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, 192, 128, 16, 3, false, 2, T>, Is_causal>(params, stream);    
+    run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, 128, 256, 12, 2, false, 2, T>, Is_causal>(params, stream);
 }
 
 template<typename T>

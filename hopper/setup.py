@@ -141,7 +141,12 @@ if not SKIP_CUDA_BUILD:
         "-lineinfo",
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
         "-DNDEBUG",  # Important, otherwise performance is severely impacted                
-        "-DCOLUMN_PERMUTE"
+        "-DCOLUMN_PERMUTE",  
+        # "-DUSE_TRI_MMA_FP8"      
+        # "-DUSE_CUSTOM_SOFTMAX",
+        # "-DNO_UNION"
+        # "-DNEW_FP8_EPI_BARRIER",
+        # "-DRELEASE_PATTERN",                
     ]
     include_dirs = [
         # Path(this_dir) / "fmha-pipeline",

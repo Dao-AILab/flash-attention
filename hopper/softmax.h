@@ -12,6 +12,8 @@
 
 #include "utils.h"
 
+#include "cutlass/fast_math.h"
+
 namespace flash {
 
 using namespace cute;
@@ -127,6 +129,8 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
 
 template <int kNRows>
 struct Softmax {
+    
+    constexpr static float max_offset = 8.0f;
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
     TensorT row_max, row_sum;
@@ -191,6 +195,7 @@ struct Softmax {
         return scores_scale;
     };
 
+    // TODO: handle offset
     template<bool Is_dropout=false, bool Split=false, typename Tensor0>
     __forceinline__ __device__ TensorT finalize(Tensor0 &acc_s, float softmax_scale_log2, float rp_dropout=1.0) {
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
@@ -220,6 +225,130 @@ struct Softmax {
             for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale(mi); }
         }
     };
+
+    // combined method
+    template <bool is_first = false, bool check_infinity = false,
+              typename FragmentS, typename FragmentO, typename PredicateFn>
+    __forceinline__ __device__ void
+    online_softmax_and_rescale_o(FragmentS &accum_s, FragmentO &accum_o,
+        float softmax_scale_log2, const PredicateFn &predicateFn) {
+
+        using FragValType = typename FragmentS::value_type;
+        using FragValTypeO = typename FragmentO::value_type;
+        using SoftType = float;
+        
+        auto VT = shape<0>(accum_s); // number of vector elements per tile, e.g. (2,2,X)
+        auto MT = shape<1>(accum_s); // number of tiles along M.
+        auto NT = shape<2>(accum_s); // number of tiles along N.
+        static_assert(get<0>(VT) == 2);
+        static_assert(get<1>(VT) == 2);
+        static_assert(NT == 1, "We suppose KBLKSIZE <= 256.");
+
+        auto VT_O = shape<0>(accum_o);
+        auto MT_O = shape<1>(accum_o);
+        auto KT = shape<2>(accum_o);
+        static_assert(size<0>(VT_O) == 2);
+        static_assert(size<1>(VT_O) == 2);
+        static_assert(MT_O == MT);
+        static_assert(KT == 1, "We suppose HEADDIM <= 256.");
+
+        MaxOp<SoftType> maxOp;        
+
+        auto data = accum_s.data();
+        auto data_o = accum_o.data();
+
+        auto maxPredicate = [&](SoftType &max_ref, const int &n) {
+            if (!predicateFn(n))
+                data[n] = -INFINITY;
+            max_ref = cutlass::fast_max(max_ref, SoftType(data[n]));
+        };
+
+        auto scaleExpSum = [&](SoftType const &max_ref, SoftType &sum_ref,
+                                const int &n) {
+            data[n] = exp2f(SoftType(data[n]) * softmax_scale_log2 - max_ref);
+            sum_ref += data[n];
+        };
+
+        const auto inverse_scale = SoftType(1.0) / softmax_scale_log2;
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int rowIdx = 0; rowIdx < MT * 2; rowIdx += 2) {
+            auto max0 = row_max(rowIdx) * inverse_scale;
+            auto max1 = row_max(rowIdx + 1) * inverse_scale;
+
+            // Traverse 2-rows + 2-cols (2x2) simultaneously.
+            CUTLASS_PRAGMA_UNROLL
+            for (int n = 0; n < 4 * NT * size<2>(VT); n += 4) {
+                maxPredicate(max0, n);
+                maxPredicate(max0, n + 1);
+                maxPredicate(max1, n + 2);
+                maxPredicate(max1, n + 3);
+            }
+            const auto max_quad_0 = Allreduce<4>::run(max0, maxOp) * softmax_scale_log2;
+            const auto max_quad_1 = Allreduce<4>::run(max1, maxOp) * softmax_scale_log2;
+
+            if constexpr (!is_first) {
+
+                // Need to avoid NaN from subtracting -infinity
+                // Can condition on previous row max
+                const auto rescale0 = check_infinity ? ((row_max(rowIdx) == -INFINITY)
+                                            ? SoftType(0.0)
+                                            : exp2f(row_max(rowIdx) - max_quad_0))
+                                            : exp2f(row_max(rowIdx) - max_quad_0);
+                row_sum(rowIdx) *= rescale0;
+
+                const auto rescale1 = check_infinity ? ((row_max(rowIdx + 1) == -INFINITY)
+                                            ? SoftType(0.0)
+                                            : exp2f(row_max(rowIdx + 1) - max_quad_1))
+                                            : exp2f(row_max(rowIdx + 1) - max_quad_1);
+                row_sum(rowIdx + 1) *= rescale1;
+
+                CUTLASS_PRAGMA_UNROLL
+                for (int no = 0; no < 4 * KT * size<2>(VT_O); no += 4) {
+                    data_o[no] = FragValTypeO(SoftType(data_o[no]) * rescale0);
+                    data_o[no + 1] = FragValTypeO(SoftType(data_o[no + 1]) * rescale0);
+                    data_o[no + 2] = FragValTypeO(SoftType(data_o[no + 2]) * rescale1);
+                    data_o[no + 3] = FragValTypeO(SoftType(data_o[no + 3]) * rescale1);
+                }
+            }
+
+            row_max(rowIdx) = max_quad_0;
+            row_max(rowIdx + 1) = max_quad_1;
+
+            auto sum0 = SoftType(0.0);
+            auto sum1 = SoftType(0.0);
+
+            // Need to avoid NaN from subtracting -infinity
+            const auto miRow0 = check_infinity ? (row_max(rowIdx) == -INFINITY
+                                    ? SoftType(0.0)
+                                    : row_max(rowIdx) - SoftType(max_offset))
+                                    : row_max(rowIdx) - SoftType(max_offset);
+            const auto miRow1 = check_infinity ? (row_max(rowIdx + 1) == -INFINITY
+                                    ? SoftType(0.0)
+                                    : row_max(rowIdx + 1) - SoftType(max_offset))
+                                    : row_max(rowIdx + 1) - SoftType(max_offset);
+
+            CUTLASS_PRAGMA_UNROLL
+            for (int n = 0; n < 4 * NT * size<2>(VT); n += 4) {
+                scaleExpSum(miRow0, sum0, n);
+                scaleExpSum(miRow0, sum0, n + 1);
+                scaleExpSum(miRow1, sum1, n + 2);
+                scaleExpSum(miRow1, sum1, n + 3);
+            }
+
+            row_sum(rowIdx) += sum0;
+            row_sum(rowIdx + 1) += sum1;            
+        }
+    }
+
+    template <bool is_first = false, bool check_infinity = true,
+              typename FragmentS, typename FragmentO>
+    __forceinline__ __device__ void
+    online_softmax_and_rescale_o(FragmentS &accum_s, FragmentO &accum_o,
+                                 float softmax_scale_log2) {
+        online_softmax_and_rescale_o<is_first, check_infinity>(
+            accum_s, accum_o, softmax_scale_log2, TrivialPredTensor{});
+    }
 
 };
 

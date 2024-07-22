@@ -40,10 +40,15 @@ struct SharedStorageQKVOVt {
     cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutQ>> smem_q;
     cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutK>> smem_k;
     cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v;
+#ifdef NO_UNION    
+    cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v_out;
+    cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
+#else    
     union {
         cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v_out;
         cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
     };
+#endif
     // union {
     //   struct {        
     //     cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v;
@@ -55,8 +60,12 @@ struct SharedStorageQKVOVt {
     // };
   };
   struct {    
-    cutlass::arch::ClusterTransactionBarrier barrier_Q;    
+    cutlass::arch::ClusterTransactionBarrier barrier_Q;   
+#ifndef NO_UNION
+    #ifndef NEW_FP8_EPI_BARRIER 
     cutlass::arch::ClusterBarrier barrier_O;
+    #endif
+#endif
     typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_k;
     typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_v;
     typename cutlass::PipelineAsync<kStages>::SharedStorage pipeline_vt;
