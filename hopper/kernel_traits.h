@@ -85,6 +85,7 @@ struct Flash_fwd_kernel_traits {
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;
     static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
+    static constexpr int NumProducerThreads = cutlass::NumThreadsPerWarpGroup;
 
     static constexpr bool Is_Q_in_regs = Is_Q_in_regs_;
     static_assert(kNWarps_ == 4 || kNWarps_ == 8 || kNWarps_ == 12 || kNWarps_ == 16);
@@ -167,6 +168,7 @@ struct Flash_fwd_kernel_traits_fp8 {
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;
     static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
+    static constexpr int NumProducerThreads = cutlass::NumThreadsPerWarpGroup;
 
     static constexpr bool Is_Q_in_regs = Is_Q_in_regs_;
     static_assert(kNWarps_ == 12 || kNWarps_ == 16);

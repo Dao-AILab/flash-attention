@@ -303,6 +303,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             if (Is_causal && n_block_max <= 0) {
                 scheduler.prefetch_next_work(scheduler_params, work_tile_info);
                 scheduler.broadcast_next_work(work_tile_info);
+                // TODO: remove this
+                cutlass::arch::NamedBarrier::sync(NumCopyThreads, static_cast<int>(FwdNamedBarriers::ProducerWG) /*id*/);
                 continue;
             }                        
         #ifdef USE_TRI_MMA_FP8
@@ -317,6 +319,9 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 scheduler, scheduler_params, work_tile_info, block_coord, work_idx);                                  
         #endif
             ++work_idx;
+            // need to sync producer warpgroup
+            // TODO: remove this
+            cutlass::arch::NamedBarrier::sync(NumCopyThreads, static_cast<int>(FwdNamedBarriers::ProducerWG) /*id*/);
         }
     #ifdef USE_TRI_MMA_FP8
         collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
