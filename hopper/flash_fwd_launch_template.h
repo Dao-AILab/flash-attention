@@ -4,8 +4,6 @@
 
 #pragma once
 
-#include <ATen/cuda/CUDAContext.h>
-
 #include "cute/tensor.hpp"
 
 #include "cutlass/cutlass.h"
@@ -16,6 +14,7 @@
 #include "tile_scheduler.hpp"
 #include "flash_fwd_kernel.h"
 #include "kernel_traits.h"
+#include "utils.h"
 
 
 template<typename Kernel_traits, bool Is_causal>
@@ -66,7 +65,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // int smem_size_v = sizeof(decltype((typename Kernel_traits::SharedStorage{}).smem_v));
     // printf("smem_size = %d, q = %d, k = %d, v = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v);
     if (smem_size >= 48 * 1024) {
-       C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+       CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
 
     int device;
@@ -75,7 +74,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     cudaError status_ = cudaDeviceGetAttribute(
         &multiprocessor_count, cudaDevAttrMultiProcessorCount, device);
     if (status_ != cudaSuccess) {
-      C10_CUDA_CHECK(status_);
+      CHECK_CUDA(status_);
     }
     dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
     static constexpr int ctaSize = Kernel_traits::kNWarps * 32;
@@ -83,7 +82,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
     cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
     cutlass::launch_kernel_on_cluster(launch_params, kernel, mainloop_params, epilogue_params, scheduler_params);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    CHECK_CUDA_KERNEL_LAUNCH();
 }
 
 template<typename T>
