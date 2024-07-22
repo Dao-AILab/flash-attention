@@ -164,7 +164,7 @@ public:
 
 };
 
-template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup>
+template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads = cutlass::NumThreadsPerWarp>
 class DynamicPersistentTileScheduler {
 
 protected:
@@ -228,13 +228,13 @@ public:
     CUTLASS_DEVICE
     void
     init_consumer() const {
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
     }
 
     CUTLASS_DEVICE
     void
     prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {
-        if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+        if (threadIdx.x % NumProducerThreads == 0) {
             current_work.tile_idx = atomicAdd(params.tile_count_semaphore, 1) + int(gridDim.x);
         }
     }
@@ -242,24 +242,28 @@ public:
     CUTLASS_DEVICE
     void
     broadcast_next_work(WorkTileInfo& current_work) const {
-        cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
-        if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+        cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+        if (threadIdx.x % NumProducerThreads == 0) {
             *tile_count_smem = current_work.tile_idx;
         }
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
     }
 
     template<bool IsProducer=false>
     CUTLASS_DEVICE
     WorkTileInfo
     get_next_work(Params const& params, WorkTileInfo const& current_work) const {
-        if constexpr (IsProducer) {
-            // thread 0 already has the right tile_idx, just need to broadcast to the rest of warp 0
+        if constexpr (IsProducer && NumProducerThreads == cutlass::NumThreadsPerWarp) {
+            // thread 0 already has the right tile_idx, just need to broadcast to the rest of the producer threads (warp 0)
             return {__shfl_sync(0xffffffff, current_work.tile_idx, 0 /*lane*/)};
-        } else {
-            cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+        } else if constexpr (IsProducer && NumProducerThreads == cutlass::NumThreadsPerWarpGroup) {
+            // TODO: investigate optimal synchronize
             int tile_idx = *tile_count_smem;
-            cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            return {tile_idx};
+        } else {
+            cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            int tile_idx = *tile_count_smem;
+            cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
             return {tile_idx};
         }
     }
