@@ -306,7 +306,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             ++work_idx;
             // need to sync producer warpgroup
             // TODO: remove this
-            cutlass::arch::NamedBarrier::sync(NumCopyThreads, static_cast<int>(FwdNamedBarriers::ProducerWG) /*id*/);
+            // if (Is_causal)
+            //     cutlass::arch::NamedBarrier::sync(NumCopyThreads, static_cast<int>(FwdNamedBarriers::ProducerWG) /*id*/);
         }
     #ifdef USE_TRI_MMA_FP8
         collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
@@ -371,6 +372,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
         #ifdef COLUMN_PERMUTE
             collective_epilogue.store_fp8(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
                                       threadIdx.x - NumCopyThreads, block_coord);                
+            // collective_epilogue.store(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
+            //                           threadIdx.x - NumCopyThreads, block_coord);
         #else
             collective_epilogue.store(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
                                       threadIdx.x - NumCopyThreads, block_coord);                
