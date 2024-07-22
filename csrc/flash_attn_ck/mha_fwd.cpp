@@ -161,6 +161,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         bool is_causal,
         int window_size_left,
         int window_size_right,
+        const float /*softcap*/,
         const bool return_dropout_randval,
         c10::optional<at::Generator> gen_)
 {
@@ -187,7 +188,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     const int head_size_og = sizes[3];
     const int seqlen_k = k.size(1);
     const int num_heads_k = k.size(2);
-    TORCH_CHECK(batch_size > 0, "batch size must be postive");
+    TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size_og <= 256, "CK only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 

@@ -162,6 +162,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
                c10::optional<at::Tensor> & /*seqused_k*/,
+               c10::optional<const at::Tensor> &/*leftpad_k_*/, // batch_size
                c10::optional<at::Tensor> &block_table_,  // batch_size x max_num_blocks_per_seq
                c10::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
                int max_seqlen_q,
@@ -172,6 +173,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
                bool is_causal,
                int window_size_left,
                int window_size_right,
+               const float /*softcap*/,
                const bool return_dropout_randval,
                c10::optional<at::Generator> gen_)
 {

@@ -180,6 +180,7 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         const bool is_causal,
         int window_size_left,
         int window_size_right,
+        const float /*softcap*/,
         const bool deterministic,
         c10::optional<at::Generator> gen_,
         c10::optional<at::Tensor> &rng_state)
