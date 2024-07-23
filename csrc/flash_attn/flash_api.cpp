@@ -800,7 +800,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
-            run_mha_bwd_<elem_type, kHeadDim>(params, stream);
+            BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+                run_mha_bwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+            });
         });
     });
 }
