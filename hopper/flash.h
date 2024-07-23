@@ -7,14 +7,6 @@
 #include <cuda.h>
 #include <vector>
 
-#ifdef OLD_GENERATOR_PATH
-#include <ATen/CUDAGeneratorImpl.h>
-#else
-#include <ATen/cuda/CUDAGeneratorImpl.h>
-#endif
-
-#include <ATen/cuda/CUDAGraphsUtils.cuh> // For at::cuda::philox::unpack
-
 #include "cutlass/fast_math.h"  // For cutlass::FastDivmod
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -117,9 +109,6 @@ struct Flash_fwd_params : public Qkv_params {
 
     // Local window size
     int window_size_left, window_size_right;
-
-    // Random state.
-    at::PhiloxCudaState philox_args;
 
     // Pointer to the RNG seed (idx 0) and offset (idx 1).
     uint64_t * rng_state;

@@ -22,6 +22,18 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
+#define CHECK_CUDA(call)                                                                                  \
+    do {                                                                                                  \
+        cudaError_t status_ = call;                                                                       \
+        if (status_ != cudaSuccess) {                                                                     \
+            fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, cudaGetErrorString(status_)); \
+            exit(1);                                                                                      \
+        }                                                                                                 \
+    } while(0)
+
+#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())
+
+
 namespace flash {
 
 using namespace cute;
@@ -63,7 +75,7 @@ struct Allreduce {
 
 template<>
 struct Allreduce<2> {
-template<typename T, typename Operator> 
+template<typename T, typename Operator>
 static __device__ __forceinline__ T run(T x, Operator &op) {
     x = op(x, __shfl_xor_sync(uint32_t(-1), x, 1));
     return x;
