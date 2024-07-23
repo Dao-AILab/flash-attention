@@ -353,7 +353,7 @@ Thanks to @beginlner for this contribution.
 ### 2.6: Softcapping.
 
 Support attention with softcapping, as used in Gemma-2 and Grok models.
-Thanks to @Narsil for this contribution.
+Thanks to @Narsil and @lucidrains for this contribution.
 
 ## Performance
 
