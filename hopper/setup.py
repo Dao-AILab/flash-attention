@@ -271,6 +271,7 @@ setup(
             "benchmarks",
         )
     ),
+    py_modules=["flash_attn_interface"],
     description="FlashAttention-3",
     long_description=long_description,
     long_description_content_type="text/markdown",

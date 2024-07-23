@@ -353,7 +353,7 @@ Thanks to @beginlner for this contribution.
 ### 2.6: Softcapping.
 
 Support attention with softcapping, as used in Gemma-2 and Grok models.
-Thanks to @Narsil for this contribution.
+Thanks to @Narsil and @lucidrains for this contribution.
 
 ## Performance
 
@@ -434,6 +434,33 @@ This new release of FlashAttention-2 has been tested on several GPT-style
 models, mostly on A100 GPUs.
 
 If you encounter bugs, please open a GitHub Issue!
+## AMD GPU/ROCm Support
+ROCm version use [composable_kernel](https://github.com/ROCm/composable_kernel) as backend. It provides the implementation of FlashAttention-2.
+
+## Installation and features
+Requirements:
+- ROCm 6.0+
+- PyTorch 1.12.1+
+
+We recommend the
+[Pytorch](https://hub.docker.com/r/rocm/pytorch)
+container from ROCm, which has all the required tools to install FlashAttention.
+
+To compile from source:
+```sh
+python setup.py install
+```
+
+FlashAttention-2 on ROCm currently supports:
+1. MI200 or MI300 GPUs.
+2. Datatype fp16 and bf16
+3. Forward's head dimensions up to 256. Backward head dimensions up to 128.
+
+## Tests
+To run the tests:
+```sh
+pytest tests/test_flash_attn_ck.py
+```
 
 ## Citation
 If you use this codebase, or otherwise found our work valuable, please cite:
