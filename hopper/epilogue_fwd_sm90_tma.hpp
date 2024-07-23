@@ -20,7 +20,8 @@ using namespace cute;
 template <typename Ktraits, typename Seqlen_traits>
 struct CollectiveEpilogueFwd {
 
-    using Element = typename Ktraits::Element;
+    using PrecType = typename Ktraits::Element;
+    using Element = decltype(cute::conditional_return<is_same_v<PrecType, cutlass::float_e4m3_t>>(cutlass::half_t{}, PrecType{}));
     static constexpr int kBlockM = Ktraits::kBlockM;
     static constexpr int kBlockN = Ktraits::kBlockN;
     static constexpr int kHeadDim = Ktraits::kHeadDim;

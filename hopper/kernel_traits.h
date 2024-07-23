@@ -25,6 +25,7 @@ struct SharedStorageQKVO {
         cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
     };
     struct {
+	cute::uint64_t tma_load_mbar[4]; // 4 TMA barriers pre-allocated for usage.
         cutlass::arch::ClusterTransactionBarrier barrier_Q;
         cutlass::arch::ClusterBarrier barrier_O;
         typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_k;
@@ -40,6 +41,7 @@ struct Flash_fwd_kernel_traits {
     using Element = elem_type;
     using ElementAccum = float;
     using index_t = int64_t;
+    using ElementO = decltype(cute::conditional_return<is_same_v<Element, cutlass::float_e4m3_t>>(cutlass::half_t{}, Element{}));
 
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;
@@ -69,9 +71,11 @@ struct Flash_fwd_kernel_traits {
             decltype(cute::GMMA::ss_op_selector<Element, Element, ElementAccum, TileShape_MNK>())
         >{},
         AtomLayoutMNK{}));
+
     using TiledMma1 = decltype(cute::make_tiled_mma(
         cute::GMMA::rs_op_selector<Element, Element, ElementAccum, decltype(select<0, 2, 1>(TileShape_MNK{})),
-                                   GMMA::Major::K, GMMA::Major::MN>(),
+                                   GMMA::Major::K, cute::conditional_return<is_same_v<Element, cutlass::float_e4m3_t>>(
+          GMMA::Major::K, GMMA::Major::MN)>(),
         AtomLayoutMNK{}));
 
     using SmemLayoutAtomQ = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
@@ -84,19 +88,33 @@ struct Flash_fwd_kernel_traits {
         decltype(tile_to_shape(SmemLayoutAtomK{},
                  make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
 
-    using SmemLayoutAtomV = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
+    using SmemLayoutAtomVFp16 = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<1>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
-    using SmemLayoutV =
-        decltype(tile_to_shape(SmemLayoutAtomV{},
+    using SmemLayoutVFp16 =
+        decltype(tile_to_shape(SmemLayoutAtomVFp16{},
                  make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
 
-    using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
+     using SmemLayoutAtomVFp8 = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
+        decltype(cute::get<2>(TileShape_MNK{})), decltype(cute::get<1>(TileShape_MNK{}))>());
+     using SmemLayoutVFp8 =
+        decltype(tile_to_shape(SmemLayoutAtomVFp8{},
+                 make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{})));
+     using SmemLayoutV = decltype(cute::conditional_return<is_same_v<Element, cutlass::float_e4m3_t>>(SmemLayoutVFp8{}, SmemLayoutVFp16{}));
+    // Note this is the transpose in terms of the view, not in terms of memory.
+    using SmemLayoutVtFp16 =
+        decltype(cute::composition(SmemLayoutVFp16{},
+                                   make_layout(make_shape(get<2>(TileShape_MNK{}), get<1>(TileShape_MNK{}), Int<kStages>{}),
+                                               make_stride(get<1>(TileShape_MNK{}), _1{}, Int<size(SmemLayoutVFp16{}(_, _, _0{}))>{}))));
+
+    using SmemLayoutVt = decltype(cute::conditional_return<is_same_v<Element, cutlass::float_e4m3_t>>(SmemLayoutVFp8{}, SmemLayoutVtFp16{}));
+
+    using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, ElementO,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
     using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 2>(TileShape_MNK{})));
 
-    using SmemCopyAtomQ = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
+    using SmemCopyAtomQ = Copy_Atom<cute::SM75_U32x4_LDSM_N, ElementO>;
 
-    using SharedStorage = SharedStorageQKVO<kStages, Element, Element, Element, SmemLayoutQ,
+    using SharedStorage = SharedStorageQKVO<kStages, Element, Element, ElementO, SmemLayoutQ,
                                             SmemLayoutK, SmemLayoutV, SmemLayoutO>;
 
     using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;
