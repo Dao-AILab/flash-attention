@@ -194,7 +194,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     static constexpr int NumCopyThreads = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
     static constexpr int kBlockM = Ktraits::kBlockM;
     // static constexpr int kBlockN = Ktraits::kBlockN;
-    // constexpr int kHeadDim = Ktraits::kHeadDim;
+    static constexpr int kHeadDim = Ktraits::kHeadDim;
+    static constexpr bool Delay_V_release = Is_causal && kHeadDim == 128;
 
     using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal>;
     using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits>;
@@ -362,7 +363,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             //     smem_pipe_release, tOrO, softmax, n_block_max,
             //     threadIdx.x - NumCopyThreads, work_idx, m_block,
             //     shared_storage);
-            collective_mainloop.mma_fp8_ver2(
+            collective_mainloop.mma_fp8_ver2<Delay_V_release>(
                 mainloop_params, pipeline_k, pipeline_vt, smem_pipe_read, smem_pipe_release,
                 tOrO, softmax, n_block_max,
                 threadIdx.x - NumCopyThreads, work_idx, m_block,
