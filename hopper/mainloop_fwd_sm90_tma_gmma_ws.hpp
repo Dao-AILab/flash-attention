@@ -705,10 +705,8 @@ struct CollectiveMainloopFwd {
                 ++smem_pipe_write;
                 ++smem_pipe_read;
             }
-
-            scheduler.prefetch_next_work(scheduler_params, work_tile_info);
-
-            scheduler.broadcast_next_work(work_tile_info);
+            // scheduler.prefetch_next_work(scheduler_params, work_tile_info);
+            // scheduler.broadcast_next_work(work_tile_info);
 
         }
         
@@ -1460,7 +1458,7 @@ struct CollectiveMainloopFwd {
         consumer_wait(pipeline_k, smem_pipe_read);                        
         warp_scheduler_barrier_sync();
         flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);        
-        warp_scheduler_barrier_arrive();
+        // warp_scheduler_barrier_arrive();
         if (work_idx != 0) {        
             int lane_predicate = cute::elect_one_sync();
             if (cutlass::canonical_warp_idx_sync() == Ktraits::kNWarps - 1 && lane_predicate) {
@@ -1472,6 +1470,7 @@ struct CollectiveMainloopFwd {
             }        
         }        
         warpgroup_wait<0>();
+        warp_scheduler_barrier_arrive();
         pipeline_k.consumer_release(smem_pipe_read);
 
         auto col_limit_causal = [&](int row, int n_block) {
@@ -1544,6 +1543,7 @@ struct CollectiveMainloopFwd {
                 ++smem_pipe_read;
             }
         }
+        #if 1
         else {
             CUTLASS_PRAGMA_UNROLL      
             for (int iter = 0; iter < extra_iterations && n_block >= 0; ++iter, --n_block) {
@@ -1572,6 +1572,7 @@ struct CollectiveMainloopFwd {
                 ++smem_pipe_read;
             }
         }
+        #endif
 
         if constexpr(Delay_V_release) {
             warp_scheduler_barrier_sync();
