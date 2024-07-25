@@ -316,16 +316,21 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         dout_padded = dout;
     }
 
-
     // Cast to char to avoid compiler warning about narrowing
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
     at::Tensor dq_accum;
+    TORCH_CHECK(!deterministic, "Bwd only support non deterministic mode");
+
     if (!deterministic) {
+        // bwd kernel assume dq and q share the same stride
+        dq_accum = at::empty_strided(q.sizes(), q.strides(), opts.dtype(at::kFloat));
+        dq_accum = dq_accum.reshape({1, total_q, num_heads, head_size_8x});
         dq_accum = torch::empty({1, total_q, num_heads, head_size_8x}, opts.dtype(at::kFloat));
     } else {
+        assert(0);
         const ck_tile::index_t kN0 = (head_size_8x > 32 & head_size_8x <= 128) ? 128 : 64;
         const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(max_seqlen_k, kN0);
         dq_accum = torch::zeros({nsplits, total_q, num_heads, head_size_8x}, opts.dtype(at::kFloat));
