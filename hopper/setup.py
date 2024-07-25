@@ -137,16 +137,17 @@ if not SKIP_CUDA_BUILD:
         "--expt-extended-lambda",
         "--use_fast_math",
         # "--ptxas-options=-v",  # printing out number of registers
-        "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",  # printing out number of registers
-        "-lineinfo",
+        # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",  # printing out number of registers
+        # "-lineinfo",
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
         "-DNDEBUG",  # Important, otherwise performance is severely impacted                
-        "-DCOLUMN_PERMUTE",  
+        "-DCOLUMN_PERMUTE",
+        # "-DDISABLE_CAUSAL",  
         # "-DUSE_TRI_MMA_FP8"      
         # "-DUSE_CUSTOM_SOFTMAX",
         # "-DNO_UNION"
         # "-DNEW_FP8_EPI_BARRIER",
-        # "-DRELEASE_PATTERN",                
+        "-DRELEASE_PATTERN",                
     ]
     include_dirs = [
         # Path(this_dir) / "fmha-pipeline",
