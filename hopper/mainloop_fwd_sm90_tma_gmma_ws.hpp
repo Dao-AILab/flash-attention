@@ -1397,7 +1397,8 @@ struct CollectiveMainloopFwd {
     mma_fp8_ver2(Params const& mainloop_params,
         MainloopPipeline pipeline_k,
         MainloopPipelineNoTMA pipeline_vt,
-        PipelineState& smem_pipe_read,        
+        PipelineState& smem_pipe_read,
+        PipelineState& smem_pipe_release,        
         FrgTensorO& tOrO,
         Softmax& softmax,
         int n_block_count,
@@ -1458,11 +1459,12 @@ struct CollectiveMainloopFwd {
         }        
         warpgroup_wait<0>();                
         // warp_scheduler_barrier_arrive();
-        pipeline_k.consumer_release(smem_pipe_read);
+        pipeline_k.consumer_release(smem_pipe_read); // DEFAULT
+        // pipeline_k.consumer_release(smem_pipe_release);
 
         auto col_limit_causal = [&](int row, int n_block) {
             return row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
-        };
+        };       
         {
             Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
             Tensor tScS = threadMma0.partition_C(cS);
@@ -1495,12 +1497,16 @@ struct CollectiveMainloopFwd {
         
         consumer_wait(pipeline_vt, smem_pipe_read);
         flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);                
-        pipeline_vt.consumer_release(smem_pipe_read);
+        #ifndef RELEASE_PATTERN
+            pipeline_vt.consumer_release(smem_pipe_read); // DEFAULT
+        #endif
+        // pipeline_vt.consumer_release(smem_pipe_release);
         
         ++smem_pipe_read;
+        // ++smem_pipe_release;
         --n_block;        
 
-#if 1        
+        
         constexpr int extra_iterations = !Is_causal ? kStages - 1 : cute::ceil_div(kBlockM, kBlockN);
         // constexpr int extra_iterations = kStages - 1;
 
@@ -1528,7 +1534,8 @@ struct CollectiveMainloopFwd {
                 }
 
                 warp_scheduler_barrier_arrive();
-                pipeline_k.consumer_release(smem_pipe_read);
+                pipeline_k.consumer_release(smem_pipe_read); // DEFAULT
+                consumer_wait(pipeline_vt, smem_pipe_read); 
 
                 cute::copy(softmax.template max</*Is_first=*/false, /*Check_inf=*/true>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);            
                 softmax.rescale_o(tOrO, scores_scale);
@@ -1538,21 +1545,37 @@ struct CollectiveMainloopFwd {
                                         convert_layout_acc_Aregs_fp8(tSrS.layout()));
                 permute_regs_A_to_C(tOrP);
             
-                consumer_wait(pipeline_vt, smem_pipe_read);                                    
+                // consumer_wait(pipeline_vt, smem_pipe_read);                                    
+                #ifdef RELEASE_PATTERN
+                    pipeline_vt.consumer_release(smem_pipe_release);
+                    ++smem_pipe_release;
+                #endif
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);            
-                pipeline_vt.consumer_release(smem_pipe_read);
-                ++smem_pipe_read;                
+                #ifndef RELEASE_PATTERN
+                    pipeline_vt.consumer_release(smem_pipe_read);
+                #endif
+                ++smem_pipe_read;                 
             }
-        } else {
+        }
+    #if 1   
+        else {
             CUTLASS_PRAGMA_UNROLL      
             for (int iter = 0; iter < extra_iterations && n_block >= 0; ++iter, --n_block) {
                 Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
                         
                 consumer_wait(pipeline_k, smem_pipe_read);
+                #ifdef RELEASE_PATTERN
+                    pipeline_vt.consumer_release(smem_pipe_release);
+                    ++smem_pipe_release;
+                #endif                
                 warp_scheduler_barrier_sync();
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);                                                                                       
                 warp_scheduler_barrier_arrive();
-                pipeline_k.consumer_release(smem_pipe_read);
+                #ifndef RELEASE_PATTERN
+                    pipeline_k.consumer_release(smem_pipe_read);                
+                #else 
+                    consumer_wait(pipeline_vt, smem_pipe_read);
+                #endif
 
                 cute::copy(softmax.template max</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);            
                 softmax.rescale_o(tOrO, scores_scale);
@@ -1562,46 +1585,97 @@ struct CollectiveMainloopFwd {
                                         convert_layout_acc_Aregs_fp8(tSrS.layout()));
                 permute_regs_A_to_C(tOrP);
             
-                consumer_wait(pipeline_vt, smem_pipe_read);
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);            
-                pipeline_vt.consumer_release(smem_pipe_read);
-                ++smem_pipe_read;                
+                // consumer_wait(pipeline_vt, smem_pipe_read);
+
+                // warp_scheduler_barrier_sync();
+                #ifdef RELEASE_PATTERN
+                    pipeline_k.consumer_release(smem_pipe_read);
+                #else
+                    consumer_wait(pipeline_vt, smem_pipe_read);
+                #endif
+                flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                // warp_scheduler_barrier_arrive();            
+                #ifndef RELEASE_PATTERN
+                    pipeline_vt.consumer_release(smem_pipe_read);
+                #endif
+                ++smem_pipe_read;                               
             }
         }              
-#endif
+    #endif
 
+    #ifdef RELEASE_PATTERN
+        warp_scheduler_barrier_sync();
+    #else
         if constexpr (kHeadDim == 128)
             warp_scheduler_barrier_sync();
+    #endif
 
         CUTLASS_PRAGMA_NO_UNROLL        
         for (; n_block >= 0; --n_block) {
             Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));        
             consumer_wait(pipeline_k, smem_pipe_read); // wait K
+            
+        #ifdef RELEASE_PATTERN
+            pipeline_vt.consumer_release(smem_pipe_release);
+            ++smem_pipe_release;
+        #else            
             if constexpr (kHeadDim == 256)
                 warp_scheduler_barrier_sync();
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);                                                                                       
+        #endif
+            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);                                                                                       
+        #ifdef RELEASE_PATTERN
             warp_scheduler_barrier_arrive();
-
-            pipeline_k.consumer_release(smem_pipe_read); // release current K        
+        #endif
+            warpgroup_wait<0>();            
+        #ifndef RELEASE_PATTERN
+            warp_scheduler_barrier_arrive();
+            pipeline_k.consumer_release(smem_pipe_read); // release current K   
+        #else
+            consumer_wait(pipeline_vt, smem_pipe_read);     
+        #endif            
                                       
             cute::copy(softmax.template max</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);            
-            softmax.rescale_o(tOrO, scores_scale);            
+            softmax.rescale_o(tOrO, scores_scale);      
             softmax.template online_softmax</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2);            
 
             Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(),
                                       convert_layout_acc_Aregs_fp8(tSrS.layout()));        
             permute_regs_A_to_C(tOrP);
             
-            consumer_wait(pipeline_vt, smem_pipe_read);
+            // consumer_wait(pipeline_vt, smem_pipe_read);
+            
+        #ifdef RELEASE_PATTERN
+            pipeline_k.consumer_release(smem_pipe_read); // release current K   
+        #else
+            consumer_wait(pipeline_vt, smem_pipe_read);     
             if constexpr (kHeadDim == 128)
                 warp_scheduler_barrier_sync();
-            flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);            
-            pipeline_vt.consumer_release(smem_pipe_read);
-            ++smem_pipe_read;
-        }
+        #endif
+            flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);      
+            // warp_scheduler_barrier_arrive();      
+            #ifdef RELEASE_PATTERN
+                warp_scheduler_barrier_sync();
+            #endif
+            warpgroup_wait<0>();
+            // warp_scheduler_barrier_sync();
+            #ifndef RELEASE_PATTERN
+                pipeline_vt.consumer_release(smem_pipe_read);
+            #endif
 
+            ++smem_pipe_read;            
+        }        
+                 
+        #ifdef RELEASE_PATTERN
+            warp_scheduler_barrier_arrive();                
+            pipeline_vt.consumer_release(smem_pipe_release);
+            ++smem_pipe_release;
+        #else
         if constexpr (kHeadDim == 128)
-            warp_scheduler_barrier_arrive();        
+            warp_scheduler_barrier_arrive();   
+        #endif
+
+
+
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
         
         cute::copy(softmax.template finalize</*Check_inf=*/Is_causal>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);

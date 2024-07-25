@@ -272,7 +272,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
         PipelineState smem_pipe_read_v;
     #else
         PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>(); 
-        PipelineState smem_pipe_read;
+        PipelineState smem_pipe_read, smem_pipe_release;
     #endif
 
         int work_idx = 0;
@@ -325,7 +325,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
         PipelineState smem_pipe_read_k, smem_pipe_read_vt;        
     #else
         PipelineState smem_pipe_read;
-        // PipelineState smem_pipe_release;
+        PipelineState smem_pipe_release;
     #endif                
 
         collective_mainloop.mma_init_fp8();
@@ -363,7 +363,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             //     threadIdx.x - NumCopyThreads, work_idx, m_block,
             //     shared_storage);
             collective_mainloop.mma_fp8_ver2(
-                mainloop_params, pipeline_k, pipeline_vt, smem_pipe_read,
+                mainloop_params, pipeline_k, pipeline_vt, smem_pipe_read, smem_pipe_release,
                 tOrO, softmax, n_block_max,
                 threadIdx.x - NumCopyThreads, work_idx, m_block,
                 shared_storage);  
