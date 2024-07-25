@@ -21,7 +21,6 @@
 template<typename Kernel_traits, bool Is_causal, typename Seqlen_traits>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using Element = typename Kernel_traits::Element;
-    using ElementO = decltype(cute::conditional_return<is_same_v<Element, cutlass::float_e4m3_t>>(cutlass::half_t{}, Element{}));
     using TileShape_MNK = typename Kernel_traits::TileShape_MNK;
     using ClusterShape = typename Kernel_traits::ClusterShape_MNK;
 
@@ -128,14 +127,10 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
         SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
             // Only use Cluster if number of tiles along seqlen_q is even and not Is_causal
             BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, 128) % 2 == 0 && !Is_causal && !Seqlen_traits::kUseVarSeqLen, UseCluster, [&] {
-                if constexpr (is_same_v<T, cutlass::float_e4m3_t>) {
-                    //run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 192, 128, 16, 3, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
-                    //run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 192, 128, 16, 2, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
-                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 12, 4, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal, Seqlen_traits>(params, stream);
-                    //run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 12, 4, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
-                } else {  
-                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, Is_causal ? 128 : 176, 12, 2, false, UseCluster ? 2 : 1, T>, Is_causal, Seqlen_traits>(params, stream);
-                }  
+                run_flash_fwd<
+                    Flash_fwd_kernel_traits<Headdim, 128, Is_causal ? 128 : 176, 12, 2, false, UseCluster ? 2 : 1, T>, 
+                    Is_causal, Seqlen_traits
+                >(params, stream);
             });
         });
     });
@@ -148,11 +143,10 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
         SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
             // Only use Cluster if number of tiles along seqlen_q is even
             BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, 128) % 2 == 0 && !Is_causal && !Seqlen_traits::kUseVarSeqLen, UseCluster, [&] {
-                if constexpr (is_same_v<T, cutlass::float_e4m3_t>) {
-                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 12, 3, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal, Seqlen_traits>(params, stream); 
-                } else {
-                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 80, 12, 2, false, UseCluster ? 2 : 1, T>, Is_causal, Seqlen_traits>(params, stream);
-                }  
+                run_flash_fwd<
+                    Flash_fwd_kernel_traits<Headdim, 128, 80, 12, 2, false, UseCluster ? 2 : 1, T>, 
+                    Is_causal, Seqlen_traits
+                >(params, stream);
             });
         });
     });
