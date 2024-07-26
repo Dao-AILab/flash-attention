@@ -54,7 +54,7 @@ def create_mixer_cls(config, cross_attn=False, return_residual=False):
     fused_bias_fc = getattr(config, 'fused_bias_fc', False)
     rotary_kwargs = {}
     if config.position_embedding_type == "rotary":
-        rotary_kwargs["rotary_emb_dim"] = getattr(config, "rotary_emb_dim", config.hidden_size)
+        rotary_kwargs["rotary_emb_dim"] = getattr(config, "rotary_emb_dim", 64)
         rotary_kwargs["rotary_emb_base"] = getattr(config, "rotary_emb_base", 10000.0)
         rotary_kwargs["rotary_emb_scale_base"] = getattr(config, "rotary_emb_scale_base", None)
         rotary_kwargs["rotary_emb_interleaved"] = getattr(config, "rotary_emb_interleaved", False)
@@ -100,7 +100,8 @@ def create_block(config, layer_idx=None):
     mlp_cls = create_mlp_cls(config, layer_idx, return_residual=return_residual)
     norm_cls = partial(nn.LayerNorm, eps=config.layer_norm_eps)
     block = Block(config.hidden_size, mixer_cls, mlp_cls, norm_cls=norm_cls,
-                  prenorm=False, resid_dropout1=config.hidden_dropout_prob,
+                  prenorm=False,# if config.prenorm == None else config.prenorm, 
+                  resid_dropout1=config.hidden_dropout_prob,
                   resid_dropout2=config.hidden_dropout_prob,
                   fused_dropout_add_ln=getattr(config, 'fused_dropout_add_ln', False),
                   return_residual=return_residual)
@@ -132,11 +133,13 @@ class BertEncoder(nn.Module):
         This means that we only compute the last layer output for these tokens.
         subset_mask: (batch, seqlen), dtype=torch.bool
         """
+        #print (key_padding_mask.shape)
         if key_padding_mask is None or not self.use_flash_attn:
             mixer_kwargs = ({'key_padding_mask': key_padding_mask}
                             if key_padding_mask is not None else None)
             for layer in self.layers:
                 hidden_states = layer(hidden_states, mixer_kwargs=mixer_kwargs)
+                #print (hidden_states.shape)
             if subset_mask is not None:
                 hidden_states = hidden_states[subset_mask]
         else:
@@ -245,12 +248,10 @@ class BertPreTrainingHeads(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.predictions = BertLMPredictionHead(config)
-        self.seq_relationship = nn.Linear(config.hidden_size, 2)
 
     def forward(self, sequence_output, pooled_output):
         prediction_scores = self.predictions(sequence_output)
-        seq_relationship_score = self.seq_relationship(pooled_output)
-        return prediction_scores, seq_relationship_score
+        return prediction_scores
 
 
 class BertPreTrainedModel(nn.Module):
@@ -287,15 +288,15 @@ class BertPreTrainedModel(nn.Module):
         """
         # Instantiate model.
         model = cls(config, *inputs, **kwargs)
-        load_return = model.load_state_dict(remap_state_dict(state_dict_from_pretrained(model_name),
-                                                             config), strict=False)
+        #load_return = model.load_state_dict(remap_state_dict(state_dict_from_pretrained(model_name),
+        load_return = model.load_state_dict(state_dict_from_pretrained(model_name), strict=False)
         logger.info(load_return)
         return model
 
 
 class BertModel(BertPreTrainedModel):
 
-    def __init__(self, config: BertConfig, add_pooling_layer=True):
+    def __init__(self, config: BertConfig, add_pooling_layer=False):
         super().__init__(config)
         self.pad_vocab_size_multiple = getattr(config, 'pad_vocab_size_multiple', 1)
         if config.vocab_size % self.pad_vocab_size_multiple != 0:
@@ -304,6 +305,7 @@ class BertModel(BertPreTrainedModel):
         self.fused_dropout_add_ln = getattr(config, 'fused_dropout_add_ln', False)
         if self.fused_dropout_add_ln and layer_norm is None:
             raise ImportError('dropout_add_layer_norm is not installed')
+        #assert config.position_embedding_type == 'absolute'
         assert config.hidden_act in ['gelu', 'gelu_new', 'gelu_fast']
 
         self.embeddings = BertEmbeddings(config.hidden_size, config.vocab_size,
@@ -377,6 +379,7 @@ class BertForPreTraining(BertPreTrainedModel):
         # If last_layer_subset, we only need the compute the last layer for a subset of tokens
         # (e.g., the tokens we need to compute the masked LM loss and the next-sentence prediction).
         self.last_layer_subset = getattr(config, 'last_layer_subset', False)
+        loss_reduction = getattr(config, 'loss_reduction', 'mean')
         if self.last_layer_subset:
             assert self.dense_seq_output, 'last_layer_subset requires dense_seq_output'
         use_xentropy = getattr(config, 'use_xentropy', False)
@@ -387,7 +390,7 @@ class BertForPreTraining(BertPreTrainedModel):
 
         self.bert = BertModel(config)
         self.cls = BertPreTrainingHeads(config)
-        self.mlm_loss = loss_cls(ignore_index=0)
+        self.mlm_loss = loss_cls(ignore_index=0, reduction = loss_reduction)
         self.nsp_loss = loss_cls(ignore_index=-1)
 
         # Initialize weights and apply final processing
@@ -398,7 +401,7 @@ class BertForPreTraining(BertPreTrainedModel):
         self.cls.predictions.decoder.weight = self.bert.embeddings.word_embeddings.weight
 
     def forward(self, input_ids, position_ids=None, token_type_ids=None, attention_mask=None,
-                labels=None, next_sentence_label=None):
+                labels=None, next_sentence_label=None, repeat_weights = None):
         """
         If labels are provided, they must be 0 for masked out tokens (as specified in the attention
         mask).
@@ -424,28 +427,31 @@ class BertForPreTraining(BertPreTrainedModel):
             if not self.last_layer_subset:
                 sequence_output = index_first_axis(rearrange(sequence_output, 'b s d -> (b s) d'),
                                                    masked_token_idx)
-        prediction_scores, seq_relationship_score = self.cls(sequence_output, pooled_output)
+        prediction_scores = self.cls(sequence_output, pooled_output)
 
         total_loss = None
-        if labels is not None and next_sentence_label is not None:
-            if self.dense_seq_output and labels is not None:  # prediction_scores are already flattened
+        if labels is not None:
+            if repeat_weights is not None:
+                masked_lm_loss = self.mlm_loss(rearrange(prediction_scores, '... v -> (...) v'),
+                                               rearrange(labels, '... -> (...)')) * repeat_weights.flatten()
+                masked_lm_loss = masked_lm_loss.mean()
+
+            elif self.dense_seq_output and labels is not None:  # prediction_scores are already flattened
                 masked_lm_loss = self.mlm_loss(prediction_scores,
                                                labels.flatten()[masked_token_idx])
             else:
                 masked_lm_loss = self.mlm_loss(rearrange(prediction_scores, '... v -> (...) v'),
                                                rearrange(labels, '... -> (...)'))
-            next_sentence_loss = self.nsp_loss(rearrange(seq_relationship_score, '... t -> (...) t'),
-                                               rearrange(next_sentence_label, '... -> (...)'))
-            total_loss = masked_lm_loss.float() + next_sentence_loss.float()
+            total_loss = masked_lm_loss.float()# + next_sentence_loss.float()
 
         return BertForPreTrainingOutput(
             loss=total_loss,
             prediction_logits=prediction_scores,
-            seq_relationship_logits=seq_relationship_score,
         )
 
 
 def remap_state_dict(state_dict, config):
+    #print (state_dict)
     # LayerNorm
     def key_mapping_ln_gamma_beta(key):
         key = re.sub(r'LayerNorm.gamma$', 'LayerNorm.weight', key)
@@ -492,14 +498,18 @@ def remap_state_dict(state_dict, config):
             state_dict[f'bert.encoder.layers.{d}.mixer.Wqkv.weight'] = torch.cat(
                 [Wq, Wk, Wv], dim=0
             )
-            state_dict[f'bert.encoder.layers.{d}.mixer.Wqkv.bias'] = torch.cat([bq, bk, bv], dim=0)
+            state_dict[f'bert.encoder.layers.{d}.mixer.Wqkv.bias'] = torch.cat(
+                [bq, bk, bv], dim=0
+            )
         else:
             state_dict[f'bert.encoder.layers.{d}.mixer.Wq.weight'] = Wq
             state_dict[f'bert.encoder.layers.{d}.mixer.Wkv.weight'] = torch.cat(
                 [Wk, Wv], dim=0
             )
             state_dict[f'bert.encoder.layers.{d}.mixer.Wq.bias'] = bq
-            state_dict[f'bert.encoder.layers.{d}.mixer.Wkv.bias'] = torch.cat([bk, bv], dim=0)
+            state_dict[f'bert.encoder.layers.{d}.mixer.Wkv.bias'] = torch.cat(
+                [bk, bv], dim=0
+            )
     def key_mapping_attn(key):
         return re.sub(r'^bert.encoder.layers.(\d+).attention.output.dense.(weight|bias)',
                       r'bert.encoder.layers.\1.mixer.out_proj.\2', key)
