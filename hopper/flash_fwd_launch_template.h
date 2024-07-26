@@ -170,6 +170,7 @@ void run_mha_fwd_hdim64_fp8(Flash_fwd_params &params, cudaStream_t stream) {
             });
         });
     });
+    // run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 16, 4, false, 2, T>, false, flash::FixedSeqLenTraits>(params, stream);
 }
 
 template<typename T>
@@ -185,6 +186,7 @@ void run_mha_fwd_hdim128_fp8(Flash_fwd_params &params, cudaStream_t stream) {
             });
         });
     });
+    // run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 12, 2, false, 2, T>, false, flash::FixedSeqLenTraits>(params, stream);
 }
 
 template<typename T>
@@ -200,4 +202,5 @@ void run_mha_fwd_hdim256_fp8(Flash_fwd_params &params, cudaStream_t stream) {
             });
         });
     });
+    // run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 12, 2, false, 2, T>, false, flash::FixedSeqLenTraits>(params, stream);
 }
