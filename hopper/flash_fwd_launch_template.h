@@ -26,6 +26,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using ClusterShape = typename Kernel_traits::ClusterShape_MNK;
 
     // print(typename Kernel_traits::SmemLayoutVt{}); printf("\n"); print(typename Kernel_traits::SmemLayoutVt_tmp{});
+<<<<<<< HEAD
     using CollectiveMainloop = flash::CollectiveMainloopFwd<Kernel_traits, Is_causal, Seqlen_traits>;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<Kernel_traits, Seqlen_traits>;
     using Scheduler = std::conditional_t<
@@ -40,6 +41,15 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.total_q, params.seqlen_q, params.cu_seqlens_q);
     Seqlen_traits seqlen_traits_k(
         params.total_k, params.seqlen_k, params.cu_seqlens_k, params.seqused_k);
+=======
+    using CollectiveMainloop = flash::CollectiveMainloopFwd<Kernel_traits, Is_causal>;
+    using CollectiveEpilogue = flash::CollectiveEpilogueFwd<Kernel_traits>;
+    using Scheduler = std::conditional_t<!Is_causal,
+        flash::StaticPersistentTileScheduler,
+        flash::DynamicPersistentTileScheduler<Kernel_traits::kNThreads - cutlass::NumThreadsPerWarpGroup, Kernel_traits::NumProducerThreads>>;    
+        // flash::SingleTileScheduler>;
+    // using Scheduler = flash::StaticPersistentTileScheduler;
+>>>>>>> 17dd4b7e5ebe53f433298c923fd1d8200bfc94a5
     typename CollectiveMainloop::Params mainloop_params =
         CollectiveMainloop::to_underlying_arguments({
             static_cast<Element const*>(params.q_ptr),
@@ -62,10 +72,15 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     typename CollectiveEpilogue::Params epilogue_params =
         CollectiveEpilogue::to_underlying_arguments({
             static_cast<OutputType*>(params.o_ptr),
+<<<<<<< HEAD
             seqlen_traits_q.get_gmem_layout(
                 params.seqlen_q, params.d, params.h, params.b,
                 params.o_row_stride, params.o_head_stride, params.o_batch_stride
             ),  // layout_O
+=======
+            {params.seqlen_q, params.d, params.h, params.b},  // shape_O
+            {params.o_row_stride, _1{}, params.o_head_stride, params.o_batch_stride},  // stride_O
+>>>>>>> 17dd4b7e5ebe53f433298c923fd1d8200bfc94a5
             static_cast<float*>(params.softmax_lse_ptr),
             seqlen_traits_q.get_lse_gmem_layout(
                 params.seqlen_q, params.h, params.b
@@ -80,9 +95,15 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // Get the ptr to kernel function.
     void *kernel;
     if constexpr(cutlass::sizeof_bits_v<Element> == 8)
+<<<<<<< HEAD
         kernel = (void *)flash::compute_attn_ws_fp8<Kernel_traits, Is_causal, Scheduler, Seqlen_traits>;
     else
         kernel = (void *)flash::compute_attn_ws<Kernel_traits, Is_causal, Scheduler, Seqlen_traits>;
+=======
+        kernel = (void *)flash::compute_attn_ws_fp8<Kernel_traits, Is_causal, Scheduler>;
+    else
+        kernel = (void *)flash::compute_attn_ws<Kernel_traits, Is_causal, Scheduler>;
+>>>>>>> 17dd4b7e5ebe53f433298c923fd1d8200bfc94a5
     int smem_size = sizeof(typename Kernel_traits::SharedStorage);
     // int smem_size_q = sizeof(decltype((typename Kernel_traits::SharedStorage{}).smem_q));
     // int smem_size_k = sizeof(decltype((typename Kernel_traits::SharedStorage{}).smem_k));
@@ -198,6 +219,46 @@ void run_mha_fwd_hdim256_fp8(Flash_fwd_params &params, cudaStream_t stream) {
             BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0 && !Is_causal && !Seqlen_traits::kUseVarSeqLen, UseCluster, [&] {
                 run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 12, 2, false, UseCluster ? 2 : 1, T>, Is_causal, Seqlen_traits>(params, stream);
             });
+        });
+    });
+}
+
+template<typename T>
+void run_mha_fwd_hdim64_fp8(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 64;
+    constexpr static int kBlockM = 192;
+    constexpr static int kBlockN = 128;
+    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        // Only use Cluster if number of tiles along seqlen_q is even
+        BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0, UseCluster, [&] {
+            run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 16, 4, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);            
+        });
+    });
+}
+
+template<typename T>
+void run_mha_fwd_hdim128_fp8(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 128;
+    constexpr static int kBlockM = 128;
+    constexpr static int kBlockN = 256;    
+    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        // Only use Cluster if number of tiles along seqlen_q is even
+        BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0, UseCluster, [&] {
+            run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 12, 2, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
+            // run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, 192, 128, 16, 3, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
+        });
+    });
+}
+
+template<typename T>
+void run_mha_fwd_hdim256_fp8(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 256; 
+    constexpr static int kBlockM = 128;
+    constexpr static int kBlockN = 128;
+    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        // Only use Cluster if number of tiles along seqlen_q is even
+        BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0, UseCluster, [&] {
+            run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 12, 2, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
         });
     });
 }
