@@ -194,8 +194,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     static constexpr int NumCopyThreads = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
     static constexpr int kBlockM = Ktraits::kBlockM;
     // static constexpr int kBlockN = Ktraits::kBlockN;
-    static constexpr int kHeadDim = Ktraits::kHeadDim;
-    static constexpr bool Delay_V_release = Is_causal && kHeadDim == 128;
+    // static constexpr int kHeadDim = Ktraits::kHeadDim;
+    static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128;
 
     using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal>;
     using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits>;
@@ -238,11 +238,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
     if (warp_idx == 0 && lane_predicate) {
         shared_storage.barrier_Q.init(1 /*numThreads*/);
-#ifndef NO_UNION
-    #ifndef NEW_FP8_EPI_BARRIER
         shared_storage.barrier_O.init(size(ClusterShape{}) /*numThreads*/);
-    #endif
-#endif
     }
     // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
     MainloopPipeline pipeline_k(shared_storage.pipeline_k, pipeline_params, ClusterShape{});
@@ -266,15 +262,9 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     if (warp_group_idx == 0) {  // Producer
         cutlass::arch::warpgroup_reg_dealloc<Ktraits::kNWarps == 12 ? 40 : 32>();
         
-               
-    #ifdef USE_TRI_MMA_FP8
-        PipelineState smem_pipe_write_k  = cutlass::make_producer_start_state<MainloopPipeline>(); 
-        PipelineState smem_pipe_write_v  = cutlass::make_producer_start_state<MainloopPipeline>(); 
-        PipelineState smem_pipe_read_v;
-    #else
         PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>(); 
         PipelineState smem_pipe_read, smem_pipe_release;
-    #endif
+
 
         int work_idx = 0;
 
@@ -289,32 +279,22 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             if (Is_causal && n_block_max <= 0) {
                 scheduler.prefetch_next_work(scheduler_params, work_tile_info);
                 scheduler.broadcast_next_work(work_tile_info);
-                // TODO: remove this
+                // need to sync producer warpgroup
                 cutlass::arch::NamedBarrier::sync(NumCopyThreads, static_cast<int>(FwdNamedBarriers::ProducerWG) /*id*/);
                 continue;
             }                        
-        #ifdef USE_TRI_MMA_FP8
-            collective_mainloop.load_fp8_ver1(
-                mainloop_params, pipeline_k, pipeline_v, pipeline_vt,
-                smem_pipe_write_k, smem_pipe_write_v, smem_pipe_read_v, shared_storage,
-                scheduler, scheduler_params, work_tile_info, block_coord, work_idx);            
-        #else
+
             collective_mainloop.load_fp8(
                 mainloop_params, pipeline_k, pipeline_v, pipeline_vt,
                 smem_pipe_write, smem_pipe_read, shared_storage,
-                scheduler, scheduler_params, work_tile_info, block_coord, work_idx);                                  
-        #endif
+                scheduler, scheduler_params, work_tile_info, block_coord, work_idx);
             ++work_idx;
-            // need to sync producer warpgroup
-            // TODO: remove this
-            // if (Is_causal)
-            //     cutlass::arch::NamedBarrier::sync(NumCopyThreads, static_cast<int>(FwdNamedBarriers::ProducerWG) /*id*/);
+            // don't need to sync producer warpgroup here
+            // if constexpr (Is_causal) {
+            //     cutlass::arch::NamedBarrier::sync(NumCopyThreads, static_cast<int>(FwdNamedBarriers::ProducerWG) /*id*/); }
         }
-    #ifdef USE_TRI_MMA_FP8
-        collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
-    #else
         collective_mainloop.load_tail_one_write(pipeline_k, pipeline_v, smem_pipe_write);
-    #endif
+
         
     } else {  // Consumer
         cutlass::arch::warpgroup_reg_alloc<Ktraits::kNWarps == 12 ? 232 : 160>();        
@@ -322,12 +302,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
         TileScheduler scheduler(&shared_storage.tile_count_semaphore);
         // Initialize matmul objects.
         typename Ktraits::TiledMma1 tiled_mma1;
-    #ifdef USE_TRI_MMA_FP8
-        PipelineState smem_pipe_read_k, smem_pipe_read_vt;        
-    #else
         PipelineState smem_pipe_read;
         PipelineState smem_pipe_release;
-    #endif                
 
         collective_mainloop.mma_init_fp8();
         scheduler.init_consumer();
@@ -349,32 +325,16 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 collective_epilogue.store_zero(epilogue_params, threadIdx.x - NumCopyThreads, block_coord);
                 continue;
             }
-                        
-        #ifdef USE_TRI_MMA_FP8
-            collective_mainloop.mma_fp8_ver1(
-                mainloop_params, pipeline_k, pipeline_vt,
-                smem_pipe_read_k, smem_pipe_read_vt,
-                tOrO, softmax, n_block_max,
-                threadIdx.x - NumCopyThreads, work_idx, m_block,
-                shared_storage);              
-        #else
-            // collective_mainloop.mma_fp8(
-            //     mainloop_params, pipeline_k, pipeline_vt, smem_pipe_read,
-            //     smem_pipe_release, tOrO, softmax, n_block_max,
-            //     threadIdx.x - NumCopyThreads, work_idx, m_block,
-            //     shared_storage);
-            collective_mainloop.mma_fp8_ver2<Delay_V_release>(
+            
+            collective_mainloop.mma_fp8<Delay_V_release>(
                 mainloop_params, pipeline_k, pipeline_vt, smem_pipe_read, smem_pipe_release,
                 tOrO, softmax, n_block_max,
                 threadIdx.x - NumCopyThreads, work_idx, m_block,
-                shared_storage);  
-        #endif
+                shared_storage); 
 
-        #ifdef COLUMN_PERMUTE
+        #ifndef NO_FP8_COLUMN_PERMUTE
             collective_epilogue.store_fp8(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
-                                      threadIdx.x - NumCopyThreads, block_coord);                
-            // collective_epilogue.store(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
-            //                           threadIdx.x - NumCopyThreads, block_coord);
+                                      threadIdx.x - NumCopyThreads, block_coord);
         #else
             collective_epilogue.store(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
                                       threadIdx.x - NumCopyThreads, block_coord);                

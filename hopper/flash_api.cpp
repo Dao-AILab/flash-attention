@@ -223,7 +223,6 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
     if (!params.is_e4m3) {
-        #if 0
         if (params.is_bf16) {
             if (params.d == 64) {
                 run_mha_fwd_<cutlass::bfloat16_t, 64>(params, stream);
@@ -241,7 +240,6 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
                 run_mha_fwd_<cutlass::half_t, 256>(params, stream);
             }
         }
-        #endif
     } else {
         if (params.d == 64) {
             run_mha_fwd_<cutlass::float_e4m3_t, 64>(params, stream);

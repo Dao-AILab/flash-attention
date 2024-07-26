@@ -128,8 +128,7 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int kNRows>
-struct Softmax {
-    
+struct Softmax { 
     constexpr static float max_offset = 8.0f;
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
@@ -194,8 +193,7 @@ struct Softmax {
         }
         return scores_scale;
     };
-
-    // TODO: handle offset
+    
     template<bool Is_dropout=false, bool Split=false, typename Tensor0>
     __forceinline__ __device__ TensorT finalize(Tensor0 &acc_s, float softmax_scale_log2, float rp_dropout=1.0) {
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
@@ -226,7 +224,7 @@ struct Softmax {
         }
     };
 
-    // combined method
+    // combined online softmax method with arbitrary predication
     template <bool is_first = false, bool check_infinity = false,
               typename FragmentS, typename FragmentO, typename PredicateFn>
     __forceinline__ __device__ void

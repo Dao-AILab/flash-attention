@@ -110,15 +110,15 @@ if not SKIP_CUDA_BUILD:
     cutlass_dir = repo_dir / "csrc" / "cutlass"
     sources = [
         "flash_api.cpp",
-        # "flash_fwd_hdim64_fp16_sm90.cu",
-        # "flash_fwd_hdim64_bf16_sm90.cu",
-        # "flash_fwd_hdim128_fp16_sm90.cu",
-        # "flash_fwd_hdim128_bf16_sm90.cu",
-        # "flash_fwd_hdim256_fp16_sm90.cu",
-        # "flash_fwd_hdim256_bf16_sm90.cu",
-        # "flash_bwd_hdim64_fp16_sm90.cu",
-        # "flash_bwd_hdim128_fp16_sm90.cu",
-        # "flash_bwd_hdim256_fp16_sm90.cu",
+        "flash_fwd_hdim64_fp16_sm90.cu",
+        "flash_fwd_hdim64_bf16_sm90.cu",
+        "flash_fwd_hdim128_fp16_sm90.cu",
+        "flash_fwd_hdim128_bf16_sm90.cu",
+        "flash_fwd_hdim256_fp16_sm90.cu",
+        "flash_fwd_hdim256_bf16_sm90.cu",
+        "flash_bwd_hdim64_fp16_sm90.cu",
+        "flash_bwd_hdim128_fp16_sm90.cu",
+        "flash_bwd_hdim256_fp16_sm90.cu",
         "flash_fwd_hdim64_e4m3_sm90.cu",
         "flash_fwd_hdim128_e4m3_sm90.cu",
         "flash_fwd_hdim256_e4m3_sm90.cu"
@@ -136,18 +136,11 @@ if not SKIP_CUDA_BUILD:
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
         "--use_fast_math",
-        # "--ptxas-options=-v",  # printing out number of registers
-        # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",  # printing out number of registers
-        # "-lineinfo",
+        "--ptxas-options=-v",  # printing out number of registers
+        "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",  # printing out number of registers
+        "-lineinfo",
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
-        "-DNDEBUG",  # Important, otherwise performance is severely impacted                
-        "-DCOLUMN_PERMUTE",
-        # "-DDISABLE_CAUSAL",  
-        # "-DUSE_TRI_MMA_FP8"      
-        # "-DUSE_CUSTOM_SOFTMAX",
-        # "-DNO_UNION"
-        # "-DNEW_FP8_EPI_BARRIER",
-        "-DRELEASE_PATTERN",                
+        "-DNDEBUG",  # Important, otherwise performance is severely impacted             
     ]
     include_dirs = [
         # Path(this_dir) / "fmha-pipeline",
