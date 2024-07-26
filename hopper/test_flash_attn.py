@@ -24,7 +24,7 @@ def print_diffs(out, out_ref):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("dtype_to", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["gqa"])
 @pytest.mark.parametrize("causal", [False, True])
@@ -59,7 +59,9 @@ def print_diffs(out, out_ref):
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_output(
-    seqlen_q, seqlen_k, d, causal, mha_type, dtype_to
+    seqlen_q, seqlen_k, d, causal, mha_type,
+    dtype,
+    # dtype_to
 ):
     device = "cuda"
     dtype = torch.float16
@@ -77,17 +79,17 @@ def test_flash_attn_output(
     k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True)
 
-    q = q.to(dtype_to)
-    k = k.to(dtype_to)
-    v = v.to(dtype_to)
+    # q = q.to(dtype_to)
+    # k = k.to(dtype_to)
+    # v = v.to(dtype_to)
 
     print(q.dtype)
 
     out, lse = flash_attn_func(q, k, v, causal=causal)
 
-    q = q.to(dtype)
-    k = k.to(dtype)
-    v = v.to(dtype)
+    # q = q.to(dtype)
+    # k = k.to(dtype)
+    # v = v.to(dtype)
     
     out_ref, attn_ref = attention_ref(
         q,

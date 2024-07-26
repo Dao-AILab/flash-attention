@@ -188,11 +188,12 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
 }
 
-template <typename Ktraits, bool Is_causal, typename TileScheduler>
+template <typename Ktraits, bool Is_causal, typename TileScheduler, typename Seqlen_traits>
 __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1)
-    compute_attn_ws_fp8(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal>::Params const mainloop_params,
-                        CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits>::Params const epilogue_params,
-                        CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params
+    compute_attn_ws_fp8(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal, Seqlen_traits>::Params const mainloop_params,
+                        CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits, Seqlen_traits>::Params const epilogue_params,
+                        CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params,
+                        Seqlen_traits seqlen_traits_q, Seqlen_traits seqlen_traits_k
                         ) {
 
     using Element = typename Ktraits::Element;
@@ -212,8 +213,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     // static constexpr int kHeadDim = Ktraits::kHeadDim;
     static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128;
 
-    using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal>;
-    using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits>;
+    using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, Seqlen_traits>;
+    using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits, Seqlen_traits>;
 
     using MainloopPipeline = typename Ktraits::MainloopPipeline;
     using MainloopPipelineVt = typename Ktraits::MainloopPipelineNoTMA;
@@ -280,7 +281,6 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
         PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>(); 
         PipelineState smem_pipe_read, smem_pipe_release;
 
-
         int work_idx = 0;
 
         TileScheduler scheduler(&shared_storage.tile_count_semaphore);
@@ -290,27 +290,31 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, bidh, bidb] = block_coord;
 
-            int n_block_max = collective_mainloop.get_n_block_max(mainloop_params, m_block);
+            seqlen_traits_q.init(bidb);
+            seqlen_traits_k.init(bidb);
+            if (m_block * kBlockM >= seqlen_traits_q.actual_seq_len) {
+                continue;
+            }
+            int n_block_max = collective_mainloop.get_n_block_max(
+                mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
             if (Is_causal && n_block_max <= 0) {
                 scheduler.prefetch_next_work(scheduler_params, work_tile_info);
                 scheduler.broadcast_next_work(work_tile_info);
                 // need to sync producer warpgroup
                 cutlass::arch::NamedBarrier::sync(NumCopyThreads, static_cast<int>(FwdNamedBarriers::ProducerWG) /*id*/);
                 continue;
-            }                        
-
+            }
             collective_mainloop.load_fp8(
                 mainloop_params, pipeline_k, pipeline_v, pipeline_vt,
                 smem_pipe_write, smem_pipe_read, shared_storage,
-                scheduler, scheduler_params, work_tile_info, block_coord, work_idx);
+                scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
+                seqlen_traits_q, seqlen_traits_k);
             ++work_idx;
             // don't need to sync producer warpgroup here
             // if constexpr (Is_causal) {
             //     cutlass::arch::NamedBarrier::sync(NumCopyThreads, static_cast<int>(FwdNamedBarriers::ProducerWG) /*id*/); }
         }
         collective_mainloop.load_tail_one_write(pipeline_k, pipeline_v, smem_pipe_write);
-
-        
     } else {  // Consumer
         cutlass::arch::warpgroup_reg_alloc<Ktraits::kNWarps == 12 ? 232 : 160>();        
 
@@ -335,9 +339,15 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, bidh, bidb] = block_coord;
 
-            int n_block_max = collective_mainloop.get_n_block_max(mainloop_params, m_block);
+            seqlen_traits_q.init(bidb);
+            seqlen_traits_k.init(bidb);
+            if (m_block * kBlockM >= seqlen_traits_q.actual_seq_len) {
+                continue;
+            }
+            int n_block_max = collective_mainloop.get_n_block_max(
+                mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
             if (Is_causal && n_block_max <= 0) {  // We exit early and write 0 to gO and -inf to gLSE.
-                collective_epilogue.store_zero(epilogue_params, threadIdx.x - NumCopyThreads, block_coord);
+                collective_epilogue.store_zero(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q);
                 continue;
             }
             
@@ -345,14 +355,14 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 mainloop_params, pipeline_k, pipeline_vt, smem_pipe_read, smem_pipe_release,
                 tOrO, softmax, n_block_max,
                 threadIdx.x - NumCopyThreads, work_idx, m_block,
-                shared_storage); 
+                shared_storage, seqlen_traits_q, seqlen_traits_k); 
 
         #ifndef NO_FP8_COLUMN_PERMUTE
             collective_epilogue.store_fp8(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
-                                      threadIdx.x - NumCopyThreads, block_coord);
+                                      threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q);
         #else
             collective_epilogue.store(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
-                                      threadIdx.x - NumCopyThreads, block_coord);                
+                                      threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q);                
         #endif
             ++work_idx;
         }
