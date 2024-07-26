@@ -62,15 +62,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     typename CollectiveEpilogue::Params epilogue_params =
         CollectiveEpilogue::to_underlying_arguments({
             static_cast<OutputType*>(params.o_ptr),
-<<<<<<< HEAD
             seqlen_traits_q.get_gmem_layout(
                 params.seqlen_q, params.d, params.h, params.b,
                 params.o_row_stride, params.o_head_stride, params.o_batch_stride
             ),  // layout_O
-=======
-            {params.seqlen_q, params.d, params.h, params.b},  // shape_O
-            {params.o_row_stride, _1{}, params.o_head_stride, params.o_batch_stride},  // stride_O
->>>>>>> 17dd4b7e5ebe53f433298c923fd1d8200bfc94a5
             static_cast<float*>(params.softmax_lse_ptr),
             seqlen_traits_q.get_lse_gmem_layout(
                 params.seqlen_q, params.h, params.b
@@ -85,15 +80,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // Get the ptr to kernel function.
     void *kernel;
     if constexpr(cutlass::sizeof_bits_v<Element> == 8)
-<<<<<<< HEAD
         kernel = (void *)flash::compute_attn_ws_fp8<Kernel_traits, Is_causal, Scheduler, Seqlen_traits>;
     else
         kernel = (void *)flash::compute_attn_ws<Kernel_traits, Is_causal, Scheduler, Seqlen_traits>;
-=======
-        kernel = (void *)flash::compute_attn_ws_fp8<Kernel_traits, Is_causal, Scheduler>;
-    else
-        kernel = (void *)flash::compute_attn_ws<Kernel_traits, Is_causal, Scheduler>;
->>>>>>> 17dd4b7e5ebe53f433298c923fd1d8200bfc94a5
     int smem_size = sizeof(typename Kernel_traits::SharedStorage);
     // int smem_size_q = sizeof(decltype((typename Kernel_traits::SharedStorage{}).smem_q));
     // int smem_size_k = sizeof(decltype((typename Kernel_traits::SharedStorage{}).smem_k));
