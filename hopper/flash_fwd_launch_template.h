@@ -26,7 +26,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using ClusterShape = typename Kernel_traits::ClusterShape_MNK;
 
     // print(typename Kernel_traits::SmemLayoutVt{}); printf("\n"); print(typename Kernel_traits::SmemLayoutVt_tmp{});
-<<<<<<< HEAD
     using CollectiveMainloop = flash::CollectiveMainloopFwd<Kernel_traits, Is_causal, Seqlen_traits>;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<Kernel_traits, Seqlen_traits>;
     using Scheduler = std::conditional_t<
@@ -41,15 +40,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.total_q, params.seqlen_q, params.cu_seqlens_q);
     Seqlen_traits seqlen_traits_k(
         params.total_k, params.seqlen_k, params.cu_seqlens_k, params.seqused_k);
-=======
-    using CollectiveMainloop = flash::CollectiveMainloopFwd<Kernel_traits, Is_causal>;
-    using CollectiveEpilogue = flash::CollectiveEpilogueFwd<Kernel_traits>;
-    using Scheduler = std::conditional_t<!Is_causal,
-        flash::StaticPersistentTileScheduler,
-        flash::DynamicPersistentTileScheduler<Kernel_traits::kNThreads - cutlass::NumThreadsPerWarpGroup, Kernel_traits::NumProducerThreads>>;    
-        // flash::SingleTileScheduler>;
-    // using Scheduler = flash::StaticPersistentTileScheduler;
->>>>>>> 17dd4b7e5ebe53f433298c923fd1d8200bfc94a5
     typename CollectiveMainloop::Params mainloop_params =
         CollectiveMainloop::to_underlying_arguments({
             static_cast<Element const*>(params.q_ptr),
