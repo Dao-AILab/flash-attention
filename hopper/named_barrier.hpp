@@ -19,10 +19,6 @@ enum class FwdNamedBarriers {
     WarpSchedulerWG2 = 5,
     WarpSchedulerWG3 = 6,
     ProducerWG = 7
-
-// #ifdef NEW_FP8_EPI_BARRIER
-//     OutEmpty = 7
-// #endif
 };
 
 } // flash

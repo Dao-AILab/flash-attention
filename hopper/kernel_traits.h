@@ -39,33 +39,15 @@ struct SharedStorageQKVOVt {
   struct {
     cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutQ>> smem_q;
     cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutK>> smem_k;
-    cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v;
-#ifdef NO_UNION    
-    cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v_out;
-    cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
-#else    
+    cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v;  
     union {
         cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v_out;
         cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
     };
-#endif
-    // union {
-    //   struct {        
-    //     cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v;
-    //     cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v_out;
-    //   };
-    //   struct {
-    //     cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
-    //   };
-    // };
   };
   struct {    
-    cutlass::arch::ClusterTransactionBarrier barrier_Q;   
-#ifndef NO_UNION
-    #ifndef NEW_FP8_EPI_BARRIER 
+    cutlass::arch::ClusterTransactionBarrier barrier_Q;
     cutlass::arch::ClusterBarrier barrier_O;
-    #endif
-#endif
     typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_k;
     typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_v;
     typename cutlass::PipelineAsync<kStages>::SharedStorage pipeline_vt;
@@ -155,7 +137,7 @@ struct Flash_fwd_kernel_traits {
 
 };
 
-// Traits struct for fp8 kernel
+// Traits struct for fp8 kernel with in-kernel transpose
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, int kStages_, bool Is_Q_in_regs_=false,
          int kClusterM_ = 1, typename elem_type=cutlass::float_e4m3_t>
 struct Flash_fwd_kernel_traits_fp8 {
@@ -230,7 +212,7 @@ struct Flash_fwd_kernel_traits_fp8 {
         decltype(composition(SmemLayoutVt{},
                              make_ordered_layout(product_each(shape(SmemLayoutV{})), Step<_2, _1, _3>{})));
     using SmemLayoutDivideVt = decltype(tiled_divide(SmemLayoutVtTrans{}, TransposeShapeAtomV{}));
-#ifdef COLUMN_PERMUTE
+#ifndef NO_FP8_COLUMN_PERMUTE
     using SmemShapeSTSM = Shape<Shape<_16, _4>, Shape<_8, _8>>;
 #else
     using SmemShapeSTSM = Shape<Shape<_16, _4>, Shape<_16, _4>>;
