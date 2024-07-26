@@ -178,8 +178,6 @@ void run_mha_fwd_hdim64_fp8(Flash_fwd_params &params, cudaStream_t stream) {
             run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 16, 4, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);            
         });
     });
-    // constexpr static bool Is_causal = false;
-    // run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, 192, 128, 16, 4, false, 1, T>, Is_causal>(params, stream);
 }
 
 template<typename T>
@@ -194,24 +192,17 @@ void run_mha_fwd_hdim128_fp8(Flash_fwd_params &params, cudaStream_t stream) {
             // run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, 192, 128, 16, 3, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
         });
     });
-    // constexpr static bool Is_causal = false;
-    // run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, 192, 128, 16, 3, false, 2, T>, Is_causal>(params, stream);    
-    // run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, 128, 256, 12, 2, false, 2, T>, Is_causal>(params, stream);
 }
 
 template<typename T>
 void run_mha_fwd_hdim256_fp8(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 256; 
-    constexpr static int kBlockM = 128;   
-#if 1   
+    constexpr static int kBlockM = 128;
+    constexpr static int kBlockN = 128;
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         // Only use Cluster if number of tiles along seqlen_q is even
         BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0, UseCluster, [&] {
-            run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, 128, 128, 12, 2, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
+            run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 12, 2, false, !Is_causal && UseCluster ? 2 : 1, T>, Is_causal>(params, stream);
         });
     });
-#else
-    constexpr static bool Is_causal = false;
-    run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, 128, 128, 12, 2, false, 2, T>, Is_causal>(params, stream);
-#endif
 }
