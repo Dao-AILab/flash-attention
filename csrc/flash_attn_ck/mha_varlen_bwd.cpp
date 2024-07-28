@@ -381,6 +381,8 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
 
     if (max_seqlen_q > 0) {
         ck_tile::stream_config stream_config{stream};
+        dq.zero_();
+        dq_accum.zero_();
 
         auto traits =
             get_ck_fmha_varlen_bwd_traits(mask, q_dtype_str, head_size_8x, is_dropout, alibi_slopes_.has_value(), deterministic);

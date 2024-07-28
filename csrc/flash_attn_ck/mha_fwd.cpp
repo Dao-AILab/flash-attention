@@ -11,7 +11,6 @@ fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
                                        std::string dtype,
                                        int head_size,
                                        bool has_dropout,
-                                       bool has_dropout_randval,
                                        bool has_lse,
                                        bool enable_alibi)
 {
@@ -24,7 +23,6 @@ fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
                            enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
                            has_lse,
                            has_dropout,
-                           has_dropout_randval,
                            false}; // do_fp8_static_quant
 }
 
@@ -148,6 +146,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          mask.right,
                          static_cast<ck_tile::index_t>(mask.type),
                          p_dropout,
+                         has_dropout_randval,
                          {drop_seed, drop_offset}};
 }
 
@@ -305,7 +304,6 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                 q_dtype_str,
                 head_size_8x,
                 has_dropout,
-                return_dropout_randval,
                 has_lse,
                 alibi_slopes_.has_value());
 

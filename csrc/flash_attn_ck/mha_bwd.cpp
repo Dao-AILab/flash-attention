@@ -357,6 +357,8 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
 
     if (seqlen_q > 0) {
         ck_tile::stream_config stream_config{stream};
+        dq.zero_();
+        dq_accum.zero_();
 
         auto traits =
             get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size_8x, is_dropout, alibi_slopes_.has_value(), deterministic);
