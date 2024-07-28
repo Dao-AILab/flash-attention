@@ -99,7 +99,7 @@ fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
 
     // dq_acc: (split, batch_size, seqlen_q, nheads, hdim)
     ck_tile::index_t split_stride_dq_acc = dq_acc.stride(0);
-    ck_tile::index_t batch_stride_dq_acc = dv.stride(1);
+    ck_tile::index_t batch_stride_dq_acc = dq_acc.stride(1);
     ck_tile::index_t stride_dq_acc = dq_acc.stride(2);
     ck_tile::index_t nhead_stride_dq_acc = dq_acc.stride(3);
 
@@ -163,8 +163,8 @@ fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
                          nhead_stride_o,
                          0, // nhead_stride_randval
                          nhead_stride_do,
-                         nhead_stride_dq_acc,
                          nhead_stride_lse,
+                         nhead_stride_dq_acc,
                          0, // nhead_stride_dbias, FA without dbias
                          batch_stride_q,
                          batch_stride_k,

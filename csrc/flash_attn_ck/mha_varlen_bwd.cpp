@@ -168,8 +168,8 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          nhead_stride_o,
                          0, // nhead_stride_randval
                          nhead_stride_do,
-                         nhead_stride_dq_acc,
                          nhead_stride_lse,
+                         nhead_stride_dq_acc,
                          0, // nhead_stride_dbias, FA without dbias
                          batch_stride_q,
                          batch_stride_k,
