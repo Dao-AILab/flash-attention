@@ -54,48 +54,59 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                                           uint64_t drop_seed,
                                           uint64_t drop_offset)
 {
-    // q: (total_q, nheads, hdim)
-    // k: (total_k, nheads_k, hdim)
-    // v: (total_k, nheads_k, hdim)
-    // o: (total_q, nheads, hdim)
-    // dq: (total_q, nheads, hdim)
-    // dk_expanded: (total_k, nheads, hdim)
-    // dv_expanded: (total_k, nheads, hdim)
-    // do: (total_q, nheads, hdim)
-
-    // alibi_slopes:(batch_size, nheads) or (nhead)
-    // lse: (batch_size, nheads, max_seqlen_q)
-    // d: (batch_size, nheads, max_seqlen_q)
-    // dq_acc: (split, total_q, nheads, hdim)
-
     ck_tile::index_t total_q = q.size(0);
     ck_tile::index_t total_k = k.size(0);
 
+    // q: (total_q, nheads, hdim)
+    ck_tile::index_t batch_stride_q = 0;
     ck_tile::index_t stride_q = q.stride(0);
-    ck_tile::index_t stride_k = k.stride(0);
-    ck_tile::index_t stride_v = v.stride(0);
-    ck_tile::index_t stride_o = out.stride(0);
-    ck_tile::index_t stride_do = dout.stride(0);
-    ck_tile::index_t stride_dk = dk.stride(0);
-    ck_tile::index_t stride_dv = dv.stride(0);
-
     ck_tile::index_t nhead_stride_q = q.stride(1);
+
+    // k: (total_k, nheads_k, hdim)
+    ck_tile::index_t batch_stride_k = 0;
+    ck_tile::index_t stride_k = k.stride(0);
     ck_tile::index_t nhead_stride_k = k.stride(1);
+
+    // v: (total_k, nheads_k, hdim)
+    ck_tile::index_t batch_stride_v = 0;
+    ck_tile::index_t stride_v = v.stride(0);
     ck_tile::index_t nhead_stride_v = v.stride(1);
+
+    // o: (total_q, nheads, hdim)
+    ck_tile::index_t batch_stride_o = 0;
+    ck_tile::index_t stride_o = out.stride(0);
     ck_tile::index_t nhead_stride_o = out.stride(1);
-    ck_tile::index_t nhead_stride_do = dout.stride(1);
+
+    // lse: (batch_size, nheads, max_seqlen_q)
+    ck_tile::index_t batch_stride_lse = softmax_lse.stride(0);
     ck_tile::index_t nhead_stride_lse = softmax_lse.stride(1);
 
-    ck_tile::index_t batch_stride_q = 0;
-    ck_tile::index_t batch_stride_k = 0;
-    ck_tile::index_t batch_stride_v = 0;
-    ck_tile::index_t batch_stride_o = 0;
+    // do: (total_q, nheads, hdim)
     ck_tile::index_t batch_stride_do = 0;
-    ck_tile::index_t batch_stride_lse = softmax_lse.stride(0);;
-    ck_tile::index_t batch_stride_dk = 0;
-    ck_tile::index_t batch_stride_dv = 0;
+    ck_tile::index_t stride_do = dout.stride(0);
+    ck_tile::index_t nhead_stride_do = dout.stride(1);
 
+    // d: (batch_size, nheads, max_seqlen_q)
+    // CK assume d share the same stride with lse
+
+    // dq: (total_q, nheads, hdim)
+    // CK assume dq share the same stride with q
+
+    // dk_expanded: (total_k, nheads, hdim)
+    ck_tile::index_t batch_stride_dk = 0;
+    ck_tile::index_t stride_dk = dk.stride(0);
+    // CK assume dk share the same nhead stride with k
+
+    // dv_expanded: (total_k, nheads, hdim)
+    ck_tile::index_t batch_stride_dv = 0;
+    ck_tile::index_t stride_dv = dv.stride(0);
+    // CK assume dv share the same nhead stride with v
+
+    // dq_acc: (split, total_q, nheads, hdim)
     ck_tile::index_t split_stride_dq_acc = dq_acc.stride(0);
+    ck_tile::index_t batch_stride_dq_acc = 0;
+    ck_tile::index_t stride_dq_acc = dq_acc.stride(1);
+    ck_tile::index_t nhead_stride_dq_acc = dq_acc.stride(2);
 
     float p_undrop = 1.0 - p_dropout;
 
@@ -108,6 +119,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
         TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
         TORCH_CHECK(alibi_slopes.sizes() == torch::IntArrayRef({h}) || alibi_slopes.sizes() == torch::IntArrayRef({b, h}));
         alibi_slopes_ptr = alibi_slopes.data_ptr();
+        // alibi_slopes:(batch_size, nheads) or (nhead)
         stride_alibi_slopes = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
@@ -145,6 +157,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          stride_o,
                          0, // stride_randval
                          stride_do,
+                         stride_dq_acc,
                          stride_dk,
                          stride_dv,
                          0, // stride_dbias, FA without bias
@@ -155,6 +168,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          nhead_stride_o,
                          0, // nhead_stride_randval
                          nhead_stride_do,
+                         nhead_stride_dq_acc,
                          nhead_stride_lse,
                          0, // nhead_stride_dbias, FA without dbias
                          batch_stride_q,
@@ -165,6 +179,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          0, // batch_stride_randval
                          batch_stride_do,
                          batch_stride_lse,
+                         batch_stride_dq_acc,
                          batch_stride_dk,
                          batch_stride_dv,
                          0  , // batch_stride_dbias, FA without dbias
@@ -322,15 +337,10 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
     at::Tensor dq_accum;
-    TORCH_CHECK(!deterministic, "Bwd only support non deterministic mode");
 
     if (!deterministic) {
-        // bwd kernel assume dq and q share the same stride
-        dq_accum = at::empty_strided(q.sizes(), q.strides(), opts.dtype(at::kFloat));
-        dq_accum = dq_accum.reshape({1, total_q, num_heads, head_size_8x});
         dq_accum = torch::empty({1, total_q, num_heads, head_size_8x}, opts.dtype(at::kFloat));
     } else {
-        assert(0);
         const ck_tile::index_t kN0 = (head_size_8x > 32 & head_size_8x <= 128) ? 128 : 64;
         const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(max_seqlen_k, kN0);
         dq_accum = torch::zeros({nsplits, total_q, num_heads, head_size_8x}, opts.dtype(at::kFloat));
@@ -371,7 +381,6 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
 
     if (max_seqlen_q > 0) {
         ck_tile::stream_config stream_config{stream};
-        dq.zero_(); // ck use atomic operation on dq
 
         auto traits =
             get_ck_fmha_varlen_bwd_traits(mask, q_dtype_str, head_size_8x, is_dropout, alibi_slopes_.has_value(), deterministic);
