@@ -23,99 +23,11 @@ def print_diffs(out, out_ref):
             print(f"==== diff ==== {idx}, test: {e_o}, ref: {e_o_ref}")
 
 
-<<<<<<< HEAD
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 # @pytest.mark.parametrize("dtype_to", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["gqa"])
 @pytest.mark.parametrize("causal", [False, True])
-=======
-def attention_ref(
-    q,
-    k,
-    v,
-    query_padding_mask=None,
-    key_padding_mask=None,
-    attn_bias=None,
-    dropout_p=0.0,
-    dropout_mask=None,
-    causal=False,
-    upcast=True,
-    reorder_ops=False,
-):
-    """
-    Arguments:
-        q: (batch_size, seqlen_q, nheads, head_dim)
-        k: (batch_size, seqlen_k, nheads, head_dim)
-        v: (batch_size, seqlen_k, nheads, head_dim)
-        query_padding_mask: (batch_size, seqlen_q)
-        key_padding_mask: (batch_size, seqlen_k)
-        attn_bias: broadcastable to (batch_size, nheads, seqlen_q, seqlen_k)
-        dropout_p: float
-        dropout_mask: (batch_size, nheads, seqlen_q, seqlen_k)
-        causal: whether to apply causal masking
-        upcast: whether to cast all inputs to fp32, do all computation in fp32, then cast
-            output back to fp16/bf16.
-        reorder_ops: whether to change the order of operations (scaling k instead of scaling k, etc.)
-            without changing the math. This is to estimate the numerical error from operation
-            reordering.
-    Output:
-        output: (batch_size, seqlen_q, nheads, head_dim)
-        attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
-    """
-    dtype_og = q.dtype
-    if upcast:
-        q, k, v = q.float(), k.float(), v.float()
-    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
-    k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
-    v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
-    d = q.shape[-1]
-    if not reorder_ops:
-        scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
-    else:
-        scores = torch.einsum("bthd,bshd->bhts", q, k / math.sqrt(d))
-    if key_padding_mask is not None:
-        scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
-    if causal:
-        local_mask = construct_local_mask(
-            seqlen_q,
-            seqlen_k,
-            (-1, 0),
-            None,
-            None,
-            q.device,
-        )
-        scores.masked_fill_(local_mask, float("-inf"))
-    if attn_bias is not None:
-        scores = scores + attn_bias
-    attention = torch.softmax(scores, dim=-1).to(v.dtype)
-    # We want to mask here so that the attention matrix doesn't have any NaNs
-    # Otherwise we'll get NaN in dV
-    if query_padding_mask is not None:
-        attention = attention.masked_fill(rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0)
-    # Some rows might be completely masked out so we fill them with zero instead of NaN
-    if causal:
-        attention = attention.masked_fill(torch.all(local_mask, dim=-1, keepdim=True), 0.0)
-    dropout_scaling = 1.0 / (1 - dropout_p)
-    # attention_drop = attention.masked_fill(~dropout_mask, 0.0) * dropout_scaling
-    # output = torch.einsum('bhts,bshd->bthd', attention_drop , v)
-    if dropout_mask is not None:
-        attention_drop = attention.masked_fill(~dropout_mask, 0.0)
-    else:
-        attention_drop = attention
-    output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
-    if query_padding_mask is not None:
-        output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
-    return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
-
-
-
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("dtype_to", [torch.float8_e4m3fn])
-# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("causal", [False])
->>>>>>> 17dd4b7e5ebe53f433298c923fd1d8200bfc94a5
 # @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
@@ -123,7 +35,6 @@ def attention_ref(
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize("d", [64, 128, 256])
-<<<<<<< HEAD
 # @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -144,38 +55,13 @@ def attention_ref(
         (1023, 1024),
         (1024, 1023),
         (2048, 2048),
-=======
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        # (1, 1)
-        # (64, 128),
-        # (128, 128),
-        # (256, 256),
-        # (113, 203),
-        # (128, 217),
-        # (113, 211),
-        # (108, 256),
-        # (256, 512),
-        # (384, 256),
-        # (640, 128),
-        # (512, 256),
-        # (1024, 1024),
-        # (1023, 1024),
-        # (1024, 1023),
-        (4096, 4096),
->>>>>>> 17dd4b7e5ebe53f433298c923fd1d8200bfc94a5
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_output(
-<<<<<<< HEAD
     seqlen_q, seqlen_k, d, causal, mha_type,
     dtype,
     # dtype_to
-=======
-    seqlen_q, seqlen_k, d, causal, mha_type, dtype_to
->>>>>>> 17dd4b7e5ebe53f433298c923fd1d8200bfc94a5
 ):
     device = "cuda"
     dtype = torch.float16
@@ -193,29 +79,17 @@ def test_flash_attn_output(
     k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True)
 
-<<<<<<< HEAD
     # q = q.to(dtype_to)
     # k = k.to(dtype_to)
     # v = v.to(dtype_to)
-=======
-    q = q.to(dtype_to)
-    k = k.to(dtype_to)
-    v = v.to(dtype_to)
->>>>>>> 17dd4b7e5ebe53f433298c923fd1d8200bfc94a5
 
     print(q.dtype)
 
     out, lse = flash_attn_func(q, k, v, causal=causal)
 
-<<<<<<< HEAD
     # q = q.to(dtype)
     # k = k.to(dtype)
     # v = v.to(dtype)
-=======
-    q = q.to(dtype)
-    k = k.to(dtype)
-    v = v.to(dtype)
->>>>>>> 17dd4b7e5ebe53f433298c923fd1d8200bfc94a5
     
     out_ref, attn_ref = attention_ref(
         q,
@@ -281,12 +155,8 @@ def test_flash_attn_output(
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
-<<<<<<< HEAD
     # breakpoint()
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
-=======
-    # assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
->>>>>>> 17dd4b7e5ebe53f433298c923fd1d8200bfc94a5
 
     # if d <= 128:
     #     assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
