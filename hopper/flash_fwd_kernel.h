@@ -212,7 +212,9 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     static constexpr int kBlockM = Ktraits::kBlockM;
     // static constexpr int kBlockN = Ktraits::kBlockN;
     // static constexpr int kHeadDim = Ktraits::kHeadDim;
-    static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128;
+    static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128;  
+    // for now, disable for hdim 128 causal to avoid perf regression with register spilling
+    static constexpr bool Use_max_offset = !(Is_causal && Ktraits::kHeadDim == 128);    
 
     using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, Seqlen_traits>;
     using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits, Seqlen_traits>;
@@ -329,7 +331,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
         PipelineState smem_pipe_read;
         PipelineState smem_pipe_release;
 
-        collective_mainloop.mma_init_fp8();
+        collective_mainloop.mma_init();
         scheduler.init_consumer();
 
         int work_idx = 0;
@@ -339,7 +341,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
              work_tile_info = scheduler.template get_next_work</*IsProducer=*/false>(scheduler_params, work_tile_info)) {
             // Attention output (GEMM-II) accumulator.
             Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 2>(TileShape_MNK{}));
-            flash::Softmax<2 * (2 * kBlockM / NumMmaThreads)> softmax;
+            flash::Softmax<2 * (2 * kBlockM / NumMmaThreads), Use_max_offset> softmax;
 
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, bidh, bidb] = block_coord;

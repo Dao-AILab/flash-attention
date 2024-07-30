@@ -162,31 +162,37 @@ void run_mha_fwd_hdim64_fp8(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
     constexpr static int kBlockM = 192;
     constexpr static int kBlockN = 128;
+    constexpr static int kNWarps = 4 + kBlockM/16;
+    constexpr static int kStages = 4;    
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
             // Only use Cluster if number of tiles along seqlen_q is even
-            BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0 && !Is_causal && !Seqlen_traits::kUseVarSeqLen, UseCluster, [&] {
-                run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 16, 4, false, UseCluster ? 2 : 1, T>, Is_causal, Seqlen_traits>(params, stream);            
+            BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0 && !Is_causal &&
+                        !Seqlen_traits::kUseVarSeqLen, UseCluster, [&] {
+                run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
+                              false, UseCluster ? 2 : 1, T>, Is_causal, Seqlen_traits>(params, stream);            
             });
         });
-    });
-    // run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 16, 4, false, 2, T>, false, flash::FixedSeqLenTraits>(params, stream);
+    });    
 }
 
 template<typename T>
 void run_mha_fwd_hdim128_fp8(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
     constexpr static int kBlockM = 128;
-    constexpr static int kBlockN = 256;    
+    constexpr static int kBlockN = 256;
+    constexpr static int kNWarps = 4 + kBlockM/16;
+    constexpr static int kStages = 2;    
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
             // Only use Cluster if number of tiles along seqlen_q is even
-            BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0 && !Is_causal && !Seqlen_traits::kUseVarSeqLen, UseCluster, [&] {
-                run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 12, 2, false, UseCluster ? 2 : 1, T>, Is_causal, Seqlen_traits>(params, stream);
+            BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0 && !Is_causal &&
+                        !Seqlen_traits::kUseVarSeqLen, UseCluster, [&] {
+                run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
+                              false, UseCluster ? 2 : 1, T>, Is_causal, Seqlen_traits>(params, stream);
             });
         });
-    });
-    // run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 12, 2, false, 2, T>, false, flash::FixedSeqLenTraits>(params, stream);
+    });    
 }
 
 template<typename T>
@@ -194,13 +200,16 @@ void run_mha_fwd_hdim256_fp8(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 256; 
     constexpr static int kBlockM = 128;
     constexpr static int kBlockN = 128;
+    constexpr static int kNWarps = 4 + kBlockM/16;
+    constexpr static int kStages = 2;    
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
             // Only use Cluster if number of tiles along seqlen_q is even
-            BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0 && !Is_causal && !Seqlen_traits::kUseVarSeqLen, UseCluster, [&] {
-                run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 12, 2, false, UseCluster ? 2 : 1, T>, Is_causal, Seqlen_traits>(params, stream);
+            BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0 && !Is_causal &&
+                        !Seqlen_traits::kUseVarSeqLen, UseCluster, [&] {
+                run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
+                              false, UseCluster ? 2 : 1, T>, Is_causal, Seqlen_traits>(params, stream);
             });
         });
-    });
-    // run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, 12, 2, false, 2, T>, false, flash::FixedSeqLenTraits>(params, stream);
+    });    
 }

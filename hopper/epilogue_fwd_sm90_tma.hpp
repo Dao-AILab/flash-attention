@@ -28,7 +28,7 @@ struct CollectiveEpilogueFwd {
 
     static constexpr int kNWarps = Ktraits::kNWarps;
     static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
-    static constexpr bool Is_WS = kNWarps >= 12;
+    static constexpr bool Is_WS = kNWarps >= 12;    
 
     static constexpr int NumCopyThreads = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
     static constexpr int NumMmaThreads = kNThreads - NumCopyThreads;
@@ -160,7 +160,7 @@ struct CollectiveEpilogueFwd {
         if (get<1>(taccOcO_row(_0{})) == 0) {
             #pragma unroll
             for (int mi = 0; mi < size(lse); ++mi) {
-                const int row = get<0>(taccOcO_row(mi));
+                const int row = get<0>(taccOcO_row(mi));                
                 if (row < seqlen_traits_q.actual_seq_len - m_block * kBlockM) { gLSE(row) = lse(mi); }
             }
         }
@@ -220,12 +220,16 @@ struct CollectiveEpilogueFwd {
         static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
         // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the row indices.
         Tensor taccOcO_row = taccOcO(make_coord(_0{}, _, _0{}), _, _0{});
-        CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
+        CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M        
+        int const seqlen_q = [&] {
+            if constexpr(Seqlen_traits::kUseVarSeqLen) { return seqlen_traits_q.actual_seq_len; }
+            else { return shape<2>(epilogue_params.layout_LSE); }
+        }();        
         if (get<1>(taccOcO_row(_0{})) == 0) {
             #pragma unroll
             for (int mi = 0; mi < size(lse); ++mi) {
                 const int row = get<0>(taccOcO_row(mi));
-                if (row < seqlen_traits_q.actual_seq_len - m_block * kBlockM) { gLSE(row) = lse(mi); }
+                if (row < seqlen_q - m_block * kBlockM) { gLSE(row) = lse(mi); }
             }
         }
         

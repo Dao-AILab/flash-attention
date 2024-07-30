@@ -214,9 +214,9 @@ struct CollectiveMainloopFwd {
           const Seqlen_traits& seqlen_traits_k
         ) {
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
-        static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        int const seqlen_q = seqlen_traits_q.actual_seq_len;
-        int const seqlen_k = seqlen_traits_k.actual_seq_len;
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});        
+        int const seqlen_q = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        int const seqlen_k = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);        
         int n_block_max = cute::ceil_div(seqlen_k, kBlockN);
         if constexpr (Is_causal) {
             n_block_max = std::min(n_block_max,
@@ -429,7 +429,7 @@ struct CollectiveMainloopFwd {
             }
 
             shared_storage.barrier_O.wait((work_idx + 1) % 2);            
-            
+                        
             CUTLASS_PRAGMA_UNROLL
             for (int iter = 0; iter < kStages && n_block > 0; ++iter, --n_block) {
                 pipeline_v.consumer_wait(smem_pipe_read);
@@ -449,9 +449,9 @@ struct CollectiveMainloopFwd {
                     copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
                         tVgV(_, n_block-1), tVsV(_, smem_pipe_write.index()));
                 }
-            }
+            }            
             
-            #pragma unroll 2               
+            #pragma unroll 2
             for (; n_block > 0; --n_block) {
                 pipeline_v.consumer_wait(smem_pipe_read);
                 pipeline_vt.producer_acquire(smem_pipe_write);
@@ -613,7 +613,7 @@ struct CollectiveMainloopFwd {
     CUTLASS_DEVICE void
     mma_init() {
         // Tell producer (warp 0) that smem_q is ready
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);                
+        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + Ktraits::NumProducerThreads, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);                
         if constexpr (!UseSchedulerBarrier) { return; }
         static_assert(NumMmaThreads == 2 * cutlass::NumThreadsPerWarpGroup || NumMmaThreads == 3 * cutlass::NumThreadsPerWarpGroup);
         if (cutlass::canonical_warp_group_idx() > 1) {
@@ -625,23 +625,6 @@ struct CollectiveMainloopFwd {
             }
         }
 
-    }
-    
-    CUTLASS_DEVICE void
-    mma_init_fp8() {
-        // Tell producer (warpgroup 0) that smem_q is ready
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
-
-        if constexpr (!UseSchedulerBarrier) { return; }
-        static_assert(NumMmaThreads == 2 * cutlass::NumThreadsPerWarpGroup || NumMmaThreads == 3 * cutlass::NumThreadsPerWarpGroup);
-        if (cutlass::canonical_warp_group_idx() > 1) {
-            cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + 1 /*id*/);
-        }
-        if constexpr (NumMmaThreads == 3 * cutlass::NumThreadsPerWarpGroup) {
-            if (cutlass::canonical_warp_group_idx() > 2) {
-                cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + 2 /*id*/);
-            }
-        }
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
@@ -852,8 +835,9 @@ struct CollectiveMainloopFwd {
         };
 
         tiled_mma1.accumulate_ = GMMA::ScaleOut::Zero;
-        int const seqlen_q = seqlen_traits_q.actual_seq_len;
-        int const seqlen_k = seqlen_traits_k.actual_seq_len;
+        // workaround for fp8 only perf regression pending change to seqlen traits class
+        int const seqlen_q = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        int const seqlen_k = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         int n_block = n_block_count - 1;
         
         cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.barrier_Q.try_wait(work_idx % 2));
@@ -982,10 +966,10 @@ struct CollectiveMainloopFwd {
             for (; n_block >= 0; --n_block) {
                 Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
-                pipeline_vt.consumer_release(smem_pipe_release);
+                pipeline_vt.consumer_release(smem_pipe_release);                
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
                 warp_scheduler_barrier_arrive();
-                warpgroup_wait<0>();
+                warpgroup_wait<0>();                
                 consumer_wait(pipeline_vt, smem_pipe_read);
 
                 cute::copy(softmax.template max</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);
