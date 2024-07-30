@@ -90,17 +90,20 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
     // CK assume d share the same stride with lse
 
     // dq: (total_q, nheads, hdim)
-    // CK assume dq share the same stride with q
+    ck_tile::index_t batch_stride_dq = 0;
+    ck_tile::index_t stride_dq = dq.stride(0);
+    ck_tile::index_t nhead_stride_dq = dq.stride(1);
+
 
     // dk_expanded: (total_k, nheads, hdim)
     ck_tile::index_t batch_stride_dk = 0;
     ck_tile::index_t stride_dk = dk.stride(0);
-    // CK assume dk share the same nhead stride with k
+    ck_tile::index_t nhead_stride_dk = dk.stride(1);
 
     // dv_expanded: (total_k, nheads, hdim)
     ck_tile::index_t batch_stride_dv = 0;
     ck_tile::index_t stride_dv = dv.stride(0);
-    // CK assume dv share the same nhead stride with v
+    ck_tile::index_t nhead_stride_dv = dv.stride(1);
 
     // dq_acc: (split, total_q, nheads, hdim)
     ck_tile::index_t split_stride_dq_acc = dq_acc.stride(0);
@@ -158,6 +161,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          0, // stride_randval
                          stride_do,
                          stride_dq_acc,
+                         stride_dq,
                          stride_dk,
                          stride_dv,
                          0, // stride_dbias, FA without bias
@@ -170,6 +174,9 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          nhead_stride_do,
                          nhead_stride_lse,
                          nhead_stride_dq_acc,
+                         nhead_stride_q,
+                         nhead_stride_k,
+                         nhead_stride_v,
                          0, // nhead_stride_dbias, FA without dbias
                          batch_stride_q,
                          batch_stride_k,
@@ -180,6 +187,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          batch_stride_do,
                          batch_stride_lse,
                          batch_stride_dq_acc,
+                         batch_stride_dq,
                          batch_stride_dk,
                          batch_stride_dv,
                          0  , // batch_stride_dbias, FA without dbias
