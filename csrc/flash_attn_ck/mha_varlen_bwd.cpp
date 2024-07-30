@@ -270,7 +270,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     const int num_heads_k = k.size(1);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size_8x % 8 == 0, "head_size should be a multiple of 8");
-    TORCH_CHECK(head_size_8x <= 128, "CK FlashAttention backward only supports head dimension at most 128");
+    TORCH_CHECK(head_size_8x <= 256, "CK FlashAttention backward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -347,7 +347,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     at::Tensor dq_accum;
 
     if (!deterministic) {
-        dq_accum = torch::empty({1, total_q, num_heads, head_size_8x}, opts.dtype(at::kFloat));
+        dq_accum = torch::zeros({1, total_q, num_heads, head_size_8x}, opts.dtype(at::kFloat));
     } else {
         const ck_tile::index_t kN0 = (head_size_8x > 32 & head_size_8x <= 128) ? 128 : 64;
         const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(max_seqlen_k, kN0);
@@ -389,8 +389,6 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
 
     if (max_seqlen_q > 0) {
         ck_tile::stream_config stream_config{stream};
-        dq.zero_();
-        dq_accum.zero_();
 
         auto traits =
             get_ck_fmha_varlen_bwd_traits(mask, q_dtype_str, head_size_8x, is_dropout, alibi_slopes_.has_value(), deterministic);

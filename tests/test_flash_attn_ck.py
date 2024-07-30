@@ -24,7 +24,7 @@ from test_flash_attn import (
 )
 
 def is_bwd_hdim_supported(d):
-    return d <= 128 and d % 2 == 0
+    return d <= 256
 
 
 def ck_randval_to_dropout_mask(randval, p):
