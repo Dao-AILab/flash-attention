@@ -24,9 +24,9 @@ def print_diffs(out, out_ref):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["gqa"])
+# @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -38,6 +38,7 @@ def print_diffs(out, out_ref):
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
+        (1, 1),
         (257, 1),
         (64, 128),
         (128, 128),
@@ -53,28 +54,43 @@ def print_diffs(out, out_ref):
         (1024, 1024),
         (1023, 1024),
         (1024, 1023),
-        (2048, 2048),
+        (4096, 4096),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_output(
-    seqlen_q, seqlen_k, d, causal, mha_type, dtype
+    seqlen_q, seqlen_k, d, causal, mha_type, dtype,    
 ):
     device = "cuda"
+    if(dtype == torch.float8_e4m3fn):
+        dtype_init = torch.float16
+    else:
+        dtype_init = dtype    
+    print(dtype)
     # set seed
     torch.random.manual_seed(0)
     # batch_size = 40
     # nheads = 16
-    batch_size = 9
+    batch_size = 4
     nheads = 6
     nheads_kv = 6 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     # nheads_kv = 2
     # batch_size = 9
     # nheads = 6
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
-    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True)
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_init, requires_grad=True)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_init, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_init, requires_grad=True)
+
+    q = q.to(dtype)
+    k = k.to(dtype)
+    v = v.to(dtype)
+
     out, lse = flash_attn_func(q, k, v, causal=causal)
+
+    q = q.to(dtype_init)
+    k = k.to(dtype_init)
+    v = v.to(dtype_init)
+    
     out_ref, attn_ref = attention_ref(
         q,
         k,
@@ -105,8 +121,9 @@ def test_flash_attn_output(
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+    
     # if not causal:
-    #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+    #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")                
     # breakpoint()
 
     # if d <= 128:
@@ -139,7 +156,11 @@ def test_flash_attn_output(
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
     # breakpoint()
-    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+    if(dtype != torch.float8_e4m3fn):
+        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+    else:       
+        # just test correctness of fp8 kernel w/o further quantization techniques
+        assert (out - out_ref).abs().max().item() <= 40 * (out_pt - out_ref).abs().max().item()
 
     # if d <= 128:
     #     assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()

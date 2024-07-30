@@ -18,6 +18,7 @@ enum class FwdNamedBarriers {
     WarpSchedulerWG1 = 4,
     WarpSchedulerWG2 = 5,
     WarpSchedulerWG3 = 6,
+    ProducerWG = 7
 };
 
 } // flash
