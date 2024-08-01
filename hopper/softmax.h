@@ -115,8 +115,8 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
         // We don't want (-inf - (-inf)) since that would give NaN.
         // If we don't have float around M_LOG2E the multiplication is done in fp64.
         const float max_scaled = Check_inf
-            ? (max(mi) == -INFINITY ? 0.f : (max(mi) * (Scale_max ? scale : float(M_LOG2E))) - max_offset)
-            : (max(mi) * (Scale_max ? scale : float(M_LOG2E)) - max_offset);
+            ? (max(mi) == -INFINITY ? 0.f : (!Scale_max ? max(mi) : max(mi) * scale) - max_offset)
+            : (!Scale_max ? max(mi) : max(mi) * scale) - max_offset;
         #pragma unroll
         for (int ni = 0; ni < size<1>(tensor); ++ni)  {
             // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -

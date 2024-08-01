@@ -96,11 +96,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     int device;
     cudaGetDevice(&device);
     int multiprocessor_count;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &multiprocessor_count, cudaDevAttrMultiProcessorCount, device);
-    if (status_ != cudaSuccess) {
-      CHECK_CUDA(status_);
-    }
+    CHECK_CUDA(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
     dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
     static constexpr int ctaSize = Kernel_traits::kNWarps * 32;
     dim3 block_dims(ctaSize);

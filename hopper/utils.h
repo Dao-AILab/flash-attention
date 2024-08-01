@@ -15,7 +15,7 @@
 #endif
 
 #include <cute/tensor.hpp>
-#include <cute/atom/copy_atom.hpp>
+#include <cute/arch/cluster_sm90.hpp>  // For cute::elect_one_sync()
 
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>

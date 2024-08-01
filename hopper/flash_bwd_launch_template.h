@@ -7,239 +7,194 @@
 #include "cute/tensor.hpp"
 
 #include "cutlass/cluster_launch.hpp"
+#include "cutlass/device_kernel.h"  // For device_kernel
 
 #include "static_switch.h"
 #include "flash.h"
 #include "flash_bwd_preprocess_kernel.h"
+#include "flash_bwd_postprocess_kernel.h"
+#include "tile_scheduler_bwd.hpp"
+#include "mainloop_bwd_sm90_tma_gmma_ws.hpp"
+#include "epilogue_bwd_sm90_tma.hpp"
 #include "flash_bwd_kernel.h"
-#include "kernel_traits.h"
-#include "utils.h"
 
-template<bool Clear_dQaccum=true, typename Kernel_traits>
-__global__ void flash_bwd_dot_do_o_kernel(const Flash_bwd_params params) {
-    flash::compute_dot_do_o<Clear_dQaccum, Kernel_traits>(params);
-}
+using namespace cute;
 
-// template<typename Kernel_traits>
-// __global__ void flash_bwd_convert_dq_kernel(const Flash_bwd_params params, const int nsplits) {
-//     flash::convert_dQ<Kernel_traits>(params, nsplits);
-// }
-
-template<typename Kernel_traits>
-__global__ void flash_bwd_convert_dkv_kernel(const Flash_bwd_params params) {
-    flash::convert_dKV<Kernel_traits>(params);
-}
-
-template<typename Kernel_traits, bool Is_causal>
+template <int kHeadDim, int kBlockM, int kBlockN, typename Element, bool Is_causal, bool Varlen, bool Deterministic,
+          bool dKV_swapAB, bool dQ_swapAB, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1>
 void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
-    int num_m_block = cute::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
-    dim3 grid_m(num_m_block, params.b, params.h);
-    flash_bwd_dot_do_o_kernel<true, Kernel_traits><<<grid_m, Kernel_traits::kNThreadsNonWS, 0, stream>>>(params);
-    // If we use both TMA_STORE (for n_block=0) and TMA_REDUCE_ADD (for n_block>0), we don't need to clear dQaccum
-    // flash_bwd_dot_do_o_kernel<false, Kernel_traits><<<grid_m, Kernel_traits::kNThreadsNonWS, 0, stream>>>(params);
-    CHECK_CUDA_KERNEL_LAUNCH();
+    using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
+    using ElementAccum = float;
+    using PreprocessKernel = flash::FlashAttnBwdPreprocess<TileShape_MK, Element, ElementAccum, /*Clear_dQaccum=*/true, Varlen>;
+    int const total_q_padded_rounded = cute::round_up(params.total_q + params.b * 128, 128);
+    typename PreprocessKernel::Arguments preprocess_args {
+        static_cast<Element const*>(params.o_ptr),
+        {!Varlen ? params.seqlen_q : params.total_q, params.d, params.h, !Varlen ? params.b : 1},  // shape_O
+        {params.o_row_stride, _1{}, params.o_head_stride, !Varlen ? params.o_batch_stride : 0},  // stride_O
+        static_cast<Element const*>(params.do_ptr),
+        {params.do_row_stride, _1{}, params.do_head_stride, !Varlen ? params.do_batch_stride : 0},  // stride_dO
+        static_cast<float*>(params.dsoftmax_sum),
+        {!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, params.h, !Varlen ? params.b : 1},  // shape_dPsum
+        {_1{}, !Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, !Varlen ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
+        static_cast<float*>(params.softmax_lse_ptr),
+        {_1{}, !Varlen ? params.seqlen_q : params.total_q, !Varlen ? params.h * params.seqlen_q : 0},  // stride_LSE
+        static_cast<float*>(params.softmax_lse_log2_ptr),
+        {_1{}, !Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, !Varlen ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
+        static_cast<ElementAccum*>(params.dq_accum_ptr),
+        {!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, params.d_rounded, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
+        {params.d_rounded, _1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0},  // stride_dQ
+        params.b,
+        params.dq_semaphore,
+        params.cu_seqlens_q
+    };
+    typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
+    int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
+    dim3 grid_m(num_m_block, params.h, params.b);
+    cutlass::device_kernel<PreprocessKernel><<<grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream>>>(preprocess_params);
 
-    using Element = typename Kernel_traits::Element;
-    using ElementAccum = typename Kernel_traits::ElementAccum;
-    using TileShape_MNK = typename Kernel_traits::TileShape_MNK;
-    using ClusterShape = typename Kernel_traits::ClusterShape_MNK;
+    using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
+    using ClusterShape = cute::Shape<_1, Int<1>, _1>;
+    static constexpr int Stages = 2;
+    using CollectiveMainloop = flash::CollectiveMainloopBwd<Stages, ClusterShape, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm90,
+            Is_causal, Varlen, Deterministic,
+            dKV_swapAB, dQ_swapAB, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>;
+    using CollectiveEpilogue = flash::CollectiveEpilogueBwd<TileShape_MNK, Element, CollectiveMainloop::NumMmaThreads, Varlen>;
+    using Scheduler = flash::SingleTileSchedulerBwd;
+    using AttnKernel = flash::FlashAttnBwd<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
 
-    Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)),
-                            make_shape(params.seqlen_q, params.d, params.h, params.b),
-                            make_stride(params.q_row_stride, _1{}, params.q_head_stride, params.q_batch_stride));
-    auto tma_load_Q = make_tma_copy(
-        typename Kernel_traits::GmemTiledCopyQdO{},
-        mQ,
-        typename Kernel_traits::SmemLayoutQ{}(_, _, _0{}),
-        // typename Kernel_traits::SmemLayoutQ{},
-        select<0, 2>(TileShape_MNK{}),
-        size<1>(ClusterShape{})); // mcast along N mode for this M load, if any
-    Tensor mdO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.do_ptr)),
-                             make_shape(params.seqlen_q, params.d, params.h, params.b),
-                             make_stride(params.do_row_stride, _1{}, params.do_head_stride, params.do_batch_stride));
-    auto tma_load_dO = make_tma_copy(
-        typename Kernel_traits::GmemTiledCopyQdO{},
-        mdO,
-        typename Kernel_traits::SmemLayoutdO{}(_, _, _0{}),
-        // typename Kernel_traits::SmemLayoutdO{},
-        select<0, 2>(TileShape_MNK{}),
-        size<1>(ClusterShape{})); // mcast along N mode for this M load, if any
-    Tensor mK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr)),
-                            make_shape(params.seqlen_k, params.d, params.h, params.b),
-                            make_stride(params.k_row_stride, _1{}, params.k_head_stride, params.k_batch_stride));
-    auto tma_load_K = make_tma_copy(
-        typename Kernel_traits::GmemTiledCopyKV{},
-        mK,
-        typename Kernel_traits::SmemLayoutK{},
-        // typename Kernel_traits::SmemLayoutK{}(_, _, _0{}),
-        select<1, 2>(TileShape_MNK{}),
-        _1{}); // no mcast for K
-    Tensor mV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.v_ptr)),
-                            make_shape(params.seqlen_k, params.d, params.h, params.b),
-                            make_stride(params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride));
-    auto tma_load_V = make_tma_copy(
-        typename Kernel_traits::GmemTiledCopyKV{},
-        mV,
-        typename Kernel_traits::SmemLayoutV{},
-        // typename Kernel_traits::SmemLayoutV{}(_, _, _0{}),
-        select<1, 2>(TileShape_MNK{}),
-        _1{}); // no mcast for V
-    Tensor mdK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.dk_ptr)),
-                             make_shape(params.seqlen_k, params.d, params.h, params.b),
-                             make_stride(params.dk_row_stride, _1{}, params.dk_head_stride, params.dk_batch_stride));
-    auto tma_store_dK = make_tma_copy(
-        typename Kernel_traits::GmemTiledCopydKV{},
-        mdK,
-        typename Kernel_traits::SmemLayoutdK{},
-        select<1, 2>(TileShape_MNK{}),
-        _1{}); // no mcast for output
-    Tensor mdV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.dv_ptr)),
-                             make_shape(params.seqlen_k, params.d, params.h, params.b),
-                             make_stride(params.dv_row_stride, _1{}, params.dv_head_stride, params.dv_batch_stride));
-    auto tma_store_dV = make_tma_copy(
-        typename Kernel_traits::GmemTiledCopydKV{},
-        mdV,
-        typename Kernel_traits::SmemLayoutdV{},
-        select<1, 2>(TileShape_MNK{}),
-        _1{}); // no mcast for output
-    Tensor mdQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.dq_ptr)),
-                             make_shape(params.seqlen_q, params.d, params.h, params.b),
-                             make_stride(params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride));
-    Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.dq_accum_ptr)),
-                                  make_shape(params.seqlen_q, params.d, params.h, params.b),
-                                  make_stride(params.d * params.h, _1{}, params.d, params.d * params.h * params.seqlen_q_rounded));
-    auto tma_store_dQaccum = make_tma_copy(
-        // typename Kernel_traits::GmemTiledCopydKV{},
-        typename cute::SM90_TMA_STORE{},
-        // mdQ,
-        mdQaccum,
-        // typename Kernel_traits::SmemLayoutdQTMA{},
-        typename Kernel_traits::SmemLayoutdQaccTMA{},
-        select<0, 2>(TileShape_MNK{}),
-        _1{}); // no mcast for output
-    auto tma_reduce_add_dQaccum = make_tma_copy(
-        // typename Kernel_traits::GmemTiledCopydKV{},
-        typename cute::SM90_TMA_REDUCE_ADD{},
-        // mdQ,
-        mdQaccum,
-        // typename Kernel_traits::SmemLayoutdQTMA{},
-        typename Kernel_traits::SmemLayoutdQaccTMA{},
-        select<0, 2>(TileShape_MNK{}),
-        _1{}); // no mcast for output
-    // print(typename Kernel_traits::SmemLayoutVt{}); printf("\n"); print(typename Kernel_traits::SmemLayoutVt_tmp{});
+    typename CollectiveMainloop::Arguments mainloop_args {
+        static_cast<Element const*>(params.q_ptr),
+        {!Varlen ? params.seqlen_q : params.total_q, params.d, params.h, !Varlen ? params.b : 1},  // shape_Q
+        {params.q_row_stride, _1{}, params.q_head_stride, !Varlen ? params.q_batch_stride : 0},  // stride_Q
+        static_cast<Element const*>(params.k_ptr),
+        {!Varlen ? params.seqlen_k : params.total_k, params.d, params.h_k, !Varlen ? params.b : 1},  // shape_K
+        {params.k_row_stride, _1{}, params.k_head_stride, !Varlen ? params.k_batch_stride : 0},  // stride_K
+        static_cast<Element const*>(params.v_ptr),
+        {params.v_row_stride, _1{}, params.v_head_stride, !Varlen ? params.v_batch_stride : 0},  // stride_V
+        static_cast<Element const*>(params.do_ptr),
+        {params.do_row_stride, _1{}, params.do_head_stride, !Varlen ? params.do_batch_stride : 0},  // stride_dO
+        static_cast<ElementAccum*>(params.dq_accum_ptr),
+        // {params.seqlen_q_rounded, params.d_rounded, params.h, params.b},  // shape_dQaccum
+        // {params.d_rounded, _1{}, params.d_rounded * params.seqlen_q_rounded, params.d_rounded * params.seqlen_q_rounded * params.h}, // stride_dQaccum
+        {(!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded) * (params.d_rounded / 32), 32, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
+        {32, _1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
+        static_cast<float*>(params.softmax_lse_log2_ptr),
+        {!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, params.h, !Varlen ? params.b : 1},  // shape_LSE
+        {_1{}, !Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, !Varlen ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
+        static_cast<float*>(params.dsoftmax_sum),
+        {_1{}, !Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, !Varlen ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
+        params.scale_softmax,
+        params.b,
+        params.dq_semaphore,
+        params.cu_seqlens_q, params.cu_seqlens_k,
+    };
+    typename CollectiveEpilogue::Arguments epilogue_args {
+        static_cast<Element*>(params.dk_ptr),
+        {!Varlen ? params.seqlen_k : params.total_k, params.d, params.h, !Varlen ? params.b : 1},  // shape_dK
+        {params.dk_row_stride, _1{}, params.dk_head_stride, !Varlen ? params.dk_batch_stride : 0},  // stride_dK
+        static_cast<Element*>(params.dv_ptr),
+        {params.dv_row_stride, _1{}, params.dv_head_stride, !Varlen ? params.dv_batch_stride : 0},
+        params.cu_seqlens_k
+    };
 
-    // print(typename Kernel_traits::TiledMmaSdP{}); printf("\n");
-    // print(typename Kernel_traits::TiledMmadKV{}); printf("\n");
-    // print(typename Kernel_traits::TiledMmadQ{}); printf("\n");
-    // print(typename Kernel_traits::SmemLayoutAtomK{}); printf("\n");
-    // print(typename Kernel_traits::SmemLayoutK{}); printf("\n");
-    // print(typename Kernel_traits::SmemLayoutKt{}); printf("\n");
+    int num_blocks_n = cutlass::ceil_div(params.seqlen_k, get<1>(TileShape_MNK{}));
+    num_blocks_n = cutlass::round_up(num_blocks_n, size<1>(ClusterShape{}));
+    typename Scheduler::Arguments scheduler_args {
+        num_blocks_n, params.h, params.b, params.tile_count_semaphore, params.cu_seqlens_k
+    };
+
+    int device;
+    cudaGetDevice(&device);
+    typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
+        mainloop_args, epilogue_args, {device}, scheduler_args
+    });
+
     // Get the ptr to kernel function.
-    void *kernel;
-    if constexpr (!Kernel_traits::Is_WS) {
-       kernel = (void *)flash::compute_dqkv<Kernel_traits, Is_causal, decltype(tma_load_Q), decltype(tma_load_dO),
-        decltype(tma_load_K), decltype(tma_load_V), decltype(tma_store_dK), decltype(tma_store_dV)>;
-    } else {
-       kernel = (void *)flash::compute_dqkv_ws<Kernel_traits, Is_causal, decltype(tma_load_Q), decltype(tma_load_dO),
-        decltype(tma_load_K), decltype(tma_load_V), decltype(tma_store_dK), decltype(tma_store_dV), decltype(tma_store_dQaccum), decltype(tma_reduce_add_dQaccum)>;
-    }
-    // void *kernel = (void *)flash::compute_dqkv_seqqpar<Kernel_traits, Is_causal, decltype(tma_load_Q), decltype(tma_load_dO),
-        // decltype(tma_load_K), decltype(tma_load_V), decltype(tma_store_dQaccum), decltype(tma_store_dK), decltype(tma_store_dV)>;
-    auto shared_storage = typename Kernel_traits::SharedStorage{};
-    int smem_size = sizeof(typename Kernel_traits::SharedStorage);
-    int smem_size_q = sizeof(decltype(shared_storage.smem_q));
-    int smem_size_do = sizeof(decltype(shared_storage.smem_do));
-    int smem_size_k = sizeof(decltype(shared_storage.smem_k));
-    int smem_size_v = sizeof(decltype(shared_storage.smem_v));
-    // int smem_size_p = sizeof(decltype(shared_storage.smem_p));
-    int smem_size_ds = sizeof(decltype(shared_storage.smem_ds));
-    // printf("smem_size = %d, q = %d, do = %d, k = %d, v = %d, p = %d, ds = %d\n", smem_size, smem_size_q, smem_size_do, smem_size_k, smem_size_v, smem_size_p, smem_size_ds);
-    // printf("smem_size = %d, q = %d, do = %d, k = %d, v = %d, ds = %d\n", smem_size, smem_size_q, smem_size_do, smem_size_k, smem_size_v, smem_size_ds);
+    void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
+    int smem_size = AttnKernel::SharedStorageSize;
+    // int smem_size_q = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_q));
+    // int smem_size_do = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_do));
+    // int smem_size_ds = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_ds));
+    // int smem_size_dqacc = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_dqacc));
+    // int smem_size_k = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_k));
+    // int smem_size_v = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_v));
+    // printf("smem_size = %d, q = %d, k = %d, v = %d, do = %d, ds = %d, dqacc = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v, smem_size_do, smem_size_ds, smem_size_dqacc);
     if (smem_size >= 48 * 1024) {
-       CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
 
-    static constexpr int ctaSize = Kernel_traits::kNWarps * 32;
-    int num_blocks_n = cutlass::ceil_div(params.seqlen_k, Kernel_traits::kBlockN);
-    num_blocks_n = cutlass::ceil_div(num_blocks_n, size<1>(ClusterShape{})) * size<1>(ClusterShape{});
-    dim3 grid_dims(num_blocks_n, params.h, params.b);
-    // int num_blocks_m = cutlass::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
-    // num_blocks_m = cutlass::ceil_div(num_blocks_m, size<0>(ClusterShape{})) * size<0>(ClusterShape{});
-    // dim3 grid_dims(num_blocks_m, params.h, params.b);
-    dim3 block_dims(ctaSize);
+    dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
+    dim3 block_dims = AttnKernel::get_block_shape();
     dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
     cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
-    if constexpr (!Kernel_traits::Is_WS) {
-        cutlass::launch_kernel_on_cluster(launch_params, kernel, params, tma_load_Q, tma_load_dO,
-                                          tma_load_K, tma_load_V, tma_store_dK, tma_store_dV);
-    } else {
-        cutlass::launch_kernel_on_cluster(launch_params, kernel, params, tma_load_Q, tma_load_dO,
-                                          tma_load_K, tma_load_V, tma_store_dK, tma_store_dV, tma_store_dQaccum, tma_reduce_add_dQaccum);
-    }
-    // cutlass::launch_kernel_on_cluster(launch_params, kernel, params, tma_load_Q, tma_load_dO,
-                                      // tma_load_K, tma_load_V, tma_store_dQaccum, tma_store_dK, tma_store_dV);
+    cutlass::launch_kernel_on_cluster(launch_params, kernel, kernel_params);
     CHECK_CUDA_KERNEL_LAUNCH();
 
-    auto tma_load_dQaccum = make_tma_copy(
-        typename cute::SM90_TMA_LOAD{},
-        mdQaccum,
-        typename Kernel_traits::SmemLayoutdQaccTMA{},
-        select<0, 2>(TileShape_MNK{}),
-        _1{}); // no mcast for output
-    // auto kernel_dq = &flash_bwd_convert_dq_kernel<Kernel_traits>;
-    auto kernel_dq = &flash::convert_dQ<Kernel_traits, decltype(tma_load_dQaccum)>;
-    if (Kernel_traits::kSmemdQSize * 2 + 8 >= 48 * 1024)  {
-        CHECK_CUDA(cudaFuncSetAttribute(
-            kernel_dq, cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel_traits::kSmemdQSize * 2 + 8));
+    using PostprocessKernel = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_MK, Element, ElementAccum,
+        AttnKernel::CollectiveMainloop::kNThreadsdQ,
+        typename AttnKernel::CollectiveMainloop::SmemLayoutdQaccumTMA,
+        typename AttnKernel::CollectiveMainloop::TiledMmadQ,
+        AttnKernel::CollectiveMainloop::dQ_swapAB
+        >;
+    typename PostprocessKernel::Arguments postprocess_args {
+        static_cast<ElementAccum const*>(params.dq_accum_ptr),
+        // {params.seqlen_q_rounded, params.d_rounded, params.h, params.b},  // shape_dQaccum
+        // {params.d_rounded, _1{}, params.d_rounded * params.seqlen_q_rounded, params.d_rounded * params.seqlen_q_rounded * params.h},  // stride_dQaccum
+        {(!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded) * (params.d_rounded / 32), 32, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
+        {32, _1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
+        static_cast<Element*>(params.dq_ptr),
+        {!Varlen ? params.seqlen_q : params.total_q, params.d, params.h, !Varlen ? params.b : 1},  // shape_dQ
+        {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
+        params.scale_softmax,
+        params.cu_seqlens_q
+    };
+    typename PostprocessKernel::Params postprocess_params = PostprocessKernel::to_underlying_arguments(postprocess_args);
+    int num_m_block_postprocess = cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
+    dim3 grid_m_postprocess(num_m_block_postprocess, params.h, params.b);
+    // Get the ptr to kernel function.
+    auto postprocess_kernel = cutlass::device_kernel<PostprocessKernel>;
+    int smem_size_postprocess = PostprocessKernel::SharedStorageSize;
+    if (smem_size_postprocess >= 48 * 1024) {
+        CHECK_CUDA(cudaFuncSetAttribute(postprocess_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
-    kernel_dq<<<grid_m, Kernel_traits::kNThreadsdQ, Kernel_traits::kSmemdQSize * 2 + 8, stream>>>(params, tma_load_dQaccum);
+    postprocess_kernel<<<grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream>>>(postprocess_params);
     CHECK_CUDA_KERNEL_LAUNCH();
-    // auto kernel_dkv = &flash_bwd_convert_dkv_kernel<Kernel_traits>;
-    // if (Kernel_traits::kSmemdKVSize >= 48 * 1024)  {
-        // CHECK_CUDA(cudaFuncSetAttribute(
-            // kernel_dkv, cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel_traits::kSmemdKVSize));
-    // }
-    // int num_n_block = cute::ceil_div(params.seqlen_k, Kernel_traits::kBlockN);
-    // dim3 grid_n(num_n_block, params.b, params.h);
-    // kernel_dkv<<<grid_n, Kernel_traits::kNThreads, Kernel_traits::kSmemdKVSize, stream>>>(params);
-    // CHECK_CUDA_KERNEL_LAUNCH();
+
 }
 
 
 template<typename T>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
-    // BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-    //     run_flash_bwd<T, Headdim, Is_causal>(params, stream);
-    // });
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, false, false, false, 2, 2, 2, 1, T>, false>(params, stream);
-    run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 12, true, false, false, 1, 2, 2, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 96, 128, 12, true, false, true, 1, 2, 2, 1, T>, false>(params, stream);
+    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
+            BOOL_SWITCH(params.deterministic, Deterministic, [&] {
+                run_flash_bwd<Headdim, 128, 128, T, Is_causal, Varlen, Deterministic, false, false, 1, 2, 2>(params, stream);
+            });
+        });
+    });
+}
+
+template<typename T>
+void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 96;
+    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
+            BOOL_SWITCH(params.deterministic, Deterministic, [&] {
+                run_flash_bwd<Headdim, 64, 128, T, Is_causal, Varlen, Deterministic, false, false, 1, 2, 1>(params, stream);
+            });
+        });
+    });
 }
 
 template<typename T>
 void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
-    // BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-    //     run_flash_bwd<T, Headdim, Is_causal>(params, stream);
-    // });
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, false, 2, 1, 2, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, false, false, false, 1, 2, 1, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 96, 8, false, true, false, 2, 1, 2, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 96, 8, false, true, true, 2, 1, 1, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, true, false, true, 1, 2, 1, 1, T>, false>(params, stream);
-    run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 12, true, false, true, 1, 2, 1, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 12, true, false, false, 1, 2, 1, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 12, false, false, false, 1, 2, 1, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 80, 128, 12, true, false, true, 1, 2, 1, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_seqqpar_kernel_traits<Headdim, 128, 64, 8, false, true, false, 2, 1, 2, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_seqqpar_kernel_traits<Headdim, 96, 128, 8, true, false, true, 1, 2, 1, 1, T>, false>(params, stream);
-}
-
-template<typename T>
-void run_mha_bwd_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
-    // constexpr static int Headdim = 256;
-    // BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-    //     run_flash_bwd<T, Headdim, Is_causal>(params, stream);
-    // });
+    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
+            BOOL_SWITCH(params.deterministic, Deterministic, [&] {
+                run_flash_bwd<Headdim, 64, 128, T, Is_causal, Varlen, Deterministic, false, false, 1, 2, 1>(params, stream);
+            });
+        });
+    });
 }
