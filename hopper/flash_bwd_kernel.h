@@ -72,14 +72,14 @@ public:
 
     // Kernel level shared memory storage
     struct SharedStorage {
-        struct : cute::aligned_struct<1024> {
+        struct {
             union {
                 typename CollectiveMainloop::TensorStorage mainloop;
                 typename CollectiveEpilogue::TensorStorage epilogue;
             };
         };
 
-        struct : cute::aligned_struct<16> {
+        struct {
             alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_KV;
             alignas(16) cutlass::arch::ClusterBarrier barrier_dKV;
             alignas(16) typename CollectiveMainloop::MainloopPipeline::SharedStorage pipeline_q;
