@@ -421,7 +421,8 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
                 drop_seed,
                 drop_offset);
 
-        fmha_bwd(traits, args, stream_config);
+        float t = fmha_bwd(traits, args, stream_config);
+        TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
         dk_expanded.zero_();
