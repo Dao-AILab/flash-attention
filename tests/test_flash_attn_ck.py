@@ -59,7 +59,7 @@ def pad_rearrange_dropout_mask_hts_to_bhss(S_dmask, cu_seqlens_q, seqlen_q_round
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("alibi", [False, True])
 @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
@@ -152,12 +152,12 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         print(f"dV Pytorch max diff: {(dqkv_pt[:, :, 2] - dqkv_ref[:, :, 2]).abs().max().item()}")
         print(f"dQKV Pytorch mean diff: {(dqkv_pt - dqkv_ref).abs().mean().item()}")
 
-        # TODO - use 10 times to check, wait for ck to change dq type to f32
+        # TODO - use 10 times to check, wait for ck to fix bwd precision issue
         assert (dqkv - dqkv_ref).abs().max().item() <= 10 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("alibi", [False, True])
 @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
@@ -270,14 +270,14 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi,
         print(f"dV Pytorch max diff: {(dqkv_pt[:, :, 2] - dqkv_ref[:, :, 2]).abs().max().item()}")
         print(f"dQKV Pytorch mean diff: {(dqkv_pt - dqkv_ref).abs().mean().item()}")
 
-        # TODO - use 10 times to check, wait for ck to change dq type to f32
+        # TODO - use 10 times to check, wait for ck to fix bwd precision issue
         assert (dqkv - dqkv_ref).abs().max().item() <= 10 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
 @pytest.mark.parametrize("kvpacked", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("alibi", [False, True])
 @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
@@ -484,7 +484,7 @@ def test_flash_attn_output(
         print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
 
-        # TODO - use 10 times to check, wait for ck to change dq type to f32
+        # TODO - use 10 times to check, wait for ck to fix bwd precision issue
         assert (dq - dq_ref).abs().max().item() <= 10 * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item()
@@ -748,7 +748,108 @@ def test_flash_attn_varlen_output(
         print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
 
-        # TODO - use 10 times to check, wait for ck to change dq type to f32
+        # TODO - use 10 times to check, wait for ck to fix bwd precision issue
         assert (dq - dq_ref).abs().max().item() <= 10 * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item()
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
+@pytest.mark.parametrize("swap_sq_sk", [False, True])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        # (1, 239),
+        (3, 799),
+        (127, 512),
+        (127, 513),
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (1023, 1024),
+    ],
+)
+def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
+    if max(seqlen_q, seqlen_k) >= 2048:
+        pytest.skip()
+
+    if swap_sq_sk:
+        seqlen_q, seqlen_k = seqlen_k, seqlen_q
+
+    device = "cuda"
+    causal = True
+    # set seed
+    torch.random.manual_seed(0)
+    batch_size = 8
+    nheads = 9
+    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    out = flash_attn_func(q, k, v, 0.0, causal=causal, window_size=window_size)
+    out_ref, attn_ref = attention_ref(
+        q, k, v, None, None, None, 0.0, None, causal=causal, window_size=window_size
+    )
+    out_pt, attn_pt = attention_ref(
+        q,
+        k,
+        v,
+        None,
+        None,
+        None,
+        0.0,
+        None,
+        causal=causal,
+        window_size=window_size,
+        upcast=False,
+        reorder_ops=True,
+    )
+
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+
+    # Check that FlashAttention's numerical error is at most twice the numerical error
+    # of a Pytorch implementation.
+    assert (out - out_ref).abs().max().item() <= 4 * (out_pt - out_ref).abs().max().item() + 1e-5
+
+    g = torch.randn_like(out)
+    if is_bwd_hdim_supported(d):
+        do_o = (g.float() * out.float()).sum(-1)
+        (
+            dq,
+            dk,
+            dv,
+        ) = torch.autograd.grad(out, (q, k, v), g)
+        (
+            dq_ref,
+            dk_ref,
+            dv_ref,
+        ) = torch.autograd.grad(out_ref, (q, k, v), g)
+        (
+            dq_pt,
+            dk_pt,
+            dv_pt,
+        ) = torch.autograd.grad(out_pt, (q, k, v), g)
+        print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+        print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+        print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+        print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
+        print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
+        print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
+        print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+        print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+        print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+        print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
+        print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
+        print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+
+    # TODO - use 10 times to check, wait for ck to fix bwd precision issue
+    assert (dq - dq_ref).abs().max().item() <= 10 * (dq_pt - dq_ref).abs().max().item() + 1e-4
+    assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item() + 1e-4
+    assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item() + 1e-4
+
