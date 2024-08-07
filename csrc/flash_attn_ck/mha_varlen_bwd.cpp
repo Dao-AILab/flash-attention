@@ -174,9 +174,9 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          nhead_stride_do,
                          nhead_stride_lse,
                          nhead_stride_dq_acc,
-                         nhead_stride_q,
-                         nhead_stride_k,
-                         nhead_stride_v,
+                         nhead_stride_dq,
+                         nhead_stride_dk,
+                         nhead_stride_dv,
                          0, // nhead_stride_dbias, FA without dbias
                          batch_stride_q,
                          batch_stride_k,
@@ -349,7 +349,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     if (!deterministic) {
         dq_accum = torch::zeros({1, total_q, num_heads, head_size_8x}, opts.dtype(at::kFloat));
     } else {
-        const ck_tile::index_t kN0 = (head_size_8x > 32 & head_size_8x <= 128) ? 128 : 64;
+        const ck_tile::index_t kN0 = head_size_8x <= 128 ? 128 : 64;
         const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(max_seqlen_k, kN0);
         dq_accum = torch::zeros({nsplits, total_q, num_heads, head_size_8x}, opts.dtype(at::kFloat));
     }
