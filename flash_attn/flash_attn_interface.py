@@ -1,9 +1,9 @@
 # Copyright (c) 2023, Tri Dao.
 
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
@@ -45,6 +45,63 @@ def _get_block_size_n(device, head_dim, is_dropout, is_causal):
         return 64
 
 
+# this registers the kernel with PyTorch to make it work with torch.compile
+@torch.library.custom_op("tridao::_flash_attn_forward_kernel", mutates_args=())
+def _flash_attn_forward_kernel(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    alibi_slopes: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+) -> List[torch.Tensor]:
+    out, q, k, v, out_padded, softmax_lse, _, rng_state = flash_attn_cuda.fwd(
+        q,
+        k,
+        v,
+        None,
+        alibi_slopes,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        False,
+        None,
+    )
+
+    return out.clone(), q, k, v, out_padded, softmax_lse, rng_state
+
+
+# this tells torch.compile the output shape given the input shape
+@_flash_attn_forward_kernel.register_fake
+def _flash_attn_forward_kernel_fake(
+    q,
+    k,
+    v,
+    alibi_slopes,
+    dropout_p,
+    softmax_scale,
+    causal,
+    window_size_left,
+    window_size_right,
+    softcap,
+):
+    batch_size, query_length, num_heads, head_dim = q.shape
+    return (torch.empty_like(q),
+            F.pad(torch.empty(batch_size * query_length, num_heads, head_dim, device=q.device, dtype=q.dtype), (0, 8 - head_dim % 8)),
+            F.pad(torch.empty(batch_size * query_length, num_heads, head_dim, device=q.device, dtype=q.dtype), (0, 8 - head_dim % 8)),
+            F.pad(torch.empty(batch_size * query_length, num_heads, head_dim, device=q.device, dtype=q.dtype), (0, 8 - head_dim % 8)),
+            F.pad(torch.empty(batch_size * query_length, num_heads, head_dim, device=q.device, dtype=q.dtype), (0, 8 - head_dim % 8)),
+            torch.empty(batch_size, num_heads, query_length, device=q.device, dtype=q.dtype),
+            torch.empty(2, device=q.device, dtype=torch.long))
+
+
 def _flash_attn_forward(
     q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax
 ):
@@ -65,6 +122,25 @@ def _flash_attn_forward(
         None,
     )
     return out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state
+
+
+def _flash_attn_forward_compilable(
+    q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes
+):
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    out, q, k, v, out_padded, softmax_lse, rng_state = _flash_attn_forward_kernel(
+        q,
+        k,
+        v,
+        alibi_slopes,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+    )
+    return out, q, k, v, out_padded, softmax_lse, rng_state
 
 
 def _flash_attn_varlen_forward(
@@ -594,6 +670,45 @@ class FlashAttnFunc(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None, None, None, None, None
 
 
+class FlashAttnFuncCompilable(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+    ):
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        out, q, k, v, out_padded, softmax_lse, rng_state = _flash_attn_forward_compilable(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+        )
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.softcap = softcap
+        ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
+        return out
+
+
 class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -889,6 +1004,77 @@ def flash_attn_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
+    )
+
+
+def flash_attn_func_compilable(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0, # 0.0 means deactivated
+    alibi_slopes=None,
+    deterministic=False,
+):
+    """dropout_p should be set to 0.0 during evaluation
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
+    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
+    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
+    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention. Query at position i
+    will only attend to keys between
+    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
+            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
+            is added to the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+    Return:
+        out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
+            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+            normalization factor).
+        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
+            The output of softmax (possibly with different scaling). It also encodes the dropout
+            pattern (negative means that location was dropped, nonnegative means it was kept).
+    """
+    return FlashAttnFuncCompilable.apply(
+        q,
+        k,
+        v,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
     )
 
 
