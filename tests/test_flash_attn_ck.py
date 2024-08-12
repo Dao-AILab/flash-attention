@@ -1097,7 +1097,7 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
     """
 
     # TODO - 1 or 2 might fail, need to check
-    if seqlen == 1 or 2:
+    if seqlen == 1 or seqlen == 2:
         pytest.skip()
 
     device = "cuda"
