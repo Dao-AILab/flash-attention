@@ -15,7 +15,7 @@
 #endif
 
 #include <cute/tensor.hpp>
-#include <cute/atom/copy_atom.hpp>
+#include <cute/arch/cluster_sm90.hpp>  // For cute::elect_one_sync()
 
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>
@@ -142,6 +142,38 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
         }
     }
 };
+
+// Convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((4, 2, 2), MMA_M, (N / 32, MMA_N))
+template<typename Layout>
+__forceinline__ __device__ auto convert_layout_acc_Aregs_fp8(Layout acc_layout) {
+    using X = Underscore;    
+    static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
+    static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    static_assert(decltype(rank(get<0>(acc_layout)))::value == 3);
+    auto l = logical_divide(get<0>(acc_layout), Shape<X, X, _4>{});  // (2, 2, (2, N / 32)))    
+    return make_layout(make_layout(Shape<_4, _2, _2>{}),
+                       get<1>(acc_layout),
+                       make_layout(get<2, 1>(l), get<2>(acc_layout)));
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Byte permute for fp8 kernel
+template <typename Fragment>
+CUTLASS_DEVICE void permute_regs_A_to_C(Fragment &accum) {  
+
+  auto data = accum.data();    
+
+  #pragma unroll  
+  for (int n = 0; n < size(accum); n += 8) {
+      uint32_t *data_32bit = reinterpret_cast<uint32_t *>(&data[n]);
+      auto upper = data_32bit[0];
+      auto lower = data_32bit[1];
+      data_32bit[0] = __byte_perm(upper, lower, 0x5410);
+      data_32bit[1] = __byte_perm(upper, lower, 0x7632);        
+  }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

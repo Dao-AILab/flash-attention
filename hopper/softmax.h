@@ -12,6 +12,8 @@
 
 #include "utils.h"
 
+#include "cutlass/fast_math.h"
+
 namespace flash {
 
 using namespace cute;
@@ -100,8 +102,10 @@ __forceinline__ __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &ten
 }
 
 // Apply the exp to all the elements.
-template <bool Scale_max=true, bool Check_inf=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+template <bool Scale_max=true, bool Check_inf=true, bool Use_max_offset=false,
+          typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> const &max, const float scale) {
+    constexpr static float max_offset = Use_max_offset ? 8.0f : 0.0f;
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
     CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
@@ -111,8 +115,8 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
         // We don't want (-inf - (-inf)) since that would give NaN.
         // If we don't have float around M_LOG2E the multiplication is done in fp64.
         const float max_scaled = Check_inf
-            ? (max(mi) == -INFINITY ? 0.f : (max(mi) * (Scale_max ? scale : float(M_LOG2E))))
-            : (max(mi) * (Scale_max ? scale : float(M_LOG2E)));
+            ? (max(mi) == -INFINITY ? 0.f : (!Scale_max ? max(mi) : max(mi) * scale) - max_offset)
+            : (!Scale_max ? max(mi) : max(mi) * scale) - max_offset;
         #pragma unroll
         for (int ni = 0; ni < size<1>(tensor); ++ni)  {
             // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
@@ -125,8 +129,11 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int kNRows>
-struct Softmax {
+template <int kNRows, bool Use_max_offset_ = false>
+struct Softmax { 
+    constexpr static bool Use_max_offset = Use_max_offset_; 
+    // constexpr static float max_offset = Use_max_offset ? 8.0f : 0.0f;
+    // constexpr static float max_offset_E = max_offset * float(M_LN2);
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
     TensorT row_max, row_sum;
@@ -166,7 +173,7 @@ struct Softmax {
         TensorT scores_scale;
         if constexpr (Is_first) {
             flash::template reduce_max</*zero_init=*/true>(scores, row_max);
-            flash::template scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            flash::template scale_apply_exp2</*Scale_max=*/true, /*Check_inf=*/true, Use_max_offset>(scores, row_max, softmax_scale_log2);
             flash::reduce_sum</*zero_init=*/true, /*warp_reduce=*/false>(scores, row_sum);
             cute::fill(scores_scale, 1.f);
             // if (cute::thread0()) { print_tensor(scores); printf("\n scale = %f\n", softmax_scale_log2); print_tensor(row_sum); }
@@ -183,16 +190,17 @@ struct Softmax {
             //     scores_scale(mi) = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
             //     row_sum(mi) *= scores_scale(mi);
             // }
-            flash::template scale_apply_exp2</*Scale_max=*/true, Check_inf>(scores, row_max, softmax_scale_log2);
+            flash::template scale_apply_exp2</*Scale_max=*/true, Check_inf, Use_max_offset>(scores, row_max, softmax_scale_log2);
             // We don't do the reduce across threads here since we don't need to use the row_sum.
             // We do that reduce at the end when we need to normalize the softmax.
             flash::reduce_sum</*zero_init=*/false, /*warp_reduce=*/false>(scores, row_sum);
         }
         return scores_scale;
     };
-
+    
     template<bool Is_dropout=false, bool Split=false, typename Tensor0>
     __forceinline__ __device__ TensorT finalize(Tensor0 &acc_s, float softmax_scale_log2, float rp_dropout=1.0) {
+        constexpr static float max_offset_E = Use_max_offset ? 8.0f * float(M_LN2) : 0.0f;
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
@@ -203,7 +211,7 @@ struct Softmax {
         for (int mi = 0; mi < size(row_max); ++mi) {
             float sum = row_sum(mi);
             float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
-            row_sum(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : row_max(mi) * (softmax_scale_log2 * float(M_LN2)) + __logf(sum);
+            row_sum(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : (row_max(mi) * softmax_scale_log2) * float(M_LN2) - max_offset_E + __logf(sum);
             scores_scale(mi) = !Is_dropout ? inv_sum : inv_sum * rp_dropout;
         }
         return scores_scale;

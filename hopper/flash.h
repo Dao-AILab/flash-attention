@@ -170,6 +170,7 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
     // The pointer to the softmax d sum.
     void *__restrict__ dsoftmax_sum;
+    void *__restrict__ softmax_lse_log2_ptr;
 
     int *__restrict__ dq_semaphore;
 

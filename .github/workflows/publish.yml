@@ -44,7 +44,7 @@ jobs:
           # manylinux docker image, but I haven't figured out how to install CUDA on manylinux.
           os: [ubuntu-20.04]
           python-version: ['3.8', '3.9', '3.10', '3.11', '3.12']
-          torch-version: ['2.0.1', '2.1.2', '2.2.2', '2.3.1', '2.4.0.dev20240527']
+          torch-version: ['2.0.1', '2.1.2', '2.2.2', '2.3.1', '2.4.0']
           cuda-version: ['11.8.0', '12.3.2']
           # We need separate wheels that either uses C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI) or not.
           # Pytorch wheels currently don't use it, but nvcr images have Pytorch compiled with C++11 ABI.
