@@ -245,9 +245,9 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
                 if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
-                    run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+                    run_mha_fwd_<elem_type, kQKHeadDim, kVHeadDim, Is_causal>(params, stream);
                 } else {
-                    run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
+                    run_mha_fwd_splitkv_dispatch<elem_type, kQKHeadDim, kVHeadDim, Is_causal>(params, stream);
                 }
             });
         });
@@ -302,7 +302,7 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     const int num_splits, cudaDeviceProp *dprops, struct c10::TensorOptions opts) {
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
-    const max_head_size = head_size > v_head_size ? head_size : v_head_size;
+    const int max_head_size = head_size > v_head_size ? head_size : v_head_size;
     const int block_n = max_head_size <= 64 ? 256 : (max_head_size <= 128 ? 128 : 64);
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
@@ -372,6 +372,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     // TORCH_CHECK(is_sm90 || is_sm8x || is_sm75, "FlashAttention only supports Turing GPUs or newer.");
 
     auto q_dtype = q.dtype();
+
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
     if (q_dtype == torch::kBFloat16) {
@@ -387,7 +388,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
     const auto sizes = q.sizes();
-    const auto v_head_size_og = v.sizes()[3];
+    const int v_head_size_og = v.sizes()[3];
     const int batch_size = sizes[0];
     int seqlen_q = sizes[1];
     int num_heads = sizes[2];
@@ -449,13 +450,15 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         if (seqlenq_ngroups_swapped) {
             out = out.reshape({batch_size, num_heads_k, ngroups, v_head_size_og}).transpose(1, 2);
         }
-        if (head_size_og % 8 != 0) { 
-            out = torch::empty({batch_size, seqlen_q, num_heads, v_head_size_og}, q_dtype,);
+        if (v_head_size_og % 8 != 0) { 
+            out = torch::empty({batch_size, seqlen_q, num_heads, v_head_size_og}, q.options());
             out = torch::nn::functional::pad(out, torch::nn::functional::PadFuncOptions({0, 8 - v_head_size_og % 8}));
         }
     } else {
-        out = torch::empty({batch_size, seqlen_q, num_heads, v_head_size_og}, q_dtype,);
-        out = torch::nn::functional::pad(out, torch::nn::functional::PadFuncOptions({0, 8 - v_head_size_og % 8}));
+        out = torch::empty({batch_size, seqlen_q, num_heads, v_head_size_og}, q.options());
+        if (v_head_size_og % 8 != 0) {
+            out = torch::nn::functional::pad(out, torch::nn::functional::PadFuncOptions({0, 8 - v_head_size_og % 8}));
+        }
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -612,7 +615,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     CHECK_CONTIGUOUS(cu_seqlens_k);
 
     const auto sizes = q.sizes();
-    const auto v_head_size_og = v.sizes()[3];
+    const int v_head_size_og = v.sizes()[2];
     const int batch_size = cu_seqlens_q.numel() - 1;
     int num_heads = sizes[1];
     const int head_size_og = sizes[2];
@@ -698,12 +701,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
             out = out.reshape({batch_size, num_heads_k, ngroups, v_head_size_og}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size_og});
         }
         if (v_head_size_og % 8 != 0) { 
-            out = torch::empty({batch_size, seqlen_q, num_heads, v_head_size_og}, q_dtype,);
+            out = torch::empty({total_q, num_heads, v_head_size_og}, q.options());
             out = torch::nn::functional::pad(out, torch::nn::functional::PadFuncOptions({0, 8 - v_head_size_og % 8}));
         }
     } else {
-        out = torch::empty({batch_size, seqlen_q, num_heads, v_head_size_og}, q_dtype,);
-        out = torch::nn::functional::pad(out, torch::nn::functional::PadFuncOptions({0, 8 - v_head_size_og % 8}));
+        out = torch::empty({total_q, num_heads, v_head_size_og}, q.options());
+        if (v_head_size_og % 8 != 0) { 
+            out = torch::nn::functional::pad(out, torch::nn::functional::PadFuncOptions({0, 8 - v_head_size_og % 8}));
+        }
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -835,7 +840,7 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-                run_mha_bwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+                run_mha_bwd_<elem_type, kQKHeadDim, kVHeadDim, Is_causal>(params, stream);
             });
         });
     });
@@ -899,7 +904,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     TORCH_CHECK(dout.stride(-1) == 1, "dout tensor must have contiguous last dimension");
 
     const auto sizes = q.sizes();
-    const auto v_head_size_og = v.sizes()[3];
+    const int v_head_size_og = v.sizes()[3];
     const int batch_size = sizes[0];
     const int seqlen_q = sizes[1];
     const int num_heads = sizes[2];
@@ -922,7 +927,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
-    TORCH_CHECK(head_size == round_multiple(head_size_og, 8), "head_size must be head_size_og rounded to a multiple of 8");
+    // TORCH_CHECK(head_size == round_multiple(head_size_og, 8), "head_size must be head_size_og rounded to a multiple of 8");
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
 
     if (window_size_left >= seqlen_k) { window_size_left = -1; }
@@ -1143,7 +1148,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     CHECK_CONTIGUOUS(cu_seqlens_k);
 
     const auto sizes = q.sizes();
-    const auto v_head_size_og = v.sizes()[3];
+    const int v_head_size_og = v.sizes()[2];
     const int total_q = sizes[0];
     const int batch_size = cu_seqlens_q.numel() - 1;
     const int num_heads = sizes[1];
@@ -1391,7 +1396,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
 
     const auto sizes = q.sizes();
-    const auto v_head_size_og = v.sizes()[3];
+    const int v_head_size_og = vcache.sizes()[3];
     const int batch_size = sizes[0];
     int seqlen_q = sizes[1];
     int num_heads = sizes[2];
@@ -1454,13 +1459,15 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, v_head_size_og);
-        if (head_size_og % 8 != 0) { 
-            out = torch::empty({batch_size, seqlen_q, num_heads, v_head_size_og}, q_dtype,);
+        if (v_head_size_og % 8 != 0) { 
+            out = torch::empty({batch_size, seqlen_q, num_heads, v_head_size_og}, q.options());
             out = torch::nn::functional::pad(out, torch::nn::functional::PadFuncOptions({0, 8 - v_head_size_og % 8}));
         }
     } else {
-        out = torch::empty({batch_size, seqlen_q, num_heads, v_head_size_og}, q_dtype,);
-        out = torch::nn::functional::pad(out, torch::nn::functional::PadFuncOptions({0, 8 - v_head_size_og % 8}));
+        out = torch::empty({batch_size, seqlen_q, num_heads, v_head_size_og}, q.options());
+        if (v_head_size_og % 8 != 0) { 
+            out = torch::nn::functional::pad(out, torch::nn::functional::PadFuncOptions({0, 8 - v_head_size_og % 8}));
+        }
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -1590,7 +1597,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
     std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
-        params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
+        params, batch_size, num_heads, head_size, v_head_size, seqlen_k, seqlen_q,
         head_size_rounded, v_head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, opts);
 
     if (paged_KV) {

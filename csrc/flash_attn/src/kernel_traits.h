@@ -96,7 +96,7 @@ struct Flash_fwd_kernel_traits : public Base {
         Shape<Int<kBlockN>, Int<kVHeadDim>>{}));
     // https://github.com/ColfaxResearch/cutlass-kernels/blob/a222587e6d59b93ba704853d3946fb686d8b8892/src/fmha/fmha_forward.cu#L434
     using SmemLayoutVtransposed = decltype(
-        composition(SmemLayoutKV{}, make_layout(Shape<Int<kVHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
+        composition(SmemLayoutV{}, make_layout(Shape<Int<kVHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
     using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
 
     using SmemLayoutAtomO = decltype(
@@ -169,7 +169,7 @@ struct Flash_fwd_kernel_traits : public Base {
 template<int kQKHeadDim_, int kVHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_,
          int AtomLayoutMSdP_=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=2,
          bool Is_V_in_regs_=false, bool No_double_buffer_=false, typename elem_type=cutlass::half_t,
-         typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
+         typename Base=Flash_kernel_traits<kQKHeadDim_, kVHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
 struct Flash_bwd_kernel_traits : public Base {
     using Element = typename Base::Element;
     using ElementAccum = typename Base::ElementAccum;
@@ -251,7 +251,7 @@ struct Flash_bwd_kernel_traits : public Base {
         SmemLayoutAtomV{},
         make_shape(Int<kBlockN>{}, Int<kVHeadDim>{})));
     using SmemLayoutKtransposed = decltype(
-        composition(SmemLayoutKV{}, make_layout(Shape<Int<kQKHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
+        composition(SmemLayoutK{}, make_layout(Shape<Int<kQKHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
     using SmemLayoutKtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutKtransposed{}));
 
     // TODO: generalize to other values of kBlockN

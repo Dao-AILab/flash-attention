@@ -90,25 +90,20 @@
 #define HEADDIM_SWITCH(HEADDIM, ...)   \
   [&] {                                    \
     if (HEADDIM <= 32) {                   \
-      constexpr static int kHeadDim = 32;  \
+      constexpr static int kQKHeadDim = 32;  \
+      constexpr static int kVHeadDim = 64;  \
       return __VA_ARGS__();                \
     } else if (HEADDIM <= 64) {            \
-      constexpr static int kHeadDim = 64;  \
+      constexpr static int kQKHeadDim = 64;  \
+      constexpr static int kVHeadDim = 128;  \
       return __VA_ARGS__();                \
     } else if (HEADDIM <= 96) {            \
-      constexpr static int kHeadDim = 96;  \
+      constexpr static int kQKHeadDim = 96;  \
+      constexpr static int kVHeadDim = 192;  \
       return __VA_ARGS__();                \
     } else if (HEADDIM <= 128) {           \
-      constexpr static int kHeadDim = 128; \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 160) {           \
-      constexpr static int kHeadDim = 160; \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 192) {           \
-      constexpr static int kHeadDim = 192; \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 256) {           \
-      constexpr static int kHeadDim = 256; \
+      constexpr static int kQKHeadDim = 128; \
+      constexpr static int kVHeadDim = 256;  \
       return __VA_ARGS__();                \
     }                                      \
   }()

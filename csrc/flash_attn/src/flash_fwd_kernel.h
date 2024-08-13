@@ -449,7 +449,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
     // sO has the same size as sQ, so we don't need to sync here.
-    if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
+    __syncthreads();
+    // if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
 
     cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
 
@@ -834,7 +835,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
+    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKcK, tKpK,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
     cute::cp_async_fence();
 
@@ -1024,8 +1025,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // sOaccum is larger than sQ, so we need to syncthreads here
     // TODO: allocate enough smem for sOaccum
-    if constexpr (Split) { __syncthreads(); }
-
+    __syncthreads();
+    // if constexpr (Split) { __syncthreads(); }
+    
     cute::copy(smem_tiled_copy_Oaccum, taccOrOaccum, taccOsOaccum);
 
     const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)

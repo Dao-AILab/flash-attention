@@ -50,23 +50,24 @@ class Kernel:
 
     @property
     def template(self) -> str:
-        self.vhead_dim = self.qkhead_dim * 2
+        vhead_dim = self.qkhead_dim * 2
         if self.direction == "fwd":
             return KERNEL_IMPL_TEMPLATE_FWD.format(
-                DTYPE=DTYPE_MAP[self.dtype], QKHEAD_DIM=self.qkhead_dim, VHEAD_DIM=self.vhead_dim, IS_CAUSAL=self.is_causal
+                DTYPE=DTYPE_MAP[self.dtype], QKHEAD_DIM=self.qkhead_dim, VHEAD_DIM=vhead_dim, IS_CAUSAL=self.is_causal
             )
         elif self.direction == "bwd":
             return KERNEL_IMPL_TEMPLATE_BWD.format(
-                DTYPE=DTYPE_MAP[self.dtype], QKHEAD_DIM=self.qkhead_dim, VHEAD_DIM=self.vhead_dim, IS_CAUSAL=self.is_causal
+                DTYPE=DTYPE_MAP[self.dtype], QKHEAD_DIM=self.qkhead_dim, VHEAD_DIM=vhead_dim, IS_CAUSAL=self.is_causal
             )
         else:
             return KERNEL_IMPL_TEMPLATE_FWD_SPLIT.format(
-                DTYPE=DTYPE_MAP[self.dtype], QKHEAD_DIM=self.qkhead_dim, VHEAD_DIM=self.vhead_dim, IS_CAUSAL=self.is_causal
+                DTYPE=DTYPE_MAP[self.dtype], QKHEAD_DIM=self.qkhead_dim, VHEAD_DIM=vhead_dim, IS_CAUSAL=self.is_causal
             )
 
     @property
     def filename(self) -> str:
-        return f"flash_{self.direction}_qkdim{self.qkhead_dim}_vdim{self.vhead_dim}_{self.dtype}_{'causal_' if self.is_causal == 'true' else ''}sm{self.sm}.cu"
+        vhead_dim = self.qkhead_dim * 2
+        return f"flash_{self.direction}_qkdim{self.qkhead_dim}_vdim{vhead_dim}_{self.dtype}_{'causal_' if self.is_causal == 'true' else ''}sm{self.sm}.cu"
 
 
 def get_all_kernels() -> List[Kernel]:
