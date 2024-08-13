@@ -64,7 +64,7 @@ pytest -q -s test_flash_attn.py
 
 ## Installation and features
 **Requirements:**
-- A GPU backend (CUDA or ROCm)
+- CUDA toolkit or ROCm toolkit
 - PyTorch 1.12 and above.
 - `packaging` Python package (`pip install packaging`)
 - `ninja` Python package (`pip install ninja`) *
@@ -75,7 +75,7 @@ pytest -q -s test_flash_attn.py
 --version` then `echo $?` returns a nonzero exit code), uninstall then reinstall
 `ninja` (`pip uninstall -y ninja && pip install ninja`). Without `ninja`,
 compiling can take a very long time (2h) since it does not use multiple CPU
-cores. With `ninja` compiling takes 3-5 minutes on a 64-core machine.
+cores. With `ninja` compiling takes 3-5 minutes on a 64-core machine using CUDA toolkit.
 
 **To install:**
 ```sh
