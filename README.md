@@ -112,6 +112,8 @@ FlashAttention-2 with CUDA currently supports:
 3. All head dimensions up to 256. ~~Head dim > 192 backward requires A100/A800 or H100/H800~~. Head dim 256 backward now works on consumer GPUs (if there's no dropout) as of flash-attn 2.5.5.
 
 ### AMD ROCm Support
+ROCm version uses [composable_kernel](https://github.com/ROCm/composable_kernel) as the backend. It provides the implementation of FlashAttention-2.
+
 **Requirements:**
 - ROCm 6.0 and above.
 
