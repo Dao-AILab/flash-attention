@@ -57,22 +57,16 @@ def _compile_wrapper(torch_op, func):
         return func
 
 
-def _torch_custom_op_wrapper():
-    if torch.__version__ >= "2.4.0":
-        return torch.library.custom_op
-    else:
-        def wrapper(name, fn, *, mutates_args, device_types, schema):
-            return fn
-        return wrapper
-    
-
-def _torch_register_fake_wrapper():
-    if torch.__version__ >= "2.4.0":
-        return torch.library.register_fake
-    else:
-        def wrapper(op, func, *, lib, _stacklevel):
-            return func
-        return wrapper
+if torch.__version__ >= "2.4.0":
+    _torch_custom_op_wrapper = torch.library.custom_op
+    _torch_register_fake_wrapper = torch.library.register_fake
+else:
+    def custom_op_wrapper(name, fn, *, mutates_args, device_types, schema):
+        return fn
+    def register_fake_wrapper(op, func, *, lib, _stacklevel):
+        return func
+    _torch_custom_op_wrapper = custom_op_wrapper
+    _torch_register_fake_wrapper = register_fake_wrapper
 
 
 @_torch_custom_op_wrapper("flashattn::_flash_attn_forward", mutates_args=("q", "k", "v"), device_types="cuda")
