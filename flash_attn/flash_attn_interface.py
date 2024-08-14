@@ -131,7 +131,7 @@ def _flash_attn_forward_fake(
     p = torch.empty((0,), dtype=q.dtype, device=q.device, layout=q.layout)
     if return_softmax:
         p = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
-    rng_state = torch.empty((2,), dtype=torch.int64, device=q.device, requires_grad=False)
+    rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
 
     return out, softmax_lse, p, rng_state
 
