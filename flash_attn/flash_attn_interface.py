@@ -131,7 +131,7 @@ def _flash_attn_forward_fake(
     p = torch.empty((0,), dtype=q.dtype, device=q.device, layout=q.layout)
     if return_softmax:
         p = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
-    rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    rng_state = torch.empty((2,), dtype=torch.int64, device=q.device, requires_grad=False)
 
     return out, softmax_lse, p, rng_state
 
@@ -238,7 +238,7 @@ def _flash_attn_varlen_forward_fake(
 _wrapped_flash_attn_varlen_forward = _compile_wrapper(torch.ops.flashattn._flash_attn_varlen_forward, _flash_attn_varlen_forward)
 
 
-@_torch_custom_op_wrapper("flashattn::_flash_attn_backward", mutates_args=("dq", "dk", "dv", "rng_state"), device_types="cuda")
+@_torch_custom_op_wrapper("flashattn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -333,7 +333,7 @@ def _flash_attn_backward_fake(
 _wrapped_flash_attn_backward = _compile_wrapper(torch.ops.flashattn._flash_attn_backward, _flash_attn_backward)
 
 
-@_torch_custom_op_wrapper("flashattn::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv", "rng_state"), device_types="cuda")
+@_torch_custom_op_wrapper("flashattn::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
 def _flash_attn_varlen_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -573,7 +573,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
-        return out[..., :head_size_og].detach() if not return_softmax else (out[..., :head_size_og].detach(), softmax_lse, S_dmask)
+        return out[..., :head_size_og] if not return_softmax else (out[..., :head_size_og], softmax_lse, S_dmask)
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -744,7 +744,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
-        return out[..., :head_size_og].detach() if not return_softmax else (out[..., :head_size_og].detach(), softmax_lse, S_dmask)
+        return out[..., :head_size_og] if not return_softmax else (out[..., :head_size_og], softmax_lse, S_dmask)
 
     @staticmethod
     def backward(ctx, dout, *args):
