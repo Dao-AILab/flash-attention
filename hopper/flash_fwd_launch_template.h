@@ -62,8 +62,12 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             params.descale_q_ptr,
             params.descale_k_ptr,
             params.descale_v_ptr,
+<<<<<<< HEAD
             params.window_size_left,
             params.window_size_right
+=======
+            params.cache_batch_idx
+>>>>>>> added cache_batch_idx.
         });
     typename CollectiveEpilogue::Params epilogue_params =
         CollectiveEpilogue::to_underlying_arguments({
