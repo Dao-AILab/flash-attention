@@ -90,20 +90,75 @@
 #define HEADDIM_SWITCH(HEADDIM, ...)   \
   [&] {                                    \
     if (HEADDIM <= 32) {                   \
-      constexpr static int kQKHeadDim = 32;  \
-      constexpr static int kVHeadDim = 64;  \
+      constexpr static int kHeadDim = 32;  \
       return __VA_ARGS__();                \
     } else if (HEADDIM <= 64) {            \
-      constexpr static int kQKHeadDim = 64;  \
-      constexpr static int kVHeadDim = 128;  \
+      constexpr static int kHeadDim = 64;  \
       return __VA_ARGS__();                \
     } else if (HEADDIM <= 96) {            \
-      constexpr static int kQKHeadDim = 96;  \
-      constexpr static int kVHeadDim = 192;  \
+      constexpr static int kHeadDim = 96;  \
       return __VA_ARGS__();                \
     } else if (HEADDIM <= 128) {           \
-      constexpr static int kQKHeadDim = 128; \
-      constexpr static int kVHeadDim = 256;  \
+      constexpr static int kHeadDim = 128; \
+      return __VA_ARGS__();                \
+    } else if (HEADDIM <= 160) {           \
+      constexpr static int kHeadDim = 160; \
+      return __VA_ARGS__();                \
+    } else if (HEADDIM <= 192) {           \
+      constexpr static int kHeadDim = 192; \
+      return __VA_ARGS__();                \
+    } else if (HEADDIM <= 256) {           \
+      constexpr static int kHeadDim = 256; \
       return __VA_ARGS__();                \
     }                                      \
   }()
+
+#define QKHEADDIM_VHEADDIM_SWITCH(QKHEADDIM, VHEADDIM, ...)   \
+  [&] {                                                        \
+    if (QKHEADDIM <= 32 && VHEADDIM <= 32) {                     \
+      constexpr static int kQKHeadDim = 32;                    \
+      constexpr static int kVHeadDim = 32;                   \
+      return __VA_ARGS__();                                    \
+    } else if (QKHEADDIM <= 32 && VHEADDIM <= 64) {             \
+      constexpr static int kQKHeadDim = 32;                    \
+      constexpr static int kVHeadDim = 64;                   \
+      return __VA_ARGS__();                                    \
+    } else if (QKHEADDIM <= 64 && VHEADDIM <= 64) {             \
+      constexpr static int kQKHeadDim = 64;                    \
+      constexpr static int kVHeadDim = 64;                   \
+      return __VA_ARGS__();                                    \
+    } else if (QKHEADDIM <= 64 && VHEADDIM <= 128) {           \
+      constexpr static int kQKHeadDim = 64;                    \
+      constexpr static int kVHeadDim = 128;                  \
+      return __VA_ARGS__();                                    \
+    } else if (QKHEADDIM <= 96 && VHEADDIM <= 96) {            \
+      constexpr static int kQKHeadDim = 96;                    \
+      constexpr static int kVHeadDim = 96;                   \
+      return __VA_ARGS__();                                    \
+    } else if (QKHEADDIM <= 96 && VHEADDIM <= 192) {           \
+      constexpr static int kQKHeadDim = 96;                    \
+      constexpr static int kVHeadDim = 192;                  \
+      return __VA_ARGS__();                                    \
+    } else if (QKHEADDIM <= 128 && VHEADDIM <= 128) {             \
+      constexpr static int kQKHeadDim = 128;                   \
+      constexpr static int kVHeadDim = 128;                  \
+      return __VA_ARGS__();                                    \
+    } else if (QKHEADDIM <= 128 && VHEADDIM <= 256) {           \
+      constexpr static int kQKHeadDim = 128;                   \
+      constexpr static int kVHeadDim = 256;                  \
+      return __VA_ARGS__();                                    \
+    } else if (QKHEADDIM <= 160 && VHEADDIM <= 160) {            \
+      constexpr static int kQKHeadDim = 160;                  \
+      constexpr static int kVHeadDim = 160;                  \
+      return __VA_ARGS__();                                    \
+    } else if (QKHEADDIM <= 192 && VHEADDIM <= 192) {          \
+      constexpr static int kQKHeadDim = 192;                  \
+      constexpr static int kVHeadDim = 192;                  \
+      return __VA_ARGS__();                                    \
+    } else if (QKHEADDIM <= 256 && VHEADDIM <= 256) {           \
+      constexpr static int kQKHeadDim = 256;                  \
+      constexpr static int kVHeadDim = 256;                  \
+      return __VA_ARGS__();                                    \
+    }                                                           \
+  }()
+
