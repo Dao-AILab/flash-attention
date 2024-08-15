@@ -75,7 +75,15 @@ public:
                        make_stride(int64_t(h * m), int64_t(m), cute::_1()));
   }
 
-  CUTLASS_DEVICE void init(int bidb) {}
+  CUTLASS_DEVICE void init(int bidb) {
+    // TODO: add leftpad, seqlen_new for kv cache support
+    // NOTE: for FA2 kv cache API, "cu_seq_len" is a misnomer.
+    // Rather, cu_seq_len plays the role of seq_used.
+    // We can change this for FA3 if desired.
+    if(cu_seq_len) {      
+      actual_seq_len = cu_seq_len[bidb];
+    }
+  }
 
   template <typename MTensor, typename Shape>
   CUTLASS_DEVICE auto get_local_tile_tensor(
