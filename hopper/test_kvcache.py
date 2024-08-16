@@ -1,7 +1,7 @@
-#import flash_attn
 import torch
 #from flash_attn_interface import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
-import flash_attn_interface as flash_attn
+import flash_attn_interface as fa3
+import flash_attn as fa2
 
 
 def main():
@@ -64,7 +64,7 @@ def main():
 
     # Call flash attn
     # First for the single full-sized query
-    flash_attn.flash_attn_with_kvcache(
+    out0 = fa3.flash_attn_with_kvcache(
         q=q_buf_large,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -74,7 +74,7 @@ def main():
     )
 
     # Second for n-1 small queries
-    flash_attn.flash_attn_with_kvcache(
+    out1 = fa3.flash_attn_with_kvcache(
         q=q_buf_small,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -83,6 +83,29 @@ def main():
         causal=True,
     )
 
+      # Call flash attn
+    # First for the single full-sized query
+    out2 = fa2.flash_attn_with_kvcache(
+        q=q_buf_large,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cache_seqlens=cache_seqlen_large,
+        cache_batch_idx=cache_idx_large,
+        causal=True,
+    )
+
+    # Second for n-1 small queries
+    out3 = fa2.flash_attn_with_kvcache(
+        q=q_buf_small,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cache_seqlens=cache_seqlens_small,
+        cache_batch_idx=cache_idxs_small,
+        causal=True,
+    )
+
+    print ((out0 - out2).abs().max().item());
+    print ((out1 - out3).abs().max().item());
 
 if __name__ == "__main__":
     main()
