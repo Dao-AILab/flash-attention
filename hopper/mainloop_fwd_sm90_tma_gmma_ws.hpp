@@ -160,7 +160,7 @@ struct CollectiveMainloopFwd {
         float const* descale_v_ptr;
         int window_size_left;
         int window_size_right;
-        int * __restrict__ cache_batch_idx;
+        int const* cache_batch_idx;
     };
 
     // Device side kernel params
@@ -178,7 +178,7 @@ struct CollectiveMainloopFwd {
         float const* descale_v_ptr;
         int window_size_left;
         int window_size_right;
-        int * __restrict__ cache_batch_idx;
+        int const* cache_batch_idx;
     };
 
 
@@ -230,8 +230,10 @@ struct CollectiveMainloopFwd {
         ) {
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});        
-        int const seqlen_q = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        int const seqlen_k = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);        
+        // int const seqlen_q = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        // int const seqlen_k = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
+        int const seqlen_q = seqlen_traits_q.actual_seq_len;
+        int const seqlen_k = seqlen_traits_k.actual_seq_len;
         int n_block_max = cute::ceil_div(seqlen_k, kBlockN);
         if constexpr (Is_causal || Is_local) {
             n_block_max = std::min(
@@ -287,7 +289,7 @@ struct CollectiveMainloopFwd {
         Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.layout_V.shape());
 
         auto [m_block, bidh, bidb] = block_coord;
-        const int bidb_cache = mainloop_params.cache_batch_idx == nullptr ? bidb : mainloop_params.cache_batch_idx[bidb];
+        const int bidb_cache = mainloop_params.cache_batch_idx == nullptr ? bidb : mainloop_params.cache_batch_idx[bidb];        
         int bidh_kv = mainloop_params.qhead_per_khead_divmod.divide(bidh);
 
         // Prepare the TMA loads
