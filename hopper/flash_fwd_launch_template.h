@@ -50,12 +50,12 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             ),  // layout_Q
             static_cast<Element const*>(params.k_ptr),
             seqlen_traits_k.get_gmem_layout(
-                params.seqlen_k, params.d, params.h_k, params.b, 
+                params.seqlen_k, params.d, params.h_k, params.b_k, 
                 params.k_row_stride, params.k_head_stride, params.k_batch_stride
             ),  // layout_K
             static_cast<Element const*>(params.v_ptr),
             seqlen_traits_k.get_gmem_layout(
-                params.seqlen_k, params.d, params.h_k, params.b, 
+                params.seqlen_k, params.d, params.h_k, params.b_k, 
                 params.v_row_stride, params.v_head_stride, params.v_batch_stride
             ),  // layout_V
             params.scale_softmax_log2,

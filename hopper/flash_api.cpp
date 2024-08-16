@@ -21,6 +21,7 @@
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
                       const size_t b,
+                      const size_t b_k,
                       const size_t seqlen_q,
                       const size_t seqlen_k,
                       const size_t seqlen_q_rounded,
@@ -52,6 +53,7 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.is_bf16 = q.dtype() == torch::kBFloat16;
     params.is_e4m3 = q.dtype() == torch::kFloat8_e4m3fn;
+    params.is_kv_cache = false;
 
     // Set the pointers and strides.
     params.q_ptr = q.data_ptr();
@@ -97,6 +99,7 @@ void set_params_fprop(Flash_fwd_params &params,
 
     // Set the dimensions.
     params.b = b;
+    params.b_k = b_k;
     params.h = h;
     params.h_k = h_k;
     params.h_h_k_ratio = h / h_k;
@@ -192,7 +195,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                       bool deterministic) {
 
     set_params_fprop(params,
-                     b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
+                     b, b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
                      q, k, v, out,
                      cu_seqlens_q_d,
                      cu_seqlens_k_d,
@@ -371,7 +374,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
 
     Flash_fwd_params params;
     set_params_fprop(params,
-                     batch_size,
+                     batch_size, batch_size,
                      seqlen_q, seqlen_k,
                      seqlen_q_rounded, seqlen_k_rounded,
                      num_heads, num_heads_k,
@@ -551,7 +554,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     Flash_fwd_params params;
     set_params_fprop(params,
-                     batch_size,
+                     batch_size, batch_size,
                      max_seqlen_q, max_seqlen_k,
                      seqlen_q_rounded, seqlen_k_rounded,
                      num_heads, num_heads_k,
@@ -1163,7 +1166,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     Flash_fwd_params params;
     set_params_fprop(params,
-                     batch_size,
+                     batch_size, batch_size_c,
                      seqlen_q, seqlen_k,
                      seqlen_q_rounded, seqlen_k_rounded,
                      num_heads, num_heads_k,
@@ -1180,6 +1183,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      window_size_right,
                      softcap
                      );
+    params.is_kv_cache = true;
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {

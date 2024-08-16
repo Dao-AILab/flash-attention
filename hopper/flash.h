@@ -58,6 +58,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     // The dimensions.
     int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim, total_q, total_k;
+    int b_k;
 
     // The scaling factors for the kernel.
     float scale_softmax;
@@ -119,6 +120,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_e4m3;
     bool is_causal;
     bool is_local;
+    bool is_kv_cache;
 
     // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
     // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.
