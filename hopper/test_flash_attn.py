@@ -236,8 +236,8 @@ def test_flash_attn_varlen_output(
         batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True
     )
 
-    query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random")
-    key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode="random")
+    query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random", zero_lengths=False)
+    key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode="random", zero_lengths=True)
     # key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode='full')
 
     (
@@ -312,11 +312,16 @@ def test_flash_attn_varlen_output(
             dk_ref,
             dv_ref,
         ) = torch.autograd.grad(out_ref, (q, k, v), g)
+        zero_masking = rearrange(torch.logical_not(torch.any(key_padding_mask, 1)), "b -> b 1 1 1")
+        dk_ref.masked_fill_(zero_masking, 0.0)
+        dv_ref.masked_fill_(zero_masking, 0.0)
         (
             dq_pt,
             dk_pt,
             dv_pt,
         ) = torch.autograd.grad(out_pt, (q, k, v), g)
+        dk_pt.masked_fill_(zero_masking, 0.0)
+        dv_pt.masked_fill_(zero_masking, 0.0)
         dq = dq_pad_fn(dq_unpad)
         print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
         print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
