@@ -307,6 +307,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         os.makedirs("build")
 
     os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --output_dir build --receipt 2")
+    os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_appendkv --output_dir build --receipt 2")
+    os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --output_dir build --receipt 2")
     os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d bwd --output_dir build --receipt 2")
 
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
@@ -336,6 +338,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
     sources = ["csrc/flash_attn_ck/flash_api.cpp",
                "csrc/flash_attn_ck/mha_bwd.cpp",
+               "csrc/flash_attn_ck/mha_fwd_kvcache.cpp",
                "csrc/flash_attn_ck/mha_fwd.cpp",
                "csrc/flash_attn_ck/mha_varlen_bwd.cpp",
                "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
@@ -346,6 +349,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
     renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
                        "csrc/flash_attn_ck/mha_bwd.cu",
+                       "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
                        "csrc/flash_attn_ck/mha_fwd.cu",
                        "csrc/flash_attn_ck/mha_varlen_bwd.cu",
                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
