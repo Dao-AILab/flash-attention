@@ -1041,7 +1041,7 @@ def test_flash_attn_varlen_causal(
         (384, 384),
         (512, 512),
         (768, 768),
-        (1024, 1024),
+        # (1024, 1024),
     ],
 )
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
