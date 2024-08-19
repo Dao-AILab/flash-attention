@@ -77,7 +77,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
     ck_tile::index_t stride_o = out.stride(0);
     ck_tile::index_t nhead_stride_o = out.stride(1);
 
-    // lse: (batch_size, nheads, max_seqlen_q)
+    // lse: (nheads, total_q)
     ck_tile::index_t batch_stride_lse = 0;
     ck_tile::index_t nhead_stride_lse = softmax_lse.stride(0);
 
