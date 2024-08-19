@@ -125,7 +125,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                     mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
                 const int n_block_min = collective_mainloop.get_n_block_min(
                     mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
-                if ((Is_causal || Is_local || seqlen_traits_k.kUseVarSeqLen) && n_block_max <= n_block_min) {
+                if ((Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen) && n_block_max <= n_block_min) {
                     scheduler.prefetch_next_work(scheduler_params, work_tile_info);
                     scheduler.broadcast_next_work(work_tile_info);
                     continue;
@@ -173,7 +173,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
             const int n_block_min = collective_mainloop.get_n_block_min(
                 mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
-            if ((Is_causal || Is_local || seqlen_traits_k.kUseVarSeqLen) && n_block_max <= n_block_min) {  // We exit early and write 0 to gO and -inf to gLSE.
+            if ((Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen) && n_block_max <= n_block_min) {  // We exit early and write 0 to gO and -inf to gLSE.
                 collective_epilogue.store_zero(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q);
                 continue;
             }
@@ -209,7 +209,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
     static_assert(Ktraits::Is_WS);
     static constexpr bool Is_WS = Ktraits::Is_WS;
-    static constexpr bool kUseVarSeqLen = Seqlen_traits::kUseVarSeqLen;
+    static constexpr bool UseVarSeqLen = Seqlen_traits::UseVarSeqLen;
 
     static constexpr int NumMmaThreads = size(typename Ktraits::TiledMma0{});
     static constexpr int NumCopyThreads = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
@@ -302,7 +302,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, bidh, bidb] = block_coord;
 
-            if constexpr(kUseVarSeqLen) {
+            if constexpr(UseVarSeqLen) {
                 seqlen_traits_q.init(bidb);
                 seqlen_traits_k.init(bidb);
                 if (m_block * kBlockM >= seqlen_traits_q.actual_seq_len) {
@@ -355,7 +355,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, bidh, bidb] = block_coord;
 
-            if constexpr(kUseVarSeqLen) {
+            if constexpr(UseVarSeqLen) {
                 seqlen_traits_q.init(bidb);
                 seqlen_traits_k.init(bidb);
                 if (m_block * kBlockM >= seqlen_traits_q.actual_seq_len) {

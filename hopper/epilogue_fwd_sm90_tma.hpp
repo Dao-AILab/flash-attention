@@ -113,7 +113,7 @@ struct CollectiveEpilogueFwd {
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
     CUTLASS_DEVICE
     static void prefetch_tma_descriptors(Params const& epilogue_params) {
-        if constexpr (!Seqlen_traits::kUseVarSeqLen) {
+        if constexpr (!Seqlen_traits::UseVarSeqLen) {
             cute::prefetch_tma_descriptor(epilogue_params.tma_store_O.get_tma_descriptor());
         }
     }
@@ -173,7 +173,7 @@ struct CollectiveEpilogueFwd {
             );
         }
         TiledCopyO gmem_tiled_copy_O;
-        flash::write_O<!Seqlen_traits::kUseVarSeqLen, NumCopyThreads>(
+        flash::write_O<!Seqlen_traits::UseVarSeqLen, NumCopyThreads>(
             epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O, 
             epilogue_params.layout_O, select<0, 2>(TileShape_MNK{}), sO, 
             m_block, bidh, bidb, seqlen_traits_q, write_warp_idx
@@ -222,7 +222,7 @@ struct CollectiveEpilogueFwd {
         Tensor taccOcO_row = taccOcO(make_coord(_0{}, _, _0{}), _, _0{});
         CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M        
         int const seqlen_q = [&] {
-            if constexpr(Seqlen_traits::kUseVarSeqLen) { return seqlen_traits_q.actual_seq_len; }
+            if constexpr(Seqlen_traits::UseVarSeqLen) { return seqlen_traits_q.actual_seq_len; }
             else { return shape<2>(epilogue_params.layout_LSE); }
         }();        
         if (get<1>(taccOcO_row(_0{})) == 0) {
@@ -240,7 +240,7 @@ struct CollectiveEpilogueFwd {
         }
         TiledCopyO gmem_tiled_copy_O;
         Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
-        flash::write_O<!Seqlen_traits::kUseVarSeqLen, NumCopyThreads>(
+        flash::write_O<!Seqlen_traits::UseVarSeqLen, NumCopyThreads>(
             epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O, 
             epilogue_params.layout_O, select<0, 2>(TileShape_MNK{}), sO, 
             m_block, bidh, bidb, seqlen_traits_q, write_warp_idx

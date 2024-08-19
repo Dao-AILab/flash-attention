@@ -30,7 +30,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using CollectiveMainloop = flash::CollectiveMainloopFwd<Kernel_traits, Is_causal, Is_local, Seqlen_traits>;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<Kernel_traits, Seqlen_traits>;
     using Scheduler = std::conditional_t<
-        Seqlen_traits::kUseVarSeqLen || Is_local, 
+        Seqlen_traits::UseVarSeqLen || Is_local, 
         flash::SingleTileScheduler,
         std::conditional_t<!Is_causal,
             flash::StaticPersistentTileScheduler,
@@ -62,12 +62,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             params.descale_q_ptr,
             params.descale_k_ptr,
             params.descale_v_ptr,
-<<<<<<< HEAD
             params.window_size_left,
-            params.window_size_right
-=======
+            params.window_size_right,
             params.cache_batch_idx
->>>>>>> added cache_batch_idx.
         });
     typename CollectiveEpilogue::Params epilogue_params =
         CollectiveEpilogue::to_underlying_arguments({

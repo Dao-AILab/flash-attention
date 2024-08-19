@@ -230,8 +230,8 @@ struct CollectiveMainloopFwd {
         ) {
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});        
-        // int const seqlen_q = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        // int const seqlen_k = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
+        // int const seqlen_q = Seqlen_traits::UseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        // int const seqlen_k = Seqlen_traits::UseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         int const seqlen_q = seqlen_traits_q.actual_seq_len;
         int const seqlen_k = seqlen_traits_k.actual_seq_len;
         int n_block_max = cute::ceil_div(seqlen_k, kBlockN);
@@ -906,8 +906,8 @@ struct CollectiveMainloopFwd {
 
         tiled_mma1.accumulate_ = GMMA::ScaleOut::Zero;
         // workaround for fp8 only perf regression pending change to seqlen traits class
-        int const seqlen_q = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        int const seqlen_k = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
+        int const seqlen_q = Seqlen_traits::UseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        int const seqlen_k = Seqlen_traits::UseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         int n_block = n_block_count - 1;
         
         cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.barrier_Q.try_wait(work_idx % 2));

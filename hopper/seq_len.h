@@ -11,8 +11,11 @@ namespace flash {
 
 static constexpr int kMaxTileSize = 128;
 
-template <bool UseVarSeqLen> class SeqLenTraits {
+template <int SeqLenType> class SeqLenTraits {
 public:
+  static_assert(SeqLenType == 0 || SeqLenType == 1 || SeqLenType == 2, 
+                  "SeqLenType must be 0, 1, or 2");
+
   // Total number of queries / keys. Unpadded.
   int sum_s = 0;
   // seq len offsets.
@@ -23,7 +26,7 @@ public:
   int actual_seq_len = -1;
 
   // Whether this is for fixed-seq-len or var-seq-len.
-  static constexpr bool kUseVarSeqLen = UseVarSeqLen;
+  static constexpr bool UseVarSeqLen = SeqLenType == 1;
 
   using ShapeT = std::conditional_t<
       UseVarSeqLen, 
@@ -103,9 +106,8 @@ public:
   }
 };
 
-using FixedSeqLenTraits = SeqLenTraits<false>;
-
-using VarSeqLenTraits = SeqLenTraits<true>;
+using FixedSeqLenTraits = SeqLenTraits<0>;
+using VarSeqLenTraits = SeqLenTraits<1>;
 
 // Returns the static layout of a var-seq-len tensor in global memory based on
 // max_seq_len and max_batch_size.
