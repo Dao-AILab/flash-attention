@@ -32,7 +32,7 @@ def ck_randval_to_dropout_mask(randval, p):
     # If p = 0.3, randval in 255 * (0.7, 1.0] will be dropout
     # randval in 255 * [0, 0.7] will be kept
     # If return dropout_mask >=0, value will be kept
-    return torch.floor(255.0 * (1 - p) - randval)
+    return math.floor(255.0 * (1 - p)) - randval.to(torch.float32)
 
 
 def pad_rearrange_dropout_mask_hts_to_bhss(S_dmask, cu_seqlens_q, seqlen_q_rounded, seqlen_k_rounded):
