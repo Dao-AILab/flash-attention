@@ -56,6 +56,11 @@ __global__ void flash_bwd_clear_dkvaccum_kernel(const Flash_bwd_params params) {
 }
 
 template<typename Kernel_traits>
+__global__ void flash_bwd_clear_dqaccum_kernel(const Flash_bwd_params params) {
+    flash::clear_dQaccum<Kernel_traits>(params);
+}
+
+template<typename Kernel_traits>
 __global__ void flash_bwd_convert_dq_kernel(const Flash_bwd_params params, const int nsplits) {
     flash::convert_dQ<Kernel_traits>(params, nsplits);
 }
@@ -82,7 +87,14 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) 
         } else {
             flash_bwd_dot_do_o_kernel<false, Kernel_traits><<<grid_m, Kernel_traits::kNThreads, 0, stream>>>(params);
         }
+    } else {
+      if (! params.deterministic) {
+          // do atomicAdds on.
+          flash_bwd_clear_dqaccum_kernel<Kernel_traits><<<grid_m, Kernel_traits::kNThreads, 0, stream>>>(params);
+          
+      }
     }
+
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     // We want to specialize to is_even_MN and not just is_even_M, since in the case where N is not

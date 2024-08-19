@@ -5,18 +5,20 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 from einops import rearrange, repeat
 
 from flash_attn.utils.benchmark import benchmark_all, benchmark_forward, benchmark_backward
 from flash_attn.utils.benchmark import benchmark_fwd_bwd, benchmark_combined
 
-from flash_attn import flash_attn_qkvpacked_func
+from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
 
 try:
     from triton.ops.flash_attention import attention as attention_triton
 except ImportError:
     attention_triton = None
+attention_triton = None
 
 try:
     import xformers.ops as xops
@@ -71,13 +73,13 @@ repeats = 30
 device = 'cuda'
 dtype = torch.float16
 
-bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
+bs_seqlen_vals = [(1, 65536), (1, 131072)]
 causal_vals = [False, True]
-headdim_vals = [64, 128]
+headdim_vals = [64]
 dim = 2048
 dropout_p = 0.0
 
-methods = (["Flash2", "Pytorch"]
+methods = (["Flash2", ]
            + (["Triton"] if attention_triton is not None else [])
            + (["xformers.c"] if xops is not None else [])
            + (["xformers.f"] if xops is not None else []))
@@ -95,8 +97,9 @@ for causal in causal_vals:
             nheads = dim // headdim
             qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, device=device, dtype=dtype,
                               requires_grad=True)
+            q, k, v = qkv.flatten(1, 2).chunk(3, dim=1)
             f, b = time_fwd_bwd(
-                flash_attn_qkvpacked_func, qkv, dropout_p, causal=causal, repeats=repeats, verbose=False
+                flash_attn_func, q, k, v, dropout_p, causal=causal, repeats=repeats, verbose=True
             )
             time_f[config, "Flash2"] = f
             time_b[config, "Flash2"] = b
@@ -170,9 +173,9 @@ for causal in causal_vals:
                     time_f_b[config, method]
                 )
                 print(
-                    f"{method} fwd: {speed_f[config, method]:.2f} TFLOPs/s, "
-                    f"bwd: {speed_b[config, method]:.2f} TFLOPs/s, "
-                    f"fwd + bwd: {speed_f_b[config, method]:.2f} TFLOPs/s"
+                    f"{method} fwd: {speed_f[config, method]:.2f} TFLOPs/s, {time_f[config, method]} s/fwd, "
+                    f"bwd: {speed_b[config, method]:.2f} TFLOPs/s, {time_b[config, method]} s/bwd, "
+                    f"fwd + bwd: {speed_f_b[config, method]:.2f} TFLOPs/s, {time_f_b[config, method]} s/fwd_bwd"
                 )
 
 

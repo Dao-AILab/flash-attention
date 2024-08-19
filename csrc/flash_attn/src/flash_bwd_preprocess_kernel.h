@@ -135,6 +135,43 @@ inline __device__ void compute_dot_do_o(const Params &params) {
     }
 }
 
+template<typename Kernel_traits, typename Params>
+inline __device__ void clear_dQaccum(const Params &params) {
+    using Element = typename Kernel_traits::Element;
+    using ElementAccum = typename Kernel_traits::ElementAccum;
+    using index_t = typename Kernel_traits::index_t;
+
+    const int m_block = blockIdx.x;
+    // The block index for the batch.
+    const int bidb = blockIdx.y;
+    // The block index for the head.
+    const int bidh = blockIdx.z;
+    // The thread index.
+    const int tidx = threadIdx.x;
+
+    constexpr int kBlockM = Kernel_traits::kBlockM;
+    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+
+    const BlockInfo binfo(params, bidb);
+    if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
+
+    const index_t row_offset_dq_accum = binfo.q_offset(params.seqlen_q_rounded * params.h * params.d_rounded, params.h * params.d_rounded, bidb)
+        + (m_block * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128 * bidb)) * params.h * params.d_rounded + bidh * params.d_rounded;
+    // TODO: careful, we're zeroing out dQaccum with type float4, but when
+    // we do atomicAdds, we use type float. The layouts are different. Check this.
+    typename Kernel_traits::GmemTiledCopydQaccum gmem_tiled_copy_dQaccum;
+    auto gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_thread_slice(tidx);
+
+    Tensor gdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dq_accum_ptr) + row_offset_dq_accum),
+              Shape<Int<kBlockM>, Int<kHeadDim>>{},
+              make_stride(params.h * params.d_rounded, _1{}));
+    Tensor tdQgdQaccum = gmem_thr_copy_dQaccum.partition_D(gdQaccum);
+
+
+    Tensor zero = make_fragment_like(tdQgdQaccum);
+    clear(zero);
+    cute::copy(gmem_tiled_copy_dQaccum, zero, tdQgdQaccum);
+}
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, typename Params>
