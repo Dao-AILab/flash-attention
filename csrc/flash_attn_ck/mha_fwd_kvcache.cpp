@@ -40,16 +40,8 @@ fmha_fwd_splitkv_traits get_ck_fmha_fwd_splitkv_traits(const mask_info &mask,
                                    false}; // do_fp8_static_quant
 }
 
-fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
-                                       std::string dtype,
-                                       int head_size,
-                                       bool has_dropout,
-                                       bool has_lse,
-                                       bool enable_alibi);
-
 fmha_fwd_appendkv_args get_ck_fmha_fwd_appendkv_args(const int b,
                                                      const int seqlen_q,
-                                                     const int seqlen_k,
                                                      const int seqlen_knew,
                                                      const int h,
                                                      const int h_k,
@@ -112,7 +104,8 @@ fmha_fwd_appendkv_args get_ck_fmha_fwd_appendkv_args(const int b,
     }
     args.page_block_size = page_block_size;
 
-    args.cache_batch_idx = cache_batch_idx_.has_value() ? cache_batch_idx_.value().data_ptr() : nullptr;
+    args.cache_batch_idx = cache_batch_idx_.has_value() ?
+        reinterpret_cast<int *>(cache_batch_idx_.value().data_ptr()) : nullptr;
 
     args.batch_stride_q = q.stride(0);
     args.stride_q = q.stride(1);
@@ -148,9 +141,6 @@ fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
                                                    const int page_block_size,
                                                    const int num_splits,
                                                    float softmax_scale,
-                                                   float p_dropout,
-                                                   uint64_t drop_seed,
-                                                   uint64_t drop_offset,
                                                    // device pointers
                                                    const at::Tensor q,
                                                    const at::Tensor k,
@@ -201,7 +191,8 @@ fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
 
     args.seqstart_q_ptr = nullptr;
     args.seqstart_k_ptr = nullptr;
-    args.seqlen_k_ptr = seqlens_k_.has_value() ? seqlens_k_.value().data_ptr() : nullptr;
+    args.seqlen_k_ptr = seqlens_k_.has_value() ?
+        reinterpret_cast<int *>(seqlens_k_.value().data_ptr()) : nullptr;
 
     args.seqlen_q = seqlen_q;
     args.seqlen_k = seqlen_k;
@@ -267,123 +258,6 @@ fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
     args.window_size_left = mask.left;
     args.window_size_right = mask.right;
     args.mask_type = static_cast<ck_tile::index_t>(mask.type);
-
-    return args;
-}
-
-fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
-                                   bool has_dropout_randval,
-                                   const mask_info &mask,
-                                   // sizes
-                                   const int b,
-                                   const int seqlen_q,
-                                   const int seqlen_k,
-                                   const int h,
-                                   const int h_k,
-                                   const int d,
-                                   // device pointers
-                                   const at::Tensor q,
-                                   const at::Tensor k,
-                                   const at::Tensor v,
-                                   c10::optional<at::Tensor> &alibi_slopes_,
-                                   c10::optional<const at::Tensor> &seqlens_k_,
-                                   at::Tensor out,
-                                   at::Tensor softmax_lse,
-                                   at::Tensor dropout_randval,
-                                   float softmax_scale,
-                                   float p_dropout,
-                                   uint64_t drop_seed,
-                                   uint64_t drop_offset)
-{
-    // q: (batch_size, seqlen_q, nheads, d)
-    // k: (batch_size, seqlen_k, nheads_k, d)
-    // v: (batch_size, seqlen_k, nheads_k, d)
-    // o: (batch_size, seqlen_q, nheads, d)
-
-    // alibi_slopes:(batch_size, nheads) or (nhead)
-    // lse: (batch_size, nheads, seqlen_q)
-    // randval: (batch_size, nheads, seqlen_q, seqlen_k)
-
-    fmha_fwd_args args;
-    args.q_ptr = q.data_ptr();
-    args.k_ptr = k.data_ptr();
-    args.v_ptr = v.data_ptr();
-    args.bias_ptr = nullptr;
-    args.rand_val_ptr = nullptr;
-    args.lse_ptr = nullptr;
-    args.o_ptr = out.data_ptr();
-    args.seqstart_q_ptr = nullptr;
-    args.seqstart_k_ptr = nullptr;
-    args.seqlen_k_ptr = seqlens_k_.has_value() ? seqlens_k_.value().data_ptr() : nullptr;
-
-    args.seqlen_q = seqlen_q;
-    args.seqlen_k = seqlen_k;
-    args.batch = b;
-    args.max_seqlen_q = seqlen_q;
-    args.hdim_q = d;
-    args.hdim_v = d;
-    args.nhead_q = h;
-    args.nhead_k = h_k;
-    args.scale_s = softmax_scale;
-    args.scale_p = 1;
-    args.scale_o = 1;
-
-    args.batch_stride_q = q.stride(0);
-    args.stride_q = q.stride(1);
-    args.nhead_stride_q = q.stride(2);
-
-    args.batch_stride_k = k.stride(0);
-    args.stride_k = k.stride(1);
-    args.nhead_stride_k = k.stride(2);
-
-    args.batch_stride_v = v.stride(0);
-    args.stride_v = v.stride(1);
-    args.nhead_stride_v = v.stride(2);
-
-    args.batch_stride_o = out.stride(0);
-    args.stride_o = out.stride(1);
-    args.nhead_stride_o = out.stride(2);
-
-    args.batch_stride_bias = 0;
-    args.stride_bias = 0;
-    args.nhead_stride_bias = 0;
-
-    args.batch_stride_randval = 0;
-    args.stride_randval = 0;
-    args.nhead_stride_randval = 0;
-
-    args.batch_stride_lse = 0;
-    args.nhead_stride_lse = 0;
-
-    if (has_dropout_randval) {
-        args.rand_val_ptr = dropout_randval.data_ptr();
-        args.batch_stride_randval = dropout_randval.stride(0);
-        args.stride_randval = dropout_randval.stride(2);
-        args.nhead_stride_randval = dropout_randval.stride(1);
-    }
-
-    if (has_lse) {
-        args.lse_ptr = softmax_lse.data_ptr();
-        args.batch_stride_lse = softmax_lse.stride(0);
-        args.nhead_stride_lse = softmax_lse.stride(1);
-    }
-
-    if (alibi_slopes_.has_value()) {
-        auto alibi_slopes = alibi_slopes_.value();
-        CHECK_DEVICE(alibi_slopes);
-        TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
-        TORCH_CHECK(alibi_slopes.sizes() == torch::IntArrayRef({h}) || alibi_slopes.sizes() == torch::IntArrayRef({b, h}));
-        args.bias_ptr = alibi_slopes.data_ptr();
-        args.stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
-    }
-
-    args.window_size_left = mask.left;
-    args.window_size_right = mask.right;
-    args.mask_type = static_cast<ck_tile::index_t>(mask.type);
-
-    args.p_drop = p_dropout;
-    args.s_randval = has_dropout_randval;
-    args.drop_seed_offset = {drop_seed, drop_offset};
 
     return args;
 }
@@ -455,6 +329,22 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
     // causal=true is the same as causal=false in this case
     if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }
     if (is_causal) { window_size_right = 0; }
+
+    mask_info mask;
+    if (is_causal) {
+        // Causal is the special case where window_size_right == 0 and window_size_left < 0.
+        window_size_right = 0;
+        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0";
+        mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // casual
+    }
+    else if (window_size_left == -1 && window_size_right == -1) {
+        mask = mask_info::decode("0", seqlen_q, seqlen_k); // no mask
+    }
+    else {
+        // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
+        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right);
+        mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // local
+    }
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
@@ -538,15 +428,6 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
             k_padded = k;
             v_padded = v;
         }
-        // params.knew_ptr = k_padded.data_ptr();
-        // params.vnew_ptr = v_padded.data_ptr();
-        // // All stride are in elements, not bytes.
-        // params.knew_batch_stride = k_padded.stride(0);
-        // params.vnew_batch_stride = v_padded.stride(0);
-        // params.knew_row_stride = k_padded.stride(-3);
-        // params.vnew_row_stride = v_padded.stride(-3);
-        // params.knew_head_stride = k_padded.stride(-2);
-        // params.vnew_head_stride = v_padded.stride(-2);
     }
 
     if (seqlens_k_.has_value()) {
@@ -555,9 +436,7 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
         CHECK_DEVICE(seqlens_k);
         CHECK_CONTIGUOUS(seqlens_k);
         CHECK_SHAPE(seqlens_k, batch_size);
-        // params.cu_seqlens_k = static_cast<int *>(seqlens_k.data_ptr());
     }
-    // params.is_seqlens_k_cumulative = !(seqlens_k_.has_value());
 
     int rotary_dim = 0;
     if (rotary_cos_.has_value()) {
@@ -579,9 +458,6 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
         CHECK_SHAPE(rotary_sin, seqlen_ro, rotary_dim / 2);
         CHECK_CONTIGUOUS(rotary_sin);
         TORCH_CHECK(rotary_sin.scalar_type() == q_dtype, "rotary_cos must have the same dtype as query");
-        // params.rotary_cos_ptr = rotary_cos.data_ptr();
-        // params.rotary_sin_ptr = rotary_sin.data_ptr();
-        // params.is_rotary_interleaved = is_rotary_interleaved;
     }
 
 
@@ -590,66 +466,74 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
         CHECK_DEVICE(cache_batch_idx);
         CHECK_CONTIGUOUS(cache_batch_idx);
         TORCH_CHECK(cache_batch_idx.scalar_type() == torch::kInt32, "cache_batch_idx must have dtype int32");
-        // params.cache_batch_idx = reinterpret_cast<int *>(cache_batch_idx.data_ptr());
     }
 
+    TORCH_CHECK(num_splits > 0, "Does not support num_splits == 0 for now");
     // Keep references to these tensors to extend their lifetime
-    // at::Tensor softmax_lse_accum, out_accum;
-    // std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
-    //     params, batch_size, num_heads, head_size_8x, seqlen_k, seqlen_q,
-    //     head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, opts);
-
-    if (paged_KV) {
-        // params.block_table = block_table.data_ptr<int>();
-        // params.block_table_batch_stride = block_table.stride(0);
-    }
-    // params.page_block_size = page_block_size;
+    auto softmax_lse_accum = torch::empty({num_splits, batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    auto out_accum = torch::empty({num_splits, batch_size, num_heads, seqlen_q, head_size_8x}, opts.dtype(at::kFloat));
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     ck_tile::stream_config stream_config{stream};
 
     if (seqlen_knew > 0 || rotary_dim > 0) {
-        auto appendkv_traits = get_ck_fmha_fwd_appendkv_traits(
-            q_dtype_str,
-            head_size_8x,
-            rotary_dim,
-            is_rotary_interleaved);
+        auto appendkv_traits =
+            get_ck_fmha_fwd_appendkv_traits(q_dtype_str, head_size_8x, rotary_dim, is_rotary_interleaved);
 
-        auto appendkv_args = get_ck_fmha_fwd_appendkv_args(
-            batch_size,
-            seqlen_q,
-            seqlen_k,
-            seqlen_knew,
-            num_heads,
-            num_heads_k,
-            head_size_8x,
-            rotary_dim,
-            page_block_size,
-            q,
-            kcache,
-            vcache,
-            k,
-            v,
-            seqlens_k_,
-            rotary_cos_,
-            rotary_sin_,
-            cache_batch_idx_,
-            block_table_);
+        auto appendkv_args =
+            get_ck_fmha_fwd_appendkv_args(
+                batch_size,
+                seqlen_q,
+                seqlen_knew,
+                num_heads,
+                num_heads_k,
+                head_size_8x,
+                rotary_dim,
+                page_block_size,
+                q,
+                kcache,
+                vcache,
+                k,
+                v,
+                seqlens_k_,
+                rotary_cos_,
+                rotary_sin_,
+                cache_batch_idx_,
+                block_table_);
 
         fmha_fwd_appendkv(appendkv_traits, appendkv_args, stream_config);
     }
 
+    // we use splitkv even num_splits == 1
+    auto splitkv_traits =
+        get_ck_fmha_fwd_splitkv_traits(mask, q_dtype_str, head_size_8x, has_lse, alibi_slopes_.has_value());
 
-    if (num_splits > 1 || cache_batch_idx_.has_value() || page_block_size > 0)
-    {
-        // TODO
-        // fmha_fwd_splitkv(fmha_splitkv_traits, fmha_splitkv_args, stream_config);
-    }
-    else
-    {
-        // TODO
-        // fmha_fwd(fmha_traits, fmha_args, stream_config);
-    }
+    auto splitkv_args =
+        get_ck_fmha_fwd_splitkv_args(
+            has_lse,
+            mask,
+            batch_size,
+            seqlen_q,
+            seqlen_k,
+            num_heads,
+            num_heads_k,
+            head_size_8x,
+            page_block_size,
+            num_splits,
+            softmax_scale,
+            q,
+            kcache,
+            vcache,
+            seqlens_k_,
+            cache_batch_idx_,
+            block_table_,
+            alibi_slopes_,
+            out,
+            softmax_lse,
+            softmax_lse_accum,
+            out_accum);
+
+    fmha_fwd_splitkv(splitkv_traits, splitkv_args, stream_config);
 
     if (head_size_og % 8 != 0) {
         out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
