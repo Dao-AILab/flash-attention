@@ -299,7 +299,13 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         ck_tile::stream_config stream_config{stream};
 
         auto traits =
-            get_ck_fmha_fwd_traits(mask, q_dtype_str, head_size_8x, has_dropout, has_lse, alibi_slopes_.has_value());
+            get_ck_fmha_fwd_traits(
+                mask,
+                q_dtype_str,
+                head_size_8x,
+                has_dropout,
+                has_lse,
+                alibi_slopes_.has_value());
 
         auto args =
             get_ck_fmha_fwd_args(
@@ -324,7 +330,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                 drop_seed,
                 drop_offset);
 
-        fmha_fwd(traits, args, stream_config);
+        float t = fmha_fwd(traits, args, stream_config);
+        TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
