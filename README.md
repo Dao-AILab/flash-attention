@@ -1,15 +1,7 @@
-# Customized FlashAttention
-
-This repository provides Customized FlashAttention based on the official implementation.
-we have supported:
-- FlashAttention-2 with QKHeadDim=32, VHeadDim=64
-- FlashAttention-2 with QKHeadDim=64, VHeadDim=128
-- FlashAttention-2 with QKHeadDim=96, VHeadDim=192
-- FlashAttention-2 with QKHeadDim=128, VHeadDim=256
-
-Feel free to tell us what else you need. We might support it soon. :)
-
-Currently, we do not provide prebuilt library, you need to compile from source.
+# FlashAttention
+This repository provides the official implementation of FlashAttention and
+FlashAttention-2 from the
+following papers.
 
 **FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness**  
 Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, Christopher Ré  
