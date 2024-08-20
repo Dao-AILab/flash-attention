@@ -14,7 +14,7 @@ from flash_attn import (
     flash_attn_with_kvcache,
 )
 from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn.flash_attn_interface import _get_block_size_n
+# from flash_attn.flash_attn_interface import _get_block_size_n
 from flash_attn.layers.rotary import apply_rotary_emb
 
 MAX_HEADDIM_SM8x = 192
@@ -461,6 +461,39 @@ def convert_flash_attn_S_to_softmax(
     S_converted = F.pad(S_converted, (0, seqlen_k_og - seqlen_k_rounded))
     return S_converted[:, :, :seqlen_q, :seqlen_k]
 
+def _get_block_size_n_headdim(device, qk_head_dim, v_head_dim, is_dropout, is_causal):
+    # This should match the block sizes in the CUDA kernel
+    assert qk_head_dim <= 256
+    major, minor = torch.cuda.get_device_capability(device)
+    is_sm8x = major == 8 and minor > 0  # Only include sm86 and sm89, exclude sm80 (A100)
+    is_sm80 = major == 8 and minor == 0
+    is_sm90 = major == 9 and minor == 0
+    if qk_head_dim <= 32:
+        return 128
+    if qk_head_dim <= 64:
+        return 128 if not is_dropout else 64
+    elif qk_head_dim <= 96:
+        return 64
+    elif qk_head_dim <= 128:
+        # v_head_dim
+        if v_head_dim==256 and is_dropout:
+            return 64
+        if is_sm8x:
+            return 64 if (not is_dropout and is_causal) else 32
+        else:
+            return 64 if not is_dropout else 32
+    elif qk_head_dim <= 160:
+        if is_sm8x:
+            return 64
+        else:
+            return 32
+    elif qk_head_dim <= 192:
+        return 64
+    elif qk_head_dim <= 224:
+        return 64
+    elif qk_head_dim <= 256:
+        return 64
+
 
 def normalize_flash_attn_S(
     attn_unnorm,
@@ -489,6 +522,7 @@ def normalize_flash_attn_S(
     q, k, v = q.float(), k.float(), v.float()
     _, seqlen_q, _, head_dim = q.shape
     seqlen_k = k.shape[1]
+    v_head_dim = v.shape[-1]
     scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(head_dim), k)
     if key_padding_mask is not None:
         scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
@@ -504,7 +538,7 @@ def normalize_flash_attn_S(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias.to(dtype=scores.dtype)
-    block_size_n = _get_block_size_n(scores.device, head_dim, is_dropout, causal)
+    block_size_n = _get_block_size_n_headdim(scores.device, head_dim, v_head_dim, is_dropout, causal)
     scores_block = scores.split(block_size_n, dim=-1)
     lse_block = torch.stack([torch.logsumexp(s, dim=-1) for s in scores_block], dim=-1)
     lse = torch.logsumexp(lse_block, dim=-1)
@@ -585,9 +619,9 @@ def get_dropout_fraction(
 # @pytest.mark.parametrize("d", [64])
 @pytest.mark.parametrize("d,v_d", [
                                     (32, 64), 
-                                    # (64, 128), error
+                                    (64, 128),
                                     (96, 192), 
-                                    # (128, 256) error
+                                    (128, 256)
                                    ])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
