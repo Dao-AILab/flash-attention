@@ -4,6 +4,7 @@ This repository provides Customized FlashAttention based on the official impleme
 we have supported:
 - FlashAttention-2 with QKHeadDim=32, VHeadDim=64
 - FlashAttention-2 with QKHeadDim=64, VHeadDim=128
+- FlashAttention-2 with QKHeadDim=96, VHeadDim=192
 - FlashAttention-2 with QKHeadDim=128, VHeadDim=256
 
 Feel free to tell us what else you need. We might support it soon. :)
