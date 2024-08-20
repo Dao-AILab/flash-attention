@@ -96,11 +96,13 @@ fmha_fwd_appendkv_args get_ck_fmha_fwd_appendkv_args(const int b,
         auto block_table = block_table_.value();
         args.block_table_ptr = block_table.data_ptr();
         args.batch_stride_block_table = block_table.stride(0);
+        args.page_block_size = page_block_size;
     }
     else
     {
         args.block_table_ptr = nullptr;
         args.batch_stride_block_table = 0;
+        args.page_block_size = 0;
     }
     args.page_block_size = page_block_size;
 
@@ -179,11 +181,13 @@ fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
         auto block_table = block_table_.value();
         args.block_table_ptr = block_table.data_ptr();
         args.batch_stride_block_table = block_table.stride(0);
+        args.page_block_size = page_block_size;
     }
     else
     {
         args.block_table_ptr = nullptr;
         args.batch_stride_block_table = 0;
+        args.page_block_size = 0;
     }
     args.page_block_size = page_block_size;
 
