@@ -371,13 +371,17 @@ void run_mha_bwd_qkdim64_vdim128(Flash_bwd_params &params, cudaStream_t stream) 
         // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, Headdim, 128, 128, 8, 2, 4, 4, false, false, T>>(params, stream);
         // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, Headdim, 128, 64, 8, 4, 2, 4, false, false, T>, Is_dropout>(params, stream);
         // This is slightly faster. We want to split M more so we need fewer registers to store LSE.
-        constexpr static int Br = 128;
+        constexpr static int Br = 64;
         constexpr static int Bc = 128;
         constexpr static int  smem_size = 2 *(Br * QKHeaddim * 2 /*Q with double buffer*/ +  Br * VHeaddim /* dO*/ + Bc * QKHeaddim /*K, dK*/ + Bc * VHeaddim /*V, dV*/ + 
                 Br * Bc * 2 /*dS, P*/);
+        // printf("smem_size = %d\n", smem_size);
+        // printf("max_smem_per_block = %d\n", max_smem_per_block);
 
         if (max_smem_per_block >= 144 * 1024) {
-            run_flash_bwd<Flash_bwd_kernel_traits<QKHeaddim, VHeaddim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            run_flash_bwd<Flash_bwd_kernel_traits<QKHeaddim, VHeaddim, 64, 128, 8, 2, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            // A100 shared memory spill
+            // run_flash_bwd<Flash_bwd_kernel_traits<QKHeaddim, VHeaddim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
             // This has a lot of register spilling
             // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout>(params, stream);
         } else {
@@ -448,7 +452,7 @@ void run_mha_bwd_qkdim128_vdim256(Flash_bwd_params &params, cudaStream_t stream)
     // printf("max_smem_per_block = %d\n", max_smem_per_block);
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         constexpr static int Br = 64;
-        constexpr static int Bc = 128;
+        constexpr static int Bc = 64;
         constexpr static int  smem_size = 2 *(Br * QKHeaddim * 2 /*Q with double buffer*/ +  Br * VHeaddim /* dO*/ + Bc * QKHeaddim /*K, dK*/ + Bc * VHeaddim /*V, dV*/ + 
                 Br * Bc * 2 /*dS, P*/);
         // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, Headdim, 32, 128, 8, 2, 2, 2, false, false, T>>(params, stream);
@@ -456,7 +460,9 @@ void run_mha_bwd_qkdim128_vdim256(Flash_bwd_params &params, cudaStream_t stream)
         // Out of these three, the 2nd one is slightly faster (2% faster than the first). Idk why.
         // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, Headdim, 64, 128, 8, 2, 2, 2, false, false, T>>(params, stream);
         if (max_smem_per_block >= 144 * 1024) {
-            run_flash_bwd<Flash_bwd_kernel_traits<QKHeaddim, VHeaddim, 64, 128, 8, 2, 4, 2, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            run_flash_bwd<Flash_bwd_kernel_traits<QKHeaddim, VHeaddim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            // A100 shared memory spill
+            // run_flash_bwd<Flash_bwd_kernel_traits<QKHeaddim, VHeaddim, 64, 128, 8, 2, 4, 2, false, false, T>, Is_dropout, Is_causal>(params, stream);
             // run_flash_bwd_seqk_parallel<Flash_bwd_kernel_traits<Headdim, Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout>(params, stream);
             // run_flash_bwd_seqk_parallel<Flash_bwd_kernel_traits<Headdim, Headdim, 128, 128, 8, 4, 4, 4, false, true, T>, Is_dropout>(params, stream);
             // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, Headdim, 64, 128, 8, 2, 4, 2, true, false, T>, Is_dropout>(params, stream);
