@@ -104,7 +104,6 @@ fmha_fwd_appendkv_args get_ck_fmha_fwd_appendkv_args(const int b,
         args.batch_stride_block_table = 0;
         args.page_block_size = 0;
     }
-    args.page_block_size = page_block_size;
 
     args.cache_batch_idx = cache_batch_idx_.has_value() ?
         reinterpret_cast<int *>(cache_batch_idx_.value().data_ptr()) : nullptr;
@@ -189,7 +188,6 @@ fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
         args.batch_stride_block_table = 0;
         args.page_block_size = 0;
     }
-    args.page_block_size = page_block_size;
 
     args.cache_batch_idx = cache_batch_idx_.has_value() ? cache_batch_idx_.value().data_ptr() : nullptr;
 
@@ -448,7 +446,7 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
         auto rotary_cos = rotary_cos_.value();
         CHECK_DEVICE(rotary_cos);
         rotary_dim = rotary_cos.size(1) * 2;
-        TORCH_CHECK(rotary_dim <= head_size_8x, "rotary_dim must be <= headdim");
+        TORCH_CHECK(rotary_dim <= head_size_og, "rotary_dim must be <= headdim");
         TORCH_CHECK(rotary_dim % 16 == 0, "Only rotary dimensions divisible by 16 are currently supported");
         const int seqlen_ro = rotary_cos.size(0);
         TORCH_CHECK(seqlen_ro >= seqlen_k, "cos/sin seqlen must be at least the seqlen of KV cache");
