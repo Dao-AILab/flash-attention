@@ -24,12 +24,12 @@ namespace flash {
 
 using namespace cute;
 
-template <typename Ktraits, bool Is_causal, bool Is_local, typename TileScheduler, typename Seqlen_traits>
+template <typename Ktraits, bool Is_causal, bool Is_local, typename TileScheduler, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
 __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1)
-    compute_attn_ws(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal, Is_local, Seqlen_traits>::Params const mainloop_params,
-                    CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits, Seqlen_traits>::Params const epilogue_params,
+    compute_attn_ws(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>::Params const mainloop_params,
+                    CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>::Params const epilogue_params,
                     CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params,
-                    Seqlen_traits seqlen_traits_q, Seqlen_traits seqlen_traits_k
+                    Seqlen_traits_Q seqlen_traits_q, Seqlen_traits seqlen_traits_k
                     ) {
 
     using Element = typename Ktraits::Element;
@@ -47,8 +47,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     // static constexpr int kBlockN = Ktraits::kBlockN;
     // constexpr int kHeadDim = Ktraits::kHeadDim;
 
-    using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, Is_local, Seqlen_traits>;
-    using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits, Seqlen_traits>;
+    using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>;
+    using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>;
 
     using MainloopPipeline = typename Ktraits::MainloopPipeline;
     using PipelineParams = typename MainloopPipeline::Params;
@@ -192,12 +192,12 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
 }
 
-template <typename Ktraits, bool Is_causal, typename TileScheduler, typename Seqlen_traits>
+template <typename Ktraits, bool Is_causal, typename TileScheduler, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
 __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1)
-    compute_attn_ws_fp8(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal, /*Is_local=*/false, Seqlen_traits>::Params const mainloop_params,
-                        CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits, Seqlen_traits>::Params const epilogue_params,
+    compute_attn_ws_fp8(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal, /*Is_local=*/false, Seqlen_traits, Seqlen_traits_Q>::Params const mainloop_params,
+                        CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>::Params const epilogue_params,
                         CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params,
-                        Seqlen_traits seqlen_traits_q, Seqlen_traits seqlen_traits_k
+                        Seqlen_traits_Q seqlen_traits_q, Seqlen_traits seqlen_traits_k
                         ) {
 
     using Element = typename Ktraits::Element;
@@ -219,8 +219,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128;    
     static constexpr bool Use_max_offset = true;
 
-    using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, /*Is_local=*/false, Seqlen_traits>;
-    using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits, Seqlen_traits>;
+    using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, /*Is_local=*/false, Seqlen_traits, Seqlen_traits_Q>;
+    using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>;
 
     using MainloopPipeline = typename Ktraits::MainloopPipeline;
     using MainloopPipelineVt = typename Ktraits::MainloopPipelineNoTMA;

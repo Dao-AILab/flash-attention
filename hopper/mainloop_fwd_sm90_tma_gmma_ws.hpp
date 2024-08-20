@@ -79,7 +79,7 @@ struct SmemTransposeFp8_64x64 {
   }
 };
 
-template <typename Ktraits, bool Is_causal, bool Is_local, typename Seqlen_traits>
+template <typename Ktraits, bool Is_causal, bool Is_local, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
 struct CollectiveMainloopFwd {
 
     using Element = typename Ktraits::Element;
@@ -101,8 +101,8 @@ struct CollectiveMainloopFwd {
         GmemTiledCopyQ{},
         make_tensor(
             make_gmem_ptr(static_cast<Element const*>(nullptr)), 
-            repeat_like(typename Seqlen_traits::StrideT{}, int32_t(0)), 
-            typename Seqlen_traits::StrideT{}
+            repeat_like(typename Seqlen_traits_Q::StrideT{}, int32_t(0)), 
+            typename Seqlen_traits_Q::StrideT{}
         ),
         SmemLayoutQ{},
         select<0, 2>(TileShape_MNK{}),
@@ -149,7 +149,7 @@ struct CollectiveMainloopFwd {
     // Host side kernel arguments
     struct Arguments {
         Element const* ptr_Q;
-        typename Seqlen_traits::LayoutT layout_Q;
+        typename Seqlen_traits_Q::LayoutT layout_Q;
         Element const* ptr_K;
         typename Seqlen_traits::LayoutT layout_K;
         Element const* ptr_V;
@@ -165,7 +165,7 @@ struct CollectiveMainloopFwd {
 
     // Device side kernel params
     struct Params {
-        typename Seqlen_traits::LayoutT layout_Q;
+        typename Seqlen_traits_Q::LayoutT layout_Q;
         typename Seqlen_traits::LayoutT layout_K;
         typename Seqlen_traits::LayoutT layout_V;
         cutlass::FastDivmod qhead_per_khead_divmod;
@@ -225,12 +225,12 @@ struct CollectiveMainloopFwd {
     CUTLASS_DEVICE
     int get_n_block_max(
           Params const& mainloop_params, int m_block, 
-          const Seqlen_traits& seqlen_traits_q,
+          const Seqlen_traits_Q& seqlen_traits_q,
           const Seqlen_traits& seqlen_traits_k
         ) {
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});        
-        // int const seqlen_q = Seqlen_traits::UseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        // int const seqlen_q = Seqlen_traits_Q::UseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
         // int const seqlen_k = Seqlen_traits::UseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         int const seqlen_q = seqlen_traits_q.actual_seq_len;
         int const seqlen_k = seqlen_traits_k.actual_seq_len;
@@ -276,7 +276,7 @@ struct CollectiveMainloopFwd {
          typename Scheduler::WorkTileInfo& work_tile_info,
          cute::tuple<int32_t, int32_t, int32_t> block_coord,
          int work_idx,
-         const Seqlen_traits& seqlen_traits_q,
+         const Seqlen_traits_Q& seqlen_traits_q,
          const Seqlen_traits& seqlen_traits_k
          ) {
 
@@ -383,7 +383,7 @@ struct CollectiveMainloopFwd {
          typename Scheduler::WorkTileInfo& work_tile_info,
          cute::tuple<int32_t, int32_t, int32_t> block_coord,
          int work_idx,
-         const Seqlen_traits& seqlen_traits_q,
+         const Seqlen_traits_Q& seqlen_traits_q,
          const Seqlen_traits& seqlen_traits_k         
          ) {
         
@@ -684,7 +684,7 @@ struct CollectiveMainloopFwd {
         int work_idx,
         int m_block,
         SharedStorage& shared_storage,
-        const Seqlen_traits& seqlen_traits_q,
+        const Seqlen_traits_Q& seqlen_traits_q,
         const Seqlen_traits& seqlen_traits_k
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
@@ -876,7 +876,7 @@ struct CollectiveMainloopFwd {
         int work_idx,
         int m_block,
         SharedStorage& shared_storage,
-        const Seqlen_traits& seqlen_traits_q,
+        const Seqlen_traits_Q& seqlen_traits_q,
         const Seqlen_traits& seqlen_traits_k
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
@@ -906,7 +906,7 @@ struct CollectiveMainloopFwd {
 
         tiled_mma1.accumulate_ = GMMA::ScaleOut::Zero;
         // workaround for fp8 only perf regression pending change to seqlen traits class
-        int const seqlen_q = Seqlen_traits::UseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        int const seqlen_q = Seqlen_traits_Q::UseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
         int const seqlen_k = Seqlen_traits::UseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         int n_block = n_block_count - 1;
         
