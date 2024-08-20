@@ -26,6 +26,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using TileShape_MNK = typename Kernel_traits::TileShape_MNK;
     using ClusterShape = typename Kernel_traits::ClusterShape_MNK;
 
+    static_assert(Seqlen_traits_Q::DecodingGQA == (Kernel_traits::kBlockH > 1));
+
     // print(typename Kernel_traits::SmemLayoutVt{}); printf("\n"); print(typename Kernel_traits::SmemLayoutVt_tmp{});
     using CollectiveMainloop = flash::CollectiveMainloopFwd<Kernel_traits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<Kernel_traits, Seqlen_traits_Q>;
@@ -43,9 +45,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.total_k, params.seqlen_k, params.cu_seqlens_k, params.seqused_k);
     typename CollectiveMainloop::Params mainloop_params =
         CollectiveMainloop::to_underlying_arguments({
-            static_cast<Element const*>(params.q_ptr),
+            static_cast<Element const*>(params.q_ptr),            
             seqlen_traits_q.get_gmem_layout(
-                params.seqlen_q, params.d, params.h, params.b, 
+                params.seqlen_q, params.d, params.h_k, params.b, params.h_h_k_ratio, 
                 params.q_row_stride, params.q_head_stride, params.q_batch_stride
             ),  // layout_Q
             static_cast<Element const*>(params.k_ptr),
@@ -68,10 +70,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         });
     typename CollectiveEpilogue::Params epilogue_params =
         CollectiveEpilogue::to_underlying_arguments({
-            static_cast<OutputType*>(params.o_ptr),
+            static_cast<OutputType*>(params.o_ptr),            
             seqlen_traits_q.get_gmem_layout(
-                params.seqlen_q, params.d, params.h, params.b,
-                params.o_row_stride, params.o_head_stride, params.o_batch_stride
+                params.seqlen_q, params.d, params.h_k, params.b, params.h_h_k_ratio, 
+                params.q_row_stride, params.q_head_stride, params.q_batch_stride
             ),  // layout_O
             static_cast<float*>(params.softmax_lse_ptr),
             seqlen_traits_q.get_lse_gmem_layout(

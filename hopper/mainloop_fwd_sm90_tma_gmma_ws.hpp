@@ -93,6 +93,8 @@ struct CollectiveMainloopFwd {
     using GmemTiledCopyKV = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<0>(ClusterShape{})));
     
     using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
+    using SmemLayoutQCopy = typename Ktraits::SmemLayoutQCopy;
+    using TileShapeQCopy = typename Ktraits::TileShapeQCopy;
     using SmemLayoutK = typename Ktraits::SmemLayoutK;
     using SmemLayoutV = typename Ktraits::SmemLayoutV;
     using SmemLayoutVt = typename Ktraits::SmemLayoutVt;
@@ -104,8 +106,8 @@ struct CollectiveMainloopFwd {
             repeat_like(typename Seqlen_traits_Q::StrideT{}, int32_t(0)), 
             typename Seqlen_traits_Q::StrideT{}
         ),
-        SmemLayoutQ{},
-        select<0, 2>(TileShape_MNK{}),
+        SmemLayoutQCopy{},
+        TileShapeQCopy{},
         _1{}));  // no mcast for Q
 
     using TMA_K = decltype(make_tma_copy(
@@ -188,8 +190,8 @@ struct CollectiveMainloopFwd {
         TMA_Q tma_load_Q = make_tma_copy(
             GmemTiledCopyQ{},
             mQ,
-            SmemLayoutQ{},
-            select<0, 2>(TileShape_MNK{}),
+            SmemLayoutQCopy{},
+            TileShapeQCopy{},
             _1{}); // no mcast for Q
         Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K), args.layout_K);
         TMA_K tma_load_K = make_tma_copy(
@@ -296,8 +298,18 @@ struct CollectiveMainloopFwd {
         uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
         constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
-        Tensor gQ = seqlen_traits_q.get_local_tile_tensor(
-            mQ, select<0, 2>(TileShape_MNK{}), bidh, bidb)(_, _, m_block);  // (M, K)
+        Tensor gQ = [&] {
+            // Need this inside lambda to capture structured binding
+            auto [m_block, bidh, bidb] = block_coord;
+            if constexpr(Seqlen_traits_Q::DecodingGQA) {
+                return seqlen_traits_q.get_local_tile_tensor(
+                    mQ, TileShapeQCopy{}, bidh_kv, bidb)
+                        (_, _, _, m_block, bidh % int(mainloop_params.qhead_per_khead_divmod));  // (M/H, H, K)
+            } else {
+                return seqlen_traits_q.get_local_tile_tensor(
+                    mQ, TileShapeQCopy{}, bidh, bidb)(_, _, m_block);  // (M, K)
+            }
+        }();
         Tensor gK = seqlen_traits_k.get_local_tile_tensor(
             mK, select<1, 2>(TileShape_MNK{}), bidh_kv, bidb_cache);  // (N, K, _)
         Tensor gV = seqlen_traits_k.get_local_tile_tensor(

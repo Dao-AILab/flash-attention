@@ -36,6 +36,8 @@ struct CollectiveEpilogueFwd {
     using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
     using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 2>(TileShape_MNK{})));
+    using SmemLayoutOCopy = typename Ktraits::SmemLayoutOCopy;
+    using TileShapeOCopy = typename Ktraits::TileShapeOCopy;
 
     using SmemCopyAtomO = Copy_Atom<cute::SM90_U32x4_STSM_N, Element>;
     using SharedStorage = cute::array_aligned<Element, cute::cosize_v<SmemLayoutO>>;

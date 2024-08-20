@@ -21,7 +21,7 @@ static constexpr int DecodingGQASeqLenType = 2;
 template <int SeqLenType> class SeqLenTraits {
 public:
   static_assert(SeqLenType == 0 || SeqLenType == 1 || SeqLenType == 2, 
-                  "SeqLenType must be 0, 1, or 2");
+                  "SeqLenType must be 0, 1, or 2");  
 
   // Total number of queries / keys. Unpadded.
   int sum_s = 0;
@@ -85,6 +85,16 @@ public:
                        make_stride(m_stride, cute::_1{}, h_stride, b_stride));
   }
 
+  // Overload that separates h into h_k and h/h_k
+  CUTLASS_HOST_DEVICE auto get_gmem_layout(
+      int m, int k, int h_k, int b, int h_h_k_ratio,
+      int64_t m_stride, int64_t h_stride, int64_t b_stride,
+      bool padded = false) const {
+    static_assert(SeqLenType == FixedSeqLenType, "Default implementation is for FixedSeqLen.");
+    return make_layout(make_shape(m, k, h_k * h_h_k_ratio, b),
+                       make_stride(m_stride, cute::_1{}, h_stride, b_stride));    
+  }
+
   // Returns the layout of a tensor in MKHB format in global memory.
   // padded: only useful for var-seq-len for dq_accum and softmax_d.
   CUTLASS_HOST_DEVICE auto get_lse_gmem_layout(
@@ -122,6 +132,7 @@ public:
   }
 };
 
+#if 0
 template <>
 class SeqLenTraits<DecodingGQASeqLenType> {
 public:
@@ -147,6 +158,7 @@ public:
       return g_tensor;
     }
 };
+#endif
 
 using FixedSeqLenTraits = SeqLenTraits<FixedSeqLenType>;
 using VarSeqLenTraits = SeqLenTraits<VarSeqLenType>;
@@ -163,6 +175,16 @@ CUTLASS_HOST_DEVICE auto VarSeqLenTraits::get_gmem_layout(
     bool padded) const {
   return make_layout(
     make_shape(sum_s + (padded ? kMaxTileSize * b : 0), k, h), 
+    make_stride(m_stride, cute::_1{}, h_stride));
+}
+
+template <>
+CUTLASS_HOST_DEVICE auto VarSeqLenTraits::get_gmem_layout(
+    int m, int k, int h_k, int b, int h_h_k_ratio,
+    int64_t m_stride, int64_t h_stride, int64_t b_stride,
+    bool padded) const {
+  return make_layout(
+    make_shape(sum_s + (padded ? kMaxTileSize * b : 0), k, h_k * h_h_k_ratio), 
     make_stride(m_stride, cute::_1{}, h_stride));
 }
 
@@ -213,6 +235,29 @@ CUTLASS_DEVICE auto VarSeqLenTraits::get_lse_local_tile_tensor(
       g_offset.data(), 
       make_layout(cute::make_shape(actual_seq_len), cute::make_shape(_1{})));
   auto g_tensor = local_tile(g_sequence, tile_shape, make_coord(_));
+  return g_tensor;
+}
+
+// Returns layout of QO tensor in (M,H/HK,K,HK,B) format in global memory.
+template <>
+CUTLASS_HOST_DEVICE auto DecodingGQASeqLenTraits::get_gmem_layout(
+    int m, int k, int h_k, int b, int h_h_k_ratio,
+    int64_t m_stride, int64_t h_stride, int64_t b_stride, bool padded) const {
+    return make_layout(make_shape(m, h_h_k_ratio, k, h_k, b),
+                        make_stride(m_stride, h_stride, cute::_1{},
+                                    h_stride * h_h_k_ratio, b_stride));
+}
+
+// Tile Shape should be (bM/HQ, bHQ, bK)
+// Returns local tile (_, _, bK) that evaluates to (bM/HQ, bHQ, bK)
+template <>
+template <typename MTensor, typename Shape>
+CUTLASS_DEVICE auto DecodingGQASeqLenTraits::get_local_tile_tensor(
+    const MTensor &m_tensor, const Shape &tile_shape, 
+    int bidh_kv, int bidb, bool padded) const {      
+  // m_block, bidh % h_h_k_ratio are remaining coordinates
+  auto g_tensor = local_tile(
+      m_tensor(_, _, _, bidh_kv, bidb), tile_shape, make_coord(_, _, _0{}));
   return g_tensor;
 }
 
