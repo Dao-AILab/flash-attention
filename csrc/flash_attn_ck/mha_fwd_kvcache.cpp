@@ -163,7 +163,7 @@ fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
     // alibi_slopes:(batch_size, nheads) or (nhead)
     // lse: (batch_size, nheads, seqlen_q)
     // lse_acc: (split, batch_size, nheads, seqlen_q)
-    // o_acc: (split, batch_size, seqlen_q, nheads, d)
+    // o_acc: (split, batch_size, nheads, seqlen_q, d)
 
     fmha_fwd_splitkv_args args;
     args.q_ptr = q.data_ptr();
@@ -239,8 +239,8 @@ fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
 
     args.split_stride_o_acc = out_acc.stride(0);
     args.batch_stride_o_acc = out_acc.stride(1);
-    args.stride_o_acc = out_acc.stride(2);
-    args.nhead_stride_o_acc = out_acc.stride(3);
+    args.nhead_stride_o_acc = out_acc.stride(2);
+    args.stride_o_acc = out_acc.stride(3);
 
     if (has_lse) {
         args.lse_ptr = lse.data_ptr();
