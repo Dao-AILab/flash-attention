@@ -73,7 +73,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             static_cast<OutputType*>(params.o_ptr),            
             seqlen_traits_q.get_gmem_layout(
                 params.seqlen_q, params.d, params.h_k, params.b, params.h_h_k_ratio, 
-                params.q_row_stride, params.q_head_stride, params.q_batch_stride
+                params.o_row_stride, params.o_head_stride, params.o_batch_stride
             ),  // layout_O
             static_cast<float*>(params.softmax_lse_ptr),
             seqlen_traits_q.get_lse_gmem_layout(
