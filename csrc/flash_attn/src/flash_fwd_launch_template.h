@@ -410,7 +410,9 @@ void run_mha_fwd_qkdim128_vdim256(Flash_fwd_params &params, cudaStream_t stream)
             // 1st ones are good for H100, A100
             // 2nd one is good for A6000 bc we get slightly better occupancy
         } else {
-            run_flash_fwd<Flash_fwd_kernel_traits<QKHeaddim, VHeaddim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            run_flash_fwd<Flash_fwd_kernel_traits<QKHeaddim, VHeaddim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            // A100 RuntimeError: CUDA error: an illegal memory access was encountered
+            // run_flash_fwd<Flash_fwd_kernel_traits<QKHeaddim, VHeaddim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, Headdim, 128, 32, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, Headdim, 128, 32, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
