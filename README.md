@@ -57,7 +57,7 @@ python setup.py install
 To run the test:
 ```sh
 export PYTHONPATH=$PWD
-pytest -q -s test_flash_attn.py
+pytest -q -s ../tests/test_flash_attn.py
 ```
 
 
