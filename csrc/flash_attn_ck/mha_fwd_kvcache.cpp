@@ -532,7 +532,7 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
             q,
             kcache,
             vcache,
-            seqlens_k_,
+            append_seqlens_k,
             cache_batch_idx_,
             block_table_,
             alibi_slopes_,
