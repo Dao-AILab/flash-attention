@@ -162,6 +162,7 @@ struct CollectiveMainloopFwd {
         float const* descale_v_ptr;
         int window_size_left;
         int window_size_right;
+        int const qhead_per_khead;
         int const* cache_batch_idx;
     };
 
@@ -208,7 +209,7 @@ struct CollectiveMainloopFwd {
             select<1, 2>(TileShape_MNK{}),
             size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
         return {args.layout_Q, args.layout_K, args.layout_V,
-                cutlass::FastDivmod(cute::ceil_div(get<2>(args.layout_Q.shape()), get<2>(args.layout_K.shape()))),
+                cutlass::FastDivmod(args.qhead_per_khead),
                 tma_load_Q, tma_load_K, tma_load_V,
                 args.softmax_scale_log2,
                 args.descale_q_ptr, args.descale_k_ptr, args.descale_v_ptr,

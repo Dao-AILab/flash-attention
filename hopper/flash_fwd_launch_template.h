@@ -43,6 +43,16 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.total_q, params.seqlen_q, params.cu_seqlens_q, params.seqused_q);
     Seqlen_traits seqlen_traits_k(
         params.total_k, params.seqlen_k, params.cu_seqlens_k, params.seqused_k);
+
+    // print("Q layout: ");
+    // print(seqlen_traits_q.get_gmem_layout(
+    //             params.seqlen_q, params.d, params.h_k, params.b, params.h_h_k_ratio, 
+    //             params.q_row_stride, params.q_head_stride, params.q_batch_stride));
+    // print("\n");
+    // print("Q smem layout: ");
+    // using SmemLayoutQCopy = typename Kernel_traits::SmemLayoutQCopy;
+    // print(SmemLayoutQCopy{});
+    // print("\n");
     typename CollectiveMainloop::Params mainloop_params =
         CollectiveMainloop::to_underlying_arguments({
             static_cast<Element const*>(params.q_ptr),            
@@ -66,6 +76,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             params.descale_v_ptr,
             params.window_size_left,
             params.window_size_right,
+            ceil_div(params.h_h_k_ratio, Kernel_traits::kBlockH),
             params.cache_batch_idx
         });
     typename CollectiveEpilogue::Params epilogue_params =
@@ -85,6 +96,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     int num_blocks_m = cutlass::ceil_div(params.seqlen_q, Kernel_traits::kBlockM/Kernel_traits::kBlockH);
     num_blocks_m = cutlass::ceil_div(num_blocks_m, size<0>(ClusterShape{})) * size<0>(ClusterShape{});    
     int num_grid_heads = params.h_k * ceil_div(params.h_h_k_ratio, Kernel_traits::kBlockH);
+
+    // std::cout << "num blocks m = " << num_blocks_m << " num grid heads" << num_grid_heads << std::endl;
     typename Scheduler::Arguments scheduler_args = {num_blocks_m, num_grid_heads, params.b, params.tile_count_semaphore};
     typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
