@@ -17,7 +17,9 @@ void run_mha_fwd_qkdim128_vdim256(Flash_fwd_params &params, cudaStream_t stream)
                     run_flash_fwd<Flash_fwd_kernel_traits<QKHeaddim, VHeaddim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
                 }
             } else {
-                run_flash_fwd<Flash_fwd_kernel_traits<QKHeaddim, VHeaddim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                run_flash_fwd<Flash_fwd_kernel_traits<QKHeaddim, VHeaddim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                // slow on A100
+                // run_flash_fwd<Flash_fwd_kernel_traits<QKHeaddim, VHeaddim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
             }
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, Headdim, 128, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, Headdim, 128, 64, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
