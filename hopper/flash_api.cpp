@@ -240,7 +240,8 @@ void set_params_dgrad(Flash_bwd_params &params,
 }
 
 
-void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
+void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {    
+
     // HEADDIM_SWITCH(params.d, [&] {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
@@ -257,7 +258,11 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
             if (params.d == 64) {
                 run_mha_fwd_<cutlass::half_t, 64>(params, stream);
             } else if (params.d == 128) {
-                run_mha_fwd_<cutlass::half_t, 128>(params, stream);
+                if(params.use_gqa_decoding) {
+                    run_mha_fwd_gqa_<cutlass::half_t, 128>(params, stream);
+                } else {
+                    run_mha_fwd_<cutlass::half_t, 128>(params, stream);
+                }
             } else {
                 run_mha_fwd_<cutlass::half_t, 256>(params, stream);
             }
@@ -284,7 +289,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         c10::optional<at::Tensor> &descale_v_, // 1
         bool is_causal,
         int window_size_left,
-        int window_size_right) {
+        int window_size_right,
+        bool use_gqa_decoding = false
+        ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
@@ -419,6 +426,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         params.descale_k_ptr = nullptr;
         params.descale_v_ptr = nullptr;
     }
+    
+    params.use_gqa_decoding = use_gqa_decoding;
 
     if (seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();

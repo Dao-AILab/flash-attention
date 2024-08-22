@@ -50,8 +50,8 @@ struct CollectiveEpilogueFwd {
             typename Seqlen_traits::ShapeT{}, 
             typename Seqlen_traits::StrideT{}
         ),
-        SmemLayoutO{},
-        select<0, 2>(TileShape_MNK{}),
+        SmemLayoutOCopy{},
+        TileShapeOCopy{},
         _1{}));  // no mcast for O
 
     // These are for storing the output tensor without TMA (e.g., for setting output to zero and var-seq-len)
@@ -106,8 +106,8 @@ struct CollectiveEpilogueFwd {
         TMA_O tma_store_O = make_tma_copy(
             GmemTiledCopyOTMA{},
             mO,
-            SmemLayoutO{},
-            select<0, 2>(TileShape_MNK{}),
+            SmemLayoutOCopy{},
+            TileShapeOCopy{},
             _1{}); // no mcast for O
         return {args.ptr_O, args.layout_O, args.ptr_LSE, args.layout_LSE, tma_store_O};
     }
@@ -129,7 +129,8 @@ struct CollectiveEpilogueFwd {
           TiledMma tiled_mma,
           int thread_idx,
           cute::tuple<int32_t, int32_t, int32_t> const& block_coord,
-          const Seqlen_traits& seqlen_traits_q
+          const Seqlen_traits& seqlen_traits_q,
+          const cutlass::FastDivmod& qhead_per_khead_divmod
           ) {
 
         auto [m_block, bidh, bidb] = block_coord;
@@ -148,22 +149,25 @@ struct CollectiveEpilogueFwd {
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp,
                                             cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
-        Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.ptr_LSE), epilogue_params.layout_LSE);
-        Tensor gLSE = seqlen_traits_q.get_lse_local_tile_tensor(
-            mLSE, Shape<Int<kBlockM>>{}, bidh, bidb)(_, m_block);
-        Tensor caccO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));
-        auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
-        Tensor taccOcO = thread_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
-        static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
-        static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
-        // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the row indices.
-        Tensor taccOcO_row = taccOcO(make_coord(_0{}, _, _0{}), _, _0{});
-        CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
-        if (get<1>(taccOcO_row(_0{})) == 0) {
-            #pragma unroll
-            for (int mi = 0; mi < size(lse); ++mi) {
-                const int row = get<0>(taccOcO_row(mi));                
-                if (row < seqlen_traits_q.actual_seq_len - m_block * kBlockM) { gLSE(row) = lse(mi); }
+        // Don't write out LSE in gqa decoding
+        if constexpr(!Seqlen_traits::DecodingGQA) {
+            Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.ptr_LSE), epilogue_params.layout_LSE);
+            Tensor gLSE = seqlen_traits_q.get_lse_local_tile_tensor(
+                mLSE, Shape<Int<kBlockM>>{}, bidh, bidb)(_, m_block);
+            Tensor caccO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));
+            auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+            Tensor taccOcO = thread_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
+            static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
+            static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
+            // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the row indices.
+            Tensor taccOcO_row = taccOcO(make_coord(_0{}, _, _0{}), _, _0{});
+            CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
+            if (get<1>(taccOcO_row(_0{})) == 0) {
+                #pragma unroll
+                for (int mi = 0; mi < size(lse); ++mi) {
+                    const int row = get<0>(taccOcO_row(mi));                
+                    if (row < seqlen_traits_q.actual_seq_len - m_block * kBlockM) { gLSE(row) = lse(mi); }
+                }
             }
         }
 
@@ -175,11 +179,29 @@ struct CollectiveEpilogueFwd {
             );
         }
         TiledCopyO gmem_tiled_copy_O;
-        flash::write_O<!Seqlen_traits::UseVarSeqLen, NumCopyThreads>(
-            epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O, 
-            epilogue_params.layout_O, select<0, 2>(TileShape_MNK{}), sO, 
-            m_block, bidh, bidb, seqlen_traits_q, write_warp_idx
-        );
+        Tensor sO_out = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutOCopy{});        
+        if constexpr(!Seqlen_traits::DecodingGQA) {        
+            flash::write_O<!Seqlen_traits::UseVarSeqLen, NumCopyThreads>(
+                epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O, 
+                epilogue_params.layout_O, TileShapeOCopy{}, sO_out, 
+                m_block, bidh, bidb, seqlen_traits_q, write_warp_idx
+            );
+        } else {
+            int bidh_kv = qhead_per_khead_divmod.divide(bidh);
+            Tensor mO = epilogue_params.tma_store_O.get_tma_tensor(epilogue_params.layout_O.shape());
+            Tensor gO = seqlen_traits_q.get_local_tile_tensor(
+                    mO, TileShapeOCopy{}, bidh_kv, bidb)
+                        (_, _, _, m_block, bidh % int(qhead_per_khead_divmod));  // (M/H, H, K)
+            auto block_tma_O = epilogue_params.tma_store_O.get_slice(_0{});
+            Tensor tOgO = block_tma_O.partition_D(gO);  // (TMA, TMA_M, TMA_K)
+            Tensor tOsO = block_tma_O.partition_S(sO_out);  // (TMA, TMA_M, TMA_K)
+            int const lane_predicate = cute::elect_one_sync();
+            int const warp_idx = cutlass::canonical_warp_idx_sync();
+            if (warp_idx == write_warp_idx && lane_predicate) {
+                cute::copy(epilogue_params.tma_store_O, tOsO, tOgO);
+                tma_store_arrive();
+            }
+        }
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename FrgTensorLSE, typename TiledMma>
@@ -264,6 +286,7 @@ struct CollectiveEpilogueFwd {
           cute::tuple<int32_t, int32_t, int32_t> const& block_coord,
           const Seqlen_traits& seqlen_traits_q
           ) {
+        static_assert(!Seqlen_traits::DecodingGQA, "Don't call store_zero for gqa decoding.");
         auto [m_block, bidh, bidb] = block_coord;
         Tensor mO = make_tensor(make_gmem_ptr(epilogue_params.ptr_O), epilogue_params.layout_O);
         Tensor gO = seqlen_traits_q.get_local_tile_tensor(

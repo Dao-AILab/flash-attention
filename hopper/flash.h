@@ -121,6 +121,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_causal;
     bool is_local;
     bool is_kv_cache;
+    bool use_gqa_decoding;
 
     // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
     // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.
@@ -189,4 +190,5 @@ struct Flash_bwd_params : public Flash_fwd_params {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename T, int Headdim> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim> void run_mha_fwd_gqa_(Flash_fwd_params &params, cudaStream_t stream);
 template<typename T, int Headdim> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);

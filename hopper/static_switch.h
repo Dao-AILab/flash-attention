@@ -76,4 +76,24 @@
       using NAME = flash::FixedSeqLenTraits;                                   \
       return __VA_ARGS__();                                                    \
     }                                                                          \
-  }() 
+  }()
+
+#define QUERYHEAD_SWITCH(QUERYHEADS, ...)                                      \
+  [&] {                                                                        \
+    if (QUERYHEADS <= 2) {                                                     \
+      constexpr static int kBlockH = 2;                                        \
+      return __VA_ARGS__();                                                    \
+    } else if (QUERYHEADS <= 4) {                                              \
+      constexpr static int kBlockH = 4;                                        \
+      return __VA_ARGS__();                                                    \
+    } else if (QUERYHEADS <= 8) {                                              \
+      constexpr static int kBlockH = 8;                                        \
+      return __VA_ARGS__();                                                    \
+    } else if (QUERYHEADS <= 16) {                                             \
+      constexpr static int kBlockH = 16;                                       \
+      return __VA_ARGS__();                                                    \
+    } else {                                                                   \
+      constexpr static int kBlockH = 32;                                       \
+      return __VA_ARGS__();                                                    \
+    }                                                                          \
+  }()

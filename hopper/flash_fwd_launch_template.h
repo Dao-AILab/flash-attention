@@ -81,9 +81,11 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             )  // layout_LSE
         });
 
-    int num_blocks_m = cutlass::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
-    num_blocks_m = cutlass::ceil_div(num_blocks_m, size<0>(ClusterShape{})) * size<0>(ClusterShape{});
-    typename Scheduler::Arguments scheduler_args = {num_blocks_m, params.h, params.b, params.tile_count_semaphore};
+    // int num_blocks_m = cutlass::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
+    int num_blocks_m = cutlass::ceil_div(params.seqlen_q, Kernel_traits::kBlockM/Kernel_traits::kBlockH);
+    num_blocks_m = cutlass::ceil_div(num_blocks_m, size<0>(ClusterShape{})) * size<0>(ClusterShape{});    
+    int num_grid_heads = params.h_k * ceil_div(params.h_h_k_ratio, Kernel_traits::kBlockH);
+    typename Scheduler::Arguments scheduler_args = {num_blocks_m, num_grid_heads, params.b, params.tile_count_semaphore};
     typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
     // Get the ptr to kernel function.
@@ -147,6 +149,33 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
                 });
             });
         });
+    });
+}
+
+template<typename T>
+void run_mha_fwd_hdim128_gqa_decoding(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 128;
+    constexpr static bool Is_causal = false;
+    constexpr static bool UseCluster = false;
+    using Seqlen_traits = flash::FixedSeqLenTraits;
+    using Seqlen_traits_Q = flash::DecodingGQASeqLenTraits;
+#if 0
+    QUERYHEAD_SWITCH(params.h_h_k_ratio, kBlockH, [&] {
+        // BOOL_SWITCH(params.is_causal, Is_causal, [&] {            
+            // Only use Cluster if number of tiles along seqlen_q is even and not Is_causal
+            // BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, 128) % 2 == 0 && !Is_causal && !Seqlen_traits::UseVarSeqLen, UseCluster, [&] {
+                run_flash_fwd<
+                    Flash_fwd_kernel_traits<Headdim, 128, Is_causal ? 128 : 176, 12, 2, false, UseCluster ? 2 : 1, T, kBlockH>, 
+                    Is_causal, Seqlen_traits
+                >(params, stream);
+            // });            
+        // });
+    });
+#endif
+
+    QUERYHEAD_SWITCH(params.h_h_k_ratio, kBlockH, [&] {
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 176, 12, 2, false, 1, T, kBlockH>, 
+                      /*Is_causal=*/false, Seqlen_traits, Seqlen_traits_Q>(params, stream);
     });
 }
 
