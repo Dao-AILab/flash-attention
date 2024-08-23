@@ -212,9 +212,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     static constexpr int kBlockM = Ktraits::kBlockM;
     // static constexpr int kBlockN = Ktraits::kBlockN;
     // static constexpr int kHeadDim = Ktraits::kHeadDim;
-    static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128;  
-    // for now, disable for hdim 128 causal to avoid perf regression with register spilling
-    // static constexpr bool Use_max_offset = !(Is_causal && Ktraits::kHeadDim == 128);    
+    static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128;    
     static constexpr bool Use_max_offset = true;
 
     using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, Seqlen_traits>;
