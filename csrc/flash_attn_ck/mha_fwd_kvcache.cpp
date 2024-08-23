@@ -47,6 +47,7 @@ fmha_fwd_appendkv_args get_ck_fmha_fwd_appendkv_args(const int b,
                                                      const int h_k,
                                                      const int d,
                                                      const int rotary_dim,
+                                                     const bool has_mask,
                                                      const int page_block_size,
                                                      // device pointers
                                                      const at::Tensor q,
@@ -90,6 +91,7 @@ fmha_fwd_appendkv_args get_ck_fmha_fwd_appendkv_args(const int b,
     args.rotary_cos_ptr = rotary_cos_.has_value() ? rotary_cos_.value().data_ptr() : nullptr;
     args.rotary_sin_ptr = rotary_sin_.has_value() ? rotary_sin_.value().data_ptr() : nullptr;
     args.rotary_dim = rotary_dim;
+    args.has_mask = has_mask;
 
     if (block_table_.has_value())
     {
@@ -490,6 +492,7 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
                 num_heads_k,
                 head_size_8x,
                 rotary_dim,
+                mask.type != mask_enum::no_mask,
                 page_block_size,
                 q_padded,
                 kcache_padded,
