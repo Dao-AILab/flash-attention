@@ -155,6 +155,7 @@ struct CollectiveMainloopFwd {
         Element const* ptr_V;
         typename Seqlen_traits::LayoutT layout_V;
         float const softmax_scale_log2;
+        float const scale_v;
     };
 
     // Device side kernel params
@@ -167,6 +168,7 @@ struct CollectiveMainloopFwd {
         TMA_K tma_load_K;
         TMA_V tma_load_V;
         float const softmax_scale_log2;
+        float const scale_v;
     };
 
 
@@ -196,7 +198,7 @@ struct CollectiveMainloopFwd {
         return {args.layout_Q, args.layout_K, args.layout_V,
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.layout_Q.shape()), get<2>(args.layout_K.shape()))),
                 tma_load_Q, tma_load_K, tma_load_V,
-                args.softmax_scale_log2};
+                args.softmax_scale_log2, args.scale_v};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -1015,7 +1017,7 @@ struct CollectiveMainloopFwd {
         }
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
         
-        cute::copy(softmax.template finalize</*Check_inf=*/Is_causal>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);
+        cute::copy(softmax.template finalize</*Check_inf=*/Is_causal>(tSrS, mainloop_params.softmax_scale_log2, mainloop_params.scale_v), scores_scale);
         softmax.rescale_o(tOrO, scores_scale);
         return;
     }

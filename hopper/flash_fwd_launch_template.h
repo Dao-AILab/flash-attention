@@ -57,7 +57,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 params.seqlen_k, params.d, params.h_k, params.b, 
                 params.v_row_stride, params.v_head_stride, params.v_batch_stride
             ),  // layout_V
-            params.scale_softmax_log2
+            params.scale_softmax_log2,
+            params.scale_v
         });
     typename CollectiveEpilogue::Params epilogue_params =
         CollectiveEpilogue::to_underlying_arguments({

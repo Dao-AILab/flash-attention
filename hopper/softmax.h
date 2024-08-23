@@ -199,8 +199,8 @@ struct Softmax {
     };
     
     template<bool Is_dropout=false, bool Split=false, typename Tensor0>
-    __forceinline__ __device__ TensorT finalize(Tensor0 &acc_s, float softmax_scale_log2, float rp_dropout=1.0) {
-        constexpr static float max_offset_E = Use_max_offset ? 8.0f * float(M_LN2) : 0.0f;
+    __forceinline__ __device__ TensorT finalize(Tensor0 &acc_s, float softmax_scale_log2, float scale_v = 1.f, float rp_dropout=1.f) {
+        constexpr static float max_offset_E = Use_max_offset ? 8.f * float(M_LN2) : 0.f;
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
@@ -210,7 +210,7 @@ struct Softmax {
         #pragma unroll
         for (int mi = 0; mi < size(row_max); ++mi) {
             float sum = row_sum(mi);
-            float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
+            float inv_sum = (sum == 0.f || sum != sum) ? 0.f : scale_v / sum;
             row_sum(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : (row_max(mi) * softmax_scale_log2) * float(M_LN2) - max_offset_E + __logf(sum);
             scores_scale(mi) = !Is_dropout ? inv_sum : inv_sum * rp_dropout;
         }

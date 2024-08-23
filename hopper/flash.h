@@ -64,6 +64,9 @@ struct Flash_fwd_params : public Qkv_params {
     float scale_softmax_log2;
     uint32_t scale_softmax_log2_half2;
 
+    // scale_q and scale_k are multiplied into scale_softmax
+    float scale_v;
+
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
