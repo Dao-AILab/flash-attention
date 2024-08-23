@@ -369,6 +369,7 @@ struct CollectiveMainloopFwd {
                                 flatten(sVt_divide(_, i, j, stage)));
                 }
             }
+            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::ProducerWG) /*id*/);
         };
 
         Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.layout_Q.shape());
