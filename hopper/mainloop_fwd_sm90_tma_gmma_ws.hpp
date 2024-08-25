@@ -923,6 +923,10 @@ struct CollectiveMainloopFwd {
 
                 warp_scheduler_barrier_arrive();
                 pipeline_k.consumer_release(smem_pipe_read);
+                if constexpr(Delay_V_release) {
+                    pipeline_vt.consumer_release(smem_pipe_release);
+                    ++smem_pipe_release;
+                }
                 consumer_wait(pipeline_vt, smem_pipe_read);
                 
                 cute::copy(softmax.template max</*Is_first=*/false, /*Check_inf=*/true>(tSrS), scores_scale);
@@ -930,11 +934,7 @@ struct CollectiveMainloopFwd {
                 softmax.template online_softmax</*Is_first=*/false, /*Check_inf=*/true>(tSrS);
                 Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(), convert_layout_acc_Aregs_fp8(tSrS.layout()));
                 permute_regs_A_to_C(tOrP);
-
-                if constexpr(Delay_V_release) {
-                    pipeline_vt.consumer_release(smem_pipe_release);
-                    ++smem_pipe_release;
-                }
+                
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);            
                 if constexpr(!Delay_V_release) { pipeline_vt.consumer_release(smem_pipe_read); }                
                 ++smem_pipe_read;
