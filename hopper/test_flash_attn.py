@@ -39,6 +39,8 @@ def print_diffs(out, out_ref):
 # @pytest.mark.parametrize("d", [64, 96, 128])
 # @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("d", [64, 128, 256])
+@pytest.mark.parametrize("descale", [1.0])
+# @pytest.mark.parametrize("descale", [1.0, 2.0, 3.0, 4.0])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -63,7 +65,7 @@ def print_diffs(out, out_ref):
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_output(
-    seqlen_q, seqlen_k, d, causal, deterministic, mha_type, dtype,
+    seqlen_q, seqlen_k, d, causal, deterministic, mha_type, dtype, descale
 ):
     device = "cuda"
     if(dtype == torch.float8_e4m3fn):
@@ -90,16 +92,28 @@ def test_flash_attn_output(
     v = v.to(dtype)
 
     softmax_scale = q.shape[-1] ** (-0.5)
-    descale_q = torch.tensor([1.0], dtype=torch.float32, device='cuda')
-    descale_k = torch.tensor([1.0], dtype=torch.float32, device='cuda')
-    descale_v = torch.tensor([1.0], dtype=torch.float32, device='cuda')
-    out, lse = flash_attn_func(q, k, v, causal=causal, deterministic=deterministic)
-    # out, q, k, v, out_padded, softmax_lse, S_dmask = _flash_attn_forward(q, k, v, softmax_scale, causal, descale_q=descale_q, descale_k=descale_k, descale_v=descale_v)
+    descale_q = torch.tensor([descale], dtype=torch.float32, device='cuda')
+    descale_k = torch.tensor([descale], dtype=torch.float32, device='cuda')
+    descale_v = torch.tensor([descale], dtype=torch.float32, device='cuda')
+    if(dtype != torch.float8_e4m3fn):
+        out, lse = flash_attn_func(q, k, v, causal=causal, deterministic=deterministic)
+    else:
+        out, q, k, v, out_padded, lse, S_dmask = _flash_attn_forward(
+            q, k, v, softmax_scale, causal, descale_q=descale_q, descale_k=descale_k, descale_v=descale_v
+        )
 
     q = q.to(dtype_init)
     k = k.to(dtype_init)
     v = v.to(dtype_init)
-    
+
+    if(dtype == torch.float8_e4m3fn):
+        descale_q = descale_q.to(dtype_init)
+        descale_k = descale_k.to(dtype_init)
+        descale_v = descale_v.to(dtype_init)
+        q = q * descale_q
+        k = k * descale_k
+        v = v * descale_v
+        
     out_ref, attn_ref = attention_ref(
         q,
         k,
