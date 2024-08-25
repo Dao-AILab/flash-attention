@@ -137,11 +137,12 @@ struct Softmax {
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
     TensorT row_max, row_sum;
+    const float softmax_scale_log2;
 
-    CUTLASS_DEVICE Softmax() {};
+    CUTLASS_DEVICE Softmax(float scale_ = 1.f) : softmax_scale_log2(scale_) {};
 
     template<bool Is_first, bool Check_inf=false, typename Tensor0>
-    __forceinline__ __device__ TensorT max(Tensor0 &acc_s, float softmax_scale_log2) {
+    __forceinline__ __device__ TensorT max(Tensor0 &acc_s) {
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
@@ -166,7 +167,7 @@ struct Softmax {
     };
 
     template<bool Is_first, bool Check_inf=false, typename Tensor0>
-    __forceinline__ __device__ TensorT online_softmax(Tensor0 &acc_s, float softmax_scale_log2) {
+    __forceinline__ __device__ TensorT online_softmax(Tensor0 &acc_s) {
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
@@ -197,10 +198,10 @@ struct Softmax {
         }
         return scores_scale;
     };
-    
+
     template<bool Is_dropout=false, bool Split=false, typename Tensor0>
-    __forceinline__ __device__ TensorT finalize(Tensor0 &acc_s, float softmax_scale_log2, float rp_dropout=1.0) {
-        constexpr static float max_offset_E = Use_max_offset ? 8.0f * float(M_LN2) : 0.0f;
+    __forceinline__ __device__ TensorT finalize(Tensor0 &acc_s, float descale_v = 1.f, float rp_dropout=1.f) {
+        constexpr static float max_offset_E = Use_max_offset ? 8.f * float(M_LN2) : 0.f;
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
@@ -210,7 +211,7 @@ struct Softmax {
         #pragma unroll
         for (int mi = 0; mi < size(row_max); ++mi) {
             float sum = row_sum(mi);
-            float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
+            float inv_sum = (sum == 0.f || sum != sum) ? 0.f : descale_v / sum;
             row_sum(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : (row_max(mi) * softmax_scale_log2) * float(M_LN2) - max_offset_E + __logf(sum);
             scores_scale(mi) = !Is_dropout ? inv_sum : inv_sum * rp_dropout;
         }
