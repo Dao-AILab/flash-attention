@@ -64,9 +64,6 @@ struct Flash_fwd_params : public Qkv_params {
     float scale_softmax_log2;
     uint32_t scale_softmax_log2_half2;
 
-    // scale_q and scale_k are multiplied into scale_softmax
-    float scale_v;
-
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
@@ -134,6 +131,9 @@ struct Flash_fwd_params : public Qkv_params {
     bool unpadded_lse; // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
 
     int * __restrict__ tile_count_semaphore;
+    float * __restrict__ descale_q_ptr;
+    float * __restrict__ descale_k_ptr;
+    float * __restrict__ descale_v_ptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

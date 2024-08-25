@@ -41,7 +41,6 @@ void set_params_fprop(Flash_fwd_params &params,
                       void *softmax_lse_d,
                       float p_dropout,
                       float softmax_scale,
-                      float scale_v,
                       int window_size_left,
                       int window_size_right,
                       bool seqlenq_ngroups_swapped=false,
@@ -112,7 +111,6 @@ void set_params_fprop(Flash_fwd_params &params,
     __half scale_softmax_log2_half = __float2half(params.scale_softmax_log2);
     __half2 scale_softmax_log2_half2 = __half2(scale_softmax_log2_half, scale_softmax_log2_half);
     params.scale_softmax_log2_half2 = reinterpret_cast<uint32_t&>(scale_softmax_log2_half2);
-    params.scale_v = scale_v;
 
     // Set this to probability of keeping an element to simplify things.
     params.p_dropout = 1.f - p_dropout;
@@ -194,7 +192,6 @@ void set_params_dgrad(Flash_bwd_params &params,
                      softmax_lse_d,
                      p_dropout,
                      softmax_scale,
-                     1.0f,
                      window_size_left,
                      window_size_right);
 
@@ -268,9 +265,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x head_size
         c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
         const float softmax_scale,
-        const float scale_q,
-        const float scale_k,
-        const float scale_v,
+        c10::optional<at::Tensor> &descale_q_, // 1
+        c10::optional<at::Tensor> &descale_k_, // 1
+        c10::optional<at::Tensor> &descale_v_, // 1
         bool is_causal) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -371,13 +368,38 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      nullptr,
                      softmax_lse.data_ptr(),
                      /*p_dropout=*/0.f,
-                     softmax_scale * scale_q * scale_k,
-                     scale_v,
+                     softmax_scale,
                      /*window_size_left=*/-1,
                      /*window_size_right=*/is_causal ? 0 : -1);
 
     auto tile_count_semaphore = is_causal ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+
+    if(q_dtype == at::ScalarType::Float8_e4m3fn) {
+        at::Tensor descale_q, descale_k, descale_v;
+        if (descale_q_.has_value() && descale_k_.has_value() && descale_k_.has_value()) {
+            descale_q = descale_q_.value();
+            descale_k = descale_k_.value();
+            descale_v = descale_v_.value();
+            CHECK_DEVICE(descale_q);
+            CHECK_DEVICE(descale_k);
+            CHECK_DEVICE(descale_v);
+            CHECK_SHAPE(descale_q, 1);
+            CHECK_SHAPE(descale_k, 1);
+            CHECK_SHAPE(descale_v, 1);
+        } else {
+            descale_q = torch::ones({1}, opts.dtype(at::kFloat));
+            descale_k = torch::ones({1}, opts.dtype(at::kFloat));
+            descale_v = torch::ones({1}, opts.dtype(at::kFloat));
+        }
+        params.descale_q_ptr = descale_q.data_ptr<float>();
+        params.descale_k_ptr = descale_k.data_ptr<float>();
+        params.descale_v_ptr = descale_v.data_ptr<float>();
+    } else {
+        params.descale_q_ptr = nullptr;
+        params.descale_k_ptr = nullptr;
+        params.descale_v_ptr = nullptr;
+    }
 
     if (seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -520,7 +542,6 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      softmax_lse.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
-                     1.0f,
                      window_size_left,
                      window_size_right,
                      /*seqlenq_ngroups_swapped=*/false,

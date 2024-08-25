@@ -141,6 +141,7 @@ struct CollectiveMainloopFwd {
     static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<Element> / 8);
 
+    // static constexpr bool UseSchedulerBarrier = kHeadDim <= 128;
     static constexpr bool UseSchedulerBarrier =
         cutlass::sizeof_bits_v<Element> == 8 ? kHeadDim >= 128
                                              : kHeadDim <= 128;    
@@ -153,8 +154,10 @@ struct CollectiveMainloopFwd {
         typename Seqlen_traits::LayoutT layout_K;
         Element const* ptr_V;
         typename Seqlen_traits::LayoutT layout_V;
-        float const softmax_scale_log2;
-        float const scale_v;
+        float const softmax_scale_log2;        
+        float const* descale_q_ptr;
+        float const* descale_k_ptr;
+        float const* descale_v_ptr;
     };
 
     // Device side kernel params
@@ -166,8 +169,10 @@ struct CollectiveMainloopFwd {
         TMA_Q tma_load_Q;        
         TMA_K tma_load_K;
         TMA_V tma_load_V;
-        float const softmax_scale_log2;
-        float const scale_v;
+        float const softmax_scale_log2;        
+        float const* descale_q_ptr;
+        float const* descale_k_ptr;
+        float const* descale_v_ptr;
     };
 
 
@@ -197,7 +202,8 @@ struct CollectiveMainloopFwd {
         return {args.layout_Q, args.layout_K, args.layout_V,
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.layout_Q.shape()), get<2>(args.layout_K.shape()))),
                 tma_load_Q, tma_load_K, tma_load_V,
-                args.softmax_scale_log2, args.scale_v};
+                args.softmax_scale_log2,
+                args.descale_q_ptr, args.descale_k_ptr, args.descale_v_ptr};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -453,8 +459,7 @@ struct CollectiveMainloopFwd {
                 }
             }            
             
-            // CUTLASS_PRAGMA_NO_UNROLL
-            #pragma unroll 2     
+            #pragma unroll 2
             for (; n_block > 0; --n_block) {
                 pipeline_v.consumer_wait(smem_pipe_read);
                 pipeline_vt.producer_acquire(smem_pipe_write);
@@ -723,7 +728,7 @@ struct CollectiveMainloopFwd {
             }
         }
 
-        softmax.template online_softmax</*Is_first=*/true>(tSrS, mainloop_params.softmax_scale_log2);
+        softmax.template online_softmax</*Is_first=*/true>(tSrS);
         Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(), convert_layout_acc_Aregs<typename Ktraits::TiledMma1>(tSrS.layout()));
         Tensor scores_scale = make_fragment_like(softmax.row_max);
         clear(scores_scale);
@@ -750,8 +755,8 @@ struct CollectiveMainloopFwd {
                     tSrS(i) = -INFINITY;
                 }
             }
-            cute::copy(softmax.template max</*Is_first=*/false, /*Check_inf=*/true>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);
-            softmax.template online_softmax</*Is_first=*/false, /*Check_inf=*/true>(tSrS, mainloop_params.softmax_scale_log2);
+            cute::copy(softmax.template max</*Is_first=*/false, /*Check_inf=*/true>(tSrS), scores_scale);
+            softmax.template online_softmax</*Is_first=*/false, /*Check_inf=*/true>(tSrS);
             warpgroup_wait<0>();
             pipeline_v.consumer_release(smem_pipe_read_v);  // release V
             ++smem_pipe_read_k;
@@ -772,8 +777,8 @@ struct CollectiveMainloopFwd {
             warpgroup_wait<1>();
             pipeline_k.consumer_release(smem_pipe_read_k);  // release K
             // auto scores_scale = softmax.template max</*Is_first=*/false>(tSrS);
-            cute::copy(softmax.template max</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);
-            softmax.template online_softmax</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2);
+            cute::copy(softmax.template max</*Is_first=*/false>(tSrS), scores_scale);
+            softmax.template online_softmax</*Is_first=*/false>(tSrS);
             warpgroup_wait<0>();
             pipeline_v.consumer_release(smem_pipe_read_v);  // release V
             ++smem_pipe_read_k;
@@ -786,7 +791,7 @@ struct CollectiveMainloopFwd {
         softmax.rescale_o(tOrO, scores_scale);
         consumer_wait(pipeline_v, smem_pipe_read_v);
         flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-        cute::copy(softmax.template finalize</*Check_inf=*/Is_causal>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);
+        cute::copy(softmax.template finalize</*Check_inf=*/Is_causal>(tSrS), scores_scale);
         warpgroup_wait<0>();
         pipeline_v.consumer_release(smem_pipe_read_v);  // release V, otherwise producers will hang
         ++smem_pipe_read_v;
@@ -884,7 +889,7 @@ struct CollectiveMainloopFwd {
             }
         }
 
-        softmax.template online_softmax</*Is_first=*/true>(tSrS, mainloop_params.softmax_scale_log2);
+        softmax.template online_softmax</*Is_first=*/true>(tSrS);
         Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(), convert_layout_acc_Aregs_fp8(tSrS.layout()));
         permute_regs_A_to_C(tOrP);
         
@@ -920,9 +925,9 @@ struct CollectiveMainloopFwd {
                 pipeline_k.consumer_release(smem_pipe_read);
                 consumer_wait(pipeline_vt, smem_pipe_read);
                 
-                cute::copy(softmax.template max</*Is_first=*/false, /*Check_inf=*/true>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);
+                cute::copy(softmax.template max</*Is_first=*/false, /*Check_inf=*/true>(tSrS), scores_scale);
                 softmax.rescale_o(tOrO, scores_scale);
-                softmax.template online_softmax</*Is_first=*/false, /*Check_inf=*/true>(tSrS, mainloop_params.softmax_scale_log2);
+                softmax.template online_softmax</*Is_first=*/false, /*Check_inf=*/true>(tSrS);
                 Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(), convert_layout_acc_Aregs_fp8(tSrS.layout()));
                 permute_regs_A_to_C(tOrP);
 
@@ -949,9 +954,9 @@ struct CollectiveMainloopFwd {
                 if constexpr(!Delay_V_release) { pipeline_k.consumer_release(smem_pipe_read); }
                 else { consumer_wait(pipeline_vt, smem_pipe_read); }
                 
-                cute::copy(softmax.template max</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);
+                cute::copy(softmax.template max</*Is_first=*/false>(tSrS), scores_scale);
                 softmax.rescale_o(tOrO, scores_scale);
-                softmax.template online_softmax</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2);
+                softmax.template online_softmax</*Is_first=*/false>(tSrS);
                 Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(), convert_layout_acc_Aregs_fp8(tSrS.layout()));
                 permute_regs_A_to_C(tOrP);
 
@@ -974,9 +979,9 @@ struct CollectiveMainloopFwd {
                 pipeline_k.consumer_release(smem_pipe_read);
                 pipeline_vt.consumer_release(smem_pipe_release);
 
-                cute::copy(softmax.template max</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);
+                cute::copy(softmax.template max</*Is_first=*/false>(tSrS), scores_scale);
                 softmax.rescale_o(tOrO, scores_scale);
-                softmax.template online_softmax</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2);                
+                softmax.template online_softmax</*Is_first=*/false>(tSrS);
                 Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(), convert_layout_acc_Aregs_fp8(tSrS.layout()));
                 permute_regs_A_to_C(tOrP);
                 
@@ -1000,9 +1005,9 @@ struct CollectiveMainloopFwd {
                 warp_scheduler_barrier_arrive();
                 pipeline_k.consumer_release(smem_pipe_read);
 
-                cute::copy(softmax.template max</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2), scores_scale);
+                cute::copy(softmax.template max</*Is_first=*/false>(tSrS), scores_scale);
                 softmax.rescale_o(tOrO, scores_scale);
-                softmax.template online_softmax</*Is_first=*/false>(tSrS, mainloop_params.softmax_scale_log2);
+                softmax.template online_softmax</*Is_first=*/false>(tSrS);
                 Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(), convert_layout_acc_Aregs_fp8(tSrS.layout()));
                 permute_regs_A_to_C(tOrP);
 
@@ -1015,8 +1020,7 @@ struct CollectiveMainloopFwd {
             if constexpr (kHeadDim == 128) { warp_scheduler_barrier_arrive(); }
         }
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
-        
-        cute::copy(softmax.template finalize</*Check_inf=*/Is_causal>(tSrS, mainloop_params.softmax_scale_log2, mainloop_params.scale_v), scores_scale);
+        cute::copy(softmax.template finalize</*Check_inf=*/Is_causal>(tSrS, shared_storage.descale_v), scores_scale);
         softmax.rescale_o(tOrO, scores_scale);
         return;
     }

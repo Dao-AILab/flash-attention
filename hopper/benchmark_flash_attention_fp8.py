@@ -13,7 +13,7 @@ from flash_attn.utils.benchmark import benchmark_all, benchmark_forward, benchma
 from flash_attn.utils.benchmark import benchmark_fwd_bwd, benchmark_combined
 
 from flash_attn import flash_attn_qkvpacked_func
-from flash_attn_interface import flash_attn_func
+from flash_attn_interface import flash_attn_func, _flash_attn_forward
 
 try:
     from triton_fused_attention import attention as attention_triton
@@ -219,12 +219,12 @@ device = 'cuda'
 # dtype = torch.float16
 dtype = torch.float8_e4m3fn
 
-bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4224), (2, 8448), (1, 8448 * 2)]
-# bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 8192 * 2)]
-# bs_seqlen_vals = [(4, 4096), (2, 8192), (1, 8192 * 2), (4, 4224), (2, 8448), (1, 8448 * 2)]
+# bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4224), (2, 8448), (1, 8448 * 2)]
+bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 8192 * 2)]
+# bs_seqlen_vals = [(4, 4096), (2, 8192), (1, 8192 * 2)]
 # bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048)]
 causal_vals = [False, True]
-headdim_vals = [128]
+headdim_vals = [64, 128, 256]
 dim = 2048
 # dim = 256
 dropout_p = 0.0
@@ -276,8 +276,26 @@ for causal in causal_vals:
                 torch.testing.assert_close(res, res_baseline, atol=0.5, rtol=0.5)
 
             # out = torch.empty_like(q)
-            q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)                        
-            f = time_fwd(flash_attn_func, q, k, v, causal=causal, repeats=repeats, verbose=False)
+            q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+            softmax_scale = q.shape[-1] ** (-0.5)
+            descale_q = torch.tensor([1.0], dtype=torch.float32, device='cuda')
+            descale_k = torch.tensor([1.0], dtype=torch.float32, device='cuda')
+            descale_v = torch.tensor([1.0], dtype=torch.float32, device='cuda')
+
+            # f = time_fwd(flash_attn_func, q, k, v, causal=causal, repeats=repeats, verbose=False)
+            f = time_fwd(
+                _flash_attn_forward,
+                q, 
+                k, 
+                v, 
+                softmax_scale, 
+                causal=causal, 
+                descale_q=descale_q, 
+                descale_k=descale_k, 
+                descale_v=descale_v, 
+                repeats=repeats, 
+                verbose=False
+            )
 
             # res = flash_attn_func(q, k, v, causal=causal)
             # torch.testing.assert_close(res.half(), res_baseline, atol=0.05, rtol=0.05)
