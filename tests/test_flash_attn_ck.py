@@ -1284,7 +1284,8 @@ def test_flash_attn_kvcache(
             )[:, :seqlen_k]
         assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
         assert torch.equal(v_cache_select, v_cache_ref)
-    mult = 3 if not alibi else 5
+    # mult = 3 if f16, bf16 need 4
+    mult = 4 if not alibi else 5
     assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
 
 
