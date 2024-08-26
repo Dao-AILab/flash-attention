@@ -53,6 +53,10 @@
       constexpr static int kQKHeadDim = 160;                  \
       constexpr static int kVHeadDim = 160;                  \
       return __VA_ARGS__();                                    \
+    } else if (QKHEADDIM <= 192 && VHEADDIM <= 128) {          \
+      constexpr static int kQKHeadDim = 192;                  \
+      constexpr static int kVHeadDim = 128;                  \
+      return __VA_ARGS__();                                    \
     } else if (QKHEADDIM <= 192 && VHEADDIM <= 192) {          \
       constexpr static int kQKHeadDim = 192;                  \
       constexpr static int kVHeadDim = 192;                  \

@@ -69,7 +69,8 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
         (32, 64),
         (64, 128),
         (96, 192),
-        (128, 256)
+        (128, 256),
+        (192, 128)
     ]
     # "csrc/flash_attn/src/flash_fwd_qkdim32_vdim64_fp16_sm80.cu"
     for ii in ["fwd", "bwd"]:
