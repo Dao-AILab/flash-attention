@@ -469,6 +469,7 @@ def flash_attn_with_kvcache(
     alibi_slopes=None,
     num_splits=0,
     return_softmax_lse=False,
+    gqa_decoding=False,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -590,5 +591,6 @@ def flash_attn_with_kvcache(
         softcap,
         rotary_interleaved,
         num_splits,
+        gqa_decoding
     )
     return (out, softmax_lse) if return_softmax_lse else out

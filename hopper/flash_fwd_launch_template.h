@@ -171,19 +171,6 @@ void run_mha_fwd_hdim128_gqa_decoding(Flash_fwd_params &params, cudaStream_t str
     // constexpr static bool UseCluster = false;
     using Seqlen_traits = flash::FixedSeqLenTraits;
     using Seqlen_traits_Q = flash::DecodingGQASeqLenTraits;
-#if 0
-    QUERYHEAD_SWITCH(params.h_h_k_ratio, kBlockH, [&] {
-        // BOOL_SWITCH(params.is_causal, Is_causal, [&] {            
-            // Only use Cluster if number of tiles along seqlen_q is even and not Is_causal
-            // BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, 128) % 2 == 0 && !Is_causal && !Seqlen_traits::UseVarSeqLen, UseCluster, [&] {
-                run_flash_fwd<
-                    Flash_fwd_kernel_traits<Headdim, 128, Is_causal ? 128 : 176, 12, 2, false, UseCluster ? 2 : 1, T, kBlockH>, 
-                    Is_causal, Seqlen_traits
-                >(params, stream);
-            // });            
-        // });
-    });
-#endif
 
     QUERYHEAD_SWITCH(params.h_h_k_ratio, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
