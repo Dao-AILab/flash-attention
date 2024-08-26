@@ -24,7 +24,7 @@
 namespace flash {
 // Copy from PyTorch
 // https://github.com/pytorch/pytorch/blob/8b61daaf7349e9102117e1aeefaa51666d887547/aten/src/ATen/cuda/detail/UnpackRaw.cuh#L17
-static std::tuple<uint64_t, uint64_t> unpack(at::PhiloxCudaState arg) {
+inline std::tuple<uint64_t, uint64_t> unpack(at::PhiloxCudaState arg) {
   if (arg.captured_) {
     // static_cast avoids "warning: invalid narrowing conversion from "long" to "unsigned long".
     // *(arg.offset_.ptr) is a broadcast load of a single int64_t to the entire kernel.
@@ -71,30 +71,6 @@ inline int num_splits_heuristic_ck(int batch_nheads_mblocks, int num_SMs, int nu
     return 1;
 }
 
-int override_num_splits_if_necessary(int batch, int nhead, int max_seqlen_q, int hdim_v, float p_drop, int num_splits)
-{
-    int device;
-    auto status = hipGetDevice(&device);
-    if(status != hipSuccess)
-        return num_splits;
-
-    hipDeviceProp_t props{};
-    status = hipGetDeviceProperties(&props, device);
-    if(status != hipSuccess)
-        return num_splits;
-
-    // TODO - tile size should match the TileFmhaShape, hardcode for now
-    const int kM0 = 128;
-    const int kN1 = hdim_v;
-
-    const int num_m_blocks = (max_seqlen_q + kM0 - 1) / kM0;
-    const int num_n_blocks = (hdim_v + kN1 - 1) / kN1;
-
-    if(num_splits < 1 && p_drop == 0.0f)
-        return num_splits_heuristic_ck(
-            batch * nhead * num_m_blocks, props.multiProcessorCount * 2, num_n_blocks, 128);
-
-    return num_splits;
-}
+int override_num_splits_if_necessary(int batch, int nhead, int max_seqlen_q, int hdim_v, float p_drop, int num_splits);
 
 } // namespace flash

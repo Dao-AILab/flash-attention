@@ -337,6 +337,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
     sources = ["csrc/flash_attn_ck/flash_api.cpp",
+               "csrc/flash_attn_ck/flash_common.cpp",
                "csrc/flash_attn_ck/mha_bwd.cpp",
                "csrc/flash_attn_ck/mha_fwd_kvcache.cpp",
                "csrc/flash_attn_ck/mha_fwd.cpp",
@@ -348,6 +349,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     rename_cpp_to_cu(sources)
 
     renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
+                       "csrc/flash_attn_ck/flash_common.cu",
                        "csrc/flash_attn_ck/mha_bwd.cu",
                        "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
                        "csrc/flash_attn_ck/mha_fwd.cu",
