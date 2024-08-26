@@ -261,6 +261,11 @@ CUTLASS_DEVICE auto DecodingGQASeqLenTraits::get_local_tile_tensor(
   return g_tensor;
 }
 
+template <>
+CUTLASS_DEVICE void DecodingGQASeqLenTraits::init(int bidb) {
+  // no op
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace flash

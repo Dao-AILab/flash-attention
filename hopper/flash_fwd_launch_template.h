@@ -34,7 +34,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using Scheduler = std::conditional_t<
         Seqlen_traits::UseVarSeqLen || Is_local, 
         flash::SingleTileScheduler,
-        std::conditional_t<!Is_causal,
+        std::conditional_t<!Is_causal || Seqlen_traits_Q::DecodingGQA,
             flash::StaticPersistentTileScheduler,
             flash::DynamicPersistentTileScheduler<Kernel_traits::kNThreads - cutlass::NumThreadsPerWarpGroup, Kernel_traits::NumProducerThreads>
     >>;
@@ -168,8 +168,7 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T>
 void run_mha_fwd_hdim128_gqa_decoding(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
-    constexpr static bool Is_causal = false;
-    constexpr static bool UseCluster = false;
+    // constexpr static bool UseCluster = false;
     using Seqlen_traits = flash::FixedSeqLenTraits;
     using Seqlen_traits_Q = flash::DecodingGQASeqLenTraits;
 #if 0
@@ -186,9 +185,13 @@ void run_mha_fwd_hdim128_gqa_decoding(Flash_fwd_params &params, cudaStream_t str
     });
 #endif
 
-    QUERYHEAD_SWITCH(params.h_h_k_ratio, kBlockH, [&] {
-        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 176, 12, 2, false, 1, T, kBlockH>, 
-                      /*Is_causal=*/false, Seqlen_traits, Seqlen_traits_Q>(params, stream);
+    QUERYHEAD_SWITCH(params.h_h_k_ratio, [&] {
+        BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+            run_flash_fwd<
+                Flash_fwd_kernel_traits<Headdim, 128, Is_causal ? 128 : 176, 12, 2, false, 1, T, kBlockH>, 
+                Is_causal, Seqlen_traits, Seqlen_traits_Q
+            >(params, stream);
+        });
     });
 }
 

@@ -120,7 +120,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 seqlen_traits_q.init(bidb);
                 seqlen_traits_k.init(bidb);
                 if constexpr(Seqlen_traits_Q::UseVarSeqLen) {
-                    if (m_block * kBlockM >= seqlen_traits_q.actual_seq_len) {
+                    // NOTE: to support with gqa decoding, change kBlockM to kBlockM/kBlockH
+                    if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
                         continue;
                     }
                 }
@@ -170,7 +171,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             seqlen_traits_q.init(bidb);
             seqlen_traits_k.init(bidb);
             if constexpr(Seqlen_traits_Q::UseVarSeqLen) {
-                if (m_block * kBlockM >= seqlen_traits_q.actual_seq_len) {
+                // NOTE: to support with gqa decoding, change kBlockM to kBlockM/kBlockH
+                if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
                     continue;
                 }
             }
