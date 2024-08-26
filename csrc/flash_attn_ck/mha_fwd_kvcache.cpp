@@ -471,7 +471,10 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
         TORCH_CHECK(cache_batch_idx.scalar_type() == torch::kInt32, "cache_batch_idx must have dtype int32");
     }
 
-    TORCH_CHECK(num_splits > 0, "Does not support num_splits == 0 for now");
+    num_splits = flash::override_num_splits_if_necessary(batch_size, num_heads, seqlen_q, head_size_8x, 0, num_splits);
+    TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
+    TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
+
     // Keep references to these tensors to extend their lifetime
     auto softmax_lse_accum = torch::empty({num_splits, batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     auto out_accum = torch::empty({num_splits, batch_size, num_heads, seqlen_q, head_size_8x}, opts.dtype(at::kFloat));
