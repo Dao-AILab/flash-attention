@@ -16,7 +16,7 @@ void run_mha_bwd_qkdim192_vdim128(Flash_bwd_params &params, cudaStream_t stream)
         if (max_smem_per_block >= 136 * 1024) {
             run_flash_bwd<Flash_bwd_kernel_traits<QKHeaddim, VHeaddim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout, Is_causal>(params, stream);
         } else {
-            run_flash_bwd<Flash_bwd_kernel_tvvraits<QKHeaddim, VHeaddim, 64, 64, 8, 4, 2, 2, true, true, T>, Is_dropout, Is_causal>(params, stream);
+            run_flash_bwd<Flash_bwd_kernel_traits<QKHeaddim, VHeaddim, 64, 64, 8, 4, 2, 2, true, true, T>, Is_dropout, Is_causal>(params, stream);
         }
     });
 }
