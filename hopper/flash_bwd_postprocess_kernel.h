@@ -28,7 +28,9 @@ public:
     using TileShape_MK = TileShape_MK_;
     using ArchTag = ArchTag_;
 
-    static_assert(ArchTag::kMinComputeCapability >= 90);
+    static_assert(std::is_same_v<Element, cutlass::half_t> && ArchTag::kMinComputeCapability >= 75 ||
+                  std::is_same_v<Element, cutlass::bfloat16_t> && ArchTag::kMinComputeCapability >= 80 ||
+                  std::is_same_v<Element, cutlass::float_e4m3_t> && ArchTag::kMinComputeCapability >= 89);
 
     static constexpr uint32_t MaxThreadsPerBlock = kNThreads;
     static constexpr uint32_t MinBlocksPerMultiprocessor = 2;
