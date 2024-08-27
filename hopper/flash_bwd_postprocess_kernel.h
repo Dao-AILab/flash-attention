@@ -18,7 +18,7 @@ namespace flash {
 
 using namespace cute;
 
-template <class TileShape_MK_, class Element, class ElementAccum, int kNThreads, class SmemLayoutdQaccumTMA,
+template <class TileShape_MK_, class Element, class ElementAccum, class ArchTag_, int kNThreads, class SmemLayoutdQaccumTMA,
           class TiledMma, bool dQ_swapAB>
 class FlashAttnBwdPostprocessConvertdQ {
 
@@ -26,6 +26,9 @@ public:
 
     // Type Aliases
     using TileShape_MK = TileShape_MK_;
+    using ArchTag = ArchTag_;
+
+    static_assert(ArchTag::kMinComputeCapability >= 90);
 
     static constexpr uint32_t MaxThreadsPerBlock = kNThreads;
     static constexpr uint32_t MinBlocksPerMultiprocessor = 2;
