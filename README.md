@@ -3,6 +3,20 @@ This repository provides the official implementation of FlashAttention and
 FlashAttention-2 from the
 following papers.
 
+## Performance of Customized FlashAttention
+
+We test the performance speedup compare to padding qk&v hidden_dim on A100.
+
+We display CustomFlashAttention speedup using these parameters:
+
+- (qk dim, v_dim): (32,64), (64,128), (128,256); qk hidden dimension 2048 (i.e. 64, 32 or 16 heads).
+- Sequence length 512, 1k, 2k, 4k, 8k, 16k.
+- Batch size set to 16k / seqlen.
+
+### Speedup
+![Custom-flash-attn](assets/Customflash2_a100_fwd_bwd_benchmark.png)
+
+
 **FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness**  
 Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, Christopher Ré  
 Paper: https://arxiv.org/abs/2205.14135  

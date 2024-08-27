@@ -62,6 +62,32 @@ SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 
+list_headdim = []
+compile_list_headdim = []
+if not SKIP_CUDA_BUILD and not IS_ROCM:
+    list_headdim = [
+        (32, 64),
+        (64, 128),
+        (96, 192),
+        (128, 256),
+        (192, 128)
+    ]
+    # "csrc/flash_attn/src/flash_fwd_qkdim32_vdim64_fp16_sm80.cu"
+    for ii in ["fwd", "bwd"]:
+        for jj in list_headdim:
+            for kk in ["fp16", "bf16"]:
+                for ll in ["", "_causal"]:
+                    compile_list_headdim.append(
+                        f"csrc/flash_attn/src/flash_{ii}_qkdim{jj[0]}_vdim{jj[1]}_{kk}{ll}_sm80.cu"
+                    )
+    
+    # "csrc/flash_attn/src/flash_fwd_split_qkdim32_vdim64_fp16_causal_sm80.cu"
+    for jj in list_headdim:
+        for kk in ["fp16", "bf16"]:
+            for ll in ["", "_causal"]:
+                compile_list_headdim.append(
+                    f"csrc/flash_attn/src/flash_fwd_split_qkdim{jj[0]}_vdim{jj[1]}_{kk}{ll}_sm80.cu"
+                )
 
 def get_platform():
     """
@@ -265,55 +291,7 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu",
 
-                "csrc/flash_attn/src/flash_fwd_qkdim32_vdim64_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim32_vdim64_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim64_vdim128_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim64_vdim128_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim96_vdim192_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim96_vdim192_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim128_vdim256_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim128_vdim256_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim32_vdim64_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim32_vdim64_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim64_vdim128_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim64_vdim128_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim96_vdim192_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim96_vdim192_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim128_vdim256_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_qkdim128_vdim256_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim32_vdim64_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim32_vdim64_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim64_vdim128_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim64_vdim128_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim96_vdim192_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim96_vdim192_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim128_vdim256_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim128_vdim256_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim32_vdim64_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim32_vdim64_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim64_vdim128_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim64_vdim128_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim96_vdim192_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim96_vdim192_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim128_vdim256_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_qkdim128_vdim256_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim32_vdim64_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim32_vdim64_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim64_vdim128_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim64_vdim128_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim96_vdim192_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim96_vdim192_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim128_vdim256_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim128_vdim256_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim32_vdim64_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim32_vdim64_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim64_vdim128_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim64_vdim128_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim96_vdim192_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim96_vdim192_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim128_vdim256_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_qkdim128_vdim256_bf16_causal_sm80.cu",
-            ],
+            ] + compile_list_headdim,
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"] + generator_flag,
                 "nvcc": append_nvcc_threads(
