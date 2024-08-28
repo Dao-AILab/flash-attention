@@ -279,6 +279,8 @@ struct CollectiveMainloopBwd {
         int* dq_semaphore;
         int const* cu_seqlens_q = nullptr;
         int const* cu_seqlens_k = nullptr;
+        int const* seqused_k = nullptr;
+        int const* seqused_v = nullptr;
     };
 
     // Device side kernel params
@@ -303,6 +305,8 @@ struct CollectiveMainloopBwd {
         int* dq_semaphore;
         int const* cu_seqlens_q = nullptr;
         int const* cu_seqlens_k = nullptr;
+        int const* seqused_q = nullptr;
+        int const* seqused_k = nullptr;
     };
 
     static Params
@@ -362,7 +366,8 @@ struct CollectiveMainloopBwd {
                 tma_load_Q, tma_load_dO, tma_load_K, tma_load_V, tma_add_dQ, tma_load_LSE, tma_load_dPsum,
                 args.ptr_LSE_log2, args.shape_LSE, args.stride_LSE_log2, args.ptr_dPsum, args.stride_dPsum,
                 args.softmax_scale, float(args.softmax_scale * M_LOG2E),
-                args.num_batch, args.dq_semaphore, args.cu_seqlens_q, args.cu_seqlens_k};
+                args.num_batch, args.dq_semaphore, args.cu_seqlens_q, args.cu_seqlens_k,
+                args.seqused_k, args.seqused_v};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -384,7 +389,10 @@ struct CollectiveMainloopBwd {
         } else {
             return params.cu_seqlens_q == nullptr
                 ? get<0>(params.shape_Q)
-                : params.cu_seqlens_q[bidb + 1] - params.cu_seqlens_q[bidb];
+                : (params.seqused_q
+                    ? params.seqused_q[bidb]
+                    : params.cu_seqlens_q[bidb + 1] - params.cu_seqlens_q[bidb]
+                );
         }
     }
 
@@ -395,7 +403,10 @@ struct CollectiveMainloopBwd {
         } else {
             return params.cu_seqlens_k == nullptr
                 ? get<0>(params.shape_K)
-                : params.cu_seqlens_k[bidb + 1] - params.cu_seqlens_k[bidb];
+                : (params.seqused_k
+                    ? params.seqused_k[bidb]
+                    : params.cu_seqlens_k[bidb + 1] - params.cu_seqlens_k[bidb]
+                );
         }
     }
 
@@ -838,4 +849,3 @@ struct CollectiveMainloopBwd {
 };
 
 } // namespace flash
-
