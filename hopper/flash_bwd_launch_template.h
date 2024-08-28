@@ -45,7 +45,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         {params.d_rounded, _1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0},  // stride_dQ
         params.b,
         params.dq_semaphore,
-        params.cu_seqlens_q
+        params.cu_seqlens_q,
+        params.seqused_q
     };
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
     int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
@@ -87,6 +88,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.b,
         params.dq_semaphore,
         params.cu_seqlens_q, params.cu_seqlens_k,
+        params.seqused_q, params.seqused_k
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<Element*>(params.dk_ptr),
@@ -146,7 +148,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         {!Varlen ? params.seqlen_q : params.total_q, params.d, params.h, !Varlen ? params.b : 1},  // shape_dQ
         {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
         params.scale_softmax,
-        params.cu_seqlens_q
+        params.cu_seqlens_q,
+        params.seqused_q
     };
     typename PostprocessKernel::Params postprocess_params = PostprocessKernel::to_underlying_arguments(postprocess_args);
     int num_m_block_postprocess = cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
