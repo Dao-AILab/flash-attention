@@ -131,7 +131,11 @@ void set_params_fprop(Flash_fwd_params &params,
     // Causal is the special case where window_size_right == 0 and window_size_left < 0.
     // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
     params.is_causal = window_size_left < 0 && window_size_right == 0;
-
+    if ((window_size_left >= 0 || window_size_right >= 0) && !params.is_causal) {
+        params.is_local = true;
+    }
+    window_size_left = std::min(int(seqlen_k), window_size_left);
+    window_size_right = std::min(int(seqlen_k), window_size_right);
     if (window_size_left < 0 && window_size_right >= 0) { window_size_left = seqlen_k; }
     if (window_size_left >= 0 && window_size_right < 0) { window_size_right = seqlen_k; }
     params.window_size_left = window_size_left;
@@ -273,7 +277,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         c10::optional<at::Tensor> &descale_q_, // 1
         c10::optional<at::Tensor> &descale_k_, // 1
         c10::optional<at::Tensor> &descale_v_, // 1
-        bool is_causal) {
+        bool is_causal,
+        int window_size_left,
+        int window_size_right) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
@@ -375,8 +381,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      softmax_lse.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
-                     /*window_size_left=*/-1,
-                     /*window_size_right=*/is_causal ? 0 : -1);
+                     /*window_size_left=*/is_causal ? -1 : window_size_left,
+                     /*window_size_right=*/is_causal ? 0 : window_size_right);
 
     auto tile_count_semaphore = is_causal ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
@@ -437,7 +443,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int max_seqlen_q,
                const int max_seqlen_k,
                const float softmax_scale,
-               bool is_causal) {
+               bool is_causal,
+               int window_size_left,
+               int window_size_right) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
@@ -468,10 +476,6 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int head_size_og = sizes[2];
     const int num_heads_k = k.size(1);
 
-    int window_size_left = -1;
-    int window_size_right = -1;
-    if (is_causal) { window_size_right = 0; }
-
     void *cu_seqlens_q_d = cu_seqlens_q.data_ptr();
 
     const int total_q = q.sizes()[0];
@@ -479,9 +483,6 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
-
-    if (window_size_left >= max_seqlen_k) { window_size_left = -1; }
-    if (window_size_right >= max_seqlen_k) { window_size_right = -1; }
 
     CHECK_SHAPE(q, total_q, num_heads, head_size_og);
     const int total_k = k.size(0);
@@ -558,8 +559,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      softmax_lse.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
-                     window_size_left,
-                     window_size_right,
+                     is_causal ? -1 : window_size_left,
+                     is_causal ? 0 : window_size_right,
                      /*seqlenq_ngroups_swapped=*/false,
                      /*unpadded_lse=*/true);
     params.total_q = total_q;
@@ -620,6 +621,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         c10::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
         const float softmax_scale,
         const bool is_causal,
+        const int window_size_left,
+        const int window_size_right,
         const bool deterministic) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -759,8 +762,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      softmax_d.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
-                     /*window_size_left=*/-1,
-                     /*window_size_right=*/is_causal ? 0 : -1,
+                     /*window_size_left=*/is_causal ? -1 : window_size_left,
+                     /*window_size_right=*/is_causal ? 0 : window_size_right,
                      deterministic);
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
 
@@ -811,6 +814,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                const int max_seqlen_k,          // max sequence length to choose the kernel
                const float softmax_scale,
                const bool is_causal,
+               const int window_size_left,
+               const int window_size_right,
                const bool deterministic) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -973,8 +978,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                      softmax_d.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
-                     /*window_size_left=*/-1,
-                     /*window_size_right=*/is_causal ? 0 : -1,
+                     /*window_size_left=*/is_causal ? -1 : window_size_left,
+                     /*window_size_right=*/is_causal ? 0 : window_size_right,
                      deterministic);
     params.total_q = total_q;
     params.total_k = total_k;

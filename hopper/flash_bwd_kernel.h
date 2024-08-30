@@ -225,7 +225,7 @@ public:
                     }
                     if constexpr (Is_causal) {
                         int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
-                        int const m_block_max = cute::ceil_div(collective_mainloop.get_seqlen_q(params.mainloop, bidb), kBlockM);
+                        int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
                         if (m_block_min >= m_block_max) {
                             scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                             continue;
@@ -251,7 +251,7 @@ public:
                     }
                     if constexpr (Is_causal) {
                         int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
-                        int const m_block_max = cute::ceil_div(collective_mainloop.get_seqlen_q(params.mainloop, bidb), kBlockM);
+                        int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
                         if (m_block_min >= m_block_max) { continue; }
                     }
                     collective_mainloop.store_dq(params.mainloop, shared_storage, block_coord);
@@ -281,7 +281,7 @@ public:
                 }
                 if constexpr (Is_causal) {
                     int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
-                    int const m_block_max = cute::ceil_div(collective_mainloop.get_seqlen_q(params.mainloop, bidb), kBlockM);
+                    int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
                     if (m_block_min >= m_block_max) {  // We exit early and write 0 to dK and dV
                         collective_epilogue.store_zero(params.epilogue, threadIdx.x - NumCopyThreads, block_coord);
                         continue;
