@@ -78,6 +78,10 @@ struct Flash_fwd_params : public Qkv_params {
     int * __restrict__ cu_seqlens_k;
     int * __restrict__ leftpad_k;
 
+    // tree attention 
+    int * __restrict__ tree_end_position_id_k;
+    int * __restrict__ tree_start_position_id_q;
+
     // If provided, the actual length of each k sequence.
     int * __restrict__ seqused_k;
 
@@ -129,6 +133,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool is_bf16;
     bool is_causal;
+    bool is_tree_attention;
 
     // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
     // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.

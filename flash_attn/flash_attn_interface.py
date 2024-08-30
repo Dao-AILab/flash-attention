@@ -85,6 +85,8 @@ def _flash_attn_varlen_forward(
     block_table=None,
     leftpad_k=None,
     seqused_k=None,
+    tree_end_position_id_k=None,
+    tree_start_position_id_q=None
 ):
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_cuda.varlen_fwd(
@@ -109,6 +111,8 @@ def _flash_attn_varlen_forward(
         softcap,
         return_softmax,
         None,
+        tree_end_position_id_k,
+        tree_start_position_id_q
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
@@ -187,6 +191,8 @@ def _flash_attn_varlen_backward(
     alibi_slopes,
     deterministic,
     rng_state=None,
+    tree_end_position_id_k=None,
+    tree_start_position_id_q=None
 ):
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -220,6 +226,8 @@ def _flash_attn_varlen_backward(
         deterministic,
         None,
         rng_state,
+        tree_end_position_id_k,
+        tree_start_position_id_q
     )
     # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
     #     breakpoint()
@@ -614,6 +622,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
         block_table,
+        tree_end_position_id_k,
+        tree_start_position_id_q
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -633,9 +643,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=block_table,
+            tree_end_position_id_k=tree_end_position_id_k,
+            tree_start_position_id_q=tree_start_position_id_q
         )
         ctx.save_for_backward(
-            q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
+            q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state, 
+            tree_end_position_id_k, tree_start_position_id_q
         )
         ctx.dropout_p = dropout_p
         ctx.max_seqlen_q = max_seqlen_q
@@ -650,7 +663,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state, tree_end_position_id_k, tree_start_position_id_q = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_varlen_backward(
             dout,
@@ -674,11 +687,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state=rng_state,
+            tree_end_position_id_k=tree_end_position_id_k,
+            tree_start_position_id_q=tree_start_position_id_q
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -1065,6 +1080,8 @@ def flash_attn_varlen_func(
     deterministic=False,
     return_attn_probs=False,
     block_table=None,
+    tree_end_position_id_k=None,
+    tree_start_position_id_q=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1138,6 +1155,8 @@ def flash_attn_varlen_func(
         deterministic,
         return_attn_probs,
         block_table,
+        tree_end_position_id_k,
+        tree_start_position_id_q
     )
 
 
