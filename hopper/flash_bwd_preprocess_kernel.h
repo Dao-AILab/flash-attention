@@ -17,13 +17,18 @@ namespace flash {
 
 using namespace cute;
 
-template <class TileShape_MK_, class Element, class ElementAccum, bool Clear_dQaccum, bool Varlen>
+template <class TileShape_MK_, class Element, class ElementAccum, class ArchTag_, bool Clear_dQaccum, bool Varlen>
 class FlashAttnBwdPreprocess {
 
 public:
 
     // Type Aliases
     using TileShape_MK = TileShape_MK_;
+    using ArchTag = ArchTag_;
+
+    static_assert(std::is_same_v<Element, cutlass::half_t> && ArchTag::kMinComputeCapability >= 75 ||
+                  std::is_same_v<Element, cutlass::bfloat16_t> && ArchTag::kMinComputeCapability >= 80 ||
+                  std::is_same_v<Element, cutlass::float_e4m3_t> && ArchTag::kMinComputeCapability >= 89);
 
     static constexpr uint32_t MaxThreadsPerBlock = 256;
     static constexpr uint32_t MinBlocksPerMultiprocessor = 2;
