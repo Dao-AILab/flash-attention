@@ -382,9 +382,10 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     if hip_version > Version('6.1.40090'):
         cc_flag += ["-mllvm", "-enable-post-misched=0"]
     if hip_version > Version('6.2.41132'):
-        # "-mllvm", "-amdgpu-coerce-illegal-types=1",
         cc_flag += ["-mllvm", "-amdgpu-early-inline-all=true",
                     "-mllvm", "-amdgpu-function-calls=false"]
+    if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
+        cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
     extra_compile_args = {
         "cxx": ["-O3", "-std=c++17"] + generator_flag,
