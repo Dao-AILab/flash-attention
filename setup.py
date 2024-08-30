@@ -362,6 +362,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
     cc_flag += ["-O3","-std=c++17",
                 "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
+                "-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3",
                 "-fgpu-flush-denormals-to-zero",
                 "-DCK_ENABLE_BF16",
                 "-DCK_ENABLE_BF8",
