@@ -144,7 +144,7 @@ if not SKIP_CUDA_BUILD:
         "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",  # printing out number of registers
         "-lineinfo",
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
-        "-DNDEBUG",  # Important, otherwise performance is severely impacted             
+        "-DNDEBUG",  # Important, otherwise performance is severely impacted
     ]
     include_dirs = [
         # Path(this_dir) / "fmha-pipeline",

@@ -88,7 +88,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.b,
         params.dq_semaphore,
         params.cu_seqlens_q, params.cu_seqlens_k,
-        params.seqused_q, params.seqused_k
+        params.seqused_q, params.seqused_k,
+        params.window_size_left, params.window_size_right
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<Element*>(params.dk_ptr),

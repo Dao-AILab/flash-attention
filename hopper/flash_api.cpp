@@ -130,16 +130,17 @@ void set_params_fprop(Flash_fwd_params &params,
 
     // Causal is the special case where window_size_right == 0 and window_size_left < 0.
     // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
-    params.is_causal = window_size_left < 0 && window_size_right == 0;
-    if ((window_size_left >= 0 || window_size_right >= 0) && !params.is_causal) {
-        params.is_local = true;
-    }
     window_size_left = std::min(int(seqlen_k), window_size_left);
     window_size_right = std::min(int(seqlen_k), window_size_right);
-    if (window_size_left < 0 && window_size_right >= 0) { window_size_left = seqlen_k; }
-    if (window_size_left >= 0 && window_size_right < 0) { window_size_right = seqlen_k; }
+    if (window_size_left < 0) { window_size_left = seqlen_k; }
+    if (window_size_right < 0) { window_size_right = seqlen_k; }
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
+
+    params.is_causal = window_size_left == seqlen_k && window_size_right == 0;
+    if ((window_size_left < seqlen_k || window_size_right < seqlen_k) && !params.is_causal) {
+        params.is_local = true;
+    }
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
         TORCH_CHECK(params.is_causal || (window_size_left < 0 && window_size_right < 0),
@@ -356,6 +357,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
+    if (is_causal) { window_size_right = 0; }
+
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
@@ -381,8 +384,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      softmax_lse.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
-                     /*window_size_left=*/is_causal ? -1 : window_size_left,
-                     /*window_size_right=*/is_causal ? 0 : window_size_right);
+                     /*window_size_left=*/window_size_left,
+                     /*window_size_right=*/window_size_right);
 
     auto tile_count_semaphore = is_causal ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
@@ -536,6 +539,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int seqlen_q_rounded = round_multiple(max_seqlen_q, 128);
     const int seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
 
+    if (is_causal) { window_size_right = 0; }
+
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
@@ -559,8 +564,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      softmax_lse.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
-                     is_causal ? -1 : window_size_left,
-                     is_causal ? 0 : window_size_right,
+                     window_size_left,
+                     window_size_right,
                      /*seqlenq_ngroups_swapped=*/false,
                      /*unpadded_lse=*/true);
     params.total_q = total_q;
@@ -621,8 +626,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         c10::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
         const float softmax_scale,
         const bool is_causal,
-        const int window_size_left,
-        const int window_size_right,
+        int window_size_left,
+        int window_size_right,
         const bool deterministic) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -739,6 +744,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         dv_expanded = dv;
     }
 
+    if (is_causal) { window_size_right = 0; }
+
     Flash_bwd_params params;
 
     set_params_dgrad(params,
@@ -762,8 +769,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      softmax_d.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
-                     /*window_size_left=*/is_causal ? -1 : window_size_left,
-                     /*window_size_right=*/is_causal ? 0 : window_size_right,
+                     /*window_size_left=*/window_size_left,
+                     /*window_size_right=*/window_size_right,
                      deterministic);
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
 
@@ -814,8 +821,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                const int max_seqlen_k,          // max sequence length to choose the kernel
                const float softmax_scale,
                const bool is_causal,
-               const int window_size_left,
-               const int window_size_right,
+               int window_size_left,
+               int window_size_right,
                const bool deterministic) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -932,6 +939,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
         dout_padded = dout;
     }
 
+    if (is_causal) { window_size_right = 0; }
+
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
@@ -978,8 +987,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                      softmax_d.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
-                     /*window_size_left=*/is_causal ? -1 : window_size_left,
-                     /*window_size_right=*/is_causal ? 0 : window_size_right,
+                     /*window_size_left=*/window_size_left,
+                     /*window_size_right=*/window_size_right,
                      deterministic);
     params.total_q = total_q;
     params.total_k = total_k;

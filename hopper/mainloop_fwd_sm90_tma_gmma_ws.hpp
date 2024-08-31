@@ -769,11 +769,12 @@ struct CollectiveMainloopFwd {
         }
 
         softmax.template online_softmax</*Is_first=*/true>(tSrS);
+ 
         Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(), convert_layout_acc_Aregs<typename Ktraits::TiledMma1>(tSrS.layout()));
         Tensor scores_scale = make_fragment_like(softmax.row_max);
         clear(scores_scale);
 
-        constexpr int n_masking_steps = (!Is_causal && !Is_local) ? 1 : cute::ceil_div(kBlockM, kBlockN) + 1;
+        constexpr int n_masking_steps = (!Is_causal) ? 1 : cute::ceil_div(kBlockM, kBlockN) + 1;
         // Only go through these if Is_causal, since n_masking_steps = 1 when !Is_causal
         #pragma unroll
         for (int masking_step = 0; masking_step < n_masking_steps - 1 && n_block > n_block_min; ++masking_step, --n_block) {
@@ -791,12 +792,8 @@ struct CollectiveMainloopFwd {
             Tensor tScS = threadMma0.partition_C(cS);
             #pragma unroll
             for (int i = 0; i < size(tSrS); ++i) {
-                if (int(get<1>(tScS(i))) >= col_limit_right(int(get<0>(tScS(i))), n_block)) {
+                if (int(get<1>(tScS(i))) >= col_limit_right(int(get<0>(tScS(i))), n_block - 1)) {
                     tSrS(i) = -INFINITY;
-                } else if constexpr (Is_local) {
-                    if (int(get<1>(tScS(i))) < col_limit_left(int(get<0>(tScS(i))), n_block)) {
-                        tSrS(i) = -INFINITY;
-                    }
                 }
             }
             cute::copy(softmax.template max</*Is_first=*/false, /*Check_inf=*/true>(tSrS), scores_scale);
@@ -827,16 +824,17 @@ struct CollectiveMainloopFwd {
                 #pragma unroll
                 for (int i = 0; i < size(tSrS); ++i) {
                     if (
-                        int(get<1>(tScS(i))) >= col_limit_right(int(get<0>(tScS(i))), n_block) 
-                        || int(get<1>(tScS(i))) < col_limit_left(int(get<0>(tScS(i))), n_block)
+                        int(get<1>(tScS(i))) >= col_limit_right(int(get<0>(tScS(i))), n_block - 1) ||
+                        int(get<1>(tScS(i))) < col_limit_left(int(get<0>(tScS(i))), n_block - 1)
                     ) {
                         tSrS(i) = -INFINITY;
                     }
                 }
             }
             // auto scores_scale = softmax.template max</*Is_first=*/false>(tSrS);
-            cute::copy(softmax.template max</*Is_first=*/false>(tSrS), scores_scale);
-            softmax.template online_softmax</*Is_first=*/false>(tSrS);
+            cute::copy(softmax.template max</*Is_first=*/false, /*Check_inf=*/Is_local>(tSrS), scores_scale);
+            softmax.template online_softmax</*Is_first=*/false, /*Check_inf=*/Is_local>(tSrS);
+
             warpgroup_wait<0>();
             pipeline_v.consumer_release(smem_pipe_read_v);  // release V
             ++smem_pipe_read_k;
@@ -849,11 +847,10 @@ struct CollectiveMainloopFwd {
         softmax.rescale_o(tOrO, scores_scale);
         consumer_wait(pipeline_v, smem_pipe_read_v);
         flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-        cute::copy(softmax.template finalize</*Check_inf=*/Is_causal>(tSrS), scores_scale);
+        cute::copy(softmax.template finalize</*Check_inf=*/Is_causal || Is_local>(tSrS), scores_scale);
         warpgroup_wait<0>();
         pipeline_v.consumer_release(smem_pipe_read_v);  // release V, otherwise producers will hang
         ++smem_pipe_read_v;
-
         softmax.rescale_o(tOrO, scores_scale);
         return;
     }
