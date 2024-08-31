@@ -435,7 +435,7 @@ struct CollectiveMainloopBwd {
         int const seqlen_q = get_seqlen_q(params, bidb);
         int const seqlen_k = get_seqlen_k(params, bidb);
         int m_block_max = cute::ceil_div(seqlen_q, kBlockM);
-        if constexpr (Is_causal || Is_local) {
+        if constexpr (Is_local) {
             return std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + seqlen_q - seqlen_k + params.window_size_left, kBlockM));
         } else {
             return m_block_max;
@@ -613,6 +613,15 @@ struct CollectiveMainloopBwd {
             }
             cutlass::arch::NamedBarrier::arrive(kNThreadsdQ + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::dQEmpty) /*id*/);  // sdQ empty, ready to be written to
         }
+        if constexpr (Deterministic) {
+            constexpr int kBlockM = get<0>(TileShape_MNK{});        
+            int const seqlen_q = get_seqlen_q(params, bidb);
+            int const m_block_global_max = cute::ceil_div(seqlen_q, kBlockM);
+            #pragma unroll 2
+            for (; m_block < m_block_global_max; ++m_block) {
+                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
+            }
+        }
     }
 
     CUTLASS_DEVICE void
@@ -745,7 +754,7 @@ struct CollectiveMainloopBwd {
 
         // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
         // this helps quite a bit to not have to do causal masking for most of the iterations.
-        if constexpr (Is_causal || Is_local) {
+        if constexpr (Is_causal) {
             static constexpr int n_masking_steps = cute::ceil_div(kBlockN, kBlockM) + 1;
             CUTLASS_PRAGMA_NO_UNROLL
             for (; m_block < std::min(m_block_max, m_block_min + n_masking_steps); ++m_block) {
@@ -761,17 +770,12 @@ struct CollectiveMainloopBwd {
                 warpgroup_wait<1>();
                 Tensor cS = cute::make_identity_tensor(select<1, 0>(TileShape_MNK{}));
                 Tensor taccScS = thread_mma_SdP.partition_C(cS);
-                int local_row_offset_right = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM + params.window_size_right;
-                int local_row_offset_left = seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM - params.window_size_left;
+                int causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
                 #pragma unroll
                 for (int i = 0; i < size(tSrS); ++i) {
                     if (int(get<0>(taccScS(i))) >= 
-                        std::min(int(get<1>(taccScS(i))) + local_row_offset_right, seqlen_k - n_block * kBlockN)) {
+                        std::min(int(get<1>(taccScS(i))) + causal_row_offset, seqlen_k - n_block * kBlockN)) {
                         tSrS(i) = -INFINITY;
-                    } else if constexpr (Is_local) {
-                        if (int(get<0>(taccScS(i))) < std::max(0, local_row_offset_left)) {
-                            tSrS(i) = -INFINITY;
-                        }
                     }
                 }
                 // Reshape tSrS from ((2, 2, V), MMA_N, MMA_M) to (nrow=(2, V, MMA_M), ncol=(2, MMA_N))
@@ -836,9 +840,8 @@ struct CollectiveMainloopBwd {
                 int local_row_offset_left = seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM - params.window_size_left;
                 #pragma unroll
                 for (int i = 0; i < size(tSrS); ++i) {
-                    if ((int(get<0>(taccScS(i))) >= 
-                        std::min(int(get<1>(taccScS(i))) + local_row_offset_right, seqlen_k - n_block * kBlockN)
-                        ) || (int(get<0>(taccScS(i))) < std::max(0, local_row_offset_left))) {
+                    if ((int(get<0>(taccScS(i))) >= std::min(int(get<1>(taccScS(i))) + local_row_offset_right, seqlen_k - n_block * kBlockN)) || 
+                        (int(get<0>(taccScS(i))) < std::max(int(get<1>(taccScS(i))) + local_row_offset_left, 0))) {
                         tSrS(i) = -INFINITY;
                     }
                 }
