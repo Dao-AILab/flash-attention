@@ -327,8 +327,6 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         generator_flag = ["-DOLD_GENERATOR_PATH"]
 
     check_if_rocm_home_none("flash_attn")
-    cc_flag = []
-
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     validate_and_update_archs(archs)
 
