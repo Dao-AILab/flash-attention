@@ -327,8 +327,6 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         generator_flag = ["-DOLD_GENERATOR_PATH"]
 
     check_if_rocm_home_none("flash_attn")
-    cc_flag = []
-
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     validate_and_update_archs(archs)
 
@@ -374,6 +372,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                 "-DUSE_PROF_API=1",
                 # "-DFLASHATTENTION_DISABLE_BACKWARD",
                 "-D__HIP_PLATFORM_HCC__=1"]
+
+    cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get('CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT', 3)}"]
 
     # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
     hip_version = get_hip_version()
