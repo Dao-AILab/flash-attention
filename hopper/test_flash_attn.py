@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from einops import rearrange, repeat
-from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
+from flash_attn_interface import flash_attn_func, flash_attn_varlen_func, _flash_attn_forward
 from tests.test_util import generate_random_padding_mask, generate_qkv, construct_local_mask, attention_ref
 
 ABS_TOL = 5e-3
@@ -37,8 +37,10 @@ def print_diffs(out, out_ref):
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [64, 128, 256])
 # @pytest.mark.parametrize("d", [64, 96, 128])
-@pytest.mark.parametrize("d", [64, 128])
-# @pytest.mark.parametrize("d", [128])
+# @pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128, 256])
+@pytest.mark.parametrize("descale", [1.0])
+# @pytest.mark.parametrize("descale", [1.0, 2.0, 3.0, 4.0])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -63,7 +65,7 @@ def print_diffs(out, out_ref):
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_output(
-    seqlen_q, seqlen_k, d, causal, deterministic, mha_type, dtype,
+    seqlen_q, seqlen_k, d, causal, deterministic, mha_type, dtype, descale
 ):
     device = "cuda"
     if(dtype == torch.float8_e4m3fn):
@@ -89,12 +91,29 @@ def test_flash_attn_output(
     k = k.to(dtype)
     v = v.to(dtype)
 
-    out, lse = flash_attn_func(q, k, v, causal=causal, deterministic=deterministic)
+    softmax_scale = q.shape[-1] ** (-0.5)
+    descale_q = torch.tensor([descale], dtype=torch.float32, device='cuda')
+    descale_k = torch.tensor([descale], dtype=torch.float32, device='cuda')
+    descale_v = torch.tensor([descale], dtype=torch.float32, device='cuda')
+    if(dtype != torch.float8_e4m3fn):
+        out, lse = flash_attn_func(q, k, v, causal=causal, deterministic=deterministic)
+    else:
+        out, q, k, v, out_padded, lse, S_dmask = _flash_attn_forward(
+            q, k, v, softmax_scale, causal, descale_q=descale_q, descale_k=descale_k, descale_v=descale_v
+        )
 
     q = q.to(dtype_init)
     k = k.to(dtype_init)
     v = v.to(dtype_init)
-    
+
+    if(dtype == torch.float8_e4m3fn):
+        descale_q = descale_q.to(dtype_init)
+        descale_k = descale_k.to(dtype_init)
+        descale_v = descale_v.to(dtype_init)
+        q = q * descale_q
+        k = k * descale_k
+        v = v * descale_v
+        
     out_ref, attn_ref = attention_ref(
         q,
         k,
@@ -130,7 +149,7 @@ def test_flash_attn_output(
     #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")                
     # breakpoint()
 
-    if d <= 128:
+    if d <= 128 and dtype != torch.float8_e4m3fn:
         g = torch.randn_like(out)
         do_o = (g.float() * out.float()).sum(-1)
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
@@ -166,7 +185,7 @@ def test_flash_attn_output(
         # just test correctness of fp8 kernel w/o further quantization techniques
         assert (out - out_ref).abs().max().item() <= 40 * (out_pt - out_ref).abs().max().item()
 
-    if d <= 128:
+    if d <= 128 and dtype != torch.float8_e4m3fn:
         assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item() + 3e-5
         assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item() + 3e-5
         assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item() + 3e-5

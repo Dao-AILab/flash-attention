@@ -157,7 +157,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
              work_tile_info = scheduler.template get_next_work</*IsProducer=*/false>(scheduler_params, work_tile_info)) {
             // Attention output (GEMM-II) accumulator.
             Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 2>(TileShape_MNK{}));
-            flash::Softmax<2 * (2 * kBlockM / NumMmaThreads)> softmax;
+            flash::Softmax<2 * (2 * kBlockM / NumMmaThreads)> softmax(mainloop_params.softmax_scale_log2);
 
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, bidh, bidb] = block_coord;
@@ -212,9 +212,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     static constexpr int kBlockM = Ktraits::kBlockM;
     // static constexpr int kBlockN = Ktraits::kBlockN;
     // static constexpr int kHeadDim = Ktraits::kHeadDim;
-    static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128;  
-    // for now, disable for hdim 128 causal to avoid perf regression with register spilling
-    static constexpr bool Use_max_offset = !(Is_causal && Ktraits::kHeadDim == 128);    
+    static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128;    
+    static constexpr bool Use_max_offset = true;
 
     using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, Seqlen_traits>;
     using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits, Seqlen_traits>;
@@ -268,6 +267,12 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
     CollectiveMainloop collective_mainloop;
     CollectiveEpilogue collective_epilogue;
+
+    float descale_q = *mainloop_params.descale_q_ptr;
+    float descale_k = *mainloop_params.descale_k_ptr;
+    float descale_v = *mainloop_params.descale_v_ptr;
+    shared_storage.softmax_scale_qk_log2 = mainloop_params.softmax_scale_log2 * descale_q * descale_k;
+    shared_storage.descale_v = descale_v;
 
     // We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
     if constexpr (size(ClusterShape{}) > 1) {
@@ -341,7 +346,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
              work_tile_info = scheduler.template get_next_work</*IsProducer=*/false>(scheduler_params, work_tile_info)) {
             // Attention output (GEMM-II) accumulator.
             Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 2>(TileShape_MNK{}));
-            flash::Softmax<2 * (2 * kBlockM / NumMmaThreads), Use_max_offset> softmax;
+            flash::Softmax<2 * (2 * kBlockM / NumMmaThreads), Use_max_offset> softmax(shared_storage.softmax_scale_qk_log2);
 
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, bidh, bidb] = block_coord;
