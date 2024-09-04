@@ -6,10 +6,16 @@ we have supported:
 - FlashAttention-2 with QKHeadDim=64, VHeadDim=128
 - FlashAttention-2 with QKHeadDim=96, VHeadDim=192
 - FlashAttention-2 with QKHeadDim=128, VHeadDim=256
+- FlashAttention-2 with QKHeadDim=192, VHeadDim=128
 
 Feel free to tell us what else you need. We might support it soon. :)
 
 Currently, we do not provide prebuilt library, you need to compile from source.
+
+## Usage
+
+Users can modify `headdim.json` before compile from source, to select the (dim_qk, dim_v) they needed. 
+Or you can just leave `headdim.json` untouched, and compile all the supported config.
 
 ## Performance of Customized FlashAttention
 
