@@ -147,9 +147,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                            make_coord(_, 0));  // (kBlockN, kHeadDim, nblocksN)
     Tensor mV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.v_ptr)
                                           + binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)),
-                            make_shape(binfo.actual_seqlen_k, params.h_k, params.vd),
+                            make_shape(binfo.actual_seqlen_k, params.h_v, params.vd),
                             make_stride(params.v_row_stride, params.v_head_stride, _1{}));
-    Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kVHeadDim>>{},
+    Tensor gV = local_tile(mV(_, bidh / params.h_h_v_ratio, _), Shape<Int<kBlockN>, Int<kVHeadDim>>{},
                            make_coord(_, 0));  // (kBlockN, kHeadDim, nblocksN)
     Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
                             Shape<Int<kBlockM>, Int<kBlockN>>{},
@@ -599,8 +599,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         : block_table[block_table_idx] * params.k_batch_stride + block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
     const index_t row_offset_v = block_table == nullptr
         ? binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache)
-          + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride
-        : block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
+          + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_v_ratio) * params.v_head_stride
+        : block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_v_ratio) * params.v_head_stride;
 
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr) + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
                             make_shape(binfo.actual_seqlen_q, params.h, params.d),
@@ -724,7 +724,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             + ((n_block_max - 1) * kBlockN) * params.knew_row_stride + (bidh / params.h_h_k_ratio) * params.knew_head_stride;
         // const index_t row_offset_vnew = binfo.k_offset(params.vnew_batch_stride, params.vnew_row_stride, bidb)
         const index_t row_offset_vnew = bidb * params.vnew_batch_stride
-            + ((n_block_max - 1) * kBlockN) * params.vnew_row_stride + (bidh / params.h_h_k_ratio) * params.vnew_head_stride;
+            + ((n_block_max - 1) * kBlockN) * params.vnew_row_stride + (bidh / params.h_h_v_ratio) * params.vnew_head_stride;
         // Subtract seqlen_k_cache * row stride so that conceptually gK and gKnew "line up". When we access them,
         // e.g. if gK has 128 rows and gKnew has 64 rows, we access gK[:128] and gKNew[128:128 + 64].
         // This maps to accessing the first 64 rows of knew_ptr.
