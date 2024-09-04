@@ -48,7 +48,7 @@ def attention_pytorch(q, k, v, dropout_p=0.0, causal=True):
     nheads_v = v.shape[2]
     if nheads_k < nheads:
         k = repeat(k, 'b s h d -> b s (h g) d', g=nheads//nheads_k)
-    elif nheads_v < nheads:
+    if nheads_v < nheads:
         v = repeat(v, 'b s h d -> b s (h g) d', g=nheads//nheads_v)
     v_d = v.shape[-1]
     q = rearrange(q, 'b t h d -> (b h) t d')
@@ -101,7 +101,7 @@ save_csv = True
 repeats = 30
 device = 'cuda'
 dtype = torch.float16
-torch.cuda.set_device(2)
+torch.cuda.set_device(0)
 
 bs_seqlen_vals = [(4, 512), (4, 1024), (4, 2048), (4, 4096), (2, 8192), (1, 16384)]
 causal_vals = [False, True]
