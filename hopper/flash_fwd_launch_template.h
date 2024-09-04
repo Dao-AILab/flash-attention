@@ -34,7 +34,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using Scheduler = std::conditional_t<
         Seqlen_traits::UseVarSeqLen || Is_local, 
         flash::SingleTileScheduler,
-        std::conditional_t<!Is_causal || Seqlen_traits_Q::DecodingGQA,
+        std::conditional_t<!Is_causal,
             flash::StaticPersistentTileScheduler,
             flash::DynamicPersistentTileScheduler<Kernel_traits::kNThreads - cutlass::NumThreadsPerWarpGroup, Kernel_traits::NumProducerThreads>
     >>;

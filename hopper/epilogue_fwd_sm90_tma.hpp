@@ -23,6 +23,7 @@ struct CollectiveEpilogueFwd {
     using Element = typename Ktraits::OutputType;    
     static constexpr int kBlockM = Ktraits::kBlockM;
     static constexpr int kBlockN = Ktraits::kBlockN;
+    static constexpr int kBlockH = Ktraits::kBlockH;
     static constexpr int kHeadDim = Ktraits::kHeadDim;
     using TileShape_MNK = Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
 
@@ -134,12 +135,15 @@ struct CollectiveEpilogueFwd {
           ) {
 
         auto [m_block, bidh, bidb] = block_coord;
+        const int bidh_kv = qhead_per_khead_divmod.divide(bidh);
+        const int h_block = bidh % int(qhead_per_khead_divmod);
+        
         Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
         auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
         auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(thread_idx);
 
         Tensor tOrO_out = flash::convert_type<Element>(tOrO);
-        Tensor taccOrO = smem_thr_copy_O.retile_S(tOrO_out);        // ((Atom,AtomNum), MMA_M, MMA_N)
+        Tensor taccOrO = smem_thr_copy_O.retile_S(tOrO_out);  // ((Atom,AtomNum), MMA_M, MMA_N)
         Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
         // Make sure all WGs have finished reading V
@@ -148,25 +152,47 @@ struct CollectiveEpilogueFwd {
         cutlass::arch::fence_view_async_shared(); // ensure smem writes are visible to TMA
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp,
                                             cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-
-        // Don't write out LSE in gqa decoding
+        
+        Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.ptr_LSE), epilogue_params.layout_LSE);
+        Tensor caccO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));
+        auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+        Tensor taccOcO = thread_mma.partition_C(caccO);  // (MMA,MMA_M,MMA_K)
+        static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
+        static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
+        // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the row indices.
+        Tensor taccOcO_row = taccOcO(make_coord(_0{}, _, _0{}), _, _0{});
+        CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));  // 2 * MMA_M        
+        
         if constexpr(!Seqlen_traits::DecodingGQA) {
-            Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.ptr_LSE), epilogue_params.layout_LSE);
             Tensor gLSE = seqlen_traits_q.get_lse_local_tile_tensor(
                 mLSE, Shape<Int<kBlockM>>{}, bidh, bidb)(_, m_block);
-            Tensor caccO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));
-            auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
-            Tensor taccOcO = thread_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
-            static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
-            static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
-            // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the row indices.
-            Tensor taccOcO_row = taccOcO(make_coord(_0{}, _, _0{}), _, _0{});
-            CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
             if (get<1>(taccOcO_row(_0{})) == 0) {
                 #pragma unroll
                 for (int mi = 0; mi < size(lse); ++mi) {
                     const int row = get<0>(taccOcO_row(mi));                
-                    if (row < seqlen_traits_q.actual_seq_len - m_block * kBlockM) { gLSE(row) = lse(mi); }
+                    if (row < seqlen_traits_q.actual_seq_len - m_block * kBlockM) {
+                        gLSE(row) = lse(mi);
+                    }
+                }
+            }
+        } else {
+            // shape<1>(epilogue_params.layout_O) == h/h_k
+            // In common case where ceil_div(h/h_k, kBlockH) == 1,
+            // int(qhead_per_khead_divmod) == 1, bidh_kv == bidh, h_block == 0
+            const int h_offset = shape<1>(epilogue_params.layout_O) * bidh_kv +
+                    h_block * kBlockH;
+            const int m_bound = seqlen_traits_q.actual_seq_len - m_block * (kBlockM/kBlockH);
+            const int h_bound = shape<1>(epilogue_params.layout_O) - h_block * kBlockH;
+            #pragma unroll
+            for (int mi = 0; mi < size(lse); ++mi) {
+                const int row = get<0>(taccOcO_row(mi));                
+                const int h_local = row % kBlockH;
+                const int m_local = row/kBlockH;             
+                if(h_local < h_bound && m_local < m_bound) {
+                    Tensor gLSE = seqlen_traits_q.get_lse_local_tile_tensor(mLSE,
+                        Shape<Int<kBlockM/kBlockH>>{}, h_offset + h_local, bidb)
+                        (_, m_block);
+                    gLSE(m_local) = lse(mi);
                 }
             }
         }
@@ -180,18 +206,17 @@ struct CollectiveEpilogueFwd {
         }
         TiledCopyO gmem_tiled_copy_O;
         Tensor sO_out = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutOCopy{});        
-        if constexpr(!Seqlen_traits::DecodingGQA) {        
+        if constexpr(!Seqlen_traits::DecodingGQA) {
             flash::write_O<!Seqlen_traits::UseVarSeqLen, NumCopyThreads>(
                 epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O, 
                 epilogue_params.layout_O, TileShapeOCopy{}, sO_out, 
                 m_block, bidh, bidb, seqlen_traits_q, write_warp_idx
             );
         } else {
-            int bidh_kv = qhead_per_khead_divmod.divide(bidh);
             Tensor mO = epilogue_params.tma_store_O.get_tma_tensor(epilogue_params.layout_O.shape());
             Tensor gO = seqlen_traits_q.get_local_tile_tensor(
                     mO, TileShapeOCopy{}, bidh_kv, bidb)
-                        (_, _, _, m_block, bidh % int(qhead_per_khead_divmod));  // (M/H, H, K)
+                        (_, _, _, m_block, h_block);  // (bM/bH, bH, K)
             auto block_tma_O = epilogue_params.tma_store_O.get_slice(_0{});
             Tensor tOgO = block_tma_O.partition_D(gO);  // (TMA, TMA_M, TMA_K)
             Tensor tOsO = block_tma_O.partition_S(sO_out);  // (TMA, TMA_M, TMA_K)
@@ -313,7 +338,81 @@ struct CollectiveEpilogueFwd {
             gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, seqlen_traits_q.actual_seq_len - m_block * kBlockM
         );
         static_assert(kBlockM <= NumMmaThreads);
-        if (thread_idx < seqlen_traits_q.actual_seq_len - m_block * kBlockM) { gLSE(thread_idx) = -INFINITY; }
+        if (thread_idx < min(kBlockM, seqlen_traits_q.actual_seq_len - m_block * kBlockM)) {
+            gLSE(thread_idx) = -INFINITY;
+        }
+    }
+
+    // Write 0 to output and -inf to LSE
+    template<typename SharedStorage>
+    CUTLASS_DEVICE void
+    store_zero_decoding_gqa(
+          Params const& epilogue_params,
+          SharedStorage& shared_storage,
+          int thread_idx,
+          cute::tuple<int32_t, int32_t, int32_t> const& block_coord,
+          const Seqlen_traits& seqlen_traits_q,
+          const cutlass::FastDivmod& qhead_per_khead_divmod
+          ) {
+        static_assert(Seqlen_traits::DecodingGQA, "Special store_zero method for GQA decoding layouts.");
+        auto [m_block, bidh, bidb] = block_coord;
+        const int bidh_kv = qhead_per_khead_divmod.divide(bidh);
+        const int h_block = bidh % int(qhead_per_khead_divmod);        
+        const int h_bound = min(shape<1>(epilogue_params.layout_O) - h_block * kBlockH, kBlockH);
+        const int m_bound = min(seqlen_traits_q.actual_seq_len - m_block * (kBlockM/kBlockH), kBlockM/kBlockH);
+        
+        Tensor mO = make_tensor(make_gmem_ptr(epilogue_params.ptr_O), epilogue_params.layout_O);
+        Tensor gO = seqlen_traits_q.get_local_tile_tensor(
+                    mO, TileShapeOCopy{}, bidh_kv, bidb)
+                        (_, _, _, m_block, h_block); // (bM/bH, bH, K)
+        TiledCopyO gmem_tiled_copy_O;
+        auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
+        if constexpr(kNumRows <= kBlockH) {
+            // slice into bM/bH and write out zero tiles (bH, K)
+            Tensor tOgO = gmem_thr_copy_O.partition_D(gO(0,_,_));
+            Tensor tOrO = make_fragment_like(tOgO);
+            clear(tOrO);
+            Tensor cO = cute::make_identity_tensor(select<1, 2>(TileShapeOCopy{}));
+            Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+            // dummy predicate, unused since Is_even_K=true
+            Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+            #pragma unroll
+            for(int m = 0; m < m_bound; ++m) {                
+                tOgO = gmem_thr_copy_O.partition_D(gO(m,_,_));
+                flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true,
+                            /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                    gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, h_bound
+                );
+            }
+        } else {
+            // slice into bH and write out zero tiles (bM/bH, K)
+            Tensor tOgO = gmem_thr_copy_O.partition_D(gO(_,0,_));
+            Tensor tOrO = make_fragment_like(tOgO);
+            clear(tOrO);
+            Tensor cO = cute::make_identity_tensor(select<0, 2>(TileShapeOCopy{}));
+            Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+            // dummy predicate, unused since Is_even_K=true
+            Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+            #pragma unroll
+            for(int h = 0; h < h_bound; ++h) {                
+                tOgO = gmem_thr_copy_O.partition_D(gO(_,h,_));
+                flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true,
+                            /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                    gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, m_bound
+                );
+            }
+        }
+
+        const int h_offset = shape<1>(epilogue_params.layout_O) * bidh_kv + h_block * kBlockH;
+        const int thread_idx_h = thread_idx % kBlockH;
+        const int thread_idx_m = thread_idx / kBlockH;
+        
+        Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.ptr_LSE), epilogue_params.layout_LSE);
+        Tensor gLSE = seqlen_traits_q.get_lse_local_tile_tensor(
+            mLSE, Shape<Int<kBlockM/kBlockH>>{}, h_offset + thread_idx_h, bidb)(_, m_block);
+        if(thread_idx_h < h_bound && thread_idx_m < m_bound) {
+            gLSE(thread_idx_m) = -INFINITY;
+        }
     }
 
 };
