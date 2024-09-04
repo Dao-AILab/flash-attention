@@ -28,6 +28,7 @@ void set_params_fprop(Flash_fwd_params &params,
                       const size_t seqlen_k_rounded,
                       const size_t h,
                       const size_t h_k,
+                      const size_t h_v,
                       const size_t d,
                       const size_t d_rounded,
                       const size_t vd,
@@ -95,7 +96,9 @@ void set_params_fprop(Flash_fwd_params &params,
     params.b = b;
     params.h = h;
     params.h_k = h_k;
+    params.h_v = h_v;
     params.h_h_k_ratio = h / h_k;
+    params.h_h_v_ratio = h / h_v;
     params.seqlen_q = seqlen_q;
     params.seqlen_k = seqlen_k;
     params.seqlen_q_rounded = seqlen_q_rounded;
@@ -167,6 +170,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                       const size_t seqlen_k_rounded,
                       const size_t h,
                       const size_t h_k,
+                      const size_t h_v,
                       const size_t d,
                       const size_t d_rounded,
                       const size_t vd,
@@ -195,7 +199,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                       const bool unpadded_lse) {
 
     set_params_fprop(params,
-                     b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,vd, vd,
+                     b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, h_v, d, d_rounded,vd, vd,
                      q, k, v, out,
                      cu_seqlens_q_d,
                      cu_seqlens_k_d,
@@ -396,10 +400,12 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     const int head_size_og = sizes[3];
     const int seqlen_k = k.size(1);
     const int num_heads_k = k.size(2);
+    const int num_heads_v = v.size(2);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(v_head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+    TORCH_CHECK(num_heads % num_heads_v == 0, "Number of heads in value must divide number of heads in query");
 
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
 
@@ -423,7 +429,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
 
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size_og);
-    CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, v_head_size_og);
+    CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_v, v_head_size_og);
 
     at::Tensor q_padded, k_padded, v_padded;
     if (head_size_og % 8 != 0) {
@@ -489,7 +495,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      batch_size,
                      seqlen_q, seqlen_k,
                      seqlen_q_rounded, seqlen_k_rounded,
-                     num_heads, num_heads_k,
+                     num_heads, num_heads_k, num_heads_v,
                      head_size, head_size_rounded,
                      v_head_size, v_head_size_rounded,
                      q_padded, k_padded, v_padded, out,
@@ -744,7 +750,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      batch_size,
                      max_seqlen_q, max_seqlen_k,
                      seqlen_q_rounded, seqlen_k_rounded,
-                     num_heads, num_heads_k,
+                     num_heads, num_heads_k, num_heads_v,
                      head_size, head_size_rounded,
                      v_head_size, v_head_size_rounded,
                      q_padded, k_padded, v_padded, out,
@@ -1013,7 +1019,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      batch_size,
                      seqlen_q, seqlen_k,
                      seqlen_q_rounded, seqlen_k_rounded,
-                     num_heads, num_heads_k,
+                     num_heads, num_heads_k, num_heads_v, 
                      head_size, head_size_rounded,
                      v_head_size_og,
                      q, k, v, out,
@@ -1273,7 +1279,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      batch_size,
                      max_seqlen_q, max_seqlen_k,
                      seqlen_q_rounded, seqlen_k_rounded,
-                     num_heads, num_heads_k,
+                     num_heads, num_heads_k, num_heads_v,
                      head_size, head_size_rounded,
                      v_head_size_og,
                      q, k, v, out,
@@ -1491,7 +1497,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      batch_size,
                      seqlen_q, seqlen_k,
                      seqlen_q_rounded, seqlen_k_rounded,
-                     num_heads, num_heads_k,
+                     num_heads, num_heads_k, num_heads_v,
                      head_size, head_size_rounded,
                      v_head_size, v_head_size_rounded,
                      q_padded, kcache_padded, vcache_padded, out,
