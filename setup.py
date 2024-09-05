@@ -156,9 +156,9 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     cc_flag = []
     if CUDA_HOME is not None:
         _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
-        if bare_metal_version < Version("11.6"):
+        if bare_metal_version < Version("11.7"):
             raise RuntimeError(
-                "FlashAttention is only supported on CUDA 11.6 and above.  "
+                "FlashAttention is only supported on CUDA 11.7 and above.  "
                 "Note: make sure nvcc has a supported version by running nvcc -V."
             )
     # cc_flag.append("-gencode")
