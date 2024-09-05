@@ -275,7 +275,7 @@ struct CollectiveMainloopFwd {
         n_block_max = cute::ceil_div(seqlen_k, kBlockN);
         if constexpr (Is_causal) {
             n_block_max = std::min(n_block_max,
-                                   cute::ceil_div((m_block + 1) * kBlockM_div_H + seqlen_k - seqlen_q, kBlockN));
+                cute::ceil_div((m_block + 1) * kBlockM_div_H + seqlen_k - seqlen_q, kBlockN));
         }
     }
 

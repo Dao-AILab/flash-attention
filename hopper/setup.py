@@ -110,12 +110,12 @@ if not SKIP_CUDA_BUILD:
     cutlass_dir = repo_dir / "csrc" / "cutlass"
     sources = [
         "flash_api.cpp",
-        # "flash_fwd_hdim64_fp16_sm90.cu",
-        # "flash_fwd_hdim64_bf16_sm90.cu",
+        "flash_fwd_hdim64_fp16_sm90.cu",
+        "flash_fwd_hdim64_bf16_sm90.cu",
         "flash_fwd_hdim128_fp16_sm90.cu",
         "flash_fwd_hdim128_bf16_sm90.cu",
-        # "flash_fwd_hdim256_fp16_sm90.cu",
-        # "flash_fwd_hdim256_bf16_sm90.cu",
+        "flash_fwd_hdim256_fp16_sm90.cu",
+        "flash_fwd_hdim256_bf16_sm90.cu",
         # "flash_bwd_hdim64_fp16_sm90.cu",
         # "flash_bwd_hdim96_fp16_sm90.cu",
         # "flash_bwd_hdim128_fp16_sm90.cu",
@@ -126,8 +126,8 @@ if not SKIP_CUDA_BUILD:
         # "flash_fwd_hdim64_e4m3_sm90.cu",
         # "flash_fwd_hdim128_e4m3_sm90.cu",
         # "flash_fwd_hdim256_e4m3_sm90.cu",
-        # "flash_fwd_hdim128_fp16_sm90_gqa.cu",
-        # "flash_fwd_hdim128_bf16_sm90_gqa.cu"
+        "flash_fwd_hdim128_fp16_sm90_gqa.cu",
+        "flash_fwd_hdim128_bf16_sm90_gqa.cu"
     ]
     nvcc_flags = [
         "-O3",
