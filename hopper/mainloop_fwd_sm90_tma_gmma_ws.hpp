@@ -86,8 +86,12 @@ struct CollectiveMainloopFwd {
     using TileShape_MNK = typename Ktraits::TileShape_MNK;
     using ClusterShape = typename Ktraits::ClusterShape_MNK;
 
-    static constexpr int kStages = Ktraits::kStages;
-    static constexpr int kHeadDim = Ktraits::kHeadDim;    
+    static constexpr int  kStages  = Ktraits::kStages;
+    static constexpr int  kHeadDim = Ktraits::kHeadDim;
+    // static constexpr int  kBlockM  = Ktraits::kBlockM;
+    // static constexpr int  kBlockN  = Ktraits::kBlockN;
+    // static constexpr int  kBlockH  = Ktraits::kBlockH;
+    static constexpr bool Is_split = Ktraits::Is_split;
 
     using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
     using GmemTiledCopyKV = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<0>(ClusterShape{})));
@@ -164,6 +168,7 @@ struct CollectiveMainloopFwd {
         int window_size_right;
         int const qhead_per_khead;
         int const* cache_batch_idx;
+        int const num_splits;
     };
 
     // Device side kernel params
@@ -182,6 +187,7 @@ struct CollectiveMainloopFwd {
         int window_size_left;
         int window_size_right;
         int const* cache_batch_idx;
+        cutlass::FastDivmod num_splits_divmod;
     };
 
 
@@ -214,7 +220,8 @@ struct CollectiveMainloopFwd {
                 args.softmax_scale_log2,
                 args.descale_q_ptr, args.descale_k_ptr, args.descale_v_ptr,
                 args.window_size_left, args.window_size_right,
-                args.cache_batch_idx};
+                args.cache_batch_idx,
+                cutlass::FastDivmod(args.num_splits)};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -225,6 +232,54 @@ struct CollectiveMainloopFwd {
         cute::prefetch_tma_descriptor(mainloop_params.tma_load_V.get_tma_descriptor());
     }
 
+    CUTLASS_DEVICE
+    void get_n_block_min_max(
+          Params const& mainloop_params,
+          int m_block, 
+          int n_split_idx,
+          const Seqlen_traits_Q& seqlen_traits_q,
+          const Seqlen_traits& seqlen_traits_k,
+          int& n_block_min,
+          int& n_block_max
+        ) {
+        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});
+        static constexpr int kBlockM_div_H = kBlockM/Ktraits::kBlockH;        
+        int const seqlen_q = seqlen_traits_q.actual_seq_len;
+        int const seqlen_k = seqlen_traits_k.actual_seq_len;
+        int const num_n_blocks = ceil_div(seqlen_k, kBlockN);
+        int const n_blocks_per_split
+            = mainloop_params.num_splits_divmod.divide(num_n_blocks + int(mainloop_params.num_splits_divmod) - 1);
+        n_block_min = n_split_idx * n_blocks_per_split;
+        n_block_max = min(num_n_blocks, (n_split_idx + 1) * n_blocks_per_split);
+
+        if constexpr (Is_causal) {
+            n_block_max = std::min(n_block_max,
+                cute::ceil_div((m_block + 1) * kBlockM_div_H + seqlen_k - seqlen_q, kBlockN));
+        }
+    }
+
+    CUTLASS_DEVICE
+    void get_n_block_max(
+          Params const& mainloop_params,
+          int m_block, 
+          const Seqlen_traits_Q& seqlen_traits_q,
+          const Seqlen_traits& seqlen_traits_k,
+          int& n_block_max
+        ) {
+        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});
+        static constexpr int kBlockM_div_H = kBlockM/Ktraits::kBlockH;
+        int const seqlen_q = seqlen_traits_q.actual_seq_len;
+        int const seqlen_k = seqlen_traits_k.actual_seq_len;
+        n_block_max = cute::ceil_div(seqlen_k, kBlockN);
+        if constexpr (Is_causal) {
+            n_block_max = std::min(n_block_max,
+                                   cute::ceil_div((m_block + 1) * kBlockM_div_H + seqlen_k - seqlen_q, kBlockN));
+        }
+    }
+
+#if 0
     CUTLASS_DEVICE
     int get_n_block_max(
           Params const& mainloop_params, int m_block, 
@@ -246,6 +301,7 @@ struct CollectiveMainloopFwd {
         }
         return n_block_max;
     }
+#endif
 
     CUTLASS_DEVICE
     int get_n_block_min(
@@ -278,10 +334,12 @@ struct CollectiveMainloopFwd {
          Scheduler& scheduler,
          typename Scheduler::Params const& scheduler_params,
          typename Scheduler::WorkTileInfo& work_tile_info,
-         cute::tuple<int32_t, int32_t, int32_t> block_coord,
+         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
          int work_idx,
          const Seqlen_traits_Q& seqlen_traits_q,
-         const Seqlen_traits& seqlen_traits_k
+         const Seqlen_traits& seqlen_traits_k,
+         int n_block_min,
+         int n_block_max
          ) {
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQCopy{});
@@ -292,7 +350,7 @@ struct CollectiveMainloopFwd {
         Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.layout_K.shape());
         Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.layout_V.shape());
 
-        auto [m_block, bidh, bidb] = block_coord;
+        auto [m_block, n_split_idx, bidh, bidb] = block_coord;
         const int bidb_cache = mainloop_params.cache_batch_idx == nullptr ? bidb : mainloop_params.cache_batch_idx[bidb];        
         int bidh_kv = mainloop_params.qhead_per_khead_divmod.divide(bidh);
 
@@ -302,7 +360,7 @@ struct CollectiveMainloopFwd {
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
         Tensor gQ = [&] {
             // Need this inside lambda to capture structured binding
-            auto [m_block, bidh, bidb] = block_coord;
+            auto [m_block, n_split_idx, bidh, bidb] = block_coord;
             if constexpr(Seqlen_traits_Q::DecodingGQA) {
                 return seqlen_traits_q.get_local_tile_tensor(
                     mQ, TileShapeQCopy{}, bidh_kv, bidb)
@@ -334,8 +392,7 @@ struct CollectiveMainloopFwd {
             }
         }
 
-        const int n_block_min = get_n_block_min(mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
-        const int n_block_max = get_n_block_max(mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
+        // int n_block_max = get_n_block_max(mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
         int n_block = n_block_max - 1;
 
         int lane_predicate = cute::elect_one_sync();
@@ -395,10 +452,11 @@ struct CollectiveMainloopFwd {
          Scheduler& scheduler,
          typename Scheduler::Params const& scheduler_params,
          typename Scheduler::WorkTileInfo& work_tile_info,
-         cute::tuple<int32_t, int32_t, int32_t> block_coord,
+         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
          int work_idx,
          const Seqlen_traits_Q& seqlen_traits_q,
-         const Seqlen_traits& seqlen_traits_k         
+         const Seqlen_traits& seqlen_traits_k,
+         int n_block_max
          ) {
         
         using SmemLayoutTransposeV = typename Ktraits::SmemLayoutTransposeV;
@@ -428,7 +486,7 @@ struct CollectiveMainloopFwd {
         Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.layout_K.shape());
         Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.layout_V.shape());
 
-        auto [m_block, bidh, bidb] = block_coord;
+        auto [m_block, split_idx, bidh, bidb] = block_coord;
         const int bidb_cache = mainloop_params.cache_batch_idx == nullptr ? bidb : mainloop_params.cache_batch_idx[bidb];
         int bidh_kv = mainloop_params.qhead_per_khead_divmod.divide(bidh);
 
@@ -460,7 +518,7 @@ struct CollectiveMainloopFwd {
             }
         }
 
-        int n_block_max = get_n_block_max(mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
+        // int n_block_max = get_n_block_max(mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
         int n_block = n_block_max - 1;
 
         int lane_predicate = cute::elect_one_sync();
@@ -693,7 +751,7 @@ struct CollectiveMainloopFwd {
         FrgTensorO& tOrO,
         Softmax& softmax,
         int n_block_count,
-        int n_block_min,
+        int n_block_max,
         int thread_idx,
         int work_idx,
         int m_block,
@@ -732,6 +790,7 @@ struct CollectiveMainloopFwd {
         int const seqlen_q = seqlen_traits_q.actual_seq_len;
         int const seqlen_k = seqlen_traits_k.actual_seq_len;
         int n_block = n_block_count - 1;
+        int n_block_global = n_block_max - 1;
 
         cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.barrier_Q.try_wait(work_idx % 2));
         if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.barrier_Q.wait(work_idx % 2); }
@@ -773,14 +832,15 @@ struct CollectiveMainloopFwd {
             Tensor tScS = threadMma0.partition_C(cS);
             #pragma unroll
             for (int i = 0; i < size(tSrS); ++i) {
-                if constexpr (!Is_causal && !Is_local) {  // Just masking based on col
-                    if (int(get<1>(tScS(i))) >= int(seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
+                if constexpr (!Is_causal) {  // Just masking based on col
+                    if (int(get<1>(tScS(i))) >= int(seqlen_k - n_block_global * kBlockN)) { tSrS(i) = -INFINITY; }
                 } else {  // mask based on both row and col
                     // using std::min is faster than doing col >= limit0 or col >= limit1
                     // Need to cast get<1>(tScS(i)) to (signed) int since by default it's unsigned, and the
                     // right hand side can be negative and might be converted to a very large unsigned integer.
                     int row = int(get<0>(tScS(i))) / Ktraits::kBlockH;
-                    if (int(get<1>(tScS(i))) >= col_limit_right(row, n_block)) {
+                    if (int(get<1>(tScS(i))) >= std::min(seqlen_k - n_block_global * kBlockN,
+                                                        col_limit_causal(row, n_block_global))) {
                         tSrS(i) = -INFINITY;
                     } else if constexpr (Is_local) {
                         if (int(get<1>(tScS(i))) < col_limit_left(int(get<0>(tScS(i))), n_block)) {
@@ -797,10 +857,11 @@ struct CollectiveMainloopFwd {
         Tensor scores_scale = make_fragment_like(softmax.row_max);
         clear(scores_scale);
 
-        constexpr int n_masking_steps = (!Is_causal) ? 1 : cute::ceil_div(kBlockM, kBlockN) + 1;
+        // TODO: modify this for split kv to eliminate superfluous masking steps
+        constexpr int n_masking_steps = !Is_causal ? 1 : cute::ceil_div(kBlockM, kBlockN) + 1;
         // Only go through these if Is_causal, since n_masking_steps = 1 when !Is_causal
         #pragma unroll
-        for (int masking_step = 0; masking_step < n_masking_steps - 1 && n_block > n_block_min; ++masking_step, --n_block) {
+        for (int masking_step = 0; masking_step < n_masking_steps - 1 && n_block > 0; ++masking_step, --n_block, --n_block_global) {
             Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read_k);
             warp_scheduler_barrier_sync();
@@ -816,7 +877,7 @@ struct CollectiveMainloopFwd {
             #pragma unroll
             for (int i = 0; i < size(tSrS); ++i) {
                 int row = int(get<0>(tScS(i))) / Ktraits::kBlockH;
-                if (int(get<1>(tScS(i))) >= col_limit_right(row, n_block - 1)) {
+                if (int(get<1>(tScS(i))) >= col_limit_causal(row, n_block_global - 1)) {
                     tSrS(i) = -INFINITY;
                 }
             }

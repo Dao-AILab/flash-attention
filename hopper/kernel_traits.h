@@ -59,12 +59,14 @@ struct SharedStorageQKVOVt {
 
 // If Share_Q_K_smem is true, that forces Is_Q_in_regs to be true
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, int kStages_, bool Is_Q_in_regs_=false,
-         int kClusterM_ = 1, typename elem_type=cutlass::half_t, int kBlockH_ = 1>
+         int kClusterM_ = 1, typename elem_type=cutlass::half_t, bool Is_split_=false, int kBlockH_ = 1>
 struct Flash_fwd_kernel_traits {
     using Element = elem_type;
     using ElementAccum = float;
-    using OutputType = elem_type;
+    using OutputType = std::conditional_t<Is_split_, float, elem_type>;
     using index_t = int64_t;
+
+    static constexpr bool Is_split = Is_split_;
 
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;
@@ -143,7 +145,7 @@ struct Flash_fwd_kernel_traits {
 
     using SmemCopyAtomQ = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
 
-    using SharedStorage = SharedStorageQKVO<kStages, Element, Element, Element, SmemLayoutQ,
+    using SharedStorage = SharedStorageQKVO<kStages, Element, Element, OutputType, SmemLayoutQ,
                                             SmemLayoutK, SmemLayoutV, SmemLayoutO>;
 
     using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;
@@ -155,13 +157,15 @@ struct Flash_fwd_kernel_traits {
 
 // Traits struct for fp8 kernel with in-kernel transpose
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, int kStages_, bool Is_Q_in_regs_=false,
-         int kClusterM_ = 1, typename elem_type=cutlass::float_e4m3_t, int kBlockH_ = 1>
+         int kClusterM_ = 1, typename elem_type=cutlass::float_e4m3_t, bool Is_split_ = false, int kBlockH_ = 1>
 struct Flash_fwd_kernel_traits_fp8 {
     using Element = elem_type;
     static_assert(cutlass::sizeof_bits_v<Element> == 8);
     using ElementAccum = float;
     using OutputType = cutlass::half_t;
-    using index_t = int64_t;      
+    using index_t = int64_t;
+
+    static constexpr bool Is_split = Is_split_;
 
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;

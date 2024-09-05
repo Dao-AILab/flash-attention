@@ -239,6 +239,38 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.deterministic = deterministic;
 }
 
+std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, const int batch_size,
+    const int num_heads, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
+    const int head_size_rounded, const float p_dropout,
+    const int num_splits, cudaDeviceProp *dprops, struct c10::TensorOptions opts) {
+
+    // This needs to match with run_mha_fwd_splitkv_dispatch
+    // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
+    // In any case we don't expect seqlen_q to be larger than 64 for inference.
+    params.num_splits = num_splits;
+    at::Tensor softmax_lse_accum;
+    at::Tensor out_accum;
+
+    if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
+        if (num_splits < 1) {
+               TORCH_CHECK(false, "num_splits heuristic is not supported yet");
+	}
+        if (params.num_splits > 1) {
+            softmax_lse_accum = torch::empty({num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+            out_accum = torch::empty({num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
+            params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+            params.oaccum_ptr = out_accum.data_ptr();
+            params.oaccum_row_stride = out_accum.stride(-2);
+            params.oaccum_head_stride = out_accum.stride(-3);
+            params.oaccum_batch_stride = out_accum.stride(-4);
+            params.oaccum_split_stride = out_accum.stride(0);
+        }
+        TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
+    }
+
+    return std::make_tuple(softmax_lse_accum, out_accum);
+}
+
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {    
 
@@ -248,37 +280,37 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     if (!params.is_e4m3) {
         if (params.is_bf16) {
             if (params.d == 64) {
-                run_mha_fwd_<cutlass::bfloat16_t, 64>(params, stream);
+                // run_mha_fwd_<cutlass::bfloat16_t, 64>(params, stream);
             } else if (params.d == 128) {
                 if(params.use_gqa_decoding) {
-                    run_mha_fwd_gqa_<cutlass::bfloat16_t, 128>(params, stream);
+                    // run_mha_fwd_gqa_<cutlass::bfloat16_t, 128>(params, stream);
                 } else {
                     run_mha_fwd_<cutlass::bfloat16_t, 128>(params, stream);
                 }
             } else {
-                run_mha_fwd_<cutlass::bfloat16_t, 256>(params, stream);
+                // run_mha_fwd_<cutlass::bfloat16_t, 256>(params, stream);
             }
         } else {
             if (params.d == 64) {
-                run_mha_fwd_<cutlass::half_t, 64>(params, stream);
+                // run_mha_fwd_<cutlass::half_t, 64>(params, stream);
             } else if (params.d == 128) {
                 if(params.use_gqa_decoding) {
-                    run_mha_fwd_gqa_<cutlass::half_t, 128>(params, stream);
+                    // run_mha_fwd_gqa_<cutlass::half_t, 128>(params, stream);
                 } else {
                     run_mha_fwd_<cutlass::half_t, 128>(params, stream);
                 }
             } else {
-                run_mha_fwd_<cutlass::half_t, 256>(params, stream);
+                // run_mha_fwd_<cutlass::half_t, 256>(params, stream);
             }
         }
     } else {
-        if (params.d == 64) {
-            run_mha_fwd_<cutlass::float_e4m3_t, 64>(params, stream);
-        } else if (params.d == 128) {
-            run_mha_fwd_<cutlass::float_e4m3_t, 128>(params, stream);
-        } else if (params.d == 256) {
-            run_mha_fwd_<cutlass::float_e4m3_t, 256>(params, stream);
-        }        
+        // if (params.d == 64) {
+        //     run_mha_fwd_<cutlass::float_e4m3_t, 64>(params, stream);
+        // } else if (params.d == 128) {
+        //     run_mha_fwd_<cutlass::float_e4m3_t, 128>(params, stream);
+        // } else if (params.d == 256) {
+        //     run_mha_fwd_<cutlass::float_e4m3_t, 256>(params, stream);
+        // }        
     }
 }
 
@@ -612,23 +644,23 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
   //         run_mha_bwd_<elem_type, kHeadDim>(params, stream);
   //     });
   // });
-  if (!params.is_bf16) {
-    if (params.d <= 64) {
-      run_mha_bwd_<cutlass::half_t, 64>(params, stream);
-    } else if (params.d <= 96) {
-      run_mha_bwd_<cutlass::half_t, 96>(params, stream);
-    } else {
-      run_mha_bwd_<cutlass::half_t, 128>(params, stream);
-    }
-  } else {
-    if (params.d <= 64) {
-      run_mha_bwd_<cutlass::bfloat16_t, 64>(params, stream);
-    } else if (params.d <= 96) {
-      run_mha_bwd_<cutlass::bfloat16_t, 96>(params, stream);
-    } else {
-      run_mha_bwd_<cutlass::bfloat16_t, 128>(params, stream);
-    }
-  }
+//   if (!params.is_bf16) {
+//     if (params.d <= 64) {
+//       run_mha_bwd_<cutlass::half_t, 64>(params, stream);
+//     } else if (params.d <= 96) {
+//       run_mha_bwd_<cutlass::half_t, 96>(params, stream);
+//     } else {
+//       run_mha_bwd_<cutlass::half_t, 128>(params, stream);
+//     }
+//   } else {
+//     if (params.d <= 64) {
+//       run_mha_bwd_<cutlass::bfloat16_t, 64>(params, stream);
+//     } else if (params.d <= 96) {
+//       run_mha_bwd_<cutlass::bfloat16_t, 96>(params, stream);
+//     } else {
+//       run_mha_bwd_<cutlass::bfloat16_t, 128>(params, stream);
+//     }
+//   }
 }
 
 std::vector<at::Tensor>
@@ -1293,10 +1325,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
 
     // Keep references to these tensors to extend their lifetime
-    //at::Tensor softmax_lse_accum, out_accum;
-    //std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
-    //    params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
-    //    head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, opts);
+    at::Tensor softmax_lse_accum, out_accum;
+    std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
+       params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
+       head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, opts);
 
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();

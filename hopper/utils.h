@@ -261,16 +261,16 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int NumCopyThreads, typename ElemO, typename TMACopyO, typename LayoutO, 
+template <bool Is_split, int NumCopyThreads, typename ElemO, typename TMACopyO, typename LayoutO, 
           typename TileShapeO, typename SMemO, typename SeqLenTraits>
 __forceinline__ __device__ void write_tma(
         ElemO* O, const TMACopyO& tma_store_O,
         const LayoutO& layout_O, const TileShapeO& tile_shape_O,
-        const SMemO& sO, int m_block, int bidh, int bidb,
+        const SMemO& sO, int m_block, int bidh, int bidb, int n_split_idx,
         const SeqLenTraits& seqlen_traits_o, int write_warp_idx) {
     Tensor mO = tma_store_O.get_tma_tensor(layout_O.shape());
-    Tensor gO = seqlen_traits_o.get_local_tile_tensor(
-        mO, tile_shape_O, bidh, bidb
+    Tensor gO = seqlen_traits_o.get_o_local_tile_tensor<Is_split>(
+        mO, tile_shape_O, bidh, bidb, n_split_idx
     )(_, _, m_block);  // (M, K)
     auto block_tma_O = tma_store_O.get_slice(_0{});
     Tensor tOgO = block_tma_O.partition_D(gO);  // (TMA, TMA_M, TMA_K)
@@ -333,17 +333,19 @@ __forceinline__ __device__ void write_tiled(
     }
 }
 
-template <bool IsTMACopy, int NumCopyThreads, typename ElemO, 
+template <bool IsTMACopy, bool Is_split, int NumCopyThreads, typename ElemO, 
           typename TMACopyO, typename TiledCopyO, typename LayoutO, 
           typename TileShapeO, typename SMemO, typename SeqLenTraits>
 __forceinline__ __device__ void write_O(
         ElemO* O, const TMACopyO& tma_copy_O, const TiledCopyO& tiled_copy_O,
         const LayoutO& layout_O, const TileShapeO& tile_shape_O,
-        const SMemO& sO, int m_block, int bidh, int bidb,
+        const SMemO& sO, int m_block, int bidh, int bidb, int n_split_idx,
         const SeqLenTraits& seqlen_traits_o, int write_warp_idx) {
     if constexpr (IsTMACopy) {
-        write_tma<NumCopyThreads>(O, tma_copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb, seqlen_traits_o, write_warp_idx);
+        write_tma<Is_split, NumCopyThreads>(O, tma_copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb,
+            n_split_idx, seqlen_traits_o, write_warp_idx);
     } else {
+        static_assert(!Is_split, "Don't use write_tiled with split kv kernel");
         write_tiled<NumCopyThreads>(O, tiled_copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb, seqlen_traits_o);
     }
 }
