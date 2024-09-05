@@ -418,12 +418,13 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
-    const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
-    const int ngroups = num_heads / num_heads_k;
+    const int num_heads_maxkv = num_heads_k > num_heads_v ? num_heads_k : num_heads_v;
+    const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_maxkv && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size_og % 8 == 0 && v_head_size_og % 8 == 0 && !alibi_slopes_.has_value();
+    const int ngroups = num_heads / num_heads_maxkv;
     if (seqlenq_ngroups_swapped) {
-        q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
+        q = q.reshape({batch_size, num_heads_maxkv, ngroups, head_size_og}).transpose(1, 2);
         seqlen_q = ngroups;
-        num_heads = num_heads_k;
+        num_heads = num_heads_maxkv;
     }
 
 
@@ -455,7 +456,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, sizes[1], sizes[2], v_head_size_og);
         if (seqlenq_ngroups_swapped) {
-            out = out.reshape({batch_size, num_heads_k, ngroups, v_head_size_og}).transpose(1, 2);
+            out = out.reshape({batch_size, num_heads_maxkv, ngroups, v_head_size_og}).transpose(1, 2);
         }
         if (v_head_size_og % 8 != 0) { 
             out = torch::empty({batch_size, seqlen_q, num_heads, v_head_size_og}, q.options());
@@ -552,10 +553,10 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     }
 
     if (seqlenq_ngroups_swapped) {
-        out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, v_head_size_og});
-        out_padded = out_padded.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, v_head_size_og});
-        q_padded = q_padded.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
-        softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
+        out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_maxkv * seqlen_q, v_head_size_og});
+        out_padded = out_padded.transpose(1, 2).reshape({batch_size, 1, num_heads_maxkv * seqlen_q, v_head_size_og});
+        q_padded = q_padded.transpose(1, 2).reshape({batch_size, 1, num_heads_maxkv * seqlen_q, head_size_og});
+        softmax_lse = softmax_lse.reshape({batch_size, num_heads_maxkv * seqlen_q, 1});
     }
     return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
 }
@@ -642,15 +643,15 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     void *cu_seqlens_q_d = cu_seqlens_q.data_ptr();
 
-    // TODO: check here
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
-    const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
-    const int ngroups = num_heads / num_heads_k;
+    const int num_heads_maxkv = num_heads_k > num_heads_v ? num_heads_k : num_heads_v;
+    const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_maxkv && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size_og % 8 == 0 && v_head_size_og % 8 == 0 && !alibi_slopes_.has_value();
+    const int ngroups = num_heads / num_heads_maxkv;
     if (seqlenq_ngroups_swapped) {
-        q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size_og});
+        q = q.reshape({batch_size, num_heads_maxkv, ngroups, head_size_og}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_maxkv, head_size_og});
         max_seqlen_q = ngroups;
-        num_heads = num_heads_k;
+        num_heads = num_heads_maxkv;
         cu_seqlens_q_d = nullptr;
     }
 
@@ -709,7 +710,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, sizes[0], sizes[1], v_head_size_og);
         if (seqlenq_ngroups_swapped) {
-            out = out.reshape({batch_size, num_heads_k, ngroups, v_head_size_og}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size_og});
+            out = out.reshape({batch_size, num_heads_maxkv, ngroups, v_head_size_og}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_maxkv, head_size_og});
         }
         if (v_head_size_og % 8 != 0) { 
             out = torch::empty({total_q, num_heads, v_head_size_og}, q.options());
@@ -834,10 +835,10 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
 
     if (seqlenq_ngroups_swapped) {
-        int64_t size_before[] = {batch_size, max_seqlen_q, num_heads_k, head_size_og};
-        int64_t size_after[] = {batch_size, num_heads_k * max_seqlen_q, head_size_og};
-        int64_t o_size_before[] = {batch_size, max_seqlen_q, num_heads_k, v_head_size_og};
-        int64_t o_size_after[] = {batch_size, num_heads_k * max_seqlen_q, v_head_size_og};
+        int64_t size_before[] = {batch_size, max_seqlen_q, num_heads_maxkv, head_size_og};
+        int64_t size_after[] = {batch_size, num_heads_maxkv * max_seqlen_q, head_size_og};
+        int64_t o_size_before[] = {batch_size, max_seqlen_q, num_heads_maxkv, v_head_size_og};
+        int64_t o_size_after[] = {batch_size, num_heads_maxkv * max_seqlen_q, v_head_size_og};
         out = out.reshape(o_size_before).transpose(1, 2).reshape(o_size_after);
         out_padded = out_padded.reshape(o_size_before).transpose(1, 2).reshape(o_size_after);
         q_padded = q_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
@@ -1446,12 +1447,13 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
-    const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
+    const int num_heads_maxkv = num_heads_k > num_heads_v ? num_heads_k : num_heads_v; 
+    const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_maxkv && window_size_left < 0 && window_size_right < 0 && head_size_og % 8 == 0 && v_head_size_og % 8 == 0 && !alibi_slopes_.has_value();
     if (seqlenq_ngroups_swapped) {
-        const int ngroups = num_heads / num_heads_k;
-        q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
+        const int ngroups = num_heads / num_heads_maxkv;
+        q = q.reshape({batch_size, num_heads_maxkv, ngroups, head_size_og}).transpose(1, 2);
         seqlen_q = ngroups;
-        num_heads = num_heads_k;
+        num_heads = num_heads_maxkv;
     }
 
     if (window_size_left >= seqlen_k) { window_size_left = -1; }
@@ -1484,6 +1486,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        // TODO: check here for seqlenq_ngroups_swapped
         CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, v_head_size_og);
         if (v_head_size_og % 8 != 0) { 
             out = torch::empty({batch_size, seqlen_q, num_heads, v_head_size_og}, q.options());
@@ -1662,8 +1665,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
 
     if (seqlenq_ngroups_swapped) {
-        out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, v_head_size_og});
-        softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
+        out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_maxkv * seqlen_q, v_head_size_og});
+        softmax_lse = softmax_lse.reshape({batch_size, num_heads_maxkv * seqlen_q, 1});
     }
     return {out, softmax_lse};
 }
