@@ -157,6 +157,7 @@ void set_params_fprop(Flash_fwd_params &params,
     #endif
 
     params.unpadded_lse = unpadded_lse;
+    // params.seqlenq_ngroups_swapped = seqlenq_ngroups_swapped;
 }
 
 void set_params_dgrad(Flash_bwd_params &params,
@@ -277,40 +278,53 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     // HEADDIM_SWITCH(params.d, [&] {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
-    if (!params.is_e4m3) {
-        if (params.is_bf16) {
-            if (params.d == 64) {
-                run_mha_fwd_<cutlass::bfloat16_t, 64>(params, stream);
-            } else if (params.d == 128) {
-                if(params.use_gqa_decoding) {
+    if (!params.is_e4m3) {        
+        if(!params.use_gqa_decoding) {
+            if (params.is_bf16) {
+                if (params.d == 64) {
+                    run_mha_fwd_<cutlass::bfloat16_t, 64>(params, stream);
+                } else if (params.d == 128) {
+                    run_mha_fwd_<cutlass::bfloat16_t, 128>(params, stream);
+                } else {
+                    run_mha_fwd_<cutlass::bfloat16_t, 256>(params, stream);
+                }
+            } else {
+                if (params.d == 64) {
+                    run_mha_fwd_<cutlass::half_t, 64>(params, stream);
+                } else if (params.d == 128) {
+                    run_mha_fwd_<cutlass::half_t, 128>(params, stream);
+                } else {
+                    run_mha_fwd_<cutlass::half_t, 256>(params, stream);
+                }
+            }
+        }
+        else {
+            if (params.is_bf16) {
+                if (params.d == 64) {
+                    run_mha_fwd_gqa_<cutlass::bfloat16_t, 64>(params, stream);
+                } else if (params.d == 128) {
                     run_mha_fwd_gqa_<cutlass::bfloat16_t, 128>(params, stream);
                 } else {
-                    run_mha_fwd_<cutlass::bfloat16_t, 128>(params, stream);
+                    run_mha_fwd_gqa_<cutlass::bfloat16_t, 256>(params, stream);
                 }
             } else {
-                run_mha_fwd_<cutlass::bfloat16_t, 256>(params, stream);
-            }
-        } else {
-            if (params.d == 64) {
-                run_mha_fwd_<cutlass::half_t, 64>(params, stream);
-            } else if (params.d == 128) {
-                if(params.use_gqa_decoding) {
+                if (params.d == 64) {
+                    run_mha_fwd_gqa_<cutlass::half_t, 64>(params, stream);
+                } else if (params.d == 128) {
                     run_mha_fwd_gqa_<cutlass::half_t, 128>(params, stream);
                 } else {
-                    run_mha_fwd_<cutlass::half_t, 128>(params, stream);
+                    run_mha_fwd_gqa_<cutlass::half_t, 256>(params, stream);
                 }
-            } else {
-                run_mha_fwd_<cutlass::half_t, 256>(params, stream);
             }
         }
     } else {
-        // if (params.d == 64) {
-        //     run_mha_fwd_<cutlass::float_e4m3_t, 64>(params, stream);
-        // } else if (params.d == 128) {
-        //     run_mha_fwd_<cutlass::float_e4m3_t, 128>(params, stream);
-        // } else if (params.d == 256) {
-        //     run_mha_fwd_<cutlass::float_e4m3_t, 256>(params, stream);
-        // }        
+        if (params.d == 64) {
+            run_mha_fwd_<cutlass::float_e4m3_t, 64>(params, stream);
+        } else if (params.d == 128) {
+            run_mha_fwd_<cutlass::float_e4m3_t, 128>(params, stream);
+        } else if (params.d == 256) {
+            run_mha_fwd_<cutlass::float_e4m3_t, 256>(params, stream);
+        }        
     }
 }
 
@@ -644,23 +658,23 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
   //         run_mha_bwd_<elem_type, kHeadDim>(params, stream);
   //     });
   // });
-//   if (!params.is_bf16) {
-//     if (params.d <= 64) {
-//       run_mha_bwd_<cutlass::half_t, 64>(params, stream);
-//     } else if (params.d <= 96) {
-//       run_mha_bwd_<cutlass::half_t, 96>(params, stream);
-//     } else {
-//       run_mha_bwd_<cutlass::half_t, 128>(params, stream);
-//     }
-//   } else {
-//     if (params.d <= 64) {
-//       run_mha_bwd_<cutlass::bfloat16_t, 64>(params, stream);
-//     } else if (params.d <= 96) {
-//       run_mha_bwd_<cutlass::bfloat16_t, 96>(params, stream);
-//     } else {
-//       run_mha_bwd_<cutlass::bfloat16_t, 128>(params, stream);
-//     }
-//   }
+  if (!params.is_bf16) {
+    if (params.d <= 64) {
+      run_mha_bwd_<cutlass::half_t, 64>(params, stream);
+    } else if (params.d <= 96) {
+      run_mha_bwd_<cutlass::half_t, 96>(params, stream);
+    } else {
+      run_mha_bwd_<cutlass::half_t, 128>(params, stream);
+    }
+  } else {
+    if (params.d <= 64) {
+      run_mha_bwd_<cutlass::bfloat16_t, 64>(params, stream);
+    } else if (params.d <= 96) {
+      run_mha_bwd_<cutlass::bfloat16_t, 96>(params, stream);
+    } else {
+      run_mha_bwd_<cutlass::bfloat16_t, 128>(params, stream);
+    }
+  }
 }
 
 std::vector<at::Tensor>
@@ -1152,7 +1166,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
-    const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
+    const int seqlenq_ngroups_swapped =
+        seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 &&
+        window_size_right < 0 && head_size_og % 8 == 0 &&
+        !alibi_slopes_.has_value() && !use_gqa_decoding;
     if (seqlenq_ngroups_swapped) {
         const int ngroups = num_heads / num_heads_k;
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);

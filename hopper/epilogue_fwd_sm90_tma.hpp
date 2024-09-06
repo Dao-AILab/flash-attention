@@ -29,7 +29,7 @@ struct CollectiveEpilogueFwd {
 
     static constexpr int kNWarps = Ktraits::kNWarps;
     static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
-    static constexpr bool Is_WS = kNWarps >= 12;    
+    static constexpr bool Is_WS = Ktraits::Is_WS;
 
     static constexpr int NumCopyThreads = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
     static constexpr int NumMmaThreads = kNThreads - NumCopyThreads;
