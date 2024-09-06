@@ -11,8 +11,88 @@ import flash_attn_2_cuda as flash_attn_cuda
 
 # isort: on
 
+@torch.library.register_fake("flash_attn::fwd")
+def _(q, k, v, out_, alibi_slopes_, p_dropout, softmax_scale, is_casual, window_size_left, window_size_right, softcap, return_softmax, gen_):
+    #TODO(anijain2305): Add support for seqlenq_ngroups_swapped and head_size_%8 != 0
+    batch_size, seqlen_q, num_heads, head_size_og = q.shape
+    _, seqlen_k, num_heads_k, _ = k.shape
+
+
+
+    if head_size_og%8 != 0:
+        # Fix this
+        raise NotImplementedError("Need to pad")
+    else:
+        q_padded = torch.empty_like(q)
+        k_padded = torch.empty_like(k)
+        v_padded = torch.empty_like(v)
+    
+    out = torch.empty_like(q)
+
+    # Copy of following C++ code
+    # auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    # const int head_size = round_multiple(head_size_og, 8);
+    # const int head_size_rounded = head_size <= 192 ? round_multiple(head_size, 32) : 256;
+    # const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
+    # const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
+
+
+    def round_multiple(x, m):
+        return ((x + m - 1) // m) * m
+    
+    head_size = round_multiple(head_size_og, 8)
+    head_size_rounded = round_multiple(head_size, 32) if head_size <= 192 else 256
+    seqlen_q_rounded = round_multiple(seqlen_q, 128)
+    seqlen_k_rounded = round_multiple(seqlen_k, 128)
+
+    # Is there a better way than using `.to` everywhere?
+    softmax_lse = torch.empty(batch_size, num_heads, seqlen_q).to(dtype=torch.float).to(device=q_padded.device)
+
+    p = torch.empty(1).to(device=q_padded.device).to(dtype=q_padded.dtype)
+    if return_softmax:
+        p = torch.empty(batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded).to(device=q_padded.device).to(dtype=q_padded.dtype)
+
+    rng_state = torch.empty(2, dtype=torch.int64).to(device=q_padded.device)
+
+    out_padded = out
+
+    # if seqlenq_ngroups_swapped:
+    #     out = ...
+    # returns [out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state] 
+    return out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state
+
+
+@torch.library.register_fake("flash_attn::bwd")
+def _(dout, q, k, v, out, softmax_lse, dq, dk, dv, alibi_slopes, dropout_p, softmax_scale, causal,window_size_left, window_size_right, softcap, deterministic, gen_, rng_state):
+    batch_size, seqlen_q, num_heads, head_size_og = q.shape
+    head_size_og = dout.shape[3]
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+
+    _, seqlen_k, num_heads_k, _ = k.shape
+
+    # Copy of following C++ code
+    # auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    # const int head_size_rounded = head_size <= 192 ? round_multiple(head_size, 32) : 256;
+    # const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
+    # const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
+
+    def round_multiple(x, m):
+        return ((x + m - 1) // m) * m
+    
+    head_size_rounded = round_multiple(head_size_og, 32) if head_size_og <= 192 else 256
+    seqlen_q_rounded = round_multiple(seqlen_q, 128)
+    seqlen_k_rounded = round_multiple(seqlen_k, 128)
+
+    softmax_d = torch.empty(batch_size, num_heads, seqlen_q_rounded, dtype=torch.float).to(device=dq.device)
+
+    return [dq, dk, dv, softmax_d]
+    
 def maybe_contiguous(x):
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+    # TODO(anijain2305) - Fix this.
+    return x.contiguous() if x is not None else x
+    # return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 def _get_block_size_n(device, head_dim, is_dropout, is_causal):
     # This should match the block sizes in the CUDA kernel
@@ -49,7 +129,8 @@ def _flash_attn_forward(
     q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax
 ):
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_cuda.fwd(
+    # out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_cuda.fwd(
+    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = torch.ops.flash_attn.fwd(
         q,
         k,
         v,
@@ -141,7 +222,7 @@ def _flash_attn_backward(
         dk,
         dv,
         softmax_d,
-    ) = flash_attn_cuda.bwd(
+    ) = torch.ops.flash_attn.bwd(
         dout,
         q,
         k,
