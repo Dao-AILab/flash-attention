@@ -333,10 +333,10 @@ def flash_attn_func(
         v,
         softmax_scale,
         causal,
-        deterministic=deterministic,
-        descale_q=descale_q,
-        descale_k=descale_k,
-        descale_v=descale_v,
+        deterministic,
+        descale_q,
+        descale_k,
+        descale_v,
     )
 
 
