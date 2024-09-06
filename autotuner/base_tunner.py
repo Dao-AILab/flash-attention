@@ -73,7 +73,7 @@ class BaseTunner:
         self.Br_list = [32, 64, 128, 256]
         self.Bc_list = [32, 64, 128, 256]
 
-        self.template_dir = "template"
+        self.template_dir = "autotuner/template"
         self.op_name = op_name
         self.cache_path = os.path.join(os.path.dirname(__file__), "../../cache/")
         self.problem_key = {
@@ -98,7 +98,7 @@ class BaseTunner:
         pass
     
     def profile(self, config:BaseConfig, device="cuda:0") -> float:
-        spec = importlib.util.spec_from_file_location("flash_attn_func", self.tempdir+"/"+config.temp_dir+"/flash_attn_profile_interface.py")
+        spec = importlib.util.spec_from_file_location("flash_attn_func", self.tempdir+"/"+config.output_dir+"/flash_attn_profile_interface.py")
         flash_attn_func = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(flash_attn_func)
         latency = profile_fwd(flash_attn_func)
@@ -216,11 +216,12 @@ class BaseTunner:
     
 if __name__=="__main__":
     import torch
+    from configs.fwd_config import FlashFwdConfig
     batch_size = 4
     seqlen = 2048
     nheads = 8
-    headdim = 32
-    v_headdim = 32
+    headdim = 192
+    v_headdim = 128
     device = 'cuda'
     dtype = torch.bfloat16
     q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype,
@@ -231,5 +232,6 @@ if __name__=="__main__":
                                 requires_grad=True)
     base_tunner = BaseTunner(arch=None, torch_array=[q,k,v], op_name="flash_fwd", tempdir="autotuner/temp")
 
-    config = BaseConfig(headdim,v_headdim,64,32)
+    config = FlashFwdConfig(headdim,v_headdim,64,64)
     base_tunner.compile([config])
+    base_tunner.profile(config)

@@ -8,7 +8,6 @@ class BaseConfig:
 
         self.operation = None
         self.template_dir = None
-        self.output_dir = str(self)
 
     def __repr__(self) -> str:
         return "Config(Kd={}, D={}, Br={}, Bc={}, Nwarps={}".format(self.Kd, self.D, self.Br, self.Bc, self.Nwarps)
@@ -21,6 +20,10 @@ class BaseConfig:
         cc = cls.__new__(cls) # cls: 子类
         cc.__dict__.update(dd)
         return cc
+    
+    @property
+    def output_dir(self):
+        return str(self)
     
 if __name__ == "__main__":
     cc = BaseConfig(1,2,3,4)

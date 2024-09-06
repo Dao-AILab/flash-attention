@@ -20,7 +20,7 @@ include_path = [
     "csrc/flash_attn",
     "csrc/flash_attn/src",
     "csrc/cutlass/include",
-    OUTPUT_DIR,
+    OUTPUT_KERNEL_DIR,
 ]
 
 cc_flag = []
@@ -31,6 +31,9 @@ cc_flag.append("arch=compute_80,code=sm_80")
 # cc_flag.append("-gencode")
 # cc_flag.append("arch=compute_90,code=sm_90")
 
+build_dir = OUTPUT_KERNEL_DIR + "/build"
+if not os.path.exists(build_dir):
+    os.makedirs(build_dir)
 
 
 flash_attn_cuda = torch.utils.cpp_extension.load(
@@ -68,7 +71,7 @@ flash_attn_cuda = torch.utils.cpp_extension.load(
                     + generator_flag
                     + cc_flag,
     extra_include_paths=include_path,
-    build_directory=f"build_autotuner",
+    build_directory=build_dir,
 )
 
 # isort: off

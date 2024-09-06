@@ -43,7 +43,7 @@ class CodeEmitter:
         # generate kernel code
         # TODO: parallelize
         for config in configs:
-            kernel_code_dir = Path(output_dir) / Path(str(config))
+            kernel_code_dir = Path(output_dir) / Path(config.output_dir)
             if not kernel_code_dir.exists():
                 os.mkdir(kernel_code_dir)
             for file_name in self.kernel_file_list:
@@ -53,6 +53,14 @@ class CodeEmitter:
 
                 with open(kernel_code_dir / Path(file_name), "w") as f:
                     f.write(code_template)
+
+            # flash_attn_profile_interface.py
+            with open(Path(template_dir) / Path("flash_attn_profile_interface.py")) as f:
+                code_template = f.read()
+            code_template = code_template.replace("OUTPUT_DIR", f"\"{str(output_dir)}\"")
+            code_template = code_template.replace("OUTPUT_KERNEL_DIR", f"\"{str(kernel_code_dir)}\"")
+            with open(Path(kernel_code_dir) / Path("flash_attn_profile_interface.py"), "w") as f:
+                f.write(code_template)
 
 
     def emit_code_kernel(self, code_template:str, config:BaseConfig):
