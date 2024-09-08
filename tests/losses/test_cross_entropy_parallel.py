@@ -15,11 +15,13 @@ is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
     "dtype", [torch.float16, torch.float32] + ([torch.bfloat16] if is_sm8x else [])
 )
 # @pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("precompute_lse", [False, True])
+# @pytest.mark.parametrize("precompute_lse", [False])
 @pytest.mark.parametrize("inplace_backward", [False, True])
 # @pytest.mark.parametrize("inplace_backward", [False])
-@pytest.mark.parametrize("lse_square_scale", [0.0, 1e-2])
-# @pytest.mark.parametrize("lse_square_scale", [0.0])
-@pytest.mark.parametrize("logit_scale", [0.7])
+# @pytest.mark.parametrize("lse_square_scale", [0.0, 1e-2])
+@pytest.mark.parametrize("lse_square_scale", [1e-2])
+@pytest.mark.parametrize("logit_scale", [1.0, 0.7])
 # @pytest.mark.parametrize("logit_scale", [1.0])
 @pytest.mark.parametrize("smoothing", [0.0, 0.9])
 # @pytest.mark.parametrize("smoothing", [0.0])
@@ -28,8 +30,17 @@ is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 # @pytest.mark.parametrize("world_size", [1, 2])
 @pytest.mark.parametrize("world_size", [2])
 def test_cross_entropy_loss_parallel(
-    vocab_size, world_size, smoothing, logit_scale, lse_square_scale, inplace_backward, dtype
+    vocab_size,
+    world_size,
+    smoothing,
+    logit_scale,
+    lse_square_scale,
+    inplace_backward,
+    precompute_lse,
+    dtype,
 ):
+    if precompute_lse and (logit_scale != 1.0 or smoothing != 0.0):
+        pytest.skip("precompute_lse only works with logit_scale=1.0 and smoothing=0.0")
     assert vocab_size % world_size == 0
     rtol, atol = (
         (1e-5, 2e-5)
@@ -67,7 +78,12 @@ def test_cross_entropy_loss_parallel(
         inplace_backward=inplace_backward,
         process_group=parallel_state.get_tensor_model_parallel_group(),
     )
-    out = model(x, y)
+    if precompute_lse:
+        with torch.no_grad():
+            lse = torch.logsumexp(x.float(), dim=-1)
+    else:
+        lse = None
+    out = model(x, y, precomputed_lse=lse)
     out_pt = model_pt(x_pt.float() * logit_scale, y)
     if lse_square_scale > 0.0:
         lse_pt = torch.logsumexp(x_pt.float() * logit_scale, dim=-1)
