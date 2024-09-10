@@ -7,8 +7,8 @@ from base_tunner import BaseTunner
 from configs.fwd_config import FlashFwdConfig
 
 class FlashFwdTunner(BaseTunner):
-    def __init__(self, arch, torch_array: list, tempdir: str):
-        super().__init__(arch, torch_array, "flash_fwd", tempdir)
+    def __init__(self, arch, torch_array: list, shape_config, tempdir: str):
+        super().__init__(arch, torch_array, "flash_fwd", shape_config, tempdir)
     
     def validate_register_fuse(self, config):
         Br = config.Br

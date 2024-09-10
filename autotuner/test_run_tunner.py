@@ -1,6 +1,7 @@
 import torch
 from tunner import FlashFwdTunner
 from arch import A100
+from code_emitter import ShapeConfig
 
 batch_size = 4
 seqlen = 2048
@@ -16,5 +17,5 @@ k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype,
 v = torch.randn(batch_size, seqlen, nheads, v_headdim, device=device, dtype=dtype,
                                 requires_grad=True)
 
-tunner = FlashFwdTunner(A100(), [q,k,v], "autotuner/temp")    
+tunner = FlashFwdTunner(A100(), [q,k,v], ShapeConfig(headdim,v_headdim), "autotuner/temp")    
 tunner.tune()

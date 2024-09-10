@@ -69,7 +69,7 @@ def _create_code_for_profiling(config):
 #     return CompileResult(config,lib_name)
 
 class BaseTunner:
-    def __init__(self, arch, torch_array: list, op_name, tempdir):
+    def __init__(self, arch, torch_array: list, op_name, shape_config: ShapeConfig, tempdir):
         self.arch = arch
         self.torch_array = torch_array
         self.Br_list = [32, 64, 128] # [32, 64, 128, 256]
@@ -82,8 +82,10 @@ class BaseTunner:
             "dim_qk": torch_array[0].shape[-1],
             "dim_v": torch_array[2].shape[-1]
         }
+        assert torch_array[0].shape[-1] == shape_config.Kd
+        assert torch_array[2].shape[-1] == shape_config.D
         # TODO: causal, dropout
-        self.shape_config = ShapeConfig(torch_array[0].shape[-1],torch_array[2].shape[-1])
+        self.shape_config = shape_config
         self.tempdir = tempdir
 
     def compile(self, configs:list, timeout: float = None):
