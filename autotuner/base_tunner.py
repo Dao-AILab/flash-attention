@@ -75,7 +75,7 @@ class BaseTunner:
 
         self.template_dir = "autotuner/template"
         self.op_name = op_name
-        self.cache_path = os.path.join(os.path.dirname(__file__), "../../cache/")
+        self.cache_path = os.path.join(os.path.dirname(__file__), "./cache/")
         self.problem_key = {
             "dim_qk": torch_array[0].shape[-1],
             "dim_v": torch_array[2].shape[-1]
@@ -88,14 +88,6 @@ class BaseTunner:
         code_emitter = CodeEmitter(self.template_dir, temp_dir)
         code_emitter.generate_code(self.shape_config, configs)
 
-    
-    def compile_parallel(self, configs:list, temp_dir:str, timeout: float = None):
-        # ## compile
-        # arch = self.arch
-        # with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-        #     libs = executor.map(_compile, configs,[arch for _ in configs],[temp_dir for _ in configs],[timeout for _ in configs])
-        # return list(libs)
-        pass
     
     def profile(self, config:BaseConfig, device="cuda:0") -> float:
         spec = importlib.util.spec_from_file_location("flash_attn_func", self.tempdir+"/"+config.output_dir+"/flash_attn_profile_interface.py")
@@ -116,16 +108,14 @@ class BaseTunner:
             for Bc in self.Bc_list:
                 cur_configs = self.generate_configs(Br,Bc,dim_qk,dim_v)
                 for cur_config in cur_configs:
-                    if cur_config.fuse_type=="register" and self.validate_register_fuse(cur_config):
-                        configs.append(cur_config)
-                    elif cur_config.fuse_type=="shared" and self.validate_shared_fuse(cur_config):
+                    if self.operation == "flash_fwd" and self.validate_register_fuse(cur_config):
                         configs.append(cur_config)
                     else: # BWD
                         if self.validate_kernel(cur_config):
                             configs.append(cur_config)
         return configs
 
-    def tune(self, log_path="../logs/"):
+    def tune(self, log_path="./logs/"):
         st = time.time()
 
         dim_qk = self.problem_key["dim_qk"]
