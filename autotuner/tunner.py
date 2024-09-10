@@ -3,8 +3,8 @@ import ctypes
 import os
 import torch
 
-from .base_tunner import BaseTunner
-from .configs.fwd_config import FlashFwdConfig
+from base_tunner import BaseTunner
+from configs.fwd_config import FlashFwdConfig
 
 class FlashFwdTunner(BaseTunner):
     def __init__(self, arch, torch_array: list, tempdir: str):

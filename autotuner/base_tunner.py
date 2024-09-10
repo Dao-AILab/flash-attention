@@ -1,13 +1,15 @@
 import ctypes
 import os
 from concurrent.futures import ThreadPoolExecutor
+# import multiprocessing
+# from functools import partial
 import tempfile
 import subprocess
 import importlib.util
 
 import ctypes
 import torch
-from configs.base_config import BaseConfig
+from configs import BaseConfig, supported_configs
 
 import pprint
 import json
@@ -70,8 +72,8 @@ class BaseTunner:
     def __init__(self, arch, torch_array: list, op_name, tempdir):
         self.arch = arch
         self.torch_array = torch_array
-        self.Br_list = [32, 64, 128, 256]
-        self.Bc_list = [32, 64, 128, 256]
+        self.Br_list = [32, 64, 128] # [32, 64, 128, 256]
+        self.Bc_list = [32, 64, 128] # [32, 64, 128, 256]
 
         self.template_dir = "autotuner/template"
         self.op_name = op_name
@@ -80,6 +82,7 @@ class BaseTunner:
             "dim_qk": torch_array[0].shape[-1],
             "dim_v": torch_array[2].shape[-1]
         }
+        # TODO: causal, dropout
         self.shape_config = ShapeConfig(torch_array[0].shape[-1],torch_array[2].shape[-1])
         self.tempdir = tempdir
 
@@ -89,11 +92,12 @@ class BaseTunner:
         code_emitter.generate_code(self.shape_config, configs)
 
     
-    def profile(self, config:BaseConfig, device="cuda:0") -> float:
+    def profile(self, config:BaseConfig, device="cuda:0", repeat=30) -> float:
         spec = importlib.util.spec_from_file_location("flash_attn_func", self.tempdir+"/"+config.output_dir+"/flash_attn_profile_interface.py")
-        flash_attn_func = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(flash_attn_func)
-        latency = profile_fwd(flash_attn_func)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        flash_attn_func = mod.flash_attn_func
+        latency = profile_fwd(flash_attn_func, self.shape_config.Kd, self.shape_config.D, is_bf16=self.shape_config.is_bf16, causal=self.shape_config.is_causal, device=device, repeats=repeat)
         if latency < 0:
             latency = 1e8
         # remove lib
@@ -108,7 +112,7 @@ class BaseTunner:
             for Bc in self.Bc_list:
                 cur_configs = self.generate_configs(Br,Bc,dim_qk,dim_v)
                 for cur_config in cur_configs:
-                    if self.operation == "flash_fwd" and self.validate_register_fuse(cur_config):
+                    if self.op_name  == "flash_fwd" and self.validate_register_fuse(cur_config):
                         configs.append(cur_config)
                     else: # BWD
                         if self.validate_kernel(cur_config):
@@ -139,6 +143,17 @@ class BaseTunner:
         # cresults = self.compile(configs,src_dir.name,timeout=1200)
         # cresults = self.compile_parallel(configs,src_dir.name,timeout=120)
         self.compile(configs,timeout=120)
+
+        # warm up (parallel compile module)
+        # module name must be different in api.py
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            latencys = executor.map(self.profile, configs, ["cuda:0" for _ in range(len(configs))], [1 for _ in range(len(configs))])
+        # with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+        #     latencys = executor.map(_profile,[self.tempdir for _ in range(len(configs))],[self.shape_config for _ in range(len(configs))], configs, ["cuda:0" for _ in range(len(configs))], [1 for _ in range(len(configs))])
+        # multiprocessing.set_start_method('spawn', force=True)
+        # pool = multiprocessing.Pool(os.cpu_count())
+        # outs = pool.map(partial(self.profile, repeat=1), configs)
+
         profile_dict = {}
         latency = 1e8
         best_config = None

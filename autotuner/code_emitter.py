@@ -22,6 +22,8 @@ class CodeEmitter:
         ]
         self.kernel_file_list = [
             "flash_fwd.h",
+            "flash_profile.h",
+            "flash_fwd_launch_template_profile.h"
         ]
 
     def generate_code(self, shape_config:ShapeConfig, configs:list[BaseConfig]):
@@ -41,7 +43,6 @@ class CodeEmitter:
                 f.write(code_template)
 
         # generate kernel code
-        # TODO: parallelize
         for config in configs:
             kernel_code_dir = Path(output_dir) / Path(config.output_dir)
             if not kernel_code_dir.exists():
@@ -59,6 +60,7 @@ class CodeEmitter:
                 code_template = f.read()
             code_template = code_template.replace("OUTPUT_DIR", f"\"{str(output_dir)}\"")
             code_template = code_template.replace("OUTPUT_KERNEL_DIR", f"\"{str(kernel_code_dir)}\"")
+            code_template = code_template.replace("CONFIG_NAME", f"\"{str(config)}\"")
             with open(Path(kernel_code_dir) / Path("flash_attn_profile_interface.py"), "w") as f:
                 f.write(code_template)
 

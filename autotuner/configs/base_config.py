@@ -10,7 +10,7 @@ class BaseConfig:
         self.template_dir = None
 
     def __repr__(self) -> str:
-        return "Config(Kd={}, D={}, Br={}, Bc={}, Nwarps={}".format(self.Kd, self.D, self.Br, self.Bc, self.Nwarps)
+        return "Config(Kd={}, D={}, Br={}, Bc={}, Nwarps={})".format(self.Kd, self.D, self.Br, self.Bc, self.Nwarps)
 
     def __str__(self) -> str:
         return f"{self.Kd}_{self.D}_{self.Br}_{self.Bc}_{self.Nwarps}"
