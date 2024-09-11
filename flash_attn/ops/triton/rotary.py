@@ -194,7 +194,7 @@ def apply_rotary(
         else (64 if rotary_dim <= 64 else (128 if rotary_dim <= 128 else 256))
     )
     grid = lambda META: (triton.cdiv(seqlen, META["BLOCK_M"]), batch, nheads)  # noqa
-    BLOCK_M = 4 if interleaved else (8 if rotary_dim <= 64 else 4)
+    BLOCK_M = 4 if interleaved else (8 if rotary_dim <= 128 else 4)
 
     # Need this, otherwise Triton tries to launch from cuda:0 and we get
     # ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
