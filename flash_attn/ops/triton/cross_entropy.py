@@ -34,34 +34,41 @@ def cross_entropy_fwd_kernel(
     total_classes,
     class_start_idx,  # Useful for tensor parallel when each rank only has a subset of classes
     n_cols,  # shapes
-    n_rows,
     logits_row_stride,  # strides
     BLOCK_SIZE: tl.constexpr,
     HAS_SMOOTHING: tl.constexpr,
     # if SPLIT (e.g. tensor parallel), don't include the LSE in the loss since it's not the final LSE
     SPLIT: tl.constexpr,
+    PRECOMPUTED_LSE: tl.constexpr,  # If LSE is already computed (also no smoothing and logit_scale == 1.0)
 ):
     row_idx = tl.program_id(0)
-    col_block_idx = tl.program_id(1)
     logits_ptr = logits_ptr + row_idx * logits_row_stride.to(tl.int64)
-    col_offsets = col_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    sum_logits = 0.0  # For smoothing
+    if not PRECOMPUTED_LSE:
+        # Statistics for online softmax
+        m_i = -float("inf")
+        l_i = 0.0
+        for col_offset in range(0, n_cols, BLOCK_SIZE):
+            cols = col_offset + tl.arange(0, BLOCK_SIZE)
+            logits = tl.load(logits_ptr + cols, mask=cols < n_cols, other=-float("inf")).to(
+                tl.float32
+            ) * logit_scale
+            if HAS_SMOOTHING:
+                sum_logits += tl.sum(tl.where(cols < n_cols, logits, 0.0))
+            m_i_new = tl.maximum(m_i, tl.max(logits))
+            l_i = tl.exp(m_i - m_i_new) * l_i + tl.sum(tl.exp(logits - m_i_new))
+            m_i = m_i_new
+        lse = tl.log(l_i) + m_i
+        tl.store(lse_ptr + row_idx, lse)
+    else:
+        lse = tl.load(lse_ptr + row_idx)
     label_idx = tl.load(labels_ptr + row_idx)
-    logits = tl.load(logits_ptr + col_offsets, mask=col_offsets < n_cols, other=-float("inf")).to(
-        tl.float32
-    ) * logit_scale
-    max_logits = tl.max(logits, 0)
-    if HAS_SMOOTHING:
-        sum_logits = tl.sum(tl.where(col_offsets < n_cols, logits, 0.0), 0)
-    lse = tl.log(tl.sum(tl.exp(logits - max_logits), 0)) + max_logits
-    tl.store(lse_ptr + col_block_idx * n_rows + row_idx, lse)
     if label_idx == ignore_index:
         loss = 0.0
         z_loss = 0.0
     else:
         label_idx -= class_start_idx
-        if label_idx >= col_block_idx * BLOCK_SIZE and label_idx < min(
-            n_cols, (col_block_idx + 1) * BLOCK_SIZE
-        ):
+        if label_idx >= 0 and label_idx < n_cols:
             logits_label = tl.load(logits_ptr + label_idx) * logit_scale
             if HAS_SMOOTHING:
                 loss = (
@@ -82,9 +89,9 @@ def cross_entropy_fwd_kernel(
             loss += z_loss
         else:
             z_loss = 0.0
-    tl.store(loss_ptr + col_block_idx * n_rows + row_idx, loss)
+    tl.store(loss_ptr + row_idx, loss)
     if not SPLIT:
-        tl.store(z_loss_ptr + col_block_idx * n_rows + row_idx, z_loss)
+        tl.store(z_loss_ptr + row_idx, z_loss)
 
 
 @triton.heuristics(
@@ -132,7 +139,7 @@ def cross_entropy_bwd_kernel(
     if HAS_SMOOTHING:
         smooth_positive = 1.0 - smoothing
         smooth_negative = smoothing / total_classes
-        probs = tl.where(col_offsets == label_idx, probs - (1 - smoothing), probs) - smooth_negative
+        probs = tl.where(col_offsets == label_idx, probs - smooth_positive, probs) - smooth_negative
     else:
         probs = tl.where(col_offsets == label_idx, probs - 1.0, probs)
     tl.store(dlogits_ptr + col_offsets, (dloss * logit_scale) * probs, mask=col_offsets < n_cols)
@@ -145,6 +152,7 @@ class CrossEntropyLoss(torch.autograd.Function):
         ctx,
         logits,
         labels,
+        precomputed_lse=None,
         smoothing=0.0,
         logit_scale=1.0,
         lse_square_scale=0.0,
@@ -158,30 +166,28 @@ class CrossEntropyLoss(torch.autograd.Function):
         total_classes = world_size * n_cols
         rank = 0 if process_group is None else torch.distributed.get_rank(process_group)
         class_start_idx = rank * n_cols
+        use_precomputed_lse = precomputed_lse is not None and logit_scale == 1.0 and smoothing == 0.0
 
         if logits.stride(-1) != 1:
             logits = logits.contiguous()
-        # Set these similar to https://github.com/openai/triton/blob/main/python/tutorials/02-fused-softmax.py
-        MAX_BLOCK_SIZE = 64 * 1024
+        MAX_BLOCK_SIZE = 16 * 1024
         BLOCK_SIZE = min(triton.next_power_of_2(n_cols), MAX_BLOCK_SIZE)
         num_warps = (
             4
             if BLOCK_SIZE < 2048
             else (8 if BLOCK_SIZE < 8192 else (16 if BLOCK_SIZE < 128 * 1024 else 32))
         )
-        # We may split the lse computation across multiple blocks, then do a reduction
-        # lse(local_lse) to get the final LSE. This is faster for large n_cols (e.g., > 64k)
-        # where having just one thread block processing more than 64k elements is slow.
-        split = world_size > 1 or n_cols > MAX_BLOCK_SIZE
-        n_splits = (n_cols + BLOCK_SIZE - 1) // BLOCK_SIZE
-        loss_shape = (n_splits, n_rows) if n_splits > 1 else (n_rows,)
-        losses = torch.empty(*loss_shape, dtype=torch.float, device=logits.device)
-        lse = torch.empty(*loss_shape, dtype=torch.float, device=logits.device)
-        z_losses = torch.empty(*loss_shape, dtype=torch.float, device=logits.device)
+        losses = torch.empty(n_rows, dtype=torch.float, device=logits.device)
+        if use_precomputed_lse:
+            assert precomputed_lse.shape == (n_rows,)
+            lse = precomputed_lse.contiguous()
+        else:
+            lse = torch.empty(n_rows, dtype=torch.float, device=logits.device)
+        z_losses = torch.empty(n_rows, dtype=torch.float, device=logits.device)
         # Need this, otherwise Triton tries to launch from cuda:0 and we get
         # ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
         with torch.cuda.device(logits.device.index):
-            cross_entropy_fwd_kernel[(n_rows, n_splits)](
+            cross_entropy_fwd_kernel[(n_rows,)](
                 losses,  # data ptrs
                 lse,
                 z_losses,
@@ -194,23 +200,20 @@ class CrossEntropyLoss(torch.autograd.Function):
                 total_classes,
                 class_start_idx,
                 n_cols,  # shapes
-                n_rows,
                 logits.stride(0),  # strides
                 BLOCK_SIZE=BLOCK_SIZE,  # constants
+                SPLIT=world_size > 1,
+                PRECOMPUTED_LSE=use_precomputed_lse,
                 num_warps=num_warps,
-                SPLIT=split,
             )
 
-        if split:
+        if world_size > 1:
             # If there's no smoothing, if labels are in the vocab of this partition, losses contains
             # - predicted logit, and 0 otherwise.
             # If there's smoothing=0.1, for labels in the vocab of this partition, losses contains
             # -0.9 * predicted logit - 0.1 * sum logit / total_classes.
             # For labels not in the vocab of this partition, losses contains
             # -0.1 * sum logit / total_classes.
-            if n_splits > 1:
-                lse = torch.logsumexp(lse, dim=0)
-                losses = losses.sum(dim=0)
             if world_size > 1:
                 lse_allgather = torch.empty(world_size, n_rows, dtype=lse.dtype, device=lse.device)
                 torch.distributed.all_gather_into_tensor(lse_allgather, lse, group=process_group)
@@ -242,6 +245,7 @@ class CrossEntropyLoss(torch.autograd.Function):
         ctx.total_classes = total_classes
         ctx.class_start_idx = class_start_idx
         ctx.inplace_backward = inplace_backward
+
 
         return losses, z_losses
 
@@ -277,11 +281,13 @@ class CrossEntropyLoss(torch.autograd.Function):
                 BLOCK_SIZE=BLOCK_SIZE,  # constants
                 num_warps=num_warps,
             )
-        return dlogits, None, None, None, None, None, None, None, None
+        return dlogits, None, None, None, None, None, None, None, None, None
+
 
 def cross_entropy_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
+    precomputed_lse: Optional[torch.Tensor] = None,
     label_smoothing: float = 0.0,
     logit_scale: float = 1.0,
     lse_square_scale: float = 0.0,
@@ -309,6 +315,7 @@ def cross_entropy_loss(
     return CrossEntropyLoss.apply(
         logits,
         labels,
+        precomputed_lse,
         label_smoothing,
         logit_scale,
         lse_square_scale,

@@ -1,3 +1,6 @@
 [submodule "csrc/cutlass"]
 	path = csrc/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
+[submodule "csrc/composable_kernel"]
+	path = csrc/composable_kernel
+	url = https://github.com/ROCm/composable_kernel.git

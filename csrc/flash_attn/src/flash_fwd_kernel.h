@@ -24,14 +24,6 @@ namespace flash {
 
 using namespace cute;
 
-template <typename Engine, typename Layout>
-__forceinline__ __device__ void apply_softcap(Tensor<Engine, Layout> &tensor, const float softcap){
-    #pragma unroll
-    for (int i = 0; i < size(tensor); ++i) {
-        tensor(i) = cutlass::fast_tanh(tensor(i) * softcap);
-    }
-}
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
@@ -343,7 +335,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         );
         // if (cute::thread0()) { print(acc_s); }
         if constexpr (Is_softcap){
-            apply_softcap(acc_s, params.softcap);
+            flash::apply_softcap(acc_s, params.softcap);
         }
 
         mask.template apply_mask<Is_causal, Is_even_MN>(
@@ -415,7 +407,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             smem_thr_copy_Q, smem_thr_copy_K
         );
         if constexpr (Is_softcap){
-            apply_softcap(acc_s, params.softcap);
+            flash::apply_softcap(acc_s, params.softcap);
         }
 
         flash::cp_async_wait<0>();
@@ -923,7 +915,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         );
         // if (cute::thread0()) { print(acc_s); }
         if constexpr (Is_softcap){
-            apply_softcap(acc_s, params.softcap);
+            flash::apply_softcap(acc_s, params.softcap);
         }
 
 
@@ -1005,7 +997,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             smem_thr_copy_Q, smem_thr_copy_K
         );
         if constexpr (Is_softcap){
-            apply_softcap(acc_s, params.softcap);
+            flash::apply_softcap(acc_s, params.softcap);
         }
 
         flash::cp_async_wait<0>();

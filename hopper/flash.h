@@ -7,14 +7,6 @@
 #include <cuda.h>
 #include <vector>
 
-#ifdef OLD_GENERATOR_PATH
-#include <ATen/CUDAGeneratorImpl.h>
-#else
-#include <ATen/cuda/CUDAGeneratorImpl.h>
-#endif
-
-#include <ATen/cuda/CUDAGraphsUtils.cuh> // For at::cuda::philox::unpack
-
 #include "cutlass/fast_math.h"  // For cutlass::FastDivmod
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -65,7 +57,7 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ softmax_lseaccum_ptr;
 
     // The dimensions.
-    int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;
+    int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim, total_q, total_k;
 
     // The scaling factors for the kernel.
     float scale_softmax;
@@ -118,9 +110,6 @@ struct Flash_fwd_params : public Qkv_params {
     // Local window size
     int window_size_left, window_size_right;
 
-    // Random state.
-    at::PhiloxCudaState philox_args;
-
     // Pointer to the RNG seed (idx 0) and offset (idx 1).
     uint64_t * rng_state;
 
@@ -139,7 +128,12 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ alibi_slopes_ptr;
     index_t alibi_slopes_batch_stride;
 
+    bool unpadded_lse; // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
+
     int * __restrict__ tile_count_semaphore;
+    float * __restrict__ descale_q_ptr;
+    float * __restrict__ descale_k_ptr;
+    float * __restrict__ descale_v_ptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -179,6 +173,7 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
     // The pointer to the softmax d sum.
     void *__restrict__ dsoftmax_sum;
+    void *__restrict__ softmax_lse_log2_ptr;
 
     int *__restrict__ dq_semaphore;
 

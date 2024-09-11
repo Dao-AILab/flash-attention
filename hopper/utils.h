@@ -15,11 +15,24 @@
 #endif
 
 #include <cute/tensor.hpp>
+#include <cute/arch/cluster_sm90.hpp>  // For cute::elect_one_sync()
 
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
+
+#define CHECK_CUDA(call)                                                                                  \
+    do {                                                                                                  \
+        cudaError_t status_ = call;                                                                       \
+        if (status_ != cudaSuccess) {                                                                     \
+            fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, cudaGetErrorString(status_)); \
+            exit(1);                                                                                      \
+        }                                                                                                 \
+    } while(0)
+
+#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())
+
 
 namespace flash {
 
@@ -62,7 +75,7 @@ struct Allreduce {
 
 template<>
 struct Allreduce<2> {
-template<typename T, typename Operator> 
+template<typename T, typename Operator>
 static __device__ __forceinline__ T run(T x, Operator &op) {
     x = op(x, __shfl_xor_sync(uint32_t(-1), x, 1));
     return x;
@@ -129,6 +142,38 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
         }
     }
 };
+
+// Convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((4, 2, 2), MMA_M, (N / 32, MMA_N))
+template<typename Layout>
+__forceinline__ __device__ auto convert_layout_acc_Aregs_fp8(Layout acc_layout) {
+    using X = Underscore;    
+    static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
+    static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    static_assert(decltype(rank(get<0>(acc_layout)))::value == 3);
+    auto l = logical_divide(get<0>(acc_layout), Shape<X, X, _4>{});  // (2, 2, (2, N / 32)))    
+    return make_layout(make_layout(Shape<_4, _2, _2>{}),
+                       get<1>(acc_layout),
+                       make_layout(get<2, 1>(l), get<2>(acc_layout)));
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Byte permute for fp8 kernel
+template <typename Fragment>
+CUTLASS_DEVICE void permute_regs_A_to_C(Fragment &accum) {  
+
+  auto data = accum.data();    
+
+  #pragma unroll  
+  for (int n = 0; n < size(accum); n += 8) {
+      uint32_t *data_32bit = reinterpret_cast<uint32_t *>(&data[n]);
+      auto upper = data_32bit[0];
+      auto lower = data_32bit[1];
+      data_32bit[0] = __byte_perm(upper, lower, 0x5410);
+      data_32bit[1] = __byte_perm(upper, lower, 0x7632);        
+  }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -211,6 +256,95 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
         } else if (Clear_OOB_MN) {
             cute::clear(D(_, m, _));
         }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <int NumCopyThreads, typename ElemO, typename TMACopyO, typename LayoutO, 
+          typename TileShapeO, typename SMemO, typename SeqLenTraits>
+__forceinline__ __device__ void write_tma(
+        ElemO* O, const TMACopyO& tma_store_O,
+        const LayoutO& layout_O, const TileShapeO& tile_shape_O,
+        const SMemO& sO, int m_block, int bidh, int bidb,
+        const SeqLenTraits& seqlen_traits_o, int write_warp_idx) {
+    Tensor mO = tma_store_O.get_tma_tensor(layout_O.shape());
+    Tensor gO = seqlen_traits_o.get_local_tile_tensor(
+        mO, tile_shape_O, bidh, bidb
+    )(_, _, m_block);  // (M, K)
+    auto block_tma_O = tma_store_O.get_slice(_0{});
+    Tensor tOgO = block_tma_O.partition_D(gO);  // (TMA, TMA_M, TMA_K)
+    Tensor tOsO = block_tma_O.partition_S(sO);  // (TMA, TMA_M, TMA_K)
+
+    int const lane_predicate = cute::elect_one_sync();
+    int const warp_idx = cutlass::canonical_warp_idx_sync();
+    if (warp_idx == write_warp_idx && lane_predicate) {
+        cute::copy(tma_store_O, tOsO, tOgO);
+        tma_store_arrive();
+    }
+    // Note: no wait here.
+    // tma_store_wait<0>();
+}
+
+template <int NumCopyThreads, typename ElemO, typename TiledCopyO, typename LayoutO, 
+          typename TileShapeO, typename SMemO, typename SeqLenTraits>
+__forceinline__ __device__ void write_tiled(
+        ElemO* O, const TiledCopyO& tiled_copy_O,
+        const LayoutO& layout_O, const TileShapeO& tile_shape_O,
+        const SMemO& sO, int m_block, int bidh, int bidb,
+        const SeqLenTraits& seqlen_traits_o) {
+    Tensor mO = make_tensor(make_gmem_ptr(O), layout_O);
+    Tensor gO = seqlen_traits_o.get_local_tile_tensor(
+        mO, tile_shape_O, bidh, bidb
+    )(_, _, m_block);  // (M, K)
+
+    ThrCopy thr_copy_O = tiled_copy_O.get_slice(threadIdx.x - NumCopyThreads);
+    Tensor tOgO = thr_copy_O.partition_D(gO); // (CPY,CPY_M,CPY_K,k)
+    Tensor tOsO = thr_copy_O.partition_S(sO); // (CPY,CPY_M,CPY_K)
+
+    // Prepare for TiledCopy.
+    // Grouping is needed because cute::copy_if() does group_modes<1, R> for src and dst.
+    // After grouping, the first dim is number of elements to read together.
+    Tensor tOsOFlatten = cute::flatten(tOsO);
+    Tensor tOsOGroup = cute::group_modes<1, rank(tOsOFlatten)>(tOsOFlatten);
+    Tensor tOgOFlatten = cute::flatten(tOgO);
+    Tensor tOgOGroup = cute::group_modes<1, rank(tOgOFlatten)>(tOgOFlatten);
+
+    // Get thread coords to global index mapping.
+    Tensor gOCounting = cute::make_identity_tensor(gO.shape());
+    Tensor tSgOCounting = thr_copy_O.partition_D(gOCounting);
+    Tensor tSgOCountingFlatten = cute::flatten(tSgOCounting);
+    Tensor tSgOCountingGrouped =
+        cute::group_modes<1, rank(tSgOCountingFlatten)>(tSgOCountingFlatten);
+
+    // Write out to GMEM.
+    const int kNumMsPerTile = get<0>(tile_shape_O);
+    int cta_m = std::min(
+        seqlen_traits_o.actual_seq_len - m_block * kNumMsPerTile, kNumMsPerTile
+    );
+    if (cta_m == kNumMsPerTile) {
+        copy(tiled_copy_O, tOsOGroup, tOgOGroup);
+    } else {
+        auto predicate_fn = [&](auto coords) {
+            auto s_coords = tSgOCountingGrouped(_0{}, coords);
+            return elem_less(get<0>(s_coords), cta_m);
+        };
+        copy_if(tiled_copy_O, predicate_fn, tOsOGroup, tOgOGroup);
+    }
+}
+
+template <bool IsTMACopy, int NumCopyThreads, typename ElemO, 
+          typename TMACopyO, typename TiledCopyO, typename LayoutO, 
+          typename TileShapeO, typename SMemO, typename SeqLenTraits>
+__forceinline__ __device__ void write_O(
+        ElemO* O, const TMACopyO& tma_copy_O, const TiledCopyO& tiled_copy_O,
+        const LayoutO& layout_O, const TileShapeO& tile_shape_O,
+        const SMemO& sO, int m_block, int bidh, int bidb,
+        const SeqLenTraits& seqlen_traits_o, int write_warp_idx) {
+    if constexpr (IsTMACopy) {
+        write_tma<NumCopyThreads>(O, tma_copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb, seqlen_traits_o, write_warp_idx);
+    } else {
+        write_tiled<NumCopyThreads>(O, tiled_copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb, seqlen_traits_o);
     }
 }
 
