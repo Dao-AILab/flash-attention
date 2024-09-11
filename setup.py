@@ -231,13 +231,13 @@ if not SKIP_CUDA_BUILD:
                         "--use_fast_math",
                         # "--ptxas-options=-v",
                         # "--ptxas-options=-O2",
-                        # "-lineinfo",
+                         "-lineinfo",
                         # "-DFLASHATTENTION_DISABLE_BACKWARD",
-                        # "-DFLASHATTENTION_DISABLE_DROPOUT",
-                        # "-DFLASHATTENTION_DISABLE_ALIBI",
-                        # "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                        # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
-                        # "-DFLASHATTENTION_DISABLE_LOCAL",
+                         "-DFLASHATTENTION_DISABLE_DROPOUT",
+                         "-DFLASHATTENTION_DISABLE_ALIBI",
+                         "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                         "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+                         "-DFLASHATTENTION_DISABLE_LOCAL",
                     ]
                     + generator_flag
                     + cc_flag

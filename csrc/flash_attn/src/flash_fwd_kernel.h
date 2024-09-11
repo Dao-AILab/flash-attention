@@ -293,7 +293,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // RPE biases
     //Tensor rpe_weights = make_tensor(make_smem_ptr(reinterpret_cast<cutlass::tfloat32_t*>(smem_ + Kernel_traits::kSmemQKVSize)), typename Kernel_traits::SmemLayoutRPE{});
-    flash::RPE<Is_causal, kBlockM, kBlockN, Kernel_traits::kNThreads, false> rpe(params.rpe_num_buckets, params.rpe_max_distance, params.h, params.scale_softmax);
+    flash::RPE<Is_causal, kBlockM, kBlockN, Kernel_traits::kNWarps, Kernel_traits::kNThreads, false> rpe(params.rpe_num_buckets, params.rpe_max_distance, params.h, params.scale_softmax);
     float *smem_rpe_weights = reinterpret_cast<float *>(smem_ + Kernel_traits::kSmemQKVSize);
     float *gmem_rpe_weights = reinterpret_cast<float*>(params.rpe_weights_ptr) + bidh * params.rpe_num_buckets;
 
@@ -322,7 +322,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Load RPE biases
         if (Has_rpe_bias) {
-            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx, nullptr);
+            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx);
             __syncthreads();
         }
 
@@ -406,7 +406,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Load RPE biases
         if (Has_rpe_bias) {
-            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx, nullptr);
+            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx);
             __syncthreads();
         }
 
@@ -863,7 +863,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     flash::Softmax<2 * size<1>(acc_o)> softmax;
 
     // Array for RPE iases
-    flash::RPE<Is_causal, kBlockM, kBlockN, Kernel_traits::kNThreads, false> rpe(params.rpe_num_buckets, params.rpe_max_distance, params.h, params.scale_softmax);
+    flash::RPE<Is_causal, kBlockM, kBlockN, Kernel_traits::kNWarps, Kernel_traits::kNThreads, false> rpe(params.rpe_num_buckets, params.rpe_max_distance, params.h, params.scale_softmax);
     float *smem_rpe_weights = reinterpret_cast<float *>(smem_ + Kernel_traits::kSmemQKVSize);
     float *gmem_rpe_weights = reinterpret_cast<float*>(params.rpe_weights_ptr) + bidh * params.rpe_num_buckets;
 
@@ -893,7 +893,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // Load RPE biases
         if (Has_rpe_bias) {
-            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx, nullptr);
+            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx);
             __syncthreads();
         }
 
@@ -983,7 +983,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // Load RPE biases
         if (Has_rpe_bias) {
-            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx, nullptr);
+            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx);
             __syncthreads();
         }
 
@@ -1136,7 +1136,7 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Has_rpe_bias Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
+    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Has_rpe_bias, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

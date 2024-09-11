@@ -452,11 +452,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     flash::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
 
-    flash::RPE<Is_causal, kBlockM, kBlockN, Kernel_traits::kNThreads, true> rpe(params.rpe_num_buckets, params.rpe_max_distance, params.h, params.scale_softmax);
-    float *smem_rpe_weights = reinterpret_cast<float *>(smem_ + Kernel_traits::kSmemSize1colblockQKV);
+    flash::RPE<Is_causal, kBlockM, kBlockN, Kernel_traits::kNWarps, Kernel_traits::kNThreads, true> rpe(params.rpe_num_buckets, params.rpe_max_distance, params.h, params.scale_softmax);
     float *gmem_rpe_weights = reinterpret_cast<float*>(params.rpe_weights_ptr) + bidh * params.rpe_num_buckets;
-    int *smem_relative_position = reinterpret_cast<int *>(smem_ + Kernel_traits::kSmemSize1colblockQKV + Kernel_traits::kSmemRPESize);
     float *gmem_drpe_weights = reinterpret_cast<float*>(params.drpe_weights_ptr) + bidh * params.rpe_num_buckets;
+
+    float *smem_rpe_weights = reinterpret_cast<float *>(smem_ + Kernel_traits::kSmemSize1colblockQKV);
+    float *smem_drpe_weights = reinterpret_cast<float *>(smem_ + Kernel_traits::kSmemSize1colblockQKV + Kernel_traits::kSmemRPESize);
 
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
@@ -465,7 +466,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         __syncthreads();
 
         if (Has_rpe_bias) {
-            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx, smem_relative_position);
+            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx);
             __syncthreads();
         }
 
@@ -596,14 +597,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         }
         // if (cute::thread0()) { print(dS); }
 
-        if (Has_rpe_bias) {
-            rpe.store_ds(dS, gmem_drpe_weights, smem_relative_position,
-                binfo.actual_seqlen_k, binfo.actual_seqlen_q, n_block, m_block,
-                n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                m_block * kBlockM + get<0>(taccScS_row(0)),
-                AtomLayoutMS * 16);
-        }
-
         Tensor acc_dq = partition_fragment_C(tiled_mma_dq, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
         tdQgdQaccum.data() = tdQgdQaccum.data() + (-int(kBlockM * params.h * params.d_rounded));
         if (Is_first || Seq_parallel) {
@@ -635,6 +628,13 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         Tensor tdSadS = smem_thr_copy_PdS.retile_S(tdSrdS);                                          // ((Atom,AtomNum), MMA_N, MMA_N)
         cute::copy(smem_tiled_copy_PdS, tdSadS, tdSsdS);
         __syncthreads();
+
+        // store_ds
+        if (Has_rpe_bias) {
+            rpe.store_ds(sdS, gmem_drpe_weights, smem_drpe_weights,
+                binfo.actual_seqlen_k, binfo.actual_seqlen_q, n_block, m_block,
+                tidx);
+        }
 
         // Layout p_l = tPrP.layout();
         // Tensor tdVrPt = make_tensor(tPrP.data(), make_layout(get<0>(p_l), get<2>(p_l), get<1>(p_l)));
@@ -733,6 +733,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     }
 
     // Epilogue
+
+    __syncthreads();
+    if (Has_rpe_bias) {
+        rpe.copy_ds(gmem_drpe_weights, smem_drpe_weights, tidx);
+    }
 
     if (Is_dropout) {
         #pragma unroll

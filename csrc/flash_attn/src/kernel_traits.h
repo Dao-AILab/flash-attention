@@ -283,6 +283,7 @@ struct Flash_bwd_kernel_traits : public Base {
     static constexpr int kSmemPSize = size(SmemLayoutPdS{}) * sizeof(Element);
     static constexpr int kSmemdQSize = size(SmemLayoutdQ{}) * sizeof(Element);
     static constexpr int kSmemRPESize = (kBlockM + kBlockN - 1) * 4;
+    static constexpr int kSmemdRPESize = 256;
     static constexpr int kSmemSize = kSmemQdOSize
         + (!Is_V_in_regs
            ? kSmemKVSize + kSmemdSSize + std::max(kSmemPSize, kSmemdQSize)
@@ -291,7 +292,7 @@ struct Flash_bwd_kernel_traits : public Base {
         + (!Is_V_in_regs
            ? kSmemKVSize + kSmemdSSize + kSmemPSize
            : std::max(kSmemKVSize, kSmemKVSize / 2 + kSmemdSSize + kSmemPSize));
-    static constexpr int kSmemSize1colblock = kSmemSize1colblockQKV + 2 * kSmemRPESize;
+    static constexpr int kSmemSize1colblock = kSmemSize1colblockQKV + kSmemRPESize + kSmemdRPESize;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");

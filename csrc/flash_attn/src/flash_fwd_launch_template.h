@@ -29,7 +29,7 @@ __global__ void kernelName(KERNEL_PARAM_MODIFIER const Flash_fwd_params params)
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Has_rpe_bias, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax) {
     #if defined(ARCH_SUPPORTS_FLASH)
         static_assert(!(Is_causal && Is_local)); // Enforce constraints
-        flash::compute_attn<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Has_rpe_bias Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params);
+        flash::compute_attn<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Has_rpe_bias, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params);
     #else
         FLASH_UNSUPPORTED_ARCH
     #endif
@@ -117,7 +117,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                     // If Append_KV, then we must have seqlen_offsets, which means cu_seqlens_k != nullptr.
                                     // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
                                     // If Is_local, set Is_causal to false
-                                    auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && !Append_KV && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Is_softcap, Split, Append_KV>;
+                                    auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, Is_local && !Is_causal, Has_alibi, Has_rpe_bias, IsEvenMNConst && !Append_KV && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Is_softcap, Split, Append_KV>;
                                     // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, true, Split, Append_KV>;
                                     // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, IsEvenKConst>;
                                     if (smem_size >= 48 * 1024) {
