@@ -95,11 +95,13 @@ class BaseTunner:
         code_emitter.generate_code(self.shape_config, configs)
 
     
-    def profile(self, config:BaseConfig, repeat=30) -> float:
+    def profile(self, config:BaseConfig, repeat=30, load_only=False) -> float:
         spec = importlib.util.spec_from_file_location("flash_attn_func", self.tempdir+"/"+config.output_dir+"/flash_attn_profile_interface.py")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         flash_attn_func = mod.flash_attn_func
+        if load_only:
+            return None
         latency = profile_fwd(flash_attn_func, self.shape_config.Kd, self.shape_config.D, batch_size=self.profile_config.batch_size, seqlen=self.profile_config.seqlen_q, nheads=self.profile_config.nheads, dropout_p=self.profile_config.dropout_p,is_bf16=self.shape_config.is_bf16, causal=self.shape_config.is_causal, device=self.profile_config.device, repeats=repeat)
         if latency < 0:
             latency = 1e8
@@ -150,7 +152,7 @@ class BaseTunner:
         # warm up (parallel compile module)
         # module name must be different in api.py
         with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            latencys = executor.map(self.profile, configs, [1 for _ in range(len(configs))])
+            latencys = executor.map(self.profile, configs, [1 for _ in range(len(configs))], [True for _ in range(len(configs))])
         # with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
         #     latencys = executor.map(_profile,[self.tempdir for _ in range(len(configs))],[self.shape_config for _ in range(len(configs))], configs, ["cuda:0" for _ in range(len(configs))], [1 for _ in range(len(configs))])
         # multiprocessing.set_start_method('spawn', force=True)

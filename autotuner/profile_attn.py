@@ -16,6 +16,7 @@ from flash_attn.utils.benchmark import benchmark_forward
 
 def profile_fwd(fn,headdim, v_headdim, batch_size=4, seqlen=2048, nheads=8, device='cuda', is_bf16=False, causal=False, dropout_p=0.0, repeats=30):
     dtype = torch.bfloat16 if is_bf16 else torch.float16
+    # print(batch_size, seqlen, nheads, headdim, v_headdim, device, dtype, dropout_p, causal, repeats)
     q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype,
                               requires_grad=True)
     k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype,
