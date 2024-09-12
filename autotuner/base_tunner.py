@@ -16,7 +16,7 @@ import json
 
 import time
 
-from code_emitter import CodeEmitter, ShapeConfig
+from code_emitter import CodeEmitter, ShapeConfig, ProfileConfig
 from profile_attn import profile_fwd
 
 
@@ -69,7 +69,7 @@ def _create_code_for_profiling(config):
 #     return CompileResult(config,lib_name)
 
 class BaseTunner:
-    def __init__(self, arch, torch_array: list, op_name, shape_config: ShapeConfig, tempdir):
+    def __init__(self, arch, torch_array: list, op_name, shape_config: ShapeConfig, profile_config: ProfileConfig, tempdir):
         self.arch = arch
         self.torch_array = torch_array
         self.Br_list = [32, 64, 128] # [32, 64, 128, 256]
@@ -77,15 +77,16 @@ class BaseTunner:
 
         self.template_dir = "autotuner/template"
         self.op_name = op_name
-        self.cache_path = os.path.join(os.path.dirname(__file__), "./cache/")
+        # TODO: workaround for dropout_p
+        self.cache_path = os.path.join(os.path.dirname(__file__), "./cache/", str(profile_config.dropout_p!=0))
         self.problem_key = {
             "dim_qk": torch_array[0].shape[-1],
             "dim_v": torch_array[2].shape[-1]
         }
         assert torch_array[0].shape[-1] == shape_config.Kd
         assert torch_array[2].shape[-1] == shape_config.D
-        # TODO: causal, dropout
         self.shape_config = shape_config
+        self.profile_config = profile_config
         self.tempdir = tempdir
 
     def compile(self, configs:list, timeout: float = None):
@@ -94,12 +95,12 @@ class BaseTunner:
         code_emitter.generate_code(self.shape_config, configs)
 
     
-    def profile(self, config:BaseConfig, device="cuda:0", repeat=30) -> float:
+    def profile(self, config:BaseConfig, repeat=30) -> float:
         spec = importlib.util.spec_from_file_location("flash_attn_func", self.tempdir+"/"+config.output_dir+"/flash_attn_profile_interface.py")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         flash_attn_func = mod.flash_attn_func
-        latency = profile_fwd(flash_attn_func, self.shape_config.Kd, self.shape_config.D, is_bf16=self.shape_config.is_bf16, causal=self.shape_config.is_causal, device=device, repeats=repeat)
+        latency = profile_fwd(flash_attn_func, self.shape_config.Kd, self.shape_config.D, batch_size=self.profile_config.batch_size, seqlen=self.profile_config.seqlen_q, nheads=self.profile_config.nheads, dropout_p=self.profile_config.dropout_p,is_bf16=self.shape_config.is_bf16, causal=self.shape_config.is_causal, device=self.profile_config.device, repeats=repeat)
         if latency < 0:
             latency = 1e8
         # remove lib
@@ -149,7 +150,7 @@ class BaseTunner:
         # warm up (parallel compile module)
         # module name must be different in api.py
         with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            latencys = executor.map(self.profile, configs, ["cuda:0" for _ in range(len(configs))], [1 for _ in range(len(configs))])
+            latencys = executor.map(self.profile, configs, [1 for _ in range(len(configs))])
         # with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
         #     latencys = executor.map(_profile,[self.tempdir for _ in range(len(configs))],[self.shape_config for _ in range(len(configs))], configs, ["cuda:0" for _ in range(len(configs))], [1 for _ in range(len(configs))])
         # multiprocessing.set_start_method('spawn', force=True)
@@ -178,9 +179,9 @@ class BaseTunner:
         pprint.pprint(best_config)
         print("Latency: ", latency)
 
-        file_name = "profile_result_{}_{}_{}.txt".format(best_config.operation,dim_qk, dim_v)
+        file_name = "profile_result_{}_{}_{}_p{}_{}_{}_{}_c{}.txt".format(best_config.operation,dim_qk, dim_v, self.profile_config.batch_size, self.profile_config.seqlen_q, self.profile_config.nheads, self.profile_config.dropout_p,self.shape_config.is_causal)
         os.makedirs(log_path,exist_ok=True)
-        with open(os.path.join(log_path,file_name),"w") as f:
+        with open(os.path.join(log_path,file_name),"a") as f:
             for config in profile_dict:
                 f.write(repr(config)+"\n")
                 f.write(str(profile_dict[config])+"\n")
@@ -188,7 +189,7 @@ class BaseTunner:
             f.write("best config: \n")
             f.write(repr(best_config)+"\n")
             f.write(str(latency)+"\n")
-            f.write("\nsearch time: "+str(end-st)+"s")
+            f.write("\nsearch time: "+str(end-st)+"s" + "\n\n")
 
         cache_path = self.cache_path
         os.makedirs(cache_path,exist_ok=True)
@@ -237,7 +238,7 @@ if __name__=="__main__":
                                 requires_grad=True)
     v = torch.randn(batch_size, seqlen, nheads, v_headdim, device=device, dtype=dtype,
                                 requires_grad=True)
-    base_tunner = BaseTunner(arch=None, torch_array=[q,k,v], op_name="flash_fwd", tempdir="autotuner/temp")
+    base_tunner = BaseTunner(arch=None, torch_array=[q,k,v], op_name="flash_fwd", shape_config=ShapeConfig(headdim,v_headdim), profle_config=ProfileConfig(batch_size,seqlen,seqlen,nheads,nheads,nheads,device,dtype,0), tempdir="autotuner/temp")
 
     config = FlashFwdConfig(headdim,v_headdim,64,64)
     base_tunner.compile([config])
