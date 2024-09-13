@@ -61,7 +61,7 @@ FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
-
+USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_USE_TRITON_ROCM", "FALSE") == "TRUE"
 
 def get_platform():
     """
@@ -135,7 +135,8 @@ ext_modules = []
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if IS_ROCM:
-    subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"])
+    if not USE_TRITON_ROCM:
+        subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"])
 else:
     subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
@@ -300,94 +301,98 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
         )
     )
 elif not SKIP_CUDA_BUILD and IS_ROCM:
-    ck_dir = "csrc/composable_kernel"
-
     #use codegen get code dispatch
     if not os.path.exists("./build"):
         os.makedirs("build")
-
-    os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --output_dir build --receipt 2")
-    os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d bwd --output_dir build --receipt 2")
 
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
-    # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
-    # See https://github.com/pytorch/pytorch/pull/70650
-    generator_flag = []
-    torch_dir = torch.__path__[0]
-    if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
-        generator_flag = ["-DOLD_GENERATOR_PATH"]
+    if USE_TRITON_ROCM:
+        # Skip C++ extension compilation if using Triton Backend
+        pass
+    else:
+        ck_dir = "csrc/composable_kernel"
 
-    check_if_rocm_home_none("flash_attn")
-    cc_flag = []
+        os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --output_dir build --receipt 2")
+        os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d bwd --output_dir build --receipt 2")
 
-    archs = os.getenv("GPU_ARCHS", "native").split(";")
-    validate_and_update_archs(archs)
+        # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
+        # See https://github.com/pytorch/pytorch/pull/70650
+        generator_flag = []
+        torch_dir = torch.__path__[0]
+        if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
+            generator_flag = ["-DOLD_GENERATOR_PATH"]
 
-    cc_flag = [f"--offload-arch={arch}" for arch in archs]
+        check_if_rocm_home_none("flash_attn")
+        cc_flag = []
 
-    # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
-    # torch._C._GLIBCXX_USE_CXX11_ABI
-    # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
-    if FORCE_CXX11_ABI:
-        torch._C._GLIBCXX_USE_CXX11_ABI = True
+        archs = os.getenv("GPU_ARCHS", "native").split(";")
+        validate_and_update_archs(archs)
 
-    sources = ["csrc/flash_attn_ck/flash_api.cpp",
-               "csrc/flash_attn_ck/mha_bwd.cpp",
-               "csrc/flash_attn_ck/mha_fwd.cpp",
-               "csrc/flash_attn_ck/mha_varlen_bwd.cpp",
-               "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
-        f"build/fmha_*wd*.cpp"
-    )
+        cc_flag = [f"--offload-arch={arch}" for arch in archs]
 
-    rename_cpp_to_cu(sources)
+        # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
+        # torch._C._GLIBCXX_USE_CXX11_ABI
+        # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
+        if FORCE_CXX11_ABI:
+            torch._C._GLIBCXX_USE_CXX11_ABI = True
 
-    renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
-                       "csrc/flash_attn_ck/mha_bwd.cu",
-                       "csrc/flash_attn_ck/mha_fwd.cu",
-                       "csrc/flash_attn_ck/mha_varlen_bwd.cu",
-                       "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
-    extra_compile_args = {
-        "cxx": ["-O3", "-std=c++17"] + generator_flag,
-        "nvcc":
-            [
-                "-O3","-std=c++17",
-                "-mllvm", "-enable-post-misched=0",
-                "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
-                "-fgpu-flush-denormals-to-zero",
-                "-DCK_ENABLE_BF16",
-                "-DCK_ENABLE_BF8",
-                "-DCK_ENABLE_FP16",
-                "-DCK_ENABLE_FP32",
-                "-DCK_ENABLE_FP64",
-                "-DCK_ENABLE_FP8",
-                "-DCK_ENABLE_INT8",
-                "-DCK_USE_XDL",
-                "-DUSE_PROF_API=1",
-                "-D__HIP_PLATFORM_HCC__=1",
-                # "-DFLASHATTENTION_DISABLE_BACKWARD",
-            ]
-            + generator_flag
-            + cc_flag
-        ,
-    }
-
-    include_dirs = [
-        Path(this_dir) / "csrc" / "composable_kernel" / "include",
-        Path(this_dir) / "csrc" / "composable_kernel" / "library" / "include",
-        Path(this_dir) / "csrc" / "composable_kernel" / "example" / "ck_tile" / "01_fmha",
-    ]
-
-    ext_modules.append(
-        CUDAExtension(
-            name="flash_attn_2_cuda",
-            sources=renamed_sources,
-            extra_compile_args=extra_compile_args,
-            include_dirs=include_dirs,
+        sources = ["csrc/flash_attn_ck/flash_api.cpp",
+                "csrc/flash_attn_ck/mha_bwd.cpp",
+                "csrc/flash_attn_ck/mha_fwd.cpp",
+                "csrc/flash_attn_ck/mha_varlen_bwd.cpp",
+                "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
+            f"build/fmha_*wd*.cpp"
         )
-    )
+
+        rename_cpp_to_cu(sources)
+
+        renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
+                        "csrc/flash_attn_ck/mha_bwd.cu",
+                        "csrc/flash_attn_ck/mha_fwd.cu",
+                        "csrc/flash_attn_ck/mha_varlen_bwd.cu",
+                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
+        extra_compile_args = {
+            "cxx": ["-O3", "-std=c++17"] + generator_flag,
+            "nvcc":
+                [
+                    "-O3","-std=c++17",
+                    "-mllvm", "-enable-post-misched=0",
+                    "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
+                    "-fgpu-flush-denormals-to-zero",
+                    "-DCK_ENABLE_BF16",
+                    "-DCK_ENABLE_BF8",
+                    "-DCK_ENABLE_FP16",
+                    "-DCK_ENABLE_FP32",
+                    "-DCK_ENABLE_FP64",
+                    "-DCK_ENABLE_FP8",
+                    "-DCK_ENABLE_INT8",
+                    "-DCK_USE_XDL",
+                    "-DUSE_PROF_API=1",
+                    "-D__HIP_PLATFORM_HCC__=1",
+                    # "-DFLASHATTENTION_DISABLE_BACKWARD",
+                ]
+                + generator_flag
+                + cc_flag
+            ,
+        }
+
+        include_dirs = [
+            Path(this_dir) / "csrc" / "composable_kernel" / "include",
+            Path(this_dir) / "csrc" / "composable_kernel" / "library" / "include",
+            Path(this_dir) / "csrc" / "composable_kernel" / "example" / "ck_tile" / "01_fmha",
+        ]
+
+        ext_modules.append(
+            CUDAExtension(
+                name="flash_attn_2_cuda",
+                sources=renamed_sources,
+                extra_compile_args=extra_compile_args,
+                include_dirs=include_dirs,
+            )
+        )
 
 
 def get_package_version():

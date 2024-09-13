@@ -112,7 +112,7 @@ FlashAttention-2 with CUDA currently supports:
 3. All head dimensions up to 256. ~~Head dim > 192 backward requires A100/A800 or H100/H800~~. Head dim 256 backward now works on consumer GPUs (if there's no dropout) as of flash-attn 2.5.5.
 
 ### AMD ROCm Support
-ROCm version uses [composable_kernel](https://github.com/ROCm/composable_kernel) as the backend. It provides the implementation of FlashAttention-2.
+ROCm version has two backends. There is [composable_kernel](https://github.com/ROCm/composable_kernel) (ck) which is the default backend and a [Triton](https://github.com/triton-lang/triton) backend. They provide an implementation of FlashAttention-2.
 
 **Requirements:**
 - ROCm 6.0 and above.
@@ -121,10 +121,33 @@ We recommend the
 [Pytorch](https://hub.docker.com/r/rocm/pytorch)
 container from ROCm, which has all the required tools to install FlashAttention.
 
-FlashAttention-2 with ROCm currently supports:
+#### Composable Kernel Backend
+FlashAttention-2 ROCm CK backend currently supports:
 1. MI200 or MI300 GPUs.
 2. Datatype fp16 and bf16
 3. Forward's head dimensions up to 256. Backward head dimensions up to 128.
+#### Triton Backend
+FlashAttention-2 ROCm Triton backend is a work in progress. 
+It current supports Forwards only. However some features like PagedAttention and Sliding Window are missing. It can run on both MI and Navi Machines. We are working on backwards.
+
+Inorder to use the triton backend for rocm, follow the steps below.
+
+First install the recommended Triton [commit](https://github.com/triton-lang/triton/commit/2e9f2c2d20601c24b91a4c32a7b97ad1f8a55d88).
+
+```
+git clone https://github.com/triton-lang/triton
+cd triton
+git checkout 2e9f2c2d20601c24b91a4c32a7b97ad1f8a55d88 
+pip install --verbose -e python
+```
+Then install and test Flash Attention with the flag `FLASH_ATTENTION_USE_TRITON_ROCM` set to `"TRUE"`.
+
+```
+export FLASH_ATTENTION_USE_TRITON_ROCM="TRUE"
+cd flash-attention
+python setup.py install
+pytest tests/test_flash_attn.py
+```
 
 
 ## How to use FlashAttention

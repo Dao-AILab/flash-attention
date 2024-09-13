@@ -4,10 +4,15 @@ from typing import Optional, Union
 
 import torch
 import torch.nn as nn
+import os
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
-import flash_attn_2_cuda as flash_attn_cuda
+USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_USE_TRITON_ROCM", "FALSE") == "TRUE"
+if USE_TRITON_ROCM:
+    from flash_attn import flash_attn_triton_interface_amd as flash_attn_gpu
+else:
+    import flash_attn_2_cuda as flash_attn_gpu
 
 # isort: on
 
@@ -49,7 +54,7 @@ def _flash_attn_forward(
     q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax
 ):
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_cuda.fwd(
+    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
         q,
         k,
         v,
@@ -87,7 +92,7 @@ def _flash_attn_varlen_forward(
     seqused_k=None,
 ):
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_cuda.varlen_fwd(
+    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
         q,
         k,
         v,
@@ -141,7 +146,7 @@ def _flash_attn_backward(
         dk,
         dv,
         softmax_d,
-    ) = flash_attn_cuda.bwd(
+    ) = flash_attn_gpu.bwd(
         dout,
         q,
         k,
@@ -195,7 +200,7 @@ def _flash_attn_varlen_backward(
         dk,
         dv,
         softmax_d,
-    ) = flash_attn_cuda.varlen_bwd(
+    ) = flash_attn_gpu.varlen_bwd(
         dout,
         q,
         k,
@@ -1261,7 +1266,7 @@ def flash_attn_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
-    out, softmax_lse = flash_attn_cuda.fwd_kvcache(
+    out, softmax_lse = flash_attn_gpu.fwd_kvcache(
         q,
         k_cache,
         v_cache,
