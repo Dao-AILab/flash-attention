@@ -221,21 +221,40 @@ void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
     // TODO: add splitkv
     constexpr static int Headdim = 64;
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        BOOL_SWITCH(params.is_local, Is_local, [&] {
-            SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
-                run_flash_fwd<
-                    Flash_fwd_kernel_traits<Headdim, 192, 128, 16, 2, false, 1, T>, 
-                    Is_causal, Is_local && !Is_causal, Seqlen_traits
-                >(params, stream);
-            });
+      BOOL_SWITCH(ceil_div(params.seqlen_q, 64) == 1, Single_MMA_WG, [&] {
+        SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
+                BOOL_SWITCH(params.num_splits > 1, Is_split, [&] {
+            run_flash_fwd<
+                Flash_fwd_kernel_traits<Headdim, Single_MMA_WG ? 64 : 192, 128, Single_MMA_WG ? 8 : 16, 2, false, 1, T, !Seqlen_traits::UseVarSeqLen && Is_split>,
+                Is_causal, Seqlen_traits
+            >(params, stream);
         });
+        });
+    });
     });
 }
 
 template<typename T>
 void run_mha_fwd_hdim64_gqa_decoding(Flash_fwd_params &params, cudaStream_t stream) {
     // TODO
-    // constexpr static int Headdim = 64;
+    constexpr static int Headdim = 64;
+    // constexpr static bool UseCluster = false;
+    using Seqlen_traits = flash::FixedSeqLenTraits;
+    using Seqlen_traits_Q = flash::DecodingGQASeqLenTraits;
+
+    QUERYHEAD_SWITCH(params.h_h_k_ratio, [&] {
+        BOOL_SWITCH(ceil_div(kBlockH * params.seqlen_q, 64) == 1, Single_MMA_WG, [&] {
+            BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+                BOOL_SWITCH(params.num_splits > 1, Is_split, [&] {
+                    run_flash_fwd<
+                        Flash_fwd_kernel_traits<Headdim, Single_MMA_WG ? 64 : 192, Is_causal ? 128 : 176,
+                            Single_MMA_WG ? 8 :  16, 2, false, 1, T, !Seqlen_traits::UseVarSeqLen && Is_split, kBlockH>,
+                        Is_causal, Seqlen_traits, Seqlen_traits_Q
+                    >(params, stream);
+                });
+            });
+        });
+    });
 }
 
 template<typename T>
