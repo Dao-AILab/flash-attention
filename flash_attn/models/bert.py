@@ -172,7 +172,7 @@ class BertEncoder(nn.Module):
                 hidden_states = hidden_states[subset_mask]
         else:
             batch, seqlen = hidden_states.shape[:2]
-            hidden_states, indices, cu_seqlens, max_seqlen_in_batch = unpad_input(
+            hidden_states, indices, cu_seqlens, max_seqlen_in_batch, _ = unpad_input(
                 hidden_states, key_padding_mask
             )
             mixer_kwargs = {"cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen_in_batch}

@@ -119,16 +119,13 @@ def unpad_input(hidden_states, attention_mask, unused_mask=None):
     # times larger than it needs to be, wasting memory. It's faster and more memory-efficient to
     # index with integer indices. Moreover, torch's index is a bit slower than it needs to be,
     # so we write custom forward and backward to make it a bit faster.
-    res = (
+    return (
         index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices),
         indices,
         cu_seqlens,
         max_seqlen_in_batch,
+        used_seqlens_in_batch, 
     )
-    if unused_mask is not None:
-        return res + (used_seqlens_in_batch, )
-    else:
-        return res
 
 
 def unpad_input_for_concatenated_sequences(hidden_states, attention_mask_in_length):

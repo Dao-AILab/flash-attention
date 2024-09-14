@@ -51,7 +51,7 @@ def generate_qkv(
         assert not qkvpacked
 
     if query_padding_mask is not None:
-        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, seqused_q  = unpad_input(
+        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, seqused_q, _  = unpad_input(
             q, query_padding_mask, query_unused_mask,
         )
         output_pad_fn = lambda output_unpad: pad_input(
@@ -69,8 +69,8 @@ def generate_qkv(
         )
 
     if key_padding_mask is not None:
-        k_unpad, indices_k, cu_seqlens_k, max_seqlen_k, seqused_k = unpad_input(k, key_padding_mask, key_unused_mask)
-        v_unpad, _, _, _, _ = unpad_input(v, key_padding_mask, key_unused_mask)
+        k_unpad, indices_k, cu_seqlens_k, max_seqlen_k, seqused_k, _ = unpad_input(k, key_padding_mask, key_unused_mask)
+        v_unpad, _, _, _, _, _ = unpad_input(v, key_padding_mask, key_unused_mask)
     else:
         k_unpad = rearrange(k, "b s h d -> (b s) h d")
         v_unpad = rearrange(v, "b s h d -> (b s) h d")
