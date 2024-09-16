@@ -103,10 +103,10 @@ def unpad_input(hidden_states, attention_mask, unused_mask=None):
         unused_mask: (batch, seqlen), bool / int, 1 means the element is allocated but unused.
     Return:
         hidden_states: (total_nnz, ...), where total_nnz = number of tokens selected in attention_mask + unused_mask.
-        indices: (used_nnz), the indices of non-masked tokens from the flattened input sequence.
+        indices: (total_nnz), the indices of masked tokens from the flattened input sequence.
         cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
         max_seqlen_in_batch: int
-        seqused: (batch), optionally returns the number of tokens selected in attention_mask + unused_mask if unused_mask is not None.
+        seqused: (batch), returns the number of tokens selected in attention_mask + unused_mask.
     """
     all_masks = (attention_mask + unused_mask) if unused_mask is not None else attention_mask
     seqlens_in_batch = all_masks.sum(dim=-1, dtype=torch.int32)
