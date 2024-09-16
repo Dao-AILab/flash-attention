@@ -1,8 +1,5 @@
 import math
 
-import sys
-sys.path.remove("/home/yingz/llm_inference")
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -86,11 +83,10 @@ def test_flash_attn_output(
     batch_size = 4
     nheads = 6
     nheads_kv = 6 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
-    # nheads_kv = 1
-    # batch_size = 1
-    # nheads = 1
+    # nheads_kv = 2
+    # batch_size = 9
+    # nheads = 6
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
-    print(f"window_size: {window_size}", flush=True)
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_init, requires_grad=True)
     k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_init, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_init, requires_grad=True)
@@ -255,12 +251,12 @@ def test_flash_attn_varlen_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
+    # batch_size = 1
+    # nheads = 1
+    # nheads_kv = 1
     batch_size = 9
-    nheads = 4
-    nheads_kv = 4
-    # batch_size = 9
-    # nheads = 6
-    # nheads_kv = 6 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    nheads = 6
+    nheads_kv = 6 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
 
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
