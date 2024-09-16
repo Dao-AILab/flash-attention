@@ -56,7 +56,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
     // o: (total_q, nheads, d)
 
     // alibi_slopes:(batch, nheads) or (nhead)
-    // lse: (batch, nheads, max_seqlen_q)
+    // lse: (nheads, total_q)
     // randval: (nheads, total_q, max_seqlen_k)
 
     ck_tile::index_t total_q = q.size(0);
@@ -72,15 +72,14 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
     ck_tile::index_t nhead_stride_k = k.stride(1);
     ck_tile::index_t nhead_stride_v = v.stride(1);
     ck_tile::index_t nhead_stride_o = out.stride(1);
-    ck_tile::index_t nhead_stride_lse = has_lse ? softmax_lse.stride(1) : 0;
+    ck_tile::index_t nhead_stride_lse = has_lse ? softmax_lse.stride(0) : 0;
     ck_tile::index_t nhead_stride_randval = has_dropout_randval ? dropout_randval.stride(0) : 0;
 
     ck_tile::index_t batch_stride_q = 0;
     ck_tile::index_t batch_stride_k = 0;
     ck_tile::index_t batch_stride_v = 0;
     ck_tile::index_t batch_stride_o = 0;
-
-    ck_tile::index_t batch_stride_lse = has_lse ? softmax_lse.stride(0) : 0;
+    ck_tile::index_t batch_stride_lse = 0;
     ck_tile::index_t batch_stride_randval = 0;
 
     void *alibi_slopes_ptr = nullptr;
@@ -100,8 +99,6 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          v.data_ptr(),
                          alibi_slopes_ptr, // bias
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
-                         nullptr, // lse_acc
-                         nullptr, // o_acc
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
                          seqlens_q.data_ptr(), // seqstart_q
@@ -115,7 +112,6 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          d,             // hdim_v
                          h,             // nhead
                          h_k,           // nhead_k
-                         1,             // num_splits
                          softmax_scale, // scale_s
                          1,             // scale_p
                          1,             // scale_o
@@ -124,7 +120,6 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          stride_v,
                          stride_alibi_slopes,
                          stride_randval,
-                         0, // stride_o_acc,
                          stride_o,
                          nhead_stride_q,
                          nhead_stride_k,
@@ -132,8 +127,6 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          0, // nhead_stride_bias, FA without bias
                          nhead_stride_randval,
                          nhead_stride_lse,
-                         0, // nhead_stride_lse_acc
-                         0, // nhead_stride_o_acc
                          nhead_stride_o,
                          batch_stride_q,
                          batch_stride_k,
@@ -141,11 +134,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          0, // batch_stride_bias, FA without bias
                          batch_stride_randval,
                          batch_stride_lse,
-                         0, // batch_stride_lse_acc
-                         0, // batch_stride_o_acc
                          batch_stride_o,
-                         0, // split_stride_lse_acc
-                         0, // split_stride_o_acc
                          mask.left,
                          mask.right,
                          static_cast<ck_tile::index_t>(mask.type),
@@ -290,7 +279,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
 
     at::Tensor softmax_lse;
     // TODO - check gradient, only training require lse
-    softmax_lse = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(torch::kFloat32));
+    softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(torch::kFloat32));
 
     at::Tensor p;
     if (return_dropout_randval) {
@@ -327,7 +316,13 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         ck_tile::stream_config stream_config{stream};
 
         auto traits =
-            get_ck_fmha_varlen_fwd_traits(mask, q_dtype_str, head_size_8x, has_dropout, has_lse, alibi_slopes_.has_value());
+            get_ck_fmha_varlen_fwd_traits(
+                mask,
+                q_dtype_str,
+                head_size_8x,
+                has_dropout,
+                has_lse,
+                alibi_slopes_.has_value());
 
         auto args =
             get_ck_fmha_varlen_fwd_args(
@@ -353,7 +348,8 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
                 drop_seed,
                 drop_offset);
 
-        fmha_fwd(traits, args, stream_config);
+        float t = fmha_fwd(traits, args, stream_config);
+        TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
