@@ -85,6 +85,7 @@ public:
         int num_batch;  // We need this to know the size of dq_semaphore in case of varlen
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
+        int const* seqused = nullptr;
     };
 
     // Kernel entry point API
@@ -107,6 +108,7 @@ public:
         int num_batch;
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
+        int const* seqused = nullptr;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -131,7 +133,8 @@ public:
             args.stride_dQaccum,
             args.num_batch,
             args.dq_semaphore,
-            args.cu_seqlens
+            args.cu_seqlens,
+            args.seqused
         };
     }
 
@@ -148,7 +151,7 @@ public:
 
         bool const is_varlen = Varlen && params.cu_seqlens != nullptr;
         int const offset_o = !is_varlen ? 0 : params.cu_seqlens[bidb];
-        int const seqlen_o = !is_varlen ? get<0>(params.shape_O) : params.cu_seqlens[bidb + 1] - offset_o;
+        int const seqlen_o = !is_varlen ? get<0>(params.shape_O) : (params.seqused ? params.seqused[bidb] : params.cu_seqlens[bidb + 1] - offset_o);
         if (is_varlen && m_block * kBlockM >= seqlen_o) { return; }
 
         Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O), params.shape_O, params.stride_O)(_, _, bidh, !is_varlen ? bidb : 0);

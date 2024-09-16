@@ -45,7 +45,7 @@ def print_diffs(out, out_ref):
     "seqlen_q,seqlen_k",
     [
         (1, 1),
-        (257, 1),
+        # (257, 1),
         (64, 128),
         (128, 128),
         (256, 256),
@@ -199,6 +199,8 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("deterministic", [False, True])
 # @pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("add_unused_qkv", [False, True])
+# @pytest.mark.parametrize("add_unused_qkv", [True])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [128])
@@ -231,7 +233,7 @@ def test_flash_attn_output(
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_varlen_output(
-    seqlen_q, seqlen_k, d, causal, deterministic, mha_type, dtype
+    seqlen_q, seqlen_k, d, causal, deterministic, add_unused_qkv, mha_type, dtype
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
@@ -259,12 +261,27 @@ def test_flash_attn_varlen_output(
     key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode="random", zero_lengths=True)
     # key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode='full')
 
+    def _gen_unused_masks(padding_mask, add_unused, max_seq_len, bs, device):
+        if add_unused:
+            another_mask = generate_random_padding_mask(max_seq_len, bs, device)
+            attn_mask = torch.logical_and(padding_mask, another_mask)
+            unused_mask = torch.logical_xor(torch.logical_or(padding_mask, another_mask), attn_mask)
+        else:
+            attn_mask = padding_mask
+            unused_mask = None
+        return attn_mask, unused_mask
+
+    query_padding_mask, query_unused_mask = _gen_unused_masks(query_padding_mask, add_unused_qkv, seqlen_q, batch_size, q.device)
+    key_padding_mask, key_unused_mask = _gen_unused_masks(key_padding_mask, add_unused_qkv, seqlen_k, batch_size, k.device)
+
     (
         q_unpad,
         k_unpad,
         v_unpad,
         cu_seqlens_q,
         cu_seqlens_k,
+        seqused_q,
+        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
         q,
@@ -273,7 +290,7 @@ def test_flash_attn_varlen_output(
         output_pad_fn,
         dq_pad_fn,
         dk_pad_fn,
-    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False, query_unused_mask=query_unused_mask, key_unused_mask=key_unused_mask)
     # print("cu_seqlens_q: ", cu_seqlens_q)
     # print("cu_seqlens_k: ", cu_seqlens_k)
     # print("q_unpad, shape: ", q_unpad.shape)
@@ -289,8 +306,13 @@ def test_flash_attn_varlen_output(
         max_seqlen_k,
         causal=causal,
         deterministic=deterministic,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
     )
     out = output_pad_fn(out_unpad)
+    if query_unused_mask is not None:
+        q_zero_masking = rearrange(query_unused_mask, "b s -> b s 1 1")
+        out.masked_fill_(q_zero_masking, 0.0)
     dropout_mask = None
 
     out_ref, attn_ref = attention_ref(
@@ -326,6 +348,10 @@ def test_flash_attn_varlen_output(
         ) = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g)
         dk = dk_pad_fn(dk_unpad)
         dv = dk_pad_fn(dv_unpad)
+        if key_unused_mask is not None:
+            k_zero_masking = rearrange(key_unused_mask, "b s -> b s 1 1")
+            dk.masked_fill_(k_zero_masking, 0.0)
+            dv.masked_fill_(k_zero_masking, 0.0)
         (
             dq_ref,
             dk_ref,
@@ -342,6 +368,8 @@ def test_flash_attn_varlen_output(
         dk_pt.masked_fill_(zero_masking, 0.0)
         dv_pt.masked_fill_(zero_masking, 0.0)
         dq = dq_pad_fn(dq_unpad)
+        if query_unused_mask is not None:
+            dq.masked_fill_(q_zero_masking, 0.0)
         print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
         print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
         print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")

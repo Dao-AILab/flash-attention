@@ -231,7 +231,7 @@ def test_rotary_emb_varlen_func(inplace, interleaved, rotary_fraction, seqlen_of
     x_pt = x.detach().clone().requires_grad_()
     lengths = torch.randint(max(1, seqlen - 20), seqlen + 1, (batch_size, 1), device=device)
     padding_mask = rearrange(torch.arange(seqlen, device=device), "s -> 1 s") < lengths
-    x_unpad, indices, cu_seqlens, max_seqlen = unpad_input(x, padding_mask)
+    x_unpad, indices, cu_seqlens, max_seqlen, _ = unpad_input(x, padding_mask)
     x_unpad_clone = x_unpad.clone()
     x_unpad = x_unpad.requires_grad_()
     cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)

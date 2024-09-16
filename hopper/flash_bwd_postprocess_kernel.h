@@ -102,6 +102,7 @@ public:
         StridedQ const stride_dQ;
         float const softmax_scale;
         int const* cu_seqlens = nullptr;
+        int const* seqused = nullptr;
     };
 
     // Kernel entry point API
@@ -113,6 +114,7 @@ public:
         StridedQ const stride_dQ;
         float const softmax_scale;
         int const* cu_seqlens = nullptr;
+        int const* seqused = nullptr;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -133,7 +135,8 @@ public:
             args.shape_dQ,
             args.stride_dQ,
             args.softmax_scale,
-            args.cu_seqlens
+            args.cu_seqlens,
+            args.seqused
         };
     }
 
@@ -156,7 +159,7 @@ public:
         int const bidb = blockIdx.z;
 
         bool const is_varlen = params.cu_seqlens != nullptr;
-        int const seqlen = !is_varlen ? get<0>(params.shape_dQ) : params.cu_seqlens[bidb + 1] - params.cu_seqlens[bidb];
+        int const seqlen = !is_varlen ? get<0>(params.shape_dQ) : (params.seqused ? params.seqused[bidb] : params.cu_seqlens[bidb + 1] - params.cu_seqlens[bidb]);
         if (is_varlen && m_block * kBlockM >= seqlen) { return; }
 
         int lane_predicate = cute::elect_one_sync();

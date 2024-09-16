@@ -80,6 +80,7 @@ struct CollectiveEpilogueBwd {
         Element* ptr_dV;
         StridedKV const stride_dV;
         int const* cu_seqlens = nullptr;
+        int const* seqused = nullptr;
     };
 
     // Device side kernel params
@@ -91,6 +92,7 @@ struct CollectiveEpilogueBwd {
         StridedKV const stride_dV;
         TMA_dKV tma_store_dK, tma_store_dV;
         int const* cu_seqlens = nullptr;
+        int const* seqused = nullptr;
     };
 
     static Params
@@ -113,7 +115,7 @@ struct CollectiveEpilogueBwd {
             select<1, 2>(TileShape_MNK{}),
             _1{}); // no mcast for dKV
         return {args.ptr_dK, args.shape_dK, args.stride_dK, args.ptr_dV, args.stride_dV,
-                tma_store_dK, tma_store_dV, args.cu_seqlens};
+                tma_store_dK, tma_store_dV, args.cu_seqlens, args.seqused};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -185,7 +187,9 @@ struct CollectiveEpilogueBwd {
             cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
             bool const is_varlen = params.cu_seqlens != nullptr;
             int const offset = !is_varlen ? 0 : params.cu_seqlens[bidb];
-            int const seqlen = !is_varlen ? get<0>(params.shape_dK) : params.cu_seqlens[bidb + 1] - params.cu_seqlens[bidb];
+            int const seqlen = !is_varlen ? get<0>(params.shape_dK) : (
+                params.seqused ? params.seqused[bidb] : params.cu_seqlens[bidb + 1] - params.cu_seqlens[bidb]
+            );
 
             Tensor mdK = make_tensor(make_gmem_ptr(params.ptr_dK), params.shape_dK, params.stride_dK)(_, _, bidh, !is_varlen ? bidb : 0);
             Tensor gdK = local_tile(cute::domain_offset(make_coord(offset, _0{}), mdK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
@@ -236,7 +240,7 @@ struct CollectiveEpilogueBwd {
         auto [n_block, bidh, bidb] = block_coord;
         bool const is_varlen = Varlen && params.cu_seqlens != nullptr;
         int const offset = !is_varlen ? 0 : params.cu_seqlens[bidb];
-        int const seqlen = !is_varlen ? get<0>(params.shape_dK) : params.cu_seqlens[bidb + 1] - offset;
+        int const seqlen = !is_varlen ? get<0>(params.shape_dK) : (params.seqused ? params.seqused[bidb] : params.cu_seqlens[bidb + 1] - offset);
 
         Tensor mdK = make_tensor(make_gmem_ptr(params.ptr_dK), params.shape_dK, params.stride_dK)(_, _, bidh, !is_varlen ? bidb : 0);
         Tensor gdK = local_tile(cute::domain_offset(make_coord(offset, _0{}), mdK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
