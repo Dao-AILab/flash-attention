@@ -356,7 +356,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         int block_col_idx = n_block * (kBlockN / 32);
         if (Return_softmax) {
             Tensor rP_drop = make_fragment_like(rP);
-            cute::copy(rP, rP_drop);
+            // cutlass'bug on vectorization for tile (192,64)
+            cute::copy(cute::coalesce(rP), cute::coalesce(rP_drop));
             dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
                 rP_drop, block_row_idx, block_col_idx, kNWarps
             );
@@ -418,7 +419,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         int block_col_idx = n_block * (kBlockN / 32);
         if (Return_softmax) {
             Tensor rP_drop = make_fragment_like(rP);
-            cute::copy(rP, rP_drop);
+            // cutlass'bug on vectorization for tile (192,64)
+            cute::copy(cute::coalesce(rP), cute::coalesce(rP_drop));
             dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
                 rP_drop, block_row_idx, block_col_idx, kNWarps
             );
