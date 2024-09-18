@@ -8,6 +8,8 @@ we have supported:
 - FlashAttention-2 with QKHeadDim=128, VHeadDim=256
 - FlashAttention-2 with QKHeadDim=192, VHeadDim=128
 
+For headdim not supported, you can use the autotuner to generate the implementation. Details are in `autotuner.md`.
+
 Feel free to tell us what else you need. We might support it soon. :)
 
 Currently, we do not provide prebuilt library, you need to compile from source.
