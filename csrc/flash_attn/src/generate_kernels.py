@@ -20,21 +20,41 @@ IS_CAUSAL = ["false", "true"]
 KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_launch_template.h"
 
 template<>
-void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream) {{
+void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream) {{
     run_mha_fwd_hdim{HEAD_DIM}<{DTYPE}, {IS_CAUSAL}>(params, stream);
 }}
 """
 
 KERNEL_IMPL_TEMPLATE_FWD_SPLIT = """#include "flash_fwd_launch_template.h"
 
-template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream);
 """
 
 KERNEL_IMPL_TEMPLATE_BWD = """#include "flash_bwd_launch_template.h"
 
 template<>
-void run_mha_bwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_bwd_params &params, cudaStream_t stream) {{
+void run_mha_bwd_<{DTYPE}, {HEAD_DIM}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_bwd_params &params, cudaStream_t stream) {{
     run_mha_bwd_hdim{HEAD_DIM}<{DTYPE}, {IS_CAUSAL}>(params, stream);
+}}
+"""
+KERNEL_IMPL_TEMPLATE_FWD_VDIM = """#include "flash_fwd_launch_template.h"
+
+template<>
+void run_mha_fwd_<{DTYPE}, {QKHEAD_DIM}, {VHEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream) {{
+    run_mha_fwd_qkdim{QKHEAD_DIM}_vdim{VHEAD_DIM}<{DTYPE}, {IS_CAUSAL}>(params, stream);
+}}
+"""
+
+KERNEL_IMPL_TEMPLATE_FWD_SPLIT_VDIM = """#include "flash_fwd_launch_template.h"
+
+template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {QKHEAD_DIM}, {VHEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream);
+"""
+
+KERNEL_IMPL_TEMPLATE_BWD_VDIM = """#include "flash_bwd_launch_template.h"
+
+template<>
+void run_mha_bwd_<{DTYPE}, {QKHEAD_DIM}, {VHEAD_DIM}, {IS_CAUSAL}>(Flash_bwd_params &params, cudaStream_t stream) {{
+    run_mha_bwd_qkdim{QKHEAD_DIM}_vdim{VHEAD_DIM}<{DTYPE}, {IS_CAUSAL}>(params, stream);
 }}
 """
 
@@ -43,34 +63,54 @@ void run_mha_bwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_bwd_params &params, cu
 class Kernel:
     sm: int
     dtype: str
-    head_dim: int
+    qkhead_dim: int
+    vhead_dim: int
     is_causal: bool
     direction: str
 
     @property
     def template(self) -> str:
-        if self.direction == "fwd":
-            return KERNEL_IMPL_TEMPLATE_FWD.format(
-                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim, IS_CAUSAL=self.is_causal
-            )
-        elif self.direction == "bwd":
-            return KERNEL_IMPL_TEMPLATE_BWD.format(
-                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim, IS_CAUSAL=self.is_causal
-            )
+        if self.qkhead_dim == self.vhead_dim:
+            if self.direction == "fwd":
+                return KERNEL_IMPL_TEMPLATE_FWD.format(
+                    DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.qkhead_dim, IS_CAUSAL=self.is_causal
+                )
+            elif self.direction == "bwd":
+                return KERNEL_IMPL_TEMPLATE_BWD.format(
+                    DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.qkhead_dim, IS_CAUSAL=self.is_causal
+                )
+            else:
+                return KERNEL_IMPL_TEMPLATE_FWD_SPLIT.format(
+                    DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.qkhead_dim, IS_CAUSAL=self.is_causal
+                )
         else:
-            return KERNEL_IMPL_TEMPLATE_FWD_SPLIT.format(
-                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim, IS_CAUSAL=self.is_causal
-            )
+            if self.direction == "fwd":
+                return KERNEL_IMPL_TEMPLATE_FWD_VDIM.format(
+                    DTYPE=DTYPE_MAP[self.dtype], QKHEAD_DIM=self.qkhead_dim, VHEAD_DIM=self.vhead_dim, IS_CAUSAL=self.is_causal
+                )
+            elif self.direction == "bwd":
+                return KERNEL_IMPL_TEMPLATE_BWD_VDIM.format(
+                    DTYPE=DTYPE_MAP[self.dtype], QKHEAD_DIM=self.qkhead_dim, VHEAD_DIM=self.vhead_dim, IS_CAUSAL=self.is_causal
+                )
+            else:
+                return KERNEL_IMPL_TEMPLATE_FWD_SPLIT_VDIM.format(
+                    DTYPE=DTYPE_MAP[self.dtype], QKHEAD_DIM=self.qkhead_dim, VHEAD_DIM=self.vhead_dim, IS_CAUSAL=self.is_causal
+                )
 
     @property
     def filename(self) -> str:
-        return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}_{'causal_' if self.is_causal == 'true' else ''}sm{self.sm}.cu"
+        if self.qkhead_dim == self.vhead_dim:
+            return f"flash_{self.direction}_hdim{self.qkhead_dim}_{self.dtype}_{'causal_' if self.is_causal == 'true' else ''}sm{self.sm}.cu"
+        else:
+            return f"flash_{self.direction}_qkdim{self.qkhead_dim}_vdim{self.vhead_dim}_{self.dtype}_{'causal_' if self.is_causal == 'true' else ''}sm{self.sm}.cu"
 
 
 def get_all_kernels() -> List[Kernel]:
     for direction in ["fwd", "fwd_split", "bwd"]:
-        for dtype, head_dim, is_causal, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, IS_CAUSAL, SM):
-            yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, is_causal=is_causal, direction=direction)
+        for dtype, qkhead_dim, is_causal, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, IS_CAUSAL, SM):
+            for vhead_dim in [qkhead_dim, 2 * qkhead_dim]:
+                if vhead_dim <= 256:
+                    yield Kernel(sm=sm, dtype=dtype, qkhead_dim=qkhead_dim, vhead_dim=vhead_dim,is_causal=is_causal, direction=direction)
 
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:
