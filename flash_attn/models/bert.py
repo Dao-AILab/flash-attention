@@ -189,13 +189,13 @@ class BertEncoder(nn.Module):
                     ).flatten()
                     subset_seqlens = (subset_mask & key_padding_mask).sum(dim=-1, dtype=torch.int32)
                     subset_cu_seqlens = F.pad(
-                        torch.cumsum(subset_seqlens, dim=0, dtype=torch.torch.int32), (1, 0)
+                        torch.cumsum(subset_seqlens, dim=0, dtype=torch.int32), (1, 0)
                     )
                 else:
                     subset_idx = torch.nonzero(subset_mask, as_tuple=False).flatten()
                     subset_seqlens = subset_mask.sum(dim=-1, dtype=torch.int32)
                     subset_cu_seqlens = F.pad(
-                        torch.cumsum(subset_seqlens, dim=0, dtype=torch.torch.int32), (1, 0)
+                        torch.cumsum(subset_seqlens, dim=0, dtype=torch.int32), (1, 0)
                     )
                 hidden_states_subset, hidden_states = index_first_axis_residual(
                     hidden_states, subset_idx
