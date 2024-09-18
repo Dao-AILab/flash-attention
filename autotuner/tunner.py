@@ -50,8 +50,13 @@ class FlashFwdTunner(BaseTunner):
     
     def generate_configs(self,Br:int,Bc:int,dim_qk:int,dim_v:int):
         configs = []
-        # TODO: more general
         for Nthreads in [128, 256]:
+            # TODO: more general
+            # global load atom
+            load_atom = 64 if (dim_qk % 64 == 0 and dim_v % 64 == 0 ) else 32
+            NthreadsPerRow = load_atom / (128/16)
+            if Br % (Nthreads / NthreadsPerRow) != 0 or Bc % (Nthreads / NthreadsPerRow) != 0:
+                continue
             config1 = FlashFwdConfig(dim_qk,dim_v,Br,Bc,Nthreads//32,False,False)
             config2 = FlashFwdConfig(dim_qk,dim_v,Br,Bc,Nthreads//32,True,False)
             config3 = FlashFwdConfig(dim_qk,dim_v,Br,Bc,Nthreads//32,True,True)

@@ -72,8 +72,8 @@ class BaseTunner:
     def __init__(self, arch, torch_array: list, op_name, shape_config: ShapeConfig, profile_config: ProfileConfig, tempdir):
         self.arch = arch
         self.torch_array = torch_array
-        self.Br_list = [32, 64, 128] # [32, 64, 128, 256]
-        self.Bc_list = [32, 64, 128] # [32, 64, 128, 256]
+        self.Br_list = [32, 64, 96, 128, 160, 192, 224, 256] # [32, 64, 128, 256]
+        self.Bc_list = [32, 64, 96, 128, 160, 192, 224, 256] # [32, 64, 128, 256]
 
         self.template_dir = "autotuner/template"
         self.op_name = op_name

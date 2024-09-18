@@ -69,7 +69,8 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kVHeadDim = kVHeadDim_;
     static_assert(kQKHeadDim % 32 == 0);
     static_assert(kVHeadDim % 32 == 0);
-    static constexpr int kBlockKSmem = kQKHeadDim % 64 == 0 ? 64 : 32;
+    // TODO: split QK & V
+    static constexpr int kBlockKSmem = (kQKHeadDim % 64 == 0 && kVHeadDim % 64 == 0) ? 64 : 32;
     static constexpr int kBlockKGmem = kQKHeadDim % 128 == 0 ? 128 : (kQKHeadDim % 64 == 0 ? 64 : 32);
 
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
@@ -118,6 +119,7 @@ struct Flash_fwd_kernel_traits : public Base {
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kQKHeadDim % kGmemElemsPerLoad == 0, "kQKHeadDim must be a multiple of kGmemElemsPerLoad");
+    static_assert(kVHeadDim % kGmemElemsPerLoad == 0, "kVHeadDim must be a multiple of kGmemElemsPerLoad");
     // Using kBlockKSmem here is 6-10% faster than kBlockKGmem for d=128 because of bank conflicts.
     // For example, for d=128, smem is split into 2 "pages", each page takes care of columns
     // 0-63 and 64-127. If we have 16 threads per row for gmem read, when we write to smem,
@@ -127,6 +129,9 @@ struct Flash_fwd_kernel_traits : public Base {
     static_assert(kNThreads % kGmemThreadsPerRow == 0, "kNThreads must be a multiple of kGmemThreadsPerRow");
     using GmemLayoutAtom = Layout<Shape <Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
+    // for global load thread mapping
+    static_assert(kBlockN % (kNThreads / kGmemThreadsPerRow) == 0, "kBlockN must be a multiple of kNThreads / kGmemThreadsPerRow");
+    static_assert(kBlockM % (kNThreads / kGmemThreadsPerRow) == 0, "kBlockM must be a multiple of kNThreads / kGmemThreadsPerRow");
 
     // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
     // from the same address by the same threadblock. This is slightly faster.
