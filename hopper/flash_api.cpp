@@ -157,7 +157,7 @@ void set_params_fprop(Flash_fwd_params &params,
     #endif
 
     params.unpadded_lse = unpadded_lse;
-    // params.seqlenq_ngroups_swapped = seqlenq_ngroups_swapped;
+    params.seqlenq_ngroups_swapped = seqlenq_ngroups_swapped;
 }
 
 void set_params_dgrad(Flash_bwd_params &params,

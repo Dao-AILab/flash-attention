@@ -109,7 +109,7 @@ def main():
     if args.validate:
         # Call flash attn
         # First for the single full-sized query
-        out0 = fa3.flash_attn_with_kvcache(
+        out0, lse0 = fa3.flash_attn_with_kvcache(
             q=q_buf_large,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -117,11 +117,25 @@ def main():
             cache_batch_idx=cache_idx_large,
             causal=bool(args.causal),
             num_splits=args.splits,
+            return_softmax_lse=True,
            #num_splits=1
         )   
 
+         # Second for n-1 small queries
+        out1_split1, lse1_split1 = fa3.flash_attn_with_kvcache(
+            q=q_buf_small,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cache_seqlens=cache_seqlens_small,
+            cache_batch_idx=cache_idxs_small,
+            causal=bool(args.causal),
+            num_splits=1,
+            gqa_decoding=bool(args.gqa),
+            return_softmax_lse=True,
+        )
+
         # Second for n-1 small queries
-        out1 = fa3.flash_attn_with_kvcache(
+        out1, lse1 = fa3.flash_attn_with_kvcache(
             q=q_buf_small,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -130,6 +144,7 @@ def main():
             causal=bool(args.causal),
             num_splits=args.splits,
             gqa_decoding=bool(args.gqa),
+            return_softmax_lse=True,
         )
 
         # Call flash attn
@@ -141,16 +156,16 @@ def main():
             cache_seqlens=cache_seqlen_large,
             cache_batch_idx=cache_idx_large,
             causal=bool(args.causal),
-            num_splits=args.splits
+            num_splits=args.splits,
         )
 
         print ('big')
-        print ('diff-max', (out0 - out2).abs().max().item())
+        print ('diff-max', (out0 - out2).abs().max().item(), cache_seqlens_small)
         print ('diff-mean', (out0 - out2).abs().mean().item())
 
 
         # Second for n-1 small queries
-        out3 = fa2.flash_attn_with_kvcache(
+        out3, lse_fa2 = fa2.flash_attn_with_kvcache(
             q=q_buf_small,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -158,10 +173,13 @@ def main():
             cache_batch_idx=cache_idxs_small,
             causal=bool(args.causal),
             num_splits=args.splits,
+            return_softmax_lse=True,
             #num_splits=1
         )
 
         print ('small') #, out1)
+        print ('lse', lse1, lse_fa2, (lse1 - lse_fa2).abs(), out1.shape)
+        print ('lse-dif-max', (lse1 - lse_fa2).abs().max().item())
         print ('diff-max', (out1 - out3).abs().max().item())
         print ('diff-mean', (out1 - out3).abs().mean().item())
 

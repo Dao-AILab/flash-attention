@@ -65,7 +65,7 @@ __global__ void combine_attn_seqk_parallel(Params const params) {
     // This layout maps row_offset_lse to {bidh, q_offset, bidb} or {bidh, bidb, q_offset}.
     Layout flat_layout = make_layout(lse_size);
     Layout orig_layout = make_layout(make_shape(params.seqlen_q, params.h, params.b));
-    auto transposed_stride = make_stride(1, params.seqlen_q * params.b, params.seqlen_q);
+    auto transposed_stride = params.seqlenq_ngroups_swapped ? make_stride(params.b, params.seqlen_q * params.b, 1) : make_stride(1, params.seqlen_q * params.b, params.seqlen_q);
     Layout remapped_layout = make_layout(make_shape(params.seqlen_q, params.h, params.b), transposed_stride);
     Layout final_layout = cute::composition(remapped_layout, cute::composition(orig_layout, flat_layout));
 

@@ -363,7 +363,7 @@ struct CollectiveEpilogueFwd {
         );
         static_assert(kBlockM <= NumMmaThreads);
         if (thread_idx < min(kBlockM, seqlen_traits_q.actual_seq_len - m_block * kBlockM)) {
-            gLSE(thread_idx) = -INFINITY;
+            gLSE(thread_idx) = !Is_split ? INFINITY : -INFINITY;
         }
     }
 
@@ -435,7 +435,7 @@ struct CollectiveEpilogueFwd {
         Tensor gLSE = seqlen_traits_q.get_lse_local_tile_tensor<Is_split>(
             mLSE, Shape<Int<kBlockM/kBlockH>>{}, h_offset + thread_idx_h, bidb, n_split_idx)(_, m_block);
         if(thread_idx_h < h_bound && thread_idx_m < m_bound) {
-            gLSE(thread_idx_m) = -INFINITY;
+            gLSE(thread_idx_m) = !Is_split ? INFINITY : -INFINITY;
         }
     }
 
