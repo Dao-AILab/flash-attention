@@ -52,6 +52,8 @@ struct SharedStorageQKVOVt {
     typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_v;
     typename cutlass::PipelineAsync<kStages>::SharedStorage pipeline_vt;
     int tile_count_semaphore;
+    float softmax_scale_qk_log2;
+    float descale_v;
   };
 };
 

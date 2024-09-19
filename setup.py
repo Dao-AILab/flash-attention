@@ -10,6 +10,7 @@ import shutil
 from pathlib import Path
 from packaging.version import parse, Version
 import platform
+import json
 
 from setuptools import setup, find_packages
 import subprocess
@@ -65,13 +66,8 @@ FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE
 list_headdim = []
 compile_list_headdim = []
 if not SKIP_CUDA_BUILD and not IS_ROCM:
-    list_headdim = [
-        (32, 64),
-        (64, 128),
-        (96, 192),
-        (128, 256),
-        (192, 128)
-    ]
+    with open('headdim.json', 'r') as file:
+        list_headdim = json.load(file)
     # "csrc/flash_attn/src/flash_fwd_qkdim32_vdim64_fp16_sm80.cu"
     for ii in ["fwd", "bwd"]:
         for jj in list_headdim:
@@ -88,6 +84,9 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 compile_list_headdim.append(
                     f"csrc/flash_attn/src/flash_fwd_split_qkdim{jj[0]}_vdim{jj[1]}_{kk}{ll}_sm80.cu"
                 )
+
+    from csrc.flash_attn.src.generate_switch_headdim import write_file
+    write_file()
 
 def get_platform():
     """

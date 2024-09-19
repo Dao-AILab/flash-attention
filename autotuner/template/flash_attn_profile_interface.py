@@ -1,13 +1,82 @@
-# Copyright (c) 2023, Tri Dao.
-
 from typing import Optional, Union
 
 import torch
 import torch.nn as nn
 
+import torch.utils.cpp_extension
+
+import os
+from pathlib import Path
+
+# Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
+# See https://github.com/pytorch/pytorch/pull/70650
+generator_flag = []
+torch_dir = torch.__path__[0]
+if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
+    generator_flag = ["-DOLD_GENERATOR_PATH"]
+
+
+include_path = [
+    "csrc/flash_attn",
+    "csrc/flash_attn/src",
+    "csrc/cutlass/include",
+    OUTPUT_KERNEL_DIR,
+]
+
+cc_flag = []
+# cc_flag.append("-gencode")
+# cc_flag.append("arch=compute_75,code=sm_75")
+cc_flag.append("-gencode")
+cc_flag.append("arch=compute_80,code=sm_80")
+# cc_flag.append("-gencode")
+# cc_flag.append("arch=compute_90,code=sm_90")
+
+build_dir = OUTPUT_KERNEL_DIR + "/build"
+if not os.path.exists(build_dir):
+    os.makedirs(build_dir)
+
+
+flash_attn_cuda = torch.utils.cpp_extension.load(
+    name="flash_attn_cuda"+CONFIG_NAME,
+    sources=[
+        OUTPUT_DIR + "/flash_profile_api.cpp", # "csrc/flash_attn/flash_api.cpp",
+        OUTPUT_DIR + "/flash_fwd.cu",
+        # "csrc/flash_attn/src/flash_fwd_qkdim192_vdim128_fp16_sm80.cu",
+        # "csrc/flash_attn/src/flash_bwd_qkdim192_vdim128_fp16_sm80.cu",
+        # "csrc/flash_attn/src/flash_fwd_split_qkdim192_vdim128_fp16_sm80.cu",
+    ],
+    extra_cflags=[
+        "-O3", "-std=c++17"
+    ] + generator_flag,
+    extra_cuda_cflags=[
+                        "-O3",
+                        "-std=c++17",
+                        "-U__CUDA_NO_HALF_OPERATORS__",
+                        "-U__CUDA_NO_HALF_CONVERSIONS__",
+                        "-U__CUDA_NO_HALF2_OPERATORS__",
+                        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                        "--expt-relaxed-constexpr",
+                        "--expt-extended-lambda",
+                        "--use_fast_math",
+                        # "--ptxas-options=-v",
+                        # "--ptxas-options=-O2",
+                        # "-lineinfo",
+                        # "-DFLASHATTENTION_DISABLE_BACKWARD",
+                        # "-DFLASHATTENTION_DISABLE_DROPOUT",
+                        # "-DFLASHATTENTION_DISABLE_ALIBI",
+                        # "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                        # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+                        # "-DFLASHATTENTION_DISABLE_LOCAL",
+                    ]
+                    + generator_flag
+                    + cc_flag,
+    extra_include_paths=include_path,
+    build_directory=build_dir,
+)
+
 # isort: off
 # We need to import the CUDA kernels after importing torch
-import flash_attn_2_cuda as flash_attn_cuda
+# import flash_attn_2_cuda as flash_attn_cuda
 
 # isort: on
 

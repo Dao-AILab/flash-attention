@@ -40,10 +40,11 @@ struct Qkv_params {
     index_t v_head_stride;
 
     // The number of heads.
-    int h, h_k;
+    int h, h_k, h_v;
     // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
     // different from nheads (query).
     int h_h_k_ratio; // precompute h / h_k,
+    int h_h_v_ratio;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

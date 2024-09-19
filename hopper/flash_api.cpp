@@ -105,7 +105,7 @@ void set_params_fprop(Flash_fwd_params &params,
     params.d = d;
     params.d_rounded = d_rounded;
 
-    // Set the different scale values.
+    // Set the different scale values.    
     params.scale_softmax = softmax_scale;
     params.scale_softmax_log2 = softmax_scale * M_LOG2E;
     __half scale_softmax_log2_half = __float2half(params.scale_softmax_log2);
@@ -265,6 +265,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x head_size
         c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
         const float softmax_scale,
+        c10::optional<at::Tensor> &descale_q_, // 1
+        c10::optional<at::Tensor> &descale_k_, // 1
+        c10::optional<at::Tensor> &descale_v_, // 1
         bool is_causal) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -371,6 +374,32 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
 
     auto tile_count_semaphore = is_causal ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+
+    if(q_dtype == at::ScalarType::Float8_e4m3fn) {
+        at::Tensor descale_q, descale_k, descale_v;
+        if (descale_q_.has_value() && descale_k_.has_value() && descale_k_.has_value()) {
+            descale_q = descale_q_.value();
+            descale_k = descale_k_.value();
+            descale_v = descale_v_.value();
+            CHECK_DEVICE(descale_q);
+            CHECK_DEVICE(descale_k);
+            CHECK_DEVICE(descale_v);
+            CHECK_SHAPE(descale_q, 1);
+            CHECK_SHAPE(descale_k, 1);
+            CHECK_SHAPE(descale_v, 1);
+        } else {
+            descale_q = torch::ones({1}, opts.dtype(at::kFloat));
+            descale_k = torch::ones({1}, opts.dtype(at::kFloat));
+            descale_v = torch::ones({1}, opts.dtype(at::kFloat));
+        }
+        params.descale_q_ptr = descale_q.data_ptr<float>();
+        params.descale_k_ptr = descale_k.data_ptr<float>();
+        params.descale_v_ptr = descale_v.data_ptr<float>();
+    } else {
+        params.descale_q_ptr = nullptr;
+        params.descale_k_ptr = nullptr;
+        params.descale_v_ptr = nullptr;
+    }
 
     if (seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();

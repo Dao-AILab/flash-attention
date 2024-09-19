@@ -10,9 +10,11 @@
 
 #include <cutlass/numeric_types.h>
 
-#include "flash.h"
-#include "static_switch.h"
-#include "static_switch_headdim.h"
+#include "flash_profile.h"
+// #include "static_switch.h"
+// #include "static_switch_headdim.h"
+#define False false
+#define True true
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
@@ -246,17 +248,22 @@ void set_params_dgrad(Flash_bwd_params &params,
 }
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
-    FP16_SWITCH(!params.is_bf16, [&] {
-        QKHEADDIM_VHEADDIM_SWITCH(params.d, params.vd, [&] {
-                BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-                    if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
-                        run_mha_fwd_<elem_type, kQKHeadDim, kVHeadDim, Is_causal>(params, stream);
-                    } else {
-                        run_mha_fwd_splitkv_dispatch<elem_type, kQKHeadDim, kVHeadDim, Is_causal>(params, stream);
-                    }
-                });
-        });
-    });
+    constexpr bool is_bf16 = /*{is_bf16}*/;
+    constexpr bool is_causal = /*{is_causal}*/;
+    constexpr int kQKHeadDim = /*{Kd}*/;
+    constexpr int kVHeadDim = /*{D}*/;
+    assert(params.is_bf16 == is_bf16);
+    assert(params.is_causal == is_causal);
+    assert(params.d == kQKHeadDim);
+    assert(params.vd == kVHeadDim);
+
+    if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+        run_mha_fwd_<std::conditional_t<is_bf16,cutlass::bfloat16_t,cutlass::half_t>, kQKHeadDim, kVHeadDim, is_causal>(params, stream);
+    } else {
+        // TODO: temporary workaround
+        // run_mha_fwd_splitkv_dispatch<std::conditional_t<is_bf16,cutlass::bfloat16_t,cutlass::half_t>, kQKHeadDim, kVHeadDim, is_causal>(params, stream);
+    }
+
 }
 
 // Find the number of splits that maximizes the occupancy. For example, if we have
@@ -849,13 +856,19 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 }
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
-    FP16_SWITCH(!params.is_bf16, [&] {
-        QKHEADDIM_VHEADDIM_SWITCH(params.d, params.vd, [&] {
-            BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-                run_mha_bwd_<elem_type, kQKHeadDim, kVHeadDim, Is_causal>(params, stream);
-            });
-        });
-    });
+
+    constexpr bool is_bf16 = /*{is_bf16}*/;
+    constexpr bool is_causal = /*{is_causal}*/;
+    constexpr int kQKHeadDim = /*{Kd}*/;
+    constexpr int kVHeadDim = /*{D}*/;
+
+    assert(params.is_bf16 == is_bf16);
+    assert(params.is_causal == is_causal);
+    assert(params.d == kQKHeadDim);
+    assert(params.vd == kVHeadDim);
+
+    // TODO: temporary workaround
+    // run_mha_bwd_<std::conditional_t<is_bf16,cutlass::bfloat16_t,cutlass::half_t>, kQKHeadDim, kVHeadDim, is_causal>(params, stream);
 }
 std::vector<at::Tensor>
 mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_size_og
@@ -1675,7 +1688,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");
     m.def("varlen_fwd", &mha_varlen_fwd, "Forward pass (variable length)");
-    m.def("bwd", &mha_bwd, "Backward pass");
-    m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
-    m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
+    // m.def("bwd", &mha_bwd, "Backward pass");
+    // m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
+    // m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
 }

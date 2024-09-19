@@ -7,7 +7,17 @@
 #include <cuda.h>
 #include <vector>
 
-#include "cutlass/fast_math.h"  // For cutlass::FastDivmod
+#ifdef OLD_GENERATOR_PATH
+#include <ATen/CUDAGeneratorImpl.h>
+#else
+#include <ATen/cuda/CUDAGeneratorImpl.h>
+#endif
+
+#include <ATen/cuda/CUDAGraphsUtils.cuh> // For at::cuda::philox::unpack
+
+constexpr int TOTAL_DIM = 0;
+constexpr int H_DIM = 1;
+constexpr int D_DIM = 2;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -30,10 +40,11 @@ struct Qkv_params {
     index_t v_head_stride;
 
     // The number of heads.
-    int h, h_k;
+    int h, h_k, h_v;
     // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
     // different from nheads (query).
     int h_h_k_ratio; // precompute h / h_k,
+    int h_h_v_ratio;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -57,16 +68,16 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ softmax_lseaccum_ptr;
 
     // The dimensions.
-    int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim, total_q, total_k;
+    int b, seqlen_q, seqlen_k, seqlen_knew, d, vd, seqlen_q_rounded, seqlen_k_rounded, d_rounded, vd_rounded, rotary_dim, total_q;
 
     // The scaling factors for the kernel.
     float scale_softmax;
     float scale_softmax_log2;
-    uint32_t scale_softmax_log2_half2;
 
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
+    int * __restrict__ leftpad_k;
 
     // If provided, the actual length of each k sequence.
     int * __restrict__ seqused_k;
@@ -109,12 +120,15 @@ struct Flash_fwd_params : public Qkv_params {
 
     // Local window size
     int window_size_left, window_size_right;
+    float softcap;
+
+    // Random state.
+    at::PhiloxCudaState philox_args;
 
     // Pointer to the RNG seed (idx 0) and offset (idx 1).
     uint64_t * rng_state;
 
     bool is_bf16;
-    bool is_e4m3;
     bool is_causal;
 
     // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
@@ -128,12 +142,8 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ alibi_slopes_ptr;
     index_t alibi_slopes_batch_stride;
 
-    bool unpadded_lse; // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
-
-    int * __restrict__ tile_count_semaphore;
-    float * __restrict__ descale_q_ptr;
-    float * __restrict__ descale_k_ptr;
-    float * __restrict__ descale_v_ptr;
+    bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
+    bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -173,9 +183,6 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
     // The pointer to the softmax d sum.
     void *__restrict__ dsoftmax_sum;
-    void *__restrict__ softmax_lse_log2_ptr;
-
-    int *__restrict__ dq_semaphore;
 
     bool deterministic;
     index_t dq_accum_split_stride;
@@ -183,5 +190,7 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename T, int Headdim> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
-template<typename T, int Headdim> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+template<typename T, int QKHeaddim, int VHeaddim, bool Is_causal> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
+// template<typename T, int QKHeaddim, int VHeaddim, bool Is_causal> void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
+
+// template<typename T, int QKHeaddim, int VHeaddim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
