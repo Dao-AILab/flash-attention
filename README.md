@@ -32,6 +32,10 @@ We display CustomFlashAttention speedup using these parameters:
 ### Speedup
 ![Custom-flash-attn](assets/Customflash2_a100_fwd_bwd_benchmark.png)
 
+# FlashAttention
+This repository provides the official implementation of FlashAttention and
+FlashAttention-2 from the
+following papers.
 
 **FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness**  
 Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, Christopher Ré  
