@@ -1,6 +1,6 @@
 # Autotuner
 
-Autotuner can automatically generate the best config for flash-attention kernel with not-implemented headdim qk & headdim v , or different hardware such as nvidia Ampere, Ada Lovelace.
+Autotuner can automatically generate the best config for flash-attention kernel with not-implemented headdim qk & headdim v , or existing headdim on different hardware such as nvidia Ampere, Ada Lovelace.
 
 Currently, the autotuner only support flash attention forward. We plan to support backward and forward_split soon.
 
