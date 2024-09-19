@@ -23,6 +23,7 @@ template<typename Kernel_traits, bool Is_causal, bool Is_local, typename Seqlen_
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Is_causal and Is_local cannot be true at the same time.");
     using Element = typename Kernel_traits::Element;
+    using ElementAccum = typename Kernel_traits::ElementAccum;
     using OutputType = typename Kernel_traits::OutputType;
     using TileShape_MNK = typename Kernel_traits::TileShape_MNK;
     using ClusterShape = typename Kernel_traits::ClusterShape_MNK;
@@ -175,29 +176,31 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
       // We want kBlockM to be as small as possible for more parallelism.
       // With 128 threads we can load 512 elements at a time, so if headdim is divisible by 128, kBlockM = 4.
       // If headdim is divisible by 64, then we set kBlockM = 8, etc.
-      constexpr static int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
+      constexpr static int kHeadDim = Kernel_traits::kHeadDim;
+      constexpr static int kBlockM = kHeadDim % 128 == 0 ? 4 : (kHeadDim % 64 == 0 ? 8 : 16);
+      constexpr static bool Is_even_K = true; // always true for our current setting
       void *kernel_combine;
       int smem_size_combine;
       if (params.num_splits <= 2) {
-        kernel_combine = (void *) flash::combine_attn_seqk_parallel<Kernel_traits, kBlockM, 1, true, Flash_fwd_params>;
+        kernel_combine = (void *) flash::combine_attn_seqk_parallel<Element, ElementAccum, kHeadDim, kBlockM, 1, Is_even_K, Flash_fwd_params>;
         smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<2>, Int<kBlockM+1>>>);
       } else if (params.num_splits <= 4) {
-        kernel_combine = (void *) flash::combine_attn_seqk_parallel<Kernel_traits, kBlockM, 2, true, Flash_fwd_params>;
+        kernel_combine = (void *) flash::combine_attn_seqk_parallel<Element, ElementAccum, kHeadDim, kBlockM, 2, Is_even_K, Flash_fwd_params>;
         smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<4>, Int<kBlockM+1>>>);
       } else if (params.num_splits <= 8) {
-        kernel_combine = (void *) flash::combine_attn_seqk_parallel<Kernel_traits, kBlockM, 3, true, Flash_fwd_params>;
+        kernel_combine = (void *) flash::combine_attn_seqk_parallel<Element, ElementAccum, kHeadDim, kBlockM, 3, Is_even_K, Flash_fwd_params>;
         smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<8>, Int<kBlockM+1>>>);
       } else if (params.num_splits <= 16) {
-        kernel_combine = (void *) flash::combine_attn_seqk_parallel<Kernel_traits, kBlockM, 4, true, Flash_fwd_params>;
+        kernel_combine = (void *) flash::combine_attn_seqk_parallel<Element, ElementAccum, kHeadDim, kBlockM, 4, Is_even_K, Flash_fwd_params>;
         smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<16>, Int<kBlockM+1>>>);
       } else if (params.num_splits <= 32) {
-        kernel_combine = (void *) flash::combine_attn_seqk_parallel<Kernel_traits, kBlockM, 5, true, Flash_fwd_params>;
+        kernel_combine = (void *) flash::combine_attn_seqk_parallel<Element, ElementAccum, kHeadDim, kBlockM, 5, Is_even_K, Flash_fwd_params>;
         smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<32>, Int<kBlockM+1>>>);
       } else if (params.num_splits <= 64) {
-        kernel_combine = (void *) flash::combine_attn_seqk_parallel<Kernel_traits, kBlockM, 6, true, Flash_fwd_params>;
+        kernel_combine = (void *) flash::combine_attn_seqk_parallel<Element, ElementAccum, kHeadDim, kBlockM, 6, Is_even_K, Flash_fwd_params>;
         smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<64>, Int<kBlockM+1>>>);
       } else if (params.num_splits <= 128) {
-        kernel_combine = (void *) flash::combine_attn_seqk_parallel<Kernel_traits, kBlockM, 7, true, Flash_fwd_params>;
+        kernel_combine = (void *) flash::combine_attn_seqk_parallel<Element, ElementAccum, kHeadDim, kBlockM, 7, Is_even_K, Flash_fwd_params>;
         smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<128>, Int<kBlockM+1>>>);
       } else {
         // don't support > 128 splits

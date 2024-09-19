@@ -21,13 +21,15 @@ struct SharedStorageLSE {
     cute::array_aligned<Element, cute::size_v<SmemLayout>> smem_lse;
 };
 
-template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, typename Params>
-__global__ void combine_attn_seqk_parallel(Params  const params) {
-    using Element = typename Kernel_traits::Element;
-    using ElementAccum = typename Kernel_traits::ElementAccum;
-    using index_t = typename Kernel_traits::index_t;
+// DONT use Kernel_traits here to avoid redundant compilation.
+// template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, typename Params>
+template<typename Element, typename ElementAccum, int kHeadDim, int kBlockM, int Log_max_splits, bool Is_even_K, typename Params>
+__global__ void combine_attn_seqk_parallel(Params const params) {
+    // using Element = typename Kernel_traits::Element;
+    // using ElementAccum = typename Kernel_traits::ElementAccum;
+    using index_t = int64_t; // Kernel_traits::index_t
     constexpr int kMaxSplits = 1 << Log_max_splits;
-    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    // constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kNThreads = 128; //Kernel_traits::kNThreads;
 
     static_assert(kMaxSplits <= 128, "kMaxSplits must be <= 128");
@@ -42,7 +44,6 @@ __global__ void combine_attn_seqk_parallel(Params  const params) {
     SharedStorage &shared_storage =
       *reinterpret_cast<SharedStorage *>(smem_);
     Tensor sLSE = make_tensor(make_smem_ptr(shared_storage.smem_lse.data()), Shape<Int<kMaxSplits>, Int<kBlockM+1>>{});
-
 
     // The thread and block index.
     const int tidx = threadIdx.x;
