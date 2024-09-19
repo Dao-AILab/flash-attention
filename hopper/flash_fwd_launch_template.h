@@ -250,8 +250,8 @@ void run_mha_fwd_hdim64_gqa_decoding(Flash_fwd_params &params, cudaStream_t stre
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
                 BOOL_SWITCH(params.num_splits > 1, Is_split, [&] {
                     run_flash_fwd<
-                        Flash_fwd_kernel_traits<Headdim, Single_MMA_WG ? 64 : 192, Is_causal ? 128 : 176,
-                            Single_MMA_WG ? 8 :  16, 2, false, 1, T, !Seqlen_traits::UseVarSeqLen && Is_split, kBlockH>,
+                        Flash_fwd_kernel_traits<Headdim, Single_MMA_WG ? 64 : 192, 128,
+                            Single_MMA_WG ? 8 : 16, 2, false, 1, T, !Seqlen_traits::UseVarSeqLen && Is_split, kBlockH>,
                         Is_causal, Seqlen_traits, Seqlen_traits_Q
                     >(params, stream);
                 });
