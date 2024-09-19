@@ -1,37 +1,3 @@
-# Customized FlashAttention
-
-This repository provides Customized FlashAttention based on the official implementation.
-we have supported:
-- FlashAttention-2 with QKHeadDim=32, VHeadDim=64
-- FlashAttention-2 with QKHeadDim=64, VHeadDim=128
-- FlashAttention-2 with QKHeadDim=96, VHeadDim=192
-- FlashAttention-2 with QKHeadDim=128, VHeadDim=256
-- FlashAttention-2 with QKHeadDim=192, VHeadDim=128
-
-For headdim not supported, you can use the autotuner to generate the implementation. Details are in `autotuner.md`.
-
-Feel free to tell us what else you need. We might support it soon. :)
-
-Currently, we do not provide prebuilt library, you need to compile from source.
-
-## Usage
-
-Users can modify `headdim.json` before compile from source, to select the (dim_qk, dim_v) they needed. 
-Or you can just leave `headdim.json` untouched, and compile all the supported config.
-
-## Performance of Customized FlashAttention
-
-We test the performance speedup compare to padding qk&v hidden_dim on A100.
-
-We display CustomFlashAttention speedup using these parameters:
-
-- (qk dim, v_dim): (32,64), (64,128), (128,256); qk hidden dimension 2048 (i.e. 64, 32 or 16 heads).
-- Sequence length 512, 1k, 2k, 4k, 8k, 16k.
-- Batch size set to 16k / seqlen.
-
-### Speedup
-![Custom-flash-attn](assets/Customflash2_a100_fwd_bwd_benchmark.png)
-
 # FlashAttention
 This repository provides the official implementation of FlashAttention and
 FlashAttention-2 from the
