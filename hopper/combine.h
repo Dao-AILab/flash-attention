@@ -25,7 +25,7 @@ struct SharedStorageLSE {
 // template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, typename Params>
 template<typename Element, typename ElementAccum, int kHeadDim, int kBlockM, int Log_max_splits, bool Is_even_K, typename Params>
 __global__ void combine_attn_seqk_parallel(Params const params) {
-    // using Element = typename Kernel_traits::Element;
+    // using Element = typename Kernel_traits::OutputType;
     // using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = int64_t; // Kernel_traits::index_t
     constexpr int kMaxSplits = 1 << Log_max_splits;
