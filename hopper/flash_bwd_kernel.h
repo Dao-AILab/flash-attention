@@ -253,7 +253,7 @@ public:
                     }
                     if constexpr (Is_causal) {
                         int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
-                        int const m_block_max = cute::ceil_div(collective_mainloop.get_seqlen_q(params.mainloop, bidb), kBlockM);
+                        int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
                         if (m_block_min >= m_block_max) { continue; }
                     }
                     collective_mainloop.store_dq(params.mainloop, shared_storage, block_coord);

@@ -20,6 +20,7 @@
 
 template<typename Kernel_traits, bool Is_causal, bool Is_local, typename Seqlen_traits>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+    static_assert(!(Is_causal && Is_local), "Is_causal and Is_local cannot be true at the same time.");
     using Element = typename Kernel_traits::Element;
     using OutputType = typename Kernel_traits::OutputType;
     using TileShape_MNK = typename Kernel_traits::TileShape_MNK;
@@ -121,7 +122,7 @@ void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
             SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
                 run_flash_fwd<
                     Flash_fwd_kernel_traits<Headdim, 192, 128, 16, 2, false, 1, T>, 
-                    Is_causal, Is_local, Seqlen_traits
+                    Is_causal, Is_local && !Is_causal, Seqlen_traits
                 >(params, stream);
             });
         });
@@ -138,7 +139,7 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
                 BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, 128) % 2 == 0 && !Is_causal && !Is_local && !Seqlen_traits::kUseVarSeqLen, UseCluster, [&] {
                     run_flash_fwd<
                         Flash_fwd_kernel_traits<Headdim, 128, (Is_causal || Is_local) ? 128 : 176, 12, 2, false, UseCluster ? 2 : 1, T>, 
-                        Is_causal, Is_local, Seqlen_traits
+                        Is_causal, Is_local && !Is_causal, Seqlen_traits
                     >(params, stream);
                 });
             });
@@ -156,7 +157,7 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
                 BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, 128) % 2 == 0 && !Is_causal && !Is_local && !Seqlen_traits::kUseVarSeqLen, UseCluster, [&] {
                     run_flash_fwd<
                         Flash_fwd_kernel_traits<Headdim, 128, 80, 12, 2, false, UseCluster ? 2 : 1, T>, 
-                        Is_causal, Is_local, Seqlen_traits
+                        Is_causal, Is_local && !Is_causal, Seqlen_traits
                     >(params, stream);
                 });
             });

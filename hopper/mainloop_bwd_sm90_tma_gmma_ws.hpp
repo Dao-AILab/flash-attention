@@ -613,7 +613,7 @@ struct CollectiveMainloopBwd {
             }
             cutlass::arch::NamedBarrier::arrive(kNThreadsdQ + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::dQEmpty) /*id*/);  // sdQ empty, ready to be written to
         }
-        if constexpr (Deterministic) {
+        if constexpr (Is_local && Deterministic) {
             constexpr int kBlockM = get<0>(TileShape_MNK{});        
             int const seqlen_q = get_seqlen_q(params, bidb);
             int const m_block_global_max = cute::ceil_div(seqlen_q, kBlockM);

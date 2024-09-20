@@ -23,6 +23,7 @@ using namespace cute;
 template <int kHeadDim, int kBlockM, int kBlockN, typename Element, bool Is_causal, bool Is_local, bool Varlen, bool Deterministic,
           bool dKV_swapAB, bool dQ_swapAB, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1>
 void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+    static_assert(!(Is_causal && Is_local), "Is_causal and Is_local cannot be true at the same time.");
     using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
     using ElementAccum = float;
     using PreprocessKernel = flash::FlashAttnBwdPreprocess<TileShape_MK, Element, ElementAccum, cutlass::arch::Sm90, /*Clear_dQaccum=*/true, Varlen>;
@@ -174,7 +175,7 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
         BOOL_SWITCH(params.is_local, Is_local, [&] {
             BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
                 BOOL_SWITCH(params.deterministic, Deterministic, [&] {
-                    run_flash_bwd<Headdim, 128, 128, T, Is_causal, Is_local, Varlen, Deterministic, false, false, 1, 2, 2>(params, stream);
+                    run_flash_bwd<Headdim, 128, 128, T, Is_causal, Is_local && !Is_causal, Varlen, Deterministic, false, false, 1, 2, 2>(params, stream);
                 });
             });
         });
@@ -188,7 +189,7 @@ void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
         BOOL_SWITCH(params.is_local, Is_local, [&] {
             BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
                 BOOL_SWITCH(params.deterministic, Deterministic, [&] {
-                    run_flash_bwd<Headdim, 64, 128, T, Is_causal, Is_local, Varlen, Deterministic, false, false, 1, 2, 1>(params, stream);
+                    run_flash_bwd<Headdim, 64, 128, T, Is_causal, Is_local && !Is_causal, Varlen, Deterministic, false, false, 1, 2, 1>(params, stream);
                 });
             });
         });
@@ -202,7 +203,7 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
         BOOL_SWITCH(params.is_local, Is_local, [&] {
             BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
                 BOOL_SWITCH(params.deterministic, Deterministic, [&] {
-                    run_flash_bwd<Headdim, 64, 128, T, Is_causal, Is_local, Varlen, Deterministic, false, false, 1, 2, 1>(params, stream);
+                    run_flash_bwd<Headdim, 64, 128, T, Is_causal, Is_local && !Is_causal, Varlen, Deterministic, false, false, 1, 2, 1>(params, stream);
                 });
             });
         });
