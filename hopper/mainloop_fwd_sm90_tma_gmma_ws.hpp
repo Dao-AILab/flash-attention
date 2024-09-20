@@ -350,8 +350,8 @@ struct CollectiveMainloopFwd {
         Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.layout_V.shape());
 
         auto [m_block, n_split_idx, bidh, bidb] = block_coord;
-        const int bidb_cache = mainloop_params.cache_batch_idx == nullptr ? bidb : mainloop_params.cache_batch_idx[bidb];        
-        int bidh_kv = mainloop_params.qhead_per_khead_divmod.divide(bidh);
+        const int bidb_cache = mainloop_params.cache_batch_idx == nullptr ? bidb : mainloop_params.cache_batch_idx[bidb];
+        const int bidh_kv = mainloop_params.qhead_per_khead_divmod.divide(bidh);
 
         // Prepare the TMA loads
         uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
@@ -790,9 +790,9 @@ struct CollectiveMainloopFwd {
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
 
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        static constexpr int kBlockM_div_H = kBlockM / Ktraits::kBlockH;
+        static constexpr int kBlockH = Ktraits::kBlockH;
+        static constexpr int kBlockM_div_H = get<0>(TileShape_MNK{}) / kBlockH;
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
@@ -888,7 +888,7 @@ struct CollectiveMainloopFwd {
                     // using std::min is faster than doing col >= limit0 or col >= limit1
                     // Need to cast get<1>(tScS(i)) to (signed) int since by default it's unsigned, and the
                     // right hand side can be negative and might be converted to a very large unsigned integer.
-                    int row = int(get<0>(tScS(i))) / Ktraits::kBlockH;
+                    int row = int(get<0>(tScS(i))) / kBlockH;
                     if (int(get<1>(tScS(i))) >= std::min(seqlen_k - n_block_global * kBlockN,
                                                         col_limit_causal(row, n_block_global))) {
                         tSrS(i) = -INFINITY;
@@ -908,7 +908,7 @@ struct CollectiveMainloopFwd {
         clear(scores_scale);
 
         // TODO: modify this for split kv to eliminate superfluous masking steps
-        constexpr int n_masking_steps = !Is_causal ? 1 : cute::ceil_div(kBlockM, kBlockN) + 1;
+        constexpr int n_masking_steps = !Is_causal ? 1 : cute::ceil_div(kBlockM_div_H, kBlockN) + 1;
         // Only go through these if Is_causal, since n_masking_steps = 1 when !Is_causal
         #pragma unroll
         for (int masking_step = 0; masking_step < n_masking_steps - 1 && n_block > 0; ++masking_step, --n_block, --n_block_global) {
@@ -926,7 +926,7 @@ struct CollectiveMainloopFwd {
             Tensor tScS = threadMma0.partition_C(cS);
             #pragma unroll
             for (int i = 0; i < size(tSrS); ++i) {
-                int row = int(get<0>(tScS(i))) / Ktraits::kBlockH;
+                int row = int(get<0>(tScS(i))) / kBlockH;
                 if (int(get<1>(tScS(i))) >= col_limit_causal(row, n_block_global - 1)) {
                     tSrS(i) = -INFINITY;
                 }

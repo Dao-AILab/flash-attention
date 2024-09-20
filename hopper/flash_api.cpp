@@ -372,7 +372,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
             run_mha_fwd_<cutlass::float_e4m3_t, 128>(params, stream);
         } else if (params.d == 256) {
             run_mha_fwd_<cutlass::float_e4m3_t, 256>(params, stream);
-        }        
+        }
     }
 }
 
@@ -1297,7 +1297,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      );
     params.is_kv_cache = true;
 
-    auto tile_count_semaphore = is_causal ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
+    auto tile_count_semaphore = is_causal || num_splits > 1
+        ? torch::zeros({1}, opts.dtype(torch::kInt32))
+        : torch::empty({1}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
 
     params.use_gqa_decoding = use_gqa_decoding;

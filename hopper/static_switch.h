@@ -78,22 +78,47 @@
     }                                                                          \
   }()
 
-#define QUERYHEAD_SWITCH(QUERYHEADS, ...)                                      \
+#define QUERYHEAD_SWITCH(QUERYHEADS, CONST_NAME, ...)                          \
   [&] {                                                                        \
     if (QUERYHEADS <= 2) {                                                     \
-      constexpr static int kBlockH = 2;                                        \
+      constexpr static int CONST_NAME = 2;                                     \
       return __VA_ARGS__();                                                    \
     } else if (QUERYHEADS <= 4) {                                              \
-      constexpr static int kBlockH = 4;                                        \
+      constexpr static int CONST_NAME = 4;                                     \
       return __VA_ARGS__();                                                    \
     } else if (QUERYHEADS <= 8) {                                              \
-      constexpr static int kBlockH = 8;                                        \
+      constexpr static int CONST_NAME = 8;                                     \
       return __VA_ARGS__();                                                    \
     } else if (QUERYHEADS <= 16) {                                             \
-      constexpr static int kBlockH = 16;                                       \
+      constexpr static int CONST_NAME = 16;                                    \
       return __VA_ARGS__();                                                    \
     } else {                                                                   \
-      constexpr static int kBlockH = 32;                                       \
+      constexpr static int CONST_NAME = 32;                                    \
+      return __VA_ARGS__();                                                    \
+    }                                                                          \
+  }()
+
+#define MMA_3WG_SWITCH(QLEN, CONST_NAME, ...)                                  \
+  [&] {                                                                        \
+    if (QLEN <= 64) {                                                          \
+      constexpr static int CONST_NAME = 1;                                     \
+      return __VA_ARGS__();                                                    \
+    } else if (QLEN <= 128) {                                                  \
+      constexpr static int CONST_NAME = 2;                                     \
+      return __VA_ARGS__();                                                    \
+    } else {                                                                   \
+      constexpr static int CONST_NAME = 3;                                     \
+      return __VA_ARGS__();                                                    \
+    }                                                                          \
+  }()
+
+#define MMA_2WG_SWITCH(QLEN, CONST_NAME, ...)                                  \
+  [&] {                                                                        \
+    if (QLEN <= 64) {                                                          \
+      constexpr static int CONST_NAME = 1;                                     \
+      return __VA_ARGS__();                                                    \
+    } else {                                                                   \
+      constexpr static int CONST_NAME = 2;                                     \
       return __VA_ARGS__();                                                    \
     }                                                                          \
   }()
