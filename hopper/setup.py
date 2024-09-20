@@ -146,6 +146,13 @@ if not SKIP_CUDA_BUILD:
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
         "-DNDEBUG",  # Important, otherwise performance is severely impacted
     ]
+    if get_platform() == "win_amd64":
+        nvcc_flags.extend(
+            [
+                "-D_USE_MATH_DEFINES",  # for M_LN2
+                "-Xcompiler=/Zc:__cplusplus",  # sets __cplusplus correctly, CUTLASS_CONSTEXPR_IF_CXX17 needed for cutlass::gcd
+            ]
+        )
     include_dirs = [
         # Path(this_dir) / "fmha-pipeline",
         # repo_dir / "lib",
