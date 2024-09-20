@@ -208,34 +208,6 @@ public:
   
 };
 
-#if 0
-template <>
-class SeqLenTraits<DecodingGQASeqLenType> {
-public:
-
-    // Returns the layout of QO tensor in (M,H/HK,K,HK,B) format in global memory.  
-    CUTLASS_HOST_DEVICE auto get_query_gmem_layout(
-        int m, int k, int h_k, int b, int h_h_k_ratio,
-        int64_t m_stride, int64_t h_stride, int64_t b_stride) const {
-        return make_layout(make_shape(m, h_h_k_ratio, k, h_k, b),
-                           make_stride(m_stride, h_stride, cute::_1{},
-                                       h_stride * h_h_k_ratio, b_stride));
-    }
-
-    // Tile Shape should be (bM/HQ, bHQ, bK)
-    // Returns local tile (bM/HQ, bHQ, bK)
-    template <typename MTensor, typename Shape>
-    CUTLASS_DEVICE auto get_query_local_tile_tensor(
-        const MTensor &m_tensor, const Shape &tile_shape, 
-        int bidh_kv, int bidb, int m_block, int bidh_local) const {    
-      // expect bidh_local = bidh % qhead_per_khead
-      auto g_tensor = local_tile(
-          m_tensor(_, _, _, bidh_kv, bidb), tile_shape, make_coord(m_block, bidh_local, _0{}));
-      return g_tensor;
-    }
-};
-#endif
-
 using FixedSeqLenTraits = SeqLenTraits<FixedSeqLenType>;
 using VarSeqLenTraits = SeqLenTraits<VarSeqLenType>;
 using DecodingGQASeqLenTraits = SeqLenTraits<DecodingGQASeqLenType>;
