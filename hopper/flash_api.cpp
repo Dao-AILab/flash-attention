@@ -240,21 +240,69 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.deterministic = deterministic;
 }
 
+
+// Find the number of splits that maximizes the occupancy. For example, if we have
+// batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
+// better than having 3 splits (efficiency = 0.67). However, we also don't want too many
+// splits as that would incur more HBM reads/writes.
+// So we find the best efficiency, then find the smallest number of splits that gets 85%
+// of the best efficiency.
+inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
+    // If we have enough to almost fill the SMs, then just use 1 split
+    if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
+    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
+    float max_efficiency = 0.f;
+    std::vector<float> efficiency;
+    efficiency.reserve(max_splits);
+    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
+    // Some splits are not eligible. For example, if we have 64 blocks and choose 11 splits,
+    // we'll have 6 * 10 + 4 blocks. If we choose 12 splits, we'll have 6 * 11 + (-2) blocks
+    // (i.e. it's 11 splits anyway).
+    // So we check if the number of blocks per split is the same as the previous num_splits.
+    auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
+        return num_splits == 1 || ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1);
+    };
+    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+        if (!is_split_eligible(num_splits)) {
+            efficiency.push_back(0.f);
+        } else {
+            float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
+            float eff = n_waves / ceil(n_waves);
+            // printf("num_splits = %d, eff = %f\n", num_splits, eff);
+            if (eff > max_efficiency) { max_efficiency = eff; }
+            efficiency.push_back(eff);
+        }
+    }
+    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+        if (!is_split_eligible(num_splits)) { continue; }
+        if (efficiency[num_splits - 1] >= 0.50 * max_efficiency) {
+            // printf("num_splits chosen = %d\n", num_splits);
+            return num_splits;
+        }
+    }
+    return 1;
+}
+
 std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, const int batch_size,
-    const int num_heads, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
+    const int num_heads, const int num_heads_k, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
     const int head_size_rounded, const float p_dropout,
-    const int num_splits, cudaDeviceProp *dprops, struct c10::TensorOptions opts) {
+    const int num_splits, cudaDeviceProp *dprops, bool use_gqa_decoding, struct c10::TensorOptions opts) {
+    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
-    // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
-    // In any case we don't expect seqlen_q to be larger than 64 for inference.
+    const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+    const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+    int gqa_ratio = num_heads / num_heads_k;
+    const int block_m = 128;
     params.num_splits = num_splits;
     at::Tensor softmax_lse_accum;
     at::Tensor out_accum;
 
     if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
         if (num_splits < 1) {
-               TORCH_CHECK(false, "num_splits heuristic is not supported yet");
+	    int batch_nheads_mblocks = use_gqa_decoding ? ceildiv(max_seqlen_q, block_m / gqa_ratio) * batch_size * num_heads_k : ceildiv(max_seqlen_q, block_m) * batch_size * num_heads;
+            params.num_splits = num_splits_heuristic(batch_nheads_mblocks, dprops->multiProcessorCount, num_n_blocks, 128);
+	    printf("%d\n", params.num_splits);
 	}
         if (params.num_splits > 1) {
             softmax_lse_accum = torch::empty({num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
@@ -1345,8 +1393,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
     std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
-       params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
-       head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, opts);
+       params, batch_size, num_heads, num_heads_k, head_size, seqlen_k, seqlen_q,
+       head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, use_gqa_decoding,  opts);
 
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
