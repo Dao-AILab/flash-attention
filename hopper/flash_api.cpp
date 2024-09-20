@@ -302,11 +302,10 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
         if (num_splits < 1) {
 	    int batch_nheads_mblocks = use_gqa_decoding ? ceildiv(max_seqlen_q, block_m / gqa_ratio) * batch_size * num_heads_k : ceildiv(max_seqlen_q, block_m) * batch_size * num_heads;
             params.num_splits = num_splits_heuristic(batch_nheads_mblocks, dprops->multiProcessorCount, num_n_blocks, 128);
-	    printf("%d\n", params.num_splits);
 	}
         if (params.num_splits > 1) {
-            softmax_lse_accum = torch::empty({num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
-            out_accum = torch::empty({num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
+            softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+            out_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
             params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
             params.oaccum_ptr = out_accum.data_ptr();
             params.oaccum_row_stride = out_accum.stride(-2);
