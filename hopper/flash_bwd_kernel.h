@@ -31,6 +31,7 @@ public:
 
     // Type Aliases
     static constexpr bool Is_causal = CollectiveMainloop_::Is_causal;
+    static constexpr bool Is_local = CollectiveMainloop_::Is_local;
     static_assert(CollectiveMainloop_::Varlen == CollectiveEpilogue_::Varlen);
     static constexpr bool Varlen = CollectiveMainloop_::Varlen;
 
@@ -155,6 +156,7 @@ public:
         static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int NumCopyThreads = NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
         using MainloopPipeline = typename CollectiveMainloop::MainloopPipeline;
         using PipelineParams = typename MainloopPipeline::Params;
@@ -218,14 +220,14 @@ public:
                     auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                     auto [n_block, bidh, bidb] = block_coord;
                     if constexpr (Varlen) {
-                        if (n_block * kBlockM >= collective_mainloop.get_seqlen_k(params.mainloop, bidb)) {
+                        if (n_block * kBlockN >= collective_mainloop.get_seqlen_k(params.mainloop, bidb)) {
                             scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                             continue;
                         }
                     }
-                    if constexpr (Is_causal) {
+                    if constexpr (Is_causal || Is_local) {
                         int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
-                        int const m_block_max = cute::ceil_div(collective_mainloop.get_seqlen_q(params.mainloop, bidb), kBlockM);
+                        int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
                         if (m_block_min >= m_block_max) {
                             scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                             continue;
@@ -247,11 +249,11 @@ public:
                     auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                     auto [n_block, bidh, bidb] = block_coord;
                     if constexpr (Varlen) {
-                        if (n_block * kBlockM >= collective_mainloop.get_seqlen_k(params.mainloop, bidb)) { continue; }
+                        if (n_block * kBlockN >= collective_mainloop.get_seqlen_k(params.mainloop, bidb)) { continue; }
                     }
                     if constexpr (Is_causal) {
                         int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
-                        int const m_block_max = cute::ceil_div(collective_mainloop.get_seqlen_q(params.mainloop, bidb), kBlockM);
+                        int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
                         if (m_block_min >= m_block_max) { continue; }
                     }
                     collective_mainloop.store_dq(params.mainloop, shared_storage, block_coord);
@@ -277,11 +279,11 @@ public:
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 auto [n_block, bidh, bidb] = block_coord;
                 if constexpr (Varlen) {
-                    if (n_block * kBlockM >= collective_mainloop.get_seqlen_k(params.mainloop, bidb)) { continue; }
+                    if (n_block * kBlockN >= collective_mainloop.get_seqlen_k(params.mainloop, bidb)) { continue; }
                 }
-                if constexpr (Is_causal) {
+                if constexpr (Is_causal || Is_local) {
                     int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
-                    int const m_block_max = cute::ceil_div(collective_mainloop.get_seqlen_q(params.mainloop, bidb), kBlockM);
+                    int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
                     if (m_block_min >= m_block_max) {  // We exit early and write 0 to dK and dV
                         collective_epilogue.store_zero(params.epilogue, threadIdx.x - NumCopyThreads, block_coord);
                         continue;
@@ -300,7 +302,6 @@ public:
             }
             collective_epilogue.store_tail();
         }
-
     }
 
 };

@@ -24,11 +24,14 @@ def print_diffs(out, out_ref):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# @pytest.mark.parametrize("dtype", [torch.float16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("local", [False, True])
+# @pytest.mark.parametrize("local", [True])
 @pytest.mark.parametrize("deterministic", [False, True])
 # @pytest.mark.parametrize("deterministic", [True])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -37,7 +40,7 @@ def print_diffs(out, out_ref):
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [64, 128, 256])
 # @pytest.mark.parametrize("d", [64, 96, 128])
-# @pytest.mark.parametrize("d", [64, 128])
+# @pytest.mark.parametrize("d", [256])
 @pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize("descale", [1.0])
 # @pytest.mark.parametrize("descale", [1.0, 2.0, 3.0, 4.0])
@@ -65,13 +68,13 @@ def print_diffs(out, out_ref):
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_output(
-    seqlen_q, seqlen_k, d, causal, deterministic, mha_type, dtype, descale
+    seqlen_q, seqlen_k, d, causal, local, deterministic, mha_type, dtype, descale
 ):
     device = "cuda"
     if(dtype == torch.float8_e4m3fn):
         dtype_init = torch.float16
     else:
-        dtype_init = dtype    
+        dtype_init = dtype
     print(dtype)
     # set seed
     torch.random.manual_seed(0)
@@ -83,6 +86,7 @@ def test_flash_attn_output(
     # nheads_kv = 2
     # batch_size = 9
     # nheads = 6
+    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_init, requires_grad=True)
     k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_init, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_init, requires_grad=True)
@@ -96,7 +100,7 @@ def test_flash_attn_output(
     descale_k = torch.tensor([descale], dtype=torch.float32, device='cuda')
     descale_v = torch.tensor([descale], dtype=torch.float32, device='cuda')
     if(dtype != torch.float8_e4m3fn):
-        out, lse = flash_attn_func(q, k, v, causal=causal, deterministic=deterministic)
+        out, lse = flash_attn_func(q, k, v, causal=causal, window_size=window_size, deterministic=deterministic)
     else:
         out, q, k, v, out_padded, lse, S_dmask = _flash_attn_forward(
             q, k, v, softmax_scale, causal, descale_q=descale_q, descale_k=descale_k, descale_v=descale_v
@@ -113,7 +117,7 @@ def test_flash_attn_output(
         q = q * descale_q
         k = k * descale_k
         v = v * descale_v
-        
+
     out_ref, attn_ref = attention_ref(
         q,
         k,
@@ -121,6 +125,7 @@ def test_flash_attn_output(
         None,
         None,
         causal=causal,
+        window_size=window_size,
     )
     out_pt, attn_pt = attention_ref(
         q,
@@ -129,6 +134,7 @@ def test_flash_attn_output(
         None,
         None,
         causal=causal,
+        window_size=window_size,
         upcast=False,
         reorder_ops=True,
     )
@@ -144,9 +150,9 @@ def test_flash_attn_output(
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-    
+
     # if not causal:
-    #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")                
+    #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
     # breakpoint()
 
     if d <= 128 and dtype != torch.float8_e4m3fn:
@@ -181,7 +187,7 @@ def test_flash_attn_output(
     # breakpoint()
     if(dtype != torch.float8_e4m3fn):
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 3e-5
-    else:       
+    else:
         # just test correctness of fp8 kernel w/o further quantization techniques
         assert (out - out_ref).abs().max().item() <= 40 * (out_pt - out_ref).abs().max().item()
 
@@ -196,14 +202,16 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
+# @pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("local", [False, True])
+# @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("deterministic", [False, True])
 # @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("add_unused_qkv", [False, True])
 # @pytest.mark.parametrize("add_unused_qkv", [True])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [128])
+# @pytest.mark.parametrize('d', [256])
 # @pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [128])
@@ -233,7 +241,7 @@ def test_flash_attn_output(
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_varlen_output(
-    seqlen_q, seqlen_k, d, causal, deterministic, add_unused_qkv, mha_type, dtype
+    seqlen_q, seqlen_k, d, causal, local, deterministic, add_unused_qkv, mha_type, dtype
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
@@ -245,10 +253,13 @@ def test_flash_attn_varlen_output(
     torch.random.manual_seed(0)
     # batch_size = 1
     # nheads = 1
+    # nheads_kv = 1
     batch_size = 9
     nheads = 6
     nheads_kv = 6 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
- 
+
+    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(
         batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True
@@ -308,6 +319,7 @@ def test_flash_attn_varlen_output(
         deterministic=deterministic,
         seqused_q=seqused_q,
         seqused_k=seqused_k,
+        window_size=window_size,
     )
     out = output_pad_fn(out_unpad)
     if query_unused_mask is not None:
@@ -322,6 +334,7 @@ def test_flash_attn_varlen_output(
         query_padding_mask,
         key_padding_mask,
         causal=causal,
+        window_size=window_size,
     )
     out_pt, attn_pt = attention_ref(
         q,
@@ -330,6 +343,7 @@ def test_flash_attn_varlen_output(
         query_padding_mask,
         key_padding_mask,
         causal=causal,
+        window_size=window_size,
         upcast=False,
         reorder_ops=True,
     )

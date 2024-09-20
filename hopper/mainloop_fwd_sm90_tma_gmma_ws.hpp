@@ -79,7 +79,7 @@ struct SmemTransposeFp8_64x64 {
   }
 };
 
-template <typename Ktraits, bool Is_causal, typename Seqlen_traits>
+template <typename Ktraits, bool Is_causal, bool Is_local, typename Seqlen_traits>
 struct CollectiveMainloopFwd {
 
     using Element = typename Ktraits::Element;
@@ -158,6 +158,8 @@ struct CollectiveMainloopFwd {
         float const* descale_q_ptr;
         float const* descale_k_ptr;
         float const* descale_v_ptr;
+        int window_size_left;
+        int window_size_right;
     };
 
     // Device side kernel params
@@ -173,6 +175,8 @@ struct CollectiveMainloopFwd {
         float const* descale_q_ptr;
         float const* descale_k_ptr;
         float const* descale_v_ptr;
+        int window_size_left;
+        int window_size_right;
     };
 
 
@@ -203,7 +207,8 @@ struct CollectiveMainloopFwd {
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.layout_Q.shape()), get<2>(args.layout_K.shape()))),
                 tma_load_Q, tma_load_K, tma_load_V,
                 args.softmax_scale_log2,
-                args.descale_q_ptr, args.descale_k_ptr, args.descale_v_ptr};
+                args.descale_q_ptr, args.descale_k_ptr, args.descale_v_ptr,
+                args.window_size_left, args.window_size_right};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -225,11 +230,32 @@ struct CollectiveMainloopFwd {
         int const seqlen_q = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
         int const seqlen_k = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);        
         int n_block_max = cute::ceil_div(seqlen_k, kBlockN);
-        if constexpr (Is_causal) {
-            n_block_max = std::min(n_block_max,
-                                   cute::ceil_div((m_block + 1) * kBlockM + seqlen_k - seqlen_q, kBlockN));
+        if constexpr (Is_causal || Is_local) {
+            n_block_max = std::min(
+                n_block_max,
+                cute::ceil_div((m_block + 1) * kBlockM + seqlen_k - seqlen_q + mainloop_params.window_size_right, kBlockN));
         }
         return n_block_max;
+    }
+
+    CUTLASS_DEVICE
+    int get_n_block_min(
+          Params const& mainloop_params, int m_block, 
+          const Seqlen_traits& seqlen_traits_q,
+          const Seqlen_traits& seqlen_traits_k
+        ) {
+        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});        
+        int const seqlen_q = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        int const seqlen_k = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);        
+        if constexpr (!Is_local) {
+            return 0;
+        } else {
+            return std::max(
+                0, 
+                (m_block * kBlockM + seqlen_k - seqlen_q - mainloop_params.window_size_left) / kBlockN
+            );
+        }
     }
 
     template <typename Scheduler, typename SharedStorage>
@@ -288,7 +314,8 @@ struct CollectiveMainloopFwd {
             }
         }
 
-        int n_block_max = get_n_block_max(mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
+        const int n_block_min = get_n_block_min(mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
+        const int n_block_max = get_n_block_max(mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
         int n_block = n_block_max - 1;
 
         int lane_predicate = cute::elect_one_sync();
@@ -315,7 +342,7 @@ struct CollectiveMainloopFwd {
         if (lane_predicate) {
             // CUTLASS_PRAGMA_NO_UNROLL
             #pragma unroll 2
-            for (; n_block > 0; --n_block) {
+            for (; n_block > n_block_min; --n_block) {
                 pipeline_k.producer_acquire(smem_pipe_write_k);
                 copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
                     tKgK(_, n_block - 1), tKsK(_, smem_pipe_write_k.index()));
@@ -645,6 +672,7 @@ struct CollectiveMainloopFwd {
         FrgTensorO& tOrO,
         Softmax& softmax,
         int n_block_count,
+        int n_block_min,
         int thread_idx,
         int work_idx,
         int m_block,
@@ -706,37 +734,50 @@ struct CollectiveMainloopFwd {
         pipeline_k.consumer_release(smem_pipe_read_k);
         ++smem_pipe_read_k;
 
-        auto col_limit_causal = [&](int row, int n_block) {
-            return row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
+        auto col_limit_right = [&](int row, int n_block) {
+            return std::min(
+                seqlen_k - n_block * kBlockN, 
+                row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM + mainloop_params.window_size_right
+            );
+        };
+        auto col_limit_left = [&](int row, int n_block) {
+            return std::max(
+                0,
+                row + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM - mainloop_params.window_size_left
+            );
         };
         {
             Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
             Tensor tScS = threadMma0.partition_C(cS);
             #pragma unroll
             for (int i = 0; i < size(tSrS); ++i) {
-                if constexpr (!Is_causal) {  // Just masking based on col
+                if constexpr (!Is_causal && !Is_local) {  // Just masking based on col
                     if (int(get<1>(tScS(i))) >= int(seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
                 } else {  // mask based on both row and col
                     // using std::min is faster than doing col >= limit0 or col >= limit1
                     // Need to cast get<1>(tScS(i)) to (signed) int since by default it's unsigned, and the
                     // right hand side can be negative and might be converted to a very large unsigned integer.
-                    if (int(get<1>(tScS(i))) >= std::min(seqlen_k - n_block * kBlockN,
-                                                        col_limit_causal(int(get<0>(tScS(i))), n_block))) {
+                    if (int(get<1>(tScS(i))) >= col_limit_right(int(get<0>(tScS(i))), n_block)) {
                         tSrS(i) = -INFINITY;
+                    } else if constexpr (Is_local) {
+                        if (int(get<1>(tScS(i))) < col_limit_left(int(get<0>(tScS(i))), n_block)) {
+                            tSrS(i) = -INFINITY;
+                        }
                     }
                 }
             }
         }
 
         softmax.template online_softmax</*Is_first=*/true>(tSrS);
+ 
         Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(), convert_layout_acc_Aregs<typename Ktraits::TiledMma1>(tSrS.layout()));
         Tensor scores_scale = make_fragment_like(softmax.row_max);
         clear(scores_scale);
 
-        constexpr int n_masking_steps = !Is_causal ? 1 : cute::ceil_div(kBlockM, kBlockN) + 1;
+        constexpr int n_masking_steps = (!Is_causal) ? 1 : cute::ceil_div(kBlockM, kBlockN) + 1;
         // Only go through these if Is_causal, since n_masking_steps = 1 when !Is_causal
         #pragma unroll
-        for (int masking_step = 0; masking_step < n_masking_steps - 1 && n_block > 0; ++masking_step, --n_block) {
+        for (int masking_step = 0; masking_step < n_masking_steps - 1 && n_block > n_block_min; ++masking_step, --n_block) {
             Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read_k);
             warp_scheduler_barrier_sync();
@@ -751,7 +792,7 @@ struct CollectiveMainloopFwd {
             Tensor tScS = threadMma0.partition_C(cS);
             #pragma unroll
             for (int i = 0; i < size(tSrS); ++i) {
-                if (int(get<1>(tScS(i))) >= col_limit_causal(int(get<0>(tScS(i))), n_block - 1)) {
+                if (int(get<1>(tScS(i))) >= col_limit_right(int(get<0>(tScS(i))), n_block - 1)) {
                     tSrS(i) = -INFINITY;
                 }
             }
@@ -765,7 +806,7 @@ struct CollectiveMainloopFwd {
         }
 
         #pragma unroll 1
-        for (; n_block > 0; --n_block) {
+        for (; n_block > n_block_min; --n_block) {
             Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read_k);
             warp_scheduler_barrier_sync();
@@ -776,9 +817,24 @@ struct CollectiveMainloopFwd {
             warp_scheduler_barrier_arrive();
             warpgroup_wait<1>();
             pipeline_k.consumer_release(smem_pipe_read_k);  // release K
+
+            if constexpr(Is_local) {
+                Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
+                Tensor tScS = threadMma0.partition_C(cS);
+                #pragma unroll
+                for (int i = 0; i < size(tSrS); ++i) {
+                    if (
+                        int(get<1>(tScS(i))) >= col_limit_right(int(get<0>(tScS(i))), n_block - 1) ||
+                        int(get<1>(tScS(i))) < col_limit_left(int(get<0>(tScS(i))), n_block - 1)
+                    ) {
+                        tSrS(i) = -INFINITY;
+                    }
+                }
+            }
             // auto scores_scale = softmax.template max</*Is_first=*/false>(tSrS);
-            cute::copy(softmax.template max</*Is_first=*/false>(tSrS), scores_scale);
-            softmax.template online_softmax</*Is_first=*/false>(tSrS);
+            cute::copy(softmax.template max</*Is_first=*/false, /*Check_inf=*/Is_local>(tSrS), scores_scale);
+            softmax.template online_softmax</*Is_first=*/false, /*Check_inf=*/Is_local>(tSrS);
+
             warpgroup_wait<0>();
             pipeline_v.consumer_release(smem_pipe_read_v);  // release V
             ++smem_pipe_read_k;
@@ -791,11 +847,10 @@ struct CollectiveMainloopFwd {
         softmax.rescale_o(tOrO, scores_scale);
         consumer_wait(pipeline_v, smem_pipe_read_v);
         flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-        cute::copy(softmax.template finalize</*Check_inf=*/Is_causal>(tSrS), scores_scale);
+        cute::copy(softmax.template finalize</*Check_inf=*/Is_causal || Is_local>(tSrS), scores_scale);
         warpgroup_wait<0>();
         pipeline_v.consumer_release(smem_pipe_read_v);  // release V, otherwise producers will hang
         ++smem_pipe_read_v;
-
         softmax.rescale_o(tOrO, scores_scale);
         return;
     }
