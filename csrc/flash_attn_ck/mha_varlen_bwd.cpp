@@ -264,17 +264,13 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     const int total_q = sizes[0];
     const int batch_size = cu_seqlens_q.numel() - 1;
     const int num_heads = sizes[1];
-    const int head_size_og = dout.size(2);
-    const int head_size_8x = sizes[2];
+    const int head_size = sizes[2];
     const int total_k = k.size(0);
     const int num_heads_k = k.size(1);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(head_size_8x % 8 == 0, "head_size should be a multiple of 8");
-    TORCH_CHECK(head_size_8x <= 256, "CK FlashAttention backward only supports head dimension at most 256");
+    TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
+    TORCH_CHECK(head_size <= 256, "CK FlashAttention backward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
-
-    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
-    TORCH_CHECK(head_size_8x == round_multiple(head_size_og, 8), "head_size_8x must be head_size_og rounded to a multiple of 8");
 
     if (window_size_left >= max_seqlen_k) { window_size_left = -1; }
     if (window_size_right >= max_seqlen_k) { window_size_right = -1; }
@@ -295,11 +291,11 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
 
     // q, k, v, out had been padded in mha_fwd
     // dq_, dk_, dv_ are also padded tensor
-    CHECK_SHAPE(q, total_q, num_heads, head_size_8x);
-    CHECK_SHAPE(k, total_k, num_heads_k, head_size_8x);
-    CHECK_SHAPE(v, total_k, num_heads_k, head_size_8x);
-    CHECK_SHAPE(out, total_q, num_heads, head_size_8x);
-    CHECK_SHAPE(dout, total_q, num_heads, head_size_og);
+    CHECK_SHAPE(q, total_q, num_heads, head_size);
+    CHECK_SHAPE(k, total_k, num_heads_k, head_size);
+    CHECK_SHAPE(v, total_k, num_heads_k, head_size);
+    CHECK_SHAPE(out, total_q, num_heads, head_size);
+    CHECK_SHAPE(dout, total_q, num_heads, head_size);
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
 
@@ -309,7 +305,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         TORCH_CHECK(dq.dtype() == q_dtype, "dq must have the same dtype as q");
         CHECK_DEVICE(dq);
         TORCH_CHECK(dq.stride(-1) == 1, "dq must have contiguous last dimension");
-        CHECK_SHAPE(dq, total_q, num_heads, head_size_8x);
+        CHECK_SHAPE(dq, total_q, num_heads, head_size);
     } else {
         dq = torch::empty_like(q);
     }
@@ -318,7 +314,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
         CHECK_DEVICE(dk);
         TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
-        CHECK_SHAPE(dk, total_k, num_heads_k, head_size_8x);
+        CHECK_SHAPE(dk, total_k, num_heads_k, head_size);
     } else {
         dk = torch::empty_like(k);
     }
@@ -327,16 +323,9 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         TORCH_CHECK(dv.dtype() == q_dtype, "dv must have the same dtype as q");
         CHECK_DEVICE(dv);
         TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
-        CHECK_SHAPE(dv, total_k, num_heads_k, head_size_8x);
+        CHECK_SHAPE(dv, total_k, num_heads_k, head_size);
     } else {
         dv = torch::empty_like(v);
-    }
-
-    at::Tensor dout_padded;
-    if (head_size_og % 8 != 0) {
-        dout_padded = torch::nn::functional::pad(dout, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-    } else {
-        dout_padded = dout;
     }
 
     // Cast to char to avoid compiler warning about narrowing
@@ -347,17 +336,17 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     at::Tensor dq_accum;
 
     if (!deterministic) {
-        dq_accum = torch::zeros({1, total_q, num_heads, head_size_8x}, opts.dtype(at::kFloat));
+        dq_accum = torch::zeros({1, total_q, num_heads, head_size}, opts.dtype(at::kFloat));
     } else {
-        const ck_tile::index_t kN0 = head_size_8x <= 128 ? 128 : 64;
+        const ck_tile::index_t kN0 = head_size <= 128 ? 128 : 64;
         const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(max_seqlen_k, kN0);
-        dq_accum = torch::zeros({nsplits, total_q, num_heads, head_size_8x}, opts.dtype(at::kFloat));
+        dq_accum = torch::zeros({nsplits, total_q, num_heads, head_size}, opts.dtype(at::kFloat));
     }
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
-        dk_expanded = torch::empty({total_k, num_heads, head_size_8x}, opts);
-        dv_expanded = torch::empty({total_k, num_heads, head_size_8x}, opts);
+        dk_expanded = torch::empty({total_k, num_heads, head_size}, opts);
+        dv_expanded = torch::empty({total_k, num_heads, head_size}, opts);
     } else {
         dk_expanded = dk;
         dv_expanded = dv;
@@ -391,7 +380,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         ck_tile::stream_config stream_config{stream};
 
         auto traits =
-            get_ck_fmha_varlen_bwd_traits(mask, q_dtype_str, head_size_8x, is_dropout, alibi_slopes_.has_value(), deterministic);
+            get_ck_fmha_varlen_bwd_traits(mask, q_dtype_str, head_size, is_dropout, alibi_slopes_.has_value(), deterministic);
 
         auto args =
             get_ck_fmha_varlen_bwd_args(
@@ -401,7 +390,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
                 max_seqlen_k,
                 num_heads,
                 num_heads_k,
-                head_size_8x,
+                head_size,
                 q,
                 k,
                 v,
@@ -410,7 +399,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
                 alibi_slopes_,
                 out,
                 softmax_lse,
-                dout_padded,
+                dout,
                 dq_accum,
                 softmax_d,
                 dq,
@@ -432,13 +421,8 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
-        at::sum_out(dk, at::reshape(dk_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size_8x}), {2});
-        at::sum_out(dv, at::reshape(dv_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size_8x}), {2});
-    }
-    if (head_size_og % 8 != 0) {
-        dq = dq.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-        dk = dk.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-        dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+        at::sum_out(dk, at::reshape(dk_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
+        at::sum_out(dv, at::reshape(dv_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
     }
 
     return { dq, dk, dv, softmax_d };

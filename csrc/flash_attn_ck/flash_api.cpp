@@ -5,11 +5,11 @@
 #include "flash_common.hpp"
 
 std::vector<at::Tensor>
-mha_fwd(at::Tensor &q,
-        const at::Tensor &k,
-        const at::Tensor &v,
-        c10::optional<at::Tensor> &out_,
-        c10::optional<at::Tensor> &alibi_slopes_,
+mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
+        const at::Tensor &k,                      // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
+        const at::Tensor &v,                      // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
+        c10::optional<at::Tensor> &out_,          // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
+        c10::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
         const float p_dropout,
         const float softmax_scale,
         bool is_causal,
@@ -43,7 +43,7 @@ mha_varlen_fwd(at::Tensor &q,                               // total_q x num_hea
                c10::optional<at::Generator> gen_);
 
 std::vector<at::Tensor>
-mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num_heads, x head_size_og
+mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num_heads, x multiple_of(head_size_og, 8)
         const at::Tensor &q,                      // batch_size x seqlen_q x num_heads x head_size
         const at::Tensor &k,                      // batch_size x seqlen_k x num_heads_k x head_size
         const at::Tensor &v,                      // batch_size x seqlen_k x num_heads_k x head_size
@@ -113,10 +113,10 @@ mha_fwd_kvcache(at::Tensor &q,                                     // batch_size
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.doc() = "FlashAttention";
-    m.def("fwd", &mha_fwd, "Forward pass");
-    m.def("varlen_fwd", &mha_varlen_fwd, "Forward pass (variable length)");
-    m.def("bwd", &mha_bwd, "Backward pass");
-    m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
-    m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
+        m.doc() = "FlashAttention";
+        m.def("fwd", &mha_fwd, "Forward pass");
+        m.def("varlen_fwd", &mha_varlen_fwd, "Forward pass (variable length)");
+        m.def("bwd", &mha_bwd, "Backward pass");
+        m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
+        m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
 }
