@@ -286,14 +286,20 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
 std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, const int batch_size,
     const int num_heads, const int num_heads_k, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
     const int head_size_rounded, const float p_dropout,
-    const int num_splits, cudaDeviceProp *dprops, bool use_gqa_decoding, struct c10::TensorOptions opts) {
+    const int num_splits, cudaDeviceProp *dprops, bool use_gqa_decoding, bool is_causal, struct c10::TensorOptions opts) {
     auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
-    const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+    int block_n = 128;
+    if (head_size == 128 && !is_causal) {
+       block_n = 176;
+    } else if (head_size == 256) {
+       block_n = 80;
+    }
+
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
     int gqa_ratio = num_heads / num_heads_k;
-    const int block_m = 128;
+    const int block_m = head_size == 64 ? 192 : 128 ;
     params.num_splits = num_splits;
     at::Tensor softmax_lse_accum;
     at::Tensor out_accum;
@@ -1395,7 +1401,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     at::Tensor softmax_lse_accum, out_accum;
     std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
        params, batch_size, num_heads, num_heads_k, head_size, seqlen_k, seqlen_q,
-       head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, use_gqa_decoding,  opts);
+       head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, use_gqa_decoding, is_causal,  opts);
 
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
