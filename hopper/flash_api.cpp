@@ -1302,7 +1302,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      );
     params.is_kv_cache = true;
 
-    auto tile_count_semaphore = is_causal || num_splits > 1
+    auto tile_count_semaphore = is_causal || num_splits != 1
         ? torch::zeros({1}, opts.dtype(torch::kInt32))
         : torch::empty({1}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
