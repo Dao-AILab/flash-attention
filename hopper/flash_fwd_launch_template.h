@@ -186,25 +186,25 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
       int smem_size_combine;
       if (params.num_splits <= 2) {
         kernel_combine = (void *) flash::combine_attn_seqk_parallel<FinalOutputType, ElementAccum, kHeadDim, kBlockM, 1, Is_even_K, Flash_fwd_params>;
-        smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<2>, Int<kBlockM+1>>>);
+        smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<2>, Int<kBlockM+1>>, Shape<Int<2>>>);
       } else if (params.num_splits <= 4) {
         kernel_combine = (void *) flash::combine_attn_seqk_parallel<FinalOutputType, ElementAccum, kHeadDim, kBlockM, 2, Is_even_K, Flash_fwd_params>;
-        smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<4>, Int<kBlockM+1>>>);
+        smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<4>, Int<kBlockM+1>>, Shape<Int<4>>>);
       } else if (params.num_splits <= 8) {
         kernel_combine = (void *) flash::combine_attn_seqk_parallel<FinalOutputType, ElementAccum, kHeadDim, kBlockM, 3, Is_even_K, Flash_fwd_params>;
-        smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<8>, Int<kBlockM+1>>>);
+        smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<8>, Int<kBlockM+1>>, Shape<Int<8>>>);
       } else if (params.num_splits <= 16) {
         kernel_combine = (void *) flash::combine_attn_seqk_parallel<FinalOutputType, ElementAccum, kHeadDim, kBlockM, 4, Is_even_K, Flash_fwd_params>;
-        smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<16>, Int<kBlockM+1>>>);
+        smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<16>, Int<kBlockM+1>>, Shape<Int<16>>>);
       } else if (params.num_splits <= 32) {
         kernel_combine = (void *) flash::combine_attn_seqk_parallel<FinalOutputType, ElementAccum, kHeadDim, kBlockM, 5, Is_even_K, Flash_fwd_params>;
-        smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<32>, Int<kBlockM+1>>>);
+        smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<32>, Int<kBlockM+1>>, Shape<Int<32>>>);
       } else if (params.num_splits <= 64) {
         kernel_combine = (void *) flash::combine_attn_seqk_parallel<FinalOutputType, ElementAccum, kHeadDim, kBlockM, 6, Is_even_K, Flash_fwd_params>;
-        smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<64>, Int<kBlockM+1>>>);
+        smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<64>, Int<kBlockM+1>>, Shape<Int<64>>>);
       } else if (params.num_splits <= 128) {
         kernel_combine = (void *) flash::combine_attn_seqk_parallel<FinalOutputType, ElementAccum, kHeadDim, kBlockM, 7, Is_even_K, Flash_fwd_params>;
-        smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<128>, Int<kBlockM+1>>>);
+        smem_size_combine = sizeof(flash::SharedStorageLSE<float, Shape<Int<128>, Int<kBlockM+1>>, Shape<Int<128>>>);
       } else {
         // don't support > 128 splits
         return;

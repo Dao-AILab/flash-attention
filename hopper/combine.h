@@ -4,6 +4,7 @@
 #include <cute/tensor.hpp>
 
 #include <cutlass/cutlass.h>
+#include "cutlass/layout/layout.h"
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
 
@@ -16,9 +17,10 @@ using namespace cute;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <class Element, class SmemLayout>
+template <class Element, class SmemShape, class SmemShapeMaxSplits>
 struct SharedStorageLSE {
-    cute::array_aligned<Element, cute::size_v<SmemLayout>> smem_lse;
+    cute::array_aligned<Element, cute::size_v<SmemShape>> smem_lse;
+    cute::array_aligned<bool, cute::size_v<SmemShapeMaxSplits>> smem_valid_splits;
 };
 
 // DONT use Kernel_traits here to avoid redundant compilation.
@@ -40,10 +42,11 @@ __global__ void combine_attn_seqk_parallel(Params const params) {
     // kBlockM + 1 instead of kBlockM to reduce bank conflicts.
     //__shared__ __align__(16) ElementAccum sLSE[kMaxSplits][kBlockM+1];
     extern __shared__  char smem_[];
-    using SharedStorage = SharedStorageLSE<ElementAccum, Shape<Int<kMaxSplits>, Int<kBlockM+1>>>;
+    using SharedStorage = SharedStorageLSE<ElementAccum, Shape<Int<kMaxSplits>, Int<kBlockM+1>>, Shape<Int<kMaxSplits>>>;
     SharedStorage &shared_storage =
       *reinterpret_cast<SharedStorage *>(smem_);
     Tensor sLSE = make_tensor(make_smem_ptr(shared_storage.smem_lse.data()), Shape<Int<kMaxSplits>, Int<kBlockM+1>>{});
+    Tensor sValidSplits = make_tensor(make_smem_ptr(shared_storage.smem_valid_splits.data()), Shape<Int<kMaxSplits>>{});
 
     // The thread and block index.
     const int tidx = threadIdx.x;
@@ -83,8 +86,23 @@ __global__ void combine_attn_seqk_parallel(Params const params) {
         if (row < kMaxSplits) { sLSE(row,col) = lse; }
         // if (bidx == 0 && tidx < 32) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse); }
     }
-    // if (bidx == 1 && tidx < 32) { printf("tidx = %d, row_offset_lse = %d, lse = %f\n", tidx, row_offset_lse, lse_accum(0)); }
     __syncthreads();
+
+    // Reduce along the kBlockM dimension to determine valid splits (store in SMEM)
+    // One thread per split. Know NumThreads = 128 >= NumMaxSplits
+    if (tidx < kMaxSplits) {
+        bool is_valid_split = false;
+        #pragma unroll
+        for (int col = 0; col < kBlockM; ++col) {
+            if(sLSE(tidx,col) != -INFINITY) {
+                is_valid_split = true;
+            }
+        }
+        sValidSplits(tidx) = is_valid_split;
+    }
+    __syncthreads();
+    // if (bidx == 1 && tidx < 32) { printf("tidx = %d, row_offset_lse = %d, lse = %f\n", tidx, row_offset_lse, lse_accum(0)); }
+    
     Tensor lse_accum = make_tensor<ElementAccum>(Shape<Int<kNLsePerThread>>{});
     constexpr int kRowsPerLoadTranspose = std::min(kRowsPerLoadLSE, kMaxSplits);
     // To make sure that kMaxSplits is within 1 warp: we decide how many elements within kMaxSplits
@@ -100,6 +118,7 @@ __global__ void combine_attn_seqk_parallel(Params const params) {
         const int col = tidx / kRowsPerLoadTranspose;
         //if (bidx == 0 && tidx < 128) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse_accum(l)); }
         lse_accum(l) = (row < kMaxSplits && col < kBlockM) ? sLSE(row,col) : -INFINITY;
+
     }
     //return;
 
@@ -169,22 +188,25 @@ __global__ void combine_attn_seqk_parallel(Params const params) {
     }
     // Load Oaccum in then scale and accumulate to O
     for (int split = 0; split < params.num_splits; ++split) {
-        flash::copy</*Is_even_MN=*/false, Is_even_K>(
-            gmem_tiled_copy_Oaccum, tOgOaccum, tOrOaccum, tOcOaccum, tOpOaccum, params.b * params.h * params.seqlen_q - bidx * kBlockM
-        );
-        #pragma unroll
-        for (int m = 0; m < size<1>(tOrOaccum); ++m) {
-            int row = get<0>(tOcOaccum(0, m, 0));
-            ElementAccum lse_scale = sLSE(split,row);
+        // DONT copy in Oaccum if lse(split) = -inf for all kBlockM.
+        if(sValidSplits(split)) {            
+            flash::copy</*Is_even_MN=*/false, Is_even_K>(
+                gmem_tiled_copy_Oaccum, tOgOaccum, tOrOaccum, tOcOaccum, tOpOaccum, params.b * params.h * params.seqlen_q - bidx * kBlockM
+            );
             #pragma unroll
-            for (int k = 0; k < size<2>(tOrOaccum); ++k) {
+            for (int m = 0; m < size<1>(tOrOaccum); ++m) {
+                int row = get<0>(tOcOaccum(0, m, 0));
+                ElementAccum lse_scale = sLSE(split,row);
                 #pragma unroll
-                for (int i = 0; i < size<0>(tOrOaccum); ++i) {
-                    tOrO(i, m, k) += lse_scale * tOrOaccum(i, m, k);
-                    //tOrO(i, m, k) += tOrOaccum(i, m, k);
+                for (int k = 0; k < size<2>(tOrOaccum); ++k) {
+                    #pragma unroll
+                    for (int i = 0; i < size<0>(tOrOaccum); ++i) {
+                        tOrO(i, m, k) += lse_scale * tOrOaccum(i, m, k);
+                        //tOrO(i, m, k) += tOrOaccum(i, m, k);
+                    }
                 }
+            //if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE(split, 0), sLSE(split, 1)); print_tensor(tOrOaccum); }
             }
-         //if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE(split, 0), sLSE(split, 1)); print_tensor(tOrOaccum); }
         }
         tOgOaccum.data() = tOgOaccum.data() + params.b * params.h * params.seqlen_q * params.d_rounded;
     }
