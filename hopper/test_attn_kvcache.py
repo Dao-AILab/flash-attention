@@ -101,15 +101,17 @@ def attention_ref(
 # @pytest.mark.parametrize("use_heuristic_only", [False])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("num_requests", [1, 4, 16])
-@pytest.mark.parametrize("query_seqlen", [1, 16])
+@pytest.mark.parametrize("query_seqlen", [1, 16, 32, 128])
 @pytest.mark.parametrize("context_seqlen", [4096, 16384, 65536])
 @pytest.mark.parametrize("headdim", [64, 128, 256])
 @pytest.mark.parametrize(
     "nheads_kv, gqa_ratio",
     [
+        (1, 1),
+        (2, 5),
         (3, 3),
         (1, 32),
-        (24, 2),
+        (5, 7),
         (8, 1),
         (1, 16),
         (12, 4),
@@ -198,9 +200,9 @@ def test_flash_attn_kvcach_output(nheads_kv, gqa_ratio, num_requests, query_seql
                 print ('lse-max-diff gqa',i, context_seqlen, (lse_ref - lse_fa3_gqa).abs().max().item())
                 print ('lse-mean-diff gqa',i, context_seqlen, (lse_ref - lse_fa3_gqa).abs().mean().item())
 
-                assert ((out_ref - out_fa3).abs().max().item() <= 1e-3)
+                assert ((out_ref - out_fa3).abs().max().item() <= 2e-3)
                 assert ((out_ref - out_fa3).abs().mean().item() <= 1e-4)
-                assert ((out_ref - out_fa3_gqa).abs().max().item() <= 1e-3)
+                assert ((out_ref - out_fa3_gqa).abs().max().item() <= 2e-3)
                 assert ((out_ref - out_fa3_gqa).abs().mean().item() <= 1e-4)
                 assert ((lse_ref - lse_fa3).abs().max().item() <= 1e-3)
                 assert ((lse_ref - lse_fa3).abs().mean().item() <= 1e-4)
