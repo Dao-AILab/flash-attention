@@ -199,7 +199,7 @@ def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_se
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("num_requests", [1, 4, 16])
 @pytest.mark.parametrize("query_seqlen", [1, 16, 32, 128])
-@pytest.mark.parametrize("context_seqlen", [4096, 16384, 65536])
+@pytest.mark.parametrize("context_seqlen", [4096, 16384, 65536, 65536*2])
 @pytest.mark.parametrize("headdim", [64, 128, 256])
 @pytest.mark.parametrize(
     "nheads_kv, gqa_ratio",
