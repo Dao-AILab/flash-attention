@@ -97,31 +97,37 @@ def attention_ref(
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
+@pytest.mark.parametrize("use_heuristic_only", [True])
+# @pytest.mark.parametrize("use_heuristic_only", [False])
+@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("num_requests", [1, 4, 16])
 @pytest.mark.parametrize("query_seqlen", [1, 16])
-@pytest.mark.parametrize("context_seqlen", [16384, 65536])
+@pytest.mark.parametrize("context_seqlen", [4096, 16384, 65536])
 @pytest.mark.parametrize("headdim", [64, 128, 256])
 @pytest.mark.parametrize(
     "nheads_kv, gqa_ratio",
     [
+        (3, 3),
+        (1, 32),
         (24, 2),
         (8, 1),
-        (16, 1),
-        (48, 4),
-        (16, 2),
+        (1, 16),
+        (12, 4),
+        (8, 2),
     ],
 )
-#@pytest.mark.parametrize("nheads_q", [24])
-#@pytest.mark.parametrize("nheads_kv", [4//2])
-#@pytest.mark.parametrize("num_requests", [1])
-#@pytest.mark.parametrize("query_seqlen", [1])
-#@pytest.mark.parametrize("context_seqlen", [16384])
-#@pytest.mark.parametrize("headdim", [128])
-def test_flash_attn_kvcach_output(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim):
+def test_flash_attn_kvcach_output(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, use_heuristic_only):
     device = "cuda"
     num_caches = 16
-    cache_seqlen = 65536
+    if context_seqlen <= 65536:
+        cache_seqlen = 65536
+    else:
+        cache_seqlen = context_seqlen
     nheads_q = nheads_kv * gqa_ratio
+    if use_heuristic_only:
+        max_splits = 1
+    else:
+        max_splits = 128
 
     k_cache = torch.randn(
         (num_caches, cache_seqlen, nheads_kv, headdim), device="cuda", dtype=torch.bfloat16
@@ -148,21 +154,25 @@ def test_flash_attn_kvcach_output(nheads_kv, gqa_ratio, num_requests, query_seql
                     v_cache=v_cache,
                     cache_seqlens=cache_seqlens,
                     cache_batch_idx=cache_idxs,
-                    causal=True,
+                    causal=causal,
                     num_splits=1,
                     return_softmax_lse=True,
+                    gqa_decoding=False
                 )
 
-    for i in range(1, 128):
+    # i=0 case is with num splits heuristic
+    for i in range(0, max_splits+1):
                 out_fa3, lse_fa3 = flash_attn_interface.flash_attn_with_kvcache(
                     q=q,
                     k_cache=k_cache,
                     v_cache=v_cache,
                     cache_seqlens=cache_seqlens,
                     cache_batch_idx=cache_idxs,
-                    causal=True,
+                    causal=causal,
                     num_splits=i,
                     return_softmax_lse=True,
+                    gqa_decoding=False,
+                    max_seqlen_k_hint=context_seqlen
                 )
 
                 out_fa3_gqa, lse_fa3_gqa = flash_attn_interface.flash_attn_with_kvcache(
@@ -171,10 +181,11 @@ def test_flash_attn_kvcach_output(nheads_kv, gqa_ratio, num_requests, query_seql
                     v_cache=v_cache,
                     cache_seqlens=cache_seqlens,
                     cache_batch_idx=cache_idxs,
-                    causal=True,
+                    causal=causal,
                     num_splits=i,
                     return_softmax_lse=True,
-                    gqa_decoding=True
+                    gqa_decoding=True,
+                    max_seqlen_k_hint=context_seqlen
                 )
 
                 torch.cuda.synchronize()
