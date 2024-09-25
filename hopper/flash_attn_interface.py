@@ -470,6 +470,7 @@ def flash_attn_with_kvcache(
     num_splits=0,
     return_softmax_lse=False,
     gqa_decoding=None,
+    max_seqlen_k_hint=None
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -571,9 +572,14 @@ def flash_attn_with_kvcache(
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
     if gqa_decoding is None:
-        use_gqa_decoding = True if q.shape[1] <=64 else False
+        use_gqa_decoding = True if q.shape[1] <= 64 else False
     else:
         use_gqa_decoding = gqa_decoding
+    # not in gqa/mqa setup
+    if q.shape[2] == k_cache.shape[2]:
+        use_gqa_decoding = False
+    if max_seqlen_k_hint is None:
+       max_seqlen_k_hint = k_cache.shape[1]
     out, softmax_lse = flashattn_hopper_cuda.fwd_kvcache(
         q,
         k_cache,
@@ -595,6 +601,7 @@ def flash_attn_with_kvcache(
         softcap,
         rotary_interleaved,
         num_splits,
+        max_seqlen_k_hint,
         use_gqa_decoding
     )
     return (out, softmax_lse) if return_softmax_lse else out

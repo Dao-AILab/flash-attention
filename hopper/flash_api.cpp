@@ -245,38 +245,96 @@ void set_params_dgrad(Flash_bwd_params &params,
 // batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
 // better than having 3 splits (efficiency = 0.67). However, we also don't want too many
 // splits as that would incur more HBM reads/writes.
-// So we find the best efficiency, then find the smallest number of splits that gets 85%
+// So we find the best efficiency, then find the smallest number of splits that gets 80%
 // of the best efficiency.
-inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
-    // If we have enough to almost fill the SMs, then just use 1 split
-    if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
+inline int num_splits_heuristic(int batch_nheads_mblocks, int batch_nheads, int num_SMs, int num_n_blocks,
+    int max_splits, int head_size, bool use_one_mma_wg) {
+    // Goal of the starting threshold is to determine whether to split or not.
+    // Empirically, the efficiency threshold can be much lower than 80% depending on num_n_blocks.
+    int num_m_blocks = batch_nheads_mblocks/batch_nheads;
+    float start_threshold;
+    float num_n_blocksf = float(num_n_blocks);
+    if (head_size == 128) {
+        if (std::log2f(num_n_blocksf) <= 4) { // 2048 -- .25
+            start_threshold = .20f + (std::log2f(num_n_blocksf) - 3) * .05f;
+        } else if (std::log2f(num_n_blocksf) <= 5) { // 4096 -- .25
+            start_threshold = .25f;
+        } else if (std::log2f(num_n_blocksf) <= 6) { // 8192 -- .36
+            start_threshold = .28f + (std::log2f(num_n_blocksf) - 5) * .08f;
+        } else if (std::log2f(num_n_blocksf) <= 7) { // 16K -- .42
+            start_threshold = .36f + (std::log2f(num_n_blocksf) - 6) * .06f;
+        } else {
+            // Just split freely
+            start_threshold = .8f;
+        }
+        if (num_m_blocks > 1 && start_threshold < .5f)
+            start_threshold += .05f * (std::log2f(num_n_blocksf) - 2);
+    } else if (head_size == 256) {
+        // TODO for hdim 256
+        if (num_n_blocks <= 40) {
+            start_threshold = .24f;
+        } else if (std::log2f(num_n_blocksf) <= 8) {
+            start_threshold = .33f + std::max(0.f, (std::log2f(num_n_blocksf) - std::log2f(50)) * 0.02971f);
+        } else {
+            // Just split freely
+            start_threshold = .8f;
+        }
+    } else {
+        // TODO for hdim 64
+        start_threshold = .8f;
+    }
+
+    float first_wave = float(batch_nheads_mblocks) / num_SMs;
+    // printf("Start threshold and wave = %f, %f.\n", start_threshold, first_wave);
+    // Only use start_threshold if initial work doesn't exceed one wave
+    if (first_wave/ceil(first_wave) > start_threshold && first_wave <= 1.f ||
+        first_wave/ceil(first_wave) > .8f) {
+        return 1;
+    }
+    // if (first_wave_batch_nheads > start_threshold) { return 1; }
+    // if (first_wave_batch_nheads > start_threshold || first_wave > .8f) { return 1; }
+    // if (float(batch_nheads)/num_SMs > start_threshold) { return 1; }
+
+    // If num_n_blocks is too small, use 1 split
+    // For example, we never split for hdim = 128 and seqlen_k = 512,
+    // or for hdim = 128, seqlen_k = 1024, and one MMA warpgroup.
+    if (num_n_blocks < 8 || (use_one_mma_wg && num_n_blocks < 10)) { return 1; }
+
     max_splits = std::min({max_splits, num_SMs, num_n_blocks});
     float max_efficiency = 0.f;
     std::vector<float> efficiency;
     efficiency.reserve(max_splits);
-    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
+    
+    // NOTE: disable split eligibility check for FA3 since we have dynamic tile scheduler
+    // for exiting splits with no work early, and check leads to efficiency quantization issues.
+    // Comment from FA2:
     // Some splits are not eligible. For example, if we have 64 blocks and choose 11 splits,
     // we'll have 6 * 10 + 4 blocks. If we choose 12 splits, we'll have 6 * 11 + (-2) blocks
     // (i.e. it's 11 splits anyway).
     // So we check if the number of blocks per split is the same as the previous num_splits.
-    auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
-        return num_splits == 1 || ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1);
-    };
+    // auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
+    // auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
+    //     return num_splits == 1 || ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1);
+    // };
     for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        if (!is_split_eligible(num_splits)) {
-            efficiency.push_back(0.f);
-        } else {
+        // if (!is_split_eligible(num_splits)) {
+        //     efficiency.push_back(0.f);
+        // } else {
             float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
             float eff = n_waves / ceil(n_waves);
-            // printf("num_splits = %d, eff = %f\n", num_splits, eff);
+            // printf("num_splits = %d, n_waves = %f, ceil(n_waves) = %f,  eff = %f\n", num_splits, n_waves, ceil(n_waves), eff);
             if (eff > max_efficiency) { max_efficiency = eff; }
             efficiency.push_back(eff);
-        }
+        // }
     }
+    // Correct for excessive splitting with e.g. 1 bsz*nheads*mblocks
+    // Empirically, efficiency threshold in these cases is about 40% for 64K seqlen_k
+    float threshold = std::min(0.3f + batch_nheads_mblocks * 0.1f, 0.8f) * max_efficiency;
+    // printf("Max efficiency = %f. Threshold = %f.\n", max_efficiency, threshold);
     for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        if (!is_split_eligible(num_splits)) { continue; }
-        if (efficiency[num_splits - 1] >= 0.50 * max_efficiency) {
-            // printf("num_splits chosen = %d\n", num_splits);
+        // if (!is_split_eligible(num_splits)) { continue; }
+        if (efficiency[num_splits - 1] > threshold) {
+            // printf("num_splits chosen = %d, threshold = %f, efficiency = %f.\n", num_splits, threshold, efficiency[num_splits - 1]);
             return num_splits;
         }
     }
@@ -289,26 +347,33 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     const int num_splits, cudaDeviceProp *dprops, bool use_gqa_decoding, bool is_causal, struct c10::TensorOptions opts) {
     auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
 
-    // This needs to match with run_mha_fwd_splitkv_dispatch
-    int block_n = 128;
-    if (head_size == 128 && !is_causal) {
-       block_n = 176;
-    } else if (head_size == 256) {
-       block_n = 80;
-    }
-
-    const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
-    int gqa_ratio = num_heads / num_heads_k;
-    const int block_m = head_size == 64 ? 192 : 128 ;
     params.num_splits = num_splits;
     at::Tensor softmax_lse_accum;
     at::Tensor out_accum;
 
     if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
         if (num_splits < 1) {
-	    int batch_nheads_mblocks = use_gqa_decoding ? ceildiv(max_seqlen_q, block_m / gqa_ratio) * batch_size * num_heads_k : ceildiv(max_seqlen_q, block_m) * batch_size * num_heads;
-            params.num_splits = num_splits_heuristic(batch_nheads_mblocks, dprops->multiProcessorCount, num_n_blocks, 128);
-	}
+            const int gqa_ratio = num_heads / num_heads_k;
+            const int block_h = 1 << static_cast<int>(std::ceil(std::log2(std::clamp(gqa_ratio, 1, 32))));
+            const int block_m = head_size == 64 ? 192 : 128;
+            const bool use_one_mma_wg = max_seqlen_q <= 64/block_h;
+            
+            int block_n = 128;
+            if (head_size == 128 && !is_causal) {
+                block_n = 176;
+            } else if (head_size == 256) {
+                block_n = use_one_mma_wg ? 96 : 80;
+            }
+            const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+            
+	        int batch_nheads = use_gqa_decoding ? batch_size * num_heads_k : batch_size * num_heads;
+            int batch_nheads_mblocks = use_gqa_decoding
+                ? ceildiv(max_seqlen_q, block_m / block_h) * batch_nheads
+                : ceildiv(max_seqlen_q, block_m) * batch_nheads;
+            params.num_splits = num_splits_heuristic(batch_nheads_mblocks, batch_nheads,
+                dprops->multiProcessorCount, num_n_blocks, 128, head_size, use_one_mma_wg);
+            // printf("Num splits heuristic = %d.\n", params.num_splits);
+	    }
         if (params.num_splits > 1) {
             softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
             out_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
@@ -1159,6 +1224,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 const float softcap,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
                 int num_splits,
+                int max_seqlen_k_hint,
                 bool use_gqa_decoding
                 ) {
 
@@ -1302,11 +1368,6 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      );
     params.is_kv_cache = true;
 
-    auto tile_count_semaphore = is_causal || num_splits != 1
-        ? torch::zeros({1}, opts.dtype(torch::kInt32))
-        : torch::empty({1}, opts.dtype(torch::kInt32));
-    params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
-
     params.use_gqa_decoding = use_gqa_decoding;
 
     at::Tensor k, v, k_padded, v_padded;
@@ -1400,8 +1461,13 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
     std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
-       params, batch_size, num_heads, num_heads_k, head_size, seqlen_k, seqlen_q,
-       head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, use_gqa_decoding, is_causal,  opts);
+       params, batch_size, num_heads, num_heads_k, head_size, max_seqlen_k_hint, seqlen_q,
+       head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, use_gqa_decoding, is_causal, opts);
+    
+    auto tile_count_semaphore = is_causal || params.num_splits != 1
+        ? torch::zeros({1}, opts.dtype(torch::kInt32))
+        : torch::empty({1}, opts.dtype(torch::kInt32));
+    params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
 
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
@@ -1433,6 +1499,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
+
     return {out, softmax_lse};
 }
 
