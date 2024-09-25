@@ -7,6 +7,41 @@ import itertools
 import math
 import time
 
+def construct_local_mask(
+    seqlen_q,
+    seqlen_k,
+    window_size=(-1, -1),  # -1 means infinite window size
+    query_padding_mask=None,
+    key_padding_mask=None,
+    device=None,
+    key_leftpad=None,
+):
+    row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")
+    col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
+    if key_leftpad is not None:
+        key_leftpad = rearrange(key_leftpad, "b -> b 1 1 1")
+        col_idx = repeat(col_idx, "s -> b 1 1 s", b=key_leftpad.shape[0])
+        col_idx = torch.where(col_idx >= key_leftpad, col_idx - key_leftpad, 2**32)
+    sk = (
+        seqlen_k
+        if key_padding_mask is None
+        else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
+    )
+    sq = (
+        seqlen_q
+        if query_padding_mask is None
+        else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
+    )
+    if window_size[0] < 0:
+        return col_idx > row_idx + sk - sq + window_size[1]
+    else:
+        sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
+        return torch.logical_or(
+            col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk),
+            col_idx < row_idx + sk - sq - window_size[0],
+        )
+
+
 def attention_ref(
     q,
     k,
@@ -97,6 +132,68 @@ def attention_ref(
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
+# @pytest.mark.parametrize("use_heuristic_only", [False])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("num_requests", [1])
+@pytest.mark.parametrize("query_seqlen", [1, 16])
+@pytest.mark.parametrize("context_seqlen", [1024])
+@pytest.mark.parametrize("headdim", [128])
+@pytest.mark.parametrize(
+    "nheads_kv, gqa_ratio",
+    [
+        (1, 1),
+        (2, 5),
+        (3, 3),
+        (1, 32),
+        (5, 7),
+        (8, 1),
+        (1, 16),
+        (12, 4),
+        (8, 2),
+    ],
+)
+def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal):
+    device = "cuda"
+    num_caches = num_requests
+    cache_seqlen = context_seqlen
+    nheads_q = nheads_kv * gqa_ratio
+
+    k_cache = torch.randn(
+        (num_caches, cache_seqlen, nheads_kv, headdim), device="cuda", dtype=torch.bfloat16
+    )
+    v_cache = torch.randn(
+        (num_caches, cache_seqlen, nheads_kv, headdim), device="cuda", dtype=torch.bfloat16
+    )
+    # print(f"***{model_name}***")
+    q = torch.randn((num_requests, query_seqlen, nheads_q, headdim), device="cuda", dtype=torch.bfloat16)
+    cache_idxs = torch.randperm(num_caches, dtype=torch.int32, device="cuda")[:num_requests]
+    cache_seqlens = torch.tensor([context_seqlen] * num_requests, dtype=torch.int32, device="cuda")
+    torch.cuda.synchronize()
+
+    out_ref, _ = attention_ref(
+        q,
+        k_cache,
+        v_cache,
+        causal=causal,
+    )
+
+    out_fa3, lse_fa3 = flash_attn_interface.flash_attn_with_kvcache(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    cache_seqlens=cache_seqlens,
+                    cache_batch_idx=cache_idxs,
+                    causal=causal,
+                    num_splits=1,
+                    return_softmax_lse=True,
+                    gqa_decoding=False
+                )
+
+
+    torch.cuda.synchronize()
+    assert ((out_ref - out_fa3).abs().max().item() <= 2e-3)
+    assert ((out_ref - out_fa3).abs().mean().item() <= 1e-4)
+
 @pytest.mark.parametrize("use_heuristic_only", [True])
 # @pytest.mark.parametrize("use_heuristic_only", [False])
 @pytest.mark.parametrize("causal", [True, False])
@@ -118,7 +215,7 @@ def attention_ref(
         (8, 2),
     ],
 )
-def test_flash_attn_kvcach_output(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, use_heuristic_only):
+def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, use_heuristic_only):
     device = "cuda"
     num_caches = 16
     if context_seqlen <= 65536:
