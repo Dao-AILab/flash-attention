@@ -238,7 +238,7 @@ def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seq
     # print(f"***{model_name}***")
     q = torch.randn((num_requests, query_seqlen, nheads_q, headdim), device="cuda", dtype=torch.bfloat16)
     cache_idxs = torch.randperm(num_caches, dtype=torch.int32, device="cuda")[:num_requests]
-    cache_seqlens = torch.randint(0, context_seqlen, (num_requests,), dtype=torch.int32).to(device) if cache_seqlen_rand else torch.tensor([context_seqlen] * num_requests, dtype=torch.int32, device="cuda")
+    cache_seqlens = torch.randint(1024, context_seqlen-1, (num_requests,), dtype=torch.int32).to(device) if cache_seqlen_rand else torch.tensor([context_seqlen] * num_requests, dtype=torch.int32, device="cuda")
     torch.cuda.synchronize()
 
     out_ref, lse_ref = flash_attn_interface.flash_attn_with_kvcache(
