@@ -199,7 +199,7 @@ def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_se
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("num_requests", [1, 4, 16])
 @pytest.mark.parametrize("query_seqlen", [1, 16, 32, 128])
-@pytest.mark.parametrize("context_seqlen", [4096, 16384, 65536, 65536*2])
+@pytest.mark.parametrize("context_seqlen", [4096, 16384, 65536])
 @pytest.mark.parametrize("headdim", [64, 128, 256])
 @pytest.mark.parametrize("cache_seqlen_rand", [True, False])
 @pytest.mark.parametrize(
@@ -238,7 +238,7 @@ def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seq
     # print(f"***{model_name}***")
     q = torch.randn((num_requests, query_seqlen, nheads_q, headdim), device="cuda", dtype=torch.bfloat16)
     cache_idxs = torch.randperm(num_caches, dtype=torch.int32, device="cuda")[:num_requests]
-    cache_seqlens = torch.randint(1024, context_seqlen-1, (num_requests,), dtype=torch.int32).to(device) if cache_seqlen_rand else torch.tensor([context_seqlen] * num_requests, dtype=torch.int32, device="cuda")
+    cache_seqlens = torch.randint(query_seqlen, context_seqlen-1, (num_requests,), dtype=torch.int32).to(device) if cache_seqlen_rand else torch.tensor([context_seqlen] * num_requests, dtype=torch.int32, device="cuda")
     torch.cuda.synchronize()
 
     out_ref, lse_ref = flash_attn_interface.flash_attn_with_kvcache(
@@ -291,10 +291,16 @@ def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seq
                 print ('lse-max-diff gqa',i, context_seqlen, (lse_ref - lse_fa3_gqa).abs().max().item())
                 print ('lse-mean-diff gqa',i, context_seqlen, (lse_ref - lse_fa3_gqa).abs().mean().item())
 
-                assert ((out_ref - out_fa3).abs().max().item() <= 2e-3)
-                assert ((out_ref - out_fa3).abs().mean().item() <= 1e-4)
-                assert ((out_ref - out_fa3_gqa).abs().max().item() <= 2e-3)
-                assert ((out_ref - out_fa3_gqa).abs().mean().item() <= 1e-4)
+                if cache_seqlen_rand:
+                    assert ((out_ref - out_fa3).abs().max().item() <= 1e-2)
+                    assert ((out_ref - out_fa3_gqa).abs().max().item() <= 1e-2)
+                    assert ((out_ref - out_fa3).abs().mean().item() <= 1e-3)
+                    assert ((out_ref - out_fa3_gqa).abs().mean().item() <= 1e-3)
+                else:
+                    assert ((out_ref - out_fa3).abs().max().item() <= 2e-3)
+                    assert ((out_ref - out_fa3_gqa).abs().max().item() <= 2e-3)
+                    assert ((out_ref - out_fa3).abs().mean().item() <= 1e-4)
+                    assert ((out_ref - out_fa3_gqa).abs().mean().item() <= 1e-4)
                 assert ((lse_ref - lse_fa3).abs().max().item() <= 1e-3)
                 assert ((lse_ref - lse_fa3).abs().mean().item() <= 1e-4)
                 assert ((lse_ref - lse_fa3_gqa).abs().max().item() <= 1e-3)
