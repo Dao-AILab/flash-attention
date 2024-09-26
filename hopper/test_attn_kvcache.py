@@ -201,6 +201,7 @@ def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_se
 @pytest.mark.parametrize("query_seqlen", [1, 16, 32, 128])
 @pytest.mark.parametrize("context_seqlen", [4096, 16384, 65536, 65536*2])
 @pytest.mark.parametrize("headdim", [64, 128, 256])
+@pytest.mark.parametrize("cache_seqlen_rand", [True, False])
 @pytest.mark.parametrize(
     "nheads_kv, gqa_ratio",
     [
@@ -215,7 +216,7 @@ def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_se
         (8, 2),
     ],
 )
-def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, use_heuristic_only):
+def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, use_heuristic_only, cache_seqlen_rand):
     device = "cuda"
     num_caches = 16
     if context_seqlen <= 65536:
@@ -237,15 +238,8 @@ def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seq
     # print(f"***{model_name}***")
     q = torch.randn((num_requests, query_seqlen, nheads_q, headdim), device="cuda", dtype=torch.bfloat16)
     cache_idxs = torch.randperm(num_caches, dtype=torch.int32, device="cuda")[:num_requests]
-    cache_seqlens = torch.tensor([context_seqlen] * num_requests, dtype=torch.int32, device="cuda")
+    cache_seqlens = torch.randint(0, context_seqlen, (num_requests,), dtype=torch.int32).to(device) if cache_seqlen_rand else torch.tensor([context_seqlen] * num_requests, dtype=torch.int32, device="cuda")
     torch.cuda.synchronize()
-
-    #out_ref, = attention_ref(
-    #    q,
-    #    k_cache,
-    #    v_cache,
-    #    causal=True,
-    #)
 
     out_ref, lse_ref = flash_attn_interface.flash_attn_with_kvcache(
                     q=q,
