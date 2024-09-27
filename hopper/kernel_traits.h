@@ -59,12 +59,14 @@ struct SharedStorageQKVOVt {
 
 // If Share_Q_K_smem is true, that forces Is_Q_in_regs to be true
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, int kStages_, bool Is_Q_in_regs_=false,
-         int kClusterM_ = 1, typename elem_type=cutlass::half_t>
+         int kClusterM_ = 1, typename elem_type=cutlass::half_t, bool kUseDocMasking_=false>
 struct Flash_fwd_kernel_traits {
     using Element = elem_type;
     using ElementAccum = float;
     using OutputType = elem_type;
     using index_t = int64_t;
+
+    static constexpr bool kUseDocMasking = kUseDocMasking_;
 
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;
@@ -141,13 +143,15 @@ struct Flash_fwd_kernel_traits {
 
 // Traits struct for fp8 kernel with in-kernel transpose
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, int kStages_, bool Is_Q_in_regs_=false,
-         int kClusterM_ = 1, typename elem_type=cutlass::float_e4m3_t>
+         int kClusterM_ = 1, typename elem_type=cutlass::float_e4m3_t, bool kUseDocMasking_ = false>
 struct Flash_fwd_kernel_traits_fp8 {
     using Element = elem_type;
     static_assert(cutlass::sizeof_bits_v<Element> == 8);
     using ElementAccum = float;
     using OutputType = cutlass::half_t;
     using index_t = int64_t;      
+
+    static constexpr bool kUseDocMasking = kUseDocMasking_;
 
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;

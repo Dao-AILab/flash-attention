@@ -21,6 +21,8 @@ public:
   int *seq_used = nullptr;
   // seq len of the current batch.
   int actual_seq_len = -1;
+  // max seq len per batch.
+  int max_seq_len = -1;
 
   // Whether this is for fixed-seq-len or var-seq-len.
   static constexpr bool kUseVarSeqLen = UseVarSeqLen;
@@ -53,7 +55,8 @@ public:
 
   CUTLASS_HOST SeqLenTraits(
       int sum_s, int max_seq_len, int *cu_seq_len = nullptr, int *seq_used = nullptr): 
-      sum_s(sum_s), cu_seq_len(cu_seq_len), seq_used(seq_used), actual_seq_len(max_seq_len) {}
+      sum_s(sum_s), cu_seq_len(cu_seq_len), seq_used(seq_used), 
+      actual_seq_len(max_seq_len), max_seq_len(max_seq_len) {}
 
   // Returns the layout of a tensor in MKHB format in global memory.
   // padded: only useful for var-seq-len for dq_accum and softmax_d.
@@ -75,7 +78,7 @@ public:
                        make_stride(int64_t(h * m), int64_t(m), cute::_1()));
   }
 
-  CUTLASS_DEVICE void init(int bidb) {}
+  CUTLASS_DEVICE bool init(int bidb) {return true;}
 
   template <typename MTensor, typename Shape>
   CUTLASS_DEVICE auto get_local_tile_tensor(
@@ -124,9 +127,10 @@ CUTLASS_HOST_DEVICE auto VarSeqLenTraits::get_lse_gmem_layout(
 }
 
 template <>
-CUTLASS_DEVICE void VarSeqLenTraits::init(int bidb) {
+CUTLASS_DEVICE bool VarSeqLenTraits::init(int bidb) {
   actual_seq_len = 
       seq_used ? seq_used[bidb] : (cu_seq_len[bidb + 1] - cu_seq_len[bidb]);
+  return cu_seq_len[bidb] < max_seq_len;
 }
 
 template <>

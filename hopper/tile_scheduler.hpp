@@ -19,7 +19,7 @@ public:
 
     // Host side kernel arguments
     struct Arguments {
-        int const num_blocks_m, num_head, num_batch;
+        int const num_blocks_m, num_head, num_batch, max_num_docs_per_batch;
         int* const tile_count_semaphore = nullptr;
     };
 
@@ -54,6 +54,9 @@ public:
             return {M_idx, H_idx, B_idx};
         }
 
+        CUTLASS_DEVICE
+        void
+        move_to_next_batch() {}
     };
 
     CUTLASS_DEVICE
@@ -61,7 +64,7 @@ public:
 
     CUTLASS_DEVICE
     WorkTileInfo
-    get_initial_work() const {
+    get_initial_work(Params const& params) const {
         return {int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), true};
     }
 
@@ -94,19 +97,20 @@ public:
 
     // Host side kernel arguments
     struct Arguments {
-        int const num_blocks_m, num_head, num_batch;
+        int const num_blocks_m, num_head, num_batch, max_num_docs_per_batch;
         int* const tile_count_semaphore = nullptr;
     };
 
     // Device side kernel params
     struct Params {
-        int total_blocks;
+        int total_blocks, max_num_docs_per_batch;
         cutlass::FastDivmod m_block_divmod, head_divmod;
     };
 
     static Params
     to_underlying_arguments(Arguments const& args) {
         return {args.num_blocks_m * args.num_head * args.num_batch,
+                args.max_num_docs_per_batch,
                 cutlass::FastDivmod(args.num_blocks_m), cutlass::FastDivmod(args.num_head)};
     }
 
@@ -132,6 +136,9 @@ public:
             return {m_block, bidh, bidb};
         }
 
+        CUTLASS_DEVICE
+        void
+        move_to_next_batch() {}
     };
 
     CUTLASS_DEVICE
@@ -139,7 +146,7 @@ public:
 
     CUTLASS_DEVICE
     WorkTileInfo
-    get_initial_work() const {
+    get_initial_work(Params const& params) const {
         return {int(blockIdx.x)};
     }
 
@@ -164,6 +171,103 @@ public:
 
 };
 
+class DocMaskingStaticPersistentTileScheduler {
+
+public:
+    // Host side kernel arguments
+    struct Arguments {
+        int const num_blocks_m, num_head, num_batch, max_num_docs_per_batch;
+        int* const tile_count_semaphore = nullptr;
+    };
+
+    // Device side kernel params
+    struct Params {
+        int total_blocks, block_size;
+        cutlass::FastDivmod m_block_divmod, head_divmod, doc_divmod;
+    };
+
+    static Params
+    to_underlying_arguments(Arguments const& args) {
+        return {args.num_blocks_m * args.num_head * args.num_batch,
+                args.max_num_docs_per_batch * args.num_head * args.num_blocks_m,
+                cutlass::FastDivmod(args.num_blocks_m), cutlass::FastDivmod(args.num_head),
+                cutlass::FastDivmod(args.max_num_docs_per_batch)};
+    }
+
+    static dim3
+    get_grid_dim(Arguments const& args, int num_sm) {
+        return {uint32_t(num_sm)};
+    }
+
+    struct WorkTileInfo {
+        int tile_idx;
+        int m_block;
+        int bidh;
+        int bidb;
+        bool next_batch = false;
+
+        CUTLASS_DEVICE
+        WorkTileInfo(int tile_idx_, Params const& params) : tile_idx(tile_idx_) { 
+            bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(m_block, tile_idx));
+        }
+
+        CUTLASS_DEVICE
+        bool
+        is_valid(Params const& params) const {
+            return tile_idx < params.total_blocks;
+        }
+
+        CUTLASS_DEVICE
+        cute::tuple<int32_t, int32_t, int32_t>
+        get_block_coord(Params const& params) const {
+            return {m_block, bidh, bidb};
+        }
+
+        CUTLASS_DEVICE
+        void
+        move_to_next_batch() {
+            next_batch = true;
+        }
+
+    };
+
+    CUTLASS_DEVICE
+    DocMaskingStaticPersistentTileScheduler(int* tile_count_smem_) {};
+
+    CUTLASS_DEVICE
+    WorkTileInfo
+    get_initial_work(Params const& params) const {
+        return {int(blockIdx.x), params};
+    }
+
+    CUTLASS_DEVICE
+    void
+    init_consumer() const {}
+
+    CUTLASS_DEVICE
+    void
+    prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {}
+
+    CUTLASS_DEVICE
+    void
+    broadcast_next_work(WorkTileInfo& current_work) const {}
+
+    template<bool IsProducer=false>
+    CUTLASS_DEVICE
+    WorkTileInfo
+    get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+        if (current_work.next_batch) {
+            int min_next_tile_idx = (params.doc_divmod.div(current_work.bidb) + 1) * params.block_size;
+            int next_tile_idx = current_work.tile_idx + 
+                (min_next_tile_idx - current_work.tile_idx + int(gridDim.x) - 1) / 
+                int(gridDim.x) * int(gridDim.x);
+            return {next_tile_idx, params};
+        } else {
+            return {current_work.tile_idx + int(gridDim.x), params};
+        }
+    }
+};
+
 template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads = cutlass::NumThreadsPerWarp>
 class DynamicPersistentTileScheduler {
 
@@ -174,7 +278,7 @@ public:
 
     // Host side kernel arguments
     struct Arguments {
-        int const num_blocks_m, num_head, num_batch;
+        int const num_blocks_m, num_head, num_batch, max_num_docs_per_batch;
         int* const tile_count_semaphore;
     };
 
@@ -214,6 +318,9 @@ public:
             return {m_block, bidh, bidb};
         }
 
+        CUTLASS_DEVICE
+        void
+        move_to_next_batch() {}
     };
 
     CUTLASS_DEVICE
@@ -221,7 +328,7 @@ public:
 
     CUTLASS_DEVICE
     WorkTileInfo
-    get_initial_work() const {
+    get_initial_work(Params const& params) const {
         return {int(blockIdx.x)};
     }
 

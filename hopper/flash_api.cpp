@@ -45,7 +45,8 @@ void set_params_fprop(Flash_fwd_params &params,
                       int window_size_left,
                       int window_size_right,
                       bool seqlenq_ngroups_swapped=false,
-                      bool unpadded_lse=false) {
+                      bool unpadded_lse=false,
+                      bool optimize_for_doc_masking=false) {
 
     // Reset the parameters
     params = {};
@@ -154,6 +155,7 @@ void set_params_fprop(Flash_fwd_params &params,
     #endif
 
     params.unpadded_lse = unpadded_lse;
+    params.optimize_for_doc_masking = optimize_for_doc_masking;
 }
 
 void set_params_dgrad(Flash_bwd_params &params,
@@ -189,7 +191,10 @@ void set_params_dgrad(Flash_bwd_params &params,
                       float softmax_scale,
                       int window_size_left,
                       int window_size_right,
-                      bool deterministic) {
+                      bool deterministic,
+                      bool seqlenq_ngroups_swapped=false,
+                      bool unpadded_lse=false,
+                      bool optimize_for_doc_masking=false) {
 
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
@@ -203,7 +208,10 @@ void set_params_dgrad(Flash_bwd_params &params,
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     seqlenq_ngroups_swapped,
+                     unpadded_lse,
+                     optimize_for_doc_masking);
 
     // Set the pointers and strides.
     params.do_ptr = dout.data_ptr();
@@ -448,7 +456,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                const float softmax_scale,
                bool is_causal,
                int window_size_left,
-               int window_size_right) {
+               int window_size_right,
+               bool optimize_for_doc_masking) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
@@ -567,7 +576,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      window_size_left,
                      window_size_right,
                      /*seqlenq_ngroups_swapped=*/false,
-                     /*unpadded_lse=*/true);
+                     /*unpadded_lse=*/true,
+                     /*optimize_for_doc_masking=*/optimize_for_doc_masking);
     params.total_q = total_q;
     params.total_k = total_k;
 
@@ -823,7 +833,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                const bool is_causal,
                int window_size_left,
                int window_size_right,
-               const bool deterministic) {
+               const bool deterministic,
+               const bool optimize_for_doc_masking) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -989,7 +1000,10 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                      softmax_scale,
                      /*window_size_left=*/window_size_left,
                      /*window_size_right=*/window_size_right,
-                     deterministic);
+                     deterministic,
+                     /*seqlenq_ngroups_swapped=*/false,
+                     /*unpadded_lse=*/true,
+                     optimize_for_doc_masking);
     params.total_q = total_q;
     params.total_k = total_k;
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();

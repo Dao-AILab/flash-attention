@@ -110,15 +110,18 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             int work_idx = 0;
 
             TileScheduler scheduler(&shared_storage.tile_count_semaphore);
-            for (auto work_tile_info = scheduler.get_initial_work();
+            for (auto work_tile_info = scheduler.get_initial_work(scheduler_params);
                  work_tile_info.is_valid(scheduler_params);
                  work_tile_info = scheduler.template get_next_work</*IsProducer=*/true>(scheduler_params, work_tile_info)) {
                 auto block_coord = work_tile_info.get_block_coord(scheduler_params);
                 auto [m_block, bidh, bidb] = block_coord;
 
-                seqlen_traits_q.init(bidb);
+                bool within_max_seqlen = seqlen_traits_q.init(bidb);
                 seqlen_traits_k.init(bidb);
                 if (m_block * kBlockM >= seqlen_traits_q.actual_seq_len) {
+                    if (!within_max_seqlen) {
+                        work_tile_info.move_to_next_batch();
+                    }
                     continue;
                 }
                 const int n_block_max = collective_mainloop.get_n_block_max(
@@ -154,7 +157,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
         int work_idx = 0;
         CUTLASS_PRAGMA_NO_UNROLL
-        for (auto work_tile_info = scheduler.get_initial_work();
+        for (auto work_tile_info = scheduler.get_initial_work(scheduler_params);
              work_tile_info.is_valid(scheduler_params);
              work_tile_info = scheduler.template get_next_work</*IsProducer=*/false>(scheduler_params, work_tile_info)) {
             // Attention output (GEMM-II) accumulator.
@@ -164,9 +167,12 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, bidh, bidb] = block_coord;
 
-            seqlen_traits_q.init(bidb);
+            bool within_max_seqlen = seqlen_traits_q.init(bidb);
             seqlen_traits_k.init(bidb);
             if (m_block * kBlockM >= seqlen_traits_q.actual_seq_len) {
+                if (!within_max_seqlen) {
+                    work_tile_info.move_to_next_batch();
+                }
                 continue;
             }
             const int n_block_max = collective_mainloop.get_n_block_max(
@@ -296,7 +302,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
         int work_idx = 0;
 
         TileScheduler scheduler(&shared_storage.tile_count_semaphore);
-        for (auto work_tile_info = scheduler.get_initial_work();
+        for (auto work_tile_info = scheduler.get_initial_work(scheduler_params);
                 work_tile_info.is_valid(scheduler_params);
                 work_tile_info = scheduler.template get_next_work</*IsProducer=*/true>(scheduler_params, work_tile_info)) {
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
@@ -345,7 +351,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
         int work_idx = 0;
         CUTLASS_PRAGMA_NO_UNROLL
-        for (auto work_tile_info = scheduler.get_initial_work();
+        for (auto work_tile_info = scheduler.get_initial_work(scheduler_params);
              work_tile_info.is_valid(scheduler_params);
              work_tile_info = scheduler.template get_next_work</*IsProducer=*/false>(scheduler_params, work_tile_info)) {
             // Attention output (GEMM-II) accumulator.

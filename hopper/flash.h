@@ -137,6 +137,9 @@ struct Flash_fwd_params : public Qkv_params {
     float * __restrict__ descale_q_ptr;
     float * __restrict__ descale_k_ptr;
     float * __restrict__ descale_v_ptr;
+
+    // Whether to optimize for document masking.
+    bool optimize_for_doc_masking;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

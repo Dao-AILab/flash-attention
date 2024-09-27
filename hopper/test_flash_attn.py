@@ -405,3 +405,113 @@ def test_flash_attn_varlen_output(
         assert (dq - dq_ref).abs().max().item() < 1e-4 or (dq - dq_ref).abs().max().item() <= 3 * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() < 1e-4 or (dk - dk_ref).abs().max().item() <= 3 * (dk_pt - dk_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() < 1e-4 or (dv - dv_ref).abs().max().item() <= 3 * (dv_pt - dv_ref).abs().max().item()
+
+
+def test_doc_mask():
+    import numpy as np
+
+    query = torch.randn(8192, 4, 64, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(8192, 4, 64, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn(8192, 4, 64, device="cuda", dtype=torch.bfloat16)
+    p = 0
+    cu_seqlens_q = torch.tensor(
+        [0, 1177, 2579, 3414, 3899, 4202, 4585, 5283, 5477, 5660, 7056, 7691, 8192],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, 1177, 2579, 3414, 3899, 4202, 4585, 5283, 5477, 5660, 7056, 7691, 8192],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    max_seqlen_q = 1402
+    max_seqlen_k = 1402
+
+    cu_seqlens_q_max = torch.full(
+        (8192,),
+        8192,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cu_seqlens_k_max = torch.full(
+        (8192,),
+        8192,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cu_seqlens_q_max[: cu_seqlens_q.numel()] = cu_seqlens_q
+    cu_seqlens_k_max[: cu_seqlens_k.numel()] = cu_seqlens_k
+
+    ncu_out = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        cu_seqlens_q_max,
+        cu_seqlens_k_max,
+        8192,
+        8192,
+    )
+    # return
+ 
+    times = []
+    for i in range(100):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        out0 = flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+        )
+        end.record()
+        torch.cuda.synchronize()
+        if i > 3:
+            times.append(start.elapsed_time(end))
+    print(np.mean(times))
+
+    times = []
+    for i in range(100):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        out1 = flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            8192,
+            8192,
+        )
+        end.record()
+        torch.cuda.synchronize()
+        if i > 3:
+            times.append(start.elapsed_time(end))
+    print(np.mean(times))
+ 
+    times = []
+    for i in range(100):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        out2 = flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_seqlens_q_max,
+            cu_seqlens_k_max,
+            8192,
+            8192,
+            optimize_for_doc_masking=True,
+        )
+        end.record()
+        torch.cuda.synchronize()
+        if i > 3:
+            times.append(start.elapsed_time(end))
+    print(np.mean(times))
+    print(torch.allclose(out0[0], out1[0]))
+    print(torch.allclose(out1[0], out2[0]))
