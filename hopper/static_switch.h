@@ -78,6 +78,25 @@
     }                                                                          \
   }()
 
+#define SEQLEN_SWITCH_FWD(VAR_SEQ_LEN_Q, SEQ_USED_K, NAME_Q, NAME_K, ...)      \
+  [&] {                                                                        \
+    bool useVarSeqLenQ = VAR_SEQ_LEN_Q;                                        \
+    bool useSeqUsedK = SEQ_USED_K;                                             \
+    if (useVarSeqLenQ) {                                                       \
+      using NAME_Q = flash::VarSeqLenTraits;                                   \
+      using NAME_K = flash::VarSeqLenTraits;                                   \
+      return __VA_ARGS__();                                                    \
+    } else if (useSeqUsedK) {                                                  \
+      using NAME_Q = flash::FixedSeqLenTraits;                                 \
+      using NAME_K = flash::FixedSeqLenTraitsDynamic;                          \
+      return __VA_ARGS__();                                                    \
+    } else {                                                                   \
+      using NAME_Q = flash::FixedSeqLenTraits;                                 \
+      using NAME_K = flash::FixedSeqLenTraits;                                 \
+      return __VA_ARGS__();                                                    \
+    }                                                                          \
+  }()
+
 #define QUERYHEAD_SWITCH(QUERYHEADS, CONST_NAME, ...)                          \
   [&] {                                                                        \
     if (QUERYHEADS <= 2) {                                                     \

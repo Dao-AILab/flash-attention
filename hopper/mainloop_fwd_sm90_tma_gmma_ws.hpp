@@ -241,11 +241,13 @@ struct CollectiveMainloopFwd {
           int& n_block_min,
           int& n_block_max
         ) {
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        // static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        static constexpr int kBlockM_div_H = kBlockM/Ktraits::kBlockH;        
-        int const seqlen_q = seqlen_traits_q.actual_seq_len;
-        int const seqlen_k = seqlen_traits_k.actual_seq_len;
+        static constexpr int kBlockM_div_H = get<0>(TileShape_MNK{})/Ktraits::kBlockH;
+        // int const seqlen_q = seqlen_traits_q.actual_seq_len;
+        // int const seqlen_k = seqlen_traits_k.actual_seq_len;
+        int const seqlen_q = Seqlen_traits_Q::Is_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        int const seqlen_k = Seqlen_traits::Is_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         int const num_n_blocks = ceil_div(seqlen_k, kBlockN);
         int const n_blocks_per_split
             = mainloop_params.num_splits_divmod.divide(num_n_blocks + int(mainloop_params.num_splits_divmod) - 1);
@@ -266,11 +268,13 @@ struct CollectiveMainloopFwd {
           const Seqlen_traits& seqlen_traits_k,
           int& n_block_max
         ) {
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        // static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        static constexpr int kBlockM_div_H = kBlockM/Ktraits::kBlockH;
-        int const seqlen_q = seqlen_traits_q.actual_seq_len;
-        int const seqlen_k = seqlen_traits_k.actual_seq_len;
+        static constexpr int kBlockM_div_H = get<0>(TileShape_MNK{})/Ktraits::kBlockH;
+        // int const seqlen_q = seqlen_traits_q.actual_seq_len;
+        // int const seqlen_k = seqlen_traits_k.actual_seq_len;
+        int const seqlen_q = Seqlen_traits_Q::Is_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        int const seqlen_k = Seqlen_traits::Is_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         n_block_max = cute::ceil_div(seqlen_k, kBlockN);
         if constexpr (Is_causal) {
             n_block_max = std::min(n_block_max,
@@ -480,6 +484,7 @@ struct CollectiveMainloopFwd {
          int work_idx,
          const Seqlen_traits_Q& seqlen_traits_q,
          const Seqlen_traits& seqlen_traits_k,
+         int n_block_min,
          int n_block_max
          ) {
         
@@ -512,14 +517,24 @@ struct CollectiveMainloopFwd {
 
         auto [m_block, split_idx, bidh, bidb] = block_coord;
         const int bidb_cache = mainloop_params.cache_batch_idx == nullptr ? bidb : mainloop_params.cache_batch_idx[bidb];
-        int bidh_kv = mainloop_params.qhead_per_khead_divmod.divide(bidh);
+        const int bidh_kv = mainloop_params.qhead_per_khead_divmod.divide(bidh);
 
         // Prepare the TMA loads
         uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
         constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
-        Tensor gQ = seqlen_traits_q.get_local_tile_tensor(
-            mQ, select<0, 2>(TileShape_MNK{}), bidh, bidb)(_, _, m_block);  // (M, K)
+        Tensor gQ = [&] {
+            // Need this inside lambda to capture structured binding
+            auto [m_block, n_split_idx, bidh, bidb] = block_coord;
+            if constexpr(Seqlen_traits_Q::DecodingGQA) {
+                return seqlen_traits_q.get_local_tile_tensor(
+                    mQ, TileShapeQCopy{}, bidh_kv, bidb)
+                        (_, _, _, m_block, bidh % int(mainloop_params.qhead_per_khead_divmod));  // (M/H, H, K)
+            } else {
+                return seqlen_traits_q.get_local_tile_tensor(
+                    mQ, TileShapeQCopy{}, bidh, bidb)(_, _, m_block);  // (M, K)
+            }
+        }();
         Tensor gK = seqlen_traits_k.get_local_tile_tensor(
             mK, select<1, 2>(TileShape_MNK{}), bidh_kv, bidb_cache);  // (N, K, _)
         Tensor gV = seqlen_traits_k.get_local_tile_tensor(
@@ -569,13 +584,13 @@ struct CollectiveMainloopFwd {
             shared_storage.barrier_O.wait((work_idx + 1) % 2);            
                         
             CUTLASS_PRAGMA_UNROLL
-            for (int iter = 0; iter < kStages && n_block > 0; ++iter, --n_block) {
+            for (int iter = 0; iter < kStages && n_block > n_block_min; ++iter, --n_block) {
                 pipeline_v.consumer_wait(smem_pipe_read);
                 // pipeline_vt.producer_acquire(smem_pipe_write);
                 do_transpose_V(smem_pipe_read.index());
                 pipeline_vt.producer_commit(smem_pipe_write);
                 pipeline_v.consumer_release(smem_pipe_read);
-
+                
                 ++smem_pipe_write;
                 ++smem_pipe_read;
                 
@@ -589,8 +604,8 @@ struct CollectiveMainloopFwd {
                 }
             }            
             
-            #pragma unroll 2
-            for (; n_block > 0; --n_block) {
+            #pragma unroll 1
+            for (; n_block > n_block_min; --n_block) {
                 pipeline_v.consumer_wait(smem_pipe_read);
                 pipeline_vt.producer_acquire(smem_pipe_write);
                 do_transpose_V(smem_pipe_read.index());
@@ -614,7 +629,7 @@ struct CollectiveMainloopFwd {
             scheduler.broadcast_next_work(work_tile_info);
             
             pipeline_v.consumer_wait(smem_pipe_read);
-            if (n_block_max > kStages)
+            if (n_block_max-n_block_min > kStages)
                 pipeline_vt.producer_acquire(smem_pipe_write);
             do_transpose_V(smem_pipe_read.index());
             pipeline_vt.producer_commit(smem_pipe_write);
@@ -647,7 +662,7 @@ struct CollectiveMainloopFwd {
 
             constexpr int extra_iterations = kStages - 1;
             CUTLASS_PRAGMA_UNROLL
-            for (int iter = 0; iter < extra_iterations && n_block >= 0; ++iter) {
+            for (int iter = 0; iter < extra_iterations && n_block >= n_block_min; ++iter) {
                 if (warp_idx_in_warpgroup == 0 && lane_predicate) {
                     pipeline_k.producer_acquire(smem_pipe_write);
                     copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
@@ -668,9 +683,8 @@ struct CollectiveMainloopFwd {
                 --n_block;
             }
 
-            // CUTLASS_PRAGMA_NO_UNROLL
-            #pragma unroll 2        
-            for (; n_block >= 0; --n_block) {
+            #pragma unroll 1
+            for (; n_block >= n_block_min; --n_block) {
                 
                 if (warp_idx_in_warpgroup == 0 && lane_predicate) {
                     pipeline_k.producer_acquire(smem_pipe_write);
@@ -779,7 +793,7 @@ struct CollectiveMainloopFwd {
         PipelineState& smem_pipe_read_v,
         FrgTensorO& tOrO,
         Softmax& softmax,
-        int n_block_count,
+        int n_block_min,
         int n_block_max,
         int thread_idx,
         int work_idx,
@@ -816,10 +830,9 @@ struct CollectiveMainloopFwd {
         };
 
         tiled_mma1.accumulate_ = GMMA::ScaleOut::Zero;
-        int const seqlen_q = seqlen_traits_q.actual_seq_len;
-        int const seqlen_k = seqlen_traits_k.actual_seq_len;
-        int n_block = n_block_count - 1;
-        int n_block_global = n_block_max - 1;
+        int const seqlen_q = Seqlen_traits_Q::Is_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        int const seqlen_k = Seqlen_traits::Is_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
+        int n_block = n_block_max - 1;
 
         cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.barrier_Q.try_wait(work_idx % 2));
         if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.barrier_Q.wait(work_idx % 2); }
@@ -876,6 +889,8 @@ struct CollectiveMainloopFwd {
                 0,
                 row + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM_div_H - mainloop_params.window_size_left
             );
+        auto col_limit_causal = [&](int row, int n_block_idx) {
+            return row + 1 + seqlen_k - n_block_idx * kBlockN - seqlen_q + m_block * kBlockM_div_H;
         };
         {
             Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
@@ -883,14 +898,14 @@ struct CollectiveMainloopFwd {
             #pragma unroll
             for (int i = 0; i < size(tSrS); ++i) {
                 if constexpr (!Is_causal) {  // Just masking based on col
-                    if (int(get<1>(tScS(i))) >= int(seqlen_k - n_block_global * kBlockN)) { tSrS(i) = -INFINITY; }
+                    if (int(get<1>(tScS(i))) >= int(seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
                 } else {  // mask based on both row and col
                     // using std::min is faster than doing col >= limit0 or col >= limit1
                     // Need to cast get<1>(tScS(i)) to (signed) int since by default it's unsigned, and the
                     // right hand side can be negative and might be converted to a very large unsigned integer.
                     int row = int(get<0>(tScS(i))) / kBlockH;
-                    if (int(get<1>(tScS(i))) >= std::min(seqlen_k - n_block_global * kBlockN,
-                                                        col_limit_causal(row, n_block_global))) {
+                    if (int(get<1>(tScS(i))) >= std::min(seqlen_k - n_block * kBlockN,
+                                                        col_limit_causal(row, n_block))) {
                         tSrS(i) = -INFINITY;
                     } else if constexpr (Is_local) {
                         if (int(get<1>(tScS(i))) < col_limit_left(int(get<0>(tScS(i))), n_block)) {
@@ -911,7 +926,7 @@ struct CollectiveMainloopFwd {
         constexpr int n_masking_steps = !Is_causal ? 1 : cute::ceil_div(kBlockM_div_H, kBlockN) + 1;
         // Only go through these if Is_causal, since n_masking_steps = 1 when !Is_causal
         #pragma unroll
-        for (int masking_step = 0; masking_step < n_masking_steps - 1 && n_block > 0; ++masking_step, --n_block, --n_block_global) {
+        for (int masking_step = 0; masking_step < n_masking_steps - 1 && n_block > n_block_min; ++masking_step, --n_block) {
             Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read_k);
             warp_scheduler_barrier_sync();
@@ -927,7 +942,7 @@ struct CollectiveMainloopFwd {
             #pragma unroll
             for (int i = 0; i < size(tSrS); ++i) {
                 int row = int(get<0>(tScS(i))) / kBlockH;
-                if (int(get<1>(tScS(i))) >= col_limit_causal(row, n_block_global - 1)) {
+                if (int(get<1>(tScS(i))) >= col_limit_causal(row, n_block - 1)) {
                     tSrS(i) = -INFINITY;
                 }
             }
@@ -999,7 +1014,8 @@ struct CollectiveMainloopFwd {
         PipelineState& smem_pipe_release,        
         FrgTensorO& tOrO,
         Softmax& softmax,
-        int n_block_count,
+        int n_block_min,
+        int n_block_max,
         int thread_idx,
         int work_idx,
         int m_block,
@@ -1009,8 +1025,10 @@ struct CollectiveMainloopFwd {
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
 
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        // static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
+        static constexpr int kBlockH = Ktraits::kBlockH;
+        static constexpr int kBlockM_div_H = get<0>(TileShape_MNK{}) / kBlockH;
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
@@ -1034,9 +1052,11 @@ struct CollectiveMainloopFwd {
 
         tiled_mma1.accumulate_ = GMMA::ScaleOut::Zero;
         // workaround for fp8 only perf regression pending change to seqlen traits class
-        int const seqlen_q = Seqlen_traits_Q::UseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        int const seqlen_k = Seqlen_traits::UseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
-        int n_block = n_block_count - 1;
+        // int const seqlen_q = Seqlen_traits_Q::UseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        // int const seqlen_k = Seqlen_traits::UseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
+        int const seqlen_q = Seqlen_traits_Q::Is_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        int const seqlen_k = Seqlen_traits::Is_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
+        int n_block = n_block_max - 1;
         
         cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.barrier_Q.try_wait(work_idx % 2));
         if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.barrier_Q.wait(work_idx % 2); }
@@ -1060,8 +1080,8 @@ struct CollectiveMainloopFwd {
         warp_scheduler_barrier_arrive();
         pipeline_k.consumer_release(smem_pipe_read);
 
-        auto col_limit_causal = [&](int row, int n_block) {
-            return row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
+        auto col_limit_causal = [&](int row, int n_block_idx) {
+            return row + 1 + seqlen_k - n_block_idx * kBlockN - seqlen_q + m_block * kBlockM_div_H;
         };       
         {
             Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
@@ -1071,8 +1091,9 @@ struct CollectiveMainloopFwd {
                 if constexpr (!Is_causal) {  // Just masking based on col                
                     if (int(get<1>(tScS(i))) >= int(seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
                 } else {  // mask based on both row and col
+                    int row = int(get<0>(tScS(i))) / kBlockH;
                     if (int(get<1>(tScS(i))) >= std::min(seqlen_k - n_block * kBlockN,
-                                                         col_limit_causal(int(get<0>(tScS(i))), n_block))) {
+                                                         col_limit_causal(row, n_block))) {
                         tSrS(i) = -INFINITY;
                     }
                 }
@@ -1092,11 +1113,11 @@ struct CollectiveMainloopFwd {
 
         ++smem_pipe_read;
         --n_block;
-        constexpr int extra_iterations = !Is_causal ? kStages - 1 : cute::ceil_div(kBlockM, kBlockN);        
+        constexpr int extra_iterations = !Is_causal ? kStages - 1 : cute::ceil_div(kBlockM_div_H, kBlockN);        
 
         if constexpr(Is_causal) {
             CUTLASS_PRAGMA_UNROLL      
-            for (int iter = 0; iter < extra_iterations && n_block >= 0; ++iter, --n_block) {
+            for (int iter = 0; iter < extra_iterations && n_block >= n_block_min; ++iter, --n_block) {
                 Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
                 warp_scheduler_barrier_sync();
@@ -1106,7 +1127,8 @@ struct CollectiveMainloopFwd {
                 Tensor tScS = threadMma0.partition_C(cS);
                 #pragma unroll
                 for (int i = 0; i < size(tSrS); ++i) {
-                    if (int(get<1>(tScS(i))) >= col_limit_causal(int(get<0>(tScS(i))), n_block)) {
+                    int row = int(get<0>(tScS(i))) / kBlockH;
+                    if (int(get<1>(tScS(i))) >= col_limit_causal(row, n_block)) {
                         tSrS(i) = -INFINITY;
                     }
                 }
@@ -1129,9 +1151,11 @@ struct CollectiveMainloopFwd {
                 if constexpr(!Delay_V_release) { pipeline_vt.consumer_release(smem_pipe_read); }                
                 ++smem_pipe_read;
             }
-        } else {
+        }
+        #if 1
+        else {
             CUTLASS_PRAGMA_UNROLL      
-            for (int iter = 0; iter < extra_iterations && n_block >= 0; ++iter, --n_block) {
+            for (int iter = 0; iter < extra_iterations && n_block >= n_block_min; ++iter, --n_block) {
                 Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
                 if constexpr(Delay_V_release) {
@@ -1157,11 +1181,12 @@ struct CollectiveMainloopFwd {
                 ++smem_pipe_read;
             }
         }
+        #endif
 
         if constexpr(Delay_V_release) {
             warp_scheduler_barrier_sync();
             CUTLASS_PRAGMA_NO_UNROLL
-            for (; n_block >= 0; --n_block) {
+            for (; n_block >= n_block_min; --n_block) {
                 Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);                
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);                
@@ -1187,7 +1212,7 @@ struct CollectiveMainloopFwd {
         } else {
             if constexpr (kHeadDim == 128) { warp_scheduler_barrier_sync(); }
             CUTLASS_PRAGMA_NO_UNROLL
-            for (; n_block >= 0; --n_block) {
+            for (; n_block >= n_block_min; --n_block) {
                 Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
                 if constexpr (kHeadDim == 256) { warp_scheduler_barrier_sync(); }
@@ -1210,7 +1235,7 @@ struct CollectiveMainloopFwd {
             if constexpr (kHeadDim == 128) { warp_scheduler_barrier_arrive(); }
         }
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
-        cute::copy(softmax.template finalize</*Check_inf=*/Is_causal>(tSrS, shared_storage.descale_v), scores_scale);
+        cute::copy(softmax.template finalize<false, Is_split>(tSrS, shared_storage.descale_v), scores_scale);
         softmax.rescale_o(tOrO, scores_scale);
         return;
     }

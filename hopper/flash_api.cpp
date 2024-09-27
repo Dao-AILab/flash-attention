@@ -287,8 +287,8 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int batch_nheads, int 
     float first_wave = float(batch_nheads_mblocks) / num_SMs;
     // printf("Start threshold and wave = %f, %f.\n", start_threshold, first_wave);
     // Only use start_threshold if initial work doesn't exceed one wave
-    if (first_wave/ceil(first_wave) > start_threshold && first_wave <= 1.f ||
-        first_wave/ceil(first_wave) > .8f) {
+    if ((first_wave/ceil(first_wave) > start_threshold && first_wave <= 1.f) ||
+        (first_wave/ceil(first_wave) > .8f)) {
         return 1;
     }
     // if (first_wave_batch_nheads > start_threshold) { return 1; }
@@ -329,7 +329,8 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int batch_nheads, int 
     }
     // Correct for excessive splitting with e.g. 1 bsz*nheads*mblocks
     // Empirically, efficiency threshold in these cases is about 40% for 64K seqlen_k
-    float threshold = std::min(0.3f + batch_nheads_mblocks * 0.1f, 0.8f) * max_efficiency;
+    float threshold = num_m_blocks == 1 ? std::min(0.3f + batch_nheads * 0.1f, 0.8f) : 0.8f;
+    threshold = threshold * max_efficiency;
     // printf("Max efficiency = %f. Threshold = %f.\n", max_efficiency, threshold);
     for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
         // if (!is_split_eligible(num_splits)) { continue; }

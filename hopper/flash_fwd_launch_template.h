@@ -364,8 +364,8 @@ void run_mha_fwd_hdim64_fp8(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int kBlockM = 192;
     constexpr static int kBlockN = 128;
     constexpr static int kNWarps = 4 + kBlockM/16;
-    constexpr static int kStages = 4;    
-    using Seqlen_traits = flash::FixedSeqLenTraits;
+    constexpr static int kStages = 4;
+    using Seqlen_traits = flash::FixedSeqLenTraitsStatic;
     if(params.is_causal) {
         run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
                         false, 1, T>, /*Is_causal=*/true, /*Is_local=*/false, Seqlen_traits>(params, stream);
@@ -394,7 +394,7 @@ void run_mha_fwd_hdim128_fp8(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int kBlockN = 256;
     constexpr static int kNWarps = 4 + kBlockM/16;
     constexpr static int kStages = 2;
-    using Seqlen_traits = flash::FixedSeqLenTraits;
+    using Seqlen_traits = flash::FixedSeqLenTraitsStatic;
     if(params.is_causal) {
         run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
                         false, 1, T>, /*Is_causal=*/true, /*Is_local=*/false, Seqlen_traits>(params, stream);
@@ -423,7 +423,7 @@ void run_mha_fwd_hdim256_fp8(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int kBlockN = 128;
     constexpr static int kNWarps = 4 + kBlockM/16;
     constexpr static int kStages = 2;
-    using Seqlen_traits = flash::FixedSeqLenTraits;
+    using Seqlen_traits = flash::FixedSeqLenTraitsStatic;
     if(params.is_causal) {
         run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
                         false, 1, T>, /*Is_causal=*/true, /*Is_local=*/false, Seqlen_traits>(params, stream);

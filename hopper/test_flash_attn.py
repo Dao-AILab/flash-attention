@@ -34,6 +34,7 @@ def print_diffs(out, out_ref):
 # @pytest.mark.parametrize("local", [True])
 @pytest.mark.parametrize("deterministic", [False, True])
 # @pytest.mark.parametrize("deterministic", [True])
+@pytest.mark.parametrize("gqa_parallel", [False, True])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
@@ -68,7 +69,7 @@ def print_diffs(out, out_ref):
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_output(
-    seqlen_q, seqlen_k, d, causal, local, deterministic, mha_type, dtype, descale
+    seqlen_q, seqlen_k, d, causal, local, deterministic, mha_type, dtype, descale, gqa_parallel
 ):
     device = "cuda"
     if(dtype == torch.float8_e4m3fn):
@@ -99,11 +100,15 @@ def test_flash_attn_output(
     descale_q = torch.tensor([descale], dtype=torch.float32, device='cuda')
     descale_k = torch.tensor([descale], dtype=torch.float32, device='cuda')
     descale_v = torch.tensor([descale], dtype=torch.float32, device='cuda')
+
+    # out, q, k, v, out_padded, lse, S_dmask = _flash_attn_forward(
+    #     q, k, v, softmax_scale, causal, descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, gqa_decoding=gqa_decoding
+    # )
     if(dtype != torch.float8_e4m3fn):
-        out, lse = flash_attn_func(q, k, v, causal=causal, window_size=window_size, deterministic=deterministic)
+        out, lse = flash_attn_func(q, k, v, causal=causal, window_size=window_size, deterministic=deterministic, gqa_parallel=gqa_parallel)
     else:
         out, q, k, v, out_padded, lse, S_dmask = _flash_attn_forward(
-            q, k, v, softmax_scale, causal, descale_q=descale_q, descale_k=descale_k, descale_v=descale_v
+            q, k, v, softmax_scale, causal, descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, gqa_parallel=gqa_parallel
         )
 
     q = q.to(dtype_init)

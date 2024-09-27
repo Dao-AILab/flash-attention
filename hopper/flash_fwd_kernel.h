@@ -117,10 +117,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 auto block_coord = work_tile_info.get_block_coord(scheduler_params);
                 auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
-                seqlen_traits_q.init(bidb);
-                seqlen_traits_k.init(bidb);
-                if constexpr(Seqlen_traits_Q::UseVarSeqLen) {
-                    // NOTE: to support with gqa decoding, change kBlockM to kBlockM/kBlockH
+                if constexpr(seqlen_traits_q.Is_dynamic) { seqlen_traits_q.init(bidb); }
+                if constexpr(seqlen_traits_k.Is_dynamic) { seqlen_traits_k.init(bidb); }
+                if constexpr(seqlen_traits_q.UseVarSeqLen) {
+                    // NOTE: to support in future with gqa decoding, changed kBlockM to kBlockM/kBlockH
                     if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
                         continue;
                     }
@@ -141,10 +141,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                         continue;
                     }
                 }
-                collective_mainloop.load(mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
-                                         shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
-                                         seqlen_traits_q, seqlen_traits_k,
-                                         n_block_min, n_block_max);
+                collective_mainloop.load(
+                    mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
+                    shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
+                    seqlen_traits_q, seqlen_traits_k, n_block_min, n_block_max);
                 ++work_idx;
             }
             collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
@@ -175,10 +175,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
-            seqlen_traits_q.init(bidb);
-            seqlen_traits_k.init(bidb);
-            if constexpr(Seqlen_traits_Q::UseVarSeqLen) {
-                // NOTE: to support with gqa decoding, change kBlockM to kBlockM/kBlockH
+            if constexpr(seqlen_traits_q.Is_dynamic) { seqlen_traits_q.init(bidb); }
+            if constexpr(seqlen_traits_k.Is_dynamic) { seqlen_traits_k.init(bidb); }
+            if constexpr(seqlen_traits_q.UseVarSeqLen) {
+                // NOTE: to support in future with gqa decoding, changed kBlockM to kBlockM/kBlockH
                 if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
                     continue;
                 }
@@ -205,12 +205,14 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 }   
             }         
 
-            collective_mainloop.mma(mainloop_params, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
-                                    tOrO, softmax, n_block_max - n_block_min, n_block_max, threadIdx.x - NumCopyThreads, work_idx,
-                                    m_block, shared_storage, seqlen_traits_q, seqlen_traits_k);
-                                    // tOrO, softmax, n_block_max, threadIdx.x - NumCopyThreads + (work_idx >> 30), work_idx, shared_storage);
-            collective_epilogue.store(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
-                                      threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q, mainloop_params.qhead_per_khead_divmod);
+            collective_mainloop.mma(
+                mainloop_params, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
+                tOrO, softmax, n_block_min, n_block_max, threadIdx.x - NumCopyThreads, work_idx,
+                m_block, shared_storage, seqlen_traits_q, seqlen_traits_k);
+                // tOrO, softmax, n_block_max, threadIdx.x - NumCopyThreads + (work_idx >> 30), work_idx, shared_storage);
+            collective_epilogue.store(
+                epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
+                threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q, mainloop_params.qhead_per_khead_divmod);
 
             ++work_idx;
         }
@@ -236,11 +238,12 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
     static_assert(Ktraits::Is_WS);
     static constexpr bool Is_WS = Ktraits::Is_WS;
-    static constexpr bool UseVarSeqLen = Seqlen_traits::UseVarSeqLen;
+    // static constexpr bool UseVarSeqLen = Seqlen_traits::UseVarSeqLen;
 
     static constexpr int NumMmaThreads = size(typename Ktraits::TiledMma0{});
     static constexpr int NumCopyThreads = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
     static constexpr int kBlockM = Ktraits::kBlockM;
+    static constexpr int kBlockH = Ktraits::kBlockH;
     // static constexpr int kBlockN = Ktraits::kBlockN;
     // static constexpr int kHeadDim = Ktraits::kHeadDim;
     static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128;    
@@ -315,7 +318,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
     static_assert(Ktraits::kNWarps == 12 || Ktraits::kNWarps == 16);
     if (warp_group_idx == 0) {  // Producer
-        cutlass::arch::warpgroup_reg_dealloc<Ktraits::kNWarps == 12 ? 40 : 32>();
+        cutlass::arch::warpgroup_reg_dealloc<Ktraits::kNWarps == 16 ? 32 : 40>();
         
         PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>(); 
         PipelineState smem_pipe_read, smem_pipe_release;
@@ -327,20 +330,27 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 work_tile_info.is_valid(scheduler_params);
                 work_tile_info = scheduler.template get_next_work</*IsProducer=*/true>(scheduler_params, work_tile_info)) {
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
-            auto [m_block, split_idx, bidh, bidb] = block_coord;
+            auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
-            if constexpr(UseVarSeqLen) {
-                seqlen_traits_q.init(bidb);
-                seqlen_traits_k.init(bidb);
-                if (m_block * kBlockM >= seqlen_traits_q.actual_seq_len) {
+            if constexpr(seqlen_traits_q.Is_dynamic) { seqlen_traits_q.init(bidb); }
+            if constexpr(seqlen_traits_k.Is_dynamic) { seqlen_traits_k.init(bidb); }
+            if constexpr(seqlen_traits_q.UseVarSeqLen) {
+                // NOTE: to support in future with gqa decoding, changed kBlockM to kBlockM/kBlockH
+                if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
                     continue;
                 }
             }
-            int n_block_max;
-            collective_mainloop.get_n_block_max(
-                mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k, n_block_max);
-            if constexpr(Is_causal) {
-                if(n_block_max <= 0) {
+            int n_block_min = 0, n_block_max;
+            if constexpr(Ktraits::Is_split) {
+                collective_mainloop.get_n_block_min_max(
+                    mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
+                    n_block_min, n_block_max);
+            } else {
+                collective_mainloop.get_n_block_max(
+                    mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k, n_block_max);
+            }
+            if constexpr (Is_causal || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
+                if(n_block_max <= n_block_min) {
                     scheduler.prefetch_next_work(scheduler_params, work_tile_info);
                     scheduler.broadcast_next_work(work_tile_info);
                     // need to sync producer warpgroup
@@ -349,10 +359,9 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 }
             }
             collective_mainloop.load_fp8(
-                mainloop_params, pipeline_k, pipeline_v, pipeline_vt,
-                smem_pipe_write, smem_pipe_read, shared_storage,
-                scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
-                seqlen_traits_q, seqlen_traits_k, n_block_max);
+                mainloop_params, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, smem_pipe_read,
+                shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
+                seqlen_traits_q, seqlen_traits_k, n_block_min, n_block_max);
             ++work_idx;
             // don't need to sync producer warpgroup here
             // if constexpr (Is_causal) {
@@ -381,38 +390,55 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             flash::Softmax<2 * (2 * kBlockM / NumMmaThreads), Use_max_offset> softmax(shared_storage.softmax_scale_qk_log2);
 
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
-            auto [m_block, split_idx, bidh, bidb] = block_coord;
+            auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
-            if constexpr(UseVarSeqLen) {
-                seqlen_traits_q.init(bidb);
-                seqlen_traits_k.init(bidb);
-                if (m_block * kBlockM >= seqlen_traits_q.actual_seq_len) {
+            if constexpr(seqlen_traits_q.Is_dynamic) { seqlen_traits_q.init(bidb); }
+            if constexpr(seqlen_traits_k.Is_dynamic) { seqlen_traits_k.init(bidb); }
+            if constexpr(seqlen_traits_q.UseVarSeqLen) {
+                // NOTE: to support in future with gqa decoding, changed kBlockM to kBlockM/kBlockH
+                if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
                     continue;
                 }
             }
-            int n_block_max;
-            collective_mainloop.get_n_block_max(
-                mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k, n_block_max);
-            if constexpr(Is_causal) {
-                if(n_block_max <= 0) {  // We exit early and write 0 to gO and -inf to gLSE.
-                    collective_epilogue.store_zero(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q);
+            int n_block_max, n_block_min = 0;
+            if constexpr(Ktraits::Is_split) {
+                collective_mainloop.get_n_block_min_max(
+                    mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
+                    n_block_min, n_block_max);
+            } else {
+                collective_mainloop.get_n_block_max(
+                    mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k, n_block_max);
+            }
+            if constexpr (Is_causal || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
+                if(n_block_max <= n_block_min) {  // We exit early and write 0 to gO and -inf to gLSE.
+                    if constexpr(!Seqlen_traits_Q::DecodingGQA) {
+                        collective_epilogue.store_zero(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads,
+                            block_coord, seqlen_traits_q);
+                    } else {
+                        collective_epilogue.store_zero_decoding_gqa(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads,
+                            block_coord, seqlen_traits_q, mainloop_params.qhead_per_khead_divmod);
+                    }
                     continue;
                 }
             }
             
             collective_mainloop.mma_fp8<Delay_V_release>(
                 mainloop_params, pipeline_k, pipeline_vt, smem_pipe_read, smem_pipe_release,
-                tOrO, softmax, n_block_max,
-                threadIdx.x - NumCopyThreads, work_idx, m_block,
-                shared_storage, seqlen_traits_q, seqlen_traits_k); 
+                tOrO, softmax, n_block_min, n_block_max, threadIdx.x - NumCopyThreads, work_idx, m_block,
+                shared_storage, seqlen_traits_q, seqlen_traits_k);
 
-        #ifndef NO_FP8_COLUMN_PERMUTE
-            collective_epilogue.store_fp8(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
-                                      threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q);
-        #else
-            collective_epilogue.store(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
-                                      threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q);
-        #endif
+            collective_epilogue.store(
+                epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
+                threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q, mainloop_params.qhead_per_khead_divmod);
+
+        // #ifndef NO_FP8_COLUMN_PERMUTE
+        //     collective_epilogue.store_fp8(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
+        //                               threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q);
+        // #else
+        //     collective_epilogue.store(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
+        //                               threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q);
+        // #endif
+
             ++work_idx;
         }
         collective_epilogue.store_tail();

@@ -18,7 +18,7 @@ static constexpr int FixedSeqLenType = 0;
 static constexpr int VarSeqLenType = 1;
 static constexpr int DecodingGQASeqLenType = 2;
 
-template <int SeqLenType> class SeqLenTraits {
+template <int SeqLenType, bool Is_dynamic_> class SeqLenTraits {
 public:
   static_assert(SeqLenType == 0 || SeqLenType == 1 || SeqLenType == 2, 
                   "SeqLenType must be 0, 1, or 2");  
@@ -35,6 +35,8 @@ public:
   // Whether this is for fixed-seq-len or var-seq-len.
   static constexpr bool UseVarSeqLen = SeqLenType == 1;
   static constexpr bool DecodingGQA = SeqLenType == 2;
+
+  static constexpr bool Is_dynamic = Is_dynamic_;
 
   using ShapeT = std::conditional_t<
       UseVarSeqLen, 
@@ -156,10 +158,13 @@ public:
     // TODO: add leftpad, seqlen_new for kv cache support
     // NOTE: for FA2 kv cache API, "cu_seq_len" is a misnomer.
     // Rather, cu_seq_len plays the role of seq_used.
-    // We can change this for FA3 if desired.
+    // We can change this to seq_used for FA3 if desired.
     if(cu_seq_len) {      
       actual_seq_len = cu_seq_len[bidb];
     }
+    // if (seq_used) {
+    //   actual_seq_len = seq_used[bidb];
+    // }
   }
 
   template <typename MTensor, typename Shape>
@@ -208,9 +213,13 @@ public:
   
 };
 
-using FixedSeqLenTraits = SeqLenTraits<FixedSeqLenType>;
-using VarSeqLenTraits = SeqLenTraits<VarSeqLenType>;
-using DecodingGQASeqLenTraits = SeqLenTraits<DecodingGQASeqLenType>;
+using FixedSeqLenTraits = SeqLenTraits<FixedSeqLenType, true>;
+using FixedSeqLenTraitsStatic = SeqLenTraits<FixedSeqLenType, false>;
+using FixedSeqLenTraitsDynamic = SeqLenTraits<FixedSeqLenType, true>;
+using VarSeqLenTraits = SeqLenTraits<VarSeqLenType, true>;
+using DecodingGQASeqLenTraits = SeqLenTraits<DecodingGQASeqLenType, false>;
+using DecodingGQASeqLenTraitsStatic = SeqLenTraits<DecodingGQASeqLenType, false>;
+using DecodingGQASeqLenTraitsDynamic = SeqLenTraits<DecodingGQASeqLenType, true>;
 
 // Returns the static layout of a var-seq-len tensor in global memory based on
 // max_seq_len and max_batch_size.
