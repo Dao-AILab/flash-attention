@@ -437,12 +437,22 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
             }
         }
     } else {
-        if (params.d == 64) {
-            run_mha_fwd_<cutlass::float_e4m3_t, 64>(params, stream);
-        } else if (params.d == 128) {
-            run_mha_fwd_<cutlass::float_e4m3_t, 128>(params, stream);
-        } else if (params.d == 256) {
-            run_mha_fwd_<cutlass::float_e4m3_t, 256>(params, stream);
+        if(!params.use_gqa_decoding) {
+            if (params.d == 64) {
+                run_mha_fwd_<cutlass::float_e4m3_t, 64>(params, stream);
+            } else if (params.d == 128) {
+                run_mha_fwd_<cutlass::float_e4m3_t, 128>(params, stream);
+            } else if (params.d == 256) {
+                run_mha_fwd_<cutlass::float_e4m3_t, 256>(params, stream);
+            }
+        } else {
+            if (params.d == 64) {
+                run_mha_fwd_gqa_<cutlass::float_e4m3_t, 64>(params, stream);
+            } else if (params.d == 128) {
+                run_mha_fwd_gqa_<cutlass::float_e4m3_t, 128>(params, stream);
+            } else if (params.d == 256) {
+                run_mha_fwd_gqa_<cutlass::float_e4m3_t, 256>(params, stream);
+            }
         }
     }
 }
@@ -464,15 +474,11 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
-    TORCH_CHECK(is_sm90, "FlashAttention only supports Hopper GPUs or newer.");
+    TORCH_CHECK(is_sm90, "FlashAttention-3 only supports Hopper GPUs or newer.");
 
     auto q_dtype = q.dtype();
-    // TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-    //             "FlashAttention only support fp16 and bf16 data type for now");
-    // TODO: will add e4m3 later
-    // TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kFloat8_e4m3fn,
-    //             "FlashAttention only support fp16 and bf16 data type");
-    //             "FlashAttention only support fp16 and fp8 (e4m3) data type for now");
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || q_dtype == at::ScalarType::Float8_e4m3fn,
+                "FlashAttention-3 only support fp16, bf16, or fp8 e4m3 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
@@ -493,6 +499,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+    // Guard against mistaken setting of gqa flag
+    if (num_heads == num_heads_k) { use_gqa_decoding = false; }
 
     TORCH_CHECK(head_size_og == 64 || head_size_og == 128 || head_size_og == 256, "Only support head size 64, 128, and 256 for now");
 
@@ -1219,6 +1227,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 c10::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
                 c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
                 const float softmax_scale,
+                c10::optional<at::Tensor> &descale_q_, // 1
+                c10::optional<at::Tensor> &descale_k_, // 1
+                c10::optional<at::Tensor> &descale_v_, // 1
                 bool is_causal,
                 int window_size_left,
                 int window_size_right,
@@ -1231,18 +1242,13 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     // bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
-    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    // bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
-    TORCH_CHECK(is_sm90 || is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
-    // We will support Turing in the near future
-    // TORCH_CHECK(is_sm90 || is_sm8x || is_sm75, "FlashAttention only supports Turing GPUs or newer.");
+    TORCH_CHECK(is_sm90, "FlashAttention-3 only supports Hopper GPUs or newer.");
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
-    if (q_dtype == torch::kBFloat16) {
-        TORCH_CHECK(is_sm90 || is_sm8x, "bfloat16 is only supported on Ampere GPUs or newer");
-    }
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || q_dtype == at::ScalarType::Float8_e4m3fn,
+                "FlashAttention-3 only support fp16, bf16, or fp8 e4m3 data type");
     TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
 
@@ -1279,6 +1285,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+    // Guard against mistaken setting of gqa flag
+    if (num_heads == num_heads_k) { use_gqa_decoding = false; }
 
     // causal=true is the same as causal=false in this case
     if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }
@@ -1324,13 +1332,22 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        // TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        TORCH_CHECK(q_dtype == at::ScalarType::Float8_e4m3fn
+                    ? (out.dtype() == at::kHalf)
+                    : (out.dtype() == q_dtype),
+                "Output must have the same dtype as input dtype if dtype is "
+                "not fp8, or fp16 for fp8 input.");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_og);
         if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
     } else {
-        out = torch::empty_like(q_padded);
+        if (q_dtype == at::ScalarType::Float8_e4m3fn) {
+            out = torch::empty_like(q_padded, at::kHalf);
+        }
+        else
+            out = torch::empty_like(q_padded);
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -1364,9 +1381,35 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      /*p_dropout=*/0.f,
                      softmax_scale,
                      window_size_left,
-                     window_size_right,
-                     softcap
+                     window_size_right
                      );
+
+    if(q_dtype == at::ScalarType::Float8_e4m3fn) {
+        at::Tensor descale_q, descale_k, descale_v;
+        if (descale_q_.has_value() && descale_k_.has_value() && descale_k_.has_value()) {
+            descale_q = descale_q_.value();
+            descale_k = descale_k_.value();
+            descale_v = descale_v_.value();
+            CHECK_DEVICE(descale_q);
+            CHECK_DEVICE(descale_k);
+            CHECK_DEVICE(descale_v);
+            CHECK_SHAPE(descale_q, 1);
+            CHECK_SHAPE(descale_k, 1);
+            CHECK_SHAPE(descale_v, 1);
+        } else {
+            descale_q = torch::ones({1}, opts.dtype(at::kFloat));
+            descale_k = torch::ones({1}, opts.dtype(at::kFloat));
+            descale_v = torch::ones({1}, opts.dtype(at::kFloat));
+        }
+        params.descale_q_ptr = descale_q.data_ptr<float>();
+        params.descale_k_ptr = descale_k.data_ptr<float>();
+        params.descale_v_ptr = descale_v.data_ptr<float>();
+    } else {
+        params.descale_q_ptr = nullptr;
+        params.descale_k_ptr = nullptr;
+        params.descale_v_ptr = nullptr;
+    }
+    
     params.is_kv_cache = true;
 
     params.use_gqa_decoding = use_gqa_decoding;

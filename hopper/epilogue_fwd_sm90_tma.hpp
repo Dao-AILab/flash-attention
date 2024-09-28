@@ -71,7 +71,8 @@ struct CollectiveEpilogueFwd {
     using SmemLayoutOCopy = typename Ktraits::SmemLayoutOCopy;
     using TileShapeOCopy = typename Ktraits::TileShapeOCopy;
 
-    using SmemCopyAtomO = std::conditional_t<Is_split, Copy_Atom<DefaultCopy, Element>, Copy_Atom<cute::SM90_U32x4_STSM_N, Element>>;
+    using SmemCopyAtomO = std::conditional_t<Is_split, 
+        Copy_Atom<UniversalCopy<Element>, Element>, Copy_Atom<cute::SM90_U32x4_STSM_N, Element>>;
     using SharedStorage = cute::array_aligned<Element, cute::cosize_v<SmemLayoutO>>;
 
     using GmemTiledCopyOTMA = cute::SM90_TMA_STORE;
@@ -110,7 +111,8 @@ struct CollectiveEpilogueFwd {
                                  Stride<_4, _32, _1, _0>>;
     using ValueLayoutrO = Layout<Shape<_1, _2, Shape<_2, _2>, Int<kHeadDim/16>>,
                                 Stride<_0, _2, Stride<_4, _1>, _8>>;
-    using TiledCopyrO = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<uint16_t>, Element>{},
+    // using AccessTyperO = std::conditional_t<cutlass::sizeof_bits_v<Element> == 16, uint16_t, uint32_t>;
+    using TiledCopyrO = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<Element>, Element>{},
                       ThreadLayoutrO{}, ValueLayoutrO{}));
     using TiledCopyShaperO = Shape<_8, Int<kBlockM/8>, _16, Int<kHeadDim/16>>;
     using SmemLayoutrO = decltype(composition(SmemLayoutO{}, Layout<TiledCopyShaperO>{}));

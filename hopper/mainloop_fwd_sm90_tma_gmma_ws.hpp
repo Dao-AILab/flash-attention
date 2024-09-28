@@ -572,17 +572,33 @@ struct CollectiveMainloopFwd {
         // for fp8, change from NumThreadsPerWarp to NumThreadsPerWarpGroup
         cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
 
-        if constexpr(Is_causal) {
-            if (warp_idx_in_warpgroup == 0 && lane_predicate) {
-                shared_storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
-                copy(mainloop_params.tma_load_Q.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.barrier_Q), 0 /*mcast_mask*/), tQgQ, tQsQ);
+        if (warp_idx_in_warpgroup == 0 && lane_predicate) {
+            shared_storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
+            copy(mainloop_params.tma_load_Q.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.barrier_Q), 0 /*mcast_mask*/), tQgQ, tQsQ);
+            if constexpr(!Ktraits::VO_union_all) {
                 pipeline_v.producer_acquire(smem_pipe_write);
                 copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
                     tVgV(_, n_block), tVsV(_, smem_pipe_write.index()));
             }
 
-            shared_storage.barrier_O.wait((work_idx + 1) % 2);            
-                        
+        }
+        // With fp8 kernel, smem_o is in union with smem_v_out,
+        // except for split kernel + hdim 256,
+        // so could use NamedBarrier instead of ClusterBarrier.
+        // But, this doesn't appear to have any benefit.
+        shared_storage.barrier_O.wait((work_idx + 1) % 2);
+
+        if constexpr(Ktraits::VO_union_all) {
+            if (warp_idx_in_warpgroup == 0 && lane_predicate) {
+                pipeline_v.producer_acquire(smem_pipe_write);
+                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
+                    tVgV(_, n_block), tVsV(_, smem_pipe_write.index()));
+            }
+        }
+
+        // if constexpr(Is_causal || Is_split) {
+        {
+            #if 0
             CUTLASS_PRAGMA_UNROLL
             for (int iter = 0; iter < kStages && n_block > n_block_min; ++iter, --n_block) {
                 pipeline_v.consumer_wait(smem_pipe_read);
@@ -602,9 +618,10 @@ struct CollectiveMainloopFwd {
                     copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
                         tVgV(_, n_block-1), tVsV(_, smem_pipe_write.index()));
                 }
-            }            
+            }       
+            #endif     
             
-            #pragma unroll 1
+            #pragma unroll 2
             for (; n_block > n_block_min; --n_block) {
                 pipeline_v.consumer_wait(smem_pipe_read);
                 pipeline_vt.producer_acquire(smem_pipe_write);
@@ -629,27 +646,19 @@ struct CollectiveMainloopFwd {
             scheduler.broadcast_next_work(work_tile_info);
             
             pipeline_v.consumer_wait(smem_pipe_read);
-            if (n_block_max-n_block_min > kStages)
-                pipeline_vt.producer_acquire(smem_pipe_write);
+            // if (n_block_max-n_block_min > kStages)
+            pipeline_vt.producer_acquire(smem_pipe_write);
             do_transpose_V(smem_pipe_read.index());
             pipeline_vt.producer_commit(smem_pipe_write);
             pipeline_v.consumer_release(smem_pipe_read);
 
             ++smem_pipe_write;
             ++smem_pipe_read;
-        } else {
-            if (warp_idx_in_warpgroup == 0 && lane_predicate) {
-                shared_storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
-                copy(mainloop_params.tma_load_Q.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.barrier_Q), 0 /*mcast_mask*/), tQgQ, tQsQ);
-                pipeline_v.producer_acquire(smem_pipe_write);
-                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
-                    tVgV(_, n_block), tVsV(_, smem_pipe_write.index()));        
-            }
-            // With fp8 kernel, smem_o is in union with smem_v_out,
-            // so could use NamedBarrier instead of ClusterBarrier.
-            // But, this doesn't appear to have any benefit.
-            shared_storage.barrier_O.wait((work_idx + 1) % 2);
+        }
 
+        // deprecated
+        #if 0
+        else {
             pipeline_v.consumer_wait(smem_pipe_read);
             // pipeline_vt.producer_acquire(smem_pipe_write);
             do_transpose_V(smem_pipe_read.index());
@@ -707,6 +716,7 @@ struct CollectiveMainloopFwd {
             // scheduler.prefetch_next_work(scheduler_params, work_tile_info);
             // scheduler.broadcast_next_work(work_tile_info);
         }
+        #endif
     }
 
     /// Perform a Producer Epilogue to prevent early exit of blocks in a Cluster

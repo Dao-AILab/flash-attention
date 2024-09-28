@@ -49,7 +49,6 @@ def print_diffs(out, out_ref):
     "seqlen_q,seqlen_k",
     [
         (1, 1),
-        # (257, 1),
         (64, 128),
         (128, 128),
         (256, 256),
@@ -77,14 +76,16 @@ def test_flash_attn_output(
     else:
         dtype_init = dtype
     print(dtype)
+    print('causal',causal)
+    print('gqa_parallel',gqa_parallel)
     # set seed
-    torch.random.manual_seed(0)
+    torch.random.manual_seed(42)
     # batch_size = 40
     # nheads = 16
     batch_size = 4
     nheads = 6
     nheads_kv = 6 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
-    # nheads_kv = 2
+    # nheads_kv = 1
     # batch_size = 9
     # nheads = 6
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
@@ -101,15 +102,11 @@ def test_flash_attn_output(
     descale_k = torch.tensor([descale], dtype=torch.float32, device='cuda')
     descale_v = torch.tensor([descale], dtype=torch.float32, device='cuda')
 
-    # out, q, k, v, out_padded, lse, S_dmask = _flash_attn_forward(
-    #     q, k, v, softmax_scale, causal, descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, gqa_decoding=gqa_decoding
-    # )
     if(dtype != torch.float8_e4m3fn):
         out, lse = flash_attn_func(q, k, v, causal=causal, window_size=window_size, deterministic=deterministic, gqa_parallel=gqa_parallel)
     else:
-        out, q, k, v, out_padded, lse, S_dmask = _flash_attn_forward(
-            q, k, v, softmax_scale, causal, descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, gqa_parallel=gqa_parallel
-        )
+        out, lse = flash_attn_func(q, k, v, causal=causal, deterministic=deterministic, gqa_parallel=gqa_parallel,
+                                   descale_q=descale_q, descale_k=descale_k, descale_v=descale_v)
 
     q = q.to(dtype_init)
     k = k.to(dtype_init)

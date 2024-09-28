@@ -246,7 +246,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     static constexpr int kBlockH = Ktraits::kBlockH;
     // static constexpr int kBlockN = Ktraits::kBlockN;
     // static constexpr int kHeadDim = Ktraits::kHeadDim;
-    static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128;    
+    static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128 && Ktraits::kNWarps != 8;    
     static constexpr bool Use_max_offset = true;
 
     using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, /*Is_local=*/false, Seqlen_traits, Seqlen_traits_Q>;
@@ -316,10 +316,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
         __syncthreads();
     }
 
-    static_assert(Ktraits::kNWarps == 12 || Ktraits::kNWarps == 16);
+    static_assert(Ktraits::kNWarps == 8 || Ktraits::kNWarps == 12 || Ktraits::kNWarps == 16);
     if (warp_group_idx == 0) {  // Producer
-        cutlass::arch::warpgroup_reg_dealloc<Ktraits::kNWarps == 16 ? 32 : 40>();
-        
+        cutlass::arch::warpgroup_reg_dealloc<Ktraits::kNWarps == 16 ? 32 : Ktraits::kNWarps == 12 ? 40 : 56>();
+            
         PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>(); 
         PipelineState smem_pipe_read, smem_pipe_release;
 
@@ -369,7 +369,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
         }
         collective_mainloop.load_tail_one_write(pipeline_k, pipeline_v, smem_pipe_write);
     } else {  // Consumer
-        cutlass::arch::warpgroup_reg_alloc<Ktraits::kNWarps == 12 ? 232 : 160>();        
+        cutlass::arch::warpgroup_reg_alloc<Ktraits::kNWarps == 16 ? 160 : Ktraits::kNWarps == 12 ? 232 : 256>();        
 
         TileScheduler scheduler(&shared_storage.tile_count_semaphore);
         // Initialize matmul objects.

@@ -78,13 +78,41 @@ struct SharedStorageQKVOVt {
   };
 };
 
+// Use if Oaccum is too large for SharedStorageQKVOVt
+template <int kStages, class Gemm1Type, class Gemm2Type, class OutputType, class SmemLayoutQ,
+          class SmemLayoutK, class SmemLayoutV, class SmemLayoutO>
+struct SharedStorageQKVOVtaccum {
+  struct {
+    cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutQ>> smem_q;
+    cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutK>> smem_k;
+    union {
+        struct {
+            cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v;  
+            cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v_out;
+        };
+        cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
+    };
+  };
+  struct {    
+    cutlass::arch::ClusterTransactionBarrier barrier_Q;
+    cutlass::arch::ClusterBarrier barrier_O;
+    typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_k;
+    typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_v;
+    typename cutlass::PipelineAsync<kStages>::SharedStorage pipeline_vt;
+    int tile_count_semaphore;
+    float softmax_scale_qk_log2;
+    float descale_v;
+  };
+};
+
 // If Share_Q_K_smem is true, that forces Is_Q_in_regs to be true
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, int kStages_, bool Is_Q_in_regs_=false,
          int kClusterM_ = 1, typename elem_type=cutlass::half_t, bool Is_split_=false, int kBlockH_ = 1>
 struct Flash_fwd_kernel_traits {
     using Element = elem_type;
     using ElementAccum = float;
-    using OutputType = std::conditional_t<Is_split_, float, elem_type>;
+    using FinalOutputType = elem_type;
+    using OutputType = std::conditional_t<Is_split_, float, FinalOutputType>;
     using index_t = int64_t;
 
     // The number of threads.
@@ -186,7 +214,8 @@ struct Flash_fwd_kernel_traits_fp8 {
     using Element = elem_type;
     static_assert(cutlass::sizeof_bits_v<Element> == 8);
     using ElementAccum = float;
-    using OutputType = cutlass::half_t;
+    using FinalOutputType = cutlass::half_t;
+    using OutputType = std::conditional_t<Is_split_, float, FinalOutputType>;
     using index_t = int64_t;
 
     static constexpr bool Is_split = Is_split_;
@@ -197,7 +226,7 @@ struct Flash_fwd_kernel_traits_fp8 {
     static constexpr int NumProducerThreads = cutlass::NumThreadsPerWarpGroup;
 
     static constexpr bool Is_Q_in_regs = Is_Q_in_regs_;
-    static_assert(kNWarps_ == 12 || kNWarps_ == 16);
+    static_assert(kNWarps_ == 8 || kNWarps_ == 12 || kNWarps_ == 16);
     static constexpr bool Is_WS = true;    
     static_assert(!Is_Q_in_regs, "Warp-specialization does not support Q in registers");    
 
@@ -214,6 +243,8 @@ struct Flash_fwd_kernel_traits_fp8 {
 
     static constexpr int kStages = kStages_;
     static_assert(kStages > 1);
+
+    static constexpr bool VO_union_all = Is_split && (kBlockM != 64) && (kHeadDim == 256);
 
     using AtomLayoutMNK = Layout<Shape<Int<kBlockM / 64>, _1, _1>>;    
     using TiledMma0 = decltype(cute::make_tiled_mma(
@@ -296,8 +327,13 @@ struct Flash_fwd_kernel_traits_fp8 {
 
     using SmemCopyAtomQ = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
 
-    using SharedStorage = SharedStorageQKVOVt<kStages, Element, Element, OutputType, SmemLayoutQ,
-                          SmemLayoutK, SmemLayoutV, SmemLayoutO>;
+    // using SharedStorage = SharedStorageQKVOVt<kStages, Element, Element, OutputType, SmemLayoutQ,
+    //                       SmemLayoutK, SmemLayoutV, SmemLayoutO>;
+
+    using SharedStorage = std::conditional_t<!VO_union_all,
+        SharedStorageQKVOVt<kStages, Element, Element, OutputType, SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>,
+        SharedStorageQKVOVtaccum<kStages, Element, Element, OutputType, SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>
+    >;
 
     using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;
     using MainloopPipelineNoTMA = typename cutlass::PipelineAsync<kStages>;

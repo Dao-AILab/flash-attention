@@ -186,7 +186,7 @@ def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_se
                     causal=causal,
                     num_splits=1,
                     return_softmax_lse=True,
-                    gqa_decoding=False
+                    gqa_parallel=False
                 )
 
 
@@ -250,7 +250,7 @@ def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seq
                     causal=causal,
                     num_splits=1,
                     return_softmax_lse=True,
-                    gqa_decoding=False
+                    gqa_parallel=False
                 )
 
     # i=0 case is with num splits heuristic
@@ -264,7 +264,7 @@ def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seq
                     causal=causal,
                     num_splits=i,
                     return_softmax_lse=True,
-                    gqa_decoding=False,
+                    gqa_parallel=False,
                     max_seqlen_k_hint=context_seqlen
                 )
 
@@ -277,7 +277,7 @@ def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seq
                     causal=causal,
                     num_splits=i,
                     return_softmax_lse=True,
-                    gqa_decoding=True,
+                    gqa_parallel=True,
                     max_seqlen_k_hint=context_seqlen
                 )
 

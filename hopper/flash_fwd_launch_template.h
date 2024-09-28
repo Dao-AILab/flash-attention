@@ -173,7 +173,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     CHECK_CUDA_KERNEL_LAUNCH();
 
     if constexpr (Is_split) {
-      using FinalOutputType = Element;
+      using FinalOutputType = typename Kernel_traits::FinalOutputType;
       static_assert(is_same_v<OutputType, float>, "Assume OutputType of main kernel is float.");
       static_assert(is_same_v<ElementAccum, float>, "ElementAccum must be float.");
       // We want kBlockM to be as small as possible for more parallelism.
@@ -361,86 +361,214 @@ void run_mha_fwd_hdim256_gqa_decoding(Flash_fwd_params &params, cudaStream_t str
 template<typename T>
 void run_mha_fwd_hdim64_fp8(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
-    constexpr static int kBlockM = 192;
     constexpr static int kBlockN = 128;
-    constexpr static int kNWarps = 4 + kBlockM/16;
     constexpr static int kStages = 4;
-    using Seqlen_traits = flash::FixedSeqLenTraitsStatic;
-    if(params.is_causal) {
-        run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
-                        false, 1, T>, /*Is_causal=*/true, /*Is_local=*/false, Seqlen_traits>(params, stream);
-    } else {
-        BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0, UseCluster, [&] {
-            run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
-                            false, UseCluster ? 2 : 1, T>, /*Is_causal=*/false, /*Is_local=*/false, Seqlen_traits>(params, stream);
+    constexpr static bool UseCluster = false;
+    // constexpr static int kBlockM = 192;
+    // constexpr static int kNWarps = 4 + kBlockM/16;
+    
+    // using Seqlen_traits = flash::FixedSeqLenTraitsStatic;
+    // if(params.is_causal) {
+    //     run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
+    //                     false, 1, T>, /*Is_causal=*/true, Seqlen_traits>(params, stream);
+    // } else {
+    //     BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0, UseCluster, [&] {
+    //         run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
+    //                         false, UseCluster ? 2 : 1, T>, /*Is_causal=*/false, Seqlen_traits>(params, stream);
+    //     });
+    // }
+
+    // NOTE: Need to modify for varseqlen
+    // Seqlen_traits made "fixed dynamic" for kv cache
+    using Seqlen_traits_Q = flash::FixedSeqLenTraitsStatic;
+    MMA_3WG_SWITCH(params.seqlen_q, kNumMmaWGs, [&] {
+      BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        BOOL_SWITCH(params.num_splits > 1, Is_split, [&] {
+          // BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, 192) % 2 == 0 && !Is_causal && !Is_split, UseCluster, [&] {
+            BOOL_SWITCH(params.is_kv_cache && params.cu_seqlens_k, Is_seqlen_dynamic, [&] {
+              run_flash_fwd<
+                Flash_fwd_kernel_traits_fp8<Headdim, kNumMmaWGs * 64, kBlockN, 4 + kNumMmaWGs * 4,
+                  kStages, false, UseCluster ? 2 : 1, T, Is_split>,
+                Is_causal,
+                /*Is_local=*/false,
+                std::conditional_t<Is_seqlen_dynamic, flash::FixedSeqLenTraitsDynamic, flash::FixedSeqLenTraitsStatic>,
+                Seqlen_traits_Q
+              >(params, stream);
+            });
+          // });
         });
-    }
-    // BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        // SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
-            // Only use Cluster if number of tiles along seqlen_q is even
-            // BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0 && !Is_causal &&
-            //             !Seqlen_traits::kUseVarSeqLen, UseCluster, [&] {
-            //     run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
-            //                   false, UseCluster ? 2 : 1, T>, Is_causal, Seqlen_traits>(params, stream);            
-            // });
-        // });
-    // });
+      });
+    });
+}
+
+template<typename T>
+void run_mha_fwd_hdim64_fp8_gqa_decoding(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 64;
+    constexpr static int kBlockN = 128;
+    constexpr static int kStages = 4;
+    // constexpr static bool UseCluster = false;
+
+    // Change for varseqlen
+    using Seqlen_traits_Q = flash::DecodingGQASeqLenTraits;
+
+    QUERYHEAD_SWITCH(params.h_h_k_ratio, kBlockH, [&] {
+      MMA_3WG_SWITCH(kBlockH * params.seqlen_q, kNumMmaWGs, [&] {
+        BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+          BOOL_SWITCH(params.num_splits > 1, Is_split, [&] {
+            BOOL_SWITCH(params.is_kv_cache && params.cu_seqlens_k, Is_seqlen_dynamic, [&] {
+              run_flash_fwd<
+                Flash_fwd_kernel_traits_fp8<Headdim, kNumMmaWGs * 64, kBlockN, 4 + kNumMmaWGs * 4,
+                  kStages, false, 1, T, Is_split, kBlockH>,
+                Is_causal,
+                std::conditional_t<Is_seqlen_dynamic, flash::FixedSeqLenTraitsDynamic, flash::FixedSeqLenTraitsStatic>,
+                Seqlen_traits_Q
+              >(params, stream);
+            });
+          });
+        });
+      });
+    });
 }
 
 template<typename T>
 void run_mha_fwd_hdim128_fp8(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
-    constexpr static int kBlockM = 128;
     constexpr static int kBlockN = 256;
-    constexpr static int kNWarps = 4 + kBlockM/16;
     constexpr static int kStages = 2;
-    using Seqlen_traits = flash::FixedSeqLenTraitsStatic;
-    if(params.is_causal) {
-        run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
-                        false, 1, T>, /*Is_causal=*/true, /*Is_local=*/false, Seqlen_traits>(params, stream);
-    } else {
-        BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0, UseCluster, [&] {
-            run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
-                            false, UseCluster ? 2 : 1, T>, /*Is_causal=*/false, /*Is_local=*/false, Seqlen_traits>(params, stream);
+    // constexpr static int kBlockM = 128;
+    // constexpr static int kNWarps = 4 + kBlockM/16;
+    // using Seqlen_traits = flash::FixedSeqLenTraitsStatic;
+    // if(params.is_causal) {
+    //     run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
+    //                     false, 1, T>, /*Is_causal=*/true, Seqlen_traits>(params, stream);
+    // } else {
+    //     BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0, UseCluster, [&] {
+    //         run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
+    //                         false, UseCluster ? 2 : 1, T>, /*Is_causal=*/false, Seqlen_traits>(params, stream);
+    //     });
+    // }
+
+    // NOTE: Need to modify for varseqlen
+    // Seqlen_traits made "fixed dynamic" for kv cache
+    using Seqlen_traits_Q = flash::FixedSeqLenTraitsStatic;
+    MMA_2WG_SWITCH(params.seqlen_q, kNumMmaWGs, [&] {
+      BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        BOOL_SWITCH(params.num_splits > 1, Is_split, [&] {
+          BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, 128) % 2 == 0 && !Is_causal && !Is_split, UseCluster, [&] {
+            BOOL_SWITCH(params.is_kv_cache && params.cu_seqlens_k, Is_seqlen_dynamic, [&] {
+              run_flash_fwd<
+                Flash_fwd_kernel_traits_fp8<Headdim, kNumMmaWGs * 64, kBlockN, 4 + kNumMmaWGs * 4,
+                  kStages, false, UseCluster ? 2 : 1, T, Is_split>,
+                Is_causal,
+                /*Is_local=*/false,
+                std::conditional_t<Is_seqlen_dynamic, flash::FixedSeqLenTraitsDynamic, flash::FixedSeqLenTraitsStatic>,
+                Seqlen_traits_Q
+              >(params, stream);
+            });
+          });
         });
-    }
-    // BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        // SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
-            // Only use Cluster if number of tiles along seqlen_q is even
-            // BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0 && !Is_causal &&
-            //             !Seqlen_traits::kUseVarSeqLen, UseCluster, [&] {
-            //     run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
-            //                   false, UseCluster ? 2 : 1, T>, Is_causal, Seqlen_traits>(params, stream);
-            // });
-        // });
-    // });
+      });
+    });
+}
+
+template<typename T>
+void run_mha_fwd_hdim128_fp8_gqa_decoding(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 128;
+    constexpr static int kBlockN = 256;
+    constexpr static int kStages = 2;
+    // constexpr static bool UseCluster = false;
+
+    // Change for varseqlen
+    using Seqlen_traits_Q = flash::DecodingGQASeqLenTraits;
+
+    // constexpr static bool Is_seqlen_dynamic = false;
+    // constexpr static bool Is_split = false;
+
+    QUERYHEAD_SWITCH(params.h_h_k_ratio, kBlockH, [&] {
+      MMA_2WG_SWITCH(kBlockH * params.seqlen_q, kNumMmaWGs, [&] {
+        BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+          BOOL_SWITCH(params.num_splits > 1, Is_split, [&] {
+            BOOL_SWITCH(params.is_kv_cache && params.cu_seqlens_k, Is_seqlen_dynamic, [&] {
+              run_flash_fwd<
+                Flash_fwd_kernel_traits_fp8<Headdim, kNumMmaWGs * 64, kBlockN, 4 + kNumMmaWGs * 4,
+                  kStages, false, 1, T, Is_split, kBlockH>,
+                Is_causal,
+                std::conditional_t<Is_seqlen_dynamic, flash::FixedSeqLenTraitsDynamic, flash::FixedSeqLenTraitsStatic>,
+                Seqlen_traits_Q
+              >(params, stream);
+            });
+          });
+        });
+      });
+    });
 }
 
 template<typename T>
 void run_mha_fwd_hdim256_fp8(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 256; 
-    constexpr static int kBlockM = 128;
     constexpr static int kBlockN = 128;
-    constexpr static int kNWarps = 4 + kBlockM/16;
     constexpr static int kStages = 2;
-    using Seqlen_traits = flash::FixedSeqLenTraitsStatic;
-    if(params.is_causal) {
-        run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
-                        false, 1, T>, /*Is_causal=*/true, /*Is_local=*/false, Seqlen_traits>(params, stream);
-    } else {
-        BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0, UseCluster, [&] {
-            run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
-                            false, UseCluster ? 2 : 1, T>, /*Is_causal=*/false, /*Is_local=*/false, Seqlen_traits>(params, stream);
+    // constexpr static int kBlockM = 128;
+    // constexpr static int kNWarps = 4 + kBlockM/16;
+    // using Seqlen_traits = flash::FixedSeqLenTraitsStatic;
+    // if(params.is_causal) {
+    //     run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
+    //                     false, 1, T>, /*Is_causal=*/true, Seqlen_traits>(params, stream);
+    // } else {
+    //     BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0, UseCluster, [&] {
+    //         run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
+    //                         false, UseCluster ? 2 : 1, T>, /*Is_causal=*/false, Seqlen_traits>(params, stream);
+    //     });
+    // }
+
+    // NOTE: Need to modify for varseqlen
+    // Seqlen_traits made "fixed dynamic" for kv cache
+    using Seqlen_traits_Q = flash::FixedSeqLenTraitsStatic;
+    MMA_2WG_SWITCH(params.seqlen_q, kNumMmaWGs, [&] {
+      BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        BOOL_SWITCH(params.num_splits > 1, Is_split, [&] {
+          BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, 128) % 2 == 0 && !Is_causal && !Is_split, UseCluster, [&] {
+            BOOL_SWITCH(params.is_kv_cache && params.cu_seqlens_k, Is_seqlen_dynamic, [&] {
+              run_flash_fwd<
+                Flash_fwd_kernel_traits_fp8<Headdim, kNumMmaWGs * 64, kBlockN, 4 + kNumMmaWGs * 4,
+                  kStages, false, UseCluster ? 2 : 1, T, Is_split>,
+                Is_causal,
+                /*Is_local=*/false,
+                std::conditional_t<Is_seqlen_dynamic, flash::FixedSeqLenTraitsDynamic, flash::FixedSeqLenTraitsStatic>,
+                Seqlen_traits_Q
+              >(params, stream);
+            });
+          });
         });
-    }
-    // BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        // SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
-            // Only use Cluster if number of tiles along seqlen_q is even
-            // BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, kBlockM) % 2 == 0 && !Is_causal &&
-            //             !Seqlen_traits::kUseVarSeqLen, UseCluster, [&] {
-            //     run_flash_fwd<Flash_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, kStages,
-            //                   false, UseCluster ? 2 : 1, T>, Is_causal, Seqlen_traits>(params, stream);
-            // });
-        // });
-    // });
+      });
+    });
+}
+
+template<typename T>
+void run_mha_fwd_hdim256_fp8_gqa_decoding(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 256;
+    constexpr static int kBlockN = 128;
+    constexpr static int kStages = 2;
+    // constexpr static bool UseCluster = false;
+
+    // Change for varseqlen
+    using Seqlen_traits_Q = flash::DecodingGQASeqLenTraits;
+
+    QUERYHEAD_SWITCH(params.h_h_k_ratio, kBlockH, [&] {
+      MMA_2WG_SWITCH(kBlockH * params.seqlen_q, kNumMmaWGs, [&] {
+        BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+          BOOL_SWITCH(params.num_splits > 1, Is_split, [&] {
+            BOOL_SWITCH(params.is_kv_cache && params.cu_seqlens_k, Is_seqlen_dynamic, [&] {
+              run_flash_fwd<
+                Flash_fwd_kernel_traits_fp8<Headdim, kNumMmaWGs * 64, kBlockN, 4 + kNumMmaWGs * 4,
+                  kStages, false, 1, T, Is_split, kBlockH>,
+                Is_causal,
+                std::conditional_t<Is_seqlen_dynamic, flash::FixedSeqLenTraitsDynamic, flash::FixedSeqLenTraitsStatic>,
+                Seqlen_traits_Q
+              >(params, stream);
+            });
+          });
+        });
+      });
+    });
 }
