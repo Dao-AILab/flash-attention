@@ -248,15 +248,27 @@ struct CollectiveMainloopFwd {
         // int const seqlen_k = seqlen_traits_k.actual_seq_len;
         int const seqlen_q = Seqlen_traits_Q::Is_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
         int const seqlen_k = Seqlen_traits::Is_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
-        int const num_n_blocks = ceil_div(seqlen_k, kBlockN);
-        int const n_blocks_per_split
-            = mainloop_params.num_splits_divmod.divide(num_n_blocks + int(mainloop_params.num_splits_divmod) - 1);
-        n_block_min = n_split_idx * n_blocks_per_split;
-        n_block_max = min(num_n_blocks, (n_split_idx + 1) * n_blocks_per_split);
+        n_block_max = cute::ceil_div(seqlen_k, kBlockN);
+        
+        if constexpr(Is_split) {
+            // int const num_n_blocks = ceil_div(seqlen_k, kBlockN);
+            int const n_blocks_per_split
+                = mainloop_params.num_splits_divmod.divide(n_block_max + int(mainloop_params.num_splits_divmod) - 1);
+            n_block_min = n_split_idx * n_blocks_per_split;
+            n_block_max = std::min(n_block_max, (n_split_idx + 1) * n_blocks_per_split);
+        }
 
         if constexpr (Is_causal) {
-            n_block_max = std::min(n_block_max,
+            n_block_max = std::min(
+                n_block_max,
                 cute::ceil_div((m_block + 1) * kBlockM_div_H + seqlen_k - seqlen_q, kBlockN));
+        } else if constexpr (Is_local) {
+            n_block_max = std::min(
+                n_block_max,
+                cute::ceil_div((m_block + 1) * kBlockM_div_H + seqlen_k - seqlen_q + mainloop_params.window_size_right, kBlockN));
+            n_block_min = std::max(
+                n_block_min,
+                (m_block * kBlockM_div_H + seqlen_k - seqlen_q - mainloop_params.window_size_left) / kBlockN);
         }
     }
 
@@ -279,50 +291,6 @@ struct CollectiveMainloopFwd {
         if constexpr (Is_causal) {
             n_block_max = std::min(n_block_max,
                 cute::ceil_div((m_block + 1) * kBlockM_div_H + seqlen_k - seqlen_q, kBlockN));
-        }
-    }
-
-#if 0
-    CUTLASS_DEVICE
-    int get_n_block_max(
-          Params const& mainloop_params, int m_block, 
-          const Seqlen_traits_Q& seqlen_traits_q,
-          const Seqlen_traits& seqlen_traits_k
-        ) {
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
-        static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        static constexpr int kBlockM_div_H = kBlockM/Ktraits::kBlockH;  
-        // int const seqlen_q = Seqlen_traits_Q::UseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        // int const seqlen_k = Seqlen_traits::UseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
-        int const seqlen_q = seqlen_traits_q.actual_seq_len;
-        int const seqlen_k = seqlen_traits_k.actual_seq_len;
-        int n_block_max = cute::ceil_div(seqlen_k, kBlockN);
-        if constexpr (Is_causal || Is_local) {
-            n_block_max = std::min(
-                n_block_max,
-                cute::ceil_div((m_block + 1) * kBlockM_div_H + seqlen_k - seqlen_q + mainloop_params.window_size_right, kBlockN));
-        }
-        return n_block_max;
-    }
-#endif
-
-    CUTLASS_DEVICE
-    int get_n_block_min(
-          Params const& mainloop_params, int m_block, 
-          const Seqlen_traits& seqlen_traits_q,
-          const Seqlen_traits& seqlen_traits_k
-        ) {
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
-        static constexpr int kBlockN = get<1>(TileShape_MNK{});        
-        int const seqlen_q = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        int const seqlen_k = Seqlen_traits::kUseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);        
-        if constexpr (!Is_local) {
-            return 0;
-        } else {
-            return std::max(
-                0, 
-                (m_block * kBlockM + seqlen_k - seqlen_q - mainloop_params.window_size_left) / kBlockN
-            );
         }
     }
 

@@ -126,15 +126,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                     }
                 }
                 int n_block_min = 0, n_block_max;
-                if constexpr(Ktraits::Is_split) {
-                    collective_mainloop.get_n_block_min_max(
+                collective_mainloop.get_n_block_min_max(
                         mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
                         n_block_min, n_block_max);
-                } else {
-                    collective_mainloop.get_n_block_max(
-                        mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k, n_block_max);
-                }
-                if constexpr (Is_causal || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
+                if constexpr (Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                     if(n_block_max <= n_block_min) {
                         scheduler.prefetch_next_work(scheduler_params, work_tile_info);
                         scheduler.broadcast_next_work(work_tile_info);
@@ -184,15 +179,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 }
             }
             int n_block_max, n_block_min = 0;
-            if constexpr(Ktraits::Is_split) {
-                collective_mainloop.get_n_block_min_max(
+            collective_mainloop.get_n_block_min_max(
                     mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
                     n_block_min, n_block_max);
-            } else {
-                collective_mainloop.get_n_block_max(
-                    mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k, n_block_max);
-            }
-            if constexpr (Is_causal || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
+            if constexpr (Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                 if(n_block_max <= n_block_min) {  // We exit early and write 0 to gO and -inf to gLSE.
                     if constexpr(!Seqlen_traits_Q::DecodingGQA) {
                         collective_epilogue.store_zero(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads,
@@ -341,15 +331,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 }
             }
             int n_block_min = 0, n_block_max;
-            if constexpr(Ktraits::Is_split) {
-                collective_mainloop.get_n_block_min_max(
+            collective_mainloop.get_n_block_min_max(
                     mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
                     n_block_min, n_block_max);
-            } else {
-                collective_mainloop.get_n_block_max(
-                    mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k, n_block_max);
-            }
-            if constexpr (Is_causal || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
+            if constexpr (Is_causal || Is_local ||seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                 if(n_block_max <= n_block_min) {
                     scheduler.prefetch_next_work(scheduler_params, work_tile_info);
                     scheduler.broadcast_next_work(work_tile_info);
@@ -401,15 +386,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 }
             }
             int n_block_max, n_block_min = 0;
-            if constexpr(Ktraits::Is_split) {
-                collective_mainloop.get_n_block_min_max(
+            collective_mainloop.get_n_block_min_max(
                     mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
                     n_block_min, n_block_max);
-            } else {
-                collective_mainloop.get_n_block_max(
-                    mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k, n_block_max);
-            }
-            if constexpr (Is_causal || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
+            if constexpr (Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                 if(n_block_max <= n_block_min) {  // We exit early and write 0 to gO and -inf to gLSE.
                     if constexpr(!Seqlen_traits_Q::DecodingGQA) {
                         collective_epilogue.store_zero(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads,
