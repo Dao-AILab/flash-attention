@@ -202,6 +202,7 @@ def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_se
 @pytest.mark.parametrize("context_seqlen", [4096, 16384, 65536])
 @pytest.mark.parametrize("headdim", [64, 128, 256])
 @pytest.mark.parametrize("cache_seqlen_rand", [True, False])
+@pytest.mark.parametrize("gqa_parallel", [True, False])
 @pytest.mark.parametrize(
     "nheads_kv, gqa_ratio",
     [
@@ -216,7 +217,7 @@ def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_se
         (8, 2),
     ],
 )
-def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, use_heuristic_only, cache_seqlen_rand):
+def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, use_heuristic_only, cache_seqlen_rand, gqa_parallel):
     device = "cuda"
     num_caches = 16
     if context_seqlen <= 65536:
@@ -238,7 +239,7 @@ def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seq
     # print(f"***{model_name}***")
     q = torch.randn((num_requests, query_seqlen, nheads_q, headdim), device="cuda", dtype=torch.bfloat16)
     cache_idxs = torch.randperm(num_caches, dtype=torch.int32, device="cuda")[:num_requests]
-    cache_seqlens = torch.randint(query_seqlen, context_seqlen-1, (num_requests,), dtype=torch.int32).to(device) if cache_seqlen_rand else torch.tensor([context_seqlen] * num_requests, dtype=torch.int32, device="cuda")
+    cache_seqlens = torch.randint(1, context_seqlen-1, (num_requests,), dtype=torch.int32).to(device) if cache_seqlen_rand else torch.tensor([context_seqlen] * num_requests, dtype=torch.int32, device="cuda")
     torch.cuda.synchronize()
 
     out_ref, lse_ref = flash_attn_interface.flash_attn_with_kvcache(
@@ -264,47 +265,32 @@ def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seq
                     causal=causal,
                     num_splits=i,
                     return_softmax_lse=True,
-                    gqa_parallel=False,
-                    max_seqlen_k_hint=context_seqlen
-                )
-
-                out_fa3_gqa, lse_fa3_gqa = flash_attn_interface.flash_attn_with_kvcache(
-                    q=q,
-                    k_cache=k_cache,
-                    v_cache=v_cache,
-                    cache_seqlens=cache_seqlens,
-                    cache_batch_idx=cache_idxs,
-                    causal=causal,
-                    num_splits=i,
-                    return_softmax_lse=True,
-                    gqa_parallel=True,
+                    gqa_parallel=gqa_parallel,
                     max_seqlen_k_hint=context_seqlen
                 )
 
                 torch.cuda.synchronize()
+                print ('output-ref', i, out_ref)
+                print ('output-fa3',i, out_fa3)
                 print ('output-max-diff', i, context_seqlen, (out_ref - out_fa3).abs().max().item())
                 print ('output-mean-diff',i, context_seqlen, (out_ref - out_fa3).abs().mean().item())
-                print ('output-max-diff gqa', i, context_seqlen, (out_ref - out_fa3_gqa).abs().max().item())
-                print ('output-mean-diff gqa',i, context_seqlen, (out_ref - out_fa3_gqa).abs().mean().item())
                 print ('lse-max-diff',i, context_seqlen, (lse_ref - lse_fa3).abs().max().item())
                 print ('lse-mean-diff',i,  context_seqlen, (lse_ref - lse_fa3).abs().mean().item())
-                print ('lse-max-diff gqa',i, context_seqlen, (lse_ref - lse_fa3_gqa).abs().max().item())
-                print ('lse-mean-diff gqa',i, context_seqlen, (lse_ref - lse_fa3_gqa).abs().mean().item())
 
                 if cache_seqlen_rand:
                     assert ((out_ref - out_fa3).abs().max().item() <= 1e-2)
-                    assert ((out_ref - out_fa3_gqa).abs().max().item() <= 1e-2)
                     assert ((out_ref - out_fa3).abs().mean().item() <= 1e-3)
-                    assert ((out_ref - out_fa3_gqa).abs().mean().item() <= 1e-3)
                 else:
                     assert ((out_ref - out_fa3).abs().max().item() <= 2e-3)
-                    assert ((out_ref - out_fa3_gqa).abs().max().item() <= 2e-3)
                     assert ((out_ref - out_fa3).abs().mean().item() <= 1e-4)
-                    assert ((out_ref - out_fa3_gqa).abs().mean().item() <= 1e-4)
-                assert ((lse_ref - lse_fa3).abs().max().item() <= 1e-3)
-                assert ((lse_ref - lse_fa3).abs().mean().item() <= 1e-4)
-                assert ((lse_ref - lse_fa3_gqa).abs().max().item() <= 1e-3)
-                assert ((lse_ref - lse_fa3_gqa).abs().mean().item() <= 1e-4)
+                lse_max_ref = lse_ref.abs().max().item()
+                lse_mean_ref = lse_ref.abs().mean().item()
+                lse_max_fa3 = lse_fa3.abs().max().item()
+                lse_mean_fa3 = lse_fa3.abs().mean().item()
+                lse_max_diff = (lse_ref - lse_fa3).abs().max().item()
+                lse_mean_diff = (lse_ref - lse_fa3).abs().mean().item()
+                assert ((lse_max_ref == math.inf and lse_max_fa3 == math.inf) or lse_max_diff <= 1e-3)
+                assert ((lse_mean_ref == math.inf and lse_mean_fa3 == math.inf) or lse_mean_diff <= 1e-4)
 
 if __name__ == "__main__":
     main()
