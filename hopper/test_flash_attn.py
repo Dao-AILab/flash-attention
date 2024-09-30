@@ -24,7 +24,6 @@ def print_diffs(out, out_ref):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-# @pytest.mark.parametrize("dtype", [torch.float16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
@@ -107,7 +106,7 @@ def test_flash_attn_output(
     if(dtype != torch.float8_e4m3fn):
         out, lse = flash_attn_func(q, k, v, causal=causal, window_size=window_size, deterministic=deterministic, gqa_parallel=gqa_parallel)
     else:
-        out, lse = flash_attn_func(q, k, v, causal=causal, deterministic=deterministic, gqa_parallel=gqa_parallel,
+        out, lse = flash_attn_func(q, k, v, causal=causal, window_size=window_size, deterministic=deterministic, gqa_parallel=gqa_parallel,
                                    descale_q=descale_q, descale_k=descale_k, descale_v=descale_v)
 
     q = q.to(dtype_init)
