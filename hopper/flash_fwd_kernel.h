@@ -221,9 +221,9 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
 }
 
-template <typename Ktraits, bool Is_causal, typename TileScheduler, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
+template <typename Ktraits, bool Is_causal, bool Is_local, typename TileScheduler, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
 __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1)
-    compute_attn_ws_fp8(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal, /*Is_local=*/false, Seqlen_traits, Seqlen_traits_Q>::Params const mainloop_params,
+    compute_attn_ws_fp8(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>::Params const mainloop_params,
                         CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>::Params const epilogue_params,
                         CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params,
                         Seqlen_traits_Q seqlen_traits_q, Seqlen_traits seqlen_traits_k
@@ -249,7 +249,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128 && Ktraits::kNWarps != 8;    
     static constexpr bool Use_max_offset = true;
 
-    using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, /*Is_local=*/false, Seqlen_traits, Seqlen_traits_Q>;
+    using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>;
     using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>;
 
     using MainloopPipeline = typename Ktraits::MainloopPipeline;

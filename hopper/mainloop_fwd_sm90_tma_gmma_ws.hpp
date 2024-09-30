@@ -899,6 +899,7 @@ struct CollectiveMainloopFwd {
                 0,
                 row + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM_div_H - mainloop_params.window_size_left
             );
+        };
         auto col_limit_causal = [&](int row, int n_block_idx) {
             return row + 1 + seqlen_k - n_block_idx * kBlockN - seqlen_q + m_block * kBlockM_div_H;
         };

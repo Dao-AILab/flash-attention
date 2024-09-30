@@ -229,7 +229,8 @@ dim = 2048
 # dim = 256
 dropout_p = 0.0
 
-methods = (["Pytorch", "Flash3", "cuDNN"]        
+methods = (["Pytorch", "Flash3"]
+        + (["cuDNN"] if cudnn is not None else [])
         # + (["Triton"] if attention_triton is not None else [])
         #    + (["xformers.c"] if xops is not None else [])
         #    + (["xformers.f"] if xops is not None else [])
@@ -289,7 +290,8 @@ for causal in causal_vals:
                 k, 
                 v, 
                 softmax_scale, 
-                causal=causal, 
+                causal=causal,
+                window_size=(-1,-1),
                 descale_q=descale_q, 
                 descale_k=descale_k, 
                 descale_v=descale_v, 
