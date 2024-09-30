@@ -857,10 +857,15 @@ struct CollectiveMainloopFwd {
         }
 
         auto col_limit_right = [&](int row, int n_block) {
-            return std::min(
-                seqlen_k - n_block * kBlockN, 
-                row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM_div_H + mainloop_params.window_size_right
-            );
+            // return std::min(
+            //     seqlen_k - n_block * kBlockN, 
+            //     row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM_div_H + mainloop_params.window_size_right
+            // );
+            int col_limit_base = row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM_div_H;
+            if constexpr(Is_local)
+                return col_limit_base + mainloop_params.window_size_right;
+            else
+                return col_limit_base;
         };
         auto col_limit_left = [&](int row, int n_block) {
             return std::max(
@@ -868,30 +873,29 @@ struct CollectiveMainloopFwd {
                 row + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM_div_H - mainloop_params.window_size_left
             );
         };
-        auto col_limit_causal = [&](int row, int n_block_idx) {
-            return row + 1 + seqlen_k - n_block_idx * kBlockN - seqlen_q + m_block * kBlockM_div_H;
+        auto col_limit_causal = [&](int row, int n_block) {
+            return row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM_div_H;
         };
         {
             Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
             Tensor tScS = threadMma0.partition_C(cS);
             #pragma unroll
             for (int i = 0; i < size(tSrS); ++i) {
-                if constexpr (!Is_causal) {  // Just masking based on col
+                if constexpr (!Is_causal && !Is_local) {  // Just masking based on col
                     if (int(get<1>(tScS(i))) >= int(seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
                 } else {  // mask based on both row and col
                     // using std::min is faster than doing col >= limit0 or col >= limit1
                     // Need to cast get<1>(tScS(i)) to (signed) int since by default it's unsigned, and the
                     // right hand side can be negative and might be converted to a very large unsigned integer.
                     int row = int(get<0>(tScS(i))) / kBlockH;
-                    if (int(get<1>(tScS(i))) >= std::min(seqlen_k - n_block * kBlockN,
-                                                        col_limit_causal(row, n_block))) {
+                    if (int(get<1>(tScS(i))) >= std::min(seqlen_k - n_block * kBlockN, col_limit_right(row, n_block))) {
                         tSrS(i) = -INFINITY;
-                    } else if constexpr (Is_local) {
-                        if (int(get<1>(tScS(i))) < col_limit_left(int(get<0>(tScS(i))), n_block)) {
+                    } else if constexpr(Is_local) {
+                        if (int(get<1>(tScS(i))) < col_limit_left(row, n_block)) {
                             tSrS(i) = -INFINITY;
                         }
                     }
-                }
+                } 
             }
         }
 
@@ -921,7 +925,7 @@ struct CollectiveMainloopFwd {
             #pragma unroll
             for (int i = 0; i < size(tSrS); ++i) {
                 int row = int(get<0>(tScS(i))) / kBlockH;
-                if (int(get<1>(tScS(i))) >= col_limit_causal(row, n_block - 1)) {
+                if (int(get<1>(tScS(i))) >= col_limit_right(row, n_block - 1)) {
                     tSrS(i) = -INFINITY;
                 }
             }
@@ -952,9 +956,10 @@ struct CollectiveMainloopFwd {
                 Tensor tScS = threadMma0.partition_C(cS);
                 #pragma unroll
                 for (int i = 0; i < size(tSrS); ++i) {
+                    int row = int(get<0>(tScS(i))) / kBlockH;
                     if (
-                        int(get<1>(tScS(i))) >= col_limit_right(int(get<0>(tScS(i))), n_block - 1) ||
-                        int(get<1>(tScS(i))) < col_limit_left(int(get<0>(tScS(i))), n_block - 1)
+                        int(get<1>(tScS(i))) >= col_limit_right(row, n_block - 1) ||
+                        int(get<1>(tScS(i))) < col_limit_left(row, n_block - 1)
                     ) {
                         tSrS(i) = -INFINITY;
                     }

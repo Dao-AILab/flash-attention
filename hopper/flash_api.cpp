@@ -575,7 +575,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      /*window_size_left=*/window_size_left,
                      /*window_size_right=*/window_size_right);
 
-    auto tile_count_semaphore = is_causal ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
+    auto tile_count_semaphore = is_causal || params.is_local
+        ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
 
     if(q_dtype == at::ScalarType::Float8_e4m3fn) {
@@ -1508,7 +1509,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
        params, batch_size, num_heads, num_heads_k, head_size, max_seqlen_k_hint, seqlen_q,
        head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, use_gqa_decoding, is_causal, opts);
     
-    auto tile_count_semaphore = is_causal || params.num_splits != 1
+    auto tile_count_semaphore = is_causal || params.is_local || params.num_splits != 1
         ? torch::zeros({1}, opts.dtype(torch::kInt32))
         : torch::empty({1}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
