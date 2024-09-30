@@ -197,12 +197,14 @@ __global__ void combine_attn_seqk_parallel(Params const params) {
             for (int m = 0; m < size<1>(tOrOaccum); ++m) {
                 int row = get<0>(tOcOaccum(0, m, 0));
                 ElementAccum lse_scale = sLSE(split,row);
-                #pragma unroll
-                for (int k = 0; k < size<2>(tOrOaccum); ++k) {
+                if (lse_scale != 0.f) {
                     #pragma unroll
-                    for (int i = 0; i < size<0>(tOrOaccum); ++i) {
-                        tOrO(i, m, k) += lse_scale * tOrOaccum(i, m, k);
-                        //tOrO(i, m, k) += tOrOaccum(i, m, k);
+                    for (int k = 0; k < size<2>(tOrOaccum); ++k) {
+                        #pragma unroll
+                        for (int i = 0; i < size<0>(tOrOaccum); ++i) {
+                            tOrO(i, m, k) += lse_scale * tOrOaccum(i, m, k);
+                            //tOrO(i, m, k) += tOrOaccum(i, m, k);
+                        }
                     }
                 }
             //if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE(split, 0), sLSE(split, 1)); print_tensor(tOrOaccum); }

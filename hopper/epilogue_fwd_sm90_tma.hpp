@@ -366,30 +366,34 @@ struct CollectiveEpilogueFwd {
           ) {
         static_assert(!Seqlen_traits::DecodingGQA, "Don't call store_zero for gqa decoding.");
         auto [m_block, n_split_idx, bidh, bidb] = block_coord;
-        Tensor mO = make_tensor(make_gmem_ptr(epilogue_params.ptr_O), epilogue_params.layout_O);
-        Tensor gO = seqlen_traits_q.get_o_local_tile_tensor<Is_split>(
-            mO, select<0, 2>(TileShape_MNK{}), bidh, bidb, n_split_idx
-        )(_, _, m_block);  // (M, K)
+
+        if constexpr(!Is_split) {
+            Tensor mO = make_tensor(make_gmem_ptr(epilogue_params.ptr_O), epilogue_params.layout_O);
+            Tensor gO = seqlen_traits_q.get_o_local_tile_tensor<Is_split>(
+                mO, select<0, 2>(TileShape_MNK{}), bidh, bidb, n_split_idx
+            )(_, _, m_block);  // (M, K)
+
+            TiledCopyO gmem_tiled_copy_O;
+            auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
+            Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+            Tensor tOrO = make_fragment_like(tOgO);
+            clear(tOrO);
+            // Construct identity layout for sO
+            Tensor cO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));  // (BLK_M,BLK_K) -> (blk_m,blk_k)
+            // Repeat the partitioning with identity layouts
+            Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+            Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+            #pragma unroll
+            for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(epilogue_params.layout_O.shape()); }
+            // Clear_OOB_K must be false since we don't want to write zeros to gmem
+            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, seqlen_traits_q.actual_seq_len - m_block * kBlockM
+            );
+        }
+        
         Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.ptr_LSE), epilogue_params.layout_LSE);
         Tensor gLSE = seqlen_traits_q.get_lse_local_tile_tensor<Is_split>(
             mLSE, Shape<Int<kBlockM>>{}, bidh, bidb, n_split_idx)(_, m_block);
-
-        TiledCopyO gmem_tiled_copy_O;
-        auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
-        Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
-        Tensor tOrO = make_fragment_like(tOgO);
-        clear(tOrO);
-        // Construct identity layout for sO
-        Tensor cO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));  // (BLK_M,BLK_K) -> (blk_m,blk_k)
-        // Repeat the partitioning with identity layouts
-        Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
-        Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
-        #pragma unroll
-        for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(epilogue_params.layout_O.shape()); }
-        // Clear_OOB_K must be false since we don't want to write zeros to gmem
-        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-            gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, seqlen_traits_q.actual_seq_len - m_block * kBlockM
-        );
         static_assert(kBlockM <= NumMmaThreads);
         if (thread_idx < min(kBlockM, seqlen_traits_q.actual_seq_len - m_block * kBlockM)) {
             gLSE(thread_idx) = !Is_split ? INFINITY : -INFINITY;
@@ -414,45 +418,47 @@ struct CollectiveEpilogueFwd {
         const int h_bound = min(shape<1>(epilogue_params.layout_O) - h_block * kBlockH, kBlockH);
         const int m_bound = min(seqlen_traits_q.actual_seq_len - m_block * (kBlockM/kBlockH), kBlockM/kBlockH);
         
-        Tensor mO = make_tensor(make_gmem_ptr(epilogue_params.ptr_O), epilogue_params.layout_O);
-        Tensor gO = seqlen_traits_q.get_o_local_tile_tensor<Is_split>(
-                    mO, TileShapeOCopy{}, bidh_kv, bidb, n_split_idx)
-                        (_, _, _, m_block, h_block); // (bM/bH, bH, K)
-        TiledCopyO gmem_tiled_copy_O;
-        auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
-        if constexpr(kNumRows <= kBlockH) {
-            // slice into bM/bH and write out zero tiles (bH, K)
-            Tensor tOgO = gmem_thr_copy_O.partition_D(gO(0,_,_));
-            Tensor tOrO = make_fragment_like(tOgO);
-            clear(tOrO);
-            Tensor cO = cute::make_identity_tensor(select<1, 2>(TileShapeOCopy{}));
-            Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
-            // dummy predicate, unused since Is_even_K=true
-            Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
-            #pragma unroll
-            for(int m = 0; m < m_bound; ++m) {                
-                tOgO = gmem_thr_copy_O.partition_D(gO(m,_,_));
-                flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true,
-                            /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-                    gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, h_bound
-                );
-            }
-        } else {
-            // slice into bH and write out zero tiles (bM/bH, K)
-            Tensor tOgO = gmem_thr_copy_O.partition_D(gO(_,0,_));
-            Tensor tOrO = make_fragment_like(tOgO);
-            clear(tOrO);
-            Tensor cO = cute::make_identity_tensor(select<0, 2>(TileShapeOCopy{}));
-            Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
-            // dummy predicate, unused since Is_even_K=true
-            Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
-            #pragma unroll
-            for(int h = 0; h < h_bound; ++h) {                
-                tOgO = gmem_thr_copy_O.partition_D(gO(_,h,_));
-                flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true,
-                            /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-                    gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, m_bound
-                );
+        if constexpr(!Is_split) {
+            Tensor mO = make_tensor(make_gmem_ptr(epilogue_params.ptr_O), epilogue_params.layout_O);
+            Tensor gO = seqlen_traits_q.get_o_local_tile_tensor<Is_split>(
+                        mO, TileShapeOCopy{}, bidh_kv, bidb, n_split_idx)
+                            (_, _, _, m_block, h_block); // (bM/bH, bH, K)
+            TiledCopyO gmem_tiled_copy_O;
+            auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
+            if constexpr(kNumRows <= kBlockH) {
+                // slice into bM/bH and write out zero tiles (bH, K)
+                Tensor tOgO = gmem_thr_copy_O.partition_D(gO(0,_,_));
+                Tensor tOrO = make_fragment_like(tOgO);
+                clear(tOrO);
+                Tensor cO = cute::make_identity_tensor(select<1, 2>(TileShapeOCopy{}));
+                Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+                // dummy predicate, unused since Is_even_K=true
+                Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+                #pragma unroll
+                for(int m = 0; m < m_bound; ++m) {                
+                    tOgO = gmem_thr_copy_O.partition_D(gO(m,_,_));
+                    flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true,
+                                /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, h_bound
+                    );
+                }
+            } else {
+                // slice into bH and write out zero tiles (bM/bH, K)
+                Tensor tOgO = gmem_thr_copy_O.partition_D(gO(_,0,_));
+                Tensor tOrO = make_fragment_like(tOgO);
+                clear(tOrO);
+                Tensor cO = cute::make_identity_tensor(select<0, 2>(TileShapeOCopy{}));
+                Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+                // dummy predicate, unused since Is_even_K=true
+                Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+                #pragma unroll
+                for(int h = 0; h < h_bound; ++h) {                
+                    tOgO = gmem_thr_copy_O.partition_D(gO(_,h,_));
+                    flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true,
+                                /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, m_bound
+                    );
+                }
             }
         }
 

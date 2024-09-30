@@ -148,6 +148,7 @@ def test_flash_attn_output_fp8(
     # just test correctness of fp8 kernel w/o further quantization techniques
     assert (out - out_ref).abs().max().item() <= 40 * (out_pt - out_ref).abs().max().item()
 
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
