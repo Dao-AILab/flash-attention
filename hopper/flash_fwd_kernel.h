@@ -411,14 +411,6 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
                 threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q, mainloop_params.qhead_per_khead_divmod);
 
-        // #ifndef NO_FP8_COLUMN_PERMUTE
-        //     collective_epilogue.store_fp8(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
-        //                               threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q);
-        // #else
-        //     collective_epilogue.store(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
-        //                               threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q);
-        // #endif
-
             ++work_idx;
         }
         collective_epilogue.store_tail();

@@ -857,10 +857,6 @@ struct CollectiveMainloopFwd {
         }
 
         auto col_limit_right = [&](int row, int n_block) {
-            // return std::min(
-            //     seqlen_k - n_block * kBlockN, 
-            //     row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM_div_H + mainloop_params.window_size_right
-            // );
             int col_limit_base = row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM_div_H;
             if constexpr(Is_local)
                 return col_limit_base + mainloop_params.window_size_right;
@@ -872,9 +868,6 @@ struct CollectiveMainloopFwd {
                 0,
                 row + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM_div_H - mainloop_params.window_size_left
             );
-        };
-        auto col_limit_causal = [&](int row, int n_block) {
-            return row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM_div_H;
         };
         {
             Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
@@ -1035,9 +1028,6 @@ struct CollectiveMainloopFwd {
         };
 
         tiled_mma1.accumulate_ = GMMA::ScaleOut::Zero;
-        // workaround for fp8 only perf regression pending change to seqlen traits class
-        // int const seqlen_q = Seqlen_traits_Q::UseVarSeqLen ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        // int const seqlen_k = Seqlen_traits::UseVarSeqLen ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         int const seqlen_q = Seqlen_traits_Q::Is_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
         int const seqlen_k = Seqlen_traits::Is_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         int n_block = n_block_max - 1;
