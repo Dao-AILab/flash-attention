@@ -23,6 +23,131 @@ def print_diffs(out, out_ref):
             print(f"==== diff ==== {idx}, test: {e_o}, ref: {e_o_ref}")
 
 
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("deterministic", [True])
+@pytest.mark.parametrize("gqa_parallel", [False, True])
+@pytest.mark.parametrize("d", [64, 128, 256])
+# @pytest.mark.parametrize("descale", [1.0])
+@pytest.mark.parametrize("descale", [1.0, 2.0, 3.0])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (1, 1),
+        (64, 128),
+        (128, 128),
+        (256, 256),
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (384, 256),
+        (640, 128),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (4096, 4096),
+    ],
+)
+def test_flash_attn_output_fp8(
+    seqlen_q, seqlen_k, d, causal, local, deterministic, mha_type, dtype, descale, gqa_parallel
+):
+    device = "cuda"
+    dtype_init = torch.float16
+    print(dtype)
+    print('causal',causal)
+    print('local',local)
+    print('gqa_parallel',gqa_parallel)
+    # set seed
+    torch.random.manual_seed(42)
+    # batch_size = 40
+    # nheads = 16
+    batch_size = 4
+    nheads = 6
+    nheads_kv = 6 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    # nheads_kv = 1
+    # batch_size = 9
+    # nheads = 6
+    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_init, requires_grad=True)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_init, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_init, requires_grad=True)
+
+    q = q.to(dtype)
+    k = k.to(dtype)
+    v = v.to(dtype)
+
+    softmax_scale = q.shape[-1] ** (-0.5)
+    descale_q = torch.tensor([descale], dtype=torch.float32, device='cuda')
+    descale_k = torch.tensor([descale], dtype=torch.float32, device='cuda')
+    descale_v = torch.tensor([descale], dtype=torch.float32, device='cuda')
+
+    out, lse = flash_attn_func(q, k, v, causal=causal, window_size=window_size, deterministic=deterministic, gqa_parallel=gqa_parallel,
+                                descale_q=descale_q, descale_k=descale_k, descale_v=descale_v)
+
+    q = q.to(dtype_init)
+    k = k.to(dtype_init)
+    v = v.to(dtype_init)
+
+    descale_q = descale_q.to(dtype_init)
+    descale_k = descale_k.to(dtype_init)
+    descale_v = descale_v.to(dtype_init)
+    q = q * descale_q
+    k = k * descale_k
+    v = v * descale_v
+
+    out_ref, attn_ref = attention_ref(
+        q,
+        k,
+        v,
+        None,
+        None,
+        causal=causal,
+        window_size=window_size,
+    )
+    out_pt, attn_pt = attention_ref(
+        q,
+        k,
+        v,
+        None,
+        None,
+        causal=causal,
+        window_size=window_size,
+        upcast=False,
+        reorder_ops=True,
+    )
+
+    # qk = torch.einsum('bshd,bthd->bhst', q, k).float()
+    # m = qk.amax(-1, keepdim=True)
+    # s_tmp = torch.exp((qk - m) / math.sqrt(d))
+    # exp_sum = s_tmp.sum(-1)
+    # qk = torch.einsum('bthd,bshd->bhts', q.float() / math.sqrt(d), k.float())
+    # lse_ref = torch.logsumexp(qk, dim=-1)
+
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+
+    # if not causal:
+    #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+    # breakpoint()
+
+    # dS = torch.einsum('bthd,bshd->bhts', g.float(), v.float())
+    # P = torch.softmax(qk, -1)
+    # dP = P * (dS - do_o.unsqueeze(1))
+    # dQ = torch.einsum('bhts,bshd->bthd', dP, k.float())
+    # dV = torch.einsum('bhts,bthd->bshd', P, g.float())
+    # dK = torch.einsum('bhts,bthd->bshd', dP, q.float())
+    # breakpoint()
+    
+    # just test correctness of fp8 kernel w/o further quantization techniques
+    assert (out - out_ref).abs().max().item() <= 40 * (out_pt - out_ref).abs().max().item()
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
