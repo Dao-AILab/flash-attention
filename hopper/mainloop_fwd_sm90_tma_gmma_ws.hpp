@@ -1014,7 +1014,7 @@ struct CollectiveMainloopFwd {
         constexpr int extra_iterations = !Is_causal ? kStages - 1 : cute::ceil_div(kBlockM_div_H, kBlockN);        
 
         if constexpr(Is_causal) {
-            CUTLASS_PRAGMA_UNROLL      
+            CUTLASS_PRAGMA_UNROLL
             for (int iter = 0; iter < extra_iterations && n_block >= n_block_min; ++iter, --n_block) {
                 Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
@@ -1046,7 +1046,7 @@ struct CollectiveMainloopFwd {
                 permute_regs_A_to_C(tOrP);
                 
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);            
-                if constexpr(!Delay_V_release) { pipeline_vt.consumer_release(smem_pipe_read); }                
+                if constexpr(!Delay_V_release) { pipeline_vt.consumer_release(smem_pipe_read); }
                 ++smem_pipe_read;
             }
         } else if constexpr(!Is_local) { 

@@ -14,14 +14,12 @@ namespace flash {
 
 static constexpr int kMaxTileSize = 128;
 
-static constexpr int FixedSeqLenType = 0;
-static constexpr int VarSeqLenType = 1;
-static constexpr int DecodingGQASeqLenType = 2;
-
-template <int SeqLenType, bool Is_dynamic_> class SeqLenTraits {
+template <bool UseVarSeqLen_, bool DecodingGQA_, bool Is_dynamic_> class SeqLenTraits {
 public:
-  static_assert(SeqLenType == 0 || SeqLenType == 1 || SeqLenType == 2, 
-                  "SeqLenType must be 0, 1, or 2");  
+  static_assert(!(UseVarSeqLen_ && DecodingGQA_),
+    "Variable sequence length with GQA parallelization not implemented yet.");
+  static_assert(!(UseVarSeqLen_ && !Is_dynamic_),
+    "VarSeqLen class always has variable seqlen.");
 
   // Total number of queries / keys. Unpadded.
   int sum_s = 0;
@@ -33,9 +31,8 @@ public:
   int actual_seq_len = -1;
 
   // Whether this is for fixed-seq-len or var-seq-len.
-  static constexpr bool UseVarSeqLen = SeqLenType == 1;
-  static constexpr bool DecodingGQA = SeqLenType == 2;
-
+  static constexpr bool UseVarSeqLen = UseVarSeqLen_;
+  static constexpr bool DecodingGQA = DecodingGQA_;
   static constexpr bool Is_dynamic = Is_dynamic_;
 
   using ShapeT = std::conditional_t<
@@ -93,6 +90,19 @@ public:
       int sum_s, int max_seq_len, int *cu_seq_len = nullptr, int *seq_used = nullptr): 
       sum_s(sum_s), cu_seq_len(cu_seq_len), seq_used(seq_used), actual_seq_len(max_seq_len) {}
 
+  CUTLASS_DEVICE void init(int bidb) {
+    // TODO: add leftpad, seqlen_new for kv cache support
+    // NOTE: for FA2 kv cache API, "cu_seq_len" is a misnomer.
+    // Rather, cu_seq_len plays the role of seq_used.
+    // We can change this to seq_used for FA3 if desired.
+    if(cu_seq_len) {      
+      actual_seq_len = cu_seq_len[bidb];
+    }
+    // if (seq_used) {
+    //   actual_seq_len = seq_used[bidb];
+    // }
+  }
+
   // Returns the layout of a tensor in MKHB format in global memory.
   // padded: only useful for var-seq-len for dq_accum and softmax_d.
   CUTLASS_HOST_DEVICE auto get_gmem_layout(
@@ -100,6 +110,7 @@ public:
       int64_t m_stride, int64_t h_stride, int64_t b_stride,
       bool padded = false) const {
     static_assert(!UseVarSeqLen, "Specialize default implementation for VarSeqLen.");
+    // static_assert(!DecodingGQA, "Specialize default implementation for DecodingGQA.");
     return make_layout(make_shape(m, k, h, b),
                        make_stride(m_stride, cute::_1{}, h_stride, b_stride));
   }
@@ -111,7 +122,8 @@ public:
       int m, int k, int h_k, int b, int h_h_k_ratio,
       int64_t m_stride, int64_t h_stride, int64_t b_stride,
       bool padded = false) const {
-    static_assert(SeqLenType == FixedSeqLenType, "Default implementation is for FixedSeqLen.");
+    static_assert(!UseVarSeqLen, "Specialize default implementation for VarSeqLen.");
+    static_assert(!DecodingGQA, "Specialize default implementation for DecodingGQA.");
     return make_layout(make_shape(m, k, h_k * h_h_k_ratio, b),
                        make_stride(m_stride, cute::_1{}, h_stride, b_stride));    
   }
@@ -152,19 +164,6 @@ public:
       int m, int h, int b, int num_splits, bool padded = false) const {
     return make_layout(make_shape(num_splits, b, h, m),
                        make_stride(int64_t(b * h * m), int64_t(h * m), int64_t(m), cute::_1()));
-  }
-
-  CUTLASS_DEVICE void init(int bidb) {
-    // TODO: add leftpad, seqlen_new for kv cache support
-    // NOTE: for FA2 kv cache API, "cu_seq_len" is a misnomer.
-    // Rather, cu_seq_len plays the role of seq_used.
-    // We can change this to seq_used for FA3 if desired.
-    if(cu_seq_len) {      
-      actual_seq_len = cu_seq_len[bidb];
-    }
-    // if (seq_used) {
-    //   actual_seq_len = seq_used[bidb];
-    // }
   }
 
   template <typename MTensor, typename Shape>
@@ -213,13 +212,26 @@ public:
   
 };
 
-using FixedSeqLenTraits = SeqLenTraits<FixedSeqLenType, true>;
-using FixedSeqLenTraitsStatic = SeqLenTraits<FixedSeqLenType, false>;
-using FixedSeqLenTraitsDynamic = SeqLenTraits<FixedSeqLenType, true>;
-using VarSeqLenTraits = SeqLenTraits<VarSeqLenType, true>;
-using DecodingGQASeqLenTraits = SeqLenTraits<DecodingGQASeqLenType, false>;
-using DecodingGQASeqLenTraitsStatic = SeqLenTraits<DecodingGQASeqLenType, false>;
-using DecodingGQASeqLenTraitsDynamic = SeqLenTraits<DecodingGQASeqLenType, true>;
+using FixedSeqLenTraits = SeqLenTraits<false, false, true>;
+using VarSeqLenTraits = SeqLenTraits<true, false, true>;
+using DecodingGQASeqLenTraits = SeqLenTraits<false, true, false>;
+
+using FixedSeqLenTraitsStatic = SeqLenTraits<false, false, false>;
+using FixedSeqLenTraitsDynamic = SeqLenTraits<false, false, true>;
+
+// using DecodingGQASeqLenTraitsStatic = SeqLenTraits<false, true, false>;
+// using DecodingGQASeqLenTraitsDynamic = SeqLenTraits<false, true, true>;
+
+template <>
+CUTLASS_DEVICE void VarSeqLenTraits::init(int bidb) {
+  actual_seq_len = 
+      seq_used ? seq_used[bidb] : (cu_seq_len[bidb + 1] - cu_seq_len[bidb]);
+}
+
+template <>
+CUTLASS_DEVICE void DecodingGQASeqLenTraits::init(int bidb) {
+  // no op
+}
 
 // Returns the static layout of a var-seq-len tensor in global memory based on
 // max_seq_len and max_batch_size.
@@ -253,12 +265,6 @@ CUTLASS_HOST_DEVICE auto VarSeqLenTraits::get_lse_gmem_layout(
   return make_layout(
     make_shape(h, sum_s + (padded ? kMaxTileSize * b : 0)), 
     make_stride(int64_t(sum_s + (padded ? kMaxTileSize * b : 0)), cute::_1()));
-}
-
-template <>
-CUTLASS_DEVICE void VarSeqLenTraits::init(int bidb) {
-  actual_seq_len = 
-      seq_used ? seq_used[bidb] : (cu_seq_len[bidb + 1] - cu_seq_len[bidb]);
 }
 
 template <>
@@ -369,11 +375,6 @@ CUTLASS_DEVICE auto DecodingGQASeqLenTraits::get_o_local_tile_tensor(
       m_tensor(_, _, _, bidh_kv, bidb, split_idx), tile_shape, make_coord(_, _, _0{}));
     return g_tensor;
   }
-}
-
-template <>
-CUTLASS_DEVICE void DecodingGQASeqLenTraits::init(int bidb) {
-  // no op
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

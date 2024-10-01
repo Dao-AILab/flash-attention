@@ -51,6 +51,7 @@ def print_diffs(out, out_ref):
         (1023, 1024),
         (1024, 1023),
         (4096, 4096),
+        (4224, 4224),
     ],
 )
 def test_flash_attn_output_fp8(
@@ -190,6 +191,7 @@ def test_flash_attn_output_fp8(
         (1023, 1024),
         (1024, 1023),
         (4096, 4096),
+        (4224, 4224),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
