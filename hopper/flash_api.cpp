@@ -366,9 +366,8 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
                 block_n = use_one_mma_wg ? 96 : 80;
             }
             const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
-            
-	        int batch_nheads = use_gqa_decoding ? batch_size * num_heads_k : batch_size * num_heads;
-            int batch_nheads_mblocks = use_gqa_decoding
+            const int batch_nheads = use_gqa_decoding ? batch_size * num_heads_k : batch_size * num_heads;
+            const int batch_nheads_mblocks = use_gqa_decoding
                 ? ceildiv(max_seqlen_q, block_m / block_h) * batch_nheads
                 : ceildiv(max_seqlen_q, block_m) * batch_nheads;
             params.num_splits = num_splits_heuristic(batch_nheads_mblocks, batch_nheads,
