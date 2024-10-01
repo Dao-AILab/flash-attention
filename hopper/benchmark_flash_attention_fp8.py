@@ -248,10 +248,10 @@ for causal in causal_vals:
             torch.cuda.empty_cache()
             config = (causal, headdim, batch_size, seqlen)
             nheads = dim // headdim
-            q, k, v = [torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.float16, requires_grad=False) for _ in range(3)]
+            q, k, v = [torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16, requires_grad=False) for _ in range(3)]
             
             qkv = torch.stack([q, k, v], dim=2)
-            qkv = qkv.to(torch.float16)
+            qkv = qkv.to(torch.bfloat16)
             f = time_fwd(attention_pytorch, qkv, dropout_p, causal=causal, repeats=repeats, verbose=False)
             time_f[config, "Pytorch"] = f
             res_baseline = attention_pytorch(qkv, dropout_p, causal=causal)

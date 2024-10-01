@@ -524,7 +524,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         out = out_.value();
         // TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
         TORCH_CHECK(q_dtype == at::ScalarType::Float8_e4m3fn
-                    ? (out.dtype() == at::kHalf)
+                    ? (out.dtype() == at::kBFloat16)
                     : (out.dtype() == q_dtype),
                 "Output must have the same dtype as input dtype if dtype is "
                 "not fp8, or fp16 for fp8 input.");
@@ -534,7 +534,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
     } else {
         if (q_dtype == at::ScalarType::Float8_e4m3fn)
-            out = torch::empty_like(q_padded, at::kHalf);
+            out = torch::empty_like(q_padded, at::kBFloat16);
         else
             out = torch::empty_like(q_padded);
     }
@@ -1335,7 +1335,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         out = out_.value();
         // TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
         TORCH_CHECK(q_dtype == at::ScalarType::Float8_e4m3fn
-                    ? (out.dtype() == at::kHalf)
+                    ? (out.dtype() == at::kBFloat16)
                     : (out.dtype() == q_dtype),
                 "Output must have the same dtype as input dtype if dtype is "
                 "not fp8, or fp16 for fp8 input.");
@@ -1345,7 +1345,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
     } else {
         if (q_dtype == at::ScalarType::Float8_e4m3fn) {
-            out = torch::empty_like(q_padded, at::kHalf);
+            out = torch::empty_like(q_padded, at::kBFloat16);
         }
         else
             out = torch::empty_like(q_padded);

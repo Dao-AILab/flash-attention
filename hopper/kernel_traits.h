@@ -214,7 +214,7 @@ struct Flash_fwd_kernel_traits_fp8 {
     using Element = elem_type;
     static_assert(cutlass::sizeof_bits_v<Element> == 8);
     using ElementAccum = float;
-    using FinalOutputType = cutlass::half_t;
+    using FinalOutputType = cutlass::bfloat16_t;
     using OutputType = std::conditional_t<Is_split_, float, FinalOutputType>;
     using index_t = int64_t;
 

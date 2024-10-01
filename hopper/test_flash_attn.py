@@ -57,7 +57,7 @@ def test_flash_attn_output_fp8(
     seqlen_q, seqlen_k, d, causal, local, deterministic, mha_type, dtype, descale, gqa_parallel
 ):
     device = "cuda"
-    dtype_init = torch.float16
+    dtype_init = torch.bfloat16
     print(dtype)
     print('causal',causal)
     print('local',local)
@@ -198,7 +198,7 @@ def test_flash_attn_output(
 ):
     device = "cuda"
     if(dtype == torch.float8_e4m3fn):
-        dtype_init = torch.float16
+        dtype_init = torch.bfloat16
     else:
         dtype_init = dtype
     print(dtype)
