@@ -141,3 +141,29 @@
       return __VA_ARGS__();                                                    \
     }                                                                          \
   }()
+
+#define NUM_SPLITS_SWITCH(NUM_SPLITS, LOG_MAX_SPLITS, ...)                     \
+  [&] {                                                                        \
+    if (NUM_SPLITS <= 2) {                                                     \
+      constexpr static int LOG_MAX_SPLITS = 1;                                 \
+      return __VA_ARGS__();                                                    \
+    } else if (NUM_SPLITS <= 4) {                                              \
+      constexpr static int LOG_MAX_SPLITS = 2;                                 \
+      return __VA_ARGS__();                                                    \
+    } else if (NUM_SPLITS <= 8) {                                              \
+      constexpr static int LOG_MAX_SPLITS = 3;                                 \
+      return __VA_ARGS__();                                                    \
+    } else if (NUM_SPLITS <= 16) {                                             \
+      constexpr static int LOG_MAX_SPLITS = 4;                                 \
+      return __VA_ARGS__();                                                    \
+    } else if (NUM_SPLITS <= 32) {                                             \
+      constexpr static int LOG_MAX_SPLITS = 5;                                 \
+      return __VA_ARGS__();                                                    \
+    } else if (NUM_SPLITS <= 64) {                                             \
+      constexpr static int LOG_MAX_SPLITS = 6;                                 \
+      return __VA_ARGS__();                                                    \
+    } else {                                                                   \
+      constexpr static int LOG_MAX_SPLITS = 7;                                 \
+      return __VA_ARGS__();                                                    \
+    }                                                                          \
+  }()
