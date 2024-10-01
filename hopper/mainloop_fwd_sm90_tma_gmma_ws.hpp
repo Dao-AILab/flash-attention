@@ -563,58 +563,10 @@ struct CollectiveMainloopFwd {
                     tVgV(_, n_block), tVsV(_, smem_pipe_write.index()));
             }
         }
-
-        // if constexpr(Is_causal || Is_local || Is_split) {
-        {
-            #if 0
-            CUTLASS_PRAGMA_UNROLL
-            for (int iter = 0; iter < kStages && n_block > n_block_min; ++iter, --n_block) {
-                pipeline_v.consumer_wait(smem_pipe_read);
-                // pipeline_vt.producer_acquire(smem_pipe_write);
-                do_transpose_V(smem_pipe_read.index());
-                pipeline_vt.producer_commit(smem_pipe_write);
-                pipeline_v.consumer_release(smem_pipe_read);
-                
-                ++smem_pipe_write;
-                ++smem_pipe_read;
-                
-                if (warp_idx_in_warpgroup == 0 && lane_predicate) {
-                    pipeline_k.producer_acquire(smem_pipe_write);
-                    copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
-                        tKgK(_, n_block-1), tKsK(_, smem_pipe_write.index()));
-                    pipeline_v.producer_acquire(smem_pipe_write);
-                    copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
-                        tVgV(_, n_block-1), tVsV(_, smem_pipe_write.index()));
-                }
-            }       
-            #endif     
             
-            #pragma unroll 2
-            for (; n_block > n_block_min; --n_block) {
-                pipeline_v.consumer_wait(smem_pipe_read);
-                pipeline_vt.producer_acquire(smem_pipe_write);
-                do_transpose_V(smem_pipe_read.index());
-                pipeline_vt.producer_commit(smem_pipe_write);
-                pipeline_v.consumer_release(smem_pipe_read);
-
-                ++smem_pipe_write;
-                ++smem_pipe_read;
-                
-                if (warp_idx_in_warpgroup == 0 && lane_predicate) {
-                    pipeline_k.producer_acquire(smem_pipe_write);
-                    copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
-                        tKgK(_, n_block-1), tKsK(_, smem_pipe_write.index()));
-                    pipeline_v.producer_acquire(smem_pipe_write);
-                    copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
-                        tVgV(_, n_block-1), tVsV(_, smem_pipe_write.index()));
-                }                                                                
-            }       
-
-            scheduler.prefetch_next_work(scheduler_params, work_tile_info);
-            scheduler.broadcast_next_work(work_tile_info);
-            
+        #pragma unroll 2
+        for (; n_block > n_block_min; --n_block) {
             pipeline_v.consumer_wait(smem_pipe_read);
-            // if (n_block_max-n_block_min > kStages)
             pipeline_vt.producer_acquire(smem_pipe_write);
             do_transpose_V(smem_pipe_read.index());
             pipeline_vt.producer_commit(smem_pipe_write);
@@ -622,69 +574,28 @@ struct CollectiveMainloopFwd {
 
             ++smem_pipe_write;
             ++smem_pipe_read;
-        }
+            
+            if (warp_idx_in_warpgroup == 0 && lane_predicate) {
+                pipeline_k.producer_acquire(smem_pipe_write);
+                copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
+                    tKgK(_, n_block-1), tKsK(_, smem_pipe_write.index()));
+                pipeline_v.producer_acquire(smem_pipe_write);
+                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
+                    tVgV(_, n_block-1), tVsV(_, smem_pipe_write.index()));
+            }                                                                
+        }       
 
-        // deprecated
-        #if 0
-        else {
-            pipeline_v.consumer_wait(smem_pipe_read);
-            // pipeline_vt.producer_acquire(smem_pipe_write);
-            do_transpose_V(smem_pipe_read.index());
-            pipeline_vt.producer_commit(smem_pipe_write);
-            pipeline_v.consumer_release(smem_pipe_read);
+        scheduler.prefetch_next_work(scheduler_params, work_tile_info);
+        scheduler.broadcast_next_work(work_tile_info);
+        
+        pipeline_v.consumer_wait(smem_pipe_read);
+        pipeline_vt.producer_acquire(smem_pipe_write);
+        do_transpose_V(smem_pipe_read.index());
+        pipeline_vt.producer_commit(smem_pipe_write);
+        pipeline_v.consumer_release(smem_pipe_read);
 
-            ++smem_pipe_write;
-            ++smem_pipe_read;
-            --n_block;
-
-            constexpr int extra_iterations = kStages - 1;
-            CUTLASS_PRAGMA_UNROLL
-            for (int iter = 0; iter < extra_iterations && n_block >= n_block_min; ++iter) {
-                if (warp_idx_in_warpgroup == 0 && lane_predicate) {
-                    pipeline_k.producer_acquire(smem_pipe_write);
-                    copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
-                        tKgK(_, n_block), tKsK(_, smem_pipe_write.index()));
-                    pipeline_v.producer_acquire(smem_pipe_write);
-                    copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
-                        tVgV(_, n_block), tVsV(_, smem_pipe_write.index()));                
-                }
-                
-                pipeline_v.consumer_wait(smem_pipe_read);
-                // pipeline_vt.producer_acquire(smem_pipe_write);
-                do_transpose_V(smem_pipe_read.index());
-                pipeline_vt.producer_commit(smem_pipe_write);
-                pipeline_v.consumer_release(smem_pipe_read);
-                
-                ++smem_pipe_write;
-                ++smem_pipe_read;
-                --n_block;
-            }
-
-            #pragma unroll 1
-            for (; n_block >= n_block_min; --n_block) {
-                
-                if (warp_idx_in_warpgroup == 0 && lane_predicate) {
-                    pipeline_k.producer_acquire(smem_pipe_write);
-                    copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
-                        tKgK(_, n_block), tKsK(_, smem_pipe_write.index()));
-                    pipeline_v.producer_acquire(smem_pipe_write);
-                    copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
-                        tVgV(_, n_block), tVsV(_, smem_pipe_write.index()));                                
-                }
-                
-                pipeline_v.consumer_wait(smem_pipe_read);
-                pipeline_vt.producer_acquire(smem_pipe_write);
-                do_transpose_V(smem_pipe_read.index());
-                pipeline_vt.producer_commit(smem_pipe_write);
-                pipeline_v.consumer_release(smem_pipe_read);
-                
-                ++smem_pipe_write;
-                ++smem_pipe_read;
-            }
-            // scheduler.prefetch_next_work(scheduler_params, work_tile_info);
-            // scheduler.broadcast_next_work(work_tile_info);
-        }
-        #endif
+        ++smem_pipe_write;
+        ++smem_pipe_read; 
     }
 
     /// Perform a Producer Epilogue to prevent early exit of blocks in a Cluster
