@@ -27,41 +27,30 @@
     }                                                                          \
   }()
 
-#define PREC_SWITCH(PRECTYPE, ...)                                             \
+#define PREC_SWITCH(PRECTYPE, NAME, ...)                                       \
   [&] {                                                                        \
-    if (PRECTYPE == 1) {                                                       \
-      using kPrecType = cutlass::half_t;                                       \
-      constexpr static bool kSoftFp16 = false;                                 \
-      constexpr static bool kHybrid = false;                                   \
+    if (PRECTYPE == 3) {                                                       \
+      using NAME = cutlass::float_e4m3_t;                                      \
       return __VA_ARGS__();                                                    \
     } else if (PRECTYPE == 2) {                                                \
-      using kPrecType = cutlass::float_e4m3_t;                                 \
-      constexpr static bool kSoftFp16 = false;                                 \
-      constexpr static bool kHybrid = false;                                   \
+      using NAME = cutlass::bfloat16_t;                                        \
       return __VA_ARGS__();                                                    \
-    } else if (PRECTYPE == 3) {                                                \
-      using kPrecType = cutlass::float_e4m3_t;                                 \
-      constexpr static bool kSoftFp16 = false;                                 \
-      constexpr static bool kHybrid = true;                                    \
-      return __VA_ARGS__();                                                    \
-    } else if (PRECTYPE == 4) {                                                \
-      using kPrecType = cutlass::float_e4m3_t;                                 \
-      constexpr static bool kSoftFp16 = true;                                  \
-      constexpr static bool kHybrid = false;                                   \
+    } else {                                                                   \
+      using NAME = cutlass::half_t;                                            \
       return __VA_ARGS__();                                                    \
     }                                                                          \
   }()
 
-#define HEADDIM_SWITCH(HEADDIM, ...)                                           \
+#define HEADDIM_SWITCH(HEADDIM, CONST_NAME, ...)                               \
   [&] {                                                                        \
     if (HEADDIM == 64) {                                                       \
-      constexpr static int kHeadSize = 64;                                     \
+      constexpr static int CONST_NAME = 64;                                    \
       return __VA_ARGS__();                                                    \
     } else if (HEADDIM == 128) {                                               \
-      constexpr static int kHeadSize = 128;                                    \
+      constexpr static int CONST_NAME = 128;                                   \
       return __VA_ARGS__();                                                    \
-    } else if (HEADDIM == 256) {                                               \
-      constexpr static int kHeadSize = 256;                                    \
+    } else  {                                                                  \
+      constexpr static int CONST_NAME = 256;                                   \
       return __VA_ARGS__();                                                    \
     }                                                                          \
   }()

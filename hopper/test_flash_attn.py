@@ -146,9 +146,9 @@ def test_flash_attn_output_fp8(
     # dK = torch.einsum('bhts,bthd->bshd', dP, q.float())
     # breakpoint()
     
-    # assert (out - out_ref).abs().max().item() <= 4 * (out_pt - out_ref).abs().max().item() + 2e-2
-    atol = 4 * (out_pt - out_ref).abs().max().item()
-    torch.testing.assert_close(out, out_ref, rtol=2e-2, atol=atol, check_dtype=False)
+    # assert (out - out_ref).abs().max().item() <= 4 * (out_pt - out_ref).abs().max().item() + 1e-2
+    atol = 4 * (out_pt - out_ref).abs().max().item() + 1e-2
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=atol, check_dtype=False)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

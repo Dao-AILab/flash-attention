@@ -391,11 +391,24 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
 }
 
 
-void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {    
+void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) { 
 
-    // HEADDIM_SWITCH(params.d, [&] {
-    //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
-    // });
+    int dtype = 1;
+    if (params.is_bf16) { dtype = 2; }
+    else if (params.is_e4m3) { dtype = 3; }
+    PREC_SWITCH(dtype, Element, [&] {
+      HEADDIM_SWITCH(params.d, kHeadSize, [&] {
+        if(!params.use_gqa_decoding) {
+          run_mha_fwd_<Element, kHeadSize>(params, stream);
+        } else {
+          QUERYHEAD_SWITCH(params.h_h_k_ratio, kBlockH, [&] {
+            run_mha_fwd_gqa_<Element, kHeadSize, kBlockH>(params, stream);
+          });
+        }
+      });
+    });
+
+#if 0
     if (!params.is_e4m3) {        
         if(!params.use_gqa_decoding) {
             if (params.is_bf16) {
@@ -454,6 +467,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
             }
         }
     }
+#endif
 }
 
 std::vector<at::Tensor>
