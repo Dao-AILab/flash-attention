@@ -68,7 +68,9 @@ struct Flash_fwd_params : public Qkv_params {
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
 
-    // If provided, the actual length of each k sequence.
+    // If provided, the actual length of each q / o sequence.
+    int * __restrict__ seqused_q;
+    // If provided, the actual length of each k / v sequence.
     int * __restrict__ seqused_k;
 
     int *__restrict__ blockmask;
@@ -116,6 +118,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_bf16;
     bool is_e4m3;
     bool is_causal;
+    bool is_local;
 
     // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
     // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.

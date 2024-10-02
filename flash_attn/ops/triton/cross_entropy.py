@@ -245,8 +245,6 @@ class CrossEntropyLoss(torch.autograd.Function):
         ctx.total_classes = total_classes
         ctx.class_start_idx = class_start_idx
         ctx.inplace_backward = inplace_backward
-
-
         return losses, z_losses
 
     @staticmethod

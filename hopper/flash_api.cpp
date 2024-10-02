@@ -36,6 +36,7 @@ void set_params_fprop(Flash_fwd_params &params,
                       at::Tensor out,
                       void *cu_seqlens_q_d,
                       void *cu_seqlens_k_d,
+                      void *seqused_q,
                       void *seqused_k,
                       void *p_d,
                       void *softmax_lse_d,
@@ -80,6 +81,7 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
+    params.seqused_q = static_cast<int *>(seqused_q);
     params.seqused_k = static_cast<int *>(seqused_k);
 
     TORCH_CHECK(
@@ -128,12 +130,17 @@ void set_params_fprop(Flash_fwd_params &params,
 
     // Causal is the special case where window_size_right == 0 and window_size_left < 0.
     // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
-    params.is_causal = window_size_left < 0 && window_size_right == 0;
-
-    if (window_size_left < 0 && window_size_right >= 0) { window_size_left = seqlen_k; }
-    if (window_size_left >= 0 && window_size_right < 0) { window_size_right = seqlen_k; }
+    window_size_left = std::min(int(seqlen_k), window_size_left);
+    window_size_right = std::min(int(seqlen_k), window_size_right);
+    if (window_size_left < 0) { window_size_left = seqlen_k; }
+    if (window_size_right < 0) { window_size_right = seqlen_k; }
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
+
+    params.is_causal = window_size_left == seqlen_k && window_size_right == 0;
+    if ((window_size_left < seqlen_k || window_size_right < seqlen_k) && !params.is_causal) {
+        params.is_local = true;
+    }
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
         TORCH_CHECK(params.is_causal || (window_size_left < 0 && window_size_right < 0),
@@ -171,6 +178,8 @@ void set_params_dgrad(Flash_bwd_params &params,
                       at::Tensor dv,
                       void *cu_seqlens_q_d,
                       void *cu_seqlens_k_d,
+                      void *seqused_q,
+                      void *seqused_k,
                       void *dq_accum_d,
                       void *dk_accum_d,
                       void *dv_accum_d,
@@ -187,7 +196,8 @@ void set_params_dgrad(Flash_bwd_params &params,
                      q, k, v, out,
                      cu_seqlens_q_d,
                      cu_seqlens_k_d,
-                     nullptr,
+                     seqused_q,
+                     seqused_k,
                      nullptr,
                      softmax_lse_d,
                      p_dropout,
@@ -268,7 +278,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         c10::optional<at::Tensor> &descale_q_, // 1
         c10::optional<at::Tensor> &descale_k_, // 1
         c10::optional<at::Tensor> &descale_v_, // 1
-        bool is_causal) {
+        bool is_causal,
+        int window_size_left,
+        int window_size_right) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
@@ -345,6 +357,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
+    if (is_causal) { window_size_right = 0; }
+
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
@@ -364,13 +378,14 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      q_padded, k_padded, v_padded, out,
                      /*cu_seqlens_q_d=*/nullptr,
                      /*cu_seqlens_k_d=*/nullptr,
+                     /*seqused_q=*/nullptr,
                      /*seqused_k=*/nullptr,
                      nullptr,
                      softmax_lse.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
-                     /*window_size_left=*/-1,
-                     /*window_size_right=*/is_causal ? 0 : -1);
+                     /*window_size_left=*/window_size_left,
+                     /*window_size_right=*/window_size_right);
 
     auto tile_count_semaphore = is_causal ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
@@ -426,11 +441,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                c10::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
+               c10::optional<at::Tensor> &seqused_q, // b. If given, only this many elements of each batch element's queries and outputs are used.
                c10::optional<at::Tensor> &seqused_k, // b. If given, only this many elements of each batch element's keys are used.
                int max_seqlen_q,
                const int max_seqlen_k,
                const float softmax_scale,
-               bool is_causal) {
+               bool is_causal,
+               int window_size_left,
+               int window_size_right) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
@@ -461,10 +479,6 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int head_size_og = sizes[2];
     const int num_heads_k = k.size(1);
 
-    int window_size_left = -1;
-    int window_size_right = -1;
-    if (is_causal) { window_size_right = 0; }
-
     void *cu_seqlens_q_d = cu_seqlens_q.data_ptr();
 
     const int total_q = q.sizes()[0];
@@ -473,15 +487,20 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
-    if (window_size_left >= max_seqlen_k) { window_size_left = -1; }
-    if (window_size_right >= max_seqlen_k) { window_size_right = -1; }
-
     CHECK_SHAPE(q, total_q, num_heads, head_size_og);
     const int total_k = k.size(0);
     CHECK_SHAPE(k, total_k, num_heads_k, head_size_og);
     CHECK_SHAPE(v, total_k, num_heads_k, head_size_og);
 
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+    if (seqused_q.has_value()){
+        auto seqused_q_ = seqused_q.value();
+        TORCH_CHECK(seqused_q_.dtype() == torch::kInt32, "seqused_q must have dtype int32");
+        TORCH_CHECK(seqused_q_.is_cuda(), "seqused_q must be on CUDA device");
+        TORCH_CHECK(seqused_q_.is_contiguous(), "seqused_q must be contiguous");
+        CHECK_SHAPE(seqused_q_, batch_size);
+    }
+
     CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
     if (seqused_k.has_value()){
         auto seqused_k_ = seqused_k.value();
@@ -520,6 +539,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int seqlen_q_rounded = round_multiple(max_seqlen_q, 128);
     const int seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
 
+    if (is_causal) { window_size_right = 0; }
+
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
@@ -537,6 +558,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      q_padded, k_padded, v_padded, out,
                      cu_seqlens_q_d,
                      cu_seqlens_k.data_ptr(),
+                     seqused_q.has_value() ? seqused_q.value().data_ptr() : nullptr,
                      seqused_k.has_value() ? seqused_k.value().data_ptr() : nullptr,
                      /*p_d=*/nullptr,
                      softmax_lse.data_ptr(),
@@ -604,6 +626,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         c10::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
         const float softmax_scale,
         const bool is_causal,
+        int window_size_left,
+        int window_size_right,
         const bool deterministic) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -720,6 +744,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         dv_expanded = dv;
     }
 
+    if (is_causal) { window_size_right = 0; }
+
     Flash_bwd_params params;
 
     set_params_dgrad(params,
@@ -730,8 +756,10 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      head_size, head_size_rounded,
                      q, k, v, out,
                      dout_padded, dq, dk_expanded, dv_expanded,
-                     nullptr,
-                     nullptr,
+                     /*cu_seqlens_q_d=*/nullptr,
+                     /*cu_seqlens_k_d=*/nullptr,
+                     /*seqused_q=*/nullptr,
+                     /*seqused_k=*/nullptr,
                      dq_accum.data_ptr(),
                      // loop ? dk_accum.data_ptr() : nullptr,
                      // loop ? dv_accum.data_ptr() : nullptr,
@@ -741,8 +769,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      softmax_d.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
-                     /*window_size_left=*/-1,
-                     /*window_size_right=*/is_causal ? 0 : -1,
+                     /*window_size_left=*/window_size_left,
+                     /*window_size_right=*/window_size_right,
                      deterministic);
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
 
@@ -787,10 +815,14 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                c10::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
+               c10::optional<at::Tensor> &seqused_q, // b. If given, only this many elements of each batch element's queries and outputs are used.
+               c10::optional<at::Tensor> &seqused_k, // b. If given, only this many elements of each batch element's keys are used.
                const int max_seqlen_q,
                const int max_seqlen_k,          // max sequence length to choose the kernel
                const float softmax_scale,
                const bool is_causal,
+               int window_size_left,
+               int window_size_right,
                const bool deterministic) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -854,7 +886,22 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
     CHECK_SHAPE(out, total_q, num_heads, head_size);
     CHECK_SHAPE(dout, total_q, num_heads, head_size_og);
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+    if (seqused_q.has_value()){
+        auto seqused_q_ = seqused_q.value();
+        TORCH_CHECK(seqused_q_.dtype() == torch::kInt32, "seqused_q must have dtype int32");
+        TORCH_CHECK(seqused_q_.is_cuda(), "seqused_q must be on CUDA device");
+        TORCH_CHECK(seqused_q_.is_contiguous(), "seqused_q must be contiguous");
+        CHECK_SHAPE(seqused_q_, batch_size);
+    }
+
     CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+    if (seqused_k.has_value()){
+        auto seqused_k_ = seqused_k.value();
+        TORCH_CHECK(seqused_k_.dtype() == torch::kInt32, "seqused_k must have dtype int32");
+        TORCH_CHECK(seqused_k_.is_cuda(), "seqused_k must be on CUDA device");
+        TORCH_CHECK(seqused_k_.is_contiguous(), "seqused_k must be contiguous");
+        CHECK_SHAPE(seqused_k_, batch_size);
+    }
 
     at::Tensor dq, dk, dv;
     if (dq_.has_value()) {
@@ -892,6 +939,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
         dout_padded = dout;
     }
 
+    if (is_causal) { window_size_right = 0; }
+
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
@@ -927,6 +976,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                      dout_padded, dq, dk_expanded, dv_expanded,
                      cu_seqlens_q.data_ptr(),
                      cu_seqlens_k.data_ptr(),
+                     seqused_q.has_value() ? seqused_q.value().data_ptr() : nullptr,
+                     seqused_k.has_value() ? seqused_k.value().data_ptr() : nullptr,
                      dq_accum.data_ptr(),
                      // loop ? dk_accum.data_ptr() : nullptr,
                      // loop ? dv_accum.data_ptr() : nullptr,
@@ -936,8 +987,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                      softmax_d.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
-                     /*window_size_left=*/-1,
-                     /*window_size_right=*/is_causal ? 0 : -1,
+                     /*window_size_left=*/window_size_left,
+                     /*window_size_right=*/window_size_right,
                      deterministic);
     params.total_q = total_q;
     params.total_k = total_k;

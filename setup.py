@@ -87,6 +87,10 @@ def get_cuda_bare_metal_version(cuda_dir):
     return raw_output, bare_metal_version
 
 
+def get_hip_version():
+    return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
+
+
 def check_if_cuda_home_none(global_option: str) -> None:
     if CUDA_HOME is not None:
         return
@@ -307,6 +311,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         os.makedirs("build")
 
     os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --output_dir build --receipt 2")
+    os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_appendkv --output_dir build --receipt 2")
+    os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --output_dir build --receipt 2")
     os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d bwd --output_dir build --receipt 2")
 
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
@@ -321,8 +327,6 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         generator_flag = ["-DOLD_GENERATOR_PATH"]
 
     check_if_rocm_home_none("flash_attn")
-    cc_flag = []
-
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     validate_and_update_archs(archs)
 
@@ -335,7 +339,9 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
     sources = ["csrc/flash_attn_ck/flash_api.cpp",
+               "csrc/flash_attn_ck/flash_common.cpp",
                "csrc/flash_attn_ck/mha_bwd.cpp",
+               "csrc/flash_attn_ck/mha_fwd_kvcache.cpp",
                "csrc/flash_attn_ck/mha_fwd.cpp",
                "csrc/flash_attn_ck/mha_varlen_bwd.cpp",
                "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
@@ -345,16 +351,14 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     rename_cpp_to_cu(sources)
 
     renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
+                       "csrc/flash_attn_ck/flash_common.cu",
                        "csrc/flash_attn_ck/mha_bwd.cu",
+                       "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
                        "csrc/flash_attn_ck/mha_fwd.cu",
                        "csrc/flash_attn_ck/mha_varlen_bwd.cu",
                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
-    extra_compile_args = {
-        "cxx": ["-O3", "-std=c++17"] + generator_flag,
-        "nvcc":
-            [
-                "-O3","-std=c++17",
-                "-mllvm", "-enable-post-misched=0",
+
+    cc_flag += ["-O3","-std=c++17",
                 "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
                 "-fgpu-flush-denormals-to-zero",
                 "-DCK_ENABLE_BF16",
@@ -366,12 +370,26 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                 "-DCK_ENABLE_INT8",
                 "-DCK_USE_XDL",
                 "-DUSE_PROF_API=1",
-                "-D__HIP_PLATFORM_HCC__=1",
                 # "-DFLASHATTENTION_DISABLE_BACKWARD",
-            ]
-            + generator_flag
-            + cc_flag
-        ,
+                "-D__HIP_PLATFORM_HCC__=1"]
+
+    cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get('CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT', 3)}"]
+
+    # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
+    hip_version = get_hip_version()
+    if hip_version > Version('5.7.23302'):
+        cc_flag += ["-fno-offload-uniform-block"]
+    if hip_version > Version('6.1.40090'):
+        cc_flag += ["-mllvm", "-enable-post-misched=0"]
+    if hip_version > Version('6.2.41132'):
+        cc_flag += ["-mllvm", "-amdgpu-early-inline-all=true",
+                    "-mllvm", "-amdgpu-function-calls=false"]
+    if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
+        cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
+
+    extra_compile_args = {
+        "cxx": ["-O3", "-std=c++17"] + generator_flag,
+        "nvcc": cc_flag + generator_flag,
     }
 
     include_dirs = [
@@ -410,7 +428,7 @@ def get_wheel_url():
     cxx11_abi = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper()
 
     if IS_ROCM:
-        torch_hip_version = parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
+        torch_hip_version = get_hip_version()
         hip_version = f"{torch_hip_version.major}{torch_hip_version.minor}"
         wheel_filename = f"{PACKAGE_NAME}-{flash_version}+rocm{hip_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
     else:

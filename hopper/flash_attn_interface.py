@@ -14,7 +14,7 @@ import flashattn_hopper_cuda
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
-def _flash_attn_forward(q, k, v, softmax_scale, causal, descale_q = None, descale_k = None, descale_v = None):
+def _flash_attn_forward(q, k, v, softmax_scale, causal, window_size, descale_q = None, descale_k = None, descale_v = None):
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, q, k, v, out_padded, softmax_lse, S_dmask = flashattn_hopper_cuda.fwd(
         q,
@@ -26,6 +26,8 @@ def _flash_attn_forward(q, k, v, softmax_scale, causal, descale_q = None, descal
         descale_k,
         descale_v,
         causal,
+        window_size[0],
+        window_size[1],
     )
     return out, q, k, v, out_padded, softmax_lse, S_dmask
 
@@ -42,6 +44,7 @@ def _flash_attn_backward(
     dv,
     softmax_scale,
     causal,
+    window_size,
     deterministic=False
 ):
     # dq, dk, dv are allocated by us so they should already be contiguous
@@ -58,6 +61,8 @@ def _flash_attn_backward(
         dv,
         softmax_scale,
         causal,
+        window_size[0],
+        window_size[1],
         deterministic,
     )
     return dq, dk, dv, softmax_d
@@ -72,6 +77,9 @@ def _flash_attn_varlen_forward(
     max_seqlen_k,
     softmax_scale,
     causal,
+    window_size=(-1, -1),
+    seqused_q=None,
+    seqused_k=None,
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -82,11 +90,14 @@ def _flash_attn_varlen_forward(
         None,
         cu_seqlens_q,
         cu_seqlens_k,
-        None,
+        seqused_q,
+        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
         softmax_scale,
         causal,
+        window_size[0],
+        window_size[1],
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
@@ -109,7 +120,10 @@ def _flash_attn_varlen_backward(
     max_seqlen_k,
     softmax_scale,
     causal,
+    window_size,
     deterministic=False,
+    seqused_q=None,
+    seqused_k=None,
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
@@ -132,10 +146,14 @@ def _flash_attn_varlen_backward(
         dv,
         cu_seqlens_q,
         cu_seqlens_k,
+        seqused_q,
+        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
         softmax_scale,
         causal,
+        window_size[0],
+        window_size[1],
         deterministic,
     )
     # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
@@ -152,6 +170,7 @@ class FlashAttnFunc(torch.autograd.Function):
         v,
         softmax_scale,
         causal,
+        window_size,
         deterministic=False,
         descale_q=None,
         descale_k=None,
@@ -165,6 +184,7 @@ class FlashAttnFunc(torch.autograd.Function):
             v,
             softmax_scale,
             causal,
+            window_size,
             descale_q=descale_q,
             descale_k=descale_k,
             descale_v=descale_v,
@@ -172,6 +192,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.window_size = window_size
         ctx.deterministic = deterministic
         return out, softmax_lse
 
@@ -191,12 +212,13 @@ class FlashAttnFunc(torch.autograd.Function):
             dv,
             ctx.softmax_scale,
             ctx.causal,
+            ctx.window_size,
             ctx.deterministic,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -212,7 +234,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         max_seqlen_k,
         softmax_scale,
         causal,
+        window_size,
         deterministic=False,
+        seqused_q=None,
+        seqused_k=None,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -226,20 +251,25 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_k,
             softmax_scale,
             causal=causal,
+            window_size=window_size,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
         )
         ctx.save_for_backward(
-            q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k
+            q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k,
+            seqused_q, seqused_k
         )
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.window_size = window_size
         ctx.deterministic = deterministic
         return out, softmax_lse
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_varlen_backward(
             dout,
@@ -257,12 +287,15 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.max_seqlen_k,
             ctx.softmax_scale,
             ctx.causal,
+            ctx.window_size,
             ctx.deterministic,
+            seqused_q,
+            seqused_k,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_func(
@@ -271,6 +304,7 @@ def flash_attn_func(
     v,
     softmax_scale=None,
     causal=False,
+    window_size=(-1, -1),
     deterministic=False,
     descale_q=None,
     descale_k=None,
@@ -333,6 +367,7 @@ def flash_attn_func(
         v,
         softmax_scale,
         causal,
+        window_size,
         deterministic,
         descale_q,
         descale_k,
@@ -350,7 +385,10 @@ def flash_attn_varlen_func(
     max_seqlen_k,
     softmax_scale=None,
     causal=False,
+    window_size=(-1, -1),
     deterministic=False,
+    seqused_q=None,
+    seqused_k=None,
 ):
     """
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -381,6 +419,11 @@ def flash_attn_varlen_func(
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        seqused_q: (batch_size,), dtype torch.int32. If not None, it defines the actual number of
+            query and output tokens in each sequence.
+        seqused_k: (batch_size,), dtype torch.int32. If not None, it defines the actual number of
+            key and value tokens in each sequence.
     Return:
         out: (total, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -397,5 +440,8 @@ def flash_attn_varlen_func(
         max_seqlen_k,
         softmax_scale,
         causal,
+        window_size,
         deterministic,
+        seqused_q,
+        seqused_k,
     )

@@ -24,7 +24,7 @@ namespace flash {
 using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, class Element_, class ElementAccum_, class ArchTag_,
-        bool Is_causal_, bool Varlen_, bool Deterministic,
+        bool Is_causal_, bool Is_local_, bool Varlen_, bool Deterministic,
         bool dKV_swapAB_, bool dQ_swapAB_,
         int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1>
 struct CollectiveMainloopBwd {
@@ -36,6 +36,7 @@ struct CollectiveMainloopBwd {
     using ElementAccum = ElementAccum_;
     using ArchTag = ArchTag_;
     static constexpr bool Is_causal = Is_causal_;
+    static constexpr bool Is_local = Is_local_;
     static constexpr bool Varlen = Varlen_;
     static constexpr bool SdP_swapAB = true;
     static constexpr bool dKV_swapAB = dKV_swapAB_;
@@ -279,6 +280,10 @@ struct CollectiveMainloopBwd {
         int* dq_semaphore;
         int const* cu_seqlens_q = nullptr;
         int const* cu_seqlens_k = nullptr;
+        int const* seqused_k = nullptr;
+        int const* seqused_v = nullptr;
+        int window_size_left;
+        int window_size_right;
     };
 
     // Device side kernel params
@@ -303,6 +308,10 @@ struct CollectiveMainloopBwd {
         int* dq_semaphore;
         int const* cu_seqlens_q = nullptr;
         int const* cu_seqlens_k = nullptr;
+        int const* seqused_q = nullptr;
+        int const* seqused_k = nullptr;
+        int window_size_left;
+        int window_size_right;
     };
 
     static Params
@@ -362,7 +371,8 @@ struct CollectiveMainloopBwd {
                 tma_load_Q, tma_load_dO, tma_load_K, tma_load_V, tma_add_dQ, tma_load_LSE, tma_load_dPsum,
                 args.ptr_LSE_log2, args.shape_LSE, args.stride_LSE_log2, args.ptr_dPsum, args.stride_dPsum,
                 args.softmax_scale, float(args.softmax_scale * M_LOG2E),
-                args.num_batch, args.dq_semaphore, args.cu_seqlens_q, args.cu_seqlens_k};
+                args.num_batch, args.dq_semaphore, args.cu_seqlens_q, args.cu_seqlens_k,
+                args.seqused_k, args.seqused_v, args.window_size_left, args.window_size_right};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -384,7 +394,10 @@ struct CollectiveMainloopBwd {
         } else {
             return params.cu_seqlens_q == nullptr
                 ? get<0>(params.shape_Q)
-                : params.cu_seqlens_q[bidb + 1] - params.cu_seqlens_q[bidb];
+                : (params.seqused_q
+                    ? params.seqused_q[bidb]
+                    : params.cu_seqlens_q[bidb + 1] - params.cu_seqlens_q[bidb]
+                );
         }
     }
 
@@ -395,18 +408,37 @@ struct CollectiveMainloopBwd {
         } else {
             return params.cu_seqlens_k == nullptr
                 ? get<0>(params.shape_K)
-                : params.cu_seqlens_k[bidb + 1] - params.cu_seqlens_k[bidb];
+                : (params.seqused_k
+                    ? params.seqused_k[bidb]
+                    : params.cu_seqlens_k[bidb + 1] - params.cu_seqlens_k[bidb]
+                );
         }
     }
 
     CUTLASS_DEVICE
     int get_m_block_min(Params const& params, int n_block, int bidb) {
-        if constexpr (Is_causal) {
+        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});        
+        if constexpr (Is_causal || Is_local) {
             int const seqlen_q = get_seqlen_q(params, bidb);
             int const seqlen_k = get_seqlen_k(params, bidb);
-            return std::max(0, (n_block * kBlockN + seqlen_q - seqlen_k) / kBlockM);
+            return std::max(0, (n_block * kBlockN + seqlen_q - seqlen_k - params.window_size_right) / kBlockM);
         } else {
             return 0;
+        }
+    }
+
+    CUTLASS_DEVICE
+    int get_m_block_max(Params const& params, int n_block, int bidb) {
+        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});        
+        int const seqlen_q = get_seqlen_q(params, bidb);
+        int const seqlen_k = get_seqlen_k(params, bidb);
+        int m_block_max = cute::ceil_div(seqlen_q, kBlockM);
+        if constexpr (Is_local) {
+            return std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + seqlen_q - seqlen_k + params.window_size_left, kBlockM));
+        } else {
+            return m_block_max;
         }
     }
 
@@ -480,7 +512,7 @@ struct CollectiveMainloopBwd {
             }
         }
 
-        int m_block_max = cute::ceil_div(get_seqlen_q(params, bidb), get<0>(TileShape_MNK{}));
+        int m_block_max = get_m_block_max(params, n_block, bidb);
         int m_block_min = get_m_block_min(params, n_block, bidb);
         int m_block = m_block_min;
 
@@ -557,7 +589,7 @@ struct CollectiveMainloopBwd {
         Tensor tdQgdQ = block_tma_dQ.partition_D(gdQaccum);  // (TMA, TMA_M, TMA_K)
         Tensor tdQsdQ = block_tma_dQ.partition_S(sdQ); // (TMA, TMA_M, TMA_K)
 
-        int m_block_max = cute::ceil_div(get_seqlen_q(params, bidb), get<0>(TileShape_MNK{}));
+        int m_block_max = get_m_block_max(params, n_block, bidb);
         int m_block_min = get_m_block_min(params, n_block, bidb);
         int m_block = m_block_min;
         int const num_batch = params.num_batch;
@@ -580,6 +612,15 @@ struct CollectiveMainloopBwd {
                 Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
             }
             cutlass::arch::NamedBarrier::arrive(kNThreadsdQ + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::dQEmpty) /*id*/);  // sdQ empty, ready to be written to
+        }
+        if constexpr (Is_local && Deterministic) {
+            constexpr int kBlockM = get<0>(TileShape_MNK{});        
+            int const seqlen_q = get_seqlen_q(params, bidb);
+            int const m_block_global_max = cute::ceil_div(seqlen_q, kBlockM);
+            #pragma unroll 2
+            for (; m_block < m_block_global_max; ++m_block) {
+                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
+            }
         }
     }
 
@@ -667,7 +708,7 @@ struct CollectiveMainloopBwd {
         int const seqlen_q = get_seqlen_q(params, bidb);
         int const seqlen_k = get_seqlen_k(params, bidb);
 
-        int m_block_max = cute::ceil_div(get_seqlen_q(params, bidb), get<0>(TileShape_MNK{}));
+        int m_block_max = get_m_block_max(params, n_block, bidb);
         int m_block_min = get_m_block_min(params, n_block, bidb);
         int m_block = m_block_min;
 
@@ -732,8 +773,8 @@ struct CollectiveMainloopBwd {
                 int causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
                 #pragma unroll
                 for (int i = 0; i < size(tSrS); ++i) {
-                    if (int(get<0>(taccScS(i))) >= std::min(int(get<1>(taccScS(i))) + causal_row_offset,
-                                                            seqlen_k - n_block * kBlockN)) {
+                    if (int(get<0>(taccScS(i))) >= 
+                        std::min(int(get<1>(taccScS(i))) + causal_row_offset, seqlen_k - n_block * kBlockN)) {
                         tSrS(i) = -INFINITY;
                     }
                 }
@@ -789,10 +830,23 @@ struct CollectiveMainloopBwd {
             warpgroup_wait<1>();
             Tensor cS = cute::make_identity_tensor(select<1, 0>(TileShape_MNK{}));
             Tensor taccScS = thread_mma_SdP.partition_C(cS);
-            #pragma unroll
-            for (int i = 0; i < size(tSrS); ++i) {
-                if (int(get<0>(taccScS(i))) >= int(seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
+            if constexpr (!Is_local) {
+                #pragma unroll
+                for (int i = 0; i < size(tSrS); ++i) {
+                    if (int(get<0>(taccScS(i))) >= int(seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
+                }
+            } else {
+                int local_row_offset_right = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM + params.window_size_right;
+                int local_row_offset_left = seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM - params.window_size_left;
+                #pragma unroll
+                for (int i = 0; i < size(tSrS); ++i) {
+                    if ((int(get<0>(taccScS(i))) >= std::min(int(get<1>(taccScS(i))) + local_row_offset_right, seqlen_k - n_block * kBlockN)) || 
+                        (int(get<0>(taccScS(i))) < std::max(int(get<1>(taccScS(i))) + local_row_offset_left, 0))) {
+                        tSrS(i) = -INFINITY;
+                    }
+                }
             }
+ 
             // Reshape tSrS from ((2, 2, V), MMA_N, MMA_M) to (nrow=(2, V, MMA_M), ncol=(2, MMA_N))
             Tensor scores = make_tensor(tSrS.data(), flash::convert_layout_acc_transposed_rowcol(tSrS.layout()));
             // if (blockIdx.x == 0 && threadIdx.x == 128) { print_tensor(tLSErLSE); }
@@ -838,4 +892,3 @@ struct CollectiveMainloopBwd {
 };
 
 } // namespace flash
-

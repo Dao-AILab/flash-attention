@@ -20,9 +20,10 @@
 
 using namespace cute;
 
-template <int kHeadDim, int kBlockM, int kBlockN, typename Element, bool Is_causal, bool Varlen, bool Deterministic,
+template <int kHeadDim, int kBlockM, int kBlockN, typename Element, bool Is_causal, bool Is_local, bool Varlen, bool Deterministic,
           bool dKV_swapAB, bool dQ_swapAB, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1>
 void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+    static_assert(!(Is_causal && Is_local), "Is_causal and Is_local cannot be true at the same time.");
     using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
     using ElementAccum = float;
     using PreprocessKernel = flash::FlashAttnBwdPreprocess<TileShape_MK, Element, ElementAccum, cutlass::arch::Sm90, /*Clear_dQaccum=*/true, Varlen>;
@@ -45,7 +46,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         {params.d_rounded, _1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0},  // stride_dQ
         params.b,
         params.dq_semaphore,
-        params.cu_seqlens_q
+        params.cu_seqlens_q,
+        params.seqused_q
     };
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
     int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
@@ -56,7 +58,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     using ClusterShape = cute::Shape<_1, Int<1>, _1>;
     static constexpr int Stages = 2;
     using CollectiveMainloop = flash::CollectiveMainloopBwd<Stages, ClusterShape, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm90,
-            Is_causal, Varlen, Deterministic,
+            Is_causal, Is_local, Varlen, Deterministic,
             dKV_swapAB, dQ_swapAB, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>;
     using CollectiveEpilogue = flash::CollectiveEpilogueBwd<TileShape_MNK, Element, CollectiveMainloop::NumMmaThreads, Varlen>;
     using Scheduler = flash::SingleTileSchedulerBwd;
@@ -87,6 +89,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.b,
         params.dq_semaphore,
         params.cu_seqlens_q, params.cu_seqlens_k,
+        params.seqused_q, params.seqused_k,
+        params.window_size_left, params.window_size_right
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<Element*>(params.dk_ptr),
@@ -146,7 +150,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         {!Varlen ? params.seqlen_q : params.total_q, params.d, params.h, !Varlen ? params.b : 1},  // shape_dQ
         {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
         params.scale_softmax,
-        params.cu_seqlens_q
+        params.cu_seqlens_q,
+        params.seqused_q
     };
     typename PostprocessKernel::Params postprocess_params = PostprocessKernel::to_underlying_arguments(postprocess_args);
     int num_m_block_postprocess = cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
@@ -167,9 +172,11 @@ template<typename T>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
-            BOOL_SWITCH(params.deterministic, Deterministic, [&] {
-                run_flash_bwd<Headdim, 128, 128, T, Is_causal, Varlen, Deterministic, false, false, 1, 2, 2>(params, stream);
+        BOOL_SWITCH(params.is_local, Is_local, [&] {
+            BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
+                BOOL_SWITCH(params.deterministic, Deterministic, [&] {
+                    run_flash_bwd<Headdim, 128, 128, T, Is_causal, Is_local && !Is_causal, Varlen, Deterministic, false, false, 1, 2, 2>(params, stream);
+                });
             });
         });
     });
@@ -179,9 +186,11 @@ template<typename T>
 void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 96;
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
-            BOOL_SWITCH(params.deterministic, Deterministic, [&] {
-                run_flash_bwd<Headdim, 64, 128, T, Is_causal, Varlen, Deterministic, false, false, 1, 2, 1>(params, stream);
+        BOOL_SWITCH(params.is_local, Is_local, [&] {
+            BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
+                BOOL_SWITCH(params.deterministic, Deterministic, [&] {
+                    run_flash_bwd<Headdim, 64, 128, T, Is_causal, Is_local && !Is_causal, Varlen, Deterministic, false, false, 1, 2, 1>(params, stream);
+                });
             });
         });
     });
@@ -191,9 +200,11 @@ template<typename T>
 void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
-            BOOL_SWITCH(params.deterministic, Deterministic, [&] {
-                run_flash_bwd<Headdim, 64, 128, T, Is_causal, Varlen, Deterministic, false, false, 1, 2, 1>(params, stream);
+        BOOL_SWITCH(params.is_local, Is_local, [&] {
+            BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
+                BOOL_SWITCH(params.deterministic, Deterministic, [&] {
+                    run_flash_bwd<Headdim, 64, 128, T, Is_causal, Is_local && !Is_causal, Varlen, Deterministic, false, false, 1, 2, 1>(params, stream);
+                });
             });
         });
     });
