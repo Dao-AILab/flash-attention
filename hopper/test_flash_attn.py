@@ -146,8 +146,8 @@ def test_flash_attn_output_fp8(
     # dK = torch.einsum('bhts,bthd->bshd', dP, q.float())
     # breakpoint()
     
-    # just test correctness of fp8 kernel w/o further quantization techniques
-    assert (out - out_ref).abs().max().item() <= 40 * (out_pt - out_ref).abs().max().item()
+    atol = 4 * (out_pt - out_ref).abs().max().item()
+    torch.testing.assert_close(out, out_ref, rtol=1e-1, atol=atol, check_dtype=False)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
