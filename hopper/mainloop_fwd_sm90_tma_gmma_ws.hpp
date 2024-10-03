@@ -733,7 +733,6 @@ struct CollectiveMainloopFwd {
             warp_scheduler_barrier_sync();
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
             warp_scheduler_barrier_arrive();
-        
             if (work_idx != 0) {
                 int lane_predicate = cute::elect_one_sync();
                 if (cutlass::canonical_warp_idx_sync() == Ktraits::kNWarps - 1 && lane_predicate) {
@@ -745,8 +744,6 @@ struct CollectiveMainloopFwd {
                 }
             }
             warpgroup_wait<0>();
-            pipeline_k.consumer_release(smem_pipe_read_k);
-            ++smem_pipe_read_k;
         } else {
             if (work_idx != 0) {
                 int lane_predicate = cute::elect_one_sync();
@@ -758,14 +755,13 @@ struct CollectiveMainloopFwd {
                     }
                 }
             }
-
             consumer_wait(pipeline_k, smem_pipe_read_k);
             warp_scheduler_barrier_sync();
             flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
             warp_scheduler_barrier_arrive();
-            pipeline_k.consumer_release(smem_pipe_read_k);
-            ++smem_pipe_read_k;
         }
+        pipeline_k.consumer_release(smem_pipe_read_k);
+        ++smem_pipe_read_k;
 
         auto col_limit_right = [&](int row, int n_block) {
             int col_limit_base = row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM_div_H;
