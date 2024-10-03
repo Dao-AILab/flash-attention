@@ -279,8 +279,30 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int batch_nheads, int 
             // Just split freely
             start_threshold = .8f;
         }
+    } else if (head_size == 64) {
+        if (use_one_mma_wg) {
+            if (std::log2f(num_n_blocksf) <= 4) { // 2K -- .33
+                start_threshold = .33f;
+            } else if (std::log2f(num_n_blocksf) <= 5) { // 4K -- .37
+                start_threshold = .33f + (std::log2f(num_n_blocksf) - 4) * .04f;
+            } else if (std::log2f(num_n_blocksf) <= 6) { // 8K -- .40
+                start_threshold = .37f + (std::log2f(num_n_blocksf) - 5) * .03f;
+            } else if (std::log2f(num_n_blocksf) <= 7) { // 16K -- .43
+                start_threshold = .4f + (std::log2f(num_n_blocksf) - 6) * .03f;
+            } else if (std::log2f(num_n_blocksf) <= 8) { // 32K -- .46
+                start_threshold = .43f + (std::log2f(num_n_blocksf) - 7) * .03f;
+            } else {
+                start_threshold = .8f;
+            }
+        } else {
+            if (std::log2f(num_n_blocksf) <= 6) { // 8K -- .5
+                start_threshold = .5f;
+            } else {
+                start_threshold = .8f;
+            }
+        }
     } else {
-        // TODO for hdim 64
+        // placeholder for other hdims
         start_threshold = .8f;
     }
 
