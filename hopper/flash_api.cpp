@@ -614,23 +614,23 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
 
+    at::Tensor descale_q, descale_k, descale_v;
     if(q_dtype == at::ScalarType::Float8_e4m3fn) {
-        at::Tensor descale_q, descale_k, descale_v;
-        if (descale_q_.has_value() && descale_k_.has_value() && descale_k_.has_value()) {
+        if (descale_q_.has_value()) {
             descale_q = descale_q_.value();
-            descale_k = descale_k_.value();
-            descale_v = descale_v_.value();
             CHECK_DEVICE(descale_q);
-            CHECK_DEVICE(descale_k);
-            CHECK_DEVICE(descale_v);
             CHECK_SHAPE(descale_q, 1);
+        } else { descale_q = torch::ones({1}, opts.dtype(at::kFloat)); }
+        if (descale_k_.has_value()) {
+            descale_k = descale_k_.value();
+            CHECK_DEVICE(descale_k);
             CHECK_SHAPE(descale_k, 1);
+        } else { descale_k = torch::ones({1}, opts.dtype(at::kFloat)); }
+        if (descale_v_.has_value()) {
+            descale_v = descale_v_.value();
+            CHECK_DEVICE(descale_v);
             CHECK_SHAPE(descale_v, 1);
-        } else {
-            descale_q = torch::ones({1}, opts.dtype(at::kFloat));
-            descale_k = torch::ones({1}, opts.dtype(at::kFloat));
-            descale_v = torch::ones({1}, opts.dtype(at::kFloat));
-        }
+        } else { descale_v = torch::ones({1}, opts.dtype(at::kFloat)); }
         params.descale_q_ptr = descale_q.data_ptr<float>();
         params.descale_k_ptr = descale_k.data_ptr<float>();
         params.descale_v_ptr = descale_v.data_ptr<float>();
@@ -1420,23 +1420,23 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      window_size_right
                      );
 
+    at::Tensor descale_q, descale_k, descale_v;
     if(q_dtype == at::ScalarType::Float8_e4m3fn) {
-        at::Tensor descale_q, descale_k, descale_v;
-        if (descale_q_.has_value() && descale_k_.has_value() && descale_k_.has_value()) {
+        if (descale_q_.has_value()) {
             descale_q = descale_q_.value();
-            descale_k = descale_k_.value();
-            descale_v = descale_v_.value();
             CHECK_DEVICE(descale_q);
-            CHECK_DEVICE(descale_k);
-            CHECK_DEVICE(descale_v);
             CHECK_SHAPE(descale_q, 1);
+        } else { descale_q = torch::ones({1}, opts.dtype(at::kFloat)); }
+        if (descale_k_.has_value()) {
+            descale_k = descale_k_.value();
+            CHECK_DEVICE(descale_k);
             CHECK_SHAPE(descale_k, 1);
+        } else { descale_k = torch::ones({1}, opts.dtype(at::kFloat)); }
+        if (descale_v_.has_value()) {
+            descale_v = descale_v_.value();
+            CHECK_DEVICE(descale_v);
             CHECK_SHAPE(descale_v, 1);
-        } else {
-            descale_q = torch::ones({1}, opts.dtype(at::kFloat));
-            descale_k = torch::ones({1}, opts.dtype(at::kFloat));
-            descale_v = torch::ones({1}, opts.dtype(at::kFloat));
-        }
+        } else { descale_v = torch::ones({1}, opts.dtype(at::kFloat)); }
         params.descale_q_ptr = descale_q.data_ptr<float>();
         params.descale_k_ptr = descale_k.data_ptr<float>();
         params.descale_v_ptr = descale_v.data_ptr<float>();
