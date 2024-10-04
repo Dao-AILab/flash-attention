@@ -106,12 +106,12 @@ for causal in causal_vals:
             time_b[config, "Flash"] = b
 
             print(
-                f"### causal={causal}, headdim={headdim}, batch_size={batch_size}, seqlen={seqlen} ###")
+                f"[b, s, h, d] = [{batch_size}, {seqlen}, {nheads}, {headdim}], causal={causal}")
             for method in methods:
                 speed_b[config, method] = efficiency(
                     flops(batch_size, seqlen, headdim,
                           nheads, causal, mode="bwd"),
                     time_b[config, method]
                 )
-                print(f"bwd: {speed_b[config, method]:.2f} TFLOPs/s, ")
+                print(f"bwd: {speed_b[config, method]:.2f} TFLOPs/s")
 
