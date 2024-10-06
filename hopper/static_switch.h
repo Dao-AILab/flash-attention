@@ -27,6 +27,23 @@
     }                                                                          \
   }()
 
+#define CAUSAL_LOCAL_SWITCH(CAUSAL_COND, LOCAL_COND, CAUSAL_CONST_NAME, LOCAL_CONST_NAME, ...) \
+  [&] {                                                                                        \
+    if (CAUSAL_COND) {                                                                         \
+      constexpr static bool CAUSAL_CONST_NAME = true;                                          \
+      constexpr static bool LOCAL_CONST_NAME = false;                                          \
+      return __VA_ARGS__();                                                                    \
+    } else if (LOCAL_COND) {                                                                   \
+      constexpr static bool CAUSAL_CONST_NAME = false;                                         \
+      constexpr static bool LOCAL_CONST_NAME = true;                                           \
+      return __VA_ARGS__();                                                                    \
+    } else {                                                                                   \
+      constexpr static bool CAUSAL_CONST_NAME = false;                                         \
+      constexpr static bool LOCAL_CONST_NAME = false;                                          \
+      return __VA_ARGS__();                                                                    \
+    }                                                                                          \
+  }()
+
 #define PREC_SWITCH(PRECTYPE, ...)                                             \
   [&] {                                                                        \
     if (PRECTYPE == 1) {                                                       \
@@ -57,8 +74,14 @@
     if (HEADDIM == 64) {                                                       \
       constexpr static int kHeadSize = 64;                                     \
       return __VA_ARGS__();                                                    \
+    } else if (HEADDIM == 96) {                                                \
+      constexpr static int kHeadSize = 96;                                     \
+      return __VA_ARGS__();                                                    \
     } else if (HEADDIM == 128) {                                               \
       constexpr static int kHeadSize = 128;                                    \
+      return __VA_ARGS__();                                                    \
+    } else if (HEADDIM == 96) {                                                \
+      constexpr static int kHeadSize = 96;                                     \
       return __VA_ARGS__();                                                    \
     } else if (HEADDIM == 256) {                                               \
       constexpr static int kHeadSize = 256;                                    \
@@ -66,14 +89,18 @@
     }                                                                          \
   }()
 
-#define SEQLEN_SWITCH(USE_VAR_SEQ_LEN, NAME, ...)                              \
+#define SEQLEN_SWITCH(USE_VAR_SEQ_LEN, SEQ_LEN_OUT_OF_BOUND_CHECK, ...)        \
   [&] {                                                                        \
-    bool useSeqLen = USE_VAR_SEQ_LEN;                                          \
-    if (useSeqLen) {                                                           \
-      using NAME = flash::VarSeqLenTraits;                                     \
-      return __VA_ARGS__();                                                    \
+    if (!USE_VAR_SEQ_LEN) {                                                    \
+      if (SEQ_LEN_OUT_OF_BOUND_CHECK) {                                        \
+        using kSeqLenTraitsType = FixedSeqLenTraits<true>;                     \
+        return __VA_ARGS__();                                                  \
+      } else {                                                                 \
+        using kSeqLenTraitsType = FixedSeqLenTraits<false>;                    \
+        return __VA_ARGS__();                                                  \
+      }                                                                        \
     } else {                                                                   \
-      using NAME = flash::FixedSeqLenTraits;                                   \
+      using kSeqLenTraitsType = VarSeqLenTraits;                               \
       return __VA_ARGS__();                                                    \
     }                                                                          \
   }() 

@@ -16,9 +16,6 @@
 #include "cutlass/pipeline/pipeline.hpp"
 
 #include "utils.h"
-#include "tile_scheduler_bwd.hpp"
-#include "mainloop_bwd_sm90_tma_gmma_ws.hpp"
-#include "epilogue_bwd_sm90_tma.hpp"
 
 namespace flash {
 
@@ -61,32 +58,32 @@ public:
     static constexpr uint32_t NumMmaWarpGroups = CUTE_STATIC_V(size(TiledMmaSdP{})) / cutlass::NumThreadsPerWarpGroup;
     static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMmaSdP{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup);
     static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
-    static_assert(NumMmaWarpGroups == 2);
+    static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
 
     /// Register requirement for Load and Math WGs
-    static constexpr uint32_t LoadRegisterRequirement = 24;
-    static constexpr uint32_t MmaRegisterRequirement = 240;
+    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 2 ? 24 : 32;
+    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 240 : 160;
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
-    // static constexpr uint32_t LoadRegisterRequirement = 56;
-    // static constexpr uint32_t MmaRegisterRequirement = 224;
+    // static constexpr uint32_t LoadRegisterRequirement = 40;
+    // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 232 : 152;
 
     // Kernel level shared memory storage
     struct SharedStorage {
-        struct {
+        struct TensorStorage : cute::aligned_struct<128> {
             union {
                 typename CollectiveMainloop::TensorStorage mainloop;
                 typename CollectiveEpilogue::TensorStorage epilogue;
             };
-        };
+        } tensors;
 
-        struct {
+        struct PipelineStorage : cute::aligned_struct<16> {
             alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_KV;
             alignas(16) cutlass::arch::ClusterBarrier barrier_dKV;
             alignas(16) typename CollectiveMainloop::MainloopPipeline::SharedStorage pipeline_q;
-            alignas(16) typename CollectiveMainloop::MainloopPipeline::SharedStorage pipeline_do;
+            alignas(16) typename CollectiveMainloop::MainloopPipeline_dO::SharedStorage pipeline_do;
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
-        };
+        } pipelines;
 
     };
 
@@ -161,6 +158,10 @@ public:
         using MainloopPipeline = typename CollectiveMainloop::MainloopPipeline;
         using PipelineParams = typename MainloopPipeline::Params;
         using PipelineState = typename MainloopPipeline::PipelineState;
+        using MainloopPipeline_dO = typename CollectiveMainloop::MainloopPipeline_dO;
+        using PipelineParams_dO = typename MainloopPipeline_dO::Params;
+        using PipelineState_dO = typename MainloopPipeline_dO::PipelineState;
+        static constexpr bool Q_dO_same_stages = std::is_same_v<MainloopPipeline, MainloopPipeline_dO>;
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
@@ -186,12 +187,16 @@ public:
         pipeline_params.num_consumers = NumMmaThreads;
 
         if (warp_idx == 0 && lane_predicate) {
-            shared_storage.barrier_KV.init(1 /*numThreads*/);
+            shared_storage.pipelines.barrier_KV.init(1 /*numThreads*/);
             // shared_storage.barrier_dKV.init(size(ClusterShape{}) /*numThreads*/);
         }
         // We're counting on pipeline_q to call cutlass::arch::fence_barrier_init();
-        MainloopPipeline pipeline_q(shared_storage.pipeline_q, pipeline_params, ClusterShape{});
-        MainloopPipeline pipeline_do(shared_storage.pipeline_do, pipeline_params, ClusterShape{});
+        MainloopPipeline pipeline_q(shared_storage.pipelines.pipeline_q, pipeline_params, ClusterShape{});
+        auto role_dO = warp_group_idx == 0
+            ? MainloopPipeline_dO::ThreadCategory::Producer
+            : MainloopPipeline_dO::ThreadCategory::Consumer;
+        PipelineParams_dO pipeline_params_dO {pipeline_params.transaction_bytes, role_dO, pipeline_params.is_leader, pipeline_params.num_consumers};
+        MainloopPipeline_dO pipeline_do(shared_storage.pipelines.pipeline_do, cute::conditional_return<Q_dO_same_stages>(pipeline_params, pipeline_params_dO), ClusterShape{});
 
         CollectiveMainloop collective_mainloop;
         CollectiveEpilogue collective_epilogue;
@@ -210,22 +215,16 @@ public:
             int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
             if (warp_idx_in_warpgroup == 0) {  // Load K, V, and do TMA on Q and dO
                 PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>();
+                PipelineState_dO smem_pipe_write_do = cutlass::make_producer_start_state<MainloopPipeline_dO>();
 
-                int work_idx = 0;
-
-                TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.smem_scheduler));
-                for (auto work_tile_info = scheduler.template get_initial_work</*IsProducer=*/true>(params.scheduler);
+                TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
+                for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler);
                      work_tile_info.is_valid(params.scheduler);
-                     work_tile_info = scheduler.template get_next_work</*IsProducer=*/true>(params.scheduler, work_tile_info)) {
+                     work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)) {
                     auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                     auto [n_block, bidh, bidb] = block_coord;
-                    if constexpr (Varlen) {
-                        if (n_block * kBlockN >= collective_mainloop.get_seqlen_k(params.mainloop, bidb)) {
-                            scheduler.prefetch_next_work(params.scheduler, work_tile_info);
-                            continue;
-                        }
-                    }
-                    if constexpr (Is_causal || Is_local) {
+                    // With Varlen it's possible to have query length = 0. We want to skip the iteration.
+                    if constexpr (Is_causal || Is_local || Varlen) {
                         int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
                         int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
                         if (m_block_min >= m_block_max) {
@@ -237,21 +236,17 @@ public:
                         scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                     };
                     collective_mainloop.load(params.mainloop, pipeline_q, pipeline_do, smem_pipe_write,
-                                             shared_storage, scheduler_prefetch, block_coord, work_idx);
-                    ++work_idx;
+                                             smem_pipe_write_do, shared_storage, scheduler_prefetch, block_coord);
                 }
-                collective_mainloop.load_tail(pipeline_q, pipeline_do, smem_pipe_write);
+                collective_mainloop.load_tail(pipeline_q, pipeline_do, smem_pipe_write, smem_pipe_write_do);
             } else if (warp_idx_in_warpgroup == 1) {
-                TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.smem_scheduler));
-                for (auto work_tile_info = scheduler.template get_initial_work</*IsProducer=*/false>(params.scheduler);
+                TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
+                for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
                      work_tile_info.is_valid(params.scheduler);
-                     work_tile_info = scheduler.template get_next_work</*IsProducer=*/false>(params.scheduler, work_tile_info)) {
+                     work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
                     auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                     auto [n_block, bidh, bidb] = block_coord;
-                    if constexpr (Varlen) {
-                        if (n_block * kBlockN >= collective_mainloop.get_seqlen_k(params.mainloop, bidb)) { continue; }
-                    }
-                    if constexpr (Is_causal) {
+                    if constexpr (Is_causal || Is_local || Varlen) {
                         int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
                         int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
                         if (m_block_min >= m_block_max) { continue; }
@@ -262,26 +257,24 @@ public:
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
-            TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.smem_scheduler));
+            TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
             // Initialize matmul objects.
             TiledMmadKV tiled_mma_dKV;
 
             PipelineState smem_pipe_read;
+            PipelineState_dO smem_pipe_read_do;
 
             collective_mainloop.mma_init();
             scheduler.init_consumer();
 
             int work_idx = 0;
             CUTLASS_PRAGMA_NO_UNROLL
-            for (auto work_tile_info = scheduler.template get_initial_work</*IsProducer=*/false>(params.scheduler);
+            for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
                  work_tile_info.is_valid(params.scheduler);
-                 work_tile_info = scheduler.template get_next_work</*IsProducer=*/false>(params.scheduler, work_tile_info)) {
+                 work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 auto [n_block, bidh, bidb] = block_coord;
-                if constexpr (Varlen) {
-                    if (n_block * kBlockN >= collective_mainloop.get_seqlen_k(params.mainloop, bidb)) { continue; }
-                }
-                if constexpr (Is_causal || Is_local) {
+                if constexpr (Is_causal || Is_local || Varlen) {
                     int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
                     int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
                     if (m_block_min >= m_block_max) {  // We exit early and write 0 to dK and dV
@@ -293,7 +286,7 @@ public:
                 // dK and dV output accumulator.
                 Tensor tdKrdK = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
                 Tensor tdVrdV = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
-                collective_mainloop.mma(params.mainloop, pipeline_q, pipeline_do, smem_pipe_read,
+                collective_mainloop.mma(params.mainloop, pipeline_q, pipeline_do, smem_pipe_read, smem_pipe_read_do,
                                         tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage);
                 collective_epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
                                           threadIdx.x - NumCopyThreads, block_coord);
@@ -302,6 +295,7 @@ public:
             }
             collective_epilogue.store_tail();
         }
+
     }
 
 };

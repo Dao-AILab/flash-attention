@@ -35,7 +35,7 @@ public:
 
     static constexpr int kHeadDim = get<1>(TileShape_MK{});
     using R2SLayoutAtomdQaccum = Layout<Shape<Int<kNThreads>>, Stride<_1>>;
-    using R2STiledCopydQaccum = decltype(make_tiled_copy(Copy_Atom<DefaultCopy, ElementAccum>{}, R2SLayoutAtomdQaccum{},
+    using R2STiledCopydQaccum = decltype(make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{}, R2SLayoutAtomdQaccum{},
                                                          Layout<Shape < _4>>{}));  // Val layout, 4 vals per read
     static constexpr int SmemdQaccumSize = size(TileShape_MK{});
     static_assert(size(TileShape_MK{}) == size(SmemLayoutdQaccumTMA{}), "TileShape_MK and SmemLayoutdQaccumTMA must have the same size");
@@ -68,7 +68,7 @@ public:
     using GmemLayoutAtom = Layout<Shape <Int<MaxThreadsPerBlock / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
     using GmemTiledCopy = decltype(
-        make_tiled_copy(Copy_Atom<DefaultCopy, Element>{},
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per load
 
@@ -89,7 +89,7 @@ public:
         GmemTiledCopydQaccum{},
         make_tensor(make_gmem_ptr(static_cast<ElementAccum*>(nullptr)), ShapedQ{}, StridedQ{}),
         SmemLayoutdQaccumTMA{},
-        SmemLayoutdQaccumTMA{}.shape(),
+        TileShape_MK{},
         _1{})); // no mcast for dQ
 
     // Device side arguments
@@ -126,7 +126,7 @@ public:
             GmemTiledCopydQaccum{},
             mdQaccum,
             SmemLayoutdQaccumTMA{},
-            SmemLayoutdQaccumTMA{}.shape(),
+            TileShape_MK{},
             _1{}); // no mcast for dQaccum
         return {
             tma_load_dQaccum,
@@ -172,10 +172,9 @@ public:
         __syncthreads();
 
         // Step 1: TMA to load dQaccum from gmem to smem
-        // We reshaped dQaccum to have last dimension 32, so the offset needs to be multiplied by kHeadDim / 32
-        int const offset_padded = !is_varlen ? 0 : ((params.cu_seqlens[bidb] + bidb * 128) / 128 * 128) * (kHeadDim / get<1>(SmemLayoutdQaccumTMA{}.shape()));
+        int const offset_padded = !is_varlen ? 0 : (params.cu_seqlens[bidb] + bidb * kBlockM) / kBlockM * kBlockM;
         Tensor mdQaccum = params.tma_load_dQaccum.get_tma_tensor(params.shape_dQaccum)(_, _, bidh, !is_varlen ? bidb : 0);
-        Tensor gdQaccum = local_tile(domain_offset(make_coord(offset_padded, _0{}), mdQaccum), SmemLayoutdQaccumTMA{}.shape(), make_coord(m_block, _0{}));  // (M, K)
+        Tensor gdQaccum = local_tile(domain_offset(make_coord(offset_padded, _0{}), mdQaccum), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
         auto block_tma_dQ = params.tma_load_dQaccum.get_slice(_0{});
         Tensor tdQgdQaccumTMA = block_tma_dQ.partition_D(gdQaccum);  // (TMA, TMA_M, TMA_K)
         Tensor tdQsdQaccumTMA = block_tma_dQ.partition_S(sdQaccumTMA); // (TMA, TMA_M, TMA_K)
@@ -196,9 +195,9 @@ public:
         Tensor tdQsdQaccum = s2r_thr_copy_dQaccum.partition_S(sdQaccum);
         TiledMma tiled_mma_dQ;
         Tensor taccdQrdQaccum = partition_fragment_C(tiled_mma_dQ, select<!dQ_swapAB ? 0 : 1, !dQ_swapAB ? 1 : 0>(TileShape_MK{}));
-        // if (cute::thread0()) { print(tiled_mma_dQ); printf("\n"); }
-        // if (cute::thread0()) { print(tdQsdQaccum); }
-        // if (cute::thread0()) { print(taccdQrdQaccum); }
+        // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 1) { print(tiled_mma_dQ); printf("\n"); }
+        // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 1) { print(tdQsdQaccum); }
+        // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 1) { print(taccdQrdQaccum); }
         CUTE_STATIC_ASSERT_V(size(taccdQrdQaccum) == size(tdQsdQaccum));
         Tensor tdQrdQaccum = s2r_thr_copy_dQaccum.retile_D(taccdQrdQaccum);
         cute::copy(s2r_tiled_copy_dQaccum, tdQsdQaccum, tdQrdQaccum);

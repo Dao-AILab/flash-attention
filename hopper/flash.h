@@ -28,6 +28,7 @@ struct Qkv_params {
     index_t q_head_stride;
     index_t k_head_stride;
     index_t v_head_stride;
+    index_t v_dim_stride;
 
     // The number of heads.
     int h, h_k;
@@ -56,22 +57,28 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ softmax_lse_ptr;
     void * __restrict__ softmax_lseaccum_ptr;
 
+    // For FP8 scaling
+    float * __restrict__ q_scale_ptr;
+    float * __restrict__ k_scale_ptr;
+    float * __restrict__ v_scale_ptr;
+
     // The dimensions.
-    int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim, total_q, total_k;
+    int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;
+    int total_q, total_k;
 
     // The scaling factors for the kernel.
     float scale_softmax;
     float scale_softmax_log2;
     uint32_t scale_softmax_log2_half2;
+    float softcap;
 
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
 
-    // If provided, the actual length of each q / o sequence.
-    int * __restrict__ seqused_q;
-    // If provided, the actual length of each k / v sequence.
-    int * __restrict__ seqused_k;
+    // If provided, the actual length of each q/k sequence.
+    int *__restrict__ seqused_q;
+    int *__restrict__ seqused_k;
 
     int *__restrict__ blockmask;
 
@@ -131,12 +138,7 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ alibi_slopes_ptr;
     index_t alibi_slopes_batch_stride;
 
-    bool unpadded_lse; // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
-
     int * __restrict__ tile_count_semaphore;
-    float * __restrict__ descale_q_ptr;
-    float * __restrict__ descale_k_ptr;
-    float * __restrict__ descale_v_ptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -179,6 +181,8 @@ struct Flash_bwd_params : public Flash_fwd_params {
     void *__restrict__ softmax_lse_log2_ptr;
 
     int *__restrict__ dq_semaphore;
+    int *__restrict__ dk_semaphore;
+    int *__restrict__ dv_semaphore;
 
     bool deterministic;
     index_t dq_accum_split_stride;

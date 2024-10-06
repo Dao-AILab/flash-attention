@@ -11,25 +11,46 @@ import flashattn_hopper_cuda
 
 # isort: on
 
-def maybe_contiguous(x):
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
-def _flash_attn_forward(q, k, v, softmax_scale, causal, window_size, descale_q = None, descale_k = None, descale_v = None):
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse, S_dmask = flashattn_hopper_cuda.fwd(
+def _flash_attn_forward(q, k, v, softmax_scale, causal,
+                        q_scale=None, k_scale=None, v_scale=None,
+                        window_size=(-1, -1),
+                        softcap=0.0):
+    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+    q, k = [maybe_contiguous(x) for x in (q, k)]
+    v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    out, q, k, v, out_padded, softmax_lse = flashattn_hopper_cuda.fwd(
         q,
         k,
         v,
         None,
         softmax_scale,
-        descale_q,
-        descale_k,
-        descale_v,
         causal,
-        window_size[0],
-        window_size[1],
+        q_scale, k_scale, v_scale,
+        window_size[0], window_size[1],
+        softcap
     )
-    return out, q, k, v, out_padded, softmax_lse, S_dmask
+    return out, q, k, v, out_padded, softmax_lse
+
+
+def _flash_attn_varlen_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, causal,
+                               q_scale=None, k_scale=None, v_scale=None,
+                               window_size=(-1, -1), softcap=0.0):
+    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    out, q, k, v, out_padded, softmax_lse = flashattn_hopper_cuda.fwd_varlen(
+        q,
+        k,
+        v,
+        None,
+        cu_seqlens_q, cu_seqlens_k, None, None, max_seqlen_q, max_seqlen_k,
+        softmax_scale,
+        causal,
+        q_scale, k_scale, v_scale,
+        window_size[0], window_size[1],
+        softcap,
+    )
+    return out, q, k, v, out_padded, softmax_lse
 
 
 def _flash_attn_backward(
@@ -44,9 +65,11 @@ def _flash_attn_backward(
     dv,
     softmax_scale,
     causal,
-    window_size,
+    window_size=(-1, -1),
+    softcap=0.0,
     deterministic=False
 ):
+    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     dq, dk, dv, softmax_d, *rest = flashattn_hopper_cuda.bwd(
@@ -63,78 +86,36 @@ def _flash_attn_backward(
         causal,
         window_size[0],
         window_size[1],
+        softcap,
         deterministic,
     )
     return dq, dk, dv, softmax_d
 
-def _flash_attn_varlen_forward(
-    q,
-    k,
-    v,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
-    softmax_scale,
-    causal,
-    window_size=(-1, -1),
-    seqused_q=None,
-    seqused_k=None,
-):
-    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse = flashattn_hopper_cuda.varlen_fwd(
+
+def _flash_attn_varlen_backward(
+        dout,
         q,
         k,
         v,
-        None,
+        out,
+        softmax_lse,
         cu_seqlens_q,
         cu_seqlens_k,
-        seqused_q,
-        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
+        dq,
+        dk,
+        dv,
         softmax_scale,
         causal,
-        window_size[0],
-        window_size[1],
-    )
-    # if out.isnan().any() or softmax_lse.isnan().any():
-    #     breakpoint()
-    return out, q, k, v, out_padded, softmax_lse
-
-
-def _flash_attn_varlen_backward(
-    dout,
-    q,
-    k,
-    v,
-    out,
-    softmax_lse,
-    dq,
-    dk,
-    dv,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
-    softmax_scale,
-    causal,
-    window_size,
-    deterministic=False,
-    seqused_q=None,
-    seqused_k=None,
+        window_size=(-1, -1),
+        softcap=0.0,
+        deterministic=False
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    (
-        dq,
-        dk,
-        dv,
-        softmax_d,
-        *rest,
-    ) = flashattn_hopper_cuda.varlen_bwd(
+    dq, dk, dv, softmax_d, *rest = flashattn_hopper_cuda.bwd_varlen(
         dout,
         q,
         k,
@@ -146,19 +127,94 @@ def _flash_attn_varlen_backward(
         dv,
         cu_seqlens_q,
         cu_seqlens_k,
-        seqused_q,
-        seqused_k,
+        None, None,
         max_seqlen_q,
         max_seqlen_k,
         softmax_scale,
         causal,
         window_size[0],
         window_size[1],
+        softcap,
         deterministic,
     )
-    # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
-    #     breakpoint()
     return dq, dk, dv, softmax_d
+
+
+class FlashAttnQKVPackedFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        qkv,
+        softmax_scale,
+        causal,
+        q_scale=None, k_scale=None, v_scale=None,
+        window_size=(-1, -1),
+        softcap=0.0,
+        deterministic=False,
+        num_heads_q=None,
+    ):
+        if softmax_scale is None:
+            softmax_scale = qkv.shape[-1] ** (-0.5)
+        if qkv.dim() == 5:
+            assert qkv.shape[-3] == 3
+            q, k, v = qkv.unbind(dim=-3)
+        else:
+            assert qkv.dim() == 4
+            assert num_heads_q is not None
+            num_heads_k = (qkv.shape[2] - num_heads_q) // 2
+            assert num_heads_k * 2 + num_heads_q == qkv.shape[2]
+            q, k, v = qkv.split([num_heads_q, num_heads_k, num_heads_k], dim=-2)
+        out, q, k, v, out_padded, softmax_lse = _flash_attn_forward(
+            q,
+            k,
+            v,
+            softmax_scale,
+            causal=causal,
+            q_scale=q_scale, k_scale=k_scale, v_scale=v_scale,
+            window_size=window_size,
+            softcap=softcap,
+        )
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.softcap = softcap
+        ctx.deterministic = deterministic
+        ctx.ndim = qkv.dim()
+        # return out, softmax_lse
+        return out
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, softmax_lse = ctx.saved_tensors
+        if ctx.ndim == 5:
+            qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
+            dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
+            dq, dk, dv = dqkv.unbind(dim=-3)
+        else:
+            num_heads_q = q.shape[2]
+            num_heads_k = k.shape[2]
+            qkv_shape = q.shape[:-2] + (num_heads_q + num_heads_k * 2, *q.shape[-1:])
+            dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
+            dq, dk, dv = dqkv.split([num_heads_q, num_heads_k, num_heads_k], dim=-2)
+        _flash_attn_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.window_size,
+            ctx.softcap,
+            ctx.deterministic,
+        )
+        dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
+        return dqkv, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -170,29 +226,28 @@ class FlashAttnFunc(torch.autograd.Function):
         v,
         softmax_scale,
         causal,
-        window_size,
+        q_scale=None, k_scale=None, v_scale=None,
+        window_size=(-1, -1),
+        softcap=0.0,
         deterministic=False,
-        descale_q=None,
-        descale_k=None,
-        descale_v=None,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse, S_dmask = _flash_attn_forward(
+        out, q, k, v, out_padded, softmax_lse = _flash_attn_forward(
             q,
             k,
             v,
             softmax_scale,
-            causal,
-            window_size,
-            descale_q=descale_q,
-            descale_k=descale_k,
-            descale_v=descale_v,
+            causal=causal,
+            q_scale=q_scale, k_scale=k_scale, v_scale=v_scale,
+            window_size=window_size,
+            softcap=softcap,
         )
         ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.softcap = softcap
         ctx.deterministic = deterministic
         return out, softmax_lse
 
@@ -213,12 +268,13 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.softmax_scale,
             ctx.causal,
             ctx.window_size,
+            ctx.softcap,
             ctx.deterministic,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -234,10 +290,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         max_seqlen_k,
         softmax_scale,
         causal,
-        window_size,
+        q_scale=None, k_scale=None, v_scale=None,
+        window_size=(-1, -1),
+        softcap=0.0,
         deterministic=False,
-        seqused_q=None,
-        seqused_k=None,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -251,25 +307,23 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_k,
             softmax_scale,
             causal=causal,
+            q_scale=q_scale, k_scale=k_scale, v_scale=v_scale,
             window_size=window_size,
-            seqused_q=seqused_q,
-            seqused_k=seqused_k,
+            softcap=softcap,
         )
-        ctx.save_for_backward(
-            q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k,
-            seqused_q, seqused_k
-        )
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k)
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.softcap = softcap
         ctx.deterministic = deterministic
         return out, softmax_lse
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_varlen_backward(
             dout,
@@ -278,24 +332,79 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             v,
             out,
             softmax_lse,
-            dq,
-            dk,
-            dv,
             cu_seqlens_q,
             cu_seqlens_k,
             ctx.max_seqlen_q,
             ctx.max_seqlen_k,
+            dq,
+            dk,
+            dv,
             ctx.softmax_scale,
             ctx.causal,
             ctx.window_size,
+            ctx.softcap,
             ctx.deterministic,
-            seqused_q,
-            seqused_k,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
+
+
+def flash_attn_qkvpacked_func(
+    qkv,
+    softmax_scale=None,
+    causal=False,
+    q_scale=None, k_scale=None, v_scale=None,
+    window_size=(-1, -1),
+    softcap=0.0,
+    deterministic=False,
+    num_heads_q=None,
+):
+    """dropout_p should be set to 0.0 during evaluation
+    If Q, K, V are already stacked into 1 tensor, this function will be faster than
+    calling flash_attn_func on Q, K, V since the backward pass avoids explicit concatenation
+    of the gradients of Q, K, V.
+    For multi-query and grouped-query attention (MQA/GQA), please see
+    flash_attn_kvpacked_func and flash_attn_func.
+
+    If window_size != (-1, -1), implements sliding window local attention. Query at position i
+    will only attend to keys between [i - window_size[0], i + window_size[1]] inclusive.
+
+    Arguments:
+        qkv: (batch_size, seqlen, 3, nheads, headdim)
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        softcap: float. Anything > 0 activates softcapping attention.
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of (-alibi_slope * |i - j|) is added to
+            the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
+           testing only. The returned probabilities are not guaranteed to be correct
+           (they might not have the right scaling).
+    Return:
+        out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
+            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+            normalization factor).
+        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
+            The output of softmax (possibly with different scaling). It also encodes the dropout
+            pattern (negative means that location was dropped, nonnegative means it was kept).
+    """
+    return FlashAttnQKVPackedFunc.apply(
+        qkv,
+        softmax_scale,
+        causal,
+        q_scale, k_scale, v_scale,
+        window_size,
+        softcap,
+        deterministic,
+        num_heads_q,
+    )
 
 
 def flash_attn_func(
@@ -304,11 +413,10 @@ def flash_attn_func(
     v,
     softmax_scale=None,
     causal=False,
+    q_scale=None, k_scale=None, v_scale=None,
     window_size=(-1, -1),
-    deterministic=False,
-    descale_q=None,
-    descale_k=None,
-    descale_v=None,
+    softcap=0.0,
+    deterministic=False
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -346,9 +454,6 @@ def flash_attn_func(
             is added to the attention score of query i and key j.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
-        descale_q: (1,), fp32. A de-quantization scaling factor for q in fp8 execution.
-        descale_k: (1,), fp32. A de-quantization scaling factor for k in fp8 execution.
-        descale_v: (1,), fp32. A de-quantization scaling factor for v in fp8 execution.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
@@ -357,9 +462,6 @@ def flash_attn_func(
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
-        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
-            The output of softmax (possibly with different scaling). It also encodes the dropout
-            pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     return FlashAttnFunc.apply(
         q,
@@ -367,11 +469,10 @@ def flash_attn_func(
         v,
         softmax_scale,
         causal,
+        q_scale, k_scale, v_scale,
         window_size,
+        softcap,
         deterministic,
-        descale_q,
-        descale_k,
-        descale_v,
     )
 
 
@@ -385,51 +486,11 @@ def flash_attn_varlen_func(
     max_seqlen_k,
     softmax_scale=None,
     causal=False,
+    q_scale=None, k_scale=None, v_scale=None,
     window_size=(-1, -1),
-    deterministic=False,
-    seqused_q=None,
-    seqused_k=None,
+    softcap=0.0,
+    deterministic=False
 ):
-    """
-    Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
-    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
-    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
-    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
-    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
-    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
-        1 1 1 1 0
-        1 1 1 1 1
-    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
-        0 0
-        0 0
-        0 0
-        1 0
-        1 1
-    If the row of the mask is all zero, the output will be zero.
-    Arguments:
-        q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
-        k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-        v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-           of the sequences in the batch, used to index into q.
-        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-           of the sequences in the batch, used to index into kv.
-        max_seqlen_q: int. Maximum query sequence length in the batch.
-        max_seqlen_k: int. Maximum key sequence length in the batch.
-        softmax_scale: float. The scaling of QK^T before applying softmax.
-            Default to 1 / sqrt(headdim).
-        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-        seqused_q: (batch_size,), dtype torch.int32. If not None, it defines the actual number of
-            query and output tokens in each sequence.
-        seqused_k: (batch_size,), dtype torch.int32. If not None, it defines the actual number of
-            key and value tokens in each sequence.
-    Return:
-        out: (total, nheads, headdim).
-        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
-            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
-            normalization factor).
-    """
     return FlashAttnVarlenFunc.apply(
         q,
         k,
@@ -440,8 +501,8 @@ def flash_attn_varlen_func(
         max_seqlen_k,
         softmax_scale,
         causal,
+        q_scale, k_scale, v_scale,
         window_size,
+        softcap,
         deterministic,
-        seqused_q,
-        seqused_k,
     )
