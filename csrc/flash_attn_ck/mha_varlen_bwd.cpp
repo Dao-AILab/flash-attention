@@ -51,8 +51,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                                           at::Tensor dv,
                                           float softmax_scale,
                                           float p_dropout,
-                                          uint64_t drop_seed,
-                                          uint64_t drop_offset)
+                                          std::pair<uint64_t, uint64_t> drop_seed_offset)
 {
     ck_tile::index_t total_q = q.size(0);
     ck_tile::index_t total_k = k.size(0);
@@ -197,7 +196,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          static_cast<ck_tile::index_t>(mask.type),
                          p_dropout,
                          p_undrop,
-                         {drop_seed, drop_offset}};
+                         drop_seed_offset};
 }
 
 std::vector<at::Tensor>
@@ -377,6 +376,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     }
 
     if (max_seqlen_q > 0) {
+        auto drop_seed_offset = std::make_pair(drop_seed, drop_offset);
         ck_tile::stream_config stream_config{stream};
 
         auto traits =
@@ -407,8 +407,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
                 dv_expanded,
                 softmax_scale,
                 p_dropout,
-                drop_seed,
-                drop_offset);
+                drop_seed_offset);
 
         float t = fmha_bwd(traits, args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");

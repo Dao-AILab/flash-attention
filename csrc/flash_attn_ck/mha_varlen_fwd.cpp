@@ -47,8 +47,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           at::Tensor dropout_randval,
                                           float softmax_scale,
                                           float p_dropout,
-                                          uint64_t drop_seed,
-                                          uint64_t drop_offset)
+                                          std::pair<uint64_t, uint64_t> drop_seed_offset)
 {
     // q: (total_q, nheads, d)
     // k: (total_k, nheads_k, d)
@@ -140,7 +139,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          static_cast<ck_tile::index_t>(mask.type),
                          p_dropout,
                          has_dropout_randval,
-                         {drop_seed, drop_offset}};
+                         drop_seed_offset};
 }
 
 std::vector<at::Tensor>
@@ -299,6 +298,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
     rng_state[1] = *(reinterpret_cast<int64_t*>(&drop_offset));
 
     if (max_seqlen_k > 0) {
+        auto drop_seed_offset = std::make_pair(drop_seed, drop_offset);
         auto stream = at::cuda::getCurrentHIPStream().stream();
         ck_tile::stream_config stream_config{stream};
 
@@ -332,8 +332,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
                 p,
                 softmax_scale,
                 p_dropout,
-                drop_seed,
-                drop_offset);
+                drop_seed_offset);
 
         float t = fmha_fwd(traits, args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");

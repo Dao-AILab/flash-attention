@@ -46,8 +46,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    at::Tensor dropout_randval,
                                    float softmax_scale,
                                    float p_dropout,
-                                   uint64_t drop_seed,
-                                   uint64_t drop_offset)
+                                   std::pair<uint64_t, uint64_t> drop_seed_offset)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -137,7 +136,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          static_cast<ck_tile::index_t>(mask.type),
                          p_dropout,
                          has_dropout_randval,
-                         {drop_seed, drop_offset}};
+                         drop_seed_offset};
 }
 
 std::vector<at::Tensor>
@@ -273,6 +272,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     rng_state[1] = *(reinterpret_cast<int64_t*>(&drop_offset));
 
     if (seqlen_k > 0) {
+        auto drop_seed_offset = std::make_pair(drop_seed, drop_offset);
         auto stream = at::cuda::getCurrentHIPStream().stream();
         ck_tile::stream_config stream_config{stream};
 
@@ -305,8 +305,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                 p,
                 softmax_scale,
                 p_dropout,
-                drop_seed,
-                drop_offset);
+                drop_seed_offset);
 
         float t = fmha_fwd(traits, args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
