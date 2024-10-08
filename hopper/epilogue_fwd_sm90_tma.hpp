@@ -171,12 +171,12 @@ struct CollectiveEpilogueFwd {
         const int bidh_kv = qhead_per_khead_divmod.divide(bidh);
         const int h_block = bidh % int(qhead_per_khead_divmod);
 
+         Tensor tOrO_out = flash::convert_type<Element>(tOrO);
         if constexpr (!epi_column_permute) {
             Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
             auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
             auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(thread_idx);
 
-            Tensor tOrO_out = flash::convert_type<Element>(tOrO);
             Tensor taccOrO = smem_thr_copy_O.retile_S(tOrO_out);  // ((Atom,AtomNum), MMA_M, MMA_N)
             Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
@@ -191,7 +191,6 @@ struct CollectiveEpilogueFwd {
             Tensor sOacc = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutrO{});
             auto rmem_thr_copy_O = rmem_tiled_copy_O.get_thread_slice(thread_idx);
             
-            Tensor tOrO_out = flash::convert_type<Element>(tOrO);
             Tensor taccOsO = rmem_thr_copy_O.partition_D(sOacc);
             Tensor taccOrO = make_tensor(tOrO_out.data(), shape(taccOsO));
 
@@ -257,10 +256,10 @@ struct CollectiveEpilogueFwd {
         TiledCopyO gmem_tiled_copy_O;
         Tensor sO_out = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutOCopy{});        
         if constexpr(!Seqlen_traits::DecodingGQA) {
-            flash::write_O<!Seqlen_traits::UseVarSeqLen, Is_split, NumCopyThreads>(
+            flash::write_O</*!Seqlen_traits::UseVarSeqLen*/false, true, Is_split, NumCopyThreads>(
                 epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O, 
                 epilogue_params.layout_O, TileShapeOCopy{}, sO_out, 
-                m_block, bidh, bidb, n_split_idx, seqlen_traits_q, write_warp_idx
+                m_block, bidh, bidb, n_split_idx, seqlen_traits_q, write_warp_idx, tiled_mma, tOrO_out
             );
         } else {
             Tensor mO = epilogue_params.tma_store_O.get_tma_tensor(epilogue_params.layout_O.shape());

@@ -286,6 +286,28 @@ __forceinline__ __device__ void write_tma(
     // tma_store_wait<0>();
 }
 
+// Epilogue that copies RMEM -> GMEM directly
+// Reports as uncoalesced stores by the profiler
+template <bool Is_split, class TensorO, class OutputType, class TileShapeO,
+          class LayoutO, typename SeqLenTraits, typename TiledMma>
+__device__ static void //__launch_bounds__(128, 2)
+write_rmem_to_gmem(TensorO &tOrO, 
+                    OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
+                     int m_block, int bidh, int bidb, int n_split_idx,
+		     TiledMma & tiledMma,
+                     const SeqLenTraits& seqlen_traits_o) {
+
+  Tensor mO = make_tensor(make_gmem_ptr(O), layout_O);
+  Tensor gO = seqlen_traits_o.get_o_local_tile_tensor<Is_split>(
+        mO, tile_shape_O, bidh, bidb, n_split_idx
+   )(_, _, m_block);  // (M, K)
+  auto threadMma1 = tiledMma.get_thread_slice(threadIdx.x);
+  Tensor tOgO = threadMma1.partition_C(gO);
+
+  // Write out to GMEM.
+  copy(tOrO, tOgO);
+}
+
 template <int NumCopyThreads, typename ElemO, typename TiledCopyO, typename LayoutO, 
           typename TileShapeO, typename SMemO, typename SeqLenTraits>
 __forceinline__ __device__ void write_tiled(
@@ -333,15 +355,22 @@ __forceinline__ __device__ void write_tiled(
     }
 }
 
-template <bool IsTMACopy, bool Is_split, int NumCopyThreads, typename ElemO, 
+template <bool IsTMACopy, bool IsRegToGmem, bool Is_split, int NumCopyThreads, typename ElemO, 
           typename TMACopyO, typename TiledCopyO, typename LayoutO, 
-          typename TileShapeO, typename SMemO, typename SeqLenTraits>
+          typename TileShapeO, typename SMemO, typename SeqLenTraits, class TensorO, typename TiledMma>
 __forceinline__ __device__ void write_O(
         ElemO* O, const TMACopyO& tma_copy_O, const TiledCopyO& tiled_copy_O,
         const LayoutO& layout_O, const TileShapeO& tile_shape_O,
         const SMemO& sO, int m_block, int bidh, int bidb, int n_split_idx,
-        const SeqLenTraits& seqlen_traits_o, int write_warp_idx) {
-    if constexpr (IsTMACopy) {
+        const SeqLenTraits& seqlen_traits_o, int write_warp_idx, TiledMma & tiledMma1, TensorO & tOrO) {
+
+    if constexpr (IsRegToGmem) {
+	write_rmem_to_gmem<Is_split>(tOrO, O, layout_O, 
+		     tile_shape_O,
+                     m_block, bidh, bidb, n_split_idx,
+		     tiledMma1,
+                     seqlen_traits_o);
+    } else if constexpr (IsTMACopy) {
         write_tma<Is_split, NumCopyThreads>(O, tma_copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb,
             n_split_idx, seqlen_traits_o, write_warp_idx);
     } else {
