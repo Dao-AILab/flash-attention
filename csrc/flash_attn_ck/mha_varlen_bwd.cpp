@@ -51,7 +51,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                                           at::Tensor dv,
                                           float softmax_scale,
                                           float p_dropout,
-                                          std::pair<uint64_t, uint64_t> drop_seed_offset)
+                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset)
 {
     ck_tile::index_t total_q = q.size(0);
     ck_tile::index_t total_k = k.size(0);
@@ -223,7 +223,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
                const float /*softcap*/,
                const bool deterministic,
                c10::optional<at::Generator> gen_,
-               c10::optional<at::Tensor> &rng_state)
+               c10::optional<at::Tensor> &rng_state_)
 {
 #ifdef FLASHATTENTION_DISABLE_BACKWARD
     TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -361,22 +361,26 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
-    uint64_t drop_seed = 1, drop_offset = 0;
     int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
+    at::Tensor rng_state;
 
-    if (rng_state.has_value()) {
-        uint64_t* d = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
-        drop_seed = d[0];
-        drop_offset = d[1];
+    if (rng_state_.has_value()) {
+        rng_state = rng_state_.value();
     } else if(is_dropout) {
+        rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         auto philox_args = gen->philox_cuda_state(counter_offset);
-        std::tie(drop_seed, drop_offset) = flash::unpack(philox_args);
+        hipLaunchKernelGGL(
+            flash::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0,
+            philox_args, reinterpret_cast<uint64_t*>(rng_state.data_ptr()));
+    } else {
+        rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
     }
 
     if (max_seqlen_q > 0) {
-        auto drop_seed_offset = std::make_pair(drop_seed, drop_offset);
+        auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
+        auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         ck_tile::stream_config stream_config{stream};
 
         auto traits =
