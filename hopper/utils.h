@@ -341,39 +341,48 @@ write_rmem_to_gmem_defunct(TensorO &tOrO,
 
 // Epilogue that copies RMEM -> GMEM directly
 // Reports as uncoalesced stores by the profiler
-template <int kBlockM, class TensorO, class OutputType, class TileShapeO,
+template <class TensorO, class OutputType, class TileShapeO,
           class LayoutO, typename SeqLenTraits, typename TiledMma>
 __device__ static void //__launch_bounds__(128, 2)
-write_rmem_to_gmem(TensorO &tOrO, 
-                    OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
-                     int m_block, int bidh, int bidb, int n_split_idx,
-		     TiledMma & tiled_mma,
-                     const SeqLenTraits& seqlen_traits_o) {
-
-  auto threadMma1 = tiled_mma.get_thread_slice(threadIdx.x);
-
-  using CopyAtomO = Copy_Atom<UniversalCopy<OutputType>, OutputType>;
-  auto gmem_tiled_copy_O = make_tiled_copy_C(CopyAtomO{}, tiled_mma);
-  Tensor mO = make_tensor(make_gmem_ptr(O), layout_O);
-  Tensor gO = seqlen_traits_o.get_o_local_tile_tensor<true>(
+write_rmem_to_gmem(TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
+    int m_block, int bidh, int bidb, int n_split_idx,
+	TiledMma & tiled_mma, const SeqLenTraits& seqlen_traits_o, int thread_idx) {
+    using CopyAtomO = Copy_Atom<UniversalCopy<OutputType>, OutputType>;
+    auto gmem_tiled_copy_O = make_tiled_copy_C(CopyAtomO{}, tiled_mma);
+    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(thread_idx);
+    Tensor mO = make_tensor(make_gmem_ptr(O), layout_O);
+    Tensor gO = seqlen_traits_o.get_o_local_tile_tensor<true>(
                 mO, tile_shape_O, bidh, bidb, n_split_idx
             )(_, _, m_block);  // (M, K)
+    Tensor taccOrO = gmem_thr_copy_O.retile_S(tOrO);
+    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+  
+    Tensor taccOrOFlatten = cute::flatten(taccOrO);
+    Tensor taccOrOGroup = cute::group_modes<1, rank(taccOrOFlatten)>(taccOrOFlatten);
+    Tensor tOgOFlatten = cute::flatten(tOgO);
+    Tensor tOgOGroup = cute::group_modes<1, rank(tOgOFlatten)>(tOgOFlatten);
 
-  auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(threadIdx.x);
-  Tensor tOrORetiled  = gmem_thr_copy_O.retile_S(tOrO);
-  Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
-  // Construct identity layout for sO
-   Tensor cO = cute::make_identity_tensor(tile_shape_O);  // (BLK_M,BLK_K) -> (blk_m,blk_k)
-   // Repeat the partitioning with identity layouts
-   Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
-   Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
-   #pragma unroll
-   for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(layout_O.shape()); }
-   // Clear_OOB_K must be false since we don't want to write zeros to gmem
-   flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-                gmem_tiled_copy_O, tOrORetiled, tOgO, tOcO, tOpO, seqlen_traits_o.actual_seq_len - m_block * kBlockM
-   );
+    // Get thread coords to global index mapping.
+    Tensor gOCounting = cute::make_identity_tensor(gO.shape());
+    Tensor tOgOCounting = gmem_thr_copy_O.partition_D(gOCounting);
+    Tensor tOgOCountingFlatten = cute::flatten(tOgOCounting);
+    Tensor tOgOCountingGrouped =
+        cute::group_modes<1, rank(tOgOCountingFlatten)>(tOgOCountingFlatten);
 
+    // Write out to GMEM.
+    const int kNumMsPerTile = get<0>(tile_shape_O);
+    int cta_m = std::min(
+        seqlen_traits_o.actual_seq_len - m_block * kNumMsPerTile, kNumMsPerTile
+    );
+    if (cta_m == kNumMsPerTile) {
+        copy(gmem_tiled_copy_O, taccOrOGroup, tOgOGroup);
+    } else {
+        auto predicate_fn = [&](auto coords) {
+            auto g_coords = tOgOCountingGrouped(_0{}, coords);
+            return elem_less(get<0>(g_coords), cta_m);
+        };
+        copy_if(gmem_tiled_copy_O, predicate_fn, taccOrOGroup, tOgOGroup);
+    }
 }
 
 template <int NumCopyThreads, typename ElemO, typename TiledCopyO, typename LayoutO, 
@@ -423,7 +432,7 @@ __forceinline__ __device__ void write_tiled(
     }
 }
 
-template <bool IsTMACopy, bool IsRegToGmem, bool Is_split, int NumCopyThreads, int kBlockM, typename ElemO, 
+template <bool IsTMACopy, bool IsRegToGmem, bool Is_split, int NumCopyThreads, typename ElemO, 
           typename TMACopyO, typename TiledCopyO, typename LayoutO, 
           typename TileShapeO, typename SMemO, typename SeqLenTraits, class TensorO, typename TiledMma>
 __forceinline__ __device__ void write_O(
@@ -434,11 +443,8 @@ __forceinline__ __device__ void write_O(
 
     if constexpr (IsRegToGmem) {
         static_assert(Is_split, "use write_rmem_to_gmem with split kv kernel only");
-	write_rmem_to_gmem<kBlockM>(tOrO, O, layout_O, 
-		     tile_shape_O,
-                     m_block, bidh, bidb, n_split_idx,
-		     tiledMma1,
-                     seqlen_traits_o);
+	    write_rmem_to_gmem(tOrO, O, layout_O, tile_shape_O, m_block, bidh, bidb, n_split_idx,
+		     tiledMma1, seqlen_traits_o, threadIdx.x - NumCopyThreads);
     } else if constexpr (IsTMACopy) {
         write_tma<Is_split, NumCopyThreads>(O, tma_copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb,
             n_split_idx, seqlen_traits_o, write_warp_idx);
