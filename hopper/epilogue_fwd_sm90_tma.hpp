@@ -262,7 +262,7 @@ struct CollectiveEpilogueFwd {
         TiledCopyO gmem_tiled_copy_O;
         Tensor sO_out = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutOCopy{});        
         if constexpr(!Seqlen_traits::DecodingGQA) {
-            flash::write_O<!Seqlen_traits::UseVarSeqLen, /*IsRegToGmem=*/Is_split, Is_split, NumCopyThreads>(
+            flash::write_O<!Seqlen_traits::UseVarSeqLen, IsRegToGmem, Is_split, NumCopyThreads>(
                 epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O, 
                 epilogue_params.layout_O, TileShapeOCopy{}, sO_out, 
                 m_block, bidh, bidb, n_split_idx, seqlen_traits_q, write_warp_idx, tiled_mma, tOrO_out
