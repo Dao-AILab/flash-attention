@@ -401,21 +401,28 @@ write_rmem_to_gmem_gqa(TensorO &tOrO, OutputType *O, const LayoutO& layout_O, Ti
     auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
 
     auto tileShape_MNK = cute::tile_shape(TiledMma{});
-    Tensor cO = cute::make_identity_tensor(select<0, 2>(tileShape_MNK));
+    Tensor cO = cute::make_identity_tensor(select<0, 1>(tileShape_MNK));
     Tensor tOcO = thread_mma.partition_C(cO);
 
     // Write out to GMEM.
     const int kNumMsPerTile = size<0>(tileShape_MNK);
-    int cta_m = std::min(
-        seqlen_traits_o.actual_seq_len - m_block * kNumMsPerTile, kNumMsPerTile
-    );
 
-    int bH = size<1>(gO);
+    int kBlockMH = size<0>(gO);
+    int kBlockH = size<1>(gO);
+    const int m_bound = seqlen_traits_o.actual_seq_len - m_block * kBlockMH;
+    const int h_bound = shape<1>(layout_O) - h_block * kBlockH;
+
+
+    static_assert(decltype(size<1>(tOrO))::value == 1);
+    static_assert(decltype(size<2>(tOrO))::value == 1);
+
     for (int i = 0; i < size(tOrO); ++i) {
 	    int row = int(get<0>(tOcO(i)));
 	    int col = int(get<1>(tOcO(i)));
-	    if (cta_m == kNumMsPerTile || row < cta_m) {
-		    gO(row / bH, row % bH, col) = tOrO(i);
+	    const int h_local = row % kBlockH;
+            const int m_local = row/kBlockH;
+	    if(h_local < h_bound && m_local < m_bound) {
+		    gO(m_local, h_local, col) = tOrO(i);
 	    }
     }
 }
