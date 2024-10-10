@@ -262,6 +262,7 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
         if (params.softcap == 0.f) {
             run_mha_bwd_dispatch<T, 128, 128, 64, Is_causal, Is_local, /*Has_softcap=*/false, 2, 2, true, false, false, 2, 1, 2, 2>(params, stream);
         } else {
+            // register spill with 128 x 128
             run_mha_bwd_dispatch<T, 96, 128, 64, Is_causal, Is_local, /*Has_softcap=*/true, 2, 2, true, false, true, 2, 1, 2, 2>(params, stream);
         }
     });

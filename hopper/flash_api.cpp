@@ -712,7 +712,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
     TORCH_CHECK(head_size <= 256, "FlashAttention backward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
-    TORCH_CHECK(softcap == 0.0, "Softcap is not yet supported in the backward pass");
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size_rounded = head_size <= 64 ? 64 : round_multiple(head_size, 32);
@@ -914,7 +913,6 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
     TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
     TORCH_CHECK(head_size <= 256, "FlashAttention backward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
-    TORCH_CHECK(softcap == 0.0, "Softcap is not yet supported in the backward pass");
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size_rounded = head_size <= 64 ? 64 : round_multiple(head_size, 32);

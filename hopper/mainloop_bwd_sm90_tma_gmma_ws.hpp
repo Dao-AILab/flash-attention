@@ -425,6 +425,15 @@ struct CollectiveMainloopBwd {
             assert(args.cu_seqlens_q != nullptr);
             assert(args.cu_seqlens_k != nullptr);
         }
+        // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
+        // Right after this, we multiply by log2(e) before applying exp2.
+        // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
+        // (assigning it to params.softcap_val) and pre-multiply softcap_val * log2(e)
+        // (assigning it to params.softmax_scale_log2).
+        // In the backward, we need to multiply by
+        // (1 - tanh^2) * softmax_scale / softcap_val * softcap_val = (1 - tanh^2) * softmax_scale.
+        // Instead we multiply by (1 - tanh^2) and multiply dK and dV by params.softmax_scale
+        // (the original softmax_scale) at the end.
         return {args.shape_Q, args.shape_K, args.shape_dQaccum,
                 args.ptr_dQaccum, args.stride_dQaccum,
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
@@ -1037,7 +1046,7 @@ struct CollectiveMainloopBwd {
             }
         }
 
-        static constexpr int n_local_bottom_steps = (!Is_local || !SeparateMaskingIterations) ? 0 : cute::ceil_div(kBlockM, kBlockN) + 1;
+        static constexpr int n_local_bottom_steps = (!Is_local || !SeparateMaskingIterations) ? 0 : cute::ceil_div(kBlockN, kBlockM) + 1;
         auto mask_fn = [&](auto& tSrS, int m_block) { causal_local_mask_fn(tSrS, m_block, cute::bool_constant<Is_causal && !SeparateMaskingIterations>{}, cute::bool_constant<Is_local && !SeparateMaskingIterations>{}); };
         CUTLASS_PRAGMA_NO_UNROLL
         for (; m_block < m_block_max - n_local_bottom_steps; ++m_block) {
