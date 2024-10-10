@@ -393,39 +393,30 @@ __device__ static void //__launch_bounds__(128, 2)
 write_rmem_to_gmem_gqa(TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
     int m_block, int h_block, int bidh_kv, int bidb, int n_split_idx,
         TiledMma & tiled_mma, const SeqLenTraits& seqlen_traits_o, int thread_idx) {
-    using CopyAtomO = Copy_Atom<UniversalCopy<OutputType>, OutputType>;
     Tensor mO = make_tensor(make_gmem_ptr(O), layout_O);
     Tensor gO = seqlen_traits_o.get_o_local_tile_tensor<true>(
                 mO, tile_shape_O, bidh_kv, bidb, n_split_idx
-            )(_, _, _, m_block, h_block);  // (M, K)
+            )(_, _, _, m_block, h_block);  // (bM/bH, bH, K)
 			       //
     auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
-    Tensor tOgOGroup = cute::group_modes<0, 2>(gO);
-    Tensor tOgO = thread_mma.partition_C(tOgOGroup);
+
+    auto tileShape_MNK = cute::tile_shape(TiledMma{});
+    Tensor cO = cute::make_identity_tensor(select<0, 2>(tileShape_MNK));
+    Tensor tOcO = thread_mma.partition_C(cO);
 
     // Write out to GMEM.
-    const int kNumMsPerTile = get<0>(tile_shape_O);
+    const int kNumMsPerTile = size<0>(tileShape_MNK);
     int cta_m = std::min(
         seqlen_traits_o.actual_seq_len - m_block * kNumMsPerTile, kNumMsPerTile
     );
 
     int bH = size<1>(gO);
-    if (cta_m == kNumMsPerTile) {
-	for (int i = 0; i < size<0>(tOrO); ++i) {
-	   for (int j = 0; j < size<1>(tOrO); ++j) {
-	       tOgO((i / bH) * bH + (i % bH), j) = tOrO(i, j);
-	   }
-	}
-    } else {
-         for (int i = 0; i < size<0>(tOrO); ++i)
-	 {
-           for (int j = 0; j < size<1>(tOrO); ++j)
-	   {
-	       if (i < cta_m) {
-	            tOgO((i / bH) * bH + (i % bH), j) = tOrO(i, j);
-	       }
-	   }
-	 }
+    for (int i = 0; i < size(tOrO); ++i) {
+	    int row = int(get<0>(tOcO(i)));
+	    int col = int(get<1>(tOcO(i)));
+	    if (cta_m == kNumMsPerTile || row < cta_m) {
+		    gO(row / bH, row % bH, col) = tOrO(i);
+	    }
     }
 }
 
