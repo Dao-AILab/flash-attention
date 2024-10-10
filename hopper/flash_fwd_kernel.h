@@ -100,7 +100,6 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     static_assert(Ktraits::kNWarps == 12 || Ktraits::kNWarps == 16);
     if (warp_group_idx == 0) {  // Producer
         cutlass::arch::warpgroup_reg_dealloc<Ktraits::kNWarps == 12 ? 24 : 32>();
-        // cutlass::arch::warpgroup_reg_dealloc<56>();
 
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         if (warp_idx_in_warpgroup == 0) {  // Load Q, K, V

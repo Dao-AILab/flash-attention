@@ -66,12 +66,18 @@
     }                                                                          \
   }()
 
-#define SEQLEN_SWITCH(USE_VAR_SEQ_LEN, NAME, ...)                              \
+#define SEQLEN_SWITCH(PARAMS, NAME, ...)                                       \
   [&] {                                                                        \
-    bool useSeqLen = USE_VAR_SEQ_LEN;                                          \
+    bool useSeqLen = PARAMS.cu_seqlens_q;                                      \
+    bool usePagedKV = PARAMS.page_block_size>0;                                      \
     if (useSeqLen) {                                                           \
-      using NAME = flash::VarSeqLenTraits;                                     \
-      return __VA_ARGS__();                                                    \
+      if (usePagedKV) {                                                      \
+        using NAME = flash::PagedSeqLenTraits;                                   \
+        return __VA_ARGS__();                                                  \
+      } else {                                                                 \
+        using NAME = flash::VarSeqLenTraits;                                 \
+        return __VA_ARGS__();                                                  \
+      }                                                                        \
     } else {                                                                   \
       using NAME = flash::FixedSeqLenTraits;                                   \
       return __VA_ARGS__();                                                    \
