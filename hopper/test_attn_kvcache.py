@@ -272,8 +272,8 @@ def test_flash_attn_kvcache_nosplit_fp8(nheads_kv, gqa_ratio, num_requests, quer
 @pytest.mark.parametrize("context_seqlen", [4096, 16384, 65536])
 @pytest.mark.parametrize("headdim", [64, 128, 256])
 @pytest.mark.parametrize("cache_seqlen_rand", [True, False])
-#@pytest.mark.parametrize("gqa_parallel", [True, False])
-@pytest.mark.parametrize("gqa_parallel", [True])
+@pytest.mark.parametrize("gqa_parallel", [True, False])
+#@pytest.mark.parametrize("gqa_parallel", [True])
 @pytest.mark.parametrize(
     "nheads_kv, gqa_ratio",
     [

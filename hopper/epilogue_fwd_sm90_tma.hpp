@@ -268,8 +268,13 @@ struct CollectiveEpilogueFwd {
                 m_block, bidh, bidb, n_split_idx, seqlen_traits_q, write_warp_idx, tiled_mma, tOrO_out
             );
         } else {
+	     if constexpr (Is_split) { 
+	     flash::write_rmem_to_gmem_gqa(tOrO_out, epilogue_params.ptr_O,  epilogue_params.layout_O, TileShapeOCopy{},
+              m_block, h_block, bidh_kv, bidb, n_split_idx, tiled_mma, seqlen_traits_q, threadIdx.x - NumCopyThreads);
+	     } else {
+             
             Tensor mO = epilogue_params.tma_store_O.get_tma_tensor(epilogue_params.layout_O.shape());
-            Tensor gO = seqlen_traits_q.get_o_local_tile_tensor<Is_split>(
+            Tensor gO = seqlen_traits_q.get_o_local_tile_tensor<false>(
                     mO, TileShapeOCopy{}, bidh_kv, bidb, n_split_idx)
                         (_, _, _, m_block, h_block);  // (bM/bH, bH, K)
             auto block_tma_O = epilogue_params.tma_store_O.get_slice(_0{});
@@ -281,6 +286,7 @@ struct CollectiveEpilogueFwd {
                 cute::copy(epilogue_params.tma_store_O, tOsO, tOgO);
                 tma_store_arrive();
             }
+	     } 
         }
     }
 

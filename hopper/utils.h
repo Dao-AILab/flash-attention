@@ -385,6 +385,50 @@ write_rmem_to_gmem(TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileSh
     }
 }
 
+// Epilogue that copies RMEM -> GMEM directly for GQA enabled.
+// Reports as uncoalesced stores by the profiler
+template <class TensorO, class OutputType, class TileShapeO,
+          class LayoutO, typename SeqLenTraits, typename TiledMma>
+__device__ static void //__launch_bounds__(128, 2)
+write_rmem_to_gmem_gqa(TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
+    int m_block, int h_block, int bidh_kv, int bidb, int n_split_idx,
+        TiledMma & tiled_mma, const SeqLenTraits& seqlen_traits_o, int thread_idx) {
+    using CopyAtomO = Copy_Atom<UniversalCopy<OutputType>, OutputType>;
+    Tensor mO = make_tensor(make_gmem_ptr(O), layout_O);
+    Tensor gO = seqlen_traits_o.get_o_local_tile_tensor<true>(
+                mO, tile_shape_O, bidh_kv, bidb, n_split_idx
+            )(_, _, _, m_block, h_block);  // (M, K)
+			       //
+    auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+    Tensor tOgOGroup = cute::group_modes<0, 2>(gO);
+    Tensor tOgO = thread_mma.partition_C(tOgOGroup);
+
+    // Write out to GMEM.
+    const int kNumMsPerTile = get<0>(tile_shape_O);
+    int cta_m = std::min(
+        seqlen_traits_o.actual_seq_len - m_block * kNumMsPerTile, kNumMsPerTile
+    );
+
+    int bH = size<1>(gO);
+    if (cta_m == kNumMsPerTile) {
+	for (int i = 0; i < size<0>(tOrO); ++i) {
+	   for (int j = 0; j < size<1>(tOrO); ++j) {
+	       tOgO((i / bH) * bH + (i % bH), j) = tOrO(i, j);
+	   }
+	}
+    } else {
+         for (int i = 0; i < size<0>(tOrO); ++i)
+	 {
+           for (int j = 0; j < size<1>(tOrO); ++j)
+	   {
+	       if (i < cta_m) {
+	            tOgO((i / bH) * bH + (i % bH), j) = tOrO(i, j);
+	       }
+	   }
+	 }
+    }
+}
+
 template <int NumCopyThreads, typename ElemO, typename TiledCopyO, typename LayoutO, 
           typename TileShapeO, typename SMemO, typename SeqLenTraits>
 __forceinline__ __device__ void write_tiled(
