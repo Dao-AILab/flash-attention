@@ -11,7 +11,8 @@ namespace flash {
 
 static constexpr int kMaxTileSize = 128;
 
-template <bool UseVarSeqLen> class SeqLenTraits {
+template <bool UseVarSeqLen, bool UsePagedKV> class SeqLenTraits {
+  static_assert((!UsePagedKV) || (UseVarSeqLen && UsePagedKV), "PagedKV is only supported for VarSeqLen.");
 public:
   // Total number of queries / keys. Unpadded.
   int sum_s = 0;
@@ -24,6 +25,18 @@ public:
 
   // Whether this is for fixed-seq-len or var-seq-len.
   static constexpr bool kUseVarSeqLen = UseVarSeqLen;
+
+  using ShapeKVT = std::conditional_t<
+      UseVarSeqLen && !UsePagedKV,
+      cute::Shape<int32_t, int32_t, int32_t>,
+      cute::Shape<int32_t, int32_t, int32_t, int32_t>
+  >;
+  using StrideKVT = std::conditional_t<
+      UseVarSeqLen && !UsePagedKV,
+      cute::Shape<int64_t, _1, int64_t>,
+      cute::Shape<int64_t, _1, int64_t, int64_t>
+  >;
+  using LayoutKVT = cute::Layout<ShapeKVT, StrideKVT>;
 
   using ShapeT = std::conditional_t<
       UseVarSeqLen, 
@@ -66,6 +79,27 @@ public:
                        make_stride(m_stride, cute::_1{}, h_stride, b_stride));
   }
 
+    // Returns the layout of a tensor in MKHB format in global memory.
+  // padded: only useful for var-seq-len for dq_accum and softmax_d.
+  CUTLASS_HOST_DEVICE auto get_kv_gmem_layout(
+      int m, int k, int h, int b,
+      int64_t m_stride, int64_t h_stride, int64_t b_stride,
+      int64_t page_block_size, int64_t num_blocks,
+      bool padded = false) const {
+    static_assert(UsePagedKV || !UseVarSeqLen , "Default implementation is for FixedSeqLen or PagedKV.");
+    return make_layout(make_shape(m, k, h, b),
+                       make_stride(m_stride, cute::_1{}, h_stride, b_stride));
+  }
+
+  // Returns the layout of a tensor in MKHB format in virtual memory space
+  // that is mapped to the global memory via the block table when paged attention is used
+  CUTLASS_HOST_DEVICE auto get_kv_virtual_shape(
+      int m, int k, int h, int b,
+      int64_t m_stride, int64_t h_stride, int64_t b_stride,
+      bool padded = false) const {
+    return make_shape(m, k, h, b);
+  }
+
   // Returns the layout of a tensor in MKHB format in global memory.
   // padded: only useful for var-seq-len for dq_accum and softmax_d.
   CUTLASS_HOST_DEVICE auto get_lse_gmem_layout(
@@ -86,6 +120,15 @@ public:
     return g_tensor;
   }
 
+    template <typename MTensor, typename Shape>
+  CUTLASS_DEVICE auto get_local_kv_tile_tensor(
+      const MTensor &m_tensor, const Shape &tile_shape,
+      int bidh, int bidb, bool padded = false) const {
+    auto g_tensor = local_tile(
+      m_tensor(_, _, bidh, bidb), tile_shape, make_coord(_, _0{}));
+    return g_tensor;
+  }
+
   template <typename MTensor, typename Shape>
   CUTLASS_DEVICE auto get_lse_local_tile_tensor(
       const MTensor &m_tensor, const Shape &tile_shape, 
@@ -95,9 +138,11 @@ public:
   }
 };
 
-using FixedSeqLenTraits = SeqLenTraits<false>;
+using FixedSeqLenTraits = SeqLenTraits<false, false>;
 
-using VarSeqLenTraits = SeqLenTraits<true>;
+using VarSeqLenTraits = SeqLenTraits<true, false>;
+
+using PagedSeqLenTraits = SeqLenTraits<true, true>;
 
 // Returns the static layout of a var-seq-len tensor in global memory based on
 // max_seq_len and max_batch_size.
@@ -112,6 +157,25 @@ CUTLASS_HOST_DEVICE auto VarSeqLenTraits::get_gmem_layout(
     make_shape(sum_s + (padded ? kMaxTileSize * b : 0), k, h), 
     make_stride(m_stride, cute::_1{}, h_stride));
 }
+
+template <>
+CUTLASS_HOST_DEVICE auto VarSeqLenTraits::get_kv_gmem_layout(
+    int m, int k, int h, int b,
+    int64_t m_stride, int64_t h_stride, int64_t b_stride,
+    int64_t page_block_size, int64_t num_blocks,
+    bool padded) const {
+  return make_layout(
+    make_shape(sum_s + (padded ? kMaxTileSize * b : 0), k, h),
+    make_stride(m_stride, cute::_1{}, h_stride));
+}
+
+template <>
+  CUTLASS_HOST_DEVICE auto VarSeqLenTraits::get_kv_virtual_shape(
+      int m, int k, int h, int b,
+      int64_t m_stride, int64_t h_stride, int64_t b_stride,
+      bool padded) const {
+    return make_shape(sum_s + (padded ? kMaxTileSize * b : 0), k, h);
+  }
 
 // padded: only useful for var-seq-len for dq_accum and softmax_d.
 // When padded is True, use B_M + kMaxTileSize * B as the total B_M.
@@ -134,6 +198,27 @@ template <typename MTensor, typename Shape>
 CUTLASS_DEVICE auto VarSeqLenTraits::get_local_tile_tensor(
     const MTensor &m_tensor, const Shape &tile_shape,
     int bidh, int bidb, bool padded) const {
+
+  auto g_offset = local_tile(
+      m_tensor(_, _, bidh),
+      cute::make_shape(1, get<1>(tile_shape)),
+      make_coord(cu_seq_len[bidb] + (padded ? kMaxTileSize * bidb : 0), _0{}));
+  auto g_sequence = make_tensor(
+      g_offset.data(),
+      make_layout(
+        cute::make_shape(actual_seq_len, get<1>(tile_shape)),
+        g_offset.stride()
+      ));
+  auto g_tensor = local_tile(g_sequence, tile_shape, make_coord(_, _0{}));
+  return g_tensor;
+}
+
+template <>
+template <typename MTensor, typename Shape>
+CUTLASS_DEVICE auto VarSeqLenTraits::get_local_kv_tile_tensor(
+    const MTensor &m_tensor, const Shape &tile_shape,
+    int bidh, int bidb, bool padded) const {
+
   auto g_offset = local_tile(
       m_tensor(_, _, bidh), 
       cute::make_shape(1, get<1>(tile_shape)), 
@@ -158,6 +243,103 @@ CUTLASS_DEVICE auto VarSeqLenTraits::get_lse_local_tile_tensor(
       make_coord(cu_seq_len[bidb] + (padded ? kMaxTileSize * bidb : 0)));
   auto g_sequence = make_tensor(
       g_offset.data(), 
+      make_layout(cute::make_shape(actual_seq_len), cute::make_shape(_1{})));
+  auto g_tensor = local_tile(g_sequence, tile_shape, make_coord(_));
+  return g_tensor;
+}
+
+/////////////// PagedSeqLenTraits /////////////////
+
+
+// Returns the static layout of a var-seq-len tensor in global memory based on
+// max_seq_len and max_batch_size.
+// padded: only useful for var-seq-len for dq_accum and softmax_d.
+// When padded is True, use B_M + kMaxTileSize * B as the total B_M.
+template <>
+CUTLASS_HOST_DEVICE auto PagedSeqLenTraits::get_gmem_layout(
+    int m, int k, int h, int b,
+    int64_t m_stride, int64_t h_stride, int64_t b_stride,
+    bool padded) const {
+  return make_layout(
+    make_shape(sum_s + (padded ? kMaxTileSize * b : 0), k, h),
+    make_stride(m_stride, cute::_1{}, h_stride));
+}
+  // Returns the layout of a tensor in MKHB format in global memory.
+  // padded: only useful for var-seq-len for dq_accum and softmax_d.
+  template<>
+  CUTLASS_HOST_DEVICE auto PagedSeqLenTraits::get_kv_gmem_layout(
+      int m, int k, int h, int b,
+      int64_t m_stride, int64_t h_stride, int64_t b_stride,
+      int64_t page_block_size, int64_t num_blocks,
+      bool padded) const {
+    //if (cute::thread0()) {
+    //  printf("get_kv_gmem_layout:: actual seq len=%d, page_block_size = %d, k=%d, h=%d, num_blocks=%d, m=%d, b=%d\n", (int)actual_seq_len, (int)page_block_size, k, h, (int)num_blocks, (int)m, (int)b);
+    //}
+    return static_cast<PagedSeqLenTraits::LayoutKVT>(make_layout(make_shape((int)page_block_size, k, h, (int)num_blocks),
+                       make_stride(m_stride, cute::_1{}, h_stride, b_stride)));
+  }
+
+// padded: only useful for var-seq-len for dq_accum and softmax_d.
+// When padded is True, use B_M + kMaxTileSize * B as the total B_M.
+template <>
+CUTLASS_HOST_DEVICE auto PagedSeqLenTraits::get_lse_gmem_layout(
+    int m, int h, int b, bool padded) const {
+  return make_layout(
+    make_shape(h, sum_s + (padded ? kMaxTileSize * b : 0)),
+    make_stride(int64_t(sum_s + (padded ? kMaxTileSize * b : 0)), cute::_1()));
+}
+
+template <>
+CUTLASS_DEVICE void PagedSeqLenTraits::init(int bidb) {
+  actual_seq_len =
+      seq_used ? seq_used[bidb] : (cu_seq_len[bidb + 1] - cu_seq_len[bidb]);
+}
+
+template <>
+template <typename MTensor, typename Shape>
+CUTLASS_DEVICE auto PagedSeqLenTraits::get_local_tile_tensor(
+    const MTensor &m_tensor, const Shape &tile_shape,
+    int bidh, int bidb, bool padded) const {
+
+  auto g_offset = local_tile(
+      m_tensor(_, _, bidh),
+      cute::make_shape(1, get<1>(tile_shape)),
+      make_coord(cu_seq_len[bidb] + (padded ? kMaxTileSize * bidb : 0), _0{}));
+  auto g_sequence = make_tensor(
+      g_offset.data(),
+      make_layout(
+        cute::make_shape(actual_seq_len, get<1>(tile_shape)),
+        g_offset.stride()
+      ));
+  auto g_tensor = local_tile(g_sequence, tile_shape, make_coord(_, _0{}));
+  return g_tensor;
+}
+
+template <>
+template <typename MTensor, typename Shape>
+CUTLASS_DEVICE auto PagedSeqLenTraits::get_local_kv_tile_tensor(
+      const MTensor &m_tensor, const Shape &tile_shape,
+      int bidh, int bidb, bool padded) const {
+    auto g_slice = m_tensor(_, _, bidh, bidb); // = m_tensor[:,:, head_idx, batch_idx]
+    auto g_seq_slice = make_tensor( // m_tensor[:actual_seq_len,:, head_idx, batch_idx]
+      g_slice.data(),
+      make_layout(cute::make_shape(actual_seq_len, get<1>(g_slice.layout().shape())), g_slice.layout().stride()));
+    // slice up into tiles
+    auto g_tensor = local_tile(
+      g_seq_slice, tile_shape, make_coord(_, _0{}));
+    return g_tensor;
+  }
+
+template <>
+template <typename MTensor, typename Shape>
+CUTLASS_DEVICE auto PagedSeqLenTraits::get_lse_local_tile_tensor(
+    const MTensor &m_tensor, const Shape &tile_shape,
+    int bidh, int bidb, bool padded) const {
+  auto g_offset = local_tile(
+      m_tensor(bidh, _), cute::make_shape(_1{}),
+      make_coord(cu_seq_len[bidb] + (padded ? kMaxTileSize * bidb : 0)));
+  auto g_sequence = make_tensor(
+      g_offset.data(),
       make_layout(cute::make_shape(actual_seq_len), cute::make_shape(_1{})));
   auto g_tensor = local_tile(g_sequence, tile_shape, make_coord(_));
   return g_tensor;

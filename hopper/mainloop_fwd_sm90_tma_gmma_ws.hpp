@@ -16,6 +16,7 @@
 
 #include "named_barrier.hpp"
 #include "utils.h"
+#include "copy_paged_sm90_tma.hpp"
 
 namespace flash {
 
@@ -90,7 +91,13 @@ struct CollectiveMainloopFwd {
     static constexpr int kHeadDim = Ktraits::kHeadDim;    
 
     using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
-    using GmemTiledCopyKV = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<0>(ClusterShape{})));
+    using GmemTiledCopyKVNopage = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<0>(ClusterShape{})));
+
+    // use SM90_TMA_LOAD_MULTICAST_PAGED if we would use SM90_TMA_LOAD_MULTICAST in unpaged scenario, otherwise use SM90_TMA_LOAD_PAGED
+    using GmemTiledCopyKV = typename std::conditional<
+                                std::is_same<GmemTiledCopyKVNopage, cute::SM90_TMA_LOAD_MULTICAST>::value, 
+                                SM90_TMA_LOAD_MULTICAST_PAGED, 
+                                SM90_TMA_LOAD_PAGED>::type;
     
     using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
     using SmemLayoutK = typename Ktraits::SmemLayoutK;
@@ -108,25 +115,27 @@ struct CollectiveMainloopFwd {
         select<0, 2>(TileShape_MNK{}),
         _1{}));  // no mcast for Q
 
-    using TMA_K = decltype(make_tma_copy(
+    using TMA_K = decltype(make_virtualized_tma_copy(
         GmemTiledCopyKV{},
         make_tensor(
             make_gmem_ptr(static_cast<Element const*>(nullptr)), 
-            repeat_like(typename Seqlen_traits::StrideT{}, int32_t(0)), 
-            typename Seqlen_traits::StrideT{}
+            repeat_like(typename Seqlen_traits::StrideKVT{}, int32_t(0)), 
+            typename Seqlen_traits::StrideKVT{}
         ),
+        typename Seqlen_traits::ShapeKVT{},
         take<0, 2>(SmemLayoutK{}),
         select<1, 2>(TileShape_MNK{}),
         size<0>(ClusterShape{}))); // mcast along M mode for this N load, if any
 
     // TMA_V may differ from TMA_K for fp8 kernel (e.g. swizzling mode)
-    using TMA_V = decltype(make_tma_copy(
+    using TMA_V = decltype(make_virtualized_tma_copy(
         GmemTiledCopyKV{},
         make_tensor(
             make_gmem_ptr(static_cast<Element const*>(nullptr)),
-            repeat_like(typename Seqlen_traits::StrideT{}, int32_t(0)),
-            typename Seqlen_traits::StrideT{}
+            repeat_like(typename Seqlen_traits::StrideKVT{}, int32_t(0)),
+            typename Seqlen_traits::StrideKVT{}
         ),
+        typename Seqlen_traits::ShapeKVT{},
         take<0, 2>(SmemLayoutV{}),
         select<1, 2>(TileShape_MNK{}),
         size<0>(ClusterShape{}))); // mcast along M mode for this N load, if any
@@ -151,22 +160,29 @@ struct CollectiveMainloopFwd {
         Element const* ptr_Q;
         typename Seqlen_traits::LayoutT layout_Q;
         Element const* ptr_K;
-        typename Seqlen_traits::LayoutT layout_K;
+        typename Seqlen_traits::LayoutKVT layout_K;
         Element const* ptr_V;
-        typename Seqlen_traits::LayoutT layout_V;
+        typename Seqlen_traits::LayoutKVT layout_V;
+        typename Seqlen_traits::ShapeKVT shape_KV;
         float const softmax_scale_log2;        
         float const* descale_q_ptr;
         float const* descale_k_ptr;
         float const* descale_v_ptr;
         int window_size_left;
-        int window_size_right;
+        int window_size_right;        
+        // Paged Attention block table data
+        int * block_table; // may be nullptr if not paged
+        int64_t block_table_batch_stride;
+        int page_block_size;
+        int num_blocks;
     };
 
     // Device side kernel params
     struct Params {
         typename Seqlen_traits::LayoutT layout_Q;
-        typename Seqlen_traits::LayoutT layout_K;
-        typename Seqlen_traits::LayoutT layout_V;
+        typename Seqlen_traits::LayoutKVT layout_K;
+        typename Seqlen_traits::LayoutKVT layout_V;
+        typename Seqlen_traits::ShapeKVT shape_KV;
         cutlass::FastDivmod qhead_per_khead_divmod;
         TMA_Q tma_load_Q;        
         TMA_K tma_load_K;
@@ -177,6 +193,11 @@ struct CollectiveMainloopFwd {
         float const* descale_v_ptr;
         int window_size_left;
         int window_size_right;
+        // Paged Attention block table data
+        int * block_table; // may be nullptr if not paged
+        int64_t block_table_batch_stride;
+        int page_block_size;
+        int num_blocks; // num_blocks
     };
 
 
@@ -190,25 +211,28 @@ struct CollectiveMainloopFwd {
             select<0, 2>(TileShape_MNK{}),
             _1{}); // no mcast for Q
         Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K), args.layout_K);
-        TMA_K tma_load_K = make_tma_copy(
+        TMA_K tma_load_K = make_virtualized_tma_copy(
             GmemTiledCopyKV{},
             mK,
+            args.shape_KV,
             SmemLayoutK{}(_, _, _0{}),
             select<1, 2>(TileShape_MNK{}),
             size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
         Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V), args.layout_V);
-        TMA_V tma_load_V = make_tma_copy(
+        TMA_V tma_load_V = make_virtualized_tma_copy(
             GmemTiledCopyKV{},
             mV,
+            args.shape_KV,
             SmemLayoutV{}(_, _, _0{}),
             select<1, 2>(TileShape_MNK{}),
             size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
-        return {args.layout_Q, args.layout_K, args.layout_V,
+        return {args.layout_Q, args.layout_K, args.layout_V, args.shape_KV,
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.layout_Q.shape()), get<2>(args.layout_K.shape()))),
                 tma_load_Q, tma_load_K, tma_load_V,
                 args.softmax_scale_log2,
                 args.descale_q_ptr, args.descale_k_ptr, args.descale_v_ptr,
-                args.window_size_left, args.window_size_right};
+                args.window_size_left, args.window_size_right,
+                args.block_table, args.block_table_batch_stride, args.page_block_size, args.num_blocks};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -280,8 +304,8 @@ struct CollectiveMainloopFwd {
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
 
         Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.layout_Q.shape());
-        Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.layout_K.shape());
-        Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.layout_V.shape());
+        Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.shape_KV);
+        Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.shape_KV);
 
         auto [m_block, bidh, bidb] = block_coord;
         int bidh_kv = mainloop_params.qhead_per_khead_divmod.divide(bidh);
@@ -292,9 +316,9 @@ struct CollectiveMainloopFwd {
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
         Tensor gQ = seqlen_traits_q.get_local_tile_tensor(
             mQ, select<0, 2>(TileShape_MNK{}), bidh, bidb)(_, _, m_block);  // (M, K)
-        Tensor gK = seqlen_traits_k.get_local_tile_tensor(
+        Tensor gK = seqlen_traits_k.get_local_kv_tile_tensor(
             mK, select<1, 2>(TileShape_MNK{}), bidh_kv, bidb);  // (N, K, _)
-        Tensor gV = seqlen_traits_k.get_local_tile_tensor(
+        Tensor gV = seqlen_traits_k.get_local_kv_tile_tensor(
             mV, select<1, 2>(TileShape_MNK{}), bidh_kv, bidb);  // (N, K, _)
 
         Tensor sQ_x = make_tensor(sQ.data(), make_layout(sQ.layout(), Layout<_1>{}));
@@ -307,12 +331,14 @@ struct CollectiveMainloopFwd {
                                           group_modes<0, 2>(sV), group_modes<0, 2>(gV));  // (TMA, k), (TMA, PIPE)
 
         uint16_t mcast_mask_kv = 0;
-        if constexpr (cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST>) {
+        if constexpr (cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST> || cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST_PAGED>)  {
             auto block_layout = Layout<ClusterShape>{}; // (m,n) -> block_id
             for (int m = 0; m < size<0>(block_layout); ++m) {
                 mcast_mask_kv |= (uint16_t(1) << block_layout(m, cluster_local_block_id.y, _0{}));
             }
         }
+
+        PagedCopyArgs const paged_copy_args = {mainloop_params.block_table_batch_stride, mainloop_params.page_block_size, mainloop_params.block_table};
 
         const int n_block_min = get_n_block_min(mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
         const int n_block_max = get_n_block_max(mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
@@ -321,7 +347,7 @@ struct CollectiveMainloopFwd {
         int lane_predicate = cute::elect_one_sync();
         if (lane_predicate) {
             pipeline_k.producer_acquire(smem_pipe_write_k);
-            copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
+            copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv, paged_copy_args),
                 tKgK(_, n_block), tKsK(_, smem_pipe_write_k.index()));
             ++smem_pipe_write_k;
         }
@@ -344,11 +370,11 @@ struct CollectiveMainloopFwd {
             #pragma unroll 2
             for (; n_block > n_block_min; --n_block) {
                 pipeline_k.producer_acquire(smem_pipe_write_k);
-                copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
+                copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv, paged_copy_args),
                     tKgK(_, n_block - 1), tKsK(_, smem_pipe_write_k.index()));
                 ++smem_pipe_write_k;
                 pipeline_v.producer_acquire(smem_pipe_write_v);
-                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
+                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv, paged_copy_args),
                     tVgV(_, n_block), tVsV(_, smem_pipe_write_v.index()));
                 ++smem_pipe_write_v;
             }
@@ -356,7 +382,7 @@ struct CollectiveMainloopFwd {
         scheduler.prefetch_next_work(scheduler_params, work_tile_info);
         if (lane_predicate) {
             pipeline_v.producer_acquire(smem_pipe_write_v);
-            copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
+            copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv, paged_copy_args),
                 tVgV(_, n_block), tVsV(_, smem_pipe_write_v.index()));
             ++smem_pipe_write_v;
         }
@@ -417,9 +443,9 @@ struct CollectiveMainloopFwd {
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
         Tensor gQ = seqlen_traits_q.get_local_tile_tensor(
             mQ, select<0, 2>(TileShape_MNK{}), bidh, bidb)(_, _, m_block);  // (M, K)
-        Tensor gK = seqlen_traits_k.get_local_tile_tensor(
+        Tensor gK = seqlen_traits_k.get_local_kv_tile_tensor(
             mK, select<1, 2>(TileShape_MNK{}), bidh_kv, bidb);  // (N, K, _)
-        Tensor gV = seqlen_traits_k.get_local_tile_tensor(
+        Tensor gV = seqlen_traits_k.get_local_kv_tile_tensor(
             mV, select<1, 2>(TileShape_MNK{}), bidh_kv, bidb);  // (N, K, _)
 
         Tensor sQ_x = make_tensor(sQ.data(), make_layout(sQ.layout(), Layout<_1>{}));
