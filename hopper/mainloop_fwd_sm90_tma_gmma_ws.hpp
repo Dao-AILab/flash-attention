@@ -92,6 +92,7 @@ struct CollectiveMainloopFwd {
     // static constexpr int  kBlockN  = Ktraits::kBlockN;
     // static constexpr int  kBlockH  = Ktraits::kBlockH;
     static constexpr bool Is_split = Ktraits::Is_split;
+    static constexpr bool No_smem_O = Ktraits::No_smem_O;
 
     using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
     using GmemTiledCopyKV = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<0>(ClusterShape{})));
@@ -367,13 +368,11 @@ struct CollectiveMainloopFwd {
         int n_block = n_block_max - 1;
 
         int lane_predicate = cute::elect_one_sync();
-        if constexpr (!Ktraits::KO_union) {
-            if (lane_predicate) {
-                pipeline_k.producer_acquire(smem_pipe_write_k);
-                copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
-                    tKgK(_, n_block), tKsK(_, smem_pipe_write_k.index()));
-                ++smem_pipe_write_k;
-            }
+        if (lane_predicate) {
+            pipeline_k.producer_acquire(smem_pipe_write_k);
+            copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
+                tKgK(_, n_block), tKsK(_, smem_pipe_write_k.index()));
+            ++smem_pipe_write_k;
         }
 
         // Wait for the MMA warpgroups to say that smem_q is ready
@@ -387,41 +386,19 @@ struct CollectiveMainloopFwd {
         // Wait for warp 1 to signal that smem_v are ready and V can be copied from gmem
         // Need ClusterBarrier, not just NamedBarrier. Otherwise we might have CTA 0 finishing the
         // TMA store on O first, call TMA multicast load on V, before CTA 1 can finishing TMA store on O.
-        shared_storage.barrier_O.wait((work_idx + 1) % 2);
-
-        if constexpr (Ktraits::KO_union) {
-            if (lane_predicate) {
+        if constexpr (!No_smem_O) { shared_storage.barrier_O.wait((work_idx + 1) % 2); }
+        if (lane_predicate) {
+            // CUTLASS_PRAGMA_NO_UNROLL
+            #pragma unroll 2
+            for (; n_block > n_block_min; --n_block) {
                 pipeline_k.producer_acquire(smem_pipe_write_k);
                 copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
-                    tKgK(_, n_block), tKsK(_, smem_pipe_write_k.index()));
+                    tKgK(_, n_block - 1), tKsK(_, smem_pipe_write_k.index()));
                 ++smem_pipe_write_k;
-
-                #pragma unroll 2
-                for (; n_block > n_block_min; --n_block) {                    
-                    pipeline_v.producer_acquire(smem_pipe_write_v);
-                    copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
-                        tVgV(_, n_block), tVsV(_, smem_pipe_write_v.index()));
-                    ++smem_pipe_write_v;
-                    pipeline_k.producer_acquire(smem_pipe_write_k);
-                    copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
-                        tKgK(_, n_block-1), tKsK(_, smem_pipe_write_k.index()));
-                    ++smem_pipe_write_k;
-                }
-            }
-        } else {
-            if (lane_predicate) {
-                // CUTLASS_PRAGMA_NO_UNROLL
-                #pragma unroll 2
-                for (; n_block > n_block_min; --n_block) {
-                    pipeline_k.producer_acquire(smem_pipe_write_k);
-                    copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
-                        tKgK(_, n_block - 1), tKsK(_, smem_pipe_write_k.index()));
-                    ++smem_pipe_write_k;
-                    pipeline_v.producer_acquire(smem_pipe_write_v);
-                    copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
-                        tVgV(_, n_block), tVsV(_, smem_pipe_write_v.index()));
-                    ++smem_pipe_write_v;
-                }
+                pipeline_v.producer_acquire(smem_pipe_write_v);
+                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
+                    tVgV(_, n_block), tVsV(_, smem_pipe_write_v.index()));
+                ++smem_pipe_write_v;
             }
         }
 
@@ -554,7 +531,7 @@ struct CollectiveMainloopFwd {
         // except for split kernel + hdim 256,
         // so could use NamedBarrier instead of ClusterBarrier.
         // But, this doesn't appear to have any benefit.
-        shared_storage.barrier_O.wait((work_idx + 1) % 2);
+        if constexpr (!No_smem_O) { shared_storage.barrier_O.wait((work_idx + 1) % 2); }
 
         if constexpr(Ktraits::VO_union_all) {
             if (warp_idx_in_warpgroup == 0 && lane_predicate) {
@@ -728,11 +705,11 @@ struct CollectiveMainloopFwd {
 
         Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
         
-        if constexpr(!Ktraits::KO_union) {
-            consumer_wait(pipeline_k, smem_pipe_read_k);
-            warp_scheduler_barrier_sync();
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
-            warp_scheduler_barrier_arrive();
+        consumer_wait(pipeline_k, smem_pipe_read_k);
+        warp_scheduler_barrier_sync();
+        flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
+        warp_scheduler_barrier_arrive();
+        if constexpr (!No_smem_O) {
             if (work_idx != 0) {
                 int lane_predicate = cute::elect_one_sync();
                 if (cutlass::canonical_warp_idx_sync() == Ktraits::kNWarps - 1 && lane_predicate) {
@@ -743,23 +720,8 @@ struct CollectiveMainloopFwd {
                     }
                 }
             }
-            warpgroup_wait<0>();
-        } else {
-            if (work_idx != 0) {
-                int lane_predicate = cute::elect_one_sync();
-                if (cutlass::canonical_warp_idx_sync() == Ktraits::kNWarps - 1 && lane_predicate) {
-                    tma_store_wait<0>();
-                    #pragma unroll
-                    for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
-                        shared_storage.barrier_O.arrive(cta_id, lane_predicate);
-                    }
-                }
-            }
-            consumer_wait(pipeline_k, smem_pipe_read_k);
-            warp_scheduler_barrier_sync();
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
-            warp_scheduler_barrier_arrive();
         }
+        warpgroup_wait<0>();
         pipeline_k.consumer_release(smem_pipe_read_k);
         ++smem_pipe_read_k;
 
@@ -947,15 +909,17 @@ struct CollectiveMainloopFwd {
         consumer_wait(pipeline_k, smem_pipe_read);                        
         warp_scheduler_barrier_sync();
         flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
-        if (work_idx != 0) {        
-            int lane_predicate = cute::elect_one_sync();
-            if (cutlass::canonical_warp_idx_sync() == Ktraits::kNWarps - 1 && lane_predicate) {
-                tma_store_wait<0>();
-                #pragma unroll
-                for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
-                    shared_storage.barrier_O.arrive(cta_id, lane_predicate);
-                }
-            }        
+        if constexpr (!No_smem_O) {
+            if (work_idx != 0) {        
+                int lane_predicate = cute::elect_one_sync();
+                if (cutlass::canonical_warp_idx_sync() == Ktraits::kNWarps - 1 && lane_predicate) {
+                    tma_store_wait<0>();
+                    #pragma unroll
+                    for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
+                        shared_storage.barrier_O.arrive(cta_id, lane_predicate);
+                    }
+                }        
+            }
         }
         warpgroup_wait<0>();
         warp_scheduler_barrier_arrive();

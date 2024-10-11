@@ -54,6 +54,21 @@ struct SharedStorageQKVOaccum {
     };
 };
 
+// SharedStorage struct with no smem for O
+template <int kStages, class Gemm1Type, class Gemm2Type, class SmemLayoutQ,
+          class SmemLayoutK, class SmemLayoutV>
+struct SharedStorageQKV {
+    cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutQ>> smem_q;
+    cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutK>> smem_k;
+    cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v;
+    struct {
+        cutlass::arch::ClusterTransactionBarrier barrier_Q;
+        typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_k;
+        typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_v;
+        int tile_count_semaphore;
+    };
+};
+
 template <int kStages, class Gemm1Type, class Gemm2Type, class OutputType, class SmemLayoutQ,
           class SmemLayoutK, class SmemLayoutV, class SmemLayoutO>
 struct SharedStorageQKVOVt {
@@ -139,7 +154,10 @@ struct Flash_fwd_kernel_traits {
     static constexpr int kStages = kStages_;
 
     static constexpr bool Is_split = Is_split_; 
-    static constexpr bool KO_union = Is_split && (kBlockM != 64) && (kHeadDim == 256);
+    // static constexpr bool KO_union = Is_split && (kBlockM != 64) && (kHeadDim == 256);
+    static constexpr bool KO_union = false;
+    static constexpr bool No_smem_O = Is_split;
+    
 
     using AtomLayoutMNK = Layout<Shape<Int<kBlockM / 64>, _1, _1>>;
     using TiledMma0 = decltype(cute::make_tiled_mma(
@@ -195,9 +213,14 @@ struct Flash_fwd_kernel_traits {
 
     using SmemCopyAtomQ = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
 
-    using SharedStorage = std::conditional_t<!KO_union,
+    // using SharedStorage = std::conditional_t<!KO_union,
+    //     SharedStorageQKVO<kStages, Element, Element, OutputType, SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>,
+    //     SharedStorageQKVOaccum<kStages, Element, Element, OutputType, SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>
+    // >;
+
+    using SharedStorage = std::conditional_t<!No_smem_O,
         SharedStorageQKVO<kStages, Element, Element, OutputType, SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>,
-        SharedStorageQKVOaccum<kStages, Element, Element, OutputType, SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>
+        SharedStorageQKV<kStages, Element, Element, SmemLayoutQ, SmemLayoutK, SmemLayoutV>
     >;
 
     using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;
@@ -219,6 +242,7 @@ struct Flash_fwd_kernel_traits_fp8 {
     using index_t = int64_t;
 
     static constexpr bool Is_split = Is_split_;
+    static constexpr bool No_smem_O = false;
 
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;

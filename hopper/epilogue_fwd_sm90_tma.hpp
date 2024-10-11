@@ -36,6 +36,7 @@ struct CollectiveEpilogueFwd {
     static constexpr int NumMmaThreads = kNThreads - NumCopyThreads;
 
     static constexpr bool Is_split = Ktraits::Is_split;
+    static constexpr bool No_smem_O = Ktraits::No_smem_O;
 
 #ifndef NO_FP8_COLUMN_PERMUTE
     static constexpr bool epi_column_permute = is_same_v<InputType, cutlass::float_e4m3_t>;
@@ -149,7 +150,7 @@ struct CollectiveEpilogueFwd {
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
     CUTLASS_DEVICE
     static void prefetch_tma_descriptors(Params const& epilogue_params) {
-        if constexpr (!Seqlen_traits::UseVarSeqLen) {
+        if constexpr (!Seqlen_traits::UseVarSeqLen && !No_smem_O) {
             cute::prefetch_tma_descriptor(epilogue_params.tma_store_O.get_tma_descriptor());
         }
     }
@@ -172,9 +173,7 @@ struct CollectiveEpilogueFwd {
         const int h_block = bidh % int(qhead_per_khead_divmod);
 
         Tensor tOrO_out = flash::convert_type<Element>(tOrO);
-        // NOTE: extend this to all Is_split cases and eval perf
-        constexpr static bool IsRegToGmem = Is_split && !epi_column_permute && kBlockH == 1;
-        if constexpr(!IsRegToGmem) {
+        if constexpr(!No_smem_O) {
             if constexpr (!epi_column_permute) {
                 Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
                 auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
@@ -251,48 +250,54 @@ struct CollectiveEpilogueFwd {
         }
 
         int write_warp_idx = kNWarps - 1;
-        if constexpr(!IsRegToGmem) {
+        if constexpr(!No_smem_O) {
             if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
                 cutlass::arch::NamedBarrier::sync(
                     NumMmaThreads + cutlass::NumThreadsPerWarp, 
                     cutlass::arch::ReservedNamedBarriers::EpilogueBarrier
                 );
             }
-        }
-        TiledCopyO gmem_tiled_copy_O;
-        Tensor sO_out = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutOCopy{});        
-        if constexpr(!Seqlen_traits::DecodingGQA) {
-            flash::write_O<!Seqlen_traits::UseVarSeqLen, IsRegToGmem, Is_split, NumCopyThreads>(
-                epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O, 
-                epilogue_params.layout_O, TileShapeOCopy{}, sO_out, 
-                m_block, bidh, bidb, n_split_idx, seqlen_traits_q, write_warp_idx, tiled_mma, tOrO_out
-            );
-        } else {
-	     if constexpr (Is_split) { 
-	     flash::write_rmem_to_gmem_gqa(tOrO_out, epilogue_params.ptr_O,  epilogue_params.layout_O, TileShapeOCopy{},
-              m_block, h_block, bidh_kv, bidb, n_split_idx, tiled_mma, seqlen_traits_q, threadIdx.x - NumCopyThreads);
-	     } else {
-             
-            Tensor mO = epilogue_params.tma_store_O.get_tma_tensor(epilogue_params.layout_O.shape());
-            Tensor gO = seqlen_traits_q.get_o_local_tile_tensor<false>(
-                    mO, TileShapeOCopy{}, bidh_kv, bidb, n_split_idx)
-                        (_, _, _, m_block, h_block);  // (bM/bH, bH, K)
-            auto block_tma_O = epilogue_params.tma_store_O.get_slice(_0{});
-            Tensor tOgO = block_tma_O.partition_D(gO);  // (TMA, TMA_M, TMA_K)
-            Tensor tOsO = block_tma_O.partition_S(sO_out);  // (TMA, TMA_M, TMA_K)
-            int const lane_predicate = cute::elect_one_sync();
-            int const warp_idx = cutlass::canonical_warp_idx_sync();
-            if (warp_idx == write_warp_idx && lane_predicate) {
-                cute::copy(epilogue_params.tma_store_O, tOsO, tOgO);
-                tma_store_arrive();
+        }        
+        if constexpr (No_smem_O) { 
+            if constexpr(!Seqlen_traits::DecodingGQA) {
+                flash::write_rmem_to_gmem(
+                    tOrO_out, epilogue_params.ptr_O,  epilogue_params.layout_O, TileShapeOCopy{},
+                    m_block, bidh, bidb, n_split_idx, tiled_mma, seqlen_traits_q, thread_idx);
+            } else {
+                flash::write_rmem_to_gmem_gqa(
+                    tOrO_out, epilogue_params.ptr_O,  epilogue_params.layout_O, TileShapeOCopy{}, 
+                    m_block, h_block, bidh_kv, bidb, n_split_idx, tiled_mma, seqlen_traits_q, thread_idx);
             }
-	     } 
+        } else {
+            TiledCopyO gmem_tiled_copy_O;
+            Tensor sO_out = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutOCopy{});        
+            if constexpr(!Seqlen_traits::DecodingGQA) {
+                flash::write_O<!Seqlen_traits::UseVarSeqLen, No_smem_O, Is_split, NumCopyThreads>(
+                    epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O, 
+                    epilogue_params.layout_O, TileShapeOCopy{}, sO_out, 
+                    m_block, bidh, bidb, n_split_idx, seqlen_traits_q, write_warp_idx, tiled_mma, tOrO_out
+                );
+            } else {
+                Tensor mO = epilogue_params.tma_store_O.get_tma_tensor(epilogue_params.layout_O.shape());
+                Tensor gO = seqlen_traits_q.get_o_local_tile_tensor<Is_split>(
+                    mO, TileShapeOCopy{}, bidh_kv, bidb, n_split_idx)
+                    (_, _, _, m_block, h_block);  // (bM/bH, bH, K)
+                auto block_tma_O = epilogue_params.tma_store_O.get_slice(_0{});
+                Tensor tOgO = block_tma_O.partition_D(gO);  // (TMA, TMA_M, TMA_K)
+                Tensor tOsO = block_tma_O.partition_S(sO_out);  // (TMA, TMA_M, TMA_K)
+                int const lane_predicate = cute::elect_one_sync();
+                int const warp_idx = cutlass::canonical_warp_idx_sync();
+                if (warp_idx == write_warp_idx && lane_predicate) {
+                    cute::copy(epilogue_params.tma_store_O, tOsO, tOgO);
+                    tma_store_arrive();
+                }
+            }
         }
     }
 
     CUTLASS_DEVICE void
     store_tail() {
-        tma_store_wait<0>();
+        if constexpr(!No_smem_O) { tma_store_wait<0>(); }
     }
 
     // Write 0 to output and -inf to LSE

@@ -40,6 +40,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
     static_assert(Ktraits::Is_WS);
     static constexpr bool Is_WS = Ktraits::Is_WS;
+    static constexpr bool No_smem_O = Ktraits::No_smem_O;
 
     static constexpr int NumMmaThreads = size(typename Ktraits::TiledMma0{});
     static constexpr int NumCopyThreads = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
@@ -81,7 +82,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
     if (warp_idx == 0 && lane_predicate) {
         shared_storage.barrier_Q.init(1 /*numThreads*/);
-        shared_storage.barrier_O.init(size(ClusterShape{}) /*numThreads*/);
+        if constexpr (!No_smem_O) { shared_storage.barrier_O.init(size(ClusterShape{}) /*numThreads*/); }
     }
     // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
     MainloopPipeline pipeline_k(shared_storage.pipeline_k, pipeline_params, ClusterShape{});
@@ -228,6 +229,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
     static_assert(Ktraits::Is_WS);
     static constexpr bool Is_WS = Ktraits::Is_WS;
+    static constexpr bool No_smem_O = Ktraits::No_smem_O;
     // static constexpr bool UseVarSeqLen = Seqlen_traits::UseVarSeqLen;
 
     static constexpr int NumMmaThreads = size(typename Ktraits::TiledMma0{});
@@ -280,7 +282,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
     if (warp_idx == 0 && lane_predicate) {
         shared_storage.barrier_Q.init(1 /*numThreads*/);
-        shared_storage.barrier_O.init(size(ClusterShape{}) /*numThreads*/);
+        if constexpr (!No_smem_O) { shared_storage.barrier_O.init(size(ClusterShape{}) /*numThreads*/); }
     }
     // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
     MainloopPipeline pipeline_k(shared_storage.pipeline_k, pipeline_params, ClusterShape{});

@@ -288,65 +288,12 @@ __forceinline__ __device__ void write_tma(
 
 // Epilogue that copies RMEM -> GMEM directly
 // Reports as uncoalesced stores by the profiler
-template <bool Is_split, class TensorO, class OutputType, class TileShapeO,
-          class LayoutO, typename SeqLenTraits, typename TiledMma>
-__device__ static void //__launch_bounds__(128, 2)
-write_rmem_to_gmem_defunct(TensorO &tOrO, 
-                    OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
-                     int m_block, int bidh, int bidb, int n_split_idx,
-		     TiledMma & tiledMma,
-                     const SeqLenTraits& seqlen_traits_o) {
-
-  Tensor mO = make_tensor(make_gmem_ptr(O), layout_O);
-  Tensor gO = seqlen_traits_o.get_o_local_tile_tensor<Is_split>(
-        mO, tile_shape_O, bidh, bidb, n_split_idx
-   )(_, _, m_block);  // (M, K)
-  auto threadMma1 = tiledMma.get_thread_slice(threadIdx.x);
-  Tensor tOgO = threadMma1.partition_C(gO);
-
-  // Write out to GMEM.
-  //copy(tOrO, tOgO);
-
-
-  // Prepare for TiledCopy.
-  // Grouping is needed because cute::copy_if() does group_modes<1, R> for src and dst.
-  // After grouping, the first dim is number of elements to read together.
-  Tensor tOrOFlatten = cute::flatten(tOrO);
-  Tensor tOrOGroup = cute::group_modes<1, rank(tOrOFlatten)>(tOrOFlatten);
-  Tensor tOgOFlatten = cute::flatten(tOgO);
-  Tensor tOgOGroup = cute::group_modes<1, rank(tOgOFlatten)>(tOgOFlatten);
-
-  // Get thread coords to global index mapping.
-  Tensor gOCounting = cute::make_identity_tensor(gO.shape());
-  Tensor tSgOCounting = threadMma1.partition_C(gOCounting);
-  Tensor tSgOCountingFlatten = cute::flatten(tSgOCounting);
-  Tensor tSgOCountingGrouped =
-	  cute::group_modes<1, rank(tSgOCountingFlatten)>(tSgOCountingFlatten);
-
-  // Write out to GMEM.
-  const int kNumMsPerTile = get<0>(tile_shape_O);
-  int cta_m = std::min(
-		  seqlen_traits_o.actual_seq_len - m_block * kNumMsPerTile, kNumMsPerTile
-		  );
-  if (cta_m == kNumMsPerTile) {
-          copy(tOrO, tOgO);
-  } else {
-	  auto predicate_fn = [&](auto coords) {
-		  auto s_coords = tSgOCountingGrouped(_0{}, coords);
-		  return elem_less(get<0>(s_coords), cta_m);
-	  };
-	  copy_if(predicate_fn, tOrOGroup, tOgOGroup);
-  }
-}
-
-// Epilogue that copies RMEM -> GMEM directly
-// Reports as uncoalesced stores by the profiler
 template <class TensorO, class OutputType, class TileShapeO,
           class LayoutO, typename SeqLenTraits, typename TiledMma>
-__device__ static void //__launch_bounds__(128, 2)
-write_rmem_to_gmem(TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
+__forceinline__ __device__ void write_rmem_to_gmem(
+    TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
     int m_block, int bidh, int bidb, int n_split_idx,
-	TiledMma & tiled_mma, const SeqLenTraits& seqlen_traits_o, int thread_idx) {
+	TiledMma& tiled_mma, const SeqLenTraits& seqlen_traits_o, int thread_idx) {
     using CopyAtomO = Copy_Atom<UniversalCopy<OutputType>, OutputType>;
     auto gmem_tiled_copy_O = make_tiled_copy_C(CopyAtomO{}, tiled_mma);
     auto gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(thread_idx);
@@ -387,17 +334,16 @@ write_rmem_to_gmem(TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileSh
 
 // Epilogue that copies RMEM -> GMEM directly for GQA enabled.
 // Reports as uncoalesced stores by the profiler
-template <class TensorO, class OutputType, class TileShapeO,
+template <class TensorO, class OutputType, class TileShapeO, 
           class LayoutO, typename SeqLenTraits, typename TiledMma>
-__device__ static void //__launch_bounds__(128, 2)
-write_rmem_to_gmem_gqa(TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
+__forceinline__ __device__ void write_rmem_to_gmem_gqa(
+    TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
     int m_block, int h_block, int bidh_kv, int bidb, int n_split_idx,
-        TiledMma & tiled_mma, const SeqLenTraits& seqlen_traits_o, int thread_idx) {
+    TiledMma& tiled_mma, const SeqLenTraits& seqlen_traits_o, int thread_idx) {
     Tensor mO = make_tensor(make_gmem_ptr(O), layout_O);
     Tensor gO = seqlen_traits_o.get_o_local_tile_tensor<true>(
                 mO, tile_shape_O, bidh_kv, bidb, n_split_idx
             )(_, _, _, m_block, h_block);  // (bM/bH, bH, K)
-			       //
     auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
 
     auto tileShape_MNK = cute::tile_shape(TiledMma{});
@@ -405,22 +351,22 @@ write_rmem_to_gmem_gqa(TensorO &tOrO, OutputType *O, const LayoutO& layout_O, Ti
     Tensor tOcO = thread_mma.partition_C(cO);
 
     // Write out to GMEM.
-    const int kNumMsPerTile = size<0>(tileShape_MNK);
+    // constexpr int kBlockM = size<0>(tileShape_MNK);
 
-    int kBlockMH = size<0>(gO);
-    int kBlockH = size<1>(gO);
-    const int m_bound = seqlen_traits_o.actual_seq_len - m_block * kBlockMH;
+    constexpr int kBlockMH = size<0>(gO);
+    constexpr int kBlockH = size<1>(gO);
+    const int m_bound = seqlen_traits_o.actual_seq_len - m_block * (kBlockMH);
     const int h_bound = shape<1>(layout_O) - h_block * kBlockH;
-
 
     static_assert(decltype(size<1>(tOrO))::value == 1);
     static_assert(decltype(size<2>(tOrO))::value == 1);
 
+    #pragma unroll
     for (int i = 0; i < size(tOrO); ++i) {
 	    int row = int(get<0>(tOcO(i)));
 	    int col = int(get<1>(tOcO(i)));
 	    const int h_local = row % kBlockH;
-            const int m_local = row/kBlockH;
+        const int m_local = row/kBlockH;
 	    if(h_local < h_bound && m_local < m_bound) {
 		    gO(m_local, h_local, col) = tOrO(i);
 	    }
