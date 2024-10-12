@@ -288,8 +288,8 @@ __forceinline__ __device__ void write_tma(
 
 // Epilogue that copies RMEM -> GMEM directly for GQA enabled.
 // Reports as uncoalesced stores by the profiler
-template <bool Use_gqa_layout, bool Is_split = true, class TensorO, class OutputType,
-           class LayoutO, class TileShapeO, typename TiledMma, typename SeqLenTraits>
+template <bool Use_gqa_layout, bool Is_split = true, typename TensorO, typename OutputType,
+          typename LayoutO, typename TileShapeO, typename TiledMma, typename SeqLenTraits>
 __forceinline__ __device__ void write_rmem_to_gmem(
         TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
         int m_block, int h_block, int bidh, int bidh_kv, int bidb, int n_split_idx,
