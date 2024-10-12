@@ -286,97 +286,70 @@ __forceinline__ __device__ void write_tma(
     // tma_store_wait<0>();
 }
 
-// Epilogue that copies RMEM -> GMEM directly
-// Reports as uncoalesced stores by the profiler
-template <class TensorO, class OutputType, class TileShapeO,
-          class LayoutO, typename SeqLenTraits, typename TiledMma>
-__forceinline__ __device__ void write_rmem_to_gmem(
-    TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
-    int m_block, int bidh, int bidb, int n_split_idx,
-	TiledMma& tiled_mma, const SeqLenTraits& seqlen_traits_o, int thread_idx) {
-    using CopyAtomO = Copy_Atom<UniversalCopy<OutputType>, OutputType>;
-    auto gmem_tiled_copy_O = make_tiled_copy_C(CopyAtomO{}, tiled_mma);
-    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(thread_idx);
-    Tensor mO = make_tensor(make_gmem_ptr(O), layout_O);
-    Tensor gO = seqlen_traits_o.get_o_local_tile_tensor<true>(
-                mO, tile_shape_O, bidh, bidb, n_split_idx
-            )(_, _, m_block);  // (M, K)
-    Tensor taccOrO = gmem_thr_copy_O.retile_S(tOrO);
-    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
-  
-    Tensor taccOrOFlatten = cute::flatten(taccOrO);
-    Tensor taccOrOGroup = cute::group_modes<1, rank(taccOrOFlatten)>(taccOrOFlatten);
-    Tensor tOgOFlatten = cute::flatten(tOgO);
-    Tensor tOgOGroup = cute::group_modes<1, rank(tOgOFlatten)>(tOgOFlatten);
-
-    // Get thread coords to global index mapping.
-    Tensor gOCounting = cute::make_identity_tensor(gO.shape());
-    Tensor tOgOCounting = gmem_thr_copy_O.partition_D(gOCounting);
-    Tensor tOgOCountingFlatten = cute::flatten(tOgOCounting);
-    Tensor tOgOCountingGrouped =
-        cute::group_modes<1, rank(tOgOCountingFlatten)>(tOgOCountingFlatten);
-
-    // Write out to GMEM.
-    const int kNumMsPerTile = get<0>(tile_shape_O);
-    int cta_m = std::min(
-        seqlen_traits_o.actual_seq_len - m_block * kNumMsPerTile, kNumMsPerTile
-    );
-    if (cta_m == kNumMsPerTile) {
-        copy(gmem_tiled_copy_O, taccOrOGroup, tOgOGroup);
-    } else {
-        auto predicate_fn = [&](auto coords) {
-            auto g_coords = tOgOCountingGrouped(_0{}, coords);
-            return elem_less(get<0>(g_coords), cta_m);
-        };
-        copy_if(gmem_tiled_copy_O, predicate_fn, taccOrOGroup, tOgOGroup);
-    }
-}
-
 // Epilogue that copies RMEM -> GMEM directly for GQA enabled.
 // Reports as uncoalesced stores by the profiler
-template <class TensorO, class OutputType, class TileShapeO, 
-          class LayoutO, typename SeqLenTraits, typename TiledMma>
-__forceinline__ __device__ void write_rmem_to_gmem_gqa(
-    TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
-    int m_block, int h_block, int bidh_kv, int bidb, int n_split_idx,
-    TiledMma& tiled_mma, const SeqLenTraits& seqlen_traits_o, int thread_idx) {
+template <bool Use_gqa_layout, bool Is_split = true, class TensorO, class OutputType,
+           class LayoutO, class TileShapeO, typename TiledMma, typename SeqLenTraits>
+__forceinline__ __device__ void write_rmem_to_gmem(
+        TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
+        int m_block, int h_block, int bidh, int bidh_kv, int bidb, int n_split_idx,
+        TiledMma& tiled_mma, const SeqLenTraits& seqlen_traits_o, int thread_idx) {
+    static_assert(is_same_v<typename TensorO::value_type, float>, "rmem dtype must be float");
     Tensor mO = make_tensor(make_gmem_ptr(O), layout_O);
-    Tensor gO = seqlen_traits_o.get_o_local_tile_tensor<true>(
+    Tensor gO = [&] {
+        if constexpr(Use_gqa_layout) {
+            return seqlen_traits_o.get_o_local_tile_tensor<Is_split>(
                 mO, tile_shape_O, bidh_kv, bidb, n_split_idx
-            )(_, _, _, m_block, h_block);  // (bM/bH, bH, K)
+                )(_, _, _, m_block, h_block);  // (bM/bH, bH, K)
+        } else {
+            return seqlen_traits_o.get_o_local_tile_tensor<Is_split>(
+                mO, tile_shape_O, bidh, bidb, n_split_idx
+                )(_, _, m_block);  // (bM, bK)
+        }
+    }();
     auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
-
-    auto tileShape_MNK = cute::tile_shape(TiledMma{});
-    Tensor cO = cute::make_identity_tensor(select<0, 1>(tileShape_MNK));
+    auto tile_shape_mnk = cute::tile_shape(tiled_mma);
+    Tensor cO = cute::make_identity_tensor(select<0, 1>(tile_shape_mnk));
     Tensor tOcO = thread_mma.partition_C(cO);
-
-    constexpr int kBlockMH = size<0>(gO);
-    constexpr int kBlockH = size<1>(gO);
-    const int m_bound = seqlen_traits_o.actual_seq_len - m_block * (kBlockMH);
-    const int h_bound = shape<1>(layout_O) - h_block * kBlockH;
-
-    static_assert(decltype(size<1>(tOrO))::value == 1, "MMA_M = 1");
-    static_assert(decltype(size<2>(tOrO))::value == 1, "MMA_N = 1");
-
+    // tOcO has shape ((2, 2, V), MMA_M, MMA_N), we only take only the row indices.
+    Tensor tOcO_row = tOcO(make_coord(_0{}, _, _0{}), _, _0{});
     // reshape from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
-    auto tOrO_rowcol = make_tensor(tOrO.data(), flash::convert_layout_acc_rowcol(tOrO.layout()));
-
-    Tensor tOcO_row = tOcO(make_coord(_0{}, _, _0{}), _0{}, _0{});
-
+    Tensor tOrO_rowcol = make_tensor(tOrO.data(), flash::convert_layout_acc_rowcol(tOrO.layout()));
+    const int m_bound = seqlen_traits_o.actual_seq_len - m_block * size<0>(gO);
+    // hardcoded col_idx to circumvent reg spilling with counting tensor
     const int col_start_idx = 2 * (thread_idx % 4);
-    #pragma unroll
-    for(int nrow = 0; nrow < size<0>(tOrO_rowcol); ++nrow) {
-        const int row = int(get<0>(tOcO_row(nrow)));
-        const int h_local = row % kBlockH;
-        const int m_local = row/kBlockH;
-        if(h_local < h_bound && m_local < m_bound) {
-            Tensor tOrO_row_float2 = recast<float2>(tOrO_rowcol(nrow, _));
-            #pragma unroll
-            for (int ncol = 0; ncol < size<1, 1>(tOrO_rowcol); ++ncol) {
-                 *reinterpret_cast<float2*>(&(gO(m_local, h_local, col_start_idx + 8 * ncol))) = 
-                    tOrO_row_float2(ncol);
+
+    if constexpr (Use_gqa_layout) {
+        static constexpr int kBlockH = size<1>(gO);
+        const int h_bound = shape<1>(layout_O) - h_block * kBlockH;
+        #pragma unroll
+        for(int nrow = 0; nrow < size<0>(tOrO_rowcol); ++nrow) {
+            const int row = int(get<0>(tOcO_row(nrow)));
+            const int h_local = row % kBlockH;
+            const int m_local = row / kBlockH;
+            if(h_local < h_bound && m_local < m_bound) {
+                Tensor tOrO_row_float2 = recast<float2>(tOrO_rowcol(nrow, _));
+                #pragma unroll
+                for (int ncol = 0; ncol < size<1>(tOrO_rowcol)/2; ++ncol) {
+                    *reinterpret_cast<float2*>(&(gO(m_local, h_local, col_start_idx + 8 * ncol))) = 
+                        tOrO_row_float2(ncol);
+                }
             }
         }
+    } else {
+        #pragma unroll
+        for(int nrow = 0; nrow < size<0>(tOrO_rowcol); ++nrow) {
+            const int row = int(get<0>(tOcO_row(nrow)));
+            if(row < m_bound) {
+                Tensor tOrO_row_float2 = recast<float2>(tOrO_rowcol(nrow, _));
+                #pragma unroll
+                for (int ncol = 0; ncol < size<1>(tOrO_rowcol)/2; ++ncol) {
+                    *reinterpret_cast<float2*>(&(gO(row, col_start_idx + 8 * ncol))) = 
+                        tOrO_row_float2(ncol);
+                }
+            }
+        }
+
     }
 }
 
