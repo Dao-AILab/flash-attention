@@ -268,6 +268,8 @@ struct CollectiveEpilogueFwd {
                     tOrO_out, epilogue_params.ptr_O,  epilogue_params.layout_O, TileShapeOCopy{}, 
                     m_block, h_block, bidh_kv, bidb, n_split_idx, tiled_mma, seqlen_traits_q, thread_idx);
             }
+            // cutlass::arch::NamedBarrier::sync(
+            //     NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
         } else {
             TiledCopyO gmem_tiled_copy_O;
             Tensor sO_out = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutOCopy{});        

@@ -350,26 +350,33 @@ __forceinline__ __device__ void write_rmem_to_gmem_gqa(
     Tensor cO = cute::make_identity_tensor(select<0, 1>(tileShape_MNK));
     Tensor tOcO = thread_mma.partition_C(cO);
 
-    // Write out to GMEM.
-    // constexpr int kBlockM = size<0>(tileShape_MNK);
-
     constexpr int kBlockMH = size<0>(gO);
     constexpr int kBlockH = size<1>(gO);
     const int m_bound = seqlen_traits_o.actual_seq_len - m_block * (kBlockMH);
     const int h_bound = shape<1>(layout_O) - h_block * kBlockH;
 
-    static_assert(decltype(size<1>(tOrO))::value == 1);
-    static_assert(decltype(size<2>(tOrO))::value == 1);
+    static_assert(decltype(size<1>(tOrO))::value == 1, "MMA_M = 1");
+    static_assert(decltype(size<2>(tOrO))::value == 1, "MMA_N = 1");
 
+    // reshape from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
+    auto tOrO_rowcol = make_tensor(tOrO.data(), flash::convert_layout_acc_rowcol(tOrO.layout()));
+
+    Tensor tOcO_row = tOcO(make_coord(_0{}, _, _0{}), _0{}, _0{});
+
+    const int col_start_idx = 2 * (thread_idx % 4);
     #pragma unroll
-    for (int i = 0; i < size(tOrO); ++i) {
-	    int row = int(get<0>(tOcO(i)));
-	    int col = int(get<1>(tOcO(i)));
-	    const int h_local = row % kBlockH;
+    for(int nrow = 0; nrow < size<0>(tOrO_rowcol); ++nrow) {
+        const int row = int(get<0>(tOcO_row(nrow)));
+        const int h_local = row % kBlockH;
         const int m_local = row/kBlockH;
-	    if(h_local < h_bound && m_local < m_bound) {
-		    gO(m_local, h_local, col) = tOrO(i);
-	    }
+        if(h_local < h_bound && m_local < m_bound) {
+            Tensor tOrO_row_float2 = recast<float2>(tOrO_rowcol(nrow, _));
+            #pragma unroll
+            for (int ncol = 0; ncol < size<1, 1>(tOrO_rowcol); ++ncol) {
+                 *reinterpret_cast<float2*>(&(gO(m_local, h_local, col_start_idx + 8 * ncol))) = 
+                    tOrO_row_float2(ncol);
+            }
+        }
     }
 }
 
