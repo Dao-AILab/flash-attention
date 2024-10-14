@@ -118,10 +118,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 auto block_coord = work_tile_info.get_block_coord(scheduler_params);
                 auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
-                if constexpr(seqlen_traits_q.Is_dynamic) { seqlen_traits_q.init(bidb); }
-                if constexpr(seqlen_traits_k.Is_dynamic) { seqlen_traits_k.init(bidb); }
+                seqlen_traits_q.init(bidb);
+                seqlen_traits_k.init(bidb);
                 if constexpr(seqlen_traits_q.UseVarSeqLen) {
-                    // NOTE: to support in future with gqa decoding, changed kBlockM to kBlockM/kBlockH
+                    // NOTE: to support in future with gqa packed layouts, changed kBlockM to kBlockM/kBlockH
                     if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
                         continue;
                     }
@@ -171,10 +171,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
-            if constexpr(seqlen_traits_q.Is_dynamic) { seqlen_traits_q.init(bidb); }
-            if constexpr(seqlen_traits_k.Is_dynamic) { seqlen_traits_k.init(bidb); }
+            seqlen_traits_q.init(bidb);
+            seqlen_traits_k.init(bidb);
             if constexpr(seqlen_traits_q.UseVarSeqLen) {
-                // NOTE: to support in future with gqa decoding, changed kBlockM to kBlockM/kBlockH
+                // NOTE: to support in future with gqa packed layouts, changed kBlockM to kBlockM/kBlockH
                 if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
                     continue;
                 }
@@ -185,11 +185,11 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                     n_block_min, n_block_max);
             if constexpr (Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                 if(n_block_max <= n_block_min) {  // We exit early and write 0 to gO and -inf to gLSE.
-                    if constexpr(!Seqlen_traits_Q::DecodingGQA) {
+                    if constexpr(!Seqlen_traits_Q::UseGQAPacking) {
                         collective_epilogue.store_zero(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads,
                             block_coord, seqlen_traits_q);
                     } else {
-                        collective_epilogue.store_zero_decoding_gqa(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads,
+                        collective_epilogue.store_zero_gqa(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads,
                             block_coord, seqlen_traits_q, mainloop_params.qhead_per_khead_divmod);
                     }
                     continue;
@@ -317,6 +317,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
         int work_idx = 0;
 
+        // const bool seqlen_k_init = bool(seqlen_traits_k.cu_seq_len);
+
         TileScheduler scheduler(&shared_storage.tile_count_semaphore);
         for (auto work_tile_info = scheduler.get_initial_work();
                 work_tile_info.is_valid(scheduler_params);
@@ -324,10 +326,11 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
-            if constexpr(seqlen_traits_q.Is_dynamic) { seqlen_traits_q.init(bidb); }
-            if constexpr(seqlen_traits_k.Is_dynamic) { seqlen_traits_k.init(bidb); }
+            seqlen_traits_q.init(bidb);
+            seqlen_traits_k.init(bidb);
+            // if (seqlen_k_init) { seqlen_traits_k.init(bidb); }
             if constexpr(seqlen_traits_q.UseVarSeqLen) {
-                // NOTE: to support in future with gqa decoding, changed kBlockM to kBlockM/kBlockH
+                // NOTE: to support in future with gqa packed layout, changed kBlockM to kBlockM/kBlockH
                 if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
                     continue;
                 }
@@ -368,6 +371,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
         scheduler.init_consumer();
 
         int work_idx = 0;
+        const bool seqlen_k_init = bool(seqlen_traits_k.cu_seq_len);
+
         CUTLASS_PRAGMA_NO_UNROLL
         for (auto work_tile_info = scheduler.get_initial_work();
              work_tile_info.is_valid(scheduler_params);
@@ -379,10 +384,11 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
-            if constexpr(seqlen_traits_q.Is_dynamic) { seqlen_traits_q.init(bidb); }
-            if constexpr(seqlen_traits_k.Is_dynamic) { seqlen_traits_k.init(bidb); }
+            seqlen_traits_q.init(bidb);
+            seqlen_traits_k.init(bidb);
+            // if (seqlen_k_init) { seqlen_traits_k.init(bidb); }
             if constexpr(seqlen_traits_q.UseVarSeqLen) {
-                // NOTE: to support in future with gqa decoding, changed kBlockM to kBlockM/kBlockH
+                // NOTE: to support in future with gqa packed layout, changed kBlockM to kBlockM/kBlockH
                 if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
                     continue;
                 }
@@ -393,11 +399,11 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                     n_block_min, n_block_max);
             if constexpr (Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                 if(n_block_max <= n_block_min) {  // We exit early and write 0 to gO and -inf to gLSE.
-                    if constexpr(!Seqlen_traits_Q::DecodingGQA) {
+                    if constexpr(!Seqlen_traits_Q::UseGQAPacking) {
                         collective_epilogue.store_zero(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads,
                             block_coord, seqlen_traits_q);
                     } else {
-                        collective_epilogue.store_zero_decoding_gqa(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads,
+                        collective_epilogue.store_zero_gqa(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads,
                             block_coord, seqlen_traits_q, mainloop_params.qhead_per_khead_divmod);
                     }
                     continue;

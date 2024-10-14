@@ -14,11 +14,11 @@ namespace flash {
 
 static constexpr int kMaxTileSize = 128;
 
-template <bool UseVarSeqLen_, bool DecodingGQA_, bool Is_dynamic_> class SeqLenTraits {
+template <bool UseVarSeqLen_, bool UseGQAPacking_, bool Is_batch_dynamic_> class SeqLenTraits {
 public:
-  static_assert(!(UseVarSeqLen_ && DecodingGQA_),
+  static_assert(!(UseVarSeqLen_ && UseGQAPacking_),
     "Variable sequence length with GQA parallelization not implemented yet.");
-  static_assert(!(UseVarSeqLen_ && !Is_dynamic_),
+  static_assert(!(UseVarSeqLen_ && !Is_batch_dynamic_),
     "VarSeqLen class always has variable seqlen.");
 
   // Total number of queries / keys. Unpadded.
@@ -32,14 +32,14 @@ public:
 
   // Whether this is for fixed-seq-len or var-seq-len.
   static constexpr bool UseVarSeqLen = UseVarSeqLen_;
-  static constexpr bool DecodingGQA = DecodingGQA_;
-  static constexpr bool Is_dynamic = Is_dynamic_;
+  static constexpr bool UseGQAPacking = UseGQAPacking_;
+  static constexpr bool Is_batch_dynamic = Is_batch_dynamic_;
 
   using ShapeT = std::conditional_t<
       UseVarSeqLen, 
       cute::Shape<int32_t, int32_t, int32_t>,
       std::conditional_t<
-        DecodingGQA,
+        UseGQAPacking,
         cute::Shape<int32_t, int32_t, int32_t, int32_t, int32_t>,
         cute::Shape<int32_t, int32_t, int32_t, int32_t>
       >
@@ -48,7 +48,7 @@ public:
       UseVarSeqLen, 
       cute::Shape<int64_t, _1, int64_t>, 
       std::conditional_t<
-        DecodingGQA,
+        UseGQAPacking,
         cute::Shape<int64_t, int64_t, _1, int64_t, int64_t>,
         cute::Shape<int64_t, _1, int64_t, int64_t>
       >
@@ -69,12 +69,12 @@ public:
 
   // Not used for varseqlen
   using ShapeOAccumT = std::conditional_t<
-    DecodingGQA,
+    UseGQAPacking,
     cute::Shape<int32_t, int32_t, int32_t, int32_t, int32_t, int32_t>,
     cute::Shape<int32_t, int32_t, int32_t, int32_t, int32_t>
   >;
   using StrideOAccumT = std::conditional_t<
-    DecodingGQA,
+    UseGQAPacking,
     cute::Shape<int64_t, int64_t, _1, int64_t, int64_t, int64_t>,
     cute::Shape<int64_t, _1, int64_t, int64_t, int64_t>
   >;
@@ -91,16 +91,18 @@ public:
       sum_s(sum_s), cu_seq_len(cu_seq_len), seq_used(seq_used), actual_seq_len(max_seq_len) {}
 
   CUTLASS_DEVICE void init(int bidb) {
-    // TODO: add leftpad, seqlen_new for kv cache support
-    // NOTE: for FA2 kv cache API, "cu_seq_len" is a misnomer.
-    // Rather, cu_seq_len plays the role of seq_used.
-    // We can change this to seq_used for FA3 if desired.
-    if(cu_seq_len) {      
-      actual_seq_len = cu_seq_len[bidb];
+    if constexpr(Is_batch_dynamic) {
+    //   // TODO: add leftpad, seqlen_new for kv cache support
+    //   // NOTE: for FA2 kv cache API, "cu_seq_len" is a misnomer.
+    //   // Rather, cu_seq_len plays the role of seq_used.
+    //   // We can change this to seq_used for FA3 if desired.
+      if(cu_seq_len) {      
+        actual_seq_len = cu_seq_len[bidb];
+      }
+    //   // if (seq_used) {
+    //   //   actual_seq_len = seq_used[bidb];
+    //   // }
     }
-    // if (seq_used) {
-    //   actual_seq_len = seq_used[bidb];
-    // }
   }
 
   // Returns the layout of a tensor in MKHB format in global memory.
@@ -110,7 +112,7 @@ public:
       int64_t m_stride, int64_t h_stride, int64_t b_stride,
       bool padded = false) const {
     static_assert(!UseVarSeqLen, "Specialize default implementation for VarSeqLen.");
-    // static_assert(!DecodingGQA, "Specialize default implementation for DecodingGQA.");
+    // static_assert(!UseGQAPacking, "Specialize default implementation for UseGQAPacking.");
     return make_layout(make_shape(m, k, h, b),
                        make_stride(m_stride, cute::_1{}, h_stride, b_stride));
   }
@@ -123,7 +125,7 @@ public:
       int64_t m_stride, int64_t h_stride, int64_t b_stride,
       bool padded = false) const {
     static_assert(!UseVarSeqLen, "Specialize default implementation for VarSeqLen.");
-    static_assert(!DecodingGQA, "Specialize default implementation for DecodingGQA.");
+    static_assert(!UseGQAPacking, "Specialize default implementation for UseGQAPacking.");
     return make_layout(make_shape(m, k, h_k * h_h_k_ratio, b),
                        make_stride(m_stride, cute::_1{}, h_stride, b_stride));    
   }
@@ -214,13 +216,10 @@ public:
 
 using FixedSeqLenTraits = SeqLenTraits<false, false, true>;
 using VarSeqLenTraits = SeqLenTraits<true, false, true>;
-using DecodingGQASeqLenTraits = SeqLenTraits<false, true, false>;
+using FixedGQASeqLenTraits = SeqLenTraits<false, true, false>;
 
 using FixedSeqLenTraitsStatic = SeqLenTraits<false, false, false>;
 using FixedSeqLenTraitsDynamic = SeqLenTraits<false, false, true>;
-
-// using DecodingGQASeqLenTraitsStatic = SeqLenTraits<false, true, false>;
-// using DecodingGQASeqLenTraitsDynamic = SeqLenTraits<false, true, true>;
 
 template <>
 CUTLASS_DEVICE void VarSeqLenTraits::init(int bidb) {
@@ -229,7 +228,7 @@ CUTLASS_DEVICE void VarSeqLenTraits::init(int bidb) {
 }
 
 template <>
-CUTLASS_DEVICE void DecodingGQASeqLenTraits::init(int bidb) {
+CUTLASS_DEVICE void FixedGQASeqLenTraits::init(int bidb) {
   // no op
 }
 
@@ -325,7 +324,7 @@ CUTLASS_DEVICE auto VarSeqLenTraits::get_lse_local_tile_tensor(
 
 // Returns layout of QO tensor in (M,H/HK,K,HK,B) format in global memory.
 template <>
-CUTLASS_HOST_DEVICE auto DecodingGQASeqLenTraits::get_gmem_layout(
+CUTLASS_HOST_DEVICE auto FixedGQASeqLenTraits::get_gmem_layout(
     int m, int k, int h_k, int b, int h_h_k_ratio,
     int64_t m_stride, int64_t h_stride, int64_t b_stride, bool padded) const {
   return make_layout(make_shape(m, h_h_k_ratio, k, h_k, b),
@@ -335,7 +334,7 @@ CUTLASS_HOST_DEVICE auto DecodingGQASeqLenTraits::get_gmem_layout(
 
 // Returns layout of Oaccum tensor in (M,H/HK,K,HK,B,T) format in global memory.
 template <>
-CUTLASS_HOST_DEVICE auto DecodingGQASeqLenTraits::get_oaccum_gmem_layout(
+CUTLASS_HOST_DEVICE auto FixedGQASeqLenTraits::get_oaccum_gmem_layout(
     int m, int k, int h_k, int b, int h_h_k_ratio, int num_splits,
     int64_t m_stride, int64_t h_stride, int64_t b_stride, int64_t split_stride,
     bool padded) const {
@@ -347,7 +346,7 @@ CUTLASS_HOST_DEVICE auto DecodingGQASeqLenTraits::get_oaccum_gmem_layout(
 
 template <>
 template <typename MTensor, typename Shape>
-CUTLASS_DEVICE auto DecodingGQASeqLenTraits::get_local_tile_tensor(
+CUTLASS_DEVICE auto FixedGQASeqLenTraits::get_local_tile_tensor(
     const MTensor &m_tensor, const Shape &tile_shape, 
     int bidh_kv, int bidb, bool padded) const {
   // m_tensor has shape (M, H/H_K, K, H_K, B)
@@ -360,7 +359,7 @@ CUTLASS_DEVICE auto DecodingGQASeqLenTraits::get_local_tile_tensor(
 
 template <>
 template <bool Is_split, typename MTensor, typename Shape>
-CUTLASS_DEVICE auto DecodingGQASeqLenTraits::get_o_local_tile_tensor(
+CUTLASS_DEVICE auto FixedGQASeqLenTraits::get_o_local_tile_tensor(
     const MTensor &m_tensor, const Shape &tile_shape,
     int bidh_kv, int bidb, int split_idx, bool padded) const {
   // m_tensor has shape (M, H/H_K, K, H_K, B) or (M, H/H_K, K, H_K, B, splits)

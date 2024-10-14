@@ -215,7 +215,7 @@ struct CollectiveEpilogueFwd {
         Tensor taccOcO_row = taccOcO(make_coord(_0{}, _, _0{}), _, _0{});
         CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));  // 2 * MMA_M        
         
-        if constexpr(!Seqlen_traits::DecodingGQA) {
+        if constexpr(!Seqlen_traits::UseGQAPacking) {
             Tensor gLSE = seqlen_traits_q.get_lse_local_tile_tensor<Is_split>(
                 mLSE, Shape<Int<kBlockM>>{}, bidh, bidb, n_split_idx)(_, m_block);
             if (get<1>(taccOcO_row(_0{})) == 0) {
@@ -259,14 +259,14 @@ struct CollectiveEpilogueFwd {
             }
         }        
         if constexpr (No_smem_O) { 
-            flash::write_rmem_to_gmem<Seqlen_traits::DecodingGQA, epi_column_permute>(
+            flash::write_rmem_to_gmem<Seqlen_traits::UseGQAPacking, epi_column_permute>(
                 tOrO_out, epilogue_params.ptr_O, epilogue_params.layout_O, TileShapeOCopy{}, 
                 m_block, h_block, bidh, bidh_kv, bidb, n_split_idx,
                 tiled_mma, seqlen_traits_q, thread_idx);
         } else {
             TiledCopyO gmem_tiled_copy_O;
             Tensor sO_out = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutOCopy{});        
-            if constexpr(!Seqlen_traits::DecodingGQA) {
+            if constexpr(!Seqlen_traits::UseGQAPacking) {
                 flash::write_O<!Seqlen_traits::UseVarSeqLen, No_smem_O, Is_split, NumCopyThreads>(
                     epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O, 
                     epilogue_params.layout_O, TileShapeOCopy{}, sO_out, 
@@ -305,7 +305,7 @@ struct CollectiveEpilogueFwd {
           cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord,
           const Seqlen_traits& seqlen_traits_q
           ) {
-        static_assert(!Seqlen_traits::DecodingGQA, "Don't call store_zero for gqa decoding.");
+        static_assert(!Seqlen_traits::UseGQAPacking, "Don't call store_zero for gqa packed layouts.");
         auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
         if constexpr(!Is_split) {
@@ -344,7 +344,7 @@ struct CollectiveEpilogueFwd {
     // Write 0 to output and -inf to LSE
     template<typename SharedStorage>
     CUTLASS_DEVICE void
-    store_zero_decoding_gqa(
+    store_zero_gqa(
           Params const& epilogue_params,
           SharedStorage& shared_storage,
           int thread_idx,
@@ -352,7 +352,7 @@ struct CollectiveEpilogueFwd {
           const Seqlen_traits& seqlen_traits_q,
           const cutlass::FastDivmod& qhead_per_khead_divmod
           ) {
-        static_assert(Seqlen_traits::DecodingGQA, "Special store_zero method for GQA decoding layouts.");
+        static_assert(Seqlen_traits::UseGQAPacking, "Special store_zero method for GQA packed layouts.");
         auto [m_block, n_split_idx, bidh, bidb] = block_coord;
         const int bidh_kv = qhead_per_khead_divmod.divide(bidh);
         const int h_block = bidh % int(qhead_per_khead_divmod);        

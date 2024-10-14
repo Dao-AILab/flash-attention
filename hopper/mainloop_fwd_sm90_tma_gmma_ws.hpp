@@ -245,10 +245,10 @@ struct CollectiveMainloopFwd {
         // static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
         static constexpr int kBlockM_div_H = get<0>(TileShape_MNK{})/Ktraits::kBlockH;
-        // int const seqlen_q = seqlen_traits_q.actual_seq_len;
-        // int const seqlen_k = seqlen_traits_k.actual_seq_len;
-        int const seqlen_q = Seqlen_traits_Q::Is_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        int const seqlen_k = Seqlen_traits::Is_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
+        int const seqlen_q = seqlen_traits_q.actual_seq_len;
+        int const seqlen_k = seqlen_traits_k.actual_seq_len;
+        // int const seqlen_q = Seqlen_traits_Q::Is_batch_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        // int const seqlen_k = Seqlen_traits::Is_batch_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         n_block_max = cute::ceil_div(seqlen_k, kBlockN);
         
         if constexpr(Is_split) {
@@ -284,10 +284,10 @@ struct CollectiveMainloopFwd {
         // static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
         static constexpr int kBlockM_div_H = get<0>(TileShape_MNK{})/Ktraits::kBlockH;
-        // int const seqlen_q = seqlen_traits_q.actual_seq_len;
-        // int const seqlen_k = seqlen_traits_k.actual_seq_len;
-        int const seqlen_q = Seqlen_traits_Q::Is_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        int const seqlen_k = Seqlen_traits::Is_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
+        int const seqlen_q = seqlen_traits_q.actual_seq_len;
+        int const seqlen_k = seqlen_traits_k.actual_seq_len;
+        // int const seqlen_q = Seqlen_traits_Q::Is_batch_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        // int const seqlen_k = Seqlen_traits::Is_batch_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         n_block_max = cute::ceil_div(seqlen_k, kBlockN);
         if constexpr (Is_causal) {
             n_block_max = std::min(n_block_max,
@@ -333,7 +333,7 @@ struct CollectiveMainloopFwd {
         Tensor gQ = [&] {
             // Need this inside lambda to capture structured binding
             auto [m_block, n_split_idx, bidh, bidb] = block_coord;
-            if constexpr(Seqlen_traits_Q::DecodingGQA) {
+            if constexpr(Seqlen_traits_Q::UseGQAPacking) {
                 return seqlen_traits_q.get_local_tile_tensor(
                     mQ, TileShapeQCopy{}, bidh_kv, bidb)
                         (_, _, _, m_block, bidh % int(mainloop_params.qhead_per_khead_divmod));  // (M/H, H, K)
@@ -471,7 +471,7 @@ struct CollectiveMainloopFwd {
         Tensor gQ = [&] {
             // Need this inside lambda to capture structured binding
             auto [m_block, n_split_idx, bidh, bidb] = block_coord;
-            if constexpr(Seqlen_traits_Q::DecodingGQA) {
+            if constexpr(Seqlen_traits_Q::UseGQAPacking) {
                 return seqlen_traits_q.get_local_tile_tensor(
                     mQ, TileShapeQCopy{}, bidh_kv, bidb)
                         (_, _, _, m_block, bidh % int(mainloop_params.qhead_per_khead_divmod));  // (M/H, H, K)
@@ -696,8 +696,10 @@ struct CollectiveMainloopFwd {
         };
 
         tiled_mma1.accumulate_ = GMMA::ScaleOut::Zero;
-        int const seqlen_q = Seqlen_traits_Q::Is_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        int const seqlen_k = Seqlen_traits::Is_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
+        // int const seqlen_q = Seqlen_traits_Q::Is_batch_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        // int const seqlen_k = Seqlen_traits::Is_batch_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
+        int const seqlen_q = seqlen_traits_q.actual_seq_len;
+        int const seqlen_k = seqlen_traits_k.actual_seq_len;
         int n_block = n_block_max - 1;
 
         cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.barrier_Q.try_wait(work_idx % 2));
@@ -866,6 +868,8 @@ struct CollectiveMainloopFwd {
         int work_idx,
         int m_block,
         SharedStorage& shared_storage,
+        // int seqlen_q,
+        // int seqlen_k
         const Seqlen_traits_Q& seqlen_traits_q,
         const Seqlen_traits& seqlen_traits_k
         ) {
@@ -897,8 +901,10 @@ struct CollectiveMainloopFwd {
         };
 
         tiled_mma1.accumulate_ = GMMA::ScaleOut::Zero;
-        int const seqlen_q = Seqlen_traits_Q::Is_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        int const seqlen_k = Seqlen_traits::Is_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
+        // int const seqlen_q = Seqlen_traits_Q::Is_batch_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
+        // int const seqlen_k = Seqlen_traits::Is_batch_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
+        int const seqlen_q = seqlen_traits_q.actual_seq_len;
+        int const seqlen_k = seqlen_traits_k.actual_seq_len;
         int n_block = n_block_max - 1;
         
         cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.barrier_Q.try_wait(work_idx % 2));

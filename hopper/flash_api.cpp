@@ -367,7 +367,7 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int batch_nheads, int 
 std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, const int batch_size,
     const int num_heads, const int num_heads_k, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
     const int head_size_rounded, const float p_dropout,
-    const int num_splits, cudaDeviceProp *dprops, bool use_gqa_decoding, bool is_causal, struct c10::TensorOptions opts) {
+    const int num_splits, cudaDeviceProp *dprops, bool use_gqa_packing, bool is_causal, struct c10::TensorOptions opts) {
     auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
 
     params.num_splits = num_splits;
@@ -388,8 +388,8 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
                 block_n = use_one_mma_wg ? 96 : 80;
             }
             const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
-            const int batch_nheads = use_gqa_decoding ? batch_size * num_heads_k : batch_size * num_heads;
-            const int batch_nheads_mblocks = use_gqa_decoding
+            const int batch_nheads = use_gqa_packing ? batch_size * num_heads_k : batch_size * num_heads;
+            const int batch_nheads_mblocks = use_gqa_packing
                 ? ceildiv(max_seqlen_q, block_m / block_h) * batch_nheads
                 : ceildiv(max_seqlen_q, block_m) * batch_nheads;
             params.num_splits = num_splits_heuristic(batch_nheads_mblocks, batch_nheads,
@@ -420,7 +420,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     else if (params.is_e4m3) { dtype = 3; }
     PREC_SWITCH(dtype, Element, [&] {
       HEADDIM_SWITCH(params.d, kHeadSize, [&] {
-        if(!params.use_gqa_decoding) {
+        if(!params.use_gqa_packing) {
           run_mha_fwd_<Element, kHeadSize>(params, stream);
         } else {
           QUERYHEAD_SWITCH(params.h_h_k_ratio, kBlockH, [&] {
@@ -430,9 +430,21 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
       });
     });
 
+    // if (params.is_e4m3) {
+    //     HEADDIM_SWITCH(params.d, kHeadSize, [&] {
+    //         run_mha_fwd_<cutlass::float_e4m3_t, kHeadSize>(params, stream);
+    //     });
+    // }
+
+    // if (params.is_bf16) {
+    //     HEADDIM_SWITCH(params.d, kHeadSize, [&] {
+    //         run_mha_fwd_<cutlass::bfloat16_t, kHeadSize>(params, stream);
+    //     });
+    // }
+
 #if 0
     if (!params.is_e4m3) {        
-        if(!params.use_gqa_decoding) {
+        if(!params.use_gqa_packing) {
             if (params.is_bf16) {
                 if (params.d == 64) {
                     run_mha_fwd_<cutlass::bfloat16_t, 64>(params, stream);
@@ -471,7 +483,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
             }
         }
     } else {
-        if(!params.use_gqa_decoding) {
+        if(!params.use_gqa_packing) {
             if (params.d == 64) {
                 run_mha_fwd_<cutlass::float_e4m3_t, 64>(params, stream);
             } else if (params.d == 128) {
@@ -504,7 +516,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         bool is_causal,
         int window_size_left,
         int window_size_right,
-        bool use_gqa_decoding = false
+        bool use_gqa_packing = false
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -535,7 +547,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
     // Guard against mistaken setting of gqa flag
-    if (num_heads == num_heads_k) { use_gqa_decoding = false; }
+    if (num_heads == num_heads_k) { use_gqa_packing = false; }
 
     TORCH_CHECK(head_size_og == 64 || head_size_og == 128 || head_size_og == 256, "Only support head size 64, 128, and 256 for now");
 
@@ -640,7 +652,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         params.descale_v_ptr = nullptr;
     }
     
-    params.use_gqa_decoding = use_gqa_decoding;
+    params.use_gqa_packing = use_gqa_packing;
 
     if (seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -1273,7 +1285,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
                 int num_splits,
                 int max_seqlen_k_hint,
-                bool use_gqa_decoding
+                bool use_gqa_packing
                 ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1322,7 +1334,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
     // Guard against mistaken setting of gqa flag
-    if (num_heads == num_heads_k) { use_gqa_decoding = false; }
+    if (num_heads == num_heads_k) { use_gqa_packing = false; }
 
     // causal=true is the same as causal=false in this case
     if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }
@@ -1333,7 +1345,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     const int seqlenq_ngroups_swapped =
         seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 &&
         window_size_right < 0 && head_size_og % 8 == 0 &&
-        !alibi_slopes_.has_value() && !use_gqa_decoding;
+        !alibi_slopes_.has_value() && !use_gqa_packing;
     if (seqlenq_ngroups_swapped) {
         const int ngroups = num_heads / num_heads_k;
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
@@ -1448,7 +1460,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     
     params.is_kv_cache = true;
 
-    params.use_gqa_decoding = use_gqa_decoding;
+    params.use_gqa_packing = use_gqa_packing;
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {
@@ -1542,7 +1554,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     at::Tensor softmax_lse_accum, out_accum;
     std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
        params, batch_size, num_heads, num_heads_k, head_size, max_seqlen_k_hint, seqlen_q,
-       head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, use_gqa_decoding, is_causal, opts);
+       head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, use_gqa_packing, is_causal, opts);
     
     auto tile_count_semaphore = is_causal || params.is_local || params.num_splits != 1
         ? torch::zeros({1}, opts.dtype(torch::kInt32))
