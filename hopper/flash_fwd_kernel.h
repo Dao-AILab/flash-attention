@@ -317,8 +317,6 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
         int work_idx = 0;
 
-        // const bool seqlen_k_init = bool(seqlen_traits_k.cu_seq_len);
-
         TileScheduler scheduler(&shared_storage.tile_count_semaphore);
         for (auto work_tile_info = scheduler.get_initial_work();
                 work_tile_info.is_valid(scheduler_params);
@@ -328,7 +326,6 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
             seqlen_traits_q.init(bidb);
             seqlen_traits_k.init(bidb);
-            // if (seqlen_k_init) { seqlen_traits_k.init(bidb); }
             if constexpr(seqlen_traits_q.UseVarSeqLen) {
                 // NOTE: to support in future with gqa packed layout, changed kBlockM to kBlockM/kBlockH
                 if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
@@ -371,7 +368,6 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
         scheduler.init_consumer();
 
         int work_idx = 0;
-        const bool seqlen_k_init = bool(seqlen_traits_k.cu_seq_len);
 
         CUTLASS_PRAGMA_NO_UNROLL
         for (auto work_tile_info = scheduler.get_initial_work();
@@ -386,7 +382,6 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
             seqlen_traits_q.init(bidb);
             seqlen_traits_k.init(bidb);
-            // if (seqlen_k_init) { seqlen_traits_k.init(bidb); }
             if constexpr(seqlen_traits_q.UseVarSeqLen) {
                 // NOTE: to support in future with gqa packed layout, changed kBlockM to kBlockM/kBlockH
                 if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
