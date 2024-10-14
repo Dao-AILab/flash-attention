@@ -259,7 +259,7 @@ struct CollectiveEpilogueFwd {
             }
         }        
         if constexpr (No_smem_O) { 
-            flash::write_rmem_to_gmem<Seqlen_traits::DecodingGQA>(
+            flash::write_rmem_to_gmem<Seqlen_traits::DecodingGQA, epi_column_permute>(
                 tOrO_out, epilogue_params.ptr_O, epilogue_params.layout_O, TileShapeOCopy{}, 
                 m_block, h_block, bidh, bidh_kv, bidb, n_split_idx,
                 tiled_mma, seqlen_traits_q, thread_idx);

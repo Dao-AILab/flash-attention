@@ -520,26 +520,15 @@ struct CollectiveMainloopFwd {
         if (warp_idx_in_warpgroup == 0 && lane_predicate) {
             shared_storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
             copy(mainloop_params.tma_load_Q.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.barrier_Q), 0 /*mcast_mask*/), tQgQ, tQsQ);
-            if constexpr(!Ktraits::VO_union_all) {
-                pipeline_v.producer_acquire(smem_pipe_write);
-                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
-                    tVgV(_, n_block), tVsV(_, smem_pipe_write.index()));
-            }
+            pipeline_v.producer_acquire(smem_pipe_write);
+            copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
+                tVgV(_, n_block), tVsV(_, smem_pipe_write.index()));
 
         }
         // With fp8 kernel, smem_o is in union with smem_v_out,
-        // except for split kernel + hdim 256,
         // so could use NamedBarrier instead of ClusterBarrier.
         // But, this doesn't appear to have any benefit.
         if constexpr (!No_smem_O) { shared_storage.barrier_O.wait((work_idx + 1) % 2); }
-
-        if constexpr(Ktraits::VO_union_all) {
-            if (warp_idx_in_warpgroup == 0 && lane_predicate) {
-                pipeline_v.producer_acquire(smem_pipe_write);
-                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
-                    tVgV(_, n_block), tVsV(_, smem_pipe_write.index()));
-            }
-        }
             
         #pragma unroll 2
         for (; n_block > n_block_min; --n_block) {

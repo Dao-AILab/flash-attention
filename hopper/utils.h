@@ -288,7 +288,7 @@ __forceinline__ __device__ void write_tma(
 
 // Epilogue that copies RMEM -> GMEM directly for GQA enabled.
 // Reports as uncoalesced stores by the profiler
-template <bool Use_gqa_layout, bool Is_split = true, typename TensorO, typename OutputType,
+template <bool Use_gqa_layout, bool Column_permute_fp8, bool Is_split = true, typename TensorO, typename OutputType,
           typename LayoutO, typename TileShapeO, typename TiledMma, typename SeqLenTraits>
 __forceinline__ __device__ void write_rmem_to_gmem(
         TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
@@ -317,7 +317,7 @@ __forceinline__ __device__ void write_rmem_to_gmem(
     Tensor tOrO_rowcol = make_tensor(tOrO.data(), flash::convert_layout_acc_rowcol(tOrO.layout()));
     const int m_bound = seqlen_traits_o.actual_seq_len - m_block * size<0>(gO);
     // hardcoded col_idx to circumvent reg spilling with counting tensor
-    const int col_start_idx = 2 * (thread_idx % 4);
+    const int col_start_idx = !Column_permute_fp8 ? 2 * (thread_idx % 4) : 4 * (thread_idx % 4);
 
     if constexpr (Use_gqa_layout) {
         static constexpr int kBlockH = size<1>(gO);
@@ -328,11 +328,22 @@ __forceinline__ __device__ void write_rmem_to_gmem(
             const int h_local = row % kBlockH;
             const int m_local = row / kBlockH;
             if(h_local < h_bound && m_local < m_bound) {
-                Tensor tOrO_row_float2 = recast<float2>(tOrO_rowcol(nrow, _));
-                #pragma unroll
-                for (int ncol = 0; ncol < size<1>(tOrO_rowcol)/2; ++ncol) {
-                    *reinterpret_cast<float2*>(&(gO(m_local, h_local, col_start_idx + 8 * ncol))) = 
-                        tOrO_row_float2(ncol);
+                if constexpr(!Column_permute_fp8) {
+                    Tensor tOrO_nrow_float2 = recast<float2>(tOrO_rowcol(nrow, _));
+                    #pragma unroll
+                    for (int ncol = 0; ncol < size<1>(tOrO_rowcol)/2; ++ncol) {
+                        *reinterpret_cast<float2*>(&(gO(m_local, h_local, col_start_idx + 8 * ncol))) = 
+                            tOrO_nrow_float2(ncol);
+                    }
+                } else {
+                    Tensor tOrO_nrow = tOrO_rowcol(nrow, _);
+                    #pragma unroll
+                    for (int ncol = 0; ncol < size<1>(tOrO_rowcol); ncol += 4) {
+                        gO(m_local, h_local, col_start_idx + 4 * ncol) = tOrO_nrow(ncol);
+                        gO(m_local, h_local, col_start_idx + 4 * ncol + 2) = tOrO_nrow(ncol + 1);
+                        gO(m_local, h_local, col_start_idx + 4 * ncol + 1) = tOrO_nrow(ncol + 2);
+                        gO(m_local, h_local, col_start_idx + 4 * ncol + 3) = tOrO_nrow(ncol + 3);
+                    }
                 }
             }
         }
@@ -341,15 +352,25 @@ __forceinline__ __device__ void write_rmem_to_gmem(
         for(int nrow = 0; nrow < size<0>(tOrO_rowcol); ++nrow) {
             const int row = int(get<0>(tOcO_row(nrow)));
             if(row < m_bound) {
-                Tensor tOrO_row_float2 = recast<float2>(tOrO_rowcol(nrow, _));
-                #pragma unroll
-                for (int ncol = 0; ncol < size<1>(tOrO_rowcol)/2; ++ncol) {
-                    *reinterpret_cast<float2*>(&(gO(row, col_start_idx + 8 * ncol))) = 
-                        tOrO_row_float2(ncol);
+                if constexpr(!Column_permute_fp8) {
+                    Tensor tOrO_nrow_float2 = recast<float2>(tOrO_rowcol(nrow, _));
+                    #pragma unroll
+                    for (int ncol = 0; ncol < size<1>(tOrO_rowcol)/2; ++ncol) {
+                        *reinterpret_cast<float2*>(&(gO(row, col_start_idx + 8 * ncol))) = 
+                            tOrO_nrow_float2(ncol);
+                    }
+                } else {
+                    Tensor tOrO_nrow = tOrO_rowcol(nrow, _);
+                    #pragma unroll
+                    for (int ncol = 0; ncol < size<1>(tOrO_rowcol); ncol += 4) {
+                        gO(row, col_start_idx + 4 * ncol) = tOrO_nrow(ncol);
+                        gO(row, col_start_idx + 4 * ncol + 2) = tOrO_nrow(ncol + 1);
+                        gO(row, col_start_idx + 4 * ncol + 1) = tOrO_nrow(ncol + 2);
+                        gO(row, col_start_idx + 4 * ncol + 3) = tOrO_nrow(ncol + 3);
+                    }
                 }
             }
         }
-
     }
 }
 
