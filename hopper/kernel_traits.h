@@ -253,7 +253,9 @@ struct Flash_fwd_kernel_traits_fp8 {
     using index_t = int64_t;
 
     static constexpr bool Is_split = Is_split_;
-    static constexpr bool No_smem_O = Is_split;
+    static constexpr bool No_smem_O = false;
+    // NOTE: not using smem for epilogue degrades perf substantially.
+    // static constexpr bool No_smem_O = Is_split;
 
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;
@@ -278,6 +280,9 @@ struct Flash_fwd_kernel_traits_fp8 {
 
     static constexpr int kStages = kStages_;
     static_assert(kStages > 1);
+
+    // Use this to save enough smem when writing out in float precision.
+    static constexpr bool VO_union_all = Is_split && (kBlockM != 64) && (kHeadDim == 256);
 
     using AtomLayoutMNK = Layout<Shape<Int<kBlockM / 64>, _1, _1>>;    
     using TiledMma0 = decltype(cute::make_tiled_mma(
@@ -361,7 +366,9 @@ struct Flash_fwd_kernel_traits_fp8 {
     using SmemCopyAtomQ = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
 
     using SharedStorage = std::conditional_t<!No_smem_O,
-        SharedStorageQKVOVt<kStages, Element, Element, OutputType, SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>,
+        std::conditional_t<!VO_union_all,
+            SharedStorageQKVOVt<kStages, Element, Element, OutputType, SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>,
+            SharedStorageQKVOVtaccum<kStages, Element, Element, OutputType, SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>>,
         SharedStorageQKVVt<kStages, Element, Element, SmemLayoutQ, SmemLayoutK, SmemLayoutV>>;
 
     using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;
