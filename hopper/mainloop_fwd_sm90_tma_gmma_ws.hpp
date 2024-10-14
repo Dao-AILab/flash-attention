@@ -247,8 +247,6 @@ struct CollectiveMainloopFwd {
         static constexpr int kBlockM_div_H = get<0>(TileShape_MNK{})/Ktraits::kBlockH;
         int const seqlen_q = seqlen_traits_q.actual_seq_len;
         int const seqlen_k = seqlen_traits_k.actual_seq_len;
-        // int const seqlen_q = Seqlen_traits_Q::Is_batch_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        // int const seqlen_k = Seqlen_traits::Is_batch_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         n_block_max = cute::ceil_div(seqlen_k, kBlockN);
         
         if constexpr(Is_split) {
@@ -696,8 +694,6 @@ struct CollectiveMainloopFwd {
         };
 
         tiled_mma1.accumulate_ = GMMA::ScaleOut::Zero;
-        // int const seqlen_q = Seqlen_traits_Q::Is_batch_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        // int const seqlen_k = Seqlen_traits::Is_batch_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         int const seqlen_q = seqlen_traits_q.actual_seq_len;
         int const seqlen_k = seqlen_traits_k.actual_seq_len;
         int n_block = n_block_max - 1;
@@ -868,8 +864,6 @@ struct CollectiveMainloopFwd {
         int work_idx,
         int m_block,
         SharedStorage& shared_storage,
-        // int seqlen_q,
-        // int seqlen_k
         const Seqlen_traits_Q& seqlen_traits_q,
         const Seqlen_traits& seqlen_traits_k
         ) {
@@ -901,8 +895,6 @@ struct CollectiveMainloopFwd {
         };
 
         tiled_mma1.accumulate_ = GMMA::ScaleOut::Zero;
-        // int const seqlen_q = Seqlen_traits_Q::Is_batch_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        // int const seqlen_k = Seqlen_traits::Is_batch_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         int const seqlen_q = seqlen_traits_q.actual_seq_len;
         int const seqlen_k = seqlen_traits_k.actual_seq_len;
         int n_block = n_block_max - 1;
