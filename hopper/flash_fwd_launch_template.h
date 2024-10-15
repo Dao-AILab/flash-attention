@@ -16,7 +16,6 @@
 #include "kernel_traits.h"
 #include "seq_len.h"
 #include "utils.h"
-
 #include "combine.h"
 
 template<typename Kernel_traits, bool Is_causal, bool Is_local, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
@@ -29,12 +28,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using ClusterShape = typename Kernel_traits::ClusterShape_MNK;
 
     constexpr static bool Is_split = Kernel_traits::Is_split;
+    static_assert(Seqlen_traits_Q::UseGQAPacking == (Kernel_traits::kBlockH > 1), "If kBlockH > 1, use gqa packed layouts");
+    static_assert(!(Is_split && Seqlen_traits::UseVarSeqLen), "Split KV not yet supported for variable seqlen.");
 
-    static_assert(Seqlen_traits_Q::UseGQAPacking == (Kernel_traits::kBlockH > 1));
-
-    static_assert(!(Is_split && Seqlen_traits::UseVarSeqLen), "Split KV not supported for varseqlen.");
-
-    // print(typename Kernel_traits::SmemLayoutVt{}); printf("\n"); print(typename Kernel_traits::SmemLayoutVt_tmp{});
     using CollectiveMainloop = flash::CollectiveMainloopFwd<Kernel_traits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<Kernel_traits, Seqlen_traits_Q>;
     using Scheduler = std::conditional_t<
@@ -54,15 +50,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     Seqlen_traits seqlen_traits_k(
         params.total_k, params.seqlen_k, params.cu_seqlens_k, params.seqused_k);
 
-    // print("Q layout: ");
-    // print(seqlen_traits_q.get_gmem_layout(
-    //             params.seqlen_q, params.d, params.h_k, params.b, params.h_h_k_ratio, 
-    //             params.q_row_stride, params.q_head_stride, params.q_batch_stride));
-    // print("\n");
-    // print("Q smem layout: ");
-    // using SmemLayoutQCopy = typename Kernel_traits::SmemLayoutQCopy;
-    // print(SmemLayoutQCopy{});
-    // print("\n");
     typename CollectiveMainloop::Params mainloop_params =
         CollectiveMainloop::to_underlying_arguments({
             static_cast<Element const*>(params.q_ptr),            
@@ -119,7 +106,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         }
     }();
 
-    // int num_blocks_m = cutlass::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
     int num_blocks_m = cutlass::ceil_div(params.seqlen_q, Kernel_traits::kBlockM/Kernel_traits::kBlockH);
     num_blocks_m = cutlass::ceil_div(num_blocks_m, size<0>(ClusterShape{})) * size<0>(ClusterShape{});    
     int num_grid_heads = params.h_k * ceil_div(params.h_h_k_ratio, Kernel_traits::kBlockH);
