@@ -89,19 +89,13 @@ public:
 
   CUTLASS_DEVICE void init(int bidb) {
     // TODO: add leftpad, seqlen_new for kv cache support
-    // NOTE: for FA2 kv cache API, "cu_seq_len" is a misnomer.
-    // Rather, cu_seq_len plays the role of seq_used.
-    // We can change this to seq_used for FA3 if desired.
-    if(cu_seq_len) {      
-      actual_seq_len = cu_seq_len[bidb];
+    if (seq_used) {
+      actual_seq_len = seq_used[bidb];
     }
-    // if (seq_used) {
-    //   actual_seq_len = seq_used[bidb];
-    // }
   }
 
   CUTLASS_DEVICE void init_no_guard(int bidb) {
-    actual_seq_len = cu_seq_len[bidb];
+    actual_seq_len = seq_used[bidb];
   }
 
   // Returns the layout of a tensor in MKHB format in global memory.

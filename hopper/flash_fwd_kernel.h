@@ -299,7 +299,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     float descale_v = *mainloop_params.descale_v_ptr;
     shared_storage.softmax_scale_qk_log2 = mainloop_params.softmax_scale_log2 * descale_q * descale_k;
     shared_storage.descale_v = descale_v;
-    shared_storage.seqlen_init_k = bool(seqlen_traits_k.cu_seq_len);
+    shared_storage.seqlen_init_k = seqlen_traits_k.UseVarSeqLen || bool(seqlen_traits_k.seq_used);
 
     // We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
     if constexpr (size(ClusterShape{}) > 1) {

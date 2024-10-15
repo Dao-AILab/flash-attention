@@ -284,8 +284,6 @@ struct CollectiveMainloopFwd {
         static constexpr int kBlockM_div_H = get<0>(TileShape_MNK{})/Ktraits::kBlockH;
         int const seqlen_q = seqlen_traits_q.actual_seq_len;
         int const seqlen_k = seqlen_traits_k.actual_seq_len;
-        // int const seqlen_q = Seqlen_traits_Q::Is_batch_dynamic ? seqlen_traits_q.actual_seq_len : shape<0>(mainloop_params.layout_Q);
-        // int const seqlen_k = Seqlen_traits::Is_batch_dynamic ? seqlen_traits_k.actual_seq_len : shape<0>(mainloop_params.layout_K);
         n_block_max = cute::ceil_div(seqlen_k, kBlockN);
         if constexpr (Is_causal) {
             n_block_max = std::min(n_block_max,

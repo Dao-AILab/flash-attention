@@ -150,8 +150,6 @@ void set_params_fprop(Flash_fwd_params &params,
             "This flash attention build does not support local attention.");
     #endif
 
-    params.is_seqlens_k_cumulative = true;
-
     #ifdef FLASHATTENTION_DISABLE_UNEVEN_K
         TORCH_CHECK(d == d_rounded, "This flash attention build does not support headdim not being a multiple of 32.");
     #endif
@@ -1502,9 +1500,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         CHECK_DEVICE(seqlens_k);
         CHECK_CONTIGUOUS(seqlens_k);
         CHECK_SHAPE(seqlens_k, batch_size);
-        params.cu_seqlens_k = static_cast<int *>(seqlens_k.data_ptr());
+        params.seqused_k = static_cast<int *>(seqlens_k.data_ptr());
     }
-    params.is_seqlens_k_cumulative = !(seqlens_k_.has_value());
     if (leftpad_k_.has_value()) {
         TORCH_CHECK(!paged_KV, "We don't support Paged KV and leftpad_k running at the same time yet");
         auto leftpad_k = leftpad_k_.value();
