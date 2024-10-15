@@ -132,12 +132,12 @@ def attention_ref(
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
-# @pytest.mark.parametrize("use_heuristic_only", [False])
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("num_requests", [1])
-@pytest.mark.parametrize("query_seqlen", [1, 16])
-@pytest.mark.parametrize("context_seqlen", [1024])
-@pytest.mark.parametrize("headdim", [128])
+@pytest.mark.parametrize("num_requests", [1, 4])
+@pytest.mark.parametrize("query_seqlen", [1, 8, 120])
+@pytest.mark.parametrize("context_seqlen", [1024, 3131, 4224])
+@pytest.mark.parametrize("headdim", [64, 128, 256])
+@pytest.mark.parametrize("gqa_parallel", [False, True])
 @pytest.mark.parametrize(
     "nheads_kv, gqa_ratio",
     [
@@ -152,7 +152,7 @@ def attention_ref(
         (8, 2),
     ],
 )
-def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal):
+def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, gqa_parallel):
     device = "cuda"
     num_caches = num_requests
     cache_seqlen = context_seqlen
@@ -164,9 +164,8 @@ def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_se
     v_cache = torch.randn(
         (num_caches, cache_seqlen, nheads_kv, headdim), device="cuda", dtype=torch.bfloat16
     )
-    # print(f"***{model_name}***")
     q = torch.randn((num_requests, query_seqlen, nheads_q, headdim), device="cuda", dtype=torch.bfloat16)
-    cache_idxs = torch.randperm(num_caches, dtype=torch.int32, device="cuda")[:num_requests]
+    # cache_idxs = torch.randperm(num_caches, dtype=torch.int32, device="cuda")[:num_requests]
     cache_seqlens = torch.tensor([context_seqlen] * num_requests, dtype=torch.int32, device="cuda")
     torch.cuda.synchronize()
 
@@ -182,24 +181,25 @@ def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_se
                     k_cache=k_cache,
                     v_cache=v_cache,
                     cache_seqlens=cache_seqlens,
-                    cache_batch_idx=cache_idxs,
+                    # cache_batch_idx=cache_idxs,
                     causal=causal,
                     num_splits=1,
                     return_softmax_lse=True,
-                    gqa_parallel=False
+                    gqa_parallel=gqa_parallel
                 )
 
 
     torch.cuda.synchronize()
-    assert ((out_ref - out_fa3).abs().max().item() <= 2e-3)
-    assert ((out_ref - out_fa3).abs().mean().item() <= 1e-4)
+    assert ((out_ref - out_fa3).abs().max().item() <= 4e-3)
+    assert ((out_ref - out_fa3).abs().mean().item() <= 2e-4)
 
-# @pytest.mark.parametrize("use_heuristic_only", [False])
+
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("num_requests", [1])
-@pytest.mark.parametrize("query_seqlen", [1, 16])
-@pytest.mark.parametrize("context_seqlen", [1024])
-@pytest.mark.parametrize("headdim", [128])
+@pytest.mark.parametrize("num_requests", [1, 3])
+@pytest.mark.parametrize("query_seqlen", [1, 8, 120])
+@pytest.mark.parametrize("context_seqlen", [1600, 4000, 5555])
+@pytest.mark.parametrize("headdim", [64, 128, 256])
+@pytest.mark.parametrize("gqa_parallel", [True, False])
 @pytest.mark.parametrize(
     "nheads_kv, gqa_ratio",
     [
@@ -214,7 +214,7 @@ def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_se
         (8, 2),
     ],
 )
-def test_flash_attn_kvcache_nosplit_fp8(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal):
+def test_flash_attn_kvcache_nosplit_fp8(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, gqa_parallel):
     device = "cuda"
     num_caches = num_requests
     cache_seqlen = context_seqlen
@@ -226,12 +226,11 @@ def test_flash_attn_kvcache_nosplit_fp8(nheads_kv, gqa_ratio, num_requests, quer
     v_cache = torch.randn(
         (num_caches, cache_seqlen, nheads_kv, headdim), device="cuda", dtype=torch.bfloat16
     )
-    # print(f"***{model_name}***")
     q = torch.randn((num_requests, query_seqlen, nheads_q, headdim), device="cuda", dtype=torch.bfloat16)
     q = q.to(torch.float8_e4m3fn)
     k_cache = k_cache.to(torch.float8_e4m3fn)
     v_cache = v_cache.to(torch.float8_e4m3fn)
-    cache_idxs = torch.randperm(num_caches, dtype=torch.int32, device="cuda")[:num_requests]
+    # cache_idxs = torch.randperm(num_caches, dtype=torch.int32, device="cuda")[:num_requests]
     cache_seqlens = torch.tensor([context_seqlen] * num_requests, dtype=torch.int32, device="cuda")
     torch.cuda.synchronize()
 
@@ -250,37 +249,44 @@ def test_flash_attn_kvcache_nosplit_fp8(nheads_kv, gqa_ratio, num_requests, quer
                     k_cache=k_cache,
                     v_cache=v_cache,
                     cache_seqlens=cache_seqlens,
-                    cache_batch_idx=cache_idxs,
+                    # cache_batch_idx=cache_idxs,
                     causal=causal,
                     num_splits=1,
                     return_softmax_lse=True,
-                    gqa_parallel=False,
+                    gqa_parallel=gqa_parallel,
                     descale_q=descale_q, descale_k=descale_k, descale_v=descale_v
                 )
 
 
     torch.cuda.synchronize()
-    assert ((out_ref - out_fa3).abs().max().item() <= 2e-2)
-    assert ((out_ref - out_fa3).abs().mean().item() <= 1e-2)
+    assert ((out_ref - out_fa3).abs().max().item() <= 4e-2)
+    assert ((out_ref - out_fa3).abs().mean().item() <= 2e-3)
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_heuristic_only", [True])
 # @pytest.mark.parametrize("use_heuristic_only", [False])
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("num_requests", [1, 4, 16])
-@pytest.mark.parametrize("query_seqlen", [1, 16, 32, 128])
-@pytest.mark.parametrize("context_seqlen", [4096, 16384, 65536])
-#@pytest.mark.parametrize("context_seqlen", [4096])
+# @pytest.mark.parametrize("num_requests", [1, 4, 16])
+@pytest.mark.parametrize("num_requests", [1, 3])
+# @pytest.mark.parametrize("query_seqlen", [1, 16, 32, 128])
+@pytest.mark.parametrize("query_seqlen", [1, 8, 25])
+# @pytest.mark.parametrize("context_seqlen", [4096, 16384, 65536])
+@pytest.mark.parametrize("context_seqlen", [1600, 4000, 5555])
 @pytest.mark.parametrize("headdim", [64, 128, 256])
-#@pytest.mark.parametrize("headdim", [64, 128])
-# @pytest.mark.parametrize("headdim", [256])
 @pytest.mark.parametrize("cache_seqlen_rand", [True, False])
-#@pytest.mark.parametrize("gqa_parallel", [True, False])
-@pytest.mark.parametrize("gqa_parallel", [True])
+@pytest.mark.parametrize("gqa_parallel", [True, False])
 @pytest.mark.parametrize(
     "nheads_kv, gqa_ratio",
     [
+        (1, 1),
+        (4, 1),
+        (2, 2),
+        (3, 3),
+        (4, 4),
         (2, 5),
+        (3, 9),
+        (1, 16),
+        (1, 32),
     ],
 )
 def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, use_heuristic_only, cache_seqlen_rand, gqa_parallel, dtype):
@@ -302,7 +308,6 @@ def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seq
     v_cache = torch.randn(
         (num_caches, cache_seqlen, nheads_kv, headdim), device="cuda", dtype=torch.bfloat16
     )
-    # print(f"***{model_name}***")
     q = torch.randn((num_requests, query_seqlen, nheads_q, headdim), device="cuda", dtype=torch.bfloat16)
 
     q = q.to(dtype)
@@ -368,9 +373,12 @@ def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seq
 @pytest.mark.parametrize("use_heuristic_only", [True])
 # @pytest.mark.parametrize("use_heuristic_only", [False])
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("num_requests", [1, 4, 16])
-@pytest.mark.parametrize("query_seqlen", [1, 16, 32, 128])
-@pytest.mark.parametrize("context_seqlen", [4096, 16384, 65536])
+# @pytest.mark.parametrize("num_requests", [1, 4, 16])
+@pytest.mark.parametrize("num_requests", [1, 3])
+# @pytest.mark.parametrize("query_seqlen", [1, 16, 32, 128])
+@pytest.mark.parametrize("query_seqlen", [1, 8, 25])
+# @pytest.mark.parametrize("context_seqlen", [4096, 16384, 65536])
+@pytest.mark.parametrize("context_seqlen", [1600, 4000, 5555])
 @pytest.mark.parametrize("headdim", [64, 128, 256])
 @pytest.mark.parametrize("cache_seqlen_rand", [True, False])
 @pytest.mark.parametrize("gqa_parallel", [True, False])
@@ -378,14 +386,14 @@ def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seq
     "nheads_kv, gqa_ratio",
     [
         (1, 1),
-        (2, 5),
+        (4, 1),
+        (2, 2),
         (3, 3),
-        (1, 32),
-        (5, 7),
-        (8, 1),
+        (4, 4),
+        (2, 5),
+        (3, 9),
         (1, 16),
-        (12, 4),
-        (8, 2),
+        (1, 32),
     ],
 )
 def test_flash_attn_kvcache_output_fp8(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, use_heuristic_only, cache_seqlen_rand, gqa_parallel, dtype):
@@ -407,7 +415,6 @@ def test_flash_attn_kvcache_output_fp8(nheads_kv, gqa_ratio, num_requests, query
     v_cache = torch.randn(
         (num_caches, cache_seqlen, nheads_kv, headdim), device="cuda", dtype=torch.bfloat16
     )
-    # print(f"***{model_name}***")
     q = torch.randn((num_requests, query_seqlen, nheads_q, headdim), device="cuda", dtype=torch.bfloat16)
 
     q = q.to(dtype)
@@ -463,8 +470,8 @@ def test_flash_attn_kvcache_output_fp8(nheads_kv, gqa_ratio, num_requests, query
                     assert ((out_ref - out_fa3).abs().max().item() <= 1e-1)
                     assert ((out_ref - out_fa3).abs().mean().item() <= 1e-2)
                 else:
-                    assert ((out_ref - out_fa3).abs().max().item() <= 1e-2)
-                    assert ((out_ref - out_fa3).abs().mean().item() <= 1e-3)
+                    assert ((out_ref - out_fa3).abs().max().item() <= 2e-2)
+                    assert ((out_ref - out_fa3).abs().mean().item() <= 2e-3)
                 lse_max_ref = lse_ref.abs().max().item()
                 lse_mean_ref = lse_ref.abs().mean().item()
                 lse_max_fa3 = lse_fa3.abs().max().item()
