@@ -229,7 +229,8 @@ dim = 2048
 # dim = 256
 dropout_p = 0.0
 
-methods = (["Pytorch", "Flash3", "cuDNN"]        
+methods = (["Pytorch", "Flash3"]
+        + (["cuDNN"] if cudnn is not None else [])
         # + (["Triton"] if attention_triton is not None else [])
         #    + (["xformers.c"] if xops is not None else [])
         #    + (["xformers.f"] if xops is not None else [])
@@ -247,10 +248,10 @@ for causal in causal_vals:
             torch.cuda.empty_cache()
             config = (causal, headdim, batch_size, seqlen)
             nheads = dim // headdim
-            q, k, v = [torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.float16, requires_grad=False) for _ in range(3)]
+            q, k, v = [torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16, requires_grad=False) for _ in range(3)]
             
             qkv = torch.stack([q, k, v], dim=2)
-            qkv = qkv.to(torch.float16)
+            qkv = qkv.to(torch.bfloat16)
             f = time_fwd(attention_pytorch, qkv, dropout_p, causal=causal, repeats=repeats, verbose=False)
             time_f[config, "Pytorch"] = f
             res_baseline = attention_pytorch(qkv, dropout_p, causal=causal)
@@ -289,7 +290,8 @@ for causal in causal_vals:
                 k, 
                 v, 
                 softmax_scale, 
-                causal=causal, 
+                causal=causal,
+                window_size=(-1,-1),
                 descale_q=descale_q, 
                 descale_k=descale_k, 
                 descale_v=descale_v, 
