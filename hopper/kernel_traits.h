@@ -90,6 +90,7 @@ struct SharedStorageQKVOVt {
     int tile_count_semaphore;
     float softmax_scale_qk_log2;
     float descale_v;
+    bool seqlen_init_k;
   };
 };
 
@@ -117,6 +118,7 @@ struct SharedStorageQKVOVtaccum {
     int tile_count_semaphore;
     float softmax_scale_qk_log2;
     float descale_v;
+    bool seqlen_init_k;
   };
 };
 
@@ -137,6 +139,7 @@ struct SharedStorageQKVVt {
     int tile_count_semaphore;
     float softmax_scale_qk_log2;
     float descale_v;
+    bool seqlen_init_k;
   };
 };
 

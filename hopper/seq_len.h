@@ -14,12 +14,10 @@ namespace flash {
 
 static constexpr int kMaxTileSize = 128;
 
-template <bool UseVarSeqLen_, bool UseGQAPacking_, bool Is_batch_dynamic_> class SeqLenTraits {
+template <bool UseVarSeqLen_, bool UseGQAPacking_> class SeqLenTraits {
 public:
   static_assert(!(UseVarSeqLen_ && UseGQAPacking_),
     "Variable sequence length with GQA parallelization not implemented yet.");
-  static_assert(!(UseVarSeqLen_ && !Is_batch_dynamic_),
-    "VarSeqLen class always has variable seqlen.");
 
   // Total number of queries / keys. Unpadded.
   int sum_s = 0;
@@ -33,7 +31,6 @@ public:
   // Whether this is for fixed-seq-len or var-seq-len.
   static constexpr bool UseVarSeqLen = UseVarSeqLen_;
   static constexpr bool UseGQAPacking = UseGQAPacking_;
-  static constexpr bool Is_batch_dynamic = Is_batch_dynamic_;
 
   using ShapeT = std::conditional_t<
       UseVarSeqLen, 
@@ -91,18 +88,20 @@ public:
       sum_s(sum_s), cu_seq_len(cu_seq_len), seq_used(seq_used), actual_seq_len(max_seq_len) {}
 
   CUTLASS_DEVICE void init(int bidb) {
-    if constexpr(Is_batch_dynamic) {
-    //   // TODO: add leftpad, seqlen_new for kv cache support
-    //   // NOTE: for FA2 kv cache API, "cu_seq_len" is a misnomer.
-    //   // Rather, cu_seq_len plays the role of seq_used.
-    //   // We can change this to seq_used for FA3 if desired.
-      if(cu_seq_len) {      
-        actual_seq_len = cu_seq_len[bidb];
-      }
-    //   // if (seq_used) {
-    //   //   actual_seq_len = seq_used[bidb];
-    //   // }
+    // TODO: add leftpad, seqlen_new for kv cache support
+    // NOTE: for FA2 kv cache API, "cu_seq_len" is a misnomer.
+    // Rather, cu_seq_len plays the role of seq_used.
+    // We can change this to seq_used for FA3 if desired.
+    if(cu_seq_len) {      
+      actual_seq_len = cu_seq_len[bidb];
     }
+    // if (seq_used) {
+    //   actual_seq_len = seq_used[bidb];
+    // }
+  }
+
+  CUTLASS_DEVICE void init_no_guard(int bidb) {
+    actual_seq_len = cu_seq_len[bidb];
   }
 
   // Returns the layout of a tensor in MKHB format in global memory.
@@ -214,12 +213,9 @@ public:
   
 };
 
-using FixedSeqLenTraits = SeqLenTraits<false, false, true>;
-using VarSeqLenTraits = SeqLenTraits<true, false, true>;
-using FixedGQASeqLenTraits = SeqLenTraits<false, true, false>;
-
-using FixedSeqLenTraitsStatic = SeqLenTraits<false, false, false>;
-using FixedSeqLenTraitsDynamic = SeqLenTraits<false, false, true>;
+using FixedSeqLenTraits = SeqLenTraits<false, false>;
+using VarSeqLenTraits = SeqLenTraits<true, false>;
+using FixedGQASeqLenTraits = SeqLenTraits<false, true>;
 
 template <>
 CUTLASS_DEVICE void VarSeqLenTraits::init(int bidb) {

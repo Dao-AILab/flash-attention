@@ -299,6 +299,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     float descale_v = *mainloop_params.descale_v_ptr;
     shared_storage.softmax_scale_qk_log2 = mainloop_params.softmax_scale_log2 * descale_q * descale_k;
     shared_storage.descale_v = descale_v;
+    shared_storage.seqlen_init_k = bool(seqlen_traits_k.cu_seq_len);
 
     // We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
     if constexpr (size(ClusterShape{}) > 1) {
@@ -324,8 +325,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
-            seqlen_traits_q.init(bidb);
-            seqlen_traits_k.init(bidb);
+            if constexpr (seqlen_traits_q.UseVarSeqLen) { seqlen_traits_q.init(bidb); }
+            if (shared_storage.seqlen_init_k) { seqlen_traits_k.init_no_guard(bidb); }
             if constexpr(seqlen_traits_q.UseVarSeqLen) {
                 // NOTE: to support in future with gqa packed layout, changed kBlockM to kBlockM/kBlockH
                 if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
@@ -380,8 +381,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
-            seqlen_traits_q.init(bidb);
-            seqlen_traits_k.init(bidb);
+            if constexpr (seqlen_traits_q.UseVarSeqLen) { seqlen_traits_q.init(bidb); }
+            if (shared_storage.seqlen_init_k) { seqlen_traits_k.init_no_guard(bidb); }
             if constexpr(seqlen_traits_q.UseVarSeqLen) {
                 // NOTE: to support in future with gqa packed layout, changed kBlockM to kBlockM/kBlockH
                 if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
