@@ -428,75 +428,32 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
       });
     });
 
-    // if (params.is_e4m3) {
-    //     HEADDIM_SWITCH(params.d, kHeadSize, [&] {
-    //         run_mha_fwd_<cutlass::float_e4m3_t, kHeadSize>(params, stream);
-    //     });
-    // }
-
-    // if (params.is_bf16) {
-    //     HEADDIM_SWITCH(params.d, kHeadSize, [&] {
-    //         run_mha_fwd_<cutlass::bfloat16_t, kHeadSize>(params, stream);
-    //     });
-    // }
-
 #if 0
-    if (!params.is_e4m3) {        
-        if(!params.use_gqa_packing) {
-            if (params.is_bf16) {
-                if (params.d == 64) {
-                    run_mha_fwd_<cutlass::bfloat16_t, 64>(params, stream);
-                } else if (params.d == 128) {
-                    run_mha_fwd_<cutlass::bfloat16_t, 128>(params, stream);
-                } else {
-                    run_mha_fwd_<cutlass::bfloat16_t, 256>(params, stream);
-                }
-            } else {
-                if (params.d == 64) {
-                    run_mha_fwd_<cutlass::half_t, 64>(params, stream);
-                } else if (params.d == 128) {
-                    run_mha_fwd_<cutlass::half_t, 128>(params, stream);
-                } else {
-                    run_mha_fwd_<cutlass::half_t, 256>(params, stream);
-                }
-            }
-        }
-        else {
-            if (params.is_bf16) {
-                if (params.d == 64) {
-                    run_mha_fwd_gqa_<cutlass::bfloat16_t, 64>(params, stream);
-                } else if (params.d == 128) {
-                    run_mha_fwd_gqa_<cutlass::bfloat16_t, 128>(params, stream);
-                } else {
-                    run_mha_fwd_gqa_<cutlass::bfloat16_t, 256>(params, stream);
-                }
-            } else {
-                if (params.d == 64) {
-                    run_mha_fwd_gqa_<cutlass::half_t, 64>(params, stream);
-                } else if (params.d == 128) {
-                    run_mha_fwd_gqa_<cutlass::half_t, 128>(params, stream);
-                } else {
-                    run_mha_fwd_gqa_<cutlass::half_t, 256>(params, stream);
-                }
-            }
-        }
-    } else {
-        if(!params.use_gqa_packing) {
+    if (!params.is_e4m3) { 
+        if (params.is_bf16) {
             if (params.d == 64) {
-                run_mha_fwd_<cutlass::float_e4m3_t, 64>(params, stream);
+                run_mha_fwd_<cutlass::bfloat16_t, 64>(params, stream);
             } else if (params.d == 128) {
-                run_mha_fwd_<cutlass::float_e4m3_t, 128>(params, stream);
-            } else if (params.d == 256) {
-                run_mha_fwd_<cutlass::float_e4m3_t, 256>(params, stream);
+                run_mha_fwd_<cutlass::bfloat16_t, 128>(params, stream);
+            } else {
+                run_mha_fwd_<cutlass::bfloat16_t, 256>(params, stream);
             }
         } else {
             if (params.d == 64) {
-                run_mha_fwd_gqa_<cutlass::float_e4m3_t, 64>(params, stream);
+                run_mha_fwd_<cutlass::half_t, 64>(params, stream);
             } else if (params.d == 128) {
-                run_mha_fwd_gqa_<cutlass::float_e4m3_t, 128>(params, stream);
-            } else if (params.d == 256) {
-                run_mha_fwd_gqa_<cutlass::float_e4m3_t, 256>(params, stream);
+                run_mha_fwd_<cutlass::half_t, 128>(params, stream);
+            } else {
+                run_mha_fwd_<cutlass::half_t, 256>(params, stream);
             }
+        }
+    } else {
+        if (params.d == 64) {
+            run_mha_fwd_<cutlass::float_e4m3_t, 64>(params, stream);
+        } else if (params.d == 128) {
+            run_mha_fwd_<cutlass::float_e4m3_t, 128>(params, stream);
+        } else if (params.d == 256) {
+            run_mha_fwd_<cutlass::float_e4m3_t, 256>(params, stream);
         }
     }
 #endif
