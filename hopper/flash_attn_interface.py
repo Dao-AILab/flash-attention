@@ -457,20 +457,20 @@ def flash_attn_with_kvcache(
     q,
     k_cache,
     v_cache,
-    k=None,
-    v=None,
-    rotary_cos=None,
-    rotary_sin=None,
+    # k=None,
+    # v=None,
+    # rotary_cos=None,
+    # rotary_sin=None,
     cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
     cache_batch_idx: Optional[torch.Tensor] = None,
-    cache_leftpad: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
+    # cache_leftpad: Optional[torch.Tensor] = None,
+    # block_table: Optional[torch.Tensor] = None,
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
-    rotary_interleaved=True,
-    alibi_slopes=None,
+    # softcap=0.0, # 0.0 means deactivated
+    # rotary_interleaved=True,
+    # alibi_slopes=None,
     num_splits=0,
     return_softmax_lse=False,
     gqa_parallel=None,
@@ -480,6 +480,9 @@ def flash_attn_with_kvcache(
     descale_v=None,
 ):
     """
+    NOTE: The KV cache API for FlashAttention-3 is a work in progress. We reproduce the description
+    from the FlashAttention-2 method of the same name below.
+
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
     k and v. This is useful for incremental decoding: you can pass in the cached keys/values from
     the previous step, and update them with the new keys/values from the current step, and do
@@ -566,6 +569,18 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+
+    # unimplemented kwargs
+    k=None
+    v=None
+    rotary_cos=None
+    rotary_sin=None
+    cache_leftpad=None
+    block_table=None
+    softcap=0.0
+    rotary_interleaved=True
+    alibi_slopes=None
+
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -577,7 +592,7 @@ def flash_attn_with_kvcache(
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
-    block_table = maybe_contiguous(block_table)
+    # block_table = maybe_contiguous(block_table)
     if gqa_parallel is None:
         gqa_parallel = True if q.shape[1] <= 64 else False
     # not in gqa/mqa setup
