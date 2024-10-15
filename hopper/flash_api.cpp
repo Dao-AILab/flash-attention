@@ -140,8 +140,8 @@ void set_params_fprop(Flash_fwd_params &params,
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
 
-    params.is_causal = window_size_left == seqlen_k && window_size_right == 0;
-    if ((window_size_left < seqlen_k || window_size_right < seqlen_k) && !params.is_causal) {
+    params.is_causal = window_size_left == int(seqlen_k) && window_size_right == 0;
+    if ((window_size_left < int(seqlen_k) || window_size_right < int(seqlen_k)) && !params.is_causal) {
         params.is_local = true;
     }
 
