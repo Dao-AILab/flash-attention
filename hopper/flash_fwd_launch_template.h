@@ -108,11 +108,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
     int num_blocks_m = cutlass::ceil_div(params.seqlen_q, Kernel_traits::kBlockM/Kernel_traits::kBlockH);
     num_blocks_m = cutlass::ceil_div(num_blocks_m, size<0>(ClusterShape{})) * size<0>(ClusterShape{});    
-    int num_grid_heads = params.h_k * ceil_div(params.h_h_k_ratio, Kernel_traits::kBlockH);
-
-    // std::cout << "num blocks m = " << num_blocks_m << " num grid heads" << num_grid_heads << std::endl;
+    int num_blocks_h = params.h_k * ceil_div(params.h_h_k_ratio, Kernel_traits::kBlockH);
     typename Scheduler::Arguments scheduler_args =
-        {num_blocks_m, Is_split ? params.num_splits : 1, num_grid_heads, params.b, params.tile_count_semaphore};
+        {num_blocks_m, Is_split ? params.num_splits : 1, num_blocks_h, params.b, params.tile_count_semaphore};
     typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);    
 
     // Get the ptr to kernel function.

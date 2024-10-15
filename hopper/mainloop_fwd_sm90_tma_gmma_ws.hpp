@@ -86,11 +86,11 @@ struct CollectiveMainloopFwd {
     using TileShape_MNK = typename Ktraits::TileShape_MNK;
     using ClusterShape = typename Ktraits::ClusterShape_MNK;
 
-    static constexpr int  kStages  = Ktraits::kStages;
-    static constexpr int  kHeadDim = Ktraits::kHeadDim;
-    // static constexpr int  kBlockM  = Ktraits::kBlockM;
-    // static constexpr int  kBlockN  = Ktraits::kBlockN;
-    // static constexpr int  kBlockH  = Ktraits::kBlockH;
+    static constexpr int kStages = Ktraits::kStages;
+    static constexpr int kHeadDim = Ktraits::kHeadDim;
+    // static constexpr int kBlockM = Ktraits::kBlockM;
+    // static constexpr int kBlockN = Ktraits::kBlockN;
+    // static constexpr int kBlockH = Ktraits::kBlockH;
     static constexpr bool Is_split = Ktraits::Is_split;
     static constexpr bool No_smem_O = Ktraits::No_smem_O;
 
@@ -250,7 +250,6 @@ struct CollectiveMainloopFwd {
         n_block_max = cute::ceil_div(seqlen_k, kBlockN);
         
         if constexpr(Is_split) {
-            // int const num_n_blocks = ceil_div(seqlen_k, kBlockN);
             int const n_blocks_per_split
                 = mainloop_params.num_splits_divmod.divide(n_block_max + int(mainloop_params.num_splits_divmod) - 1);
             n_block_min = n_split_idx * n_blocks_per_split;
@@ -360,7 +359,6 @@ struct CollectiveMainloopFwd {
             }
         }
 
-        // int n_block_max = get_n_block_max(mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
         int n_block = n_block_max - 1;
 
         int lane_predicate = cute::elect_one_sync();
@@ -498,7 +496,6 @@ struct CollectiveMainloopFwd {
             }
         }
 
-        // int n_block_max = get_n_block_max(mainloop_params, m_block, seqlen_traits_q, seqlen_traits_k);
         int n_block = n_block_max - 1;
 
         int lane_predicate = cute::elect_one_sync();
@@ -763,7 +760,6 @@ struct CollectiveMainloopFwd {
         Tensor scores_scale = make_fragment_like(softmax.row_max);
         clear(scores_scale);
 
-        // TODO: modify this for split kv to eliminate superfluous masking steps
         constexpr int n_masking_steps = !Is_causal ? 1 : cute::ceil_div(kBlockM_div_H, kBlockN) + 1;
         // Only go through these if Is_causal, since n_masking_steps = 1 when !Is_causal
         #pragma unroll

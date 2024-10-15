@@ -112,7 +112,6 @@ struct CollectiveEpilogueFwd {
                                  Stride<_4, _32, _1, _0>>;
     using ValueLayoutrO = Layout<Shape<_1, _2, Shape<_2, _2>, Int<kHeadDim/16>>,
                                 Stride<_0, _2, Stride<_4, _1>, _8>>;
-    // using AccessTyperO = std::conditional_t<cutlass::sizeof_bits_v<Element> == 16, uint16_t, uint32_t>;
     using TiledCopyrO = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<Element>, Element>{},
                       ThreadLayoutrO{}, ValueLayoutrO{}));
     using TiledCopyShaperO = Shape<_8, Int<kBlockM/8>, _16, Int<kHeadDim/16>>;
@@ -248,22 +247,20 @@ struct CollectiveEpilogueFwd {
                 }
             }
         }
-
-        int write_warp_idx = kNWarps - 1;
-        if constexpr(!No_smem_O) {
-            if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
-                cutlass::arch::NamedBarrier::sync(
-                    NumMmaThreads + cutlass::NumThreadsPerWarp, 
-                    cutlass::arch::ReservedNamedBarriers::EpilogueBarrier
-                );
-            }
-        }        
+       
         if constexpr (No_smem_O) { 
             flash::write_rmem_to_gmem<Seqlen_traits::UseGQAPacking, epi_column_permute>(
                 tOrO_out, epilogue_params.ptr_O, epilogue_params.layout_O, TileShapeOCopy{}, 
                 m_block, h_block, bidh, bidh_kv, bidb, n_split_idx,
                 tiled_mma, seqlen_traits_q, thread_idx);
         } else {
+            int write_warp_idx = kNWarps - 1;
+            if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
+                cutlass::arch::NamedBarrier::sync(
+                    NumMmaThreads + cutlass::NumThreadsPerWarp, 
+                    cutlass::arch::ReservedNamedBarriers::EpilogueBarrier
+                );
+            }
             TiledCopyO gmem_tiled_copy_O;
             Tensor sO_out = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutOCopy{});        
             if constexpr(!Seqlen_traits::UseGQAPacking) {

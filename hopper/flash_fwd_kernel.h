@@ -33,8 +33,6 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                     ) {
 
     using Element = typename Ktraits::Element;
-    using ElementAccum = typename Ktraits::ElementAccum;
-    using SoftType = ElementAccum;
     using TileShape_MNK = typename Ktraits::TileShape_MNK;
     using ClusterShape = typename Ktraits::ClusterShape_MNK;
 
@@ -47,7 +45,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     static constexpr int kBlockM = Ktraits::kBlockM;
     static constexpr int kBlockH = Ktraits::kBlockH;
     // static constexpr int kBlockN = Ktraits::kBlockN;
-    // constexpr int kHeadDim = Ktraits::kHeadDim;
+    // static constexpr int kHeadDim = Ktraits::kHeadDim;
 
     using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>;
     using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>;
@@ -222,15 +220,12 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
     using Element = typename Ktraits::Element;
     static_assert(cutlass::sizeof_bits_v<Element> == 8);
-    using ElementAccum = typename Ktraits::ElementAccum;
-    using SoftType = ElementAccum;
     using TileShape_MNK = typename Ktraits::TileShape_MNK;
     using ClusterShape = typename Ktraits::ClusterShape_MNK;
 
     static_assert(Ktraits::Is_WS);
     static constexpr bool Is_WS = Ktraits::Is_WS;
     static constexpr bool No_smem_O = Ktraits::No_smem_O;
-    // static constexpr bool UseVarSeqLen = Seqlen_traits::UseVarSeqLen;
 
     static constexpr int NumMmaThreads = size(typename Ktraits::TiledMma0{});
     static constexpr int NumCopyThreads = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
