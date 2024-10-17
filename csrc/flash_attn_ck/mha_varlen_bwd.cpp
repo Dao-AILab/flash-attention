@@ -23,7 +23,11 @@ fmha_bwd_traits get_ck_fmha_varlen_bwd_traits(const mask_info &mask,
                            false,    // has_dbias
                            has_dropout,
                            false, // s_randval
-                           deterministic};
+                           deterministic,
+                           false, // uses_ext_asm
+                           false, // is_v3_atomic_fp32
+                           false, // is_v3_spec
+                           2}; // how_v3_bf16_cvt 0:RTNE; 1:RTNA; 2:RTZ
 }
 
 fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
