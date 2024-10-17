@@ -105,6 +105,7 @@ struct Flash_fwd_params : public Qkv_params {
     int * __restrict__ block_table;
     index_t block_table_batch_stride;
     int page_block_size;
+    int page_num_blocks;
 
     // The dropout probability (probability of keeping an activation).
     float p_dropout;

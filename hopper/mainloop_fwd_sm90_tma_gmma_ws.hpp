@@ -16,6 +16,7 @@
 
 #include "named_barrier.hpp"
 #include "utils.h"
+#include "copy_paged_sm90_tma.hpp"
 
 namespace flash {
 
@@ -95,7 +96,13 @@ struct CollectiveMainloopFwd {
     static constexpr bool No_smem_O = Ktraits::No_smem_O;
 
     using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
-    using GmemTiledCopyKV = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<0>(ClusterShape{})));
+    using GmemTiledCopyKVNopage = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<0>(ClusterShape{})));
+
+    // use SM90_TMA_LOAD_MULTICAST_PAGED if we would use SM90_TMA_LOAD_MULTICAST in unpaged scenario, otherwise use SM90_TMA_LOAD_PAGED
+    using GmemTiledCopyKV = typename std::conditional<
+                                std::is_same<GmemTiledCopyKVNopage, cute::SM90_TMA_LOAD_MULTICAST>::value, 
+                                SM90_TMA_LOAD_MULTICAST_PAGED, 
+                                SM90_TMA_LOAD_PAGED>::type;
     
     using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
     using SmemLayoutQCopy = typename Ktraits::SmemLayoutQCopy;
@@ -115,25 +122,27 @@ struct CollectiveMainloopFwd {
         TileShapeQCopy{},
         _1{}));  // no mcast for Q
 
-    using TMA_K = decltype(make_tma_copy(
+    using TMA_K = decltype(make_virtualized_tma_copy(
         GmemTiledCopyKV{},
         make_tensor(
             make_gmem_ptr(static_cast<Element const*>(nullptr)), 
             repeat_like(typename Seqlen_traits::StrideT{}, int32_t(0)), 
             typename Seqlen_traits::StrideT{}
         ),
+        typename Seqlen_traits::ShapeT{},
         take<0, 2>(SmemLayoutK{}),
         select<1, 2>(TileShape_MNK{}),
         size<0>(ClusterShape{}))); // mcast along M mode for this N load, if any
 
     // TMA_V may differ from TMA_K for fp8 kernel (e.g. swizzling mode)
-    using TMA_V = decltype(make_tma_copy(
+    using TMA_V = decltype(make_virtualized_tma_copy(
         GmemTiledCopyKV{},
         make_tensor(
             make_gmem_ptr(static_cast<Element const*>(nullptr)),
             repeat_like(typename Seqlen_traits::StrideT{}, int32_t(0)),
             typename Seqlen_traits::StrideT{}
         ),
+        typename Seqlen_traits::ShapeT{},
         take<0, 2>(SmemLayoutV{}),
         select<1, 2>(TileShape_MNK{}),
         size<0>(ClusterShape{}))); // mcast along M mode for this N load, if any
@@ -160,6 +169,7 @@ struct CollectiveMainloopFwd {
         typename Seqlen_traits::LayoutT layout_K;
         Element const* ptr_V;
         typename Seqlen_traits::LayoutT layout_V;
+        typename Seqlen_traits::ShapeT shape_KV;
         float const softmax_scale_log2;        
         float const* descale_q_ptr;
         float const* descale_k_ptr;
@@ -169,6 +179,11 @@ struct CollectiveMainloopFwd {
         int const qhead_per_khead;
         int const* cache_batch_idx;
         int const num_splits;
+        // Paged Attention block table data
+        int * block_table; // may be nullptr if not paged
+        int64_t block_table_batch_stride;
+        int page_block_size;
+        int num_blocks;
     };
 
     // Device side kernel params
@@ -176,6 +191,7 @@ struct CollectiveMainloopFwd {
         typename Seqlen_traits_Q::LayoutT layout_Q;
         typename Seqlen_traits::LayoutT layout_K;
         typename Seqlen_traits::LayoutT layout_V;
+        typename Seqlen_traits::ShapeT shape_KV;
         cutlass::FastDivmod qhead_per_khead_divmod;
         TMA_Q tma_load_Q;        
         TMA_K tma_load_K;
@@ -188,6 +204,11 @@ struct CollectiveMainloopFwd {
         int window_size_right;
         int const* cache_batch_idx;
         cutlass::FastDivmod num_splits_divmod;
+        // Paged Attention block table data
+        int * block_table; // may be nullptr if not paged
+        int64_t block_table_batch_stride;
+        int page_block_size;
+        int num_blocks; // num_block
     };
 
 
@@ -201,27 +222,31 @@ struct CollectiveMainloopFwd {
             TileShapeQCopy{},
             _1{}); // no mcast for Q
         Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K), args.layout_K);
-        TMA_K tma_load_K = make_tma_copy(
+        TMA_K tma_load_K = make_virtualized_tma_copy(
             GmemTiledCopyKV{},
             mK,
+            args.shape_KV,
             SmemLayoutK{}(_, _, _0{}),
             select<1, 2>(TileShape_MNK{}),
             size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
         Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V), args.layout_V);
-        TMA_V tma_load_V = make_tma_copy(
+        TMA_V tma_load_V = make_virtualized_tma_copy(
             GmemTiledCopyKV{},
             mV,
+            args.shape_KV,
             SmemLayoutV{}(_, _, _0{}),
             select<1, 2>(TileShape_MNK{}),
             size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
-        return {args.layout_Q, args.layout_K, args.layout_V,
+        return {args.layout_Q, args.layout_K, args.layout_V, args.shape_KV,
                 cutlass::FastDivmod(args.qhead_per_khead),
+
                 tma_load_Q, tma_load_K, tma_load_V,
                 args.softmax_scale_log2,
                 args.descale_q_ptr, args.descale_k_ptr, args.descale_v_ptr,
                 args.window_size_left, args.window_size_right,
                 args.cache_batch_idx,
-                cutlass::FastDivmod(args.num_splits)};
+                cutlass::FastDivmod(args.num_splits),
+                args.block_table, args.block_table_batch_stride, args.page_block_size, args.num_blocks};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -314,8 +339,8 @@ struct CollectiveMainloopFwd {
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
 
         Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.layout_Q.shape());
-        Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.layout_K.shape());
-        Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.layout_V.shape());
+        Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.shape_KV);
+        Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.shape_KV);
 
         auto [m_block, n_split_idx, bidh, bidb] = block_coord;
         const int bidb_cache = mainloop_params.cache_batch_idx == nullptr ? bidb : mainloop_params.cache_batch_idx[bidb];
@@ -352,19 +377,22 @@ struct CollectiveMainloopFwd {
                                           group_modes<0, 2>(sV), group_modes<0, 2>(gV));  // (TMA, k), (TMA, PIPE)
 
         uint16_t mcast_mask_kv = 0;
-        if constexpr (cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST>) {
+        if constexpr (cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST> || cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST_PAGED>)  {
             auto block_layout = Layout<ClusterShape>{}; // (m,n) -> block_id
             for (int m = 0; m < size<0>(block_layout); ++m) {
                 mcast_mask_kv |= (uint16_t(1) << block_layout(m, cluster_local_block_id.y, _0{}));
             }
         }
 
+
+        PagedCopyArgs const paged_copy_args = {mainloop_params.block_table_batch_stride, mainloop_params.page_block_size, mainloop_params.block_table};
+
         int n_block = n_block_max - 1;
 
         int lane_predicate = cute::elect_one_sync();
         if (lane_predicate) {
             pipeline_k.producer_acquire(smem_pipe_write_k);
-            copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
+            copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv, paged_copy_args),
                 tKgK(_, n_block), tKsK(_, smem_pipe_write_k.index()));
             ++smem_pipe_write_k;
         }
@@ -386,11 +414,11 @@ struct CollectiveMainloopFwd {
             #pragma unroll 2
             for (; n_block > n_block_min; --n_block) {
                 pipeline_k.producer_acquire(smem_pipe_write_k);
-                copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
+                copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv, paged_copy_args),
                     tKgK(_, n_block - 1), tKsK(_, smem_pipe_write_k.index()));
                 ++smem_pipe_write_k;
                 pipeline_v.producer_acquire(smem_pipe_write_v);
-                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
+                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv, paged_copy_args),
                     tVgV(_, n_block), tVsV(_, smem_pipe_write_v.index()));
                 ++smem_pipe_write_v;
             }
@@ -399,7 +427,7 @@ struct CollectiveMainloopFwd {
         scheduler.prefetch_next_work(scheduler_params, work_tile_info);
         if (lane_predicate) {
             pipeline_v.producer_acquire(smem_pipe_write_v);
-            copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
+            copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv, paged_copy_args),
                 tVgV(_, n_block), tVsV(_, smem_pipe_write_v.index()));
             ++smem_pipe_write_v;
         }
@@ -451,8 +479,8 @@ struct CollectiveMainloopFwd {
         };
 
         Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.layout_Q.shape());
-        Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.layout_K.shape());
-        Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.layout_V.shape());
+        Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.shape_KV);
+        Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.shape_KV);
 
         auto [m_block, split_idx, bidh, bidb] = block_coord;
         const int bidb_cache = mainloop_params.cache_batch_idx == nullptr ? bidb : mainloop_params.cache_batch_idx[bidb];
@@ -489,12 +517,14 @@ struct CollectiveMainloopFwd {
                                           group_modes<0, 2>(sV), group_modes<0, 2>(gV));  // (TMA, k), (TMA, PIPE)
 
         uint16_t mcast_mask_kv = 0;
-        if constexpr (cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST>) {
+        if constexpr (cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST> || cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST_PAGED>) {
             auto block_layout = Layout<ClusterShape>{}; // (m,n) -> block_id
             for (int m = 0; m < size<0>(block_layout); ++m) {
                 mcast_mask_kv |= (uint16_t(1) << block_layout(m, cluster_local_block_id.y, _0{}));
             }
         }
+
+        PagedCopyArgs const paged_copy_args = {mainloop_params.block_table_batch_stride, mainloop_params.page_block_size, mainloop_params.block_table};
 
         int n_block = n_block_max - 1;
 
@@ -502,7 +532,7 @@ struct CollectiveMainloopFwd {
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         if (warp_idx_in_warpgroup == 0 && lane_predicate) {
             pipeline_k.producer_acquire(smem_pipe_write);
-            copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
+            copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, paged_copy_args),
                 tKgK(_, n_block), tKsK(_, smem_pipe_write.index()));
         }
 
@@ -515,7 +545,7 @@ struct CollectiveMainloopFwd {
             copy(mainloop_params.tma_load_Q.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.barrier_Q), 0 /*mcast_mask*/), tQgQ, tQsQ);
             if constexpr(!Ktraits::VO_union_all) {
                 pipeline_v.producer_acquire(smem_pipe_write);
-                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
+                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv, paged_copy_args),
                     tVgV(_, n_block), tVsV(_, smem_pipe_write.index()));
             }
 
@@ -529,7 +559,7 @@ struct CollectiveMainloopFwd {
         if constexpr(Ktraits::VO_union_all) {
             if (warp_idx_in_warpgroup == 0 && lane_predicate) {
                 pipeline_v.producer_acquire(smem_pipe_write);
-                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
+                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv, paged_copy_args),
                     tVgV(_, n_block), tVsV(_, smem_pipe_write.index()));
             }
         }
@@ -547,10 +577,10 @@ struct CollectiveMainloopFwd {
             
             if (warp_idx_in_warpgroup == 0 && lane_predicate) {
                 pipeline_k.producer_acquire(smem_pipe_write);
-                copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
+                copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, paged_copy_args),
                     tKgK(_, n_block-1), tKsK(_, smem_pipe_write.index()));
                 pipeline_v.producer_acquire(smem_pipe_write);
-                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
+                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv, paged_copy_args),
                     tVgV(_, n_block-1), tVsV(_, smem_pipe_write.index()));
             }                                                                
         }       
