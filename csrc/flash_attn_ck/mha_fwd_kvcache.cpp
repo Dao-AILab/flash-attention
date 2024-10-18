@@ -399,8 +399,7 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
     const int head_size_8x = round_multiple(head_size_og, 8);
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
 

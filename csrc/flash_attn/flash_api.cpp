@@ -436,8 +436,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
 
@@ -656,8 +655,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
     auto softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
@@ -898,8 +896,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     bool loop = true;
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
@@ -1126,8 +1123,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     bool loop = true;
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
     auto softmax_d = torch::empty({num_heads, total_q + 128 * batch_size}, opts.dtype(at::kFloat));
@@ -1363,8 +1359,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
 

@@ -190,8 +190,7 @@ torch::Tensor single_query_attention(const torch::Tensor q,
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{q.device()};
 
     torch::Tensor out = torch::empty_like(q);
 
