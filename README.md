@@ -60,8 +60,6 @@ export PYTHONPATH=$PWD
 pytest -q -s test_flash_attn.py
 ```
 
-
-
 ## Installation and features
 **Requirements:**
 - CUDA toolkit or ROCm toolkit
@@ -78,6 +76,12 @@ compiling can take a very long time (2h) since it does not use multiple CPU
 cores. With `ninja` compiling takes 3-5 minutes on a 64-core machine using CUDA toolkit.
 
 **To install:**
+
+> [!CAUTION]
+> Installing via `pip install flash-attn` can take a _long_ time - potentially multiple hours. For faster installation options consider downloading a wheel file from [our releases page](https://github.com/Dao-AILab/flash-attention/releases) and running `pip install flash_attn_....whl` instead.
+
+If using `pip install` to compile the package:
+
 ```sh
 pip install flash-attn --no-build-isolation
 ```
