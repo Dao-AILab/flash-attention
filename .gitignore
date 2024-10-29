@@ -19,16 +19,9 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
-.eggs
 
 # IDE-related
 .idea/
 
 # Dev
 venv
-scripts
-*.log
-core.*
-*.csv
-*.png
-*.html
