@@ -22,14 +22,16 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
-.eggs
 
 # IDE-related
 .idea/
 
 # Dev
 venv
+
+# AMD
 scripts
+.eggs
 *.log
 core.*
 *.csv
