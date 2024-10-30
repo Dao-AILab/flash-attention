@@ -505,8 +505,8 @@ def test_op_prefill_fwd_impl(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, return_scor
     (1, 1, 4, 4, 32),
     (1, 1, 16, 16, 16),
     (1, 1, 32, 32, 16),
-    (1, 1, 64, 64, 16), # pass # smallest head_size = 16
-    (1, 1, 64, 64, 64), # pass # smallest seq len seems to be 64
+    (1, 1, 64, 64, 16),
+    (1, 1, 64, 64, 64),
     (1, 1, 64, 128, 32),
     (1, 1, 128, 128, 64),
     (1, 1, 128, 256, 45),
@@ -529,10 +529,11 @@ def test_op_prefill_fwd_impl(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, return_scor
     (1, 16, 1024, 1024, 128),
 ])
 @pytest.mark.parametrize('causal', [True, False])
-@pytest.mark.parametrize('use_exp2', [False]) # using exp2 causas issue with exp2
+@pytest.mark.parametrize('use_exp2', [False]) # FIXME: using exp2 causes issue when used with causal
 @pytest.mark.parametrize('layout', ["bhsd", "bshd", "thd"])
+@pytest.mark.parametrize('sequence_parallel', [True, False])
 @pytest.mark.parametrize('DEBUG_INPUT', [False]) # debug output causes nans in both new and old backend
-def test_op_prefill_bwd_impl(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, use_exp2, layout, DEBUG_INPUT):
+def test_op_prefill_bwd_impl(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, use_exp2, layout, sequence_parallel, DEBUG_INPUT):
     dtype = torch.float16
     torch.manual_seed(20) # seed from test_op_bwd
 
@@ -619,7 +620,8 @@ def test_op_prefill_bwd_impl(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, use_exp2, l
         metadata.cu_seqlens_k,
         metadata.max_seqlens_q,
         metadata.max_seqlens_k,
-        use_exp2
+        use_exp2,
+        sequence_parallel=sequence_parallel
     )
 
     # =============================================== Check ==============================================================
