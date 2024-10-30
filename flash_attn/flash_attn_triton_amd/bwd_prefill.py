@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-from .utils import get_shape_from_layout, get_strides_from_layout, DEBUG
+from .utils import get_shape_from_layout, get_strides_from_layout, DEBUG, PERF
 
 @triton.jit
 def _bwd_preprocess_use_o(
@@ -72,7 +72,6 @@ def _bwd_preprocess_use_o(
     delta_offset = Delta + off_z * stride_deltaz + off_h * stride_deltah + q_start * stride_deltam
     delta_ptrs = delta_offset + off_m * stride_deltam
     tl.store(delta_ptrs, delta, mask=mask_m)
-
 
 
 @triton.jit
@@ -311,7 +310,7 @@ def _bwd_kernel(
     dk_offset = DK + off_z * stride_kz + off_h * stride_kh + k_start * stride_kn
     dv_offset = DV + off_z * stride_vz + off_h * stride_vh + k_start * stride_vn
     if SEQUENCE_PARALLEL:
-        dq_offset = DQ + stride_dq_all * start_n + off_z * stride_qz + off_h * stride_qh + q_start * stride_qm
+        dq_offset = DQ + start_n * stride_dq_all + off_z * stride_qz + off_h * stride_qh + q_start * stride_qm
     else:
         dq_offset = DQ + off_z * stride_qz + off_h * stride_qh + q_start * stride_qm
 
@@ -451,7 +450,7 @@ def attention_prefill_backward_triton_impl(
     max_seqlen_q: int,
     max_seqlen_k: int,
     use_exp2: bool,
-    sequence_parallel = False,
+    sequence_parallel = True,
 ):
     if DEBUG:
         print()
@@ -489,7 +488,6 @@ def attention_prefill_backward_triton_impl(
     stride_kz, stride_kh, stride_kn, stride_kk = k_strides
     stride_vz, stride_vh, stride_vn, stride_vk = v_strides
     stride_oz, stride_oh, stride_om, stride_ok = o_strides
-    stride_dq_all = q.numel()
     batch_headsize = batch * nheads_q
     is_varlen = layout == "thd"
 
@@ -515,31 +513,46 @@ def attention_prefill_backward_triton_impl(
     ACTUAL_BLOCK_DMODEL = head_size
 
     do = do.contiguous()
-    if sequence_parallel:
-        # replicate q for each parallel sequence
-        replicas = num_blocks_n
-        dq_shape = (replicas,) + q.shape
-    else:
-        dq_shape = q.shape
+    # NOTE: we might need to copy the output tensor if they are not continuous or have other issues
+    copy_back = {"dq": False, "dk": False, "dv": False}
 
-    is_qkvpacked = False
-    if dq is None or dk is None or dv is None: 
-        dq = torch.zeros(dq_shape, device=q.device, dtype=q.dtype)
+    # deal with dq
+    if dq is None:
+        if sequence_parallel:
+            dq = torch.zeros((num_blocks_n,) + q.shape, device=q.device, dtype=q.dtype)
+        else:
+            dq = torch.zeros(q.shape, device=q.device, dtype=q.dtype)
+    else:
+        dq_og = dq
+        if (not dq.is_contiguous()):
+            dq = dq.contiguous()
+            copy_back["dq"] = True
+
+        if sequence_parallel:
+            dq = torch.zeros((num_blocks_n,) + q.shape, device=q.device, dtype=q.dtype)
+            copy_back["dq"] = True
+        else:
+            # NOTE: the kernel does inplace accumlation so dq has to be zeros. This avoids the case where we are passed empty dq and it is not all zeros
+            dq.zero_()
+    stride_dq_all = dq.stride()[0]
+
+    # deal with dk, dv
+    if (dk is None) or (dv is None):
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
-    elif (not dq.is_contiguous()) or (not dq.is_contiguous()) or (not dq.is_contiguous()):
-            if DEBUG:
-                print("Not contigious and setting is packed to True")
-            is_qkvpacked = True
-            dq_og = dq
-            dq = dq.contiguous()
+    else:
+        if (not dk.is_contiguous()):
             dk_og = dk
             dk = dk.contiguous()
+            copy_back["dk"] = True
+
+        if (not dv.is_contiguous()):
             dv_og = dv
-            dv = dv.contiguous()       
-    
-    # NOTE: the kernel does inplace accumlation so dq has to be zeros. This avoids the case where we are passed empty dq and it is not all zeros
-    dq.zero_()
+            dv = dv.contiguous()
+            copy_back["dv"] = True
+
+    if DEBUG:
+        print("copy_back:", copy_back)
 
     # assert contigious
     assert do.is_contiguous()
@@ -647,26 +660,32 @@ def attention_prefill_backward_triton_impl(
         IS_VARLEN=is_varlen
     )
 
-    if len(dq.shape) == 5:
-        dq = dq.sum(dim=0)
-
     if DEBUG:
         print("_bwd_kernel outputs")
         print("dq:", dq, dq.shape)
         print("dk:", dk, dk.shape)
         print("dv:", dv, dv.shape)
         print("delta:", delta, delta.shape)
-    
-    if is_qkvpacked:
-        if DEBUG:
-            print("Copying back to original tensors due to ispacked")
-        
-        # copy back results to og tensors
+
+    if sequence_parallel:
+        dq = dq.sum(dim=0)
+
+    if DEBUG:
+        print("attention_prefill_backward_triton_new_impl outputs")
+        print("dq:", dq, dq.shape)
+        print("dk:", dk, dk.shape)
+        print("dv:", dv, dv.shape)
+        print("delta:", delta, delta.shape)
+        print("copy_back:", copy_back)
+
+    if copy_back["dq"]:
         dq_og.copy_(dq)
+        dq = dq_og
+    if copy_back["dk"]:
         dk_og.copy_(dk)
+        dk = dk_og
+    if copy_back["dv"]:
         dv_og.copy_(dv)
-        return dq_og, dk_og, dv_og, delta, None, None
-    else:
-        return dq, dk, dv, delta, None, None
+        dv = dv_og
 
-
+    return dq, dk, dv, delta, None, None
