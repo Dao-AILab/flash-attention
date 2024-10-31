@@ -232,4 +232,4 @@ struct Softmax {
 
 };
 
-}  // namespace flash
+} // namespace flash

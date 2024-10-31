@@ -245,4 +245,4 @@ __global__ void combine_attn_seqk_parallel(Params const params) {
     }
 }
 
-}
+} // namespace flash

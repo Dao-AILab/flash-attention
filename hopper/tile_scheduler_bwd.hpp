@@ -89,4 +89,4 @@ public:
 };
 
 
-} // flash
+} // namespace flash
