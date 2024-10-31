@@ -38,4 +38,4 @@ enum class BwdNamedBarriers {
     dQFull = 8,
 };
 
-} // flash
+} // namespace flash
