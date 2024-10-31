@@ -66,14 +66,17 @@ jobs:
       - name: Flash Attention Tests
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0
           pytest tests/test_flash_attn_triton_amd.py
-      - name: AMD Kernel Tests
+      - name: AMD Tests
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0
           pytest -v -s flash_attn/flash_attn_triton_amd/test.py
-      - name: AMD Kernel Bench
+      - name: AMD Bench
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+          python flash_attn/flash_attn_triton_amd/bench.py
+      - name: AMD Bench with Autotune
+        run: |
+          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+          export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=1
           python flash_attn/flash_attn_triton_amd/bench.py
