@@ -31,6 +31,7 @@ venv
 
 # AMD
 scripts
+csrc/flash_attn_ck
 .eggs
 *.log
 core.*
