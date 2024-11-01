@@ -51,7 +51,7 @@ jobs:
           pip install matplotlib pandas pytest
           git clone https://github.com/triton-lang/triton
           cd triton
-          git checkout 2e9f2c2d20601c24b91a4c32a7b97ad1f8a55d88 
+          git checkout 3ca2f498e98ed7249b82722587c511a5610e00c4 
           pip install --verbose -e python
           cd ..
       - name: Build
