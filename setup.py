@@ -348,6 +348,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         f"build/fmha_*wd*.cpp"
     )
 
+    sources+=glob.glob(f"csrc/composable_kernel/example/ck_tile/01_fmha/hsaco/*.cpp")
+
     rename_cpp_to_cu(sources)
 
     renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
@@ -357,6 +359,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                        "csrc/flash_attn_ck/mha_fwd.cu",
                        "csrc/flash_attn_ck/mha_varlen_bwd.cu",
                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
+
+    renamed_sources+=glob.glob(f"csrc/composable_kernel/example/ck_tile/01_fmha/hsaco/*.cu")
 
     cc_flag += ["-O3","-std=c++17",
                 "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
