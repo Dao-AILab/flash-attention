@@ -349,8 +349,6 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         hipLaunchKernelGGL(
             flash::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0,
             philox_args, reinterpret_cast<uint64_t*>(rng_state.data_ptr()));
-    } else {
-        rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
     }
 
     if (seqlen_q > 0) {
