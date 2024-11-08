@@ -208,7 +208,7 @@ Then install and test Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_
 export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
 cd flash-attention
 python setup.py install
-pytest tests/test_flash_attn.py
+pytest tests/test_flash_attn_triton_amd.py
 ```
 
 
