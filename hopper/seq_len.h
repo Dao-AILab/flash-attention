@@ -14,8 +14,9 @@ namespace flash {
 
 static constexpr int kMaxTileSize = 128;
 
-template <bool UseVarSeqLen_, bool UseGQAPacking_> class SeqLenTraits {
+template <bool UseVarSeqLen_, bool UsePagedKV_, bool UseGQAPacking_> class SeqLenTraits {
 public:
+  static_assert((!UsePagedKV_) || (UseVarSeqLen_ && UsePagedKV_), "PagedKV is only supported for VarSeqLen.");
   static_assert(!(UseVarSeqLen_ && UseGQAPacking_),
     "Variable sequence length with GQA parallelization not implemented yet.");
 
@@ -31,19 +32,32 @@ public:
   // Whether this is for fixed-seq-len or var-seq-len.
   static constexpr bool UseVarSeqLen = UseVarSeqLen_;
   static constexpr bool UseGQAPacking = UseGQAPacking_;
-
+  static constexpr bool UsePagedKV = UsePagedKV_;
+  
   using ShapeT = std::conditional_t<
       UseVarSeqLen, 
-      cute::Shape<int32_t, int32_t, int32_t>,
+      std::conditional_t<
+        !UsePagedKV, 
+        cute::Shape<int32_t, int32_t, int32_t>, 
+        cute::Shape<int32_t, int32_t, int32_t, int32_t>>,
       std::conditional_t<
         UseGQAPacking,
         cute::Shape<int32_t, int32_t, int32_t, int32_t, int32_t>,
         cute::Shape<int32_t, int32_t, int32_t, int32_t>
       >
   >;
+  using VirtualShapeT = std::conditional_t<
+      UsePagedKV,
+      cute::Shape<int32_t, int32_t, int32_t, int32_t>,
+      ShapeT
+  >;
+
   using StrideT = std::conditional_t<
       UseVarSeqLen, 
-      cute::Shape<int64_t, _1, int64_t>, 
+      std::conditional_t<
+        !UsePagedKV, 
+        cute::Shape<int64_t, _1, int64_t>,  
+        cute::Shape<int64_t, _1, int64_t, int64_t>>,
       std::conditional_t<
         UseGQAPacking,
         cute::Shape<int64_t, int64_t, _1, int64_t, int64_t>,
@@ -103,11 +117,20 @@ public:
   CUTLASS_HOST_DEVICE auto get_gmem_layout(
       int m, int k, int h, int b, 
       int64_t m_stride, int64_t h_stride, int64_t b_stride,
+      int page_block_size, int num_blocks,
       bool padded = false) const {
     static_assert(!UseVarSeqLen, "Specialize default implementation for VarSeqLen.");
     // static_assert(!UseGQAPacking, "Specialize default implementation for UseGQAPacking.");
     return make_layout(make_shape(m, k, h, b),
                        make_stride(m_stride, cute::_1{}, h_stride, b_stride));
+  }
+
+
+  // Returns the layout of a tensor in MKHB format in virtual memory space
+  // that is mapped to the global memory via the block table when paged attention is used
+  CUTLASS_HOST_DEVICE VirtualShapeT get_virtual_shape(
+      int m, int k, int h_k, int b, int h_h_k_ratio, bool padded) const {
+    return make_shape(m, k, h_k, b);
   }
 
   // Returns the layout of a tensor in MKHB format in global memory.
@@ -191,7 +214,7 @@ public:
       const MTensor &m_tensor, const Shape &tile_shape,
       int bidh, int bidb, int split_idx, bool padded = false) const {
     // static_assert(!UseVarSeqLen, "Don't use get_o_local_tile_tensor with VarSeqLen.");
-    // m_tensor has shape (M, K, H, B) or (M, K, H, B, splits)
+    // m_tensor has shape (M, K, H, B) or (M, K, H, B, splits) 
     // Expect tile shape (bM, K)
     // Returns g_tensor of shape = (bM, K, ceil_div(M,bM))
     if constexpr(!Is_split) {
@@ -207,9 +230,10 @@ public:
   
 };
 
-using FixedSeqLenTraits = SeqLenTraits<false, false>;
-using VarSeqLenTraits = SeqLenTraits<true, false>;
-using FixedGQASeqLenTraits = SeqLenTraits<false, true>;
+using FixedSeqLenTraits = SeqLenTraits<false, false, false>;
+using VarSeqLenTraits = SeqLenTraits<true, false, false>;
+using PagedSeqLenTraits = SeqLenTraits<true, true, false>;
+using FixedGQASeqLenTraits = SeqLenTraits<false, false, true>;
 
 template <>
 CUTLASS_DEVICE void VarSeqLenTraits::init(int bidb) {
@@ -230,6 +254,7 @@ template <>
 CUTLASS_HOST_DEVICE auto VarSeqLenTraits::get_gmem_layout(
     int m, int k, int h, int b, 
     int64_t m_stride, int64_t h_stride, int64_t b_stride,
+    int page_block_size, int num_blocks,
     bool padded) const {
   return make_layout(
     make_shape(sum_s + (padded ? kMaxTileSize * b : 0), k, h), 
@@ -246,8 +271,18 @@ CUTLASS_HOST_DEVICE auto VarSeqLenTraits::get_gmem_layout(
     make_stride(m_stride, cute::_1{}, h_stride));
 }
 
+
+template <>
+  CUTLASS_HOST_DEVICE VarSeqLenTraits::VirtualShapeT VarSeqLenTraits::get_virtual_shape(
+      int m, int k, int h, int b, int h_h_k_ratio,
+      bool padded) const {
+    return make_shape(sum_s + (padded ? kMaxTileSize * b : 0), k, h);
+  }
+
+
 // padded: only useful for var-seq-len for dq_accum and softmax_d.
 // When padded is True, use B_M + kMaxTileSize * B as the total B_M.
+//template <>
 template <>
 CUTLASS_HOST_DEVICE auto VarSeqLenTraits::get_lse_gmem_layout(
     int m, int h, int b, bool padded) const {
@@ -296,6 +331,7 @@ CUTLASS_DEVICE auto VarSeqLenTraits::get_o_local_tile_tensor(
   return g_tensor;
 }
 
+
 template <>
 template <bool Is_split, typename MTensor, typename Shape>
 CUTLASS_DEVICE auto VarSeqLenTraits::get_lse_local_tile_tensor(
@@ -321,6 +357,14 @@ CUTLASS_HOST_DEVICE auto FixedGQASeqLenTraits::get_gmem_layout(
                      make_stride(m_stride, h_stride, cute::_1{},
                                  h_stride * h_h_k_ratio, b_stride));
 }
+
+template <>
+  CUTLASS_HOST_DEVICE FixedGQASeqLenTraits::VirtualShapeT FixedGQASeqLenTraits::get_virtual_shape(
+      int m, int k, int h_k, int b, int h_h_k_ratio,
+      bool padded) const {
+    return make_shape(m, h_h_k_ratio, k, h_k, b);
+  }
+
 
 // Returns layout of Oaccum tensor in (M,H/HK,K,HK,B,T) format in global memory.
 template <>
@@ -365,6 +409,42 @@ CUTLASS_DEVICE auto FixedGQASeqLenTraits::get_o_local_tile_tensor(
     return g_tensor;
   }
 }
+
+/////////////// PagedSeqLenTraits /////////////////
+
+  // Returns the layout of a tensor in MKHB format in global memory.
+  // padded: only useful for var-seq-len for dq_accum and softmax_d.
+template<>
+CUTLASS_HOST_DEVICE auto PagedSeqLenTraits::get_gmem_layout(
+    int m, int k, int h, int b,
+    int64_t m_stride, int64_t h_stride, int64_t b_stride,
+    int page_block_size, int num_blocks,
+    bool padded) const {
+  return static_cast<PagedSeqLenTraits::LayoutT>(make_layout(make_shape((int)page_block_size, k, h, (int)num_blocks),
+                      make_stride(m_stride, cute::_1{}, h_stride, b_stride)));
+}
+
+template <>
+CUTLASS_DEVICE void PagedSeqLenTraits::init(int bidb) {
+  actual_seq_len =
+      seq_used ? seq_used[bidb] : (cu_seq_len[bidb + 1] - cu_seq_len[bidb]);
+}
+
+template <>
+template <typename MTensor, typename Shape>
+CUTLASS_DEVICE auto PagedSeqLenTraits::get_local_tile_tensor(
+      const MTensor &m_tensor, const Shape &tile_shape,
+      int bidh, int bidb, bool padded) const {
+
+    auto g_slice = m_tensor(_, _, bidh, bidb); // = m_tensor[:,:, head_idx, batch_idx]
+    auto g_seq_slice = make_tensor( // m_tensor[:actual_seq_len,:, head_idx, batch_idx]
+      g_slice.data(),
+      make_layout(cute::make_shape(actual_seq_len, get<1>(g_slice.layout().shape())), g_slice.layout().stride()));
+    // slice up into tiles
+    auto g_tensor = local_tile(
+      g_seq_slice, tile_shape, make_coord(_, _0{}));
+    return g_tensor;
+  }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
