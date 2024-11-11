@@ -261,16 +261,16 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int NumCopyThreads, typename ElemO, typename TMACopyO, typename LayoutO, 
+template <bool Is_split, int NumCopyThreads, typename ElemO, typename TMACopyO, typename LayoutO, 
           typename TileShapeO, typename SMemO, typename SeqLenTraits>
 __forceinline__ __device__ void write_tma(
         ElemO* O, const TMACopyO& tma_store_O,
         const LayoutO& layout_O, const TileShapeO& tile_shape_O,
-        const SMemO& sO, int m_block, int bidh, int bidb,
+        const SMemO& sO, int m_block, int bidh, int bidb, int n_split_idx,
         const SeqLenTraits& seqlen_traits_o, int write_warp_idx) {
     Tensor mO = tma_store_O.get_tma_tensor(layout_O.shape());
-    Tensor gO = seqlen_traits_o.get_local_tile_tensor(
-        mO, tile_shape_O, bidh, bidb
+    Tensor gO = seqlen_traits_o.get_o_local_tile_tensor<Is_split>(
+        mO, tile_shape_O, bidh, bidb, n_split_idx
     )(_, _, m_block);  // (M, K)
     auto block_tma_O = tma_store_O.get_slice(_0{});
     Tensor tOgO = block_tma_O.partition_D(gO);  // (TMA, TMA_M, TMA_K)
@@ -284,6 +284,94 @@ __forceinline__ __device__ void write_tma(
     }
     // Note: no wait here.
     // tma_store_wait<0>();
+}
+
+// Epilogue that copies RMEM -> GMEM directly for GQA enabled.
+// Reports as uncoalesced stores by the profiler
+template <bool Use_gqa_layout, bool Column_permute_fp8, bool Is_split = true, typename TensorO, typename OutputType,
+          typename LayoutO, typename TileShapeO, typename TiledMma, typename SeqLenTraits>
+__forceinline__ __device__ void write_rmem_to_gmem(
+        TensorO &tOrO, OutputType *O, const LayoutO& layout_O, TileShapeO tile_shape_O,
+        int m_block, int h_block, int bidh, int bidh_kv, int bidb, int n_split_idx,
+        TiledMma& tiled_mma, const SeqLenTraits& seqlen_traits_o, int thread_idx) {
+    static_assert(is_same_v<typename TensorO::value_type, float>, "rmem dtype must be float");
+    Tensor mO = make_tensor(make_gmem_ptr(O), layout_O);
+    Tensor gO = [&] {
+        if constexpr(Use_gqa_layout) {
+            return seqlen_traits_o.get_o_local_tile_tensor<Is_split>(
+                mO, tile_shape_O, bidh_kv, bidb, n_split_idx
+                )(_, _, _, m_block, h_block);  // (bM/bH, bH, K)
+        } else {
+            return seqlen_traits_o.get_o_local_tile_tensor<Is_split>(
+                mO, tile_shape_O, bidh, bidb, n_split_idx
+                )(_, _, m_block);  // (bM, bK)
+        }
+    }();
+    auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+    auto tile_shape_mnk = cute::tile_shape(tiled_mma);
+    Tensor cO = cute::make_identity_tensor(select<0, 1>(tile_shape_mnk));
+    Tensor tOcO = thread_mma.partition_C(cO);
+    // tOcO has shape ((2, 2, V), MMA_M, MMA_N), we only take only the row indices.
+    Tensor tOcO_row = tOcO(make_coord(_0{}, _, _0{}), _, _0{});
+    // reshape from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
+    Tensor tOrO_rowcol = make_tensor(tOrO.data(), flash::convert_layout_acc_rowcol(tOrO.layout()));
+    const int m_bound = seqlen_traits_o.actual_seq_len - m_block * size<0>(gO);
+    // hardcoded col_idx to circumvent reg spilling with counting tensor
+    const int col_start_idx = !Column_permute_fp8 ? 2 * (thread_idx % 4) : 4 * (thread_idx % 4);
+
+    if constexpr (Use_gqa_layout) {
+        static constexpr int kBlockH = size<1>(gO);
+        const int h_bound = shape<1>(layout_O) - h_block * kBlockH;
+        #pragma unroll
+        for(int nrow = 0; nrow < size<0>(tOrO_rowcol); ++nrow) {
+            const int row = int(get<0>(tOcO_row(nrow)));
+            const int h_local = row % kBlockH;
+            const int m_local = row / kBlockH;
+            if(h_local < h_bound && m_local < m_bound) {
+                if constexpr(!Column_permute_fp8) {
+                    Tensor tOrO_nrow_float2 = recast<float2>(tOrO_rowcol(nrow, _));
+                    #pragma unroll
+                    for (int ncol = 0; ncol < size<1>(tOrO_rowcol)/2; ++ncol) {
+                        *reinterpret_cast<float2*>(&(gO(m_local, h_local, col_start_idx + 8 * ncol))) = 
+                            tOrO_nrow_float2(ncol);
+                    }
+                } else {
+                    Tensor tOrO_nrow = tOrO_rowcol(nrow, _);
+                    #pragma unroll
+                    for (int ncol = 0; ncol < size<1>(tOrO_rowcol); ncol += 4) {
+                        gO(m_local, h_local, col_start_idx + 4 * ncol) = tOrO_nrow(ncol);
+                        gO(m_local, h_local, col_start_idx + 4 * ncol + 2) = tOrO_nrow(ncol + 1);
+                        gO(m_local, h_local, col_start_idx + 4 * ncol + 1) = tOrO_nrow(ncol + 2);
+                        gO(m_local, h_local, col_start_idx + 4 * ncol + 3) = tOrO_nrow(ncol + 3);
+                    }
+                }
+            }
+        }
+    } else {
+        #pragma unroll
+        for(int nrow = 0; nrow < size<0>(tOrO_rowcol); ++nrow) {
+            const int row = int(get<0>(tOcO_row(nrow)));
+            if(row < m_bound) {
+                if constexpr(!Column_permute_fp8) {
+                    Tensor tOrO_nrow_float2 = recast<float2>(tOrO_rowcol(nrow, _));
+                    #pragma unroll
+                    for (int ncol = 0; ncol < size<1>(tOrO_rowcol)/2; ++ncol) {
+                        *reinterpret_cast<float2*>(&(gO(row, col_start_idx + 8 * ncol))) = 
+                            tOrO_nrow_float2(ncol);
+                    }
+                } else {
+                    Tensor tOrO_nrow = tOrO_rowcol(nrow, _);
+                    #pragma unroll
+                    for (int ncol = 0; ncol < size<1>(tOrO_rowcol); ncol += 4) {
+                        gO(row, col_start_idx + 4 * ncol) = tOrO_nrow(ncol);
+                        gO(row, col_start_idx + 4 * ncol + 2) = tOrO_nrow(ncol + 1);
+                        gO(row, col_start_idx + 4 * ncol + 1) = tOrO_nrow(ncol + 2);
+                        gO(row, col_start_idx + 4 * ncol + 3) = tOrO_nrow(ncol + 3);
+                    }
+                }
+            }
+        }
+    }
 }
 
 template <int NumCopyThreads, typename ElemO, typename TiledCopyO, typename LayoutO, 
@@ -333,21 +421,28 @@ __forceinline__ __device__ void write_tiled(
     }
 }
 
-template <bool IsTMACopy, int NumCopyThreads, typename ElemO, 
+template <bool IsTMACopy, bool IsRegToGmem, bool Is_split, int NumCopyThreads, typename ElemO, 
           typename TMACopyO, typename TiledCopyO, typename LayoutO, 
-          typename TileShapeO, typename SMemO, typename SeqLenTraits>
+          typename TileShapeO, typename SMemO, typename SeqLenTraits, class TensorO, typename TiledMma>
 __forceinline__ __device__ void write_O(
         ElemO* O, const TMACopyO& tma_copy_O, const TiledCopyO& tiled_copy_O,
         const LayoutO& layout_O, const TileShapeO& tile_shape_O,
-        const SMemO& sO, int m_block, int bidh, int bidb,
-        const SeqLenTraits& seqlen_traits_o, int write_warp_idx) {
-    if constexpr (IsTMACopy) {
-        write_tma<NumCopyThreads>(O, tma_copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb, seqlen_traits_o, write_warp_idx);
+        const SMemO& sO, int m_block, int bidh, int bidb, int n_split_idx,
+        const SeqLenTraits& seqlen_traits_o, int write_warp_idx, TiledMma & tiledMma1, TensorO & tOrO) {
+
+    if constexpr (IsRegToGmem) {
+        static_assert(Is_split, "use write_rmem_to_gmem with split kv kernel only");
+	    write_rmem_to_gmem(tOrO, O, layout_O, tile_shape_O, m_block, bidh, bidb, n_split_idx,
+		     tiledMma1, seqlen_traits_o, threadIdx.x - NumCopyThreads);
+    } else if constexpr (IsTMACopy) {
+        write_tma<Is_split, NumCopyThreads>(O, tma_copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb,
+            n_split_idx, seqlen_traits_o, write_warp_idx);
     } else {
+        static_assert(!Is_split, "Don't use write_tiled with split kv kernel");
         write_tiled<NumCopyThreads>(O, tiled_copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb, seqlen_traits_o);
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace flash
+} // namespace flash

@@ -19,7 +19,7 @@ public:
 
     // Host side kernel arguments
     struct Arguments {
-        int const num_blocks_m, num_head, num_batch;
+        int const num_blocks_m, num_splits, num_head, num_batch;
         int* const tile_count_semaphore = nullptr;
     };
 
@@ -49,9 +49,9 @@ public:
         }
 
         CUTLASS_DEVICE
-        cute::tuple<int32_t, int32_t, int32_t>
+        cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
-            return {M_idx, H_idx, B_idx};
+            return {M_idx, 1, H_idx, B_idx};
         }
 
     };
@@ -88,26 +88,31 @@ public:
 
 ///////////////////////////////////////////////////////////////////////////////
 
+template <bool Is_split = false>
 class StaticPersistentTileScheduler {
 
 public:
 
     // Host side kernel arguments
     struct Arguments {
-        int const num_blocks_m, num_head, num_batch;
+        int const num_blocks_m, num_splits, num_head, num_batch;
         int* const tile_count_semaphore = nullptr;
     };
 
     // Device side kernel params
     struct Params {
-        int total_blocks;
-        cutlass::FastDivmod m_block_divmod, head_divmod;
+        int const total_blocks;
+        cutlass::FastDivmod const m_block_divmod, split_divmod, head_divmod;
     };
 
     static Params
     to_underlying_arguments(Arguments const& args) {
-        return {args.num_blocks_m * args.num_head * args.num_batch,
-                cutlass::FastDivmod(args.num_blocks_m), cutlass::FastDivmod(args.num_head)};
+        // return {args.num_blocks_m * args.num_head * args.num_batch,
+        //         cutlass::FastDivmod(args.num_blocks_m), cutlass::FastDivmod(args.num_head)};
+        return {args.num_blocks_m * args.num_splits * args.num_head * args.num_batch,                
+                cutlass::FastDivmod(args.num_blocks_m),
+                cutlass::FastDivmod(args.num_splits),
+                cutlass::FastDivmod(args.num_head)};
     }
 
     static dim3
@@ -125,11 +130,19 @@ public:
         }
 
         CUTLASS_DEVICE
-        cute::tuple<int32_t, int32_t, int32_t>
+        cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
-            int m_block, bidh, bidb;
-            bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(m_block, tile_idx));
-            return {m_block, bidh, bidb};
+            int m_block, split_idx, bidh, bidb;
+            if constexpr(!Is_split) {
+                bidb = params.head_divmod.divmod(bidh,
+                         params.m_block_divmod.divmod(m_block, tile_idx));
+                return {m_block, 1, bidh, bidb};
+            } else {
+                bidb = params.head_divmod.divmod(bidh,
+                         params.split_divmod.divmod(split_idx,
+                           params.m_block_divmod.divmod(m_block, tile_idx)));
+                return {m_block, split_idx, bidh, bidb};
+            }
         }
 
     };
@@ -164,7 +177,9 @@ public:
 
 };
 
-template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads = cutlass::NumThreadsPerWarp>
+template<int NumMmaThreads = 2 * cutlass::NumThreadsPerWarpGroup,
+    int NumProducerThreads = cutlass::NumThreadsPerWarp,
+    bool Is_split = false>
 class DynamicPersistentTileScheduler {
 
 protected:
@@ -174,21 +189,26 @@ public:
 
     // Host side kernel arguments
     struct Arguments {
-        int const num_blocks_m, num_head, num_batch;
+        int const num_blocks_m, num_splits, num_head, num_batch;
         int* const tile_count_semaphore;
     };
 
     // Device side kernel params
     struct Params {
-        int const total_blocks;
-        cutlass::FastDivmod const m_block_divmod, head_divmod;
+        int const total_blocks;        
+        cutlass::FastDivmod const m_block_divmod, split_divmod, head_divmod;
         int* const tile_count_semaphore;
     };
 
     static Params
     to_underlying_arguments(Arguments const& args) {
-        return {args.num_blocks_m * args.num_head * args.num_batch,
-                cutlass::FastDivmod(args.num_blocks_m), cutlass::FastDivmod(args.num_head),
+        // return {args.num_blocks_m * args.num_head * args.num_batch,
+        //         cutlass::FastDivmod(args.num_blocks_m), cutlass::FastDivmod(args.num_head),
+        //         args.tile_count_semaphore};
+        return {args.num_blocks_m * args.num_splits * args.num_head * args.num_batch,                
+                cutlass::FastDivmod(args.num_blocks_m),
+                cutlass::FastDivmod(args.num_splits),
+                cutlass::FastDivmod(args.num_head),
                 args.tile_count_semaphore};
     }
 
@@ -207,11 +227,19 @@ public:
         }
 
         CUTLASS_DEVICE
-        cute::tuple<int32_t, int32_t, int32_t>
+        cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
-            int m_block, bidh, bidb;
-            bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(m_block, tile_idx));
-            return {m_block, bidh, bidb};
+            int m_block, split_idx, bidh, bidb;
+            if constexpr(!Is_split) {
+                bidb = params.head_divmod.divmod(bidh,
+                         params.m_block_divmod.divmod(m_block, tile_idx));
+                return {m_block, 1, bidh, bidb};
+            } else {
+                bidb = params.head_divmod.divmod(bidh,
+                         params.split_divmod.divmod(split_idx,
+                           params.m_block_divmod.divmod(m_block, tile_idx)));
+                return {m_block, split_idx, bidh, bidb};
+            }
         }
 
     };
@@ -270,4 +298,4 @@ public:
 
 };
 
-} // flash
+} // namespace flash
