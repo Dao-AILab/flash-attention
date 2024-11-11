@@ -25,9 +25,12 @@ __device__ __forceinline__ void thread_reduce_(Tensor<Engine0, Layout0> const &t
     CUTE_STATIC_ASSERT_V(size<0>(summary) == size<0>(tensor));
     #pragma unroll
     for (int mi = 0; mi < size<0>(tensor); mi++) {
-        summary(mi) = zero_init ? tensor(mi, 0) : op(summary(mi), tensor(mi, 0));
+        summary(mi) = zero_init ? tensor(mi, _0{}) : op(summary(mi), tensor(mi, _0{}));
+    }
+    #pragma unroll
+    for (int ni = 1; ni < size<1>(tensor); ni++) {
         #pragma unroll
-        for (int ni = 1; ni < size<1>(tensor); ni++) {
+        for (int mi = 0; mi < size<0>(tensor); mi++) {
             summary(mi) = op(summary(mi), tensor(mi, ni));
         }
     }
@@ -75,14 +78,13 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
     for (int mi = 0; mi < size<0>(tensor); ++mi) {
         // If max is -inf, then all elements must have been -inf (possibly due to masking).
         // We don't want (-inf - (-inf)) since that would give NaN.
-        // If we don't have float around M_LOG2E the multiplication is done in fp64.
         const float max_scaled = Check_inf
             ? (max(mi) == -INFINITY ? 0.f : (!Scale_max ? max(mi) : max(mi) * scale) - max_offset)
             : (!Scale_max ? max(mi) : max(mi) * scale) - max_offset;
         #pragma unroll
         for (int ni = 0; ni < size<1>(tensor); ++ni)  {
             // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
-            // max * log_2(e)) This allows the compiler to use the ffma
+            // max * log_2(e)). This allows the compiler to use the ffma
             // instruction instead of fadd and fmul separately.
             tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
         }
@@ -144,8 +146,13 @@ struct Softmax {
         for (int mi = 0; mi < size(row_max); ++mi) {
             float sum = row_sum(mi);
             float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
-            row_sum(mi) = (sum == 0.f || sum != sum) ? -INFINITY : row_max(mi) * (softmax_scale_log2 * float(M_LN2)) + __logf(sum);
             scores_scale(mi) = inv_sum * final_scale;
+            // For FP8, we might have scaled the output of exp by 2**8 so we need to divide sum by that amount.
+            if constexpr (Max_offset != 0) {
+                static constexpr float sum_scale = 1.f / float(1 << Max_offset);
+                sum *= sum_scale;
+            }
+            row_sum(mi) = (sum == 0.f || sum != sum) ? -INFINITY : row_max(mi) * (softmax_scale_log2 * float(M_LN2)) + __logf(sum);
         }
         return scores_scale;
     };

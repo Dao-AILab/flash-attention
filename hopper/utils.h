@@ -183,7 +183,7 @@ template <typename To_type, typename Engine, typename Layout>
 __forceinline__ __device__ auto convert_type_safe(Tensor<Engine, Layout> const &tensor) {
     using From_type = typename Engine::value_type;
     Tensor out = make_fragment_like<To_type>(tensor);
-    constexpr int FragmentSize = sizeof(From_type) / sizeof(To_type);
+    constexpr int FragmentSize = std::max(sizeof(From_type) / sizeof(To_type), sizeof(To_type) / sizeof(From_type));
     static_assert(CUTE_STATIC_V(size<0>(tensor)) % FragmentSize == 0, "Fragment size does not vectorize properly");
     Tensor frag = recast<cutlass::Array<From_type, FragmentSize>>(tensor);
     Tensor out_frg = recast<cutlass::Array<To_type, FragmentSize>>(out);
@@ -286,7 +286,7 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
     static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
     #pragma unroll
     for (int m = 0; m < size<1>(S); ++m) {
-        if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
+        if (Is_even_MN || get<0>(identity_MN(_0{}, m, _0{})) < max_MN) {
             #pragma unroll
             for (int k = 0; k < size<2>(S); ++k) {
                 if (Is_even_K || predicate_K(k)) {
@@ -320,7 +320,7 @@ CUTLASS_DEVICE void permute_Aregs_fp8(Fragment &frag) {
     int selector_lower = lane_03 ? 0x7632 : 0x3276;
 
     static constexpr int upper_map[4] = {0, 3, 1, 2};
-    static constexpr int lower_map[4] = {1, 2, 0, 3};
+    // static constexpr int lower_map[4] = {1, 2, 0, 3};
 
     Tensor frag_64b = recast<uint2>(frag);  // ((1, 1, 2), MMA_M, MMA_N)
     #pragma unroll
@@ -330,7 +330,8 @@ CUTLASS_DEVICE void permute_Aregs_fp8(Fragment &frag) {
         uint32_t upper0 = lane_03 ? upper : lower;
         uint32_t lower0 = lane_03 ? lower : upper;
         upper0 = __shfl_sync(uint32_t(-1), upper0, upper_map[quad_idx], 4);
-        lower0 = __shfl_sync(uint32_t(-1), lower0, lower_map[quad_idx], 4);
+        // lower0 = __shfl_sync(uint32_t(-1), lower0, lower_map[quad_idx], 4);
+        lower0 = __shfl_sync(uint32_t(-1), lower0, upper_map[quad_idx] ^ 1, 4);
         frag_64b[i].x = __byte_perm(upper0, lower0, selector_upper);
         frag_64b[i].y = __byte_perm(upper0, lower0, selector_lower);
     }
@@ -382,37 +383,38 @@ CUTLASS_DEVICE void permute_output_fp8(Fragment &out) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename Fragment>
-CUTLASS_DEVICE void permute_output_fp8_fp16(Fragment &frag) {
+CUTLASS_DEVICE void permute_output_fp8_Vcolmajor(Fragment &frag) {
     // frag has shape ((2, 2, N / 8), MMA_M, MMA_N), each element is 16 bits
     static_assert(decltype(size<0, 0>(frag))::value == 2);
     static_assert(decltype(size<0, 1>(frag))::value == 2);
     static_assert(decltype(stride<0, 0>(frag))::value == 1);
-    static_assert(sizeof(typename Fragment::value_type) == 2);
+    static_assert(sizeof(typename Fragment::value_type) == 2 || sizeof(typename Fragment::value_type) == 4);
 
     int quad_idx = threadIdx.x % 4;
     bool lane_03 = quad_idx == 0 || quad_idx == 3;
 
     static constexpr int upper_map[4] = {0, 2, 3, 1};
-    static constexpr int lower_map[4] = {2, 0, 1, 3};
+    // static constexpr int lower_map[4] = {2, 0, 1, 3};
 
     // if (blockIdx.x == 0 && threadIdx.x == 128) { print_tensor(frag); }
-    Tensor frag_32b = group_modes<1, 3>(recast<uint32_t>(frag));  // ((1, 2, N / 8), (MMA_M, MMA_N))
-    // if (blockIdx.x == 0 && threadIdx.x == 128) { print(frag); printf("\n"); print(frag_32b); }
+    using type2 = std::conditional_t<sizeof(typename Fragment::value_type) == 2, uint32_t, uint64_t>;
+    Tensor frag_2 = group_modes<1, 3>(recast<type2>(frag));  // ((1, 2, N / 8), (MMA_M, MMA_N))
+    // if (blockIdx.x == 0 && threadIdx.x == 128) { print(frag); printf("\n"); print(frag_2); }
     #pragma unroll
-    for (int mi = 0; mi < size<1>(frag_32b); ++mi) {
+    for (int mi = 0; mi < size<1>(frag_2); ++mi) {
         #pragma unroll
-        for (int j = 0; j < size<0, 1>(frag_32b); ++j) {
+        for (int j = 0; j < size<0, 1>(frag_2); ++j) {
             #pragma unroll
-            for (int i = 0; i < size<0, 2>(frag_32b) / 2; ++i) {
-                // cutlass::swap(frag_32b(make_coord(_0{}, j, 2 * i), mi), frag_32b(make_coord(_0{}, j, 2 * i + 1), mi));
-                uint32_t upper = frag_32b(make_coord(_0{}, j, 2 * i), mi);
-                uint32_t lower = frag_32b(make_coord(_0{}, j, 2 * i + 1), mi);
-                uint32_t upper0 = lane_03 ? upper : lower;
-                uint32_t lower0 = lane_03 ? lower : upper;
+            for (int i = 0; i < size<0, 2>(frag_2) / 2; ++i) {
+                type2 upper = frag_2(make_coord(_0{}, j, 2 * i), mi);
+                type2 lower = frag_2(make_coord(_0{}, j, 2 * i + 1), mi);
+                type2 upper0 = lane_03 ? upper : lower;
+                type2 lower0 = lane_03 ? lower : upper;
                 upper0 = __shfl_sync(uint32_t(-1), upper0, upper_map[quad_idx], 4);
-                lower0 = __shfl_sync(uint32_t(-1), lower0, lower_map[quad_idx], 4);
-                frag_32b(make_coord(_0{}, j, 2 * i), mi) = lane_03 ? upper0 : lower0;
-                frag_32b(make_coord(_0{}, j, 2 * i + 1), mi) = lane_03 ? lower0 : upper0;
+                // lower0 = __shfl_sync(uint32_t(-1), lower0, lower_map[quad_idx], 4);
+                lower0 = __shfl_sync(uint32_t(-1), lower0, upper_map[quad_idx] ^ 2, 4);
+                frag_2(make_coord(_0{}, j, 2 * i), mi) = lane_03 ? upper0 : lower0;
+                frag_2(make_coord(_0{}, j, 2 * i + 1), mi) = lane_03 ? lower0 : upper0;
             }
         }
     }

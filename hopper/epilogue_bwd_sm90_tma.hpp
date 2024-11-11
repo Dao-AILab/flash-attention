@@ -78,7 +78,7 @@ struct CollectiveEpilogueBwd {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutdKV>, SmemAlignmentdKV> smem_dv;
     };
 
-    using ShapedKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen_q, d, head, batch)
+    using ShapedKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen_k, d, head, batch)
     using StridedKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
 
     using TMA_dKV = decltype(make_tma_copy(
@@ -196,8 +196,7 @@ struct CollectiveEpilogueBwd {
             if (warp_idx_sync == NumEpilogueThreads / cutlass::NumThreadsPerWarp - 1) {
                 cutlass::arch::NamedBarrier::sync(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
                                                 cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-                int const lane_predicate = cute::elect_one_sync();
-                if (lane_predicate) {
+                if (cute::elect_one_sync()) {
                     cute::copy(params.tma_store_dV, tdVsdV, tdVgdV);
                     cute::copy(params.tma_store_dK, tdKsdK, tdKgdK);
                     tma_store_arrive();
@@ -319,7 +318,7 @@ struct CollectiveEpilogueBwdGQA {
         cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutdKVaccumTMA>> smem_dkv;
     };
 
-    using ShapedKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen_q, d, head, batch)
+    using ShapedKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen_k, d, head, batch)
     using StridedKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
 
     using TMA_add_dKV = decltype(make_tma_copy(
@@ -427,6 +426,9 @@ struct CollectiveEpilogueBwdGQA {
         auto r2s_thr_copy_dKVaccum = r2s_tiled_copy_dKVaccum.get_thread_slice(thread_idx);
         Tensor tdKVsdKVaccum = r2s_thr_copy_dKVaccum.partition_D(sdKV);
 
+        // Make sure all WGs have finished reading K and V, otherwise we get racy dQ
+        // because smem_q could be changed.
+        cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
         Tensor taccdKVrdV = r2s_thr_copy_dKVaccum.retile_S(tdVrdV); // ((Atom,AtomNum), MMA_M, MMA_N)
         cute::copy(r2s_tiled_copy_dKVaccum, taccdKVrdV, tdKVsdKVaccum);
 

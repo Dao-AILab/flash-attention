@@ -271,6 +271,8 @@ struct CollectiveMainloopBwd {
     using PipelineState = typename MainloopPipeline::PipelineState;
     using MainloopPipeline_dO = typename cutlass::PipelineTmaAsync<kStages_dO>;
     using PipelineState_dO = typename MainloopPipeline_dO::PipelineState;
+    using MainloopPipeline_dQ = typename cutlass::PipelineAsync<1>;
+    using PipelineState_dQ = typename MainloopPipeline_dQ::PipelineState;
 
     // Set the bytes transferred in this TMA transaction (may involve multiple issues)
     static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutQ{})) * cutlass::sizeof_bits_v<Element> / 8);
@@ -330,7 +332,7 @@ struct CollectiveMainloopBwd {
         float const* ptr_dPsum;
         StrideLSE const stride_dPsum;
         float const softmax_scale;
-        int const window_size_left, window_size_right;
+        int const window_size_left, window_size_right, sink_token_length;
         float const softcap_val;
         int const num_batch;
         int* const dq_semaphore;
@@ -359,7 +361,7 @@ struct CollectiveMainloopBwd {
         float const* ptr_dPsum;
         StrideLSE const stride_dPsum;
         float const softmax_scale, softmax_scale_log2;
-        int const window_size_left, window_size_right;
+        int const window_size_left, window_size_right, sink_token_length;
         float const softcap_val;
         int const num_batch;
         int* const dq_semaphore;
@@ -441,7 +443,7 @@ struct CollectiveMainloopBwd {
                 args.ptr_LSE_log2, args.shape_LSE, args.stride_LSE_log2, args.ptr_dPsum, args.stride_dPsum,
                 args.softmax_scale,
                 !Has_softcap ? float(args.softmax_scale * M_LOG2E) : float(args.softcap_val * M_LOG2E),
-                args.window_size_left, args.window_size_right,
+                args.window_size_left, args.window_size_right, args.sink_token_length,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
@@ -499,8 +501,10 @@ struct CollectiveMainloopBwd {
         int m_block_max = cute::ceil_div(seqlen_q, kBlockM);
         if constexpr (Is_local) {
             static constexpr int kBlockN = get<1>(TileShape_MNK{});
-            int const seqlen_k = get_seqlen_k(params, bidb);
-            m_block_max = std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + seqlen_q - seqlen_k + params.window_size_left, kBlockM));;
+            if (n_block >= cute::ceil_div(params.sink_token_length, kBlockN)) {
+                int const seqlen_k = get_seqlen_k(params, bidb);
+                m_block_max = std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + seqlen_q - seqlen_k + params.window_size_left, kBlockM));
+            }
         }
         return m_block_max;
     }
@@ -673,6 +677,8 @@ struct CollectiveMainloopBwd {
     template <typename SharedStorage>
     CUTLASS_DEVICE void
     store_dq(Params const& params,
+             // MainloopPipeline_dQ pipeline_dq,
+             // PipelineState_dQ& smem_pipe_read_dq,
              SharedStorage &shared_storage,
              cute::tuple<int32_t, int32_t, int32_t> block_coord
              ) {
@@ -697,14 +703,15 @@ struct CollectiveMainloopBwd {
         int const num_head = get<2>(params.shape_Q);
         int *lock_ptr = !Deterministic ? nullptr : params.dq_semaphore + bidb * num_head + bidh;
         using Barrier = cutlass::GenericBarrier<cutlass::detail::SyncwarpSync>;
-        int lane_predicate = cute::elect_one_sync();
         #pragma unroll 2
         for (; m_block < m_block_max; ++m_block) {
             if constexpr (Deterministic) {
                 Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
             }
+            // Tried mbarrier instead of named barrier, but it was slower
             cutlass::arch::NamedBarrier::sync(kNThreadsdQ + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::dQFull) /*id*/);  // sdQ full, to be written to gmem
-            if (lane_predicate) {
+            // pipeline_dq.consumer_wait(smem_pipe_read_dq);
+            if (cute::elect_one_sync()) {
                 cute::copy(params.tma_add_dQ, tdQsdQ, tdQgdQ(_, _, _, m_block));
                 tma_store_arrive();
             }
@@ -713,6 +720,8 @@ struct CollectiveMainloopBwd {
                 Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
             }
             cutlass::arch::NamedBarrier::arrive(kNThreadsdQ + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::dQEmpty) /*id*/);  // sdQ empty, ready to be written to
+            // pipeline_dq.consumer_release(smem_pipe_read_dq);
+            // ++smem_pipe_read_dq;
         }
         if constexpr (Is_local && Deterministic) {
             constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -742,8 +751,10 @@ struct CollectiveMainloopBwd {
     mma(Params const& params,
         MainloopPipeline pipeline_q,
         MainloopPipeline_dO pipeline_do,
+        // MainloopPipeline_dQ pipeline_dq,
         PipelineState& smem_pipe_read,
         PipelineState_dO& smem_pipe_read_do,
+        // PipelineState_dQ& smem_pipe_write_dq,
         FrgTensordKV& tdKrdK,
         FrgTensordKV& tdVrdV,
         int thread_idx,
@@ -795,6 +806,7 @@ struct CollectiveMainloopBwd {
         auto wg_mma_dQ = tiled_mma_dQ.get_slice(warp_group_thread_layout_dq(NumdQWarpGgroups == NumMmaWarpGroups ? warp_group_idx : 0));
         // auto wg_mma_dQ = tiled_mma_dQ.get_slice(warp_group_thread_layout_dq(warp_group_idx));
         // auto wg_mma_dQ = tiled_mma_dQ.get_thread_slice(thread_idx);
+        auto thread0_mma_SdP = tiled_mma_SdP.get_thread_slice(_0{});
 
         auto smem_tiled_copy_PdS = make_tiled_copy_C(SmemCopyAtomPdS{}, tiled_mma_SdP);
         auto smem_thr_copy_PdS = smem_tiled_copy_PdS.get_thread_slice(thread_idx);
@@ -859,31 +871,68 @@ struct CollectiveMainloopBwd {
             constexpr bool Is_local = decltype(is_local_type)::value;
             Tensor cS = cute::make_identity_tensor(select<Row, Col>(TileShape_MNK{}));
             Tensor tScS = thread_mma_SdP.partition_C(cS);
+            Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(tSrS.layout()));
+            Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(tScS.layout()));
+            Tensor t0ScS = thread0_mma_SdP.partition_C(cS);
+            Tensor t0ScS_rowcol = make_tensor(t0ScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(t0ScS.layout()));
+            int const thread_col_offset = get<Col>(tScS_rowcol(_0{}, _0{}));
+            int const seqlenk_col_limit = seqlen_k - n_block * kBlockN - thread_col_offset;
             if constexpr (!Is_causal && !Is_local) {
+                // #pragma unroll
+                // for (int i = 0; i < size(tSrS); ++i) {
+                //     if (int(get<Col>(tScS(i))) >= int(seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
+                // }
                 #pragma unroll
-                for (int i = 0; i < size(tSrS); ++i) {
-                    if (int(get<Col>(tScS(i))) >= int(seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
+                for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                    if (int(get<Col>(t0ScS_rowcol(_0{}, n))) >= seqlenk_col_limit) {
+                        #pragma unroll
+                        for (int m = 0; m < size<0>(tSrS_rowcol); ++m) { tSrS_rowcol(m, n) = -INFINITY; }
+                    }
                 }
             } else {
-                int causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
+                int const thread_row_offset = get<Row>(tScS_rowcol(_0{}, _0{}));
                 if constexpr (Is_causal) {
+                    int causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
                     #pragma unroll
                     for (int i = 0; i < size(tSrS); ++i) {
-                        if (int(get<Col>(tScS(i))) >= std::min(int(get<Row>(tScS(i))) + causal_row_offset,
-                        // if (int(get<Col>(tScS(i))) >= __viaddmin_s32(int(get<Row>(tScS(i))), causal_row_offset,
-                                                                seqlen_k - n_block * kBlockN)) {
-                            tSrS(i) = -INFINITY;
-                        }
+                        // Somehow __viaddmin_s32 is a tiny bit (5 TFLOPS) slower for hdim 128 but
+                        // faster for hdim 64 (20 TFLOPS).
+                        int col_limit_right = !SeparateMaskingIterations
+                            ? std::min(int(get<Row>(tScS(i))) + causal_row_offset, seqlen_k - n_block * kBlockN)
+                            : __viaddmin_s32(int(get<Row>(tScS(i))), causal_row_offset, seqlen_k - n_block * kBlockN);
+                        if (int(get<Col>(tScS(i))) >= col_limit_right) { tSrS(i) = -INFINITY; }
                     }
+                    // int causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM - thread_col_offset + thread_row_offset;
+                    // #pragma unroll
+                    // for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                    //     // int col_limit_right = std::min(int(get<Row>(t0ScS_rowcol(m, _0{}))) + causal_row_offset, seqlenk_col_limit);
+                    //     int col_limit_right = __viaddmin_s32(int(get<Row>(t0ScS_rowcol(m, _0{}))), causal_row_offset, seqlenk_col_limit);
+                    //     #pragma unroll
+                    //     for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                    //         if (int(get<Col>(t0ScS_rowcol(_0{}, n))) >= col_limit_right) { tSrS_rowcol(m, n) = -INFINITY; }
+                    //     }
+                    // }
+                    // #pragma unroll
+                    // for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                    //     int row_limit_top = int(get<Col>(t0ScS_rowcol(_0{}, n))) - causal_row_offset;
+                    //     #pragma unroll
+                    //     for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                    //         if (int(get<Row>(t0ScS_rowcol(_0{}, n))) <= row_limit_top) { tSrS_rowcol(m, n) = -INFINITY; }
+                    //     }
+                    // }
                 } else {
+                    int causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
                     int local_row_offset_right = causal_row_offset + params.window_size_right;
                     int local_row_offset_left = causal_row_offset - 1 - params.window_size_left;
+                    int col_limit_sink = params.sink_token_length - n_block * kBlockN;
                     #pragma unroll
                     for (int i = 0; i < size(tSrS); ++i) {
-                        if (int(get<Col>(tScS(i))) >= std::min(int(get<Row>(tScS(i))) + local_row_offset_right, seqlen_k - n_block * kBlockN) ||
-                            int(get<Col>(tScS(i))) < int(get<Row>(tScS(i))) + local_row_offset_left) {
-                            tSrS(i) = -INFINITY;
-                        }
+                        int col_limit_right = std::min(int(get<Row>(tScS(i))) + local_row_offset_right, seqlen_k - n_block * kBlockN);
+                        // int col_limit_right = __viaddmin_s32(int(get<Row>(tScS(i))), local_row_offset_right, seqlen_k - n_block * kBlockN);
+                        int col_limit_left = int(get<Row>(tScS(i))) + local_row_offset_left;
+                        int col_idx = int(get<Col>(tScS(i)));
+                        if (col_idx >= col_limit_right) { tSrS(i) = -INFINITY; }
+                        if (col_idx < col_limit_left && col_idx >= col_limit_sink) { tSrS(i) = -INFINITY; }
                     }
                 }
             }
@@ -976,6 +1025,7 @@ struct CollectiveMainloopBwd {
                 cutlass::arch::fence_view_async_shared();
                 if constexpr (dQacc_use_TMA) {
                     cutlass::arch::NamedBarrier::sync(kNThreadsdQ + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::dQEmpty) /*id*/);  // sdQ empty, ready to be written to
+                    // cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<int>(BwdNamedBarriers::PdS) /*id*/);
                 } else {
                     cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<int>(BwdNamedBarriers::PdS) /*id*/);
                 }
@@ -984,10 +1034,14 @@ struct CollectiveMainloopBwd {
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/0, /*SwapAB=*/dQ_swapAB>(tiled_mma_dQ, tdQrdS_cur, tdQrK, tdQrdQ);
                 if constexpr (Mma_dKV_is_RS) { pipeline_q.consumer_release(smem_pipe_read); }  // release Q
                 if constexpr (dQacc_use_TMA) {
+                    // pipeline_dq.producer_acquire(smem_pipe_write_dq);
                     Tensor taccdQrdQ = r2s_thr_copy_dQaccum.retile_S(tdQrdQ);        // ((Atom,AtomNum), MMA_M, MMA_N)
                     cute::copy(r2s_tiled_copy_dQaccum, taccdQrdQ, tdQsdQaccum);
+                    // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x < 128 + 32) { printf("tid = %d, tdQsdQaccum addr = %p, bank = %d\n", threadIdx.x % 32, &tdQsdQaccum(0), (reinterpret_cast<int>(&tdQsdQaccum(0)) % 128) / 4); }
                     cutlass::arch::fence_view_async_shared();
                     cutlass::arch::NamedBarrier::arrive(kNThreadsdQ + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::dQFull) /*id*/);  // sdQ full, to be written to gmem
+                    // pipeline_dq.producer_commit(smem_pipe_write_dq);
+                    // ++smem_pipe_write_dq;
                 } else {
                     Tensor tdQrdQ_atomic = recast<float4>(tdQrdQ);
                     Tensor tdQgdQaccum_atomic = recast<float4>(tdQgdQaccum(_, _, _, m_block));
@@ -1046,7 +1100,18 @@ struct CollectiveMainloopBwd {
             }
         }
 
-        static constexpr int n_local_bottom_steps = (!Is_local || !SeparateMaskingIterations) ? 0 : cute::ceil_div(kBlockN, kBlockM) + 1;
+        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});
+        int const n_local_bottom_steps = (!Is_local || !SeparateMaskingIterations)
+            ? 0
+            : cute::ceil_div(kBlockN, kBlockM) + 1 +
+              (n_block >= cute::ceil_div(params.sink_token_length, kBlockN)
+               ? 0
+               // If this n_block has a sink token, m_block_max is ceil_div(seqlen_q, kBlockM), but
+               // the m_block_max_og without sink token is std::min(blah, blah).
+               // We need to apply local mask starting from m_block_max_og - (cute::ceil_div(kBlockN, kBlockM) + 1)
+               : m_block_max - std::min(cute::ceil_div(seqlen_q, kBlockM), cute::ceil_div((n_block + 1) * kBlockN + seqlen_q - seqlen_k + params.window_size_left, kBlockM)));
+
         auto mask_fn = [&](auto& tSrS, int m_block) { causal_local_mask_fn(tSrS, m_block, cute::bool_constant<Is_causal && !SeparateMaskingIterations>{}, cute::bool_constant<Is_local && !SeparateMaskingIterations>{}); };
         CUTLASS_PRAGMA_NO_UNROLL
         for (; m_block < m_block_max - n_local_bottom_steps; ++m_block) {

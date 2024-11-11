@@ -13,37 +13,47 @@ namespace flash {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-template<bool Varlen=false, int kBlock=128>
+// Host side kernel arguments
+struct TileSchedulerArguments {
+    // num_head is num_head_q if not PackGQA, else num_head_k
+    int const num_blocks, num_head, num_batch, num_splits;
+    int const qhead_per_khead;
+    int const seqlen;  // Only used if Varlen and cu_seqlens == nullptr and seqused == nullptr
+    int* const tile_count_semaphore = nullptr;
+    int* const cu_seqlens = nullptr;
+    int* const seqused = nullptr;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
+template<bool Varlen=false, bool Split=false, bool PackGQA=false, int kBlock=128>
 class SingleTileScheduler {
 
 public:
 
     using SharedStorage = int;
 
-    // Host side kernel arguments
-    struct Arguments {
-        int const num_blocks, num_head, num_batch;
-        int* const tile_count_semaphore = nullptr;
-        int* const cu_seqlens = nullptr;
-        int* const seqused = nullptr;
-    };
-
     // Device side kernel params
     struct Params {
-        int const num_blocks, num_head, num_batch;
+        int const num_blocks, num_head, num_batch, num_splits;
+        int const qhead_per_khead;
+        int const seqlen;
+        cutlass::FastDivmod nsplits_divmod;
         int* const cu_seqlens;
         int* const seqused;
     };
 
     static Params
-    to_underlying_arguments(Arguments const& args) {
-        return {args.num_blocks, args.num_head, args.num_batch,
+    to_underlying_arguments(TileSchedulerArguments const& args) {
+        return {args.num_blocks, args.num_head, args.num_batch, !Split ? 1 : args.num_splits,
+                args.qhead_per_khead, args.seqlen,
+                cutlass::FastDivmod(!Split ? 1 : args.num_splits),
                 !Varlen ? nullptr : args.cu_seqlens, !Varlen ? nullptr : args.seqused};
     }
 
     static dim3
     get_grid_shape(Params const& params, int num_sm) {
-        return {uint32_t(params.num_blocks), uint32_t(params.num_head), uint32_t(params.num_batch)};
+        return {uint32_t(params.num_blocks), uint32_t((!Split ? 1 : params.num_splits) * params.num_head), uint32_t(params.num_batch)};
     }
 
     struct WorkTileInfo {
@@ -59,9 +69,15 @@ public:
         }
 
         CUTLASS_DEVICE
-        cute::tuple<int32_t, int32_t, int32_t>
+        cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
-            return {block_idx, bidh, bidb};
+            if constexpr (!Split) {
+                return {block_idx, bidh, bidb, 0 /*split_idx*/};
+            } else {
+                int split_idx;
+                int bidh_actual = params.nsplits_divmod.divmod(split_idx, bidh);
+                return {block_idx, bidh_actual, bidb, split_idx};
+            }
         }
 
     };
@@ -75,7 +91,11 @@ public:
     get_initial_work(Params const& params) const {
         WorkTileInfo work_info {int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), true};
         if constexpr (Varlen) {
-            work_info.is_valid_tile = work_info.block_idx * kBlock < (params.seqused ? params.seqused[work_info.bidb] : params.cu_seqlens[work_info.bidb + 1] - params.cu_seqlens[work_info.bidb]);
+            int seqlen = params.seqused
+                ? params.seqused[work_info.bidb]
+                : (params.cu_seqlens ? params.cu_seqlens[work_info.bidb + 1] - params.cu_seqlens[work_info.bidb] : params.seqlen);
+            if constexpr (PackGQA) { seqlen *= params.qhead_per_khead; }
+            work_info.is_valid_tile = work_info.block_idx * kBlock < seqlen;
         }
         return work_info;
     }
@@ -99,30 +119,25 @@ public:
 
 ///////////////////////////////////////////////////////////////////////////////
 
+template<bool Split=false>
 class StaticPersistentTileScheduler {
 
 public:
 
     using SharedStorage = int;
 
-    // Host side kernel arguments
-    struct Arguments {
-        int const num_blocks, num_head, num_batch;
-        int* const tile_count_semaphore = nullptr;
-        int* const cu_seqlens = nullptr;
-        int* const seqused = nullptr;
-    };
-
     // Device side kernel params
     struct Params {
         int total_blocks;
         cutlass::FastDivmod m_block_divmod, head_divmod;
+        cutlass::FastDivmod nsplits_divmod;
     };
 
     static Params
-    to_underlying_arguments(Arguments const& args) {
-        return {args.num_blocks * args.num_head * args.num_batch,
-                cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head)};
+    to_underlying_arguments(TileSchedulerArguments const& args) {
+        return {args.num_blocks * args.num_head * args.num_batch * (!Split ? 1 : args.num_splits),
+                cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head * (!Split ? 1 : args.num_splits)),
+                cutlass::FastDivmod(!Split ? 1 : args.num_splits)};
     }
 
     static dim3
@@ -140,11 +155,15 @@ public:
         }
 
         CUTLASS_DEVICE
-        cute::tuple<int32_t, int32_t, int32_t>
+        cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
             int block, bidh, bidb;
             bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(block, tile_idx));
-            return {block, bidh, bidb};
+            int split_idx = 0;
+            if constexpr (Split) {
+                bidh = params.nsplits_divmod.divmod(split_idx, bidh);
+            }
+            return {block, bidh, bidb, split_idx};
         }
 
     };
@@ -176,7 +195,8 @@ public:
 
 };
 
-template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp>
+template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
+        bool Split=false>
 class DynamicPersistentTileScheduler {
 
 public:
@@ -187,25 +207,19 @@ protected:
 
 public:
 
-    // Host side kernel arguments
-    struct Arguments {
-        int const num_blocks, num_head, num_batch;
-        int* const tile_count_semaphore;
-        int* const cu_seqlens = nullptr;
-        int* const seqused = nullptr;
-    };
-
     // Device side kernel params
     struct Params {
         int const total_blocks;
         cutlass::FastDivmod const m_block_divmod, head_divmod;
+        cutlass::FastDivmod nsplits_divmod;
         int* const tile_count_semaphore;
     };
 
     static Params
-    to_underlying_arguments(Arguments const& args) {
-        return {args.num_blocks * args.num_head * args.num_batch,
-                cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head),
+    to_underlying_arguments(TileSchedulerArguments const& args) {
+        return {args.num_blocks * args.num_head * args.num_batch * (!Split ? 1 : args.num_splits),
+                cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head * (!Split ? 1 : args.num_splits)),
+                cutlass::FastDivmod(!Split ? 1 : args.num_splits),
                 args.tile_count_semaphore};
     }
 
@@ -224,11 +238,15 @@ public:
         }
 
         CUTLASS_DEVICE
-        cute::tuple<int32_t, int32_t, int32_t>
+        cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
             int block, bidh, bidb;
             bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(block, tile_idx));
-            return {block, bidh, bidb};
+            int split_idx = 0;
+            if constexpr (Split) {
+                bidh = params.nsplits_divmod.divmod(split_idx, bidh);
+            }
+            return {block, bidh, bidb, split_idx};
         }
 
     };
@@ -280,7 +298,8 @@ public:
 
 };
 
-template<int kBlock, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp>
+
+template<int kBlock, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp, bool Split=false, bool PackGQA=false>
 class VarlenDynamicPersistentTileScheduler {
 
 public:
@@ -291,25 +310,24 @@ protected:
 
 public:
 
-    // Host side kernel arguments
-    struct Arguments {
-        int const num_blocks, num_head, num_batch;
-        int* const tile_count_semaphore;
-        int* const cu_seqlens;
-        int* const seqused;
-    };
-
     // Device side kernel params
     struct Params {
         int num_head, num_batch;
+        int const qhead_per_khead;
+        int const seqlen;
+        cutlass::FastDivmod nsplits_divmod;
         int* const tile_count_semaphore;
         int* const cu_seqlens;
         int* const seqused;
     };
 
     static Params
-    to_underlying_arguments(Arguments const& args) {
-        return {args.num_head, args.num_batch,
+    to_underlying_arguments(TileSchedulerArguments const& args) {
+        // If Split, for the purpose of scheduling, we pretend that instead there are
+        // (args.num_splits * args.num_head) number of heads.
+        return {args.num_head * (!Split ? 1 : args.num_splits), args.num_batch,
+                args.qhead_per_khead, args.seqlen,
+                cutlass::FastDivmod(!Split ? 1 : args.num_splits),
                 args.tile_count_semaphore, args.cu_seqlens, args.seqused};
     }
 
@@ -329,9 +347,15 @@ public:
         }
 
         CUTLASS_DEVICE
-        cute::tuple<int32_t, int32_t, int32_t>
+        cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
-            return {block, bidh, bidb};
+            if constexpr (!Split) {
+                return {block, bidh, bidb, 0 /*split_idx*/};
+            } else {
+                int split_idx;
+                int bidh_actual = params.nsplits_divmod.divmod(split_idx, bidh);
+                return {block, bidh_actual, bidb, split_idx};
+            }
         }
     };
 
@@ -351,17 +375,20 @@ public:
             return val;
         };
 
-        auto get_num_m_blocks = [&](int bidb) {
+        auto get_num_m_blocks = [&](int bidb_start) {
             int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
             int seqlen;
             if (params.seqused) {
-                seqlen = lane + bidb < params.num_batch ? params.seqused[lane + bidb] : 0;
-            } else {
-                int cur_cu_seqlen = lane + bidb <= params.num_batch ? params.cu_seqlens[lane + bidb] : 0;
+                seqlen = lane + bidb_start < params.num_batch ? params.seqused[lane + bidb_start] : 0;
+            } else if (params.cu_seqlens) {
+                int cur_cu_seqlen = lane + bidb_start <= params.num_batch ? params.cu_seqlens[lane + bidb_start] : 0;
                 int next_cu_seqlen = __shfl_down_sync(0xffffffff, cur_cu_seqlen, 1);
                 seqlen = next_cu_seqlen - cur_cu_seqlen;
+            } else {
+                seqlen = params.seqlen;
             }
-            return lane + bidb < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
+            if constexpr (PackGQA) { seqlen *= params.qhead_per_khead; }
+            return lane + bidb_start < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
                 ? cute::ceil_div(seqlen, kBlock) : 0;
         };
 
@@ -372,14 +399,14 @@ public:
         int m_blocks_in_group = __shfl_sync(0xffffffff, num_m_blocks_cumulative, cutlass::NumThreadsPerWarp - 1);
         int group_end_tile = current_work.tile_idx - current_work.block - current_work.bidh * __shfl_sync(0xffffffff, num_m_blocks, 0 /*lane*/) + m_blocks_in_group * params.num_head;  // Same for all lanes
         int bidb = current_work.bidb;
-        // if (blockIdx.x <= 9 && threadIdx.x == 128) {
-        //     printf("Before while, blockIdx.x = %d, threadIdx.x = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, group_end_tile = %d, mh_blocks_in_group = %d\n", blockIdx.x, threadIdx.x, bidb, num_m_blocks, next_tile_idx, group_end_tile, mh_blocks_in_group);
+        // if (blockIdx.x <= 9 && threadIdx.x == 0) {
+        //     printf("Before while, blockIdx.x = %d, threadIdx.x = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, group_end_tile = %d, m_blocks_in_group = %d\n", blockIdx.x, threadIdx.x, bidb, num_m_blocks, next_tile_idx, group_end_tile, m_blocks_in_group);
         // }
         while (group_end_tile <= next_tile_idx) {
             bidb += cutlass::NumThreadsPerWarp - 1;
             if (bidb >= params.num_batch) {
-                // if (blockIdx.x <= 9 && threadIdx.x == 128) {
-                //     printf("Returning early, blockIdx.x = %d, threadIdx.x = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, group_end_tile = %d, mh_blocks_in_group = %d\n", blockIdx.x, threadIdx.x, bidb, num_m_blocks, next_tile_idx, group_end_tile, mh_blocks_in_group);
+                // if (blockIdx.x <= 9 && threadIdx.x == 0) {
+                //     printf("Returning early, blockIdx.x = %d, threadIdx.x = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, group_end_tile = %d, m_blocks_in_group = %d\n", blockIdx.x, threadIdx.x, bidb, num_m_blocks, next_tile_idx, group_end_tile, m_blocks_in_group);
                 // }
                 return {next_tile_idx, 0, 0, params.num_batch};
             }
@@ -387,8 +414,8 @@ public:
             num_m_blocks_cumulative = prefix_sum(num_m_blocks);
             m_blocks_in_group = __shfl_sync(0xffffffff, num_m_blocks_cumulative, cutlass::NumThreadsPerWarp - 1);
             group_end_tile += m_blocks_in_group * params.num_head;
-            // if (blockIdx.x <= 9 && threadIdx.x == 128) {
-            //     printf("Bottom of while, blockIdx.x = %d, threadIdx.x = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, group_end_tile = %d, mh_blocks_in_group = %d\n", blockIdx.x, threadIdx.x, bidb, num_m_blocks, next_tile_idx, group_end_tile, mh_blocks_in_group);
+            // if (blockIdx.x <= 9 && threadIdx.x == 0) {
+            //     printf("Bottom of while, blockIdx.x = %d, threadIdx.x = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, group_end_tile = %d, m_blocks_in_group = %d\n", blockIdx.x, threadIdx.x, bidb, num_m_blocks, next_tile_idx, group_end_tile, m_blocks_in_group);
             // }
         }
         int group_start_tile = group_end_tile - m_blocks_in_group * params.num_head;
@@ -400,8 +427,8 @@ public:
         int mh_block = next_tile_idx - group_start_tile - (batch_idx_in_group == 0 ? 0 : __shfl_sync(0xffffffff, num_m_blocks_cumulative, batch_idx_in_group - 1)) * params.num_head;
         int bidh = mh_block / num_m_blocks;
         int block = mh_block - bidh * num_m_blocks;
-        // if (blockIdx.x <= 9 && threadIdx.x == 128) {
-        //     printf("blockIdx.x = %d, threadIdx.x = %d, num_mh_blocks = %d, batch_idx_in_group = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, group_end_tile = %d, mh_blocks_in_group = %d, mh_block = %d, bidh = %d, block = %d\n", blockIdx.x, threadIdx.x, num_mh_blocks, batch_idx_in_group, bidb, num_m_blocks, next_tile_idx, group_end_tile, mh_blocks_in_group, mh_block, bidh, block);
+        // if (blockIdx.x <= 9 && threadIdx.x == 0) {
+        //     printf("blockIdx.x = %d, threadIdx.x = %d, batch_idx_in_group = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, group_end_tile = %d, m_blocks_in_group = %d, mh_block = %d, bidh = %d, block = %d\n", blockIdx.x, threadIdx.x, batch_idx_in_group, bidb, num_m_blocks, next_tile_idx, group_end_tile, m_blocks_in_group, mh_block, bidh, block);
         // }
         return {next_tile_idx, block, bidh, bidb};
     }

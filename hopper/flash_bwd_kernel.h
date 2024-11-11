@@ -51,7 +51,7 @@ public:
     static_assert(ArchTag::kMinComputeCapability >= 90);
 
     using TileScheduler = TileScheduler_;
-    using TileSchedulerArguments = typename TileScheduler::Arguments;
+    using TileSchedulerArguments = typename flash::TileSchedulerArguments;
     using TileSchedulerParams = typename TileScheduler::Params;
 
     static constexpr uint32_t NumLoadWarpGroups = 1;
@@ -82,6 +82,7 @@ public:
             alignas(16) cutlass::arch::ClusterBarrier barrier_dKV;
             alignas(16) typename CollectiveMainloop::MainloopPipeline::SharedStorage pipeline_q;
             alignas(16) typename CollectiveMainloop::MainloopPipeline_dO::SharedStorage pipeline_do;
+            // alignas(16) typename CollectiveMainloop::MainloopPipeline_dQ::SharedStorage pipeline_dq;
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
 
@@ -161,6 +162,9 @@ public:
         using MainloopPipeline_dO = typename CollectiveMainloop::MainloopPipeline_dO;
         using PipelineParams_dO = typename MainloopPipeline_dO::Params;
         using PipelineState_dO = typename MainloopPipeline_dO::PipelineState;
+        // using MainloopPipeline_dQ = typename CollectiveMainloop::MainloopPipeline_dQ;
+        // using PipelineParams_dQ = typename MainloopPipeline_dQ::Params;
+        // using PipelineState_dQ = typename MainloopPipeline_dQ::PipelineState;
         static constexpr bool Q_dO_same_stages = std::is_same_v<MainloopPipeline, MainloopPipeline_dO>;
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
@@ -197,6 +201,15 @@ public:
             : MainloopPipeline_dO::ThreadCategory::Consumer;
         PipelineParams_dO pipeline_params_dO {pipeline_params.transaction_bytes, role_dO, pipeline_params.is_leader, pipeline_params.num_consumers};
         MainloopPipeline_dO pipeline_do(shared_storage.pipelines.pipeline_do, cute::conditional_return<Q_dO_same_stages>(pipeline_params, pipeline_params_dO), ClusterShape{});
+        // PipelineParams_dQ pipeline_params_dQ;
+        // int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
+        // pipeline_params_dQ.role = warp_group_idx == 0 && warp_idx_in_warpgroup == 1
+        //     ? MainloopPipeline_dQ::ThreadCategory::Consumer
+        //     : MainloopPipeline_dQ::ThreadCategory::Producer;
+        // pipeline_params_dQ.producer_arv_count = NumMmaThreads;
+        // pipeline_params_dQ.consumer_arv_count = cutlass::NumThreadsPerWarp;
+        // pipeline_params_dQ.dst_blockid = 0;
+        // MainloopPipeline_dQ pipeline_dq(shared_storage.pipelines.pipeline_dq, pipeline_params_dQ);
 
         CollectiveMainloop collective_mainloop;
         CollectiveEpilogue collective_epilogue;
@@ -221,8 +234,9 @@ public:
                 for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler);
                      work_tile_info.is_valid(params.scheduler);
                      work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)) {
-                    auto block_coord = work_tile_info.get_block_coord(params.scheduler);
-                    auto [n_block, bidh, bidb] = block_coord;
+                    auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
+                    auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
+                    cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
                     // With Varlen it's possible to have query length = 0. We want to skip the iteration.
                     if constexpr (Is_causal || Is_local || Varlen) {
                         int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
@@ -240,18 +254,22 @@ public:
                 }
                 collective_mainloop.load_tail(pipeline_q, pipeline_do, smem_pipe_write, smem_pipe_write_do);
             } else if (warp_idx_in_warpgroup == 1) {
+                // PipelineState_dQ smem_pipe_read_dq;
                 TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
                 for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
                      work_tile_info.is_valid(params.scheduler);
                      work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
-                    auto block_coord = work_tile_info.get_block_coord(params.scheduler);
-                    auto [n_block, bidh, bidb] = block_coord;
+                    auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
+                    auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
+                    cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
                     if constexpr (Is_causal || Is_local || Varlen) {
                         int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
                         int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
                         if (m_block_min >= m_block_max) { continue; }
                     }
-                    collective_mainloop.store_dq(params.mainloop, shared_storage, block_coord);
+                    // collective_mainloop.store_dq(params.mainloop, pipeline_dq, smem_pipe_read_dq,
+                    collective_mainloop.store_dq(params.mainloop,
+                                                 shared_storage, block_coord);
                 }
             }
         } else {  // Consumer
@@ -263,6 +281,7 @@ public:
 
             PipelineState smem_pipe_read;
             PipelineState_dO smem_pipe_read_do;
+            // PipelineState_dQ smem_pipe_write_dq = cutlass::make_producer_start_state<MainloopPipeline_dQ>();
 
             collective_mainloop.mma_init();
             scheduler.init_consumer();
@@ -272,8 +291,9 @@ public:
             for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
                  work_tile_info.is_valid(params.scheduler);
                  work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
-                auto block_coord = work_tile_info.get_block_coord(params.scheduler);
-                auto [n_block, bidh, bidb] = block_coord;
+                auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
+                auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
+                cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
                 if constexpr (Is_causal || Is_local || Varlen) {
                     int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
                     int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
@@ -286,8 +306,12 @@ public:
                 // dK and dV output accumulator.
                 Tensor tdKrdK = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
                 Tensor tdVrdV = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
-                collective_mainloop.mma(params.mainloop, pipeline_q, pipeline_do, smem_pipe_read, smem_pipe_read_do,
-                                        tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage);
+                // collective_mainloop.mma(params.mainloop, pipeline_q, pipeline_do, pipeline_dq,
+                //                         smem_pipe_read, smem_pipe_read_do, smem_pipe_write_dq,
+                collective_mainloop.mma(params.mainloop, pipeline_q, pipeline_do,
+                                        smem_pipe_read, smem_pipe_read_do,
+                                        tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx,
+                                        block_coord, shared_storage);
                 collective_epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
                                           threadIdx.x - NumCopyThreads, block_coord);
 
