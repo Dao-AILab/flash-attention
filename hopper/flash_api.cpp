@@ -1442,14 +1442,14 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         }
     }
 
-    if (seqlen_k > 0 && batch_size > 0) {
+    if (seqlen_q > 0 && total_q > 0 && seqlen_k > 0 && batch_size > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
         if (num_splits > 1) {
             params.is_bf16 = true;  // Since we want output in BF16. Otherwise fwd_combine will output to FP16
             run_mha_fwd_combine(params, stream);
         }
-    } else if (batch_size > 0) {
+    } else if (seqlen_q > 0 && total_q > 0 && batch_size > 0) {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
         out.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());

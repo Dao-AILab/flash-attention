@@ -16,6 +16,7 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 
 #include "named_barrier.hpp"
+#include "mask.h"
 #include "utils.h"
 
 namespace flash {
@@ -409,6 +410,70 @@ struct CollectiveMainloopFwd {
         return {n_block_min, n_block_max};
 
     }
+
+    template <typename SharedStorage>
+    CUTLASS_DEVICE void
+    load_Q(Params const& params,
+           int const thread_idx,
+           int const seqlen_q,
+           SharedStorage &shared_storage,
+           cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord
+         ) {
+        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        Tensor sQ = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{}));
+
+        auto [m_block, bidh, bidb, split_idx] = block_coord;
+        GmemTiledCopyQCpAsync gmem_tiled_copy_Q_cp_async;
+        auto gmem_thr_copy_Q_cp_async = gmem_tiled_copy_Q_cp_async.get_thread_slice(thread_idx);
+        // Reshape Q to be ((qhead_per_khead, seqlen_q), head_size, nhead_k, batch_size)
+        bool const is_varlen_q = Varlen && params.cu_seqlens_q != nullptr;
+        int const offset_q = !is_varlen_q ? 0 : params.cu_seqlens_q[bidb];
+        Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mQ_copy = cute::tiled_divide(mQ, Shape<_1, Int<kGmemElemsPerLoad>>{});
+        Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+        Tensor tQcQ = gmem_thr_copy_Q_cp_async.partition_S(cQ);       // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
+        Tensor tQsQ = gmem_thr_copy_Q_cp_async.partition_D(sQ);       // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
+        Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
+        #pragma unroll
+        for (int k = 0; k < size(tQpQ); ++k) { tQpQ(k) = get<1>(tQcQ(_0{}, _0{}, k)) < get<1>(params.shape_Q); }
+        // if (thread_idx == 0 && m_block == 0) { print(cQ); printf("\n"); print(tQcQ); printf("\n"); print(tQsQ); printf("\n"); print(tQpQ); printf("\n"); }
+        // Similar to loading K and V when PagedKV, it's expensive to compute the pointers for Q.
+        // We split the work among threads loading the same row of Q, then __shfl_sync the pointers.
+        static constexpr int kQPtrPerThread = cute::ceil_div(size<1>(tQsQ), kGmemThreadsPerRow);
+        Tensor tPrQPtr = make_tensor<Element const*>(Shape<Int<kQPtrPerThread>>{});
+        #pragma unroll
+        for (int i = 0; i < kQPtrPerThread; ++i) {
+            int const row = i * NumMmaThreads + (thread_idx % kGmemThreadsPerRow) * (NumMmaThreads / kGmemThreadsPerRow) + (thread_idx / kGmemThreadsPerRow);
+            int const idx = m_block * kBlockM + row;
+            int m_idx, h_idx;
+            m_idx = params.qhead_per_khead_divmod.divmod(h_idx, idx);
+            tPrQPtr[i] = &mQ(make_coord(h_idx, m_idx), _0{});
+        }
+        int const qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
+        #pragma unroll
+        for (int m = 0; m < size<1>(tQsQ); ++m) {
+            int idx = m_block * kBlockM + get<0>(tQcQ(_0{}, m, _0{}));
+            Element const* q_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrQPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
+            if (idx < seqlen_q * qhead_per_khead) {
+                // if (thread_idx == 0) { printf("m: %d, m_idx: %d, h_idx: %d, q_ptr = %p, q_ptr_og = %p\n", m, m_idx, h_idx, q_ptr, &mQ_copy(0, make_coord(h_idx, m_idx), 0));}
+                Tensor mQ_cur = make_tensor(make_gmem_ptr(q_ptr), Shape<Int<kHeadDim>>{});
+                Tensor mQ_cur_copy = cute::tiled_divide(mQ_cur, Shape<Int<kGmemElemsPerLoad>>{});
+                #pragma unroll
+                for (int k = 0; k < size<2>(tQsQ); ++k) {
+                    int ki = get<1>(tQcQ(_0{}, _0{}, k)) / kGmemElemsPerLoad;
+                    // the "tiled_copy.with(tQpQ(k))"" will fill in zero for columns where tQpQ(k) is false
+                    // TODO: check this
+                    cute::copy(gmem_tiled_copy_Q_cp_async.with(tQpQ(k)), mQ_cur_copy(_, ki), tQsQ(_, m, k));
+                }
+            } // Don't need to fill in 0s for sQ since we're not gonna write the output to gmem for those rows
+        }
+        // cute::cp_async_fence();
+        // This will call cp.async.wait_all which doesn't need the cp_async_fence.
+        cutlass::arch::cp_async_wait<0>();
+        cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<int>(FwdNamedBarriers::QueryFull) /*id*/);
+        // if (thread_idx == 0 && m_block == 0) { print_tensor(sQ(_, _0{})); }
+    }
+
 
     template <typename SchedulerPrefetch, typename SharedStorage>
     CUTLASS_DEVICE void
@@ -839,11 +904,8 @@ struct CollectiveMainloopFwd {
         int warp_group_idx = __shfl_sync(0xFFFFFFFF, thread_idx / cutlass::NumThreadsPerWarpGroup, 0);
         TiledMma0 tiled_mma0;
         TiledMma1 tiled_mma1;
-
         auto wg_mma0 = tiled_mma0.get_slice(warp_group_thread_layout(warp_group_idx));
         auto wg_mma1 = tiled_mma1.get_slice(warp_group_thread_layout(warp_group_idx));
-        auto thread_mma0 = tiled_mma0.get_thread_slice(thread_idx);
-        auto thread0_mma0 = tiled_mma0.get_thread_slice(_0{});  // Only used for masking
 
         // Allocate "fragments/descriptors"
         Tensor tSrQ = wg_mma0.partition_fragment_A(sQ);
@@ -867,86 +929,11 @@ struct CollectiveMainloopFwd {
         auto [n_block_min, n_block_max] = get_n_block_min_max(params, m_block, bidb, split_idx, params.num_splits);
         int n_block = n_block_max - 1;
 
-        auto causal_local_mask_fn = [&](auto& tSrS, int const n_block, auto need_seqlenk_masking_type, auto is_causal_type, auto is_local_type) {
-            constexpr bool Need_seqlenk_masking = decltype(need_seqlenk_masking_type)::value;
-            constexpr bool Is_causal = decltype(is_causal_type)::value;
-            constexpr bool Is_local = decltype(is_local_type)::value;
-            Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
-            Tensor tScS = thread_mma0.partition_C(cS);
-            Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
-            Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol(tScS.layout()));
-            Tensor t0ScS = thread0_mma0.partition_C(cS);
-            Tensor t0ScS_rowcol = make_tensor(t0ScS.data(), flash::convert_layout_acc_rowcol(t0ScS.layout()));
-            // We want to use the col indices of thread0 to compare, since that is known at compile time.
-            // So we subtract the limit by the first col index of this thread (get<1>(tScS_rowcol(_0{}, _0{})))
-            int const thread_col_offset = get<1>(tScS_rowcol(_0{}, _0{}));
-            int const seqlenk_col_limit = seqlen_k - n_block * kBlockN - thread_col_offset;
-            if constexpr (!Is_causal && !Is_local) {
-                if constexpr (Need_seqlenk_masking) {  // Just masking based on col
-                    #pragma unroll
-                    for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-                        if (int(get<1>(t0ScS_rowcol(_0{}, n))) >= seqlenk_col_limit) {
-                            #pragma unroll
-                            for (int m = 0; m < size<0>(tSrS_rowcol); ++m) { tSrS_rowcol(m, n) = -INFINITY; }
-                        }
-                    }
-                }
-            } else {  // mask based on both row and col
-                // If PackGQA, we split the work of compute divmod among threads in the same row
-                static constexpr int kMmaThreadsPerRow = size<0, 0>(typename TiledMma0::AtomLayoutC_TV{});
-                static_assert(cutlass::NumThreadsPerWarp % kMmaThreadsPerRow == 0);
-                static_assert(CUTE_STATIC_V(size<0>(tSrS_rowcol)) <= kMmaThreadsPerRow);
-                int mma_m_idx;
-                // Might get OOB but it's ok since we'll check it later
-                if constexpr (PackGQA) {
-                    mma_m_idx = params.qhead_per_khead_divmod.divide(m_block * kBlockM + get<0>(tScS_rowcol(thread_idx % kMmaThreadsPerRow, _0{})));
-                }
-                int causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q - thread_col_offset;
-                if constexpr (Is_causal) {
-                    #pragma unroll
-                    for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
-                        int row_idx = get<0>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
-                        // if constexpr (PackGQA) { row_idx = params.qhead_per_khead_divmod.divide(row_idx); }
-                        if constexpr (PackGQA) {
-                            row_idx = __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
-                        }
-                        int col_limit_right = !Need_seqlenk_masking
-                            ? row_idx + causal_row_offset
-                            // : std::min(row_idx + causal_row_offset, seqlenk_col_limit);
-                            : __viaddmin_s32(row_idx, causal_row_offset, seqlenk_col_limit);
-                            // Slightly slower for hdim 64 and slightly faster for hdim128
-                        #pragma unroll
-                        for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-                            if (int(get<1>(t0ScS_rowcol(_0{}, n))) >= col_limit_right) { tSrS_rowcol(m, n) = -INFINITY; }
-                        }
-                    }
-                } else {
-                    int local_row_offset_right = causal_row_offset + params.window_size_right;
-                    int local_row_offset_left = causal_row_offset - 1 - params.window_size_left;
-                    int col_limit_sink = params.sink_token_length - n_block * kBlockN;
-                    #pragma unroll
-                    for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
-                        int row_idx = get<0>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
-                        // if constexpr (PackGQA) { row_idx = params.qhead_per_khead_divmod.divide(row_idx); }
-                        if constexpr (PackGQA) {
-                            row_idx = __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
-                        }
-                        int col_limit_right = !Need_seqlenk_masking
-                            ? row_idx + local_row_offset_right
-                            // : std::min(row_idx, seqlenk_col_limit);
-                            : __viaddmin_s32(row_idx, local_row_offset_right, seqlenk_col_limit);
-                        int col_limit_left = row_idx + local_row_offset_left;
-                        #pragma unroll
-                        for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-                            int col_idx = int(get<1>(t0ScS_rowcol(m, n)));
-                            if (col_idx >= col_limit_right || (col_idx < col_limit_left && col_idx >= col_limit_sink)) { tSrS_rowcol(m, n) = -INFINITY; }
-                        }
-                    }
-                }
-            }
-        };
+        flash::Mask<kBlockM, kBlockN, PackGQA> mask(
+            seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
+            params.qhead_per_khead_divmod
+        );
 
-        int const qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
         if constexpr (!PackGQA) {
             typename cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.pipelines.barrier_Q.try_wait(work_idx % 2));
             if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.pipelines.barrier_Q.wait(work_idx % 2); }
@@ -955,58 +942,7 @@ struct CollectiveMainloopFwd {
             // since all MMA threads sync in the epilogue before writing to smem_o.
             // So any thread gets there, all threads must have finished the previous MMA and at least started
             // writing to smem_o.
-            GmemTiledCopyQCpAsync gmem_tiled_copy_Q_cp_async;
-            auto gmem_thr_copy_Q_cp_async = gmem_tiled_copy_Q_cp_async.get_thread_slice(thread_idx);
-            int bidh = get<1>(block_coord);
-            // Reshape Q to be ((qhead_per_khead, seqlen_q), head_size, nhead_k, batch_size)
-            bool const is_varlen_q = Varlen && params.cu_seqlens_q != nullptr;
-            int offset_q = !is_varlen_q ? 0 : params.cu_seqlens_q[bidb];
-            Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
-            Tensor mQ_copy = cute::tiled_divide(mQ, Shape<_1, Int<kGmemElemsPerLoad>>{});
-            Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ) / 8));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
-            Tensor tQcQ = gmem_thr_copy_Q_cp_async.partition_S(cQ);       // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
-            Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
-            Tensor tQsQ = gmem_thr_copy_Q_cp_async.partition_D(sQ_pi);       // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
-            Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
-            #pragma unroll
-            for (int k = 0; k < size(tQpQ); ++k) { tQpQ(k) = get<1>(tQcQ(_0{}, _0{}, k)) < get<1>(params.shape_Q); }
-            // Similar to loading K and V when PagedKV, it's expensive to compute the pointers for Q.
-            // We split the work among threads loading the same row of Q, then __shfl_sync the pointers.
-            static constexpr int kQPtrPerThread = cute::ceil_div(size<1>(tQsQ), kGmemThreadsPerRow);
-            Tensor tPrQPtr = make_tensor<Element const*>(Shape<Int<kQPtrPerThread>>{});
-            #pragma unroll
-            for (int i = 0; i < kQPtrPerThread; ++i) {
-                int const row = i * NumMmaThreads + (thread_idx % kGmemThreadsPerRow) * (NumMmaThreads / kGmemThreadsPerRow) + (thread_idx / kGmemThreadsPerRow);
-                int const idx = m_block * kBlockM + row;
-                int m_idx, h_idx;
-                m_idx = params.qhead_per_khead_divmod.divmod(h_idx, idx);
-                tPrQPtr[i] = &mQ(make_coord(h_idx, m_idx), _0{});
-            }
-            #pragma unroll
-            for (int m = 0; m < size<1>(tQsQ); ++m) {
-                int idx = m_block * kBlockM + get<0>(tQcQ(_0{}, m, _0{}));
-                Element const* q_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrQPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
-                if (idx < seqlen_q * qhead_per_khead) {
-                    // int m_idx, h_idx;
-                    // m_idx = params.qhead_per_khead_divmod.divmod(h_idx, idx);
-                    // if (thread_idx == 0) { printf("m: %d, m_idx: %d, h_idx: %d, q_ptr = %p, q_ptr_og = %p\n", m, m_idx, h_idx, q_ptr, &mQ_copy(0, make_coord(h_idx, m_idx), 0));}
-                    Tensor mQ_cur = make_tensor(make_gmem_ptr(q_ptr), Shape<Int<kHeadDim>>{});
-                    Tensor mQ_cur_copy = cute::tiled_divide(mQ_cur, Shape<Int<kGmemElemsPerLoad>>{});
-                    #pragma unroll
-                    for (int k = 0; k < size<2>(tQsQ); ++k) {
-                        int ki = get<1>(tQcQ(_0{}, _0{}, k)) / kGmemElemsPerLoad;
-                        // the "tiled_copy.with(tQpQ(k))"" will fill in zero for columns where tQpQ(k) is false
-                        // TODO: check this
-                        // cute::copy(gmem_tiled_copy_Q_cp_async.with(tQpQ(k)), mQ_copy(_, make_coord(h_idx, m_idx), ki), tQsQ(_, m, k));
-                        cute::copy(gmem_tiled_copy_Q_cp_async.with(tQpQ(k)), mQ_cur_copy(_, ki), tQsQ(_, m, k));
-                    }
-                } // Don't need to fill in 0s for sQ since we're not gonna write the output to gmem for those rows
-            }
-            // cute::cp_async_fence();
-            // This will call cp.async.wait_all which doesn't need the cp_async_fence.
-            cutlass::arch::cp_async_wait<0>();
-            cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<int>(FwdNamedBarriers::QueryFull) /*id*/);
-            // if (thread_idx == 0 && m_block == 0) { print_tensor(sQ(_, _0{})); }
+            load_Q(params, thread_idx, seqlen_q, shared_storage, block_coord);
         }
 
         // TODO: check the case where n_block_max <= n_block_min but there are sink tokens
@@ -1038,9 +974,7 @@ struct CollectiveMainloopFwd {
             }
             if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
 
-            // Tensor scores = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
-            // if (thread_idx == 0 && m_block == 0) { print_tensor(scores); }
-            causal_local_mask_fn(tSrS, n_block, cute::bool_constant<true>{} /*need_seqlenk_masking*/, cute::bool_constant<Is_causal>{}, cute::bool_constant<Is_local>{});
+            mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, thread_idx, m_block, n_block, tiled_mma0);
 
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
@@ -1080,7 +1014,7 @@ struct CollectiveMainloopFwd {
             };
 
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-                auto mask_fn = [&](auto& tSrS, int n_block) { causal_local_mask_fn(tSrS, n_block, cute::bool_constant<false>{} /*need_seqlenk_masking*/, cute::bool_constant<Is_causal>{}, cute::bool_constant<Is_local>{}); };
+                auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, thread_idx, m_block, n_block, tiled_mma0); };
                 constexpr int n_masking_steps = cute::ceil_div(kBlockM, kBlockN) + 1;
                 #pragma unroll
                 for (int masking_step = 0; masking_step < n_masking_steps - 1 && n_block > n_block_min; ++masking_step, --n_block) {
@@ -1100,7 +1034,7 @@ struct CollectiveMainloopFwd {
             }
             // Separate masking iterations on the left for local attention
             if constexpr (Is_local) {
-                auto local_mask_fn = [&](auto& tSrS, int n_block) { causal_local_mask_fn(tSrS, n_block, cute::bool_constant<false>{} /*need_seqlenk_masking*/, cute::bool_constant<false>{} /*is_causal*/, cute::bool_constant<Is_local>{}); };
+                auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, thread_idx, m_block, n_block, tiled_mma0); };
                 #pragma unroll 1
                 for (; n_block > n_block_min; --n_block) {
                     fwd_step(n_block, local_mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
