@@ -47,8 +47,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           at::Tensor dropout_randval,
                                           float softmax_scale,
                                           float p_dropout,
-                                          uint64_t drop_seed,
-                                          uint64_t drop_offset)
+                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset)
 {
     // q: (total_q, nheads, d)
     // k: (total_k, nheads_k, d)
@@ -140,7 +139,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          static_cast<ck_tile::index_t>(mask.type),
                          p_dropout,
                          has_dropout_randval,
-                         {drop_seed, drop_offset}};
+                         drop_seed_offset};
 }
 
 std::vector<at::Tensor>
@@ -281,10 +280,9 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         if (return_dropout_randval) {p.zero_();}
     }
 
-    uint64_t drop_seed = 1, drop_offset = 0;
     int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
+    auto rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
+    auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     if (p_dropout > 0.0)  {
         auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
@@ -292,13 +290,12 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         auto philox_args = gen->philox_cuda_state(counter_offset);
-        std::tie(drop_seed, drop_offset) = flash::unpack(philox_args);
+        hipLaunchKernelGGL(
+            flash::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0, philox_args, rng_state_ptr);
     }
 
-    rng_state[0] = *(reinterpret_cast<int64_t*>(&drop_seed));
-    rng_state[1] = *(reinterpret_cast<int64_t*>(&drop_offset));
-
     if (max_seqlen_k > 0) {
+        auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         auto stream = at::cuda::getCurrentHIPStream().stream();
         ck_tile::stream_config stream_config{stream};
 
@@ -332,8 +329,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
                 p,
                 softmax_scale,
                 p_dropout,
-                drop_seed,
-                drop_offset);
+                drop_seed_offset);
 
         float t = fmha_fwd(traits, args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
