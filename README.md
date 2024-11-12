@@ -373,6 +373,10 @@ Thanks to @beginlner for this contribution.
 Support attention with softcapping, as used in Gemma-2 and Grok models.
 Thanks to @Narsil and @lucidrains for this contribution.
 
+### 2.7: Compatibility with torch compile
+
+Thanks to @ani300 for this contribution.
+
 ## Performance
 
 We present expected speedup (combined forward + backward pass) and memory savings from using FlashAttention against PyTorch standard attention, depending on sequence length, on different GPUs (speedup depends on memory bandwidth - we see more speedup on slower GPU memory).
