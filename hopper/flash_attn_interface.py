@@ -92,7 +92,7 @@ def _flash_attn_varlen_forward(
     max_seqlen_k,
     softmax_scale,
     causal,
-    block_table,
+    block_table=None,
     window_size=(-1, -1),
     seqused_q=None,
     seqused_k=None,
