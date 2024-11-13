@@ -17,6 +17,7 @@
 
 #include "named_barrier.hpp"
 #include "mask.h"
+#include "paged_kv.h"
 #include "utils.h"
 
 namespace flash {
@@ -24,7 +25,7 @@ namespace flash {
 using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, class Element_, class ElementAccum_, class ArchTag_,
-          bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool GQAPack_, bool Split_, bool V_colmajor_>
+          bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool PackGQA_, bool Split_, bool V_colmajor_>
 struct CollectiveMainloopFwd {
 
     static constexpr int kStages = Stages;
@@ -39,7 +40,7 @@ struct CollectiveMainloopFwd {
     static constexpr bool Has_softcap = Has_softcap_;
     static constexpr bool Varlen = Varlen_;
     static constexpr bool PagedKV = PagedKV_;
-    static constexpr bool PackGQA = GQAPack_;
+    static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
@@ -157,13 +158,6 @@ struct CollectiveMainloopFwd {
         make_tiled_copy(GmemCopyAtomCpAsync{},
                         GmemLayoutAtomQCpAsync{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per load
-    static_assert(NumProducerThreads % kGmemThreadsPerRow == 0, "NumProducerThreads must be a multiple of kGmemThreadsPerRow");
-    using GmemLayoutAtomKVCpAsync = Layout<Shape <Int<NumProducerThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
-                                           Stride<Int<kGmemThreadsPerRow>, _1>>;
-    using GmemTiledCopyKVCpAsync = decltype(
-        make_tiled_copy(GmemCopyAtomCpAsync{},
-                        GmemLayoutAtomKVCpAsync{},
-                        Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per load
 
     using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
     using StrideQK = cute::Stride<int64_t, _1, int64_t, int64_t>;
@@ -246,7 +240,7 @@ struct CollectiveMainloopFwd {
         StrideQK const stride_K;
         Element const* ptr_V;
         StrideV const stride_V;
-        int const* ptr_pagetable;
+        int const* const ptr_pagetable;
         ShapePageTable const shape_pagetable;
         StridePageTable const stride_pagetable;
         float const softmax_scale;
@@ -274,7 +268,7 @@ struct CollectiveMainloopFwd {
         StrideQK const stride_K;
         Element const* ptr_V;
         StrideV const stride_V;
-        int const* ptr_pagetable;
+        int const* const ptr_pagetable;
         ShapePageTable const shape_pagetable;
         StridePageTable const stride_pagetable;
         cutlass::FastDivmod page_size_divmod;
@@ -411,7 +405,7 @@ struct CollectiveMainloopFwd {
 
     }
 
-    template <typename SharedStorage>
+    template <int NumThreads, typename SharedStorage>
     CUTLASS_DEVICE void
     load_Q(Params const& params,
            int const thread_idx,
@@ -443,7 +437,7 @@ struct CollectiveMainloopFwd {
         Tensor tPrQPtr = make_tensor<Element const*>(Shape<Int<kQPtrPerThread>>{});
         #pragma unroll
         for (int i = 0; i < kQPtrPerThread; ++i) {
-            int const row = i * NumMmaThreads + (thread_idx % kGmemThreadsPerRow) * (NumMmaThreads / kGmemThreadsPerRow) + (thread_idx / kGmemThreadsPerRow);
+            int const row = i * NumThreads + (thread_idx % kGmemThreadsPerRow) * (NumThreads / kGmemThreadsPerRow) + (thread_idx / kGmemThreadsPerRow);
             int const idx = m_block * kBlockM + row;
             int m_idx, h_idx;
             m_idx = params.qhead_per_khead_divmod.divmod(h_idx, idx);
@@ -470,7 +464,7 @@ struct CollectiveMainloopFwd {
         // cute::cp_async_fence();
         // This will call cp.async.wait_all which doesn't need the cp_async_fence.
         cutlass::arch::cp_async_wait<0>();
-        cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<int>(FwdNamedBarriers::QueryFull) /*id*/);
+        cutlass::arch::NamedBarrier::sync(NumThreads, static_cast<int>(FwdNamedBarriers::QueryFull) /*id*/);
         // if (thread_idx == 0 && m_block == 0) { print_tensor(sQ(_, _0{})); }
     }
 
@@ -490,6 +484,7 @@ struct CollectiveMainloopFwd {
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
+        Tensor sK_pi = as_position_independent_swizzle_tensor(sK);
         // as_position_independent_swizzle_tensor makes address calculation easier when we do LDSM & STSM to transpose.
         // But it requires smem_vt and smem_v to be aligned to e.g 512 bytes.
         Tensor sVt = [&] {
@@ -504,9 +499,9 @@ struct CollectiveMainloopFwd {
         // Only used if we're using cp.async to load V
         Tensor sVcpasync =  [&] {
             if constexpr (!Transpose_V) {
-                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVCpAsync{});
+                return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVCpAsync{}));
             } else {
-                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVCpAsync{});
+                return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVCpAsync{}));
             }
         }();
 
@@ -525,8 +520,6 @@ struct CollectiveMainloopFwd {
         Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(select<1, 0, 2, 3>(params.shape_K))(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
-        Tensor mK_paged = make_tensor(make_gmem_ptr(params.ptr_K), params.shape_K, params.stride_K)(_, _, bidh_kv, _);
-        Tensor mV_paged = make_tensor(make_gmem_ptr(params.ptr_V), params.shape_K, params.stride_V)(_, _, bidh_kv, _);
 
         Tensor gQ = local_tile(domain_offset(make_coord(!is_varlen_q ? 0 : params.cu_seqlens_q[bidb], _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
         int const leftpad_k = Varlen && params.leftpad_k ? params.leftpad_k[bidb] : 0;
@@ -546,26 +539,12 @@ struct CollectiveMainloopFwd {
         Tensor tVgVt_TMA = group_modes<0, 3>(block_tma_V.partition_S(gVt_TMA));  // (TMA, k)
         Tensor tVsVt_TMA = group_modes<0, 3>(block_tma_V.partition_D(sVt));  // (TMA, PIPE)
 
-        Tensor mPageTable = make_tensor(make_gmem_ptr(params.ptr_pagetable), params.shape_pagetable, params.stride_pagetable)(bidb_kv, _);
-
-        GmemTiledCopyKVCpAsync gmem_tiled_copy_kv;
-        auto gmem_thr_copy_kv = gmem_tiled_copy_kv.get_thread_slice(thread_idx);
-        // Only for index calculation, since all the indices of thread 0 are known at compile time
-        auto gmem_thr0_copy_kv = gmem_tiled_copy_kv.get_thread_slice(_0{});
-        // Tensor tKgK = gmem_thr_copy_kv.partition_S(gK_paged);
-        Tensor tKsK = gmem_thr_copy_kv.partition_D(cute::as_position_independent_swizzle_tensor(sK));
-        // Tensor tVgV = gmem_thr_copy_kv.partition_S(gV_paged);
-        Tensor tVsV = gmem_thr_copy_kv.partition_D(cute::as_position_independent_swizzle_tensor(sVcpasync));
-
-        // Construct identity layout for sK
-        Tensor cK = cute::make_identity_tensor(select<1, 2>(TileShape_MNK{}));  // (BLK_N,BLK_K) -> (blk_n,blk_k)
-        // Repeat the partitioning with identity layouts
-        Tensor tKcK = gmem_thr_copy_kv.partition_S(cK);
-        Tensor t0KcK = gmem_thr0_copy_kv.partition_S(cK);
-        Tensor tKpK = make_tensor<bool>(make_shape(size<1>(tKsK), size<2>(tKsK)), Stride<_0, _1>{});
-        #pragma unroll
-        for (int k = 0; k < size<1>(tKpK); ++k) { tKpK(_0{}, k) = get<1>(tKcK(_0{}, _0{}, k)) < get<1>(params.shape_K); }
-        int const seqlen_k = get_seqlen_k(params, bidb);
+        PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumProducerThreads, Element, Transpose_V> paged_kv_manager(
+            params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
+            params.ptr_K, params.shape_K, params.stride_K,
+            params.ptr_V, params.stride_V,
+            params.page_size_divmod, bidb_kv, bidh_kv, thread_idx, get_seqlen_k(params, bidb), leftpad_k
+        );
 
         // Set up for transposing V, only used if Transpose_V
         S2RTiledCopyVt s2r_tiled_copy_vt;
@@ -614,79 +593,14 @@ struct CollectiveMainloopFwd {
             }
         }
 
-        auto [n_block_min, n_block_max] = get_n_block_min_max(params, m_block, bidb, split_idx, params.num_splits);
-        int n_block = n_block_max - 1;
-
-        static constexpr int kBlockN = get<1>(TileShape_MNK{});
-
-        // For PagedKV, it's expensive the calculate the pointers to K and V for each page table entry,
-        // since those require int64_t arithmetic. We optimize by having threads split this work.
-        // Typically there are 8 threads loading per row (e.g. hdim 64 and 128), and there are 11 rows
-        // that each thread needs to load for the case of hdim 128 and kBlockN = 176.
-        // So each of those 8 threads will calculate the K_ptr and V_ptr for 11 / 8 = 2 rows.
-        // We then use __shfl_sync to broadcast the pointers to the other threads in the warp.
-        static constexpr int kPageEntryPerThread = cute::ceil_div(size<1>(tKsK), kGmemThreadsPerRow);
-        Tensor tPrPageOffset = make_tensor<cute::tuple<int, int>>(Shape<Int<kPageEntryPerThread>>{});
-        Tensor tPrVPtr = make_tensor<Element const*>(Shape<Int<kPageEntryPerThread>>{});
-
-        auto load_page_table = [&] (int const n_block, auto need_seqlenk_masking_type) {
-            constexpr bool Need_seqlenk_masking = decltype(need_seqlenk_masking_type)::value;
-            // The uncoalesced gmem load is intentional. This is so that each thread only loads the page table entries
-            // it needs, and we don't need any sync between warps.
-            // Assuming 8 threads per row, and 176 rows, then the rows from 0 to 175 are loaded by
-            // threads 0, 8, 16, ..., 120, 1, 9, ..., 121, 2, 10, ..., 122, etc.
-            #pragma unroll
-            for (int i = 0; i < kPageEntryPerThread; ++i) {
-                int const row = i * NumProducerThreads + (thread_idx % kGmemThreadsPerRow) * (NumProducerThreads / kGmemThreadsPerRow) + (thread_idx / kGmemThreadsPerRow);
-                int const row_idx = n_block * kBlockN + row;
-                int page_idx, page_offset;
-                page_idx = params.page_size_divmod.divmod(page_offset, row_idx + leftpad_k);
-                // Add the condition (i + 1) * NumProducerThreads <= kBlockN since that is an upper bound of row
-                // and is known at compile time. It avoids branching when e.g., kBlockN = 176 and i = 0.
-                int const page = ((i + 1) * NumProducerThreads <= kBlockN || row < kBlockN) && (!Need_seqlenk_masking || row_idx < seqlen_k) ? mPageTable[page_idx] : 0;
-                tPrPageOffset[i] = {page, page_offset};
-                // if (cute::thread0()) { printf("row = %d, page_idx = %d, page_offset = %d, page = %d, leftpad_k = %d, seqlen_k = %d\n", row, page_idx, page_offset, page, leftpad_k, seqlen_k); }
-            }
-        };
-
-        auto compute_V_ptr = [&] {
-            #pragma unroll
-            for (int i = 0; i < kPageEntryPerThread; ++i) {
-                auto [page, page_offset] = tPrPageOffset[i];
-                tPrVPtr[i] = &mV_paged(page_offset, _0{}, page);
-            }
-        };
-
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
             pipeline_k.producer_acquire(smem_pipe_write);
             if constexpr (Use_TMA_KV) {
                 copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
                     tKgK_TMA(_, n_block), tKsK_TMA(_, smem_pipe_write.index()));
             } else {
-                Tensor tPrKPtr = make_tensor<Element const*>(Shape<Int<kPageEntryPerThread>>{});
-                #pragma unroll
-                for (int i = 0; i < kPageEntryPerThread; ++i) {
-                    auto [page, page_offset] = tPrPageOffset[i];
-                    tPrKPtr[i] = &mK_paged(page_offset, _0{}, page);
-                }
-                constexpr bool Need_seqlenk_masking = decltype(need_seqlenk_masking_type)::value;
-                // We want to use the row indices of thread0 to compare, since that is known at compile time.
-                // So we subtract the limit by the first row index of this thread (get<0>(tKcK(_0{}, _0{}, _0{})))
-                int const seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tKcK(_0{}, _0{}, _0{}));
-                #pragma unroll
-                for (int m = 0; m < size<1>(tKsK); ++m) {
-                    bool const should_load = !Need_seqlenk_masking || get<0>(t0KcK(_0{}, m, _0{})) < seqlenk_row_limit;
-                    Element const* k_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrKPtr(m / kGmemThreadsPerRow)), (m % kGmemThreadsPerRow), kGmemThreadsPerRow));
-                    Tensor mK_paged_cur = make_tensor(make_gmem_ptr(k_ptr), Shape<Int<kHeadDim>>{});
-                    Tensor mK_paged_cur_copy = cute::tiled_divide(mK_paged_cur, Shape<Int<kGmemElemsPerLoad>>{});
-                    if (should_load) {
-                        #pragma unroll
-                        for (int k = 0; k < size<2>(tKsK); ++k) {
-                            int const ki = get<1>(tKcK(_0{}, _0{}, k)) / kGmemElemsPerLoad;
-                            cute::copy(gmem_tiled_copy_kv.with(tKpK(_0{}, k)), mK_paged_cur_copy(_, ki), tKsK(_, m, k, smem_pipe_write.index()));
-                        }
-                    }  // Don't need to clear out the rest of the smem since we'll mask out the scores anyway
-                }
+                constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
+                paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_pi(_, _, smem_pipe_write.index()));
                 pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
             }
         };
@@ -698,22 +612,8 @@ struct CollectiveMainloopFwd {
                 copy(params.tma_load_V.with(*pipeline_v_load.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
                     tVgVt_TMA(_, n_block), tVsVt_TMA(_, smem_pipe_write.index()));
             } else {
-                constexpr bool Need_seqlenk_masking = decltype(need_seqlenk_masking_type)::value;
-                int const seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tKcK(_0{}, _0{}, _0{}));
-                #pragma unroll
-                for (int m = 0; m < size<1>(tVsV); ++m) {
-                    // Faster to rely on the cp.async to clear smem that are out of bound,
-                    // rather than calling cute::clear directly.
-                    bool should_load = !Need_seqlenk_masking || get<0>(t0KcK(_0{}, m, _0{})) < seqlenk_row_limit;
-                    Element const* v_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrVPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
-                    Tensor mV_paged_cur = make_tensor(make_gmem_ptr(v_ptr), Shape<Int<kHeadDim>>{});
-                    Tensor mV_paged_cur_copy = cute::tiled_divide(mV_paged_cur, Shape<Int<kGmemElemsPerLoad>>{});
-                    #pragma unroll
-                    for (int k = 0; k < size<2>(tVsV); ++k) {
-                        int const ki = get<1>(tKcK(_0{}, _0{}, k)) / kGmemElemsPerLoad;
-                        cute::copy(gmem_tiled_copy_kv.with(tKpK(_0{}, k) && should_load), mV_paged_cur_copy(_, ki), tVsV(_, m, k, smem_pipe_write.index()));
-                    }
-                }
+                constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
+                paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sVcpasync(_, _, smem_pipe_write.index()));
                 pipeline_v_load.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
             }
         };
@@ -740,13 +640,15 @@ struct CollectiveMainloopFwd {
         static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
         bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync());
 
+        auto [n_block_min, n_block_max] = get_n_block_min_max(params, m_block, bidb, split_idx, params.num_splits);
+        int n_block = n_block_max - 1;
+
         if (should_load_KV) {
             if constexpr (PagedKV) {
-                load_page_table(n_block, cute::bool_constant<true>{} /*Need_seqlenk_masking*/);
-                if constexpr (Transpose_V) { compute_V_ptr(); }
+                paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
             }
-            if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::bool_constant<true>{} /*Need_seqlenk_masking*/); }
-            load_K(n_block, smem_pipe_write, cute::bool_constant<true>{} /*Need_seqlenk_masking*/);
+            if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/); }
+            load_K(n_block, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/);
         }
 
         if constexpr (!PackGQA) {  // If PackGQA, we use the MMA WGs to load Q with cp.async
@@ -775,18 +677,17 @@ struct CollectiveMainloopFwd {
             ++smem_pipe_write;
             if (should_load_KV) {
                 if constexpr (PagedKV) {
-                    if constexpr (!Transpose_V) { compute_V_ptr(); }
-                    load_page_table(n_block, cute::bool_constant<false>{} /*Need_seqlenk_masking*/);
-                    if constexpr (Transpose_V) { compute_V_ptr(); }
+                    paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
                 }
-                if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Need_seqlenk_masking*/); }
-                load_K(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Need_seqlenk_masking*/);
-                if constexpr (!Transpose_V) { load_V(n_block_prev, smem_pipe_write_v, cute::bool_constant<true>{} /*Need_seqlenk_masking*/); }
+                if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/); }
+                load_K(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/);
+                if constexpr (!Transpose_V) { load_V(n_block_prev, smem_pipe_write_v, cute::bool_constant<true>{} /*Seqlenk_mask*/); }
             }
             n_block_prev = n_block;
             if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
         }
         if (Is_local) {
+            static constexpr int kBlockN = get<1>(TileShape_MNK{});
             int n_block_sink_max = cute::ceil_div(params.sink_token_length, kBlockN);
             #pragma unroll 1
             for (n_block = std::min(n_block, n_block_sink_max - 1); n_block >= 0; --n_block) {
@@ -794,23 +695,20 @@ struct CollectiveMainloopFwd {
                 ++smem_pipe_write;
                 if (should_load_KV) {
                     if constexpr (PagedKV) {
-                        if constexpr (!Transpose_V) { compute_V_ptr(); }
-                        load_page_table(n_block, cute::bool_constant<false>{} /*Need_seqlenk_masking*/);
-                        if constexpr (Transpose_V) { compute_V_ptr(); }
+                        paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
                     }
-                    if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Need_seqlenk_masking*/); }
-                    load_K(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Need_seqlenk_masking*/);
-                    if constexpr (!Transpose_V) { load_V(n_block_prev, smem_pipe_write_v, cute::bool_constant<true>{} /*Need_seqlenk_masking*/); }
+                    if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/); }
+                    load_K(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/);
+                    if constexpr (!Transpose_V) { load_V(n_block_prev, smem_pipe_write_v, cute::bool_constant<true>{} /*Seqlenk_mask*/); }
                 }
                 n_block_prev = n_block;
                 if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
             }
         }
         scheduler_prefetch();
-        if constexpr (!Transpose_V) {
-            if (should_load_KV) {
-                if constexpr (PagedKV) { compute_V_ptr(); }
-                load_V(n_block_prev, smem_pipe_write, cute::bool_constant<true>{} /*Need_seqlenk_masking*/);
+        if (should_load_KV) {
+            if constexpr (!Transpose_V) {
+                load_V(n_block_prev, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/);
             }
         }
         if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }
@@ -929,8 +827,8 @@ struct CollectiveMainloopFwd {
         auto [n_block_min, n_block_max] = get_n_block_min_max(params, m_block, bidb, split_idx, params.num_splits);
         int n_block = n_block_max - 1;
 
-        flash::Mask<kBlockM, kBlockN, PackGQA> mask(
-            seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
+        flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma0> mask(
+            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
             params.qhead_per_khead_divmod
         );
 
@@ -942,7 +840,7 @@ struct CollectiveMainloopFwd {
             // since all MMA threads sync in the epilogue before writing to smem_o.
             // So any thread gets there, all threads must have finished the previous MMA and at least started
             // writing to smem_o.
-            load_Q(params, thread_idx, seqlen_q, shared_storage, block_coord);
+            load_Q<NumMmaThreads>(params, thread_idx, seqlen_q, shared_storage, block_coord);
         }
 
         // TODO: check the case where n_block_max <= n_block_min but there are sink tokens
@@ -974,7 +872,7 @@ struct CollectiveMainloopFwd {
             }
             if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
 
-            mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, thread_idx, m_block, n_block, tiled_mma0);
+            mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
 
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
@@ -1014,7 +912,7 @@ struct CollectiveMainloopFwd {
             };
 
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-                auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, thread_idx, m_block, n_block, tiled_mma0); };
+                auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
                 constexpr int n_masking_steps = cute::ceil_div(kBlockM, kBlockN) + 1;
                 #pragma unroll
                 for (int masking_step = 0; masking_step < n_masking_steps - 1 && n_block > n_block_min; ++masking_step, --n_block) {
@@ -1034,7 +932,7 @@ struct CollectiveMainloopFwd {
             }
             // Separate masking iterations on the left for local attention
             if constexpr (Is_local) {
-                auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, thread_idx, m_block, n_block, tiled_mma0); };
+                auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
                 #pragma unroll 1
                 for (; n_block > n_block_min; --n_block) {
                     fwd_step(n_block, local_mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
