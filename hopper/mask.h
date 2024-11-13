@@ -14,40 +14,38 @@ namespace flash {
 
 using namespace cute;
 
-template <int kBlockM, int kBlockN, bool PackGQA=false>
+template <int kBlockM, int kBlockN, bool PackGQA, typename TiledMma>
 struct Mask {
 
+    int const thread_idx;
     int const seqlen_q, seqlen_k;
     int const window_size_left, window_size_right, sink_token_length;
     cutlass::FastDivmod const qhead_per_khead_divmod;
 
     CUTLASS_DEVICE
-    Mask(const int seqlen_q, const int seqlen_k,
+    Mask(const int thread_idx, const int seqlen_q, const int seqlen_k,
          const int window_size_left, const int window_size_right, const int sink_token_length,
          cutlass::FastDivmod const &qhead_per_khead_divmod)
-        : seqlen_q(seqlen_q)
+        : thread_idx(thread_idx)
+        , seqlen_q(seqlen_q)
         , seqlen_k(seqlen_k)
         , window_size_left(window_size_left)
         , window_size_right(window_size_right)
         , sink_token_length(sink_token_length)
         , qhead_per_khead_divmod(qhead_per_khead_divmod)
-        {
+    {
     };
 
-    // Causal_mask: whether this particular iteration needs causal masking
     template <bool Seqlenk_mask=false, bool Causal_mask=false, bool Local_mask=false,
-        typename Engine, typename Layout, typename TiledMma>
+        typename Engine, typename Layout>
     CUTLASS_DEVICE
-    void apply(Tensor<Engine, Layout> &tSrS,
-               int const thread_idx,
-               const int m_block, const int n_block,
-               TiledMma &tiled_mma) {
+    void apply(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block) const {
         static_assert(!(Causal_mask && Local_mask), "Cannot be both causal and local");
         static_assert(Layout::rank == 3, "Only support 3D Tensor");
         if (!Seqlenk_mask && !Causal_mask && !Local_mask) { return; }
 
-        auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
-        auto thread0_mma = tiled_mma.get_thread_slice(_0{});
+        auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
+        auto thread0_mma = TiledMma{}.get_thread_slice(_0{});
 
         Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
         Tensor tScS = thread_mma.partition_C(cS);
