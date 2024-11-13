@@ -27,6 +27,10 @@ class MetaData():
     dropout_p, return_scores= 0.0, False
     # NOTE: scale sm_scale by log_2(e) and use 2^x in the loop as we do not have native e^x support in HW.
     use_exp2 = False
+    rotary_sin = None
+    rotary_cos = None
+    rotary_interleaved = False
+    rotary_conjunction = False
     
 
     def __repr__(self) -> str:
@@ -84,6 +88,12 @@ class MetaData():
 
     def need_causal(self):
         self.causal = True
+
+    def need_rotary(self, sin, cos, rotary_interleaved, rotary_conjunction=False):
+        self.rotary_sin = sin
+        self.rotary_cos = cos
+        self.rotary_interleaved = rotary_interleaved
+        self.rotary_conjunction = rotary_conjunction
 
     def need_dropout(self, dropout_p, return_scores):
         self.dropout_p = dropout_p
