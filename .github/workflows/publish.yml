@@ -56,6 +56,9 @@ jobs:
             # Pytorch < 2.2 does not support Python 3.12
             - torch-version: '2.1.2'
               python-version: '3.12'
+            # Pytorch >= 2.5 does not support Python 3.8
+            - torch-version: '2.5.1'
+              python-version: '3.8'
 
     steps:
       - name: Checkout
