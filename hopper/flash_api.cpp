@@ -1530,7 +1530,7 @@ mha_combine(const at::Tensor &out_partial,         // num_splits x batch_size x 
 
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen}, opts.dtype(at::kFloat)).transpose(1, 2);
 
-    Flash_fwd_params params;
+    Flash_fwd_params params {};  // Need to reset the params to set everything to zero
     params.is_fp32 = out_type == at::ScalarType::Float;
     params.is_bf16 = out_type == at::ScalarType::BFloat16;
     params.oaccum_ptr = out_partial_padded.data_ptr();
