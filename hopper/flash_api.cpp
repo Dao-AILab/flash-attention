@@ -512,17 +512,6 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
 
-    // at::Tensor q_padded, k_padded, v_padded;
-    // if (head_size % 8 != 0) {
-    //     q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-    //     k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-    //     v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-    // } else {
-    //     q_padded = q;
-    //     k_padded = k;
-    //     v_padded = v;
-    // }
-
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -535,7 +524,6 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size);
-        // if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
     } else {
         if (q_dtype == at::ScalarType::Float8_e4m3fn)
             out = torch::empty_like(q, at::kBFloat16);
@@ -567,8 +555,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
                      seqlen_q_rounded, seqlen_k_rounded,
                      num_heads, num_heads_k,
                      head_size, head_size_rounded,
-                    //  q_padded, k_padded, v_padded, out,
-                    q, k, v, out,
+                     q, k, v, out,
                      /*cu_seqlens_q_d=*/nullptr,
                      /*cu_seqlens_k_d=*/nullptr,
                      /*seqused_q=*/nullptr,
@@ -621,13 +608,6 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
-    // at::Tensor out_padded = out;
-    // if (head_size_og % 8 != 0) {
-    //     out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-    //     if (out_.has_value()) { out_.value().copy_(out); }
-    // }
-
-    // return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p};
     return {out, softmax_lse, p};
 }
 
@@ -730,17 +710,6 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         CHECK_SHAPE(seqused_k_, batch_size);
     }
 
-    // at::Tensor q_padded, k_padded, v_padded;
-    // if (head_size_og % 8 != 0) {
-    //     q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-    //     k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-    //     v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-    // } else {
-    //     q_padded = q;
-    //     k_padded = k;
-    //     v_padded = v;
-    // }
-
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -811,13 +780,6 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
-    // at::Tensor out_padded = out;
-    // if (head_size_og % 8 != 0) {
-    //     out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size)});
-    //     if (out_.has_value()) { out_.value().copy_(out); }
-    // }
-
-    // return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse};
     return {out, softmax_lse};
 }
 
@@ -946,12 +908,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         dv = torch::empty_like(v);
     }
 
-    // at::Tensor dout_padded;
-    // if (head_size_og % 8 != 0) {
-    //     dout_padded = torch::nn::functional::pad(dout, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-    // } else {
-    //     dout_padded = dout;
-    // }
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
@@ -1025,12 +981,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         at::sum_out(dk, at::reshape(dk_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
         at::sum_out(dv, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
     }
-
-    // if (head_size_og % 8 != 0) {
-    //     dq = dq.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-    //     dk = dk.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-    //     dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-    // }
 
     return { dq, dk, dv, softmax_d, dq_accum};
 }
@@ -1164,13 +1114,6 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
         dv = torch::empty_like(v);
     }
 
-    // at::Tensor dout_padded;
-    // if (head_size_og % 8 != 0) {
-    //     dout_padded = torch::nn::functional::pad(dout, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-    // } else {
-    //     dout_padded = dout;
-    // }
-
     if (is_causal) { window_size_right = 0; }
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -1244,12 +1187,6 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
         at::sum_out(dk, at::reshape(dk_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
         at::sum_out(dv, at::reshape(dv_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
     }
-
-    // if (head_size_og % 8 != 0) {
-    //     dq = dq.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-    //     dk = dk.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-    //     dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-    // }
 
     return { dq, dk, dv, softmax_d, dq_accum, softmax_lse_log2 };
 }
