@@ -525,7 +525,7 @@ def fwd_kvcache(
 
     # Rotary Embedding Implementation
     if apply_rotary:
-        if metadata.causal:     # NOTE: when support is addede. Add `or metadata.local`
+        if metadata.causal:     # NOTE: when support is added. Add `or metadata.local`
             q_ro = apply_rotary_emb(
                 q,
                 metadata.rotary_cos,
