@@ -10,6 +10,7 @@ from einops import rearrange, repeat
 from flash_attn.layers.rotary import apply_rotary_emb
 
 USE_REF = os.environ.get('FLASH_ATTENTION_TRITON_AMD_REF', '0').lower() in ('1', 'true', 'yes')
+ENABLE_FUSED_ROTARY = os.environ.get('FLASH_ATTENTION_TRITON_AMD_ENABLE_FUSED_ROTARY', '0').lower() in ('1', 'true', 'yes')
 
 def fwd(q,
         k,
@@ -521,39 +522,45 @@ def fwd_kvcache(
     # rotary boolean
     apply_rotary = torch.is_tensor(rotary_cos) and torch.is_tensor(rotary_sin)
     if apply_rotary:
-        metadata.need_rotary(rotary_sin, rotary_cos, rotary_interleaved)
+        _, dim = rotary_cos.shape
+        rotary_dim = dim * 2
+        metadata.need_rotary(rotary_dim, rotary_sin, rotary_cos, rotary_interleaved)
 
-    # Rotary Embedding Implementation
-    if apply_rotary:
-        if metadata.causal:     # NOTE: when support is added. Add `or metadata.local`
-            q_ro = apply_rotary_emb(
-                q,
+    if not ENABLE_FUSED_ROTARY:
+        # Non-fused rotary kernel
+        if apply_rotary:
+            if metadata.causal:     # NOTE: when local support is added. Add `or metadata.local`
+                q_ro = apply_rotary_emb(
+                    q,
+                    metadata.rotary_cos,
+                    metadata.rotary_sin,
+                    seqlen_offsets=metadata.cache_seqlens,
+                    interleaved=metadata.rotary_interleaved,
+                )
+            else:
+                q_ro = rearrange(
+                    apply_rotary_emb(
+                        rearrange(q, "b s h d -> b 1 (s h) d"),
+                        metadata.rotary_cos,
+                        metadata.rotary_sin,
+                        seqlen_offsets=metadata.cache_seqlens,
+                        interleaved=metadata.rotary_interleaved,
+                    ),
+                    "b 1 (s h) d -> b s h d",
+                    s=metadata.max_seqlens_q,
+                )
+            k_ro = apply_rotary_emb(
+                metadata.k_new,
                 metadata.rotary_cos,
                 metadata.rotary_sin,
                 seqlen_offsets=metadata.cache_seqlens,
                 interleaved=metadata.rotary_interleaved,
             )
-        else:
-            q_ro = rearrange(
-                apply_rotary_emb(
-                    rearrange(q, "b s h d -> b 1 (s h) d"),
-                    metadata.rotary_cos,
-                    metadata.rotary_sin,
-                    seqlen_offsets=metadata.cache_seqlens,
-                    interleaved=metadata.rotary_interleaved,
-                ),
-                "b 1 (s h) d -> b s h d",
-                s=metadata.max_seqlens_q,
-            )
-        k_ro = apply_rotary_emb(
-            metadata.k_new,
-            metadata.rotary_cos,
-            metadata.rotary_sin,
-            seqlen_offsets=metadata.cache_seqlens,
-            interleaved=metadata.rotary_interleaved,
-        )
 
-        q, metadata.k_new = q_ro.to(q.dtype), k_ro.to(q.dtype)
+            q, metadata.k_new = q_ro.to(q.dtype), k_ro.to(q.dtype)
+
+            # nullify rotary parameters so that the fused rotary implementation is not executed within the triton decode fwd kernel
+            metadata.need_rotary(0, None, None, False)
 
     # launch kernel
     # TODO: pass output as an arg. Maybe we are copying output which is causing slow down
@@ -570,5 +577,10 @@ def fwd_kvcache(
         metadata.new_kv,
         metadata.k_new,
         metadata.v_new,
+        metadata.rotary_cos,
+        metadata.rotary_sin,
+        metadata.rotary_dim,
+        metadata.rotary_interleaved,
+        metadata.rotary_conjunction
     )
     return output, softmax_lse
