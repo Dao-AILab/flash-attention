@@ -763,6 +763,7 @@ struct CollectiveMainloopFwd {
             params.qhead_per_khead_divmod
         );
 
+        auto &barrier_Q = shared_storage.pipelines.barrier_Q;
         if constexpr (!Use_TMA_Q) {  // Use Mma threads to load Q with cp.async
             // If persistent, we don't need to wait for the previous work_idx to finish and signal QueryEmpty
             // since all MMA threads sync in the epilogue before writing to smem_o.
@@ -775,12 +776,11 @@ struct CollectiveMainloopFwd {
             Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
             using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element>;
             PackGQAt::load_Q(mQ, sQ_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_q, m_block);
-            cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&shared_storage.pipelines.barrier_Q));
-            shared_storage.pipelines.barrier_Q.arrive();
+            cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Q));
+            barrier_Q.arrive();
         }
-
-        typename cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.pipelines.barrier_Q.try_wait(work_idx % 2));
-        if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.pipelines.barrier_Q.wait(work_idx % 2); }
+        typename cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(barrier_Q.try_wait(work_idx % 2));
+        if (barrier_token == cutlass::BarrierStatus::WaitAgain) { barrier_Q.wait(work_idx % 2); }
 
         // TODO: check the case where n_block_max <= n_block_min but there are sink tokens
         if constexpr (true) {

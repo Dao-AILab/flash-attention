@@ -147,6 +147,7 @@ if not SKIP_CUDA_BUILD:
         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT162_OPERATORS__",
         "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+        "--ftemplate-backtrace-limit=0",  # To debug template code
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
         "--use_fast_math",

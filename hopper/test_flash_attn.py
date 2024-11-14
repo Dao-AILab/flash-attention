@@ -288,14 +288,14 @@ def attention_ref(
 # @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
-# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 50.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
-# @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
+# @pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(False, False)])
 # @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("V_colmajor", [False, True])
@@ -422,54 +422,54 @@ def test_flash_attn_output(
     #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
     # breakpoint()
 
-    # if dtype != torch.float8_e4m3fn and not V_colmajor:
-    #     g = torch.randn_like(out)
-    #     do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
-    #     import flashattn_hopper_cuda
-    #     dq, dk, dv, softmax_d, dq_accum, dk_accum, dv_accum = flashattn_hopper_cuda.bwd(
-    #         g,
-    #         q,
-    #         k,
-    #         v,
-    #         out,
-    #         lse,
-    #         None,
-    #         None,
-    #         None,
-    #         d ** (-0.5),
-    #         causal,
-    #         window_size[0], window_size[1],
-    #         sink_token_length,
-    #         softcap,
-    #         deterministic,
-    #     )
-    #     # print(f"dO_O max diff: {(softmax_d - do_o).abs().max().item()}")
-    #     # assert (softmax_d - do_o).abs().max().item() <= 1e-5
-    #     # assert dq_accum.abs().max().item() == 0.0
+    if dtype != torch.float8_e4m3fn and not V_colmajor:
+        g = torch.randn_like(out)
+        do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
+        import flashattn_hopper_cuda
+        dq, dk, dv, softmax_d, dq_accum, dk_accum, dv_accum = flashattn_hopper_cuda.bwd(
+            g,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            None,
+            None,
+            None,
+            d ** (-0.5),
+            causal,
+            window_size[0], window_size[1],
+            sink_token_length,
+            softcap,
+            deterministic,
+        )
+        # print(f"dO_O max diff: {(softmax_d - do_o).abs().max().item()}")
+        # assert (softmax_d - do_o).abs().max().item() <= 1e-5
+        # assert dq_accum.abs().max().item() == 0.0
 
-    #     # dS = torch.einsum('bthd,bshd->bhts', g.float(), v.float())
-    #     # P = torch.softmax(qk, -1)
-    #     # dP = P * (dS - do_o.transpose(1, 2).unsqueeze(1))
-    #     # dQ = torch.einsum('bhts,bshd->bthd', dP, k.float())
-    #     # dV = torch.einsum('bhts,bthd->bshd', P, g.float())
-    #     # dK = torch.einsum('bhts,bthd->bshd', dP, q.float())
+        # dS = torch.einsum('bthd,bshd->bhts', g.float(), v.float())
+        # P = torch.softmax(qk, -1)
+        # dP = P * (dS - do_o.transpose(1, 2).unsqueeze(1))
+        # dQ = torch.einsum('bhts,bshd->bthd', dP, k.float())
+        # dV = torch.einsum('bhts,bthd->bshd', P, g.float())
+        # dK = torch.einsum('bhts,bthd->bshd', dP, q.float())
 
-    #     # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
-    #     dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
-    #     dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
-    #     print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
-    #     print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
-    #     print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
-    #     print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
-    #     print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
-    #     print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
-    #     print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
-    #     print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
-    #     print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
-    #     print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
-    #     print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
-    #     print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
-    #     # breakpoint()
+        # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
+        dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
+        dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
+        print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+        print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+        print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+        print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
+        print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
+        print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
+        print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+        print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+        print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+        print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
+        print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
+        print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+        # breakpoint()
 
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
@@ -477,11 +477,11 @@ def test_flash_attn_output(
     multiple = 2 if dtype != torch.float8_e4m3fn else (3 if softcap == 0.0 else 6)
     assert (out - out_ref).abs().max().item() <= multiple * (out_pt - out_ref).abs().max().item()
 
-    # if dtype != torch.float8_e4m3fn and not V_colmajor:
-    #     multiple = 2 if softcap == 0.0 else 4
-    #     assert (dq - dq_ref).abs().max().item() <= multiple * (dq_pt - dq_ref).abs().max().item()
-    #     assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item()
-    #     assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item()
+    if dtype != torch.float8_e4m3fn and not V_colmajor:
+        multiple = 2 if softcap == 0.0 else 4
+        assert (dq - dq_ref).abs().max().item() <= multiple * (dq_pt - dq_ref).abs().max().item()
+        assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item()
+        assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item()
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
@@ -712,8 +712,8 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("rotary_interleaved", [False])
 # @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("rotary_fraction", [0.0])
-@pytest.mark.parametrize("page_size", [None, 1, 4, 128])
-# @pytest.mark.parametrize("page_size", [None])
+# @pytest.mark.parametrize("page_size", [None, 1, 4, 128])
+@pytest.mark.parametrize("page_size", [None])
 @pytest.mark.parametrize("has_leftpad", [False, True])
 # @pytest.mark.parametrize("has_leftpad", [True])
 @pytest.mark.parametrize("has_batch_idx", [False, True])

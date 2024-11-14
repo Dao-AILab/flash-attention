@@ -97,8 +97,8 @@ def cudnn_spda_setup(q, k, v, causal=False, window_size_left=-1):
         v=v,
         is_inference=False,
         attn_scale=1.0 / math.sqrt(headdim),
-        use_causal_mask_bottom_right=causal or window_size_left >= 0,
-        # use_causal_mask=causal or window_size_left >= 0,
+        # use_causal_mask_bottom_right=causal or window_size_left >= 0,
+        use_causal_mask=causal or window_size_left >= 0,
         sliding_window_length=window_size_left if window_size_left >= 0 and not causal else None,
     )
 
@@ -161,8 +161,8 @@ def cudnn_spda_bwd_setup(q, k, v, o, g, lse, causal=False, window_size_left=-1):
         dO=g,
         stats=stats,
         attn_scale=1.0 / math.sqrt(headdim),
-        use_causal_mask_bottom_right=causal or window_size_left >= 0,
-        # use_causal_mask=causal or window_size_left >= 0,
+        # use_causal_mask_bottom_right=causal or window_size_left >= 0,
+        use_causal_mask=causal or window_size_left >= 0,
         sliding_window_length=window_size_left if window_size_left >= 0 and not causal else None,
     )
 
@@ -207,7 +207,7 @@ dtype_gen = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
 device = 'cuda'
 verbose = True
 varlen = False
-page_size = 1
+page_size = None
 softcap = 0.0
 V_colmajor = False
 deterministic = False
@@ -269,8 +269,8 @@ for headdim in [128]:
         pack_gqa = None
         # seqlen_q = 64
         seqlen_q = seqlen
-        # leftpad_k = None
-        leftpad_k = torch.full((batch_size,), 0, device=device, dtype=torch.int32)
+        leftpad_k = None
+        # leftpad_k = torch.full((batch_size,), 0, device=device, dtype=torch.int32)
         q = torch.randn(batch_size, seqlen_q, nheads, headdim, device=device, dtype=dtype_gen, requires_grad=True)
         k = torch.randn(batch_size, seqlen, nheads_kv, headdim, device=device, dtype=dtype_gen, requires_grad=True)
         v = torch.randn(batch_size, seqlen, nheads_kv, headdim, device=device, dtype=dtype_gen, requires_grad=True)
