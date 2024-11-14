@@ -237,6 +237,7 @@ def _fwd_kernel_splitK(
     off_zhg = tl.program_id(1)
     off_z = off_zhg // (H_q * G_q)
     off_h_q = (off_zhg // G_q) % H_q
+    off_h_kv = (off_zhg // G_q) % H_kv
     off_g_q = off_zhg % G_q
     splitk_idx = tl.program_id(2)
 
@@ -305,13 +306,13 @@ def _fwd_kernel_splitK(
                     batch_pid=off_z,
                     start_m=i,              # current block of tokens in new_k
                     group_pid=off_g_q,
-                    head_pid=off_h_q,
+                    head_pid=off_h_kv,
 
-                    stride_batch= stride_kz,  # batch_strides if not varlen else 0
-                    stride_m=stride_kn,
-                    stride_group=stride_kg,
-                    stride_head=stride_kh,
-                    stride_headdim=stride_kd,
+                    stride_batch=stride_kn_z,  # batch_strides if not varlen else 0
+                    stride_m=stride_kn_n,
+                    stride_group=stride_kn_g,
+                    stride_head=stride_kn_h,
+                    stride_headdim=stride_kn_d,
 
                     INTERLEAVED=Rotary_interleaved,
                     CONJUGATE=Rotary_conjugate,
@@ -421,11 +422,11 @@ def _fwd_kernel_splitK(
                                 group_pid=off_g_q,
                                 head_pid=off_h_q,
 
-                                stride_batch= (stride_kz if not IS_VARLEN else 0),  # batch_strides if not varlen else 0
-                                stride_m=stride_kn,
-                                stride_group=stride_kg,
-                                stride_head=stride_kh,
-                                stride_headdim=stride_kd,
+                                stride_batch= (stride_qz if not IS_VARLEN else 0),  # batch_strides if not varlen else 0
+                                stride_m=stride_qm,
+                                stride_group=stride_qg,
+                                stride_head=stride_qh,
+                                stride_headdim=stride_qd,
 
                                 INTERLEAVED=Rotary_interleaved,
                                 CONJUGATE=Rotary_conjugate,
