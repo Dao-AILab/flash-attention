@@ -237,7 +237,6 @@ def _fwd_kernel_splitK(
     off_zhg = tl.program_id(1)
     off_z = off_zhg // (H_q * G_q)
     off_h_q = (off_zhg // G_q) % H_q
-    off_h_kv = (off_zhg // G_q) % H_kv
     off_g_q = off_zhg % G_q
     splitk_idx = tl.program_id(2)
 
@@ -306,7 +305,7 @@ def _fwd_kernel_splitK(
                     batch_pid=off_z,
                     start_m=i,              # current block of tokens in new_k
                     group_pid=off_g_q,
-                    head_pid=off_h_kv,
+                    head_pid=k_head_idx,
 
                     stride_batch=stride_kn_z,  # batch_strides if not varlen else 0
                     stride_m=stride_kn_n,
