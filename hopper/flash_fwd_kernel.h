@@ -37,6 +37,7 @@ public:
     static constexpr bool Split = CollectiveMainloop::Split;
     static constexpr bool Is_FP8 = CollectiveMainloop::Is_FP8;
     static constexpr bool Transpose_V = CollectiveMainloop::Transpose_V;
+    static constexpr bool Use_TMA_Q = CollectiveMainloop::Use_TMA_Q;
     static constexpr bool Use_TMA_KV = CollectiveMainloop::Use_TMA_KV;
     static constexpr int NumProducerThreads = CollectiveMainloop::NumProducerThreads;
 
@@ -48,6 +49,7 @@ public:
     using ClusterShape = typename CollectiveMainloop::ClusterShape;
     using MainloopArguments = typename CollectiveMainloop::Arguments;
     using MainloopParams = typename CollectiveMainloop::Params;
+    using BarrierQ = std::conditional_t<Use_TMA_Q, cutlass::arch::ClusterTransactionBarrier, cutlass::arch::ClusterBarrier>;
 
     // Epilogue derived types
     using EpilogueArguments = typename CollectiveEpilogue::Arguments;
@@ -91,7 +93,7 @@ public:
         //               <= sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)));
 
         struct PipelineStorage : cute::aligned_struct<16> {
-            alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_Q;
+            alignas(16) BarrierQ barrier_Q;
             alignas(16) cutlass::arch::ClusterBarrier barrier_O;
             alignas(16) typename CollectiveMainloop::MainloopPipelineK::SharedStorage pipeline_k;
             alignas(16) typename CollectiveMainloop::MainloopPipelineV::SharedStorage pipeline_v;
@@ -192,7 +194,7 @@ public:
         int warp_group_idx = cutlass::canonical_warp_group_idx();
 
         if (warp_idx == 0 && lane_predicate) {
-            shared_storage.pipelines.barrier_Q.init(1 /*numThreads*/);
+            shared_storage.pipelines.barrier_Q.init(Use_TMA_Q ? 1 : NumMmaThreads /*numThreads*/);
             shared_storage.pipelines.barrier_O.init(size(ClusterShape{}) /*numThreads*/);
         }
 

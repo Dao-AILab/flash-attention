@@ -17,6 +17,7 @@
 
 #include "named_barrier.hpp"
 #include "mask.h"
+#include "pack_gqa.h"
 #include "paged_kv.h"
 #include "utils.h"
 
@@ -45,6 +46,7 @@ struct CollectiveMainloopFwd {
     static constexpr bool V_colmajor = V_colmajor_;
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+    static constexpr bool Use_TMA_Q = !PackGQA;
     static constexpr bool Use_TMA_KV = !PagedKV;
     static_assert(Use_TMA_KV || size(ClusterShape{}) == 1, "If not using TMA for KV, ClusterShape must be 1");
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
@@ -151,14 +153,6 @@ struct CollectiveMainloopFwd {
     // We assume threads loading the same row are in the same warp. This is for an optimization in PagedKV where
     // these threads share the same page table entry and share the work of computing pointers to paged K and paged V.
     static_assert(cutlass::NumThreadsPerWarp % kGmemThreadsPerRow == 0, "kGmemThreadsPerRow must divide NumThreadsPerWarp");
-    using GmemCopyAtomCpAsync = cute::Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, Element>;
-    using GmemLayoutAtomQCpAsync = Layout<Shape <Int<NumMmaThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
-                                          Stride<Int<kGmemThreadsPerRow>, _1>>;
-    using GmemTiledCopyQCpAsync = decltype(
-        make_tiled_copy(GmemCopyAtomCpAsync{},
-                        GmemLayoutAtomQCpAsync{},
-                        Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per load
-
     using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
     using StrideQK = cute::Stride<int64_t, _1, int64_t, int64_t>;
     using StrideV = std::conditional_t<!V_colmajor, StrideQK, cute::Stride<_1, int64_t, int64_t, int64_t>>;
@@ -203,7 +197,7 @@ struct CollectiveMainloopFwd {
     // If PackGQA, we use cp.async (instead of TMA) to load Q, so we want smem_q to be aligned
     // and have sQ being position_independent_swizzle_tensor.
     // If !Use_TMA_KV, we use cp.async (instead of TMA) to load K & V, so we want smem_k and smem_v to be aligned.
-    static constexpr size_t SmemAlignmentQ = !PackGQA ? 128 : cutlass::detail::alignment_for_swizzle(SmemLayoutQ{});
+    static constexpr size_t SmemAlignmentQ = Use_TMA_Q ? 128 : cutlass::detail::alignment_for_swizzle(SmemLayoutQ{});
     static constexpr size_t SmemAlignmentK = Use_TMA_KV ? 128 : cutlass::detail::alignment_for_swizzle(SmemLayoutK{});
     static constexpr size_t SmemAlignmentVtNoTranspose = cutlass::detail::alignment_for_swizzle(SmemLayoutVt{});
     static_assert(SmemAlignmentQ >= 128 and SmemAlignmentK >= 128 && SmemAlignmentVtNoTranspose >= 128, "Require at least 128B alignment");
@@ -345,7 +339,7 @@ struct CollectiveMainloopFwd {
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
     CUTLASS_DEVICE
     static void prefetch_tma_descriptors(Params const& params) {
-        if constexpr (!PackGQA) {
+        if constexpr (Use_TMA_Q) {
             cute::prefetch_tma_descriptor(params.tma_load_Q.get_tma_descriptor());
         }
         if constexpr (Use_TMA_KV) {
@@ -404,70 +398,6 @@ struct CollectiveMainloopFwd {
         return {n_block_min, n_block_max};
 
     }
-
-    template <int NumThreads, typename SharedStorage>
-    CUTLASS_DEVICE void
-    load_Q(Params const& params,
-           int const thread_idx,
-           int const seqlen_q,
-           SharedStorage &shared_storage,
-           cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord
-         ) {
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
-        Tensor sQ = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{}));
-
-        auto [m_block, bidh, bidb, split_idx] = block_coord;
-        GmemTiledCopyQCpAsync gmem_tiled_copy_Q_cp_async;
-        auto gmem_thr_copy_Q_cp_async = gmem_tiled_copy_Q_cp_async.get_thread_slice(thread_idx);
-        // Reshape Q to be ((qhead_per_khead, seqlen_q), head_size, nhead_k, batch_size)
-        bool const is_varlen_q = Varlen && params.cu_seqlens_q != nullptr;
-        int const offset_q = !is_varlen_q ? 0 : params.cu_seqlens_q[bidb];
-        Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
-        Tensor mQ_copy = cute::tiled_divide(mQ, Shape<_1, Int<kGmemElemsPerLoad>>{});
-        Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
-        Tensor tQcQ = gmem_thr_copy_Q_cp_async.partition_S(cQ);       // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
-        Tensor tQsQ = gmem_thr_copy_Q_cp_async.partition_D(sQ);       // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
-        Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
-        #pragma unroll
-        for (int k = 0; k < size(tQpQ); ++k) { tQpQ(k) = get<1>(tQcQ(_0{}, _0{}, k)) < get<1>(params.shape_Q); }
-        // if (thread_idx == 0 && m_block == 0) { print(cQ); printf("\n"); print(tQcQ); printf("\n"); print(tQsQ); printf("\n"); print(tQpQ); printf("\n"); }
-        // Similar to loading K and V when PagedKV, it's expensive to compute the pointers for Q.
-        // We split the work among threads loading the same row of Q, then __shfl_sync the pointers.
-        static constexpr int kQPtrPerThread = cute::ceil_div(size<1>(tQsQ), kGmemThreadsPerRow);
-        Tensor tPrQPtr = make_tensor<Element const*>(Shape<Int<kQPtrPerThread>>{});
-        #pragma unroll
-        for (int i = 0; i < kQPtrPerThread; ++i) {
-            int const row = i * NumThreads + (thread_idx % kGmemThreadsPerRow) * (NumThreads / kGmemThreadsPerRow) + (thread_idx / kGmemThreadsPerRow);
-            int const idx = m_block * kBlockM + row;
-            int m_idx, h_idx;
-            m_idx = params.qhead_per_khead_divmod.divmod(h_idx, idx);
-            tPrQPtr[i] = &mQ(make_coord(h_idx, m_idx), _0{});
-        }
-        int const qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
-        #pragma unroll
-        for (int m = 0; m < size<1>(tQsQ); ++m) {
-            int idx = m_block * kBlockM + get<0>(tQcQ(_0{}, m, _0{}));
-            Element const* q_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrQPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
-            if (idx < seqlen_q * qhead_per_khead) {
-                // if (thread_idx == 0) { printf("m: %d, m_idx: %d, h_idx: %d, q_ptr = %p, q_ptr_og = %p\n", m, m_idx, h_idx, q_ptr, &mQ_copy(0, make_coord(h_idx, m_idx), 0));}
-                Tensor mQ_cur = make_tensor(make_gmem_ptr(q_ptr), Shape<Int<kHeadDim>>{});
-                Tensor mQ_cur_copy = cute::tiled_divide(mQ_cur, Shape<Int<kGmemElemsPerLoad>>{});
-                #pragma unroll
-                for (int k = 0; k < size<2>(tQsQ); ++k) {
-                    int ki = get<1>(tQcQ(_0{}, _0{}, k)) / kGmemElemsPerLoad;
-                    // the "tiled_copy.with(tQpQ(k))"" will fill in zero for columns where tQpQ(k) is false
-                    // TODO: check this
-                    cute::copy(gmem_tiled_copy_Q_cp_async.with(tQpQ(k)), mQ_cur_copy(_, ki), tQsQ(_, m, k));
-                }
-            } // Don't need to fill in 0s for sQ since we're not gonna write the output to gmem for those rows
-        }
-        // cute::cp_async_fence();
-        // This will call cp.async.wait_all which doesn't need the cp_async_fence.
-        cutlass::arch::cp_async_wait<0>();
-        cutlass::arch::NamedBarrier::sync(NumThreads, static_cast<int>(FwdNamedBarriers::QueryFull) /*id*/);
-        // if (thread_idx == 0 && m_block == 0) { print_tensor(sQ(_, _0{})); }
-    }
-
 
     template <typename SchedulerPrefetch, typename SharedStorage>
     CUTLASS_DEVICE void
@@ -651,7 +581,8 @@ struct CollectiveMainloopFwd {
             load_K(n_block, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/);
         }
 
-        if constexpr (!PackGQA) {  // If PackGQA, we use the MMA WGs to load Q with cp.async
+        // If !Use_TMA_Q, we use the MMA WGs to load Q with cp.async
+        if constexpr (Use_TMA_Q) {
             // Wait for the MMA warpgroups to signal that smem_q is ready
             if (SingleProducerWarp || warp_idx_in_warpgroup == 0) {
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
@@ -755,7 +686,7 @@ struct CollectiveMainloopFwd {
     CUTLASS_DEVICE void
     mma_init() {
         // Tell producer (warp 0) that smem_q is ready
-        if constexpr (!PackGQA) {
+        if constexpr (Use_TMA_Q) {
             cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
         }
         if constexpr (UseSchedulerBarrier) {
@@ -832,16 +763,24 @@ struct CollectiveMainloopFwd {
             params.qhead_per_khead_divmod
         );
 
-        if constexpr (!PackGQA) {
-            typename cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.pipelines.barrier_Q.try_wait(work_idx % 2));
-            if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.pipelines.barrier_Q.wait(work_idx % 2); }
-        } else {
+        if constexpr (!Use_TMA_Q) {  // Use Mma threads to load Q with cp.async
             // If persistent, we don't need to wait for the previous work_idx to finish and signal QueryEmpty
             // since all MMA threads sync in the epilogue before writing to smem_o.
             // So any thread gets there, all threads must have finished the previous MMA and at least started
             // writing to smem_o.
-            load_Q<NumMmaThreads>(params, thread_idx, seqlen_q, shared_storage, block_coord);
+            int const bidh = get<1>(block_coord);
+            bool const is_varlen_q = Varlen && params.cu_seqlens_q != nullptr;
+            int const offset_q = !is_varlen_q ? 0 : params.cu_seqlens_q[bidb];
+            Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
+            Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
+            using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element>;
+            PackGQAt::load_Q(mQ, sQ_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_q, m_block);
+            cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&shared_storage.pipelines.barrier_Q));
+            shared_storage.pipelines.barrier_Q.arrive();
         }
+
+        typename cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.pipelines.barrier_Q.try_wait(work_idx % 2));
+        if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.pipelines.barrier_Q.wait(work_idx % 2); }
 
         // TODO: check the case where n_block_max <= n_block_min but there are sink tokens
         if constexpr (true) {
@@ -945,7 +884,7 @@ struct CollectiveMainloopFwd {
                 }
             }
             // Tell warp 0 that smem_q is ready
-            if constexpr (!PackGQA) {  // If PackGQA, we don't use the producer WG to load Q
+            if constexpr (Use_TMA_Q) {  // If !Use_TMA_Q, we don't use the producer WG to load Q
                 cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
             }
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
