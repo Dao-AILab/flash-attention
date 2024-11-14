@@ -10,8 +10,7 @@ from einops import rearrange, repeat
 from flash_attn.layers.rotary import apply_rotary_emb
 
 USE_REF = os.environ.get('FLASH_ATTENTION_TRITON_AMD_REF', '0').lower() in ('1', 'true', 'yes')
-# ENABLE_FUSED_ROTARY = os.environ.get('FLASH_ATTENTION_TRITON_AMD_ENABLE_FUSED_ROTARY', '0').lower() in ('1', 'true', 'yes')
-ENABLE_FUSED_ROTARY = True
+ENABLE_FUSED_ROTARY = os.environ.get('FLASH_ATTENTION_TRITON_AMD_ENABLE_FUSED_ROTARY', '0').lower() in ('1', 'true', 'yes')
 
 def fwd(q,
         k,
