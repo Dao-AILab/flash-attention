@@ -763,10 +763,22 @@ struct CollectiveMainloopFwd {
             params.qhead_per_khead_divmod
         );
 
+        float softcap_val = params.softcap_val;
+        if constexpr (Has_softcap && Is_FP8) {
+            float const q_descale = params.ptr_q_descale == nullptr ? 1.0f : *params.ptr_q_descale;
+            float const k_descale = params.ptr_k_descale == nullptr ? 1.0f : *params.ptr_k_descale;
+            softcap_val *= q_descale * k_descale;
+        }
+        // Softcapping needs to happen before masking since if we apply after masking, softcapping can turn
+        // -inf to e.g. -50.0, which can affect the attention softmax.
+        auto scoremod_premask_fn = [&](auto& tSrS) {
+            if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
+        };
+
         auto &barrier_Q = shared_storage.pipelines.barrier_Q;
         if constexpr (!Use_TMA_Q) {  // Use Mma threads to load Q with cp.async
             // If persistent, we don't need to wait for the previous work_idx to finish and signal QueryEmpty
-            // since all MMA threads sync in the epilogue before writing to smem_o.
+            // since we assume that all MMA threads sync in the epilogue before writing to smem_o.
             // So any thread gets there, all threads must have finished the previous MMA and at least started
             // writing to smem_o.
             int const bidh = get<1>(block_coord);
@@ -790,27 +802,9 @@ struct CollectiveMainloopFwd {
             warp_scheduler_barrier_sync();
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
             warp_scheduler_barrier_arrive();
-            if (work_idx != 0) {
-                int warp_idx_sync = __shfl_sync(0xffffffff, thread_idx / cutlass::NumThreadsPerWarp, 0);
-                if (warp_idx_sync == NumMmaThreads / cutlass::NumThreadsPerWarp - 1) {
-                    if constexpr (!Varlen && !PackGQA) { tma_store_wait<0>(); }
-                    static_assert(size(ClusterShape{}) < cutlass::NumThreadsPerWarp);
-                    uint32_t cta_id = threadIdx.x % cutlass::NumThreadsPerWarp;
-                    shared_storage.pipelines.barrier_O.arrive(cta_id, cta_id < size(ClusterShape{}));
-                }
-            }
             warpgroup_wait<0>();
             pipeline_k.consumer_release(smem_pipe_read);
-            // This needs to happen before masking since if we apply after masking, softcapping can turn
-            // -inf to e.g. -50.0, which can affect the attention softmax.
-            float softcap_val = params.softcap_val;
-            if constexpr (Has_softcap && Is_FP8) {
-                float const q_descale = params.ptr_q_descale == nullptr ? 1.0f : *params.ptr_q_descale;
-                float const k_descale = params.ptr_k_descale == nullptr ? 1.0f : *params.ptr_k_descale;
-                softcap_val *= q_descale * k_descale;
-            }
-            if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
-
+            scoremod_premask_fn(tSrS);
             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
 
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
@@ -838,7 +832,7 @@ struct CollectiveMainloopFwd {
                 // Tensor scores = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
                 // if (thread_idx == 0 && m_block == 0) { print_tensor(scores); }
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
-                if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
+                scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block - 1);
                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
                 softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
@@ -900,38 +894,36 @@ struct CollectiveMainloopFwd {
         } else {
             // WIP: a version without intra-warpgroup overlap, for benchmarking / didactic purposes
 
-            if (work_idx != 0) {
-                int lane_predicate = cute::elect_one_sync();
-                int warp_idx_sync = __shfl_sync(0xffffffff, thread_idx / cutlass::NumThreadsPerWarp, 0);
-                if (warp_idx_sync == NumMmaThreads / cutlass::NumThreadsPerWarp - 1 && lane_predicate) {
-                    if constexpr (!Varlen && !PackGQA) { tma_store_wait<0>(); }
-                    #pragma unroll
-                    for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
-                        shared_storage.pipelines.barrier_O.arrive(cta_id, lane_predicate);
-                    }
-                }
-            }
-
-            #pragma unroll 1
-            for (; n_block >= 0; --n_block) {
+            auto fwd_step = [&](int const n_block, auto mask_fn, auto is_first_iter_type, auto check_inf_type) {
+                static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
+                static constexpr bool Check_inf = decltype(check_inf_type)::value;
                 Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
                 warpgroup_wait<0>();
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
+                scoremod_premask_fn(tSrS);
+                mask_fn(tSrS, n_block - 1);
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/false>(tSrS);
                 warp_scheduler_barrier_sync();
                 softmax.template online_softmax</*Is_first=*/false>(tSrS);
+                if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
                 Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(), flash::convert_layout_acc_Aregs<TiledMma1>(tSrS.layout()));
+                if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
                 warp_scheduler_barrier_arrive();
-                if constexpr (Is_FP8) { flash::permute_Aregs_fp8(tOrP); }
                 softmax.rescale_o(tOrO, scores_scale);
                 consumer_wait(pipeline_v, smem_pipe_read);
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 warpgroup_wait<0>();
                 pipeline_v.consumer_release(smem_pipe_read);  // release V
                 ++smem_pipe_read;
-            }
+            };
+            // fwd_step(n_block, mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>, cute::bool_constant<true>{} /*is_first_iter*/, cute::bool_constant<true>{} /*check_inf*/);
+            // --n_block;
+            // #pragma unroll 1
+            // for (; n_block >= n_block_min; --n_block) {
+            //     fwd_step(n_block, mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<true>{} /*check_inf*/);
+            // }
             // Tell warp 0 that smem_q is ready
             cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
             Tensor scores_scale = softmax.finalize();

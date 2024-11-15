@@ -19,14 +19,17 @@ namespace flash {
 
 using namespace cute;
 
-template <class TileShape_MNK_, class Element_, int NumEpilogueThreads_, bool Varlen_, bool GQAPack_, bool FP8PermuteCol=false>
+template <class TileShape_MNK_, class ClusterShape_, class Element_, int NumEpilogueThreads_, bool Varlen_, bool PackGQA_, bool FP8PermuteCol=false>
 struct CollectiveEpilogueFwd {
 
     using TileShape_MNK = TileShape_MNK_;
+    using ClusterShape = ClusterShape_;
     using Element = Element_;
     static constexpr int NumEpilogueThreads = NumEpilogueThreads_;
     static constexpr bool Varlen = Varlen_;
-    static constexpr bool PackGQA = GQAPack_;
+    static constexpr bool PackGQA = PackGQA_;
+    static constexpr bool Use_smem = sizeof(Element) <= 2;
+    static constexpr bool Use_TMA_O = !Varlen && Use_smem && !PackGQA;
 
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -52,8 +55,6 @@ struct CollectiveEpilogueFwd {
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerStore>>>{}));  // Val layout, 8 or 16 vals per store
-
-    static constexpr bool Use_smem = sizeof(Element) <= 2;
 
     using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
@@ -155,7 +156,7 @@ struct CollectiveEpilogueFwd {
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
     CUTLASS_DEVICE
     static void prefetch_tma_descriptors(Params const& params) {
-        if constexpr (!Varlen && Use_smem && !PackGQA) {
+        if constexpr (Use_TMA_O) {
             cute::prefetch_tma_descriptor(params.tma_store_O.get_tma_descriptor());
         }
     }
@@ -200,6 +201,11 @@ struct CollectiveEpilogueFwd {
             } else {
                 cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
             }
+        } else {
+            #pragma unroll
+            for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
+                shared_storage.pipelines.barrier_O.arrive(cta_id);
+            }
         }
 
         bool is_varlen = Varlen && params.cu_seqlens;
@@ -231,7 +237,7 @@ struct CollectiveEpilogueFwd {
         }
 
         // Step 3: Write O from smem -> gmem
-        if constexpr (!Varlen && Use_smem && !PackGQA) {
+        if constexpr (Use_TMA_O) {
             Tensor mO = params.tma_store_O.get_tma_tensor(params.shape_O)(_, _, bidh, bidb, split_idx);
             Tensor gO = local_tile(mO, select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
             auto block_tma_O = params.tma_store_O.get_slice(_0{});
@@ -244,6 +250,11 @@ struct CollectiveEpilogueFwd {
                 if (cute::elect_one_sync()) {
                     cute::copy(params.tma_store_O, tOsO, tOgO);
                     tma_store_arrive();
+                    tma_store_wait<0>();
+                    #pragma unroll
+                    for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
+                        shared_storage.pipelines.barrier_O.arrive(cta_id);
+                    }
                 }
             }
         } else {  // Don't use TMA since we don't want to overwrite the output of another sequence
@@ -256,9 +267,10 @@ struct CollectiveEpilogueFwd {
                 // Tensor tOsO = gmem_thr_copy_O.partition_S(sO_pi);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
                 Tensor tOrO = make_fragment_like(tOsO);
                 cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
-                // Signal to the last warp that we're done reading from sO
-                cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
-                                                    cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                #pragma unroll
+                for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
+                    shared_storage.pipelines.barrier_O.arrive(cta_id);
+                }
                 if constexpr (!PackGQA) {
                     // Construct identity layout for sO
                     Tensor cO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));  // (BLK_M,BLK_K) -> (blk_m,blk_k)
@@ -277,14 +289,8 @@ struct CollectiveEpilogueFwd {
                     // If PackGQA, we split the work of compute O_ptr among threads in the same row
                     PackGQAt::store_O(mO, tOrO, params.qhead_per_khead_divmod, thread_idx, seqlen_o, m_block);
                 }
-                // Last warp needs to wait for everyone to finish reading from sO, which it is the warp
-                // that will arrive on barrier_O in the mma of the next iteration.
-                int warp_idx_sync = __shfl_sync(0xffffffff, thread_idx / cutlass::NumThreadsPerWarp, 0);
-                if (warp_idx_sync == NumEpilogueThreads / cutlass::NumThreadsPerWarp - 1) {
-                    cutlass::arch::NamedBarrier::sync(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
-                                                      cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-                }
             } else {
+                // We already arrived on barrier_O earlier
                 static constexpr int kGmemElemsPerStoreDirect = 2;
                 cute::Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element> gmem_copy_direct;
                 // Reshape acc from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
@@ -317,7 +323,7 @@ struct CollectiveEpilogueFwd {
 
     CUTLASS_DEVICE void
     store_tail() {
-        if constexpr (!Varlen && Use_smem && !PackGQA) { tma_store_wait<0>(); }
+        // Don't need to do tma_store_wait<0>() here since we already did in @store
     }
 
     // Write 0 to output and -inf to LSE

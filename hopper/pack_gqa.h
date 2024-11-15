@@ -62,7 +62,6 @@ struct PackGQAManager {
         Tensor tPrPtr = make_tensor<TensorType const*>(Shape<Int<NumPtrPerThread>>{});
         #pragma unroll
         for (int i = 0; i < NumPtrPerThread; ++i) {
-            // int const row = i * NumThreads + (thread_idx % NumThreadsPerRow) * (NumThreads / NumThreadsPerRow) + (thread_idx / NumThreadsPerRow);
             int const row = i * NumThreads + get<0>(tRows(thread_idx % NumThreadsPerRow));
             int const idx = m_block * kBlockM + row;
             int m_idx, h_idx;

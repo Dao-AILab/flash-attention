@@ -39,6 +39,7 @@ public:
     static constexpr bool Transpose_V = CollectiveMainloop::Transpose_V;
     static constexpr bool Use_TMA_Q = CollectiveMainloop::Use_TMA_Q;
     static constexpr bool Use_TMA_KV = CollectiveMainloop::Use_TMA_KV;
+    static constexpr bool Use_TMA_O = CollectiveEpilogue::Use_TMA_O;
     static constexpr int NumProducerThreads = CollectiveMainloop::NumProducerThreads;
 
     // Mainloop derived types
@@ -195,7 +196,7 @@ public:
 
         if (warp_idx == 0 && lane_predicate) {
             shared_storage.pipelines.barrier_Q.init(Use_TMA_Q ? 1 : NumMmaThreads /*numThreads*/);
-            shared_storage.pipelines.barrier_O.init(size(ClusterShape{}) /*numThreads*/);
+            shared_storage.pipelines.barrier_O.init(size(ClusterShape{}) * (Use_TMA_O ? 1 : NumMmaThreads) /*numThreads*/);
         }
 
         // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
