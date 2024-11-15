@@ -649,4 +649,11 @@ def attention_prefill_forward_triton_impl(
                     USE_ALIBI=False if alibi_slopes is None else True, ENABLE_DROPOUT=dropout_p
                     > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_scores)
 
+    if DEBUG:
+        print()
+        print("attention_prefill_forward_triton_impl outputs")
+        print("o:", o, o.shape)
+        print("softmax_lse:", softmax_lse, softmax_lse.shape)
+        print("exp_scores:", exp_scores, exp_scores.shape if exp_scores is not None else None)
+
     return o, softmax_lse, exp_scores, grid, head_size, philox_seed, philox_offset, scores, scores_scaled_shifted

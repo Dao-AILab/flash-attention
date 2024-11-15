@@ -340,42 +340,48 @@ def test_op_bwd(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, torch_sdpa_test, use_ali
     torch.testing.assert_close(ref_dq, tri_dq, atol=ATOL, rtol=RTOL)
 
 
-@pytest.mark.parametrize('Z, H, N_CTX_Q, N_CTX_K, D_HEAD', [
-    (1, 1, 1, 1, 1),
-    (1, 1, 2, 4, 16),
-    (1, 1, 4, 2, 16),
-    (1, 1, 4, 4, 16),
-    (1, 2, 4, 4, 16),
-    (2, 1, 4, 4, 16),
-    (2, 2, 4, 4, 16),
-    (1, 1, 128, 64, 16),
-    (2, 2, 2, 128, 1),
-    (2, 3, 2, 128, 16),
-    (3, 2, 256, 512, 16),
-    (3, 3, 128, 128, 64),
-    (2, 4, 1024, 1024, 64),
-    (4, 6, 108, 256, 224),
-    (4, 8, 2048, 2048, 128),
-    (4, 16, 4096, 4096, 64),
-    (2, 4, 8192, 8192, 32),
-    # # fa configs
-    (4, 6, 113, 203, 256),
-    (4, 6, 128, 217, 256),
-    (4, 6, 113, 211, 128),
-    (4, 6, 108, 256, 128),
-    (4, 6, 256, 512, 64),
-    (4, 6, 512, 256, 64),
-    (4, 6, 1024, 1024, 32),
-    (4, 6, 1023, 1024, 32),
-    (4, 6, 1024, 1023, 32),
-    (4, 6, 2048, 2048, 32),
-])
+@pytest.mark.parametrize(
+    "Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD",
+    [
+        (1, 1, 1, 1, 1, 1),
+        (1, 1, 1, 2, 4, 16),
+        (1, 2, 2, 2, 4, 16),
+        (1, 4, 1, 2, 4, 16),
+        (1, 4, 2, 2, 4, 16),
+        (1, 1, 1, 4, 2, 16),
+        (1, 1, 1, 4, 4, 16),
+        (1, 2, 2, 4, 4, 16),
+        (2, 1, 1, 4, 4, 16),
+        (2, 2, 2, 4, 4, 16),
+        (1, 1, 1, 128, 64, 16),
+        (2, 2, 2, 2, 128, 1),
+        (2, 3, 3, 2, 128, 16),
+        (3, 2, 2, 256, 512, 16),
+        (3, 3, 3, 128, 128, 64),
+        (2, 4, 4, 1024, 1024, 64),
+        (4, 6, 6, 108, 256, 224),
+        (4, 8, 8, 2048, 2048, 128),
+        (4, 16, 16, 4096, 4096, 64),
+        (2, 4, 4, 8192, 8192, 32),
+        # fa configs
+        (4, 6, 1, 113, 203, 256),
+        (4, 6, 1, 128, 217, 256),
+        (4, 6, 2, 113, 211, 128),
+        (4, 6, 2, 108, 256, 128),
+        (4, 6, 1, 256, 512, 64),
+        (4, 6, 1, 512, 256, 64),
+        (4, 6, 2, 1024, 1024, 32),
+        (4, 6, 2, 1023, 1024, 32),
+        (4, 6, 6, 1024, 1023, 32),
+        (4, 6, 6, 2048, 2048, 32),
+    ],
+)
 @pytest.mark.parametrize('causal', [True, False])
 @pytest.mark.parametrize('return_scores', [False])
 @pytest.mark.parametrize('layout', ["bhsd", "bshd", "thd"])
 @pytest.mark.parametrize('use_exp2', [True, False]) # works when use_exp2 is false
 @pytest.mark.parametrize('DEBUG_INPUT', [False]) # NOTE: debug input can overflow when the tensors are large. Just use to figure out issues
-def test_op_prefill_fwd_impl(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, return_scores, layout, use_exp2, DEBUG_INPUT):
+def test_op_prefill_fwd_impl(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, return_scores, layout, use_exp2, DEBUG_INPUT):
     dtype = torch.float16
     torch.manual_seed(0)
     alibi_slopes = None
@@ -383,13 +389,19 @@ def test_op_prefill_fwd_impl(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, return_scor
     device = "cuda"
 
     if layout == "thd":
-        q, k, v, metadata = varlen_input_helper(Z, H, H, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+        q, k, v, metadata = varlen_input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
     else:
-        q, k, v, metadata = input_helper(Z, H, H, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout, device=device, DEBUG_INPUT=DEBUG_INPUT)
+        q, k, v, metadata = input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout, device=device, DEBUG_INPUT=DEBUG_INPUT)
     if DEBUG_INPUT:
         output_triton = torch.zeros_like(q).contiguous()
     else:
         output_triton = torch.empty_like(q)
+
+    if DEBUG:
+        if HQ // HK != 1:
+            print("MQA/GQA")
+        else:
+            print("MHA")
 
     # update metadata
     metadata.use_exp2 = use_exp2
@@ -469,79 +481,65 @@ def test_op_prefill_fwd_impl(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, return_scor
         print("output_ref:", output_ref, output_ref.shape)
     torch.testing.assert_close(output_triton, output_ref, atol=ATOL, rtol=RTOL)
 
-
-    # compare with pytorch expect thd and causal impl is different
-    if False and layout in ["bhsd", "bshd"] and not causal:
-        out_pytorch, softmax_pytorch = torch.ops.aten._scaled_dot_product_attention_math(
-                                                                            q.transpose(1, 2) if layout == "bshd" else q , 
-                                                                            k.transpose(1, 2) if layout == "bshd" else k, 
-                                                                            v.transpose(1, 2) if layout == "bshd" else v, 
-                                                                            dropout_p=dropout_p,
-                                                                            is_causal=causal, scale=metadata.sm_scale,
-                                                                            dropout_mask=None)
-        out_pytorch = out_pytorch.transpose(1, 2) if layout == "bshd" else out_pytorch
-
-        if DEBUG:
-            print("o:", output_triton, output_triton.shape)
-            print("out_pytorch:", out_pytorch, out_pytorch.shape)
-        torch.testing.assert_close(output_triton, out_pytorch, atol=ATOL, rtol=RTOL)
-        
-        # compare with pytorch output
-        if DEBUG:
-            print("softmax_triton:", softmax_triton, softmax_triton.shape)
-            print("softmax_pytorch:", softmax_pytorch, softmax_pytorch.shape)
-        torch.testing.assert_close(softmax_triton, softmax_pytorch.to(torch.float32), atol=ATOL, rtol=RTOL)
-
-
-@pytest.mark.parametrize('Z, H, N_CTX_Q, N_CTX_K, D_HEAD', [
-    (1, 1, 1, 1, 1),
-    (1, 1, 4, 4, 4),
-    (2, 1, 4, 4, 16),
-    (1, 2, 4, 4, 16),
-    (2, 2, 4, 4, 16),
-    (1, 1, 4, 4, 16),
-    (2, 1, 4, 4 , 16),
-    (4, 6, 8, 8 , 16),
-    (1, 1, 4, 4, 32),
-    (1, 1, 16, 16, 16),
-    (1, 1, 32, 32, 16),
-    (1, 1, 64, 64, 16),
-    (1, 1, 64, 64, 64),
-    (1, 1, 64, 128, 32),
-    (1, 1, 128, 128, 64),
-    (1, 1, 128, 256, 45),
-    (1, 1, 113, 203, 192),
-    (1, 1, 256, 256, 64),
-    (1, 1, 256, 512, 16),
-    (1, 1, 512, 512, 64), 
-    (1, 1, 1024, 1024, 64),
+@pytest.mark.parametrize(
+    "Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD", [
+    (1, 1, 1, 1, 1, 1),
+    (1, 1, 1, 4, 4, 4),
+    (2, 1, 1, 4, 4, 16),
+    (1, 2, 2, 4, 4, 16),
+    (1, 4, 1, 2, 4, 16),
+    (1, 8, 1, 2, 4, 16),
+    (1, 16, 1, 2, 4, 16),
+    (1, 32, 1, 2, 4, 16),
+    (1, 64, 1, 2, 4, 16),
+    (1, 4, 2, 2, 4, 16),
+    (2, 2, 2, 4, 4, 16),
+    (1, 1, 1, 4, 4, 16),
+    (2, 1, 1, 4, 4 , 16),
+    (4, 6, 6, 8, 8 , 16),
+    (1, 1, 1, 4, 4, 32),
+    (1, 1, 1, 16, 16, 16),
+    (1, 1, 1, 32, 32, 16),
+    (1, 1, 1, 64, 64, 16),
+    (1, 1, 1, 64, 64, 64),
+    (1, 1, 1, 64, 128, 32),
+    (1, 1, 1, 128, 128, 64),
+    (1, 1, 1, 128, 256, 45),
+    (1, 1, 1, 113, 203, 192),
+    (1, 1, 1, 256, 256, 64),
+    (1, 1, 1, 256, 512, 16),
+    (1, 1, 1, 512, 512, 64), 
+    (1, 1, 1, 1024, 1024, 64),
     # fa configs
-    (2, 2, 128, 128, 65),
-    (2, 2, 128, 128, 224),
-    (4, 6, 108, 256, 224),
-    (1, 1, 256, 512, 16),
+    (2, 2, 2, 128, 128, 65),
+    (2, 2, 2, 128, 128, 224),
+    (4, 6, 6, 108, 256, 224),
+    (1, 1, 1, 256, 512, 16),
     # old tests that work
-    (4, 48, 1024, 1024, 73),
-    (4, 48, 1024, 1024, 64),
-    (4, 48, 2048, 2048, 64),
-    (1, 24, 4096, 4096, 64),
-    (1, 16, 1024, 1024, 64),
-    (1, 16, 1024, 1024, 128),
+    (4, 48, 6, 1024, 1024, 64),
+    (4, 48, 12, 1024, 1024, 64),
+    (4, 48, 24, 1024, 1024, 64),
+    (4, 48, 48, 1024, 1024, 64),
+    (4, 48, 48, 1024, 1024, 73),
+    (4, 48, 48, 2048, 2048, 64),
+    (1, 24, 24, 4096, 4096, 64),
+    (1, 16, 16, 1024, 1024, 64),
+    (1, 16, 16, 1024, 1024, 128),
 ])
 @pytest.mark.parametrize('causal', [True, False])
 @pytest.mark.parametrize('use_exp2', [False]) # FIXME: using exp2 causes issue when used with causal
 @pytest.mark.parametrize('layout', ["bhsd", "bshd", "thd"])
 @pytest.mark.parametrize('sequence_parallel', [True, False])
-@pytest.mark.parametrize('DEBUG_INPUT', [False]) # debug output causes nans in both new and old backend
-def test_op_prefill_bwd_impl(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, use_exp2, layout, sequence_parallel, DEBUG_INPUT):
+@pytest.mark.parametrize('DEBUG_INPUT', [False]) # debug output causes nans on larger tensors
+def test_op_prefill_bwd_impl(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, use_exp2, layout, sequence_parallel, DEBUG_INPUT):
     dtype = torch.float16
     torch.manual_seed(20) # seed from test_op_bwd
 
     alibi_slopes = None
     if layout == "thd":
-        q, k, v, metadata = varlen_input_helper(Z, H, H, N_CTX_Q, N_CTX_K, D_HEAD, dtype, DEBUG_INPUT=DEBUG_INPUT)
+        q, k, v, metadata = varlen_input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, DEBUG_INPUT=DEBUG_INPUT)
     else:
-        q, k, v, metadata = input_helper(Z, H, H, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout, DEBUG_INPUT=DEBUG_INPUT)
+        q, k, v, metadata = input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout, DEBUG_INPUT=DEBUG_INPUT)
     if DEBUG_INPUT:
         do = torch.ones_like(q).contiguous()
     else:
@@ -572,6 +570,13 @@ def test_op_prefill_bwd_impl(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, use_exp2, l
         metadata.max_seqlens_k,
         use_exp2
     )
+
+
+    if DEBUG:
+        if HQ // HK != 1:
+            print("MQA/GQA")
+        else:
+            print("MHA")
 
     dq = torch.zeros_like(q, dtype=q.dtype) # NOTE: the kernel does inplace accumlation on dq so dq has to be zeros
     if DEBUG_INPUT:

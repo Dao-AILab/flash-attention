@@ -891,8 +891,8 @@ def test_flash_attn_varlen_qkvpacked(
 # @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("dtype", [torch.float16])
-# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("deterministic", [False, True])
 # @pytest.mark.parametrize("deterministic", [True])
 @pytest.mark.parametrize("deterministic", [False])
@@ -908,7 +908,7 @@ def test_flash_attn_varlen_qkvpacked(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize("d", [64])
+# @pytest.mark.parametrize("d", [32])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1196,8 +1196,8 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('kvpacked', [False])
 # @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 @pytest.mark.parametrize('dtype', [torch.float16])
-# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize('mha_type', ["mha"])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize('mha_type', ["mha"])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("alibi", [False, True])
@@ -1208,7 +1208,7 @@ def test_flash_attn_output(
 @pytest.mark.parametrize('causal', [False])
 @pytest.mark.parametrize("d", [32, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [160])
+# @pytest.mark.parametrize('d', [32])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [

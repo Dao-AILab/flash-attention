@@ -2,10 +2,12 @@ import torch
 import math
 from .utils import DEBUG
 
+DEBUG_CORE = DEBUG and False
+
 def attention_backward_core_ref_impl(
     do, q, k, v, o, softmax_lse, sm_scale, causal, use_exp2
 ):
-    if DEBUG:
+    if DEBUG_CORE:
         print()
         print("attention_backward_core_ref_impl")
         print("do:", do, do.shape)
@@ -29,12 +31,12 @@ def attention_backward_core_ref_impl(
 
     # recompute attention_scores. Make sure it matches the forward impl. i.e. It use float32
     attention_scores = torch.matmul(q.to(torch.float32), k.transpose(-2, -1).to(torch.float32))
-    if DEBUG:
+    if DEBUG_CORE:
         print("attention_scores:", attention_scores, attention_scores.shape)
 
     # scale scores
     attention_scaled_scores = sm_scale * attention_scores
-    if DEBUG:
+    if DEBUG_CORE:
         print("attention_scaled_scores:", attention_scaled_scores, attention_scaled_scores.shape)
 
     # Apply causal mask if necessary
@@ -44,13 +46,13 @@ def attention_backward_core_ref_impl(
         col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
         col_offset = L_q-L_k
         causal_mask = row_idx >= (col_offset + col_idx)
-        if DEBUG:
+        if DEBUG_CORE:
             print("causal_mask:", causal_mask)
         # set -inf to places the causal mask is false
         attention_scaled_scores = attention_scaled_scores.masked_fill(
              torch.logical_not(causal_mask.unsqueeze(0)), float('-inf')
         )
-        if DEBUG:
+        if DEBUG_CORE:
             print("attention_scaled_scores after causal:", attention_scaled_scores, attention_scaled_scores.shape)
 
     # compute probabilities using softmax_lse
@@ -64,17 +66,17 @@ def attention_backward_core_ref_impl(
         softmax_lse_3d =  softmax_lse.unsqueeze(-1)
         p = torch.exp(attention_scaled_scores - softmax_lse_3d)
 
-    if DEBUG:
+    if DEBUG_CORE:
         print("softmax_lse_3d:", softmax_lse_3d, softmax_lse_3d.shape)
         print("p:", p, p.shape)
     # compute gradient wrt v
     dv = torch.matmul(p.transpose(-2, -1), do.to(torch.float32))
-    if DEBUG:
+    if DEBUG_CORE:
         print("dv:", dv, dv.shape)
 
     # compute dp
     dp = torch.matmul(do, v.transpose(-2, -1))
-    if DEBUG:
+    if DEBUG_CORE:
         print("dp:", dp, dp.shape)
 
     # calculate ds using dp
@@ -84,21 +86,21 @@ def attention_backward_core_ref_impl(
     else:
         delta = torch.sum(p * dp, axis=-1) # what the math says you should use
         delta_3d = delta.unsqueeze(-1)
-    if DEBUG:
+    if DEBUG_CORE:
         print("delta_3d:", delta_3d, delta_3d.shape)
     ds = (p * (dp - delta_3d)) * sm_scale
-    if DEBUG:
+    if DEBUG_CORE:
         print("ds:", ds, ds.shape)
    
 
     # compute gradient wrt k
     dk = torch.matmul(ds.transpose(-2, -1), q.to(torch.float32))
-    if DEBUG:
+    if DEBUG_CORE:
         print("dk:", dk, dk.shape)
 
     # compute gradient wrt q
     dq = torch.matmul(ds, k.to(torch.float32))
-    if DEBUG:
+    if DEBUG_CORE:
         print("dq:", dq, dq.shape)
 
     # cast back to original dtype
@@ -109,7 +111,7 @@ def attention_backward_core_ref_impl(
     # remove d dim with size 1
     delta = delta_3d.squeeze(-1)
 
-    if DEBUG:
+    if DEBUG_CORE:
         print("attention_backward_core_ref_impl output")
         print("dq:", dq, dq.shape)
         print("dk:", dk, dk.shape)
@@ -139,8 +141,12 @@ def attention_varlen_backward_pytorch_ref_impl(
         raise ValueError(f"Unsupported layout {layout}. Expected 'thd'.")
 
     batch_size = cu_seqlens_q.shape[0] - 1
-    num_heads = q.shape[1]
-    head_dim = q.shape[2]
+    nheads_q, head_dim = q.shape[1], q.shape[2]
+    nheads_k = k.shape[1]
+
+    group_size = nheads_q // nheads_k
+    if nheads_q % nheads_k != 0:
+        raise ValueError("nheads_q must be divisible by nheads_k")
 
     # Pre-allocate outputs
     total_L_q = q.shape[0]
@@ -149,8 +155,8 @@ def attention_varlen_backward_pytorch_ref_impl(
     dq = torch.zeros_like(q)
     dk = torch.zeros_like(k)
     dv = torch.zeros_like(v)
-    # delta has the same shape as softmax_lse: [total_L_q, num_heads]
-    delta = torch.zeros((total_L_q, num_heads), dtype=torch.float32, device=o.device)
+    # delta has the same shape as softmax_lse: [total_L_q, nheads_q]
+    delta = torch.zeros((total_L_q, nheads_q), dtype=torch.float32, device=o.device)
 
     for i in range(batch_size):
         # Get the start and end indices for the current sequence
@@ -160,22 +166,37 @@ def attention_varlen_backward_pytorch_ref_impl(
         end_k = cu_seqlens_k[i + 1].item()
 
         # Extract q_i, k_i, v_i, do_i, o_i, softmax_lse_i
-        q_i = q[start_q:end_q, :, :]      # [L_q_i, num_heads, head_dim]
-        k_i = k[start_k:end_k, :, :]      # [L_k_i, num_heads, head_dim]
-        v_i = v[start_k:end_k, :, :]      # [L_k_i, num_heads, head_dim]
-        do_i = do[start_q:end_q, :, :]    # [L_q_i, num_heads, head_dim]
-        o_i = o[start_q:end_q, :, :]      # [L_q_i, num_heads, head_dim]
-        # softmax_lse has shape [total_L_q, num_heads]
-        softmax_lse_i = softmax_lse[start_q:end_q, :]  # [L_q_i, num_heads]
-        softmax_lse_i = softmax_lse_i.transpose(0, 1)  # [num_heads, L_q_i]
+        q_i = q[start_q:end_q, :, :]      # [L_q_i, nheads_q, head_dim]
+        k_i = k[start_k:end_k, :, :]      # [L_k_i, nheads_k, head_dim]
+        v_i = v[start_k:end_k, :, :]      # [L_k_i, nheads_k, head_dim]
+        do_i = do[start_q:end_q, :, :]    # [L_q_i, nheads_q, head_dim]
+        o_i = o[start_q:end_q, :, :]      # [L_q_i, nheads_q, head_dim]
+        softmax_lse_i = softmax_lse[start_q:end_q, :] # [L_q_i, nheads_q]
 
-        # Permute to [num_heads, L_q_i, head_dim]
+        if group_size != 1:
+            # MQA or GQA case
+            # Reshape tensors to include group dimension
+            q_i = q_i.view(q_i.shape[0], nheads_k, group_size, head_dim)
+            do_i = do_i.view(do_i.shape[0], nheads_k, group_size, head_dim)
+            o_i = o_i.view(o_i.shape[0], nheads_k, group_size, head_dim)
+            softmax_lse_i = softmax_lse_i.view(softmax_lse_i.shape[0], nheads_k, group_size)
+            # Expand k_i and v_i to match group_size
+            k_i = k_i.unsqueeze(2).expand(-1, -1, group_size, -1)
+            v_i = v_i.unsqueeze(2).expand(-1, -1, group_size, -1)
+            # Flatten the nheads_k and group_size dimensions
+            q_i = q_i.reshape(q_i.shape[0], nheads_k * group_size, head_dim)
+            do_i = do_i.reshape(do_i.shape[0], nheads_k * group_size, head_dim)
+            o_i = o_i.reshape(o_i.shape[0], nheads_k * group_size, head_dim)
+            softmax_lse_i = softmax_lse_i.reshape(softmax_lse_i.shape[0], nheads_k * group_size)
+            k_i = k_i.reshape(k_i.shape[0], nheads_k * group_size, head_dim)
+            v_i = v_i.reshape(v_i.shape[0], nheads_k * group_size, head_dim)
+        # Permute to [nheads_total, L, head_dim]
         q_i = q_i.permute(1, 0, 2)
         k_i = k_i.permute(1, 0, 2)
         v_i = v_i.permute(1, 0, 2)
         do_i = do_i.permute(1, 0, 2)
         o_i = o_i.permute(1, 0, 2)
-        # softmax_lse_i is already in [num_heads, L_q_i]
+        softmax_lse_i = softmax_lse_i.transpose(0, 1)
 
         # Call the core backward function for this sequence
         dq_i, dk_i, dv_i, delta_i = attention_backward_core_ref_impl(
@@ -191,16 +212,31 @@ def attention_varlen_backward_pytorch_ref_impl(
         )
 
         # Convert back to 'thd' layout
-        dq_i = dq_i.permute(1, 0, 2)  # [L_q_i, num_heads, head_dim]
-        dk_i = dk_i.permute(1, 0, 2)  # [L_k_i, num_heads, head_dim]
-        dv_i = dv_i.permute(1, 0, 2)  # [L_k_i, num_heads, head_dim]
+        dq_i = dq_i.permute(1, 0, 2)  # [L_q_i, nheads_total, head_dim]
+        dk_i = dk_i.permute(1, 0, 2)  # [L_k_i, nheads_total, head_dim]
+        dv_i = dv_i.permute(1, 0, 2)  # [L_k_i, nheads_total, head_dim]
+        delta_i = delta_i.transpose(1, 0)  # [L_q_i, nheads_total]
+
+        if group_size != 1:
+            # Reshape dq_i and delta_i back to original shape
+            dq_i = dq_i.view(dq_i.shape[0], nheads_k, group_size, head_dim)
+            delta_i = delta_i.view(delta_i.shape[0], nheads_k, group_size)
+            # Sum dk_i and dv_i over group dimension
+            dk_i = dk_i.view(dk_i.shape[0], nheads_k, group_size, head_dim)
+            dv_i = dv_i.view(dv_i.shape[0], nheads_k, group_size, head_dim)
+            dk_i = dk_i.sum(dim=2)
+            dv_i = dv_i.sum(dim=2)
+            # Reshape dq_i back to [L_q_i, nheads_q, head_dim]
+            dq_i = dq_i.reshape(dq_i.shape[0], nheads_q, head_dim)
+            delta_i = delta_i.reshape(delta_i.shape[0], nheads_q)
+        else:
+            # No need to reshape
+            pass
 
         # Place outputs in pre-allocated tensors
         dq[start_q:end_q, :, :] = dq_i
         dk[start_k:end_k, :, :] += dk_i  # Accumulate gradients for shared keys
         dv[start_k:end_k, :, :] += dv_i  # Accumulate gradients for shared values
-        # delta_i has shape [num_heads, L_q_i]
-        delta_i = delta_i.transpose(1, 0)  # [L_q_i, num_heads]
         delta[start_q:end_q, :] = delta_i
 
     return dq, dk, dv, delta
@@ -231,18 +267,42 @@ def attention_vanilla_backward_pytorch_ref_impl(
     else:
         raise ValueError(f"Unknown layout {layout}")
     
-    # Prepare tensors in [batch_size * num_heads, seq_len, head_dim] format
-    batch_size, num_heads, seq_len_q, head_dim = q.shape
-    seq_len_k = k.shape[2]
+    # Prepare tensors
+    batch_size, nheads_q, seq_len_q, head_dim = q.shape
+    batch_size, nheads_k, seq_len_k, head_dim = k.shape
 
-    # Merge batch and heads dimensions
-    do = do.reshape(batch_size * num_heads, seq_len_q, head_dim)
-    q = q.reshape(batch_size * num_heads, seq_len_q, head_dim)
-    k = k.reshape(batch_size * num_heads, seq_len_k, head_dim)
-    v = v.reshape(batch_size * num_heads, seq_len_k, head_dim)
-    softmax_lse = softmax_lse.reshape(batch_size * num_heads, seq_len_q)
-    o = o.reshape(batch_size * num_heads, seq_len_q, head_dim)
+    group_size = nheads_q // nheads_k
+    if nheads_q % nheads_k != 0:
+        raise ValueError("nheads_q must be divisible by nheads_k")
 
+    if group_size != 1:
+        # MQA or GQA case
+        # Reshape do, q, o to [batch_size, nheads_k, group_size, seq_len_q, head_dim]
+        do = do.reshape(batch_size, nheads_k, group_size, seq_len_q, head_dim)
+        q = q.reshape(batch_size, nheads_k, group_size, seq_len_q, head_dim)
+        o = o.reshape(batch_size, nheads_k, group_size, seq_len_q, head_dim)
+        # Reshape softmax_lse to [batch_size, nheads_k, group_size, seq_len_q]
+        softmax_lse = softmax_lse.reshape(batch_size, nheads_k, group_size, seq_len_q)
+        # Expand k and v to match group_size
+        k = k.unsqueeze(2).expand(-1, -1, group_size, -1, -1)  # [batch_size, nheads_k, group_size, seq_len_k, head_dim]
+        v = v.unsqueeze(2).expand(-1, -1, group_size, -1, -1)
+        # Flatten the first three dimensions for computation
+        do = do.reshape(batch_size * nheads_k * group_size, seq_len_q, head_dim)
+        q = q.reshape(batch_size * nheads_k * group_size, seq_len_q, head_dim)
+        k = k.reshape(batch_size * nheads_k * group_size, seq_len_k, head_dim)
+        v = v.reshape(batch_size * nheads_k * group_size, seq_len_k, head_dim)
+        o = o.reshape(batch_size * nheads_k * group_size, seq_len_q, head_dim)
+        softmax_lse = softmax_lse.reshape(batch_size * nheads_k * group_size, seq_len_q)
+    else:
+        # Standard case
+        do = do.reshape(batch_size * nheads_q, seq_len_q, head_dim)
+        q = q.reshape(batch_size * nheads_q, seq_len_q, head_dim)
+        k = k.reshape(batch_size * nheads_k, seq_len_k, head_dim)
+        v = v.reshape(batch_size * nheads_k, seq_len_k, head_dim)
+        o = o.reshape(batch_size * nheads_q, seq_len_q, head_dim)
+        softmax_lse = softmax_lse.reshape(batch_size * nheads_q, seq_len_q)
+
+    # Call the core backward function
     dq, dk, dv, delta = attention_backward_core_ref_impl(
         do,
         q,
@@ -255,11 +315,25 @@ def attention_vanilla_backward_pytorch_ref_impl(
         use_exp2
     )
 
-    # Reshape outputs back to [batch_size, num_heads, seq_len, head_dim]
-    dq = dq.reshape(batch_size, num_heads, seq_len_q, head_dim)
-    dk = dk.reshape(batch_size, num_heads, seq_len_k, head_dim)
-    dv = dv.reshape(batch_size, num_heads, seq_len_k, head_dim)
-    delta = delta.reshape(batch_size, num_heads, seq_len_q)
+    if group_size != 1:
+        # Reshape dq back to [batch_size, nheads_k, group_size, seq_len_q, head_dim]
+        dq = dq.reshape(batch_size, nheads_k, group_size, seq_len_q, head_dim)
+        # Reshape delta back to [batch_size, nheads_k, group_size, seq_len_q]
+        delta = delta.reshape(batch_size, nheads_k, group_size, seq_len_q)
+        # Sum dk and dv over group_size dimension, since k and v are shared across groups
+        dk = dk.reshape(batch_size, nheads_k, group_size, seq_len_k, head_dim)
+        dk = dk.sum(dim=2)  # Sum over group_size dimension
+        dv = dv.reshape(batch_size, nheads_k, group_size, seq_len_k, head_dim)
+        dv = dv.sum(dim=2)
+        # Reshape dq to [batch_size, nheads_q, seq_len_q, head_dim]
+        dq = dq.reshape(batch_size, nheads_k * group_size, seq_len_q, head_dim)
+        delta = delta.reshape(batch_size, nheads_k * group_size, seq_len_q)
+    else:
+        # Standard case
+        dq = dq.reshape(batch_size, nheads_q, seq_len_q, head_dim)
+        dk = dk.reshape(batch_size, nheads_k, seq_len_k, head_dim)
+        dv = dv.reshape(batch_size, nheads_k, seq_len_k, head_dim)
+        delta = delta.reshape(batch_size, nheads_q, seq_len_q)
 
     # Go back to original layout
     if layout == "bshd":
@@ -275,7 +349,6 @@ def attention_vanilla_backward_pytorch_ref_impl(
         raise ValueError(f"Unknown layout {layout}")
 
     return dq, dk, dv, delta
-
 
 def attention_backward_pytorch_ref_impl(
     do,
@@ -293,6 +366,26 @@ def attention_backward_pytorch_ref_impl(
     max_seqlen_k,
     use_exp2
 ):
+
+    if DEBUG:
+        print()
+        print("attention_backward_pytorch_ref_impl")
+        print("do:", do, do.shape)
+        print("q:", q, q.shape)
+        print("k:", k, k.shape)
+        print("v:", v, v.shape)
+        print("o:", o, o.shape)
+        print("softmax_lse:", softmax_lse)
+        print("sm_scale:", sm_scale)
+        print("causal:", causal)
+        print("layout:", layout)
+        print("cu_seqlens_q:", cu_seqlens_q)
+        print("cu_seqlens_k:", cu_seqlens_k)
+        print("max_seqlen_q:", max_seqlen_q)
+        print("max_seqlen_k:", max_seqlen_k)
+        print("use_exp2:", use_exp2)
+
+
     if layout == "thd":
         dq, dk, dv, delta = attention_varlen_backward_pytorch_ref_impl(
             do,
@@ -324,5 +417,13 @@ def attention_backward_pytorch_ref_impl(
             use_exp2,
         )
         
+
+    if DEBUG:
+        print()
+        print("attention_backward_pytorch_ref_impl outputs")
+        print("dq:", dq, dq.shape)
+        print("dk:", dk, dk.shape)
+        print("dv:", dv, dv.shape)
+        print("delta:", delta, delta.shape)
 
     return dq, dk, dv, delta
