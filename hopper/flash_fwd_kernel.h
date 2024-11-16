@@ -317,8 +317,7 @@ public:
                     // if (threadIdx.x == 0) { printf("Producer: Before sync\n"); }
                     cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
                     // TODO: do we need all these fences?
-                    asm volatile ("fence.proxy.async.global;");
-                    asm volatile ("membar.cta;");
+                    // asm volatile ("fence.proxy.async.global;");
                     // if (threadIdx.x == 0) { printf("Producer: After sync\n"); }
                     smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
                 }
@@ -376,8 +375,8 @@ public:
                     collective_mainloop.store_kv_new(params.mainloop, pipeline_k_new, pipeline_v_new, smem_pipe_read,
                                                      threadIdx.x - MmaThreadOffset, shared_storage, block_coord);
                     // if (threadIdx.x == 128) { printf("Consumer: Before sync\n"); }
-                    // TODO: do we need all these fences?
-                    asm volatile ("membar.cta;");
+                    // We need this sync so that the gmem write from the consumers is visible to the producer
+                    // that might do TMA read after that.
                     asm volatile ("fence.proxy.async.global;");
                     cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
                     // if (threadIdx.x == 128) { printf("Consumer: After sync\n"); }
