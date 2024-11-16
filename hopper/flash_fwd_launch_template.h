@@ -22,14 +22,16 @@
 using namespace cute;
 
 template <int kHeadDim, int kBlockM, int kBlockN, int kStages, int ClusterM, typename Element, typename ElementOut,
-          bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKV, bool PackGQA, bool Split, bool V_colmajor>
+          bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKV, bool AppendKV, bool PackGQA, bool Split, bool V_colmajor>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
+    static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
+    static_assert(!(AppendKV && !Varlen), "AppendKV requires Varlen");
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;
     static constexpr bool FP8_TransposeV = Is_FP8 && !V_colmajor;
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
-    using CollectiveMainloop = flash::CollectiveMainloopFwd<kStages, ClusterShape, TileShape_MNK, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, PackGQA, Split, V_colmajor>;
+    using CollectiveMainloop = flash::CollectiveMainloopFwd<kStages, ClusterShape, TileShape_MNK, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV, PackGQA, Split, V_colmajor>;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK, ClusterShape, ElementOut, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, FP8_TransposeV>;
 
     using SchedulerPersistent = std::conditional_t<Varlen,
@@ -40,11 +42,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     >;
     using SchedulerSingleTile = flash::SingleTileScheduler<Varlen, Split, PackGQA, kBlockM>;
     // If Split or PagedKV then we probably don't have enough work for PersistentScheduler to be useful.
-    using Scheduler = std::conditional_t<Split || PagedKV, SchedulerSingleTile, SchedulerPersistent>;
+    // If AppendKV, we *have to* use SingleTileScheduler to due the synchronization requirements.
+    using Scheduler = std::conditional_t<Split || PagedKV || AppendKV, SchedulerSingleTile, SchedulerPersistent>;
     using AttnKernel = flash::FlashAttnFwd<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
 
     bool const is_varlen_q = params.cu_seqlens_q;
     bool const is_varlen_k = params.cu_seqlens_k;
+    bool const is_varlen_k_new = params.cu_seqlens_knew;
     int seqlen_q = !is_varlen_q ? params.seqlen_q : params.total_q;
     int batch_q = !is_varlen_q ? params.b : 1;
     int batch_k = !is_varlen_k ? (params.kv_batch_idx ? params.b_k : params.b) : 1;
@@ -56,12 +60,17 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         static_cast<Element const*>(params.q_ptr),
         {seqlen_q, params.d, params.h, batch_q},  // shape_Q
         {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},  // stride_Q
-        static_cast<Element const*>(params.k_ptr),
+        static_cast<Element*>(params.k_ptr),
         {!PagedKV ? (!is_varlen_k ? params.seqlen_k : params.total_k) : params.page_size,
          params.d, params.h_k, !PagedKV ? batch_k : params.num_pages},  // shape_K
         {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0},  // stride_K
-        static_cast<Element const*>(params.v_ptr),
+        static_cast<Element*>(params.v_ptr),
         v_strides,  // stride_V
+        static_cast<Element const*>(params.knew_ptr),
+        {!is_varlen_k_new ? params.seqlen_knew : params.total_knew, params.d, params.h_k, !is_varlen_k_new ? params.b : 1},  // shape_K_new
+        {params.knew_row_stride, _1{}, params.knew_head_stride, !is_varlen_k_new ? params.knew_batch_stride : 0},  // stride_K_new
+        static_cast<Element const*>(params.vnew_ptr),
+        {params.vnew_row_stride, _1{}, params.vnew_head_stride, !is_varlen_k_new ? params.vnew_batch_stride : 0}, // stride_V_new
         params.page_table,
         // if page_size is not set, avoid dividing by zero
         {params.kv_batch_idx ? params.b_k : params.b, !PagedKV ? 0 : params.seqlen_k / params.page_size}, // shape_page_table
@@ -72,7 +81,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.softcap,
         params.num_splits,
         params.kv_batch_idx,
-        params.cu_seqlens_q, params.cu_seqlens_k, 
+        params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
         params.seqused_q, params.seqused_k,
         params.leftpad_k,
     };
@@ -146,21 +155,23 @@ void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
     BOOL_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
         BOOL_SWITCH(params.page_table, PagedKV, [&] {
-            BOOL_SWITCH(params.num_splits > 1, Split, [&] {
-                using T_out = std::conditional_t<!Split, std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>, float>;
-                bool pack_gqa = params.pack_gqa >= 0  // if negative, we use a heuristic to decide
-                    ? bool(params.pack_gqa)
-                    // If varlen, we don't actually know seqlen_q but only max_seqlen_q.
-                    : params.h != params.h_k && (Varlen || should_pack_gqa(params.seqlen_q, params.h, params.h_k, kBlockM));
-                BOOL_SWITCH(pack_gqa, PackGQA, [&] {
-                //     BOOL_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
-                //         // Only use Cluster if number of tiles along seqlen_q is even and not varlen
-                //         BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, UseCluster, [&] {
-                            // run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, !Is_causal && !Is_local && !Varlen && !Split && Enable_cluster && UseCluster ? 2 : 1, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PackGQA /*PackGQA*/, Split /*Split*/, false /*V_colmajor*/>(params, stream);
-                            // run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, !Is_causal && !Is_local && !Varlen && !Split && Enable_cluster && UseCluster ? 2 : 1, T, T_out, Is_causal, false, false, false /*Varlen*/, true /*PagedKV*/, false /*PackGQA*/, false /*Split*/, false /*V_colmajor*/>(params, stream);
-                            run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, 1, T, T_out, Is_causal, false, false, Varlen /*Varlen*/, PagedKV /*PagedKV*/, PackGQA /*PackGQA*/, Split /*Split*/, false /*V_colmajor*/>(params, stream);
-                //         });
-                //     });
+            BOOL_SWITCH(params.knew_ptr, AppendKV, [&] {
+                BOOL_SWITCH(params.num_splits > 1, Split, [&] {
+                    using T_out = std::conditional_t<!Split, std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>, float>;
+                    bool pack_gqa = params.pack_gqa >= 0  // if negative, we use a heuristic to decide
+                        ? bool(params.pack_gqa)
+                        // If varlen, we don't actually know seqlen_q but only max_seqlen_q.
+                        : params.h != params.h_k && (Varlen || should_pack_gqa(params.seqlen_q, params.h, params.h_k, kBlockM));
+                    BOOL_SWITCH(pack_gqa, PackGQA, [&] {
+                    //     BOOL_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
+                    //         // Only use Cluster if number of tiles along seqlen_q is even and not varlen
+                    //         BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, UseCluster, [&] {
+                                // run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, !Is_causal && !Is_local && !Varlen && !Split && Enable_cluster && UseCluster ? 2 : 1, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PackGQA /*PackGQA*/, Split /*Split*/, false /*V_colmajor*/>(params, stream);
+                                // run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, !Is_causal && !Is_local && !Varlen && !Split && Enable_cluster && UseCluster ? 2 : 1, T, T_out, Is_causal, false, false, false /*Varlen*/, true /*PagedKV*/, false /*PackGQA*/, false /*Split*/, false /*V_colmajor*/>(params, stream);
+                        run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, 1, T, T_out, Is_causal, false, false, Varlen /*Varlen*/, PagedKV /*PagedKV*/, AppendKV && Varlen /*AppendKV*/, PackGQA /*PackGQA*/, Split /*Split*/, false /*V_colmajor*/>(params, stream);
+                    //         });
+                    //     });
+                    });
                 });
             });
         });

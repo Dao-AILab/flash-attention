@@ -26,7 +26,7 @@ namespace flash {
 using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, class Element_, class ElementAccum_, class ArchTag_,
-          bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool PackGQA_, bool Split_, bool V_colmajor_>
+          bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_, bool PackGQA_, bool Split_, bool V_colmajor_>
 struct CollectiveMainloopFwd {
 
     static constexpr int kStages = Stages;
@@ -41,6 +41,7 @@ struct CollectiveMainloopFwd {
     static constexpr bool Has_softcap = Has_softcap_;
     static constexpr bool Varlen = Varlen_;
     static constexpr bool PagedKV = PagedKV_;
+    static constexpr bool AppendKV = AppendKV_;
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
@@ -153,6 +154,13 @@ struct CollectiveMainloopFwd {
     // We assume threads loading the same row are in the same warp. This is for an optimization in PagedKV where
     // these threads share the same page table entry and share the work of computing pointers to paged K and paged V.
     static_assert(cutlass::NumThreadsPerWarp % kGmemThreadsPerRow == 0, "kGmemThreadsPerRow must divide NumThreadsPerWarp");
+    using GmemLayoutAtom = Layout<Shape <Int<NumMmaThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
+                                  Stride<Int<kGmemThreadsPerRow>, _1>>;
+    using GmemTiledCopyAppendKV = decltype(
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
+                        GmemLayoutAtom{},
+                        Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per store
+
     using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
     using StrideQK = cute::Stride<int64_t, _1, int64_t, int64_t>;
     using StrideV = std::conditional_t<!V_colmajor, StrideQK, cute::Stride<_1, int64_t, int64_t, int64_t>>;
@@ -192,13 +200,15 @@ struct CollectiveMainloopFwd {
     using MainloopPipelineK = std::conditional_t<Use_TMA_KV, typename cutlass::PipelineTmaAsync<kStages>, typename cutlass::PipelineAsync<kStages>>;
     using MainloopPipelineV = std::conditional_t<!Transpose_V && Use_TMA_KV, typename cutlass::PipelineTmaAsync<kStages>, typename cutlass::PipelineAsync<kStages>>;
     using MainloopPipelineVt = std::conditional_t<Use_TMA_KV, typename cutlass::PipelineTmaAsync<kStages>, typename cutlass::PipelineAsync<kStages>>;
+    // We always use TMA for K_new and V_new
+    using MainloopPipelineKVNew = typename cutlass::PipelineTmaAsync<kStages>;
     using PipelineState = cutlass::PipelineState<kStages>;
 
     // If PackGQA, we use cp.async (instead of TMA) to load Q, so we want smem_q to be aligned
     // and have sQ being position_independent_swizzle_tensor.
     // If !Use_TMA_KV, we use cp.async (instead of TMA) to load K & V, so we want smem_k and smem_v to be aligned.
     static constexpr size_t SmemAlignmentQ = Use_TMA_Q ? 128 : cutlass::detail::alignment_for_swizzle(SmemLayoutQ{});
-    static constexpr size_t SmemAlignmentK = Use_TMA_KV ? 128 : cutlass::detail::alignment_for_swizzle(SmemLayoutK{});
+    static constexpr size_t SmemAlignmentK = Use_TMA_KV && !AppendKV ? 128 : cutlass::detail::alignment_for_swizzle(SmemLayoutK{});
     static constexpr size_t SmemAlignmentVtNoTranspose = cutlass::detail::alignment_for_swizzle(SmemLayoutVt{});
     static_assert(SmemAlignmentQ >= 128 and SmemAlignmentK >= 128 && SmemAlignmentVtNoTranspose >= 128, "Require at least 128B alignment");
 
@@ -226,14 +236,19 @@ struct CollectiveMainloopFwd {
 
     // Host side kernel arguments
     struct Arguments {
-        Element const* ptr_Q;
+        Element const* const ptr_Q;
         ShapeQKV const shape_Q;
         StrideQK const stride_Q;
-        Element const* ptr_K;
+        Element* const ptr_K;  // Not Element const* since we might append to KV cache in-place
         ShapeQKV const shape_K;
         StrideQK const stride_K;
-        Element const* ptr_V;
+        Element* const ptr_V;
         StrideV const stride_V;
+        Element const* const ptr_K_new;
+        ShapeQKV const shape_K_new;
+        StrideQK const stride_K_new;
+        Element const* const ptr_V_new;
+        StrideV const stride_V_new;
         int const* const ptr_pagetable;
         ShapePageTable const shape_pagetable;
         StridePageTable const stride_pagetable;
@@ -242,26 +257,32 @@ struct CollectiveMainloopFwd {
         int const window_size_left = -1, window_size_right = -1, sink_token_length = 0;
         float const softcap_val;
         int const num_splits;
-        int const* kv_batch_idx = nullptr;
-        int const* cu_seqlens_q = nullptr;
-        int const* cu_seqlens_k = nullptr;
-        int const* seqused_q = nullptr;
-        int const* seqused_k = nullptr;
-        int const* leftpad_k = nullptr;
+        int const* const kv_batch_idx = nullptr;
+        int const* const cu_seqlens_q = nullptr;
+        int const* const cu_seqlens_k = nullptr;
+        int const* const cu_seqlens_k_new = nullptr;
+        int const* const seqused_q = nullptr;
+        int const* const seqused_k = nullptr;
+        int const* const leftpad_k = nullptr;
     };
 
     // Device side kernel params
     struct Params {
-        Element const* ptr_Q;
+        Element const* const ptr_Q;
         ShapeQKV const shape_Q;
         StrideQK const stride_Q;
         ShapeQPacked const shape_Q_packed;
         StrideQPacked const stride_Q_packed;
-        Element const* ptr_K;
+        Element* const ptr_K;
         ShapeQKV const shape_K;
         StrideQK const stride_K;
-        Element const* ptr_V;
+        Element* const ptr_V;
         StrideV const stride_V;
+        Element const* const ptr_K_new;
+        ShapeQKV const shape_K_new;
+        StrideQK const stride_K_new;
+        Element const* const ptr_V_new;
+        StrideV const stride_V_new;
         int const* const ptr_pagetable;
         ShapePageTable const shape_pagetable;
         StridePageTable const stride_pagetable;
@@ -270,17 +291,20 @@ struct CollectiveMainloopFwd {
         TMA_Q tma_load_Q;
         TMA_K tma_load_K;
         TMA_V tma_load_V;
+        TMA_K tma_load_K_new;
+        TMA_V tma_load_V_new;
         float const softmax_scale_log2;
         float const* ptr_q_descale = nullptr, *ptr_k_descale = nullptr, *ptr_v_descale = nullptr;
         float const softcap_val;
         int const window_size_left, window_size_right, sink_token_length;
         int const num_splits;
-        int const* kv_batch_idx = nullptr;
-        int const* cu_seqlens_q = nullptr;
-        int const* cu_seqlens_k = nullptr;
-        int const* seqused_q = nullptr;
-        int const* seqused_k = nullptr;
-        int const* leftpad_k = nullptr;
+        int const* const kv_batch_idx = nullptr;
+        int const* const cu_seqlens_q = nullptr;
+        int const* const cu_seqlens_k = nullptr;
+        int const* const cu_seqlens_k_new = nullptr;
+        int const* const seqused_q = nullptr;
+        int const* const seqused_k = nullptr;
+        int const* const leftpad_k = nullptr;
     };
 
     static Params
@@ -306,6 +330,20 @@ struct CollectiveMainloopFwd {
             take<0, 2>(SmemLayoutVt{}),
             select<2, 1>(TileShape_MNK{}),
             size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
+        Tensor mKnew = make_tensor(make_gmem_ptr(args.ptr_K_new), args.shape_K_new, args.stride_K_new);
+        TMA_K tma_load_K_new = make_tma_copy_B_sm90(
+            GmemTiledCopyKV{},
+            cute::conditional_return<AppendKV>(mKnew, mK),
+            take<0, 2>(SmemLayoutK{}),
+            TileShape_MNK{},
+            ClusterShape{}); // mcast along M mode for this N load, if any
+        Tensor mVnew = make_tensor(make_gmem_ptr(args.ptr_V_new), select<1, 0, 2, 3>(args.shape_K_new), select<1, 0, 2, 3>(args.stride_V_new));
+        TMA_V tma_load_V_new = make_tma_copy(
+            GmemTiledCopyKV{},
+            cute::conditional_return<AppendKV>(mVnew, mV),
+            take<0, 2>(SmemLayoutVt{}),
+            select<2, 1>(TileShape_MNK{}),
+            size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
         // If PackGQA, reshape Q to be ((qhead_per_khead, seqlen_q), head_size, nhead_k, batch_size)
         int const qhead_per_khead = !PackGQA ? 1 : cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K));
         auto const shape_Q_packed = cute::conditional_return<!PackGQA>(
@@ -323,17 +361,19 @@ struct CollectiveMainloopFwd {
         // (assigning it to params.softmax_scale_log2).
         return {args.ptr_Q, args.shape_Q, args.stride_Q, shape_Q_packed, stride_Q_packed,
                 args.ptr_K, args.shape_K, args.stride_K, args.ptr_V, args.stride_V,
-                args.ptr_pagetable, args.shape_pagetable, args.stride_pagetable, 
+                args.ptr_K_new, args.shape_K_new, args.stride_K_new, args.ptr_V_new, args.stride_V_new,
+                args.ptr_pagetable, args.shape_pagetable, args.stride_pagetable,
                 cutlass::FastDivmod(int(get<0>(args.shape_K))),
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
-                tma_load_Q, tma_load_K, tma_load_V,
+                tma_load_Q, tma_load_K, tma_load_V, tma_load_K_new, tma_load_V_new,
                 !Has_softcap ? float(args.softmax_scale * M_LOG2E) : float(args.softcap_val * M_LOG2E),
                 args.ptr_q_descale, args.ptr_k_descale, args.ptr_v_descale,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.window_size_left, args.window_size_right, args.sink_token_length,
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k, args.leftpad_k};
+                args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
+                args.seqused_q, args.seqused_k, args.leftpad_k};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -346,6 +386,10 @@ struct CollectiveMainloopFwd {
             cute::prefetch_tma_descriptor(params.tma_load_K.get_tma_descriptor());
             cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
         }
+        if constexpr (AppendKV) {
+            cute::prefetch_tma_descriptor(params.tma_load_K_new.get_tma_descriptor());
+            cute::prefetch_tma_descriptor(params.tma_load_V_new.get_tma_descriptor());
+        }
     }
 
     CUTLASS_DEVICE
@@ -357,6 +401,7 @@ struct CollectiveMainloopFwd {
         }
     }
 
+    template<bool Seqlen_before_append_KV=false>
     CUTLASS_DEVICE
     int get_seqlen_k(Params const& params, int bidb) {
         int const seqlen_k_novarlen = !PagedKV ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable);
@@ -364,8 +409,16 @@ struct CollectiveMainloopFwd {
             return seqlen_k_novarlen;
         } else {
             int const leftpad = params.leftpad_k ? params.leftpad_k[bidb] : 0;
-            return (params.seqused_k ? params.seqused_k[bidb] : (params.cu_seqlens_k ? params.cu_seqlens_k[bidb + 1] - params.cu_seqlens_k[bidb] : seqlen_k_novarlen)) - leftpad;
+            int seqlen_k = (params.seqused_k ? params.seqused_k[bidb] : (params.cu_seqlens_k ? params.cu_seqlens_k[bidb + 1] - params.cu_seqlens_k[bidb] : seqlen_k_novarlen)) - leftpad;
+            if constexpr (AppendKV && !Seqlen_before_append_KV) { seqlen_k += get_seqlen_k_new(params, bidb); }
+            return seqlen_k;
         }
+    }
+
+    CUTLASS_DEVICE
+    int get_seqlen_k_new(Params const& params, int bidb) {
+        // If there's K_new then it must be varlen
+        return params.cu_seqlens_k_new ? params.cu_seqlens_k_new[bidb + 1] - params.cu_seqlens_k_new[bidb] : size<0>(params.shape_K_new);
     }
 
     CUTLASS_DEVICE
@@ -396,7 +449,6 @@ struct CollectiveMainloopFwd {
         }
         // if (threadIdx.x == 128) { printf("After split, inside, bid.y = %d, bid.z = %d, split_idx = %d, n_block_min: %d, n_block_max: %d\n", blockIdx.y, blockIdx.z, split_idx, n_block_min, n_block_max); }
         return {n_block_min, n_block_max};
-
     }
 
     template <typename SchedulerPrefetch, typename SharedStorage>
@@ -427,7 +479,7 @@ struct CollectiveMainloopFwd {
         // Only used if Transpose_V
         Tensor sV = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{}));
         // Only used if we're using cp.async to load V
-        Tensor sVcpasync =  [&] {
+        Tensor sVcpasync = [&] {
             if constexpr (!Transpose_V) {
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVCpAsync{}));
             } else {
@@ -578,7 +630,9 @@ struct CollectiveMainloopFwd {
                 paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
             }
             if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/); }
+            // if (thread_idx == 0) { printf("Producer: main load, before load_K, index = %d\n", smem_pipe_write.index());}
             load_K(n_block, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/);
+            // if (thread_idx == 0) { printf("Producer: main load, after loaf K, index = %d\n", smem_pipe_write.index());}
         }
 
         // If !Use_TMA_Q, we use the MMA WGs to load Q with cp.async
@@ -598,7 +652,9 @@ struct CollectiveMainloopFwd {
         // Wait for warp 1 to signal that smem_v are ready and V can be copied from gmem
         // Need ClusterBarrier, not just NamedBarrier. Otherwise we might have CTA 0 finishing the
         // TMA store on O first, call TMA multicast load on V, before CTA 1 can finishing TMA store on O.
+        // if (thread_idx == 0) { printf("Producer: main load, before barrier_O\n");}
         shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
+        // if (thread_idx == 0) { printf("Producer: main load, after barrier_O\n");}
 
         int n_block_prev = n_block;
         --n_block;
@@ -639,7 +695,9 @@ struct CollectiveMainloopFwd {
         scheduler_prefetch();
         if (should_load_KV) {
             if constexpr (!Transpose_V) {
+                // if (thread_idx == 0) { printf("Producer: main load, before load_V, index = %d\n", smem_pipe_write.index());}
                 load_V(n_block_prev, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/);
+                // if (thread_idx == 0) { printf("Producer: main load, after load V, index = %d\n", smem_pipe_write.index());}
             }
         }
         if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }
@@ -689,7 +747,8 @@ struct CollectiveMainloopFwd {
         if constexpr (Use_TMA_Q) {
             cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
         }
-        if constexpr (UseSchedulerBarrier) {
+        // if AppendKV then this won't work because we're using the same NamedBarrier
+        if constexpr (UseSchedulerBarrier && !AppendKV) {
             // We have NamedBarrier for up to 3 WGs
             static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
             // WG1 needs the very first signal to start
@@ -713,6 +772,15 @@ struct CollectiveMainloopFwd {
         SharedStorage& shared_storage
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
+
+        if constexpr (UseSchedulerBarrier && AppendKV) {
+            // We have NamedBarrier for up to 3 WGs
+            static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
+            // WG1 needs the very first signal to start
+            if (cutlass::canonical_warp_group_idx() == 1) {
+                cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
+            }
+        }
 
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -931,6 +999,251 @@ struct CollectiveMainloopFwd {
 
         }
 
+    }
+
+    CUTLASS_DEVICE
+    cute::tuple<int, int> get_n_block_k_new_min_max(Params const& params, int m_block, int bidb, int split_idx=0, int num_splits=1) {
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});
+        int const seqlen_k_new = get_seqlen_k_new(params, bidb);
+        int const seqlen_k_og = get_seqlen_k<true /*Seqlen_before_append_KV*/>(params, bidb);
+        auto [n_block_min, n_block_max] = get_n_block_min_max(params, m_block, bidb, split_idx, num_splits);
+        int const idx_k_new_min = std::max(n_block_min * kBlockN - seqlen_k_og, 0);
+        int const idx_k_new_max = std::min(n_block_max * kBlockN - seqlen_k_og, seqlen_k_new);
+        int const n_block_new_min = idx_k_new_min / kBlockN;
+        int const n_block_new_max = idx_k_new_max > idx_k_new_min ? cute::ceil_div(idx_k_new_max, kBlockN) : n_block_new_min;
+        // if (threadIdx.x == 128 && m_block == 0) { printf("bidb = %d, seqlen_k_new = %d, seqlen_k_og = %d, n_block_min = %d, n_block_max = %d, idx_k_new_min = %d, idx_k_new_max = %d, n_block_new_min = %d, n_block_new_max = %d\n", bidb, seqlen_k_new, seqlen_k_og, n_block_min, n_block_max, idx_k_new_min, idx_k_new_max, n_block_new_min, n_block_new_max);}
+        return {n_block_new_min, n_block_new_max};
+    }
+
+    template <typename SharedStorage>
+    CUTLASS_DEVICE void
+    load_kv_new(Params const& params,
+         MainloopPipelineKVNew pipeline_k_new,
+         MainloopPipelineKVNew pipeline_v_new,
+         PipelineState& smem_pipe_write,
+         SharedStorage &shared_storage,
+         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
+         int work_idx
+         ) {
+
+        Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
+        Tensor sVt = [&] {
+            if constexpr (!Transpose_V) {
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
+            } else {
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVt{});
+            }
+        }();
+
+        auto [m_block, bidh, bidb, split_idx] = block_coord;
+        auto [n_block_new_min, n_block_new_max] = get_n_block_k_new_min_max(params, m_block, bidb, split_idx, params.num_splits);
+        if (n_block_new_max <= n_block_new_min) { return; }
+
+        int const thread_idx = threadIdx.x % NumProducerThreads;
+        int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
+
+        // Prepare the TMA loads
+        uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+        constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
+        uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
+
+        bool const is_varlen_k_new = Varlen && params.cu_seqlens_k_new;
+        Tensor mKnew_TMA = params.tma_load_K_new.get_tma_tensor(params.shape_K_new)(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
+        Tensor mVnewt_TMA = params.tma_load_V_new.get_tma_tensor(select<1, 0, 2, 3>(params.shape_K_new))(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
+
+        int const offset_k_new = !Varlen ? 0 : (params.cu_seqlens_k_new ? params.cu_seqlens_k_new[bidb] : 0);
+        Tensor gKnew_TMA = local_tile(domain_offset(make_coord(offset_k_new, _0{}), mKnew_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+        Tensor gVnewt_TMA = local_tile(domain_offset(make_coord(_0{}, offset_k_new), mVnewt_TMA), select<2, 1>(TileShape_MNK{}), make_coord(_0{}, _));  // (K, N, _)
+
+        auto block_tma_K_new = params.tma_load_K_new.get_slice(cluster_local_block_id.x);
+        Tensor tKgKnew_TMA = group_modes<0, 3>(block_tma_K_new.partition_S(gKnew_TMA));  // (TMA, k)
+        Tensor tKsK_TMA = group_modes<0, 3>(block_tma_K_new.partition_D(sK));  // (TMA, PIPE)
+        auto block_tma_V_new = params.tma_load_V_new.get_slice(cluster_local_block_id.x);
+        Tensor tVgVnewt_TMA = group_modes<0, 3>(block_tma_V_new.partition_S(gVnewt_TMA));  // (TMA, k)
+        Tensor tVsVt_TMA = group_modes<0, 3>(block_tma_V_new.partition_D(sVt));  // (TMA, PIPE)
+
+        uint16_t mcast_mask_kv = 0;
+        if constexpr (cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST>) {
+            auto block_layout = Layout<ClusterShape>{}; // (m,n) -> block_id
+            for (int m = 0; m < size<0>(block_layout); ++m) {
+                mcast_mask_kv |= (uint16_t(1) << block_layout(m, cluster_local_block_id.y, _0{}));
+            }
+        }
+
+        auto load_K_new = [&] (int const n_block, auto const& smem_pipe_write) {
+            pipeline_k_new.producer_acquire(smem_pipe_write);
+            copy(params.tma_load_K_new.with(*pipeline_k_new.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
+                tKgKnew_TMA(_, n_block), tKsK_TMA(_, smem_pipe_write.index()));
+        };
+
+        auto load_V_new = [&] (int const n_block, auto const& smem_pipe_write) {
+            pipeline_v_new.producer_acquire(smem_pipe_write);
+            copy(params.tma_load_V_new.with(*pipeline_v_new.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
+                tVgVnewt_TMA(_, n_block), tVsVt_TMA(_, smem_pipe_write.index()));
+        };
+
+        int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
+        // If this is true, we're guaranteed that only the first warp will execute this function
+        static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
+        bool should_load_KV = (SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync();
+
+        int n_block = n_block_new_max - 1;
+        if (should_load_KV) { load_K_new(n_block, smem_pipe_write); }
+        // if (thread_idx == 0) { printf("Producer: Done loading K, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
+        // Wait for warp 1 to signal that smem_v are ready and V can be copied from gmem
+        if constexpr (!Transpose_V) { shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2); }
+        if (should_load_KV) { load_V_new(n_block, smem_pipe_write); }
+        // if (thread_idx == 0) { printf("Producer: Done loading V, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
+        ++smem_pipe_write;
+        --n_block;
+        // if (thread_idx == 0) { printf("Producer: before for loop\n"); }
+        #pragma unroll 1
+        for (; n_block >= n_block_new_min; --n_block) {
+            if (should_load_KV) {
+                load_K_new(n_block, smem_pipe_write);
+                // if (thread_idx == 0) { printf("Producer: Done loading K, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
+                load_V_new(n_block, smem_pipe_write);
+                // if (thread_idx == 0) { printf("Producer: Done loading V, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
+            }
+            ++smem_pipe_write;
+        }
+        // if (thread_idx == 0) { printf("Producer: after for loop\n"); }
+        // At the end, all threads have the correct smem_pipe_write.
+    }
+
+    template <typename SharedStorage>
+    CUTLASS_DEVICE void
+    store_kv_new(Params const& params,
+                 MainloopPipelineKVNew pipeline_k_new,
+                 MainloopPipelineKVNew pipeline_v_new,
+                 PipelineState& smem_pipe_read,
+                 int const thread_idx,
+                 SharedStorage &shared_storage,
+                 cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord
+    ) {
+
+        // as_position_independent_swizzle_tensor makes address calculation easier
+        Tensor sK = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{}));
+        // We want to use SmemLayoutVCpAsync to have shape (kBlockN, kHeadDim) instead of (kHeadDim, kBlockN)
+        Tensor sV = [&] {
+            if constexpr (!Transpose_V) {
+                return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVCpAsync{}));
+            } else {
+                return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVCpAsync{}));
+            }
+        }();
+
+        auto [m_block, bidh, bidb, split_idx] = block_coord;
+        auto [n_block_new_min, n_block_new_max] = get_n_block_k_new_min_max(params, m_block, bidb, split_idx, params.num_splits);
+        if (n_block_new_max <= n_block_new_min) { return; }
+
+        int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
+        int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
+
+        bool const is_varlen_k = Varlen && params.cu_seqlens_k;
+        Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K), params.shape_K, params.stride_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
+        Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
+
+        int const leftpad_k = Varlen && params.leftpad_k ? params.leftpad_k[bidb] : 0;
+        int const offset_k = (!Varlen ? 0 : (params.cu_seqlens_k ? params.cu_seqlens_k[bidb] : 0) + leftpad_k) + get_seqlen_k<true/*Seqlen_before_append_KV*/>(params, bidb);
+        Tensor gK = local_tile(domain_offset(make_coord(offset_k, _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+        Tensor gV = local_tile(domain_offset(make_coord(offset_k, _0{}), mV), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+
+        int const seqlen_k_new = get_seqlen_k_new(params, bidb);
+        PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element, true /*KV_Same_Iter*/> paged_kv_manager(
+            params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
+            params.ptr_K, params.shape_K, params.stride_K,
+            params.ptr_V, params.stride_V,
+            params.page_size_divmod, bidb_kv, bidh_kv, thread_idx, seqlen_k_new, offset_k
+            // passing offset_k instead of leftpad_k will move the PageTable pointer to the right position
+        );
+
+        GmemTiledCopyAppendKV gmem_tiled_copy_kv;
+        auto gmem_thr_copy_kv = gmem_tiled_copy_kv.get_thread_slice(thread_idx);
+        Tensor tKsK = gmem_thr_copy_kv.partition_S(sK);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
+        Tensor tKgK = gmem_thr_copy_kv.partition_D(gK);
+        Tensor tVsV = gmem_thr_copy_kv.partition_S(sV);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
+        Tensor tVgV = gmem_thr_copy_kv.partition_D(gV);
+        // Construct identity layout for sK
+        Tensor cK = cute::make_identity_tensor(select<1, 2>(TileShape_MNK{}));  // (BLK_N,BLK_K) -> (blk_n,blk_k)
+        // Repeat the partitioning with identity layouts
+        Tensor tKcK = gmem_thr_copy_kv.partition_D(cK);
+        Tensor tKpK = make_tensor<bool>(make_shape(size<2>(tKsK)));
+        #pragma unroll
+        for (int k = 0; k < size(tKpK); ++k) { tKpK(k) = get<1>(tKcK(_0{}, _0{}, k)) < get<1>(params.shape_K); }
+
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});
+
+        auto store_K = [&] (int const n_block, auto const& smem_pipe_read, auto need_seqlenk_masking_type) {
+            constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
+            pipeline_k_new.consumer_wait(smem_pipe_read);
+            Tensor tKrK = make_fragment_like(tKsK(_, _, _, _0{}));
+            // TODO: deal w the case where tKsK has size larger than sV (e.g. kBlockN = 176)
+            // cute::copy(gmem_tiled_copy_kv, tKsK(_, _, _, smem_pipe_read.index()), tKrK);
+            flash::copy</*Is_even_MN=*/kBlockN % shape<0>(GmemLayoutAtom{}) == 0, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
+                gmem_tiled_copy_kv, tKsK(_, _, _, smem_pipe_read.index()), tKrK, tKcK, tKpK, kBlockN
+            );
+            // Very important: PipelineTmaAsync::consumer_release assumes that the warpgroup is synchronized
+            // before calling.
+            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + cutlass::canonical_warp_group_idx() /*id*/);
+            pipeline_k_new.consumer_release(smem_pipe_read);
+            // if (thread_idx == 0) { print_tensor(sK(_, _, smem_pipe_read.index())); }
+            // if (thread_idx == 0) { print(tKsK); printf("\n"); print(tKrK); printf("\n"); print(tKgK); printf("\n");}
+            // if (thread_idx == 0) { print_tensor(tKpK); printf("\n"); printf("seqlen_limit = %d\n", seqlen_k_new - n_block * kBlockN);}
+            if constexpr (!PagedKV) {
+                Tensor tKgK_cur = tKgK(_, _, _, n_block);
+                // Clear_OOB_K must be false since we don't want to write zeros to gmem
+                flash::copy</*Is_even_MN=*/!Seqlenk_mask, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                    gmem_tiled_copy_kv, tKrK, tKgK_cur, tKcK, tKpK, std::min(seqlen_k_new - n_block * kBlockN, kBlockN)
+                );
+            } else {
+                paged_kv_manager.template store_K<Seqlenk_mask>(n_block, tKrK);
+            }
+        };
+
+        auto store_V = [&] (int const n_block, auto const& smem_pipe_read, auto need_seqlenk_masking_type) {
+            constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
+            pipeline_v_new.consumer_wait(smem_pipe_read);
+            Tensor tVrV = make_fragment_like(tVsV(_, _, _, _0{}));
+            // cute::copy(gmem_tiled_copy_kv, tVsV(_, _, _, smem_pipe_read.index()), tVrV);
+            flash::copy</*Is_even_MN=*/kBlockN % shape<0>(GmemLayoutAtom{}) == 0, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
+                gmem_tiled_copy_kv, tVsV(_, _, _, smem_pipe_read.index()), tVrV, tKcK, tKpK, kBlockN
+            );
+            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + cutlass::canonical_warp_group_idx() /*id*/);
+            pipeline_v_new.consumer_release(smem_pipe_read);
+            // if (thread_idx == 0) { print_tensor(sV(_, _, smem_pipe_read.index())); }
+            if constexpr (!PagedKV) {
+                Tensor tVgV_cur = tVgV(_, _, _, n_block);
+                // Clear_OOB_K must be false since we don't want to write zeros to gmem
+                flash::copy</*Is_even_MN=*/!Seqlenk_mask, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                    gmem_tiled_copy_kv, tVrV, tVgV_cur, tKcK, tKpK, std::min(seqlen_k_new - n_block * kBlockN, kBlockN)
+                );
+            } else {
+                paged_kv_manager.template store_V<Seqlenk_mask>(n_block, tVrV);
+            }
+        };
+
+        int n_block = n_block_new_max - 1;
+        if constexpr (PagedKV) {
+            paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
+        }
+        store_K(n_block, smem_pipe_read, cute::bool_constant<true>{} /*Seqlenk_mask*/);
+        // if (thread_idx == 0) { printf("Done storing K, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
+        store_V(n_block, smem_pipe_read, cute::bool_constant<true>{} /*Seqlenk_mask*/);
+        // if (thread_idx == 0) { printf("Done storing V, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
+        ++smem_pipe_read;
+        --n_block;
+        // if (thread_idx == 0) { printf("Before for loop\n"); }
+        #pragma unroll 1
+        for (; n_block >= n_block_new_min; --n_block) {
+            if constexpr (PagedKV) { paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block); }
+            store_K(n_block, smem_pipe_read, cute::bool_constant<true>{} /*Seqlenk_mask*/);
+            // if (thread_idx == 0) { printf("Done storing K, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
+            store_V(n_block, smem_pipe_read, cute::bool_constant<true>{} /*Seqlenk_mask*/);
+            // if (thread_idx == 0) { printf("Done storing V, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
+            ++smem_pipe_read;
+        }
+        // if (thread_idx == 0) { printf("After for loop\n"); }
     }
 
 };

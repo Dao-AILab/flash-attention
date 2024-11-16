@@ -57,7 +57,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     // The dimensions.
     int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;
-    int total_q, total_k;
+    int total_q, total_k, total_knew;
     int b_k;  // When having KV cache and with cache_batch_idx, K & V might have larger batch size than Q
 
     // The scaling factors for the kernel.
@@ -67,6 +67,7 @@ struct Flash_fwd_params : public Qkv_params {
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
+    int * __restrict__ cu_seqlens_knew;
     int * __restrict__ leftpad_k;
 
     // If provided, the actual length of each q/k sequence.

@@ -663,7 +663,6 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    assert k is None and v is None
     assert rotary_cos is None and rotary_sin is None
     assert sink_token_length == 0
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
@@ -683,8 +682,8 @@ def flash_attn_with_kvcache(
         q,
         k_cache,
         v_cache,
-        # k,
-        # v,
+        k,
+        v,
         None,  # out
         cache_seqlens,
         # rotary_cos,
@@ -705,4 +704,5 @@ def flash_attn_with_kvcache(
         num_splits,
         pack_gqa
     )
-    return (out, softmax_lse) if return_softmax_lse else out
+    # return (out, softmax_lse) if return_softmax_lse else out
+    return (out, softmax_lse, *rest) if return_softmax_lse else out

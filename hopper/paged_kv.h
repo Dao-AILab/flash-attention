@@ -39,6 +39,10 @@ struct PagedKVManager {
         make_tiled_copy(GmemCopyAtomCpAsync{},
                         GmemLayoutAtomKVCpAsync{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per load
+    using GmemTiledCopyKVStore = decltype(
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
+                        GmemLayoutAtomKVCpAsync{},
+                        Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per load
 
     using ShapeKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
     using StrideKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
@@ -46,7 +50,7 @@ struct PagedKVManager {
     using StridePageTable = cute::Stride<int64_t, _1>;
 
     using TensorPageTable = decltype(make_tensor(make_gmem_ptr(static_cast<int const*>(nullptr)), ShapePageTable{}, StridePageTable{})(int(0), _));
-    using TensorKV = decltype(make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeKV{}, StrideKV{})(_, _, int(0), _));
+    using TensorKV = decltype(make_tensor(make_gmem_ptr(static_cast<Element*>(nullptr)), ShapeKV{}, StrideKV{})(_, _, int(0), _));
     using GmemThrCopyKVCpAsync = decltype(GmemTiledCopyKVCpAsync{}.get_thread_slice(int(0)));
     using TensortKcK = decltype(GmemTiledCopyKVCpAsync{}.get_thread_slice(int(0)).partition_D(cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{})));
     using TensortKpK = decltype(make_tensor<bool>(make_shape(size<1>(TensortKcK{}), size<2>(TensortKcK{})), Stride<_0, _1>{}));
@@ -59,7 +63,7 @@ struct PagedKVManager {
     // We then use __shfl_sync to broadcast the pointers to the other threads in the warp.
     static constexpr int kPageEntryPerThread = cute::ceil_div(size<1>(TensortKcK{}), kGmemThreadsPerRow);
     using TensorPageOffset = decltype(make_tensor<cute::tuple<int, int>>(Shape<Int<kPageEntryPerThread>>{}));
-    using TensorKVPtr = decltype(make_tensor<Element const*>(Shape<Int<kPageEntryPerThread>>{}));
+    using TensorKVPtr = decltype(make_tensor<Element*>(Shape<Int<kPageEntryPerThread>>{}));
 
     cutlass::FastDivmod const &page_size_divmod;
     int const thread_idx;
@@ -77,8 +81,8 @@ struct PagedKVManager {
     CUTLASS_DEVICE
     PagedKVManager(int const* const ptr_page_table,
                    ShapePageTable const &shape_pagetable, StridePageTable const &stride_pagetable,
-                   Element const* const ptr_K, ShapeKV const &shape_K, StrideKV const &stride_K,
-                   Element const* const ptr_V, StrideKV const &stride_V,
+                   Element* const ptr_K, ShapeKV const &shape_K, StrideKV const &stride_K,
+                   Element* const ptr_V, StrideKV const &stride_V,
                    cutlass::FastDivmod const &page_size_divmod,
                    int const bidb, int const bidh, int const thread_idx, int const seqlen_k, int const leftpad_k
                    )
@@ -123,6 +127,17 @@ struct PagedKVManager {
     };
 
     CUTLASS_DEVICE
+    TensorKVPtr compute_K_ptr() {
+        Tensor tPrKPtr = make_tensor<Element*>(Shape<Int<kPageEntryPerThread>>{});
+        #pragma unroll
+        for (int i = 0; i < kPageEntryPerThread; ++i) {
+            auto [page, page_offset] = tPrPageOffset[i];
+            tPrKPtr[i] = &mK_paged(page_offset, _0{}, page);
+        }
+        return tPrKPtr;
+    };
+
+    CUTLASS_DEVICE
     void compute_V_ptr() {
         #pragma unroll
         for (int i = 0; i < kPageEntryPerThread; ++i) {
@@ -134,12 +149,7 @@ struct PagedKVManager {
     template <bool Seqlenk_mask=false, typename TensorK>
     CUTLASS_DEVICE
     void load_K(const int n_block, TensorK &&sK) {
-        Tensor tPrKPtr = make_tensor<Element const*>(Shape<Int<kPageEntryPerThread>>{});
-        #pragma unroll
-        for (int i = 0; i < kPageEntryPerThread; ++i) {
-            auto [page, page_offset] = tPrPageOffset[i];
-            tPrKPtr[i] = &mK_paged(page_offset, _0{}, page);
-        }
+        Tensor tPrKPtr = compute_K_ptr();
 
         // Only for index calculation, since all the indices of thread 0 are known at compile time
         auto gmem_thr0_copy_kv = gmem_tiled_copy_kv.get_thread_slice(_0{});
@@ -193,6 +203,77 @@ struct PagedKVManager {
             for (int k = 0; k < size<2>(tVsV); ++k) {
                 int const ki = get<1>(tKcK(_0{}, _0{}, k)) / kGmemElemsPerLoad;
                 cute::copy(gmem_tiled_copy_kv.with(tKpK(_0{}, k) && should_load), mV_paged_cur_copy(_, ki), tVsV(_, m, k));
+            }
+        }
+        if constexpr (!KV_Same_Iter) { compute_V_ptr(); }
+    };
+
+    template <bool Seqlenk_mask=false, typename TensorK>
+    CUTLASS_DEVICE
+    void store_K(const int n_block, TensorK &&tKrK) {
+        Tensor tPrKPtr = compute_K_ptr();
+        // We're using the same partitioning as GmemTiledCopyKVCpAsync (used for loading)
+        // Only for index calculation, since all the indices of thread 0 are known at compile time
+        auto gmem_thr0_copy_kv = gmem_tiled_copy_kv.get_thread_slice(_0{});
+        Tensor cK = cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{});  // (BLK_N,BLK_K) -> (blk_n,blk_k)
+        // Repeat the partitioning with identity layouts
+        Tensor tKcK = gmem_thr_copy_kv.partition_S(cK);
+        Tensor t0KcK = gmem_thr0_copy_kv.partition_S(cK);
+
+        GmemTiledCopyKVStore gmem_tiled_copy_kv_store;
+        // We want to use the row indices of thread0 to compare, since that is known at compile time.
+        // So we subtract the limit by the first row index of this thread (get<0>(tKcK(_0{}, _0{}, _0{})))
+        // int const seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tKcK(_0{}, _0{}, _0{}));
+        int const seqlenk_row_limit = seqlen_k - n_block * kBlockN;
+        // if (threadIdx.x == 128) { printf("bidx = %d, bidy = %d, bidz = %d, seqlen_k = %d, seqlenk_row_limit = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, seqlen_k, seqlenk_row_limit); }
+        #pragma unroll
+        for (int m = 0; m < size<1>(tKrK); ++m) {
+            // bool const should_load = !Seqlenk_mask || get<0>(t0KcK(_0{}, m, _0{})) < seqlenk_row_limit;
+            bool const should_load = !Seqlenk_mask || get<0>(tKcK(_0{}, m, _0{})) < std::min(seqlenk_row_limit, kBlockN);
+            Element* k_ptr = reinterpret_cast<Element*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrKPtr(m / kGmemThreadsPerRow)), (m % kGmemThreadsPerRow), kGmemThreadsPerRow));
+            Tensor mK_paged_cur = make_tensor(make_gmem_ptr(k_ptr), Shape<Int<kHeadDim>>{});
+            Tensor mK_paged_cur_copy = cute::tiled_divide(mK_paged_cur, Shape<Int<kGmemElemsPerLoad>>{});
+            if (should_load) {
+                #pragma unroll
+                for (int k = 0; k < size<2>(tKrK); ++k) {
+                    int const ki = get<1>(tKcK(_0{}, _0{}, k)) / kGmemElemsPerLoad;
+                    if (tKpK(_0{}, k)) {
+                        cute::copy(gmem_tiled_copy_kv_store, tKrK(_, m, k), mK_paged_cur_copy(_, ki));
+                    }
+                }
+            }
+        }
+    };
+
+    template <bool Seqlenk_mask=false, typename TensorV>
+    CUTLASS_DEVICE
+    void store_V(const int n_block, TensorV &&tVrV) {
+        if constexpr (KV_Same_Iter) { compute_V_ptr(); }
+        // Only for index calculation, since all the indices of thread 0 are known at compile time
+        auto gmem_thr0_copy_kv = gmem_tiled_copy_kv.get_thread_slice(_0{});
+        Tensor cK = cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{});  // (BLK_N,BLK_K) -> (blk_n,blk_k)
+        // Repeat the partitioning with identity layouts
+        Tensor tKcK = gmem_thr_copy_kv.partition_S(cK);
+        Tensor t0KcK = gmem_thr0_copy_kv.partition_S(cK);
+
+        GmemTiledCopyKVStore gmem_tiled_copy_kv_store;
+        // int const seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tKcK(_0{}, _0{}, _0{}));
+        int const seqlenk_row_limit = seqlen_k - n_block * kBlockN;
+        #pragma unroll
+        for (int m = 0; m < size<1>(tVrV); ++m) {
+            // bool should_load = !Seqlenk_mask || get<0>(t0KcK(_0{}, m, _0{})) < seqlenk_row_limit;
+            bool should_load = !Seqlenk_mask || get<0>(tKcK(_0{}, m, _0{})) < std::min(seqlenk_row_limit, kBlockN);
+            Element* v_ptr = reinterpret_cast<Element*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrVPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
+            Tensor mV_paged_cur = make_tensor(make_gmem_ptr(v_ptr), Shape<Int<kHeadDim>>{});
+            Tensor mV_paged_cur_copy = cute::tiled_divide(mV_paged_cur, Shape<Int<kGmemElemsPerLoad>>{});
+            if (should_load) {
+                #pragma unroll
+                for (int k = 0; k < size<2>(tVrV); ++k) {
+                    int const ki = get<1>(tKcK(_0{}, _0{}, k)) / kGmemElemsPerLoad;
+                    if (tKpK(_0{}, k)) {
+                        cute::copy(gmem_tiled_copy_kv_store, tVrV(_, m, k), mV_paged_cur_copy(_, ki));
+                    }
+                }
             }
         }
         if constexpr (!KV_Same_Iter) { compute_V_ptr(); }

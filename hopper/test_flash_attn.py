@@ -696,30 +696,30 @@ def test_flash_attn_varlen_output(
 
 # @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("num_splits", [1, 0])
-@pytest.mark.parametrize("num_splits", [1])
+@pytest.mark.parametrize("num_splits", [1, 2])
+# @pytest.mark.parametrize("num_splits", [1])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-# @pytest.mark.parametrize("new_kv", [False, True])
-@pytest.mark.parametrize("new_kv", [False])
+@pytest.mark.parametrize("new_kv", [False, True])
+# @pytest.mark.parametrize("new_kv", [True])
 # @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
-# @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
-@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
+@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
+# @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 # @pytest.mark.parametrize("rotary_interleaved", [False, True])
 @pytest.mark.parametrize("rotary_interleaved", [False])
 # @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("rotary_fraction", [0.0])
-# @pytest.mark.parametrize("page_size", [None, 1, 4, 128])
-@pytest.mark.parametrize("page_size", [None])
+@pytest.mark.parametrize("page_size", [None, 1, 4, 128])
+# @pytest.mark.parametrize("page_size", [None])
 @pytest.mark.parametrize("has_leftpad", [False, True])
-# @pytest.mark.parametrize("has_leftpad", [True])
-@pytest.mark.parametrize("has_batch_idx", [False, True])
-# @pytest.mark.parametrize("has_batch_idx", [True])
+# @pytest.mark.parametrize("has_leftpad", [False])
+# @pytest.mark.parametrize("has_batch_idx", [False, True])
+@pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [False, True])
-# @pytest.mark.parametrize("varlen_q", [True])
+# @pytest.mark.parametrize("varlen_q", [False])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
@@ -739,7 +739,8 @@ def test_flash_attn_varlen_output(
         (1, 128 * 1024),
         (16, 128 * 1024),
         (128, 128),
-        (2048, 1577),  # Enough tile to test persistent scheduler
+        (256, 512),  # To test appending KV with more than 1 block
+        (2048, 3577),  # Enough tile to test persistent scheduler
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
@@ -895,12 +896,12 @@ def test_flash_attn_kvcache(
         v_cache_ref[update_mask] = rearrange(v, "b s ... -> (b s) ...")
     k_cache_rep = repeat(k_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
     v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
-    out, lse = flash_attn_with_kvcache(
+    out, lse, *rest = flash_attn_with_kvcache(
         q if not varlen_q else q_unpad,
         k_cache if page_size is None else k_cache_paged,
         v_cache if page_size is None else v_cache_paged,
-        # k,
-        # v,
+        k,
+        v,
         # rotary_cos=cos,
         # rotary_sin=sin,
         cache_seqlens=cache_seqlens,
@@ -961,30 +962,31 @@ def test_flash_attn_kvcache(
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
     # breakpoint()
 
-    # # Check that FlashAttention's numerical error is at most twice the numerical error
-    # # of a Pytorch implementation.
-    # if new_kv:
-    #     if page_size is None:
-    #         k_cache_select = (
-    #             k_cache if not has_batch_idx else k_cache[cache_batch_idx.to(dtype=torch.long)]
-    #         )
-    #         v_cache_select = (
-    #             v_cache if not has_batch_idx else v_cache[cache_batch_idx.to(dtype=torch.long)]
-    #         )
-    #     else:
-    #         k_cache_select = rearrange(
-    #             k_cache_paged[page_table.to(dtype=torch.long).flatten()],
-    #             "(b nblocks) block_size ... -> b (nblocks block_size) ...",
-    #             b=batch_size,
-    #         )[:, :seqlen_k]
-    #         v_cache_select = rearrange(
-    #             v_cache_paged[page_table.to(dtype=torch.long).flatten()],
-    #             "(b nblocks) block_size ... -> b (nblocks block_size) ...",
-    #             b=batch_size,
-    #         )[:, :seqlen_k]
-    #     assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
-    #     assert torch.equal(v_cache_select, v_cache_ref)
-    mult = 3 
+    # Check that FlashAttention's numerical error is at most twice the numerical error
+    # of a Pytorch implementation.
+    if new_kv:
+        if page_size is None:
+            k_cache_select = (
+                k_cache if not has_batch_idx else k_cache[cache_batch_idx.to(dtype=torch.long)]
+            )
+            v_cache_select = (
+                v_cache if not has_batch_idx else v_cache[cache_batch_idx.to(dtype=torch.long)]
+            )
+        else:
+            k_cache_select = rearrange(
+                k_cache_paged[page_table.to(dtype=torch.long).flatten()],
+                "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+                b=batch_size,
+            )[:, :seqlen_k]
+            v_cache_select = rearrange(
+                v_cache_paged[page_table.to(dtype=torch.long).flatten()],
+                "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+                b=batch_size,
+            )[:, :seqlen_k]
+        # breakpoint()
+        assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
+        assert torch.equal(v_cache_select, v_cache_ref)
+    mult = 3
     assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
 
 

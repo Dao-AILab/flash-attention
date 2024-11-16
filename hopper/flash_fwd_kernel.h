@@ -37,6 +37,7 @@ public:
     static constexpr bool Split = CollectiveMainloop::Split;
     static constexpr bool Is_FP8 = CollectiveMainloop::Is_FP8;
     static constexpr bool Transpose_V = CollectiveMainloop::Transpose_V;
+    static constexpr bool AppendKV = CollectiveMainloop::AppendKV;
     static constexpr bool Use_TMA_Q = CollectiveMainloop::Use_TMA_Q;
     static constexpr bool Use_TMA_KV = CollectiveMainloop::Use_TMA_KV;
     static constexpr bool Use_TMA_O = CollectiveEpilogue::Use_TMA_O;
@@ -99,6 +100,8 @@ public:
             alignas(16) typename CollectiveMainloop::MainloopPipelineK::SharedStorage pipeline_k;
             alignas(16) typename CollectiveMainloop::MainloopPipelineV::SharedStorage pipeline_v;
             alignas(16) typename CollectiveMainloop::MainloopPipelineVt::SharedStorage pipeline_vt;
+            alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_k_new;
+            alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
 
@@ -174,10 +177,12 @@ public:
         using MainloopPipelineK = typename CollectiveMainloop::MainloopPipelineK;
         using MainloopPipelineV = typename CollectiveMainloop::MainloopPipelineV;
         using MainloopPipelineVt = typename CollectiveMainloop::MainloopPipelineVt;
+        using MainloopPipelineKVNew = typename CollectiveMainloop::MainloopPipelineKVNew;
         using PipelineState = typename CollectiveMainloop::PipelineState;
         using PipelineParamsK = typename MainloopPipelineK::Params;
         using PipelineParamsV = typename MainloopPipelineV::Params;
         using PipelineParamsVt = typename MainloopPipelineVt::Params;
+        using PipelineParamsKVNew = typename MainloopPipelineKVNew::Params;
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
@@ -255,6 +260,16 @@ public:
             }
         }();
 
+        PipelineParamsKVNew pipeline_params_kv_new;
+        pipeline_params_kv_new.role = warp_group_idx == 0
+            ? MainloopPipelineKVNew::ThreadCategory::Producer
+            : MainloopPipelineKVNew::ThreadCategory::Consumer;
+        pipeline_params_kv_new.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
+        pipeline_params_kv_new.is_leader = warp_group_thread_idx == 0;
+        pipeline_params_kv_new.num_consumers = NumMmaThreads;
+        auto pipeline_k_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_k_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
+        auto pipeline_v_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_v_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
+
         CollectiveMainloop collective_mainloop;
         CollectiveEpilogue collective_epilogue;
 
@@ -296,6 +311,17 @@ public:
                         continue;
                     }
                 }
+                if constexpr (AppendKV) {
+                    collective_mainloop.load_kv_new(params.mainloop, pipeline_k_new, pipeline_v_new,
+                                                    smem_pipe_write, shared_storage, block_coord, work_idx);
+                    // if (threadIdx.x == 0) { printf("Producer: Before sync\n"); }
+                    cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
+                    // TODO: do we need all these fences?
+                    asm volatile ("fence.proxy.async.global;");
+                    asm volatile ("membar.cta;");
+                    // if (threadIdx.x == 0) { printf("Producer: After sync\n"); }
+                    smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
+                }
                 auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
@@ -304,8 +330,6 @@ public:
                                          shared_storage, scheduler_prefetch, block_coord, work_idx);
                 ++work_idx;
             }
-            // We can have this extra wait to make synccheck happy
-            // if (work_idx > 1) { shared_storage.pipelines.barrier_O.wait((work_idx + 0) % 2); }
             collective_mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write);
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
@@ -346,6 +370,18 @@ public:
                         collective_epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
                         continue;
                     }
+                }
+
+                if constexpr (AppendKV) {
+                    collective_mainloop.store_kv_new(params.mainloop, pipeline_k_new, pipeline_v_new, smem_pipe_read,
+                                                     threadIdx.x - MmaThreadOffset, shared_storage, block_coord);
+                    // if (threadIdx.x == 128) { printf("Consumer: Before sync\n"); }
+                    // TODO: do we need all these fences?
+                    asm volatile ("membar.cta;");
+                    asm volatile ("fence.proxy.async.global;");
+                    cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
+                    // if (threadIdx.x == 128) { printf("Consumer: After sync\n"); }
+                    smem_pipe_read = PipelineState{};
                 }
 
                 collective_mainloop.mma(params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
