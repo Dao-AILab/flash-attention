@@ -378,7 +378,7 @@ public:
                     // We need this sync so that the gmem write from the consumers is visible to the producer
                     // that might do TMA read after that.
                     asm volatile ("fence.proxy.async.global;");
-                    cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
+                    cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
                     // if (threadIdx.x == 128) { printf("Consumer: After sync\n"); }
                     smem_pipe_read = PipelineState{};
                 }

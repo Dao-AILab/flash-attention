@@ -71,6 +71,11 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         {params.knew_row_stride, _1{}, params.knew_head_stride, !is_varlen_k_new ? params.knew_batch_stride : 0},  // stride_K_new
         static_cast<Element const*>(params.vnew_ptr),
         {params.vnew_row_stride, _1{}, params.vnew_head_stride, !is_varlen_k_new ? params.vnew_batch_stride : 0}, // stride_V_new
+        static_cast<Element const*>(params.rotary_cos_ptr),
+        {params.seqlen_k, params.rotary_dim / 2},  // shape_rotary, the seqlen shape doesn't matter
+        {params.rotary_dim / 2, _1{}},  // stride_rotary_cos
+        static_cast<Element const*>(params.rotary_sin_ptr),
+        {params.rotary_dim / 2, _1{}},  // stride_rotary_sin
         params.page_table,
         // if page_size is not set, avoid dividing by zero
         {params.kv_batch_idx ? params.b_k : params.b, !PagedKV ? 0 : params.seqlen_k / params.page_size}, // shape_page_table

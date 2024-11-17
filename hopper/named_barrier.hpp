@@ -21,6 +21,7 @@ enum class FwdNamedBarriers {
     WarpSchedulerWG3 = 6,
     ProducerWG = 7,
     AppendKV = 8,
+    QueryRotated = 9,
 };
 
 enum class BwdNamedBarriers {

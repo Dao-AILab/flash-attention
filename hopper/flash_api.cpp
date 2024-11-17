@@ -163,8 +163,6 @@ void set_params_fprop(Flash_fwd_params &params,
         TORCH_CHECK(params.is_causal || (window_size_left < 0 && window_size_right < 0),
             "This flash attention build does not support local attention.");
     #endif
-
-    params.is_seqlens_k_cumulative = true;
 }
 
 void set_params_dgrad(Flash_bwd_params &params,
@@ -1194,12 +1192,14 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
                 // batch_size x seqlen_q x num_heads x head_size or total_q x num_heads x head_size
                 c10::optional<at::Tensor> &out_,
                 c10::optional<const at::Tensor> &seqused_k_, // batch_size
+                c10::optional<const at::Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
+                c10::optional<const at::Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
                 c10::optional<const at::Tensor> &cache_batch_idx_, // indices to index into the KV cache
                 c10::optional<const at::Tensor> &leftpad_k_, // batch_size
                 c10::optional<const at::Tensor> &page_table_, // batch_size_k x max_num_pages_per_seq
                 c10::optional<const at::Tensor> &cu_seqlens_q_,  // b+1
                 c10::optional<int> max_seqlen_q_,
-                const float softmax_scale,
+                float const softmax_scale,
                 bool is_causal,
                 c10::optional<at::Tensor> &q_descale_,  // 1
                 c10::optional<at::Tensor> &k_descale_,  // 1
@@ -1207,7 +1207,8 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
                 int window_size_left,
                 int window_size_right,
                 int sink_token_length,
-                const float softcap,
+                float const softcap,
+                bool const is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
                 int num_splits,
                 c10::optional<bool> pack_gqa_
                 ) {
@@ -1433,6 +1434,34 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         CHECK_CONTIGUOUS(leftpad_k);
         CHECK_SHAPE(leftpad_k, batch_size);
         params.leftpad_k = static_cast<int *>(leftpad_k.data_ptr());
+    }
+
+    if (rotary_cos_.has_value()) {
+        TORCH_CHECK(k_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
+        auto rotary_cos = rotary_cos_.value();
+        CHECK_DEVICE(rotary_cos);
+        params.rotary_dim = rotary_cos.size(1) * 2;
+        TORCH_CHECK(params.rotary_dim <= head_size, "rotary_dim must be <= headdim");
+        TORCH_CHECK(params.rotary_dim % 16 == 0, "Only rotary dimensions divisible by 16 are currently supported");
+        const int seqlen_ro = rotary_cos.size(0);
+        if (paged_KV) {
+            TORCH_CHECK(seqlen_ro >= seqlen_k, "cos/sin seqlen must be at least the seqlen of KV cache");
+        }
+        CHECK_SHAPE(rotary_cos, seqlen_ro, params.rotary_dim / 2);
+        CHECK_CONTIGUOUS(rotary_cos);
+        TORCH_CHECK(rotary_cos.scalar_type() == q_type, "rotary_cos must have the same dtype as query");
+
+        TORCH_CHECK(rotary_sin_.has_value(), "If rotary cos is provided, rotary sin must also be provided");
+        auto rotary_sin = rotary_sin_.value();
+        CHECK_DEVICE(rotary_sin);
+        CHECK_SHAPE(rotary_sin, seqlen_ro, params.rotary_dim / 2);
+        CHECK_CONTIGUOUS(rotary_sin);
+        TORCH_CHECK(rotary_sin.scalar_type() == q_type, "rotary_cos must have the same dtype as query");
+        params.rotary_cos_ptr = rotary_cos.data_ptr();
+        params.rotary_sin_ptr = rotary_sin.data_ptr();
+        params.is_rotary_interleaved = is_rotary_interleaved;
+    } else {
+        params.rotary_dim = 0;
     }
 
     if (cache_batch_idx_.has_value()) {

@@ -5,7 +5,6 @@
 #pragma once
 
 #include <cutlass/cutlass.h>
-#include <cutlass/arch/memory.h>  // For cp_async_wait
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
@@ -19,6 +18,7 @@
 #include "mask.h"
 #include "pack_gqa.h"
 #include "paged_kv.h"
+#include "rotary.h"
 #include "utils.h"
 
 namespace flash {
@@ -46,7 +46,6 @@ struct CollectiveMainloopFwd {
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
-    static constexpr int kHeadDim = get<2>(TileShape_MNK{});
     static constexpr bool Use_TMA_Q = !PackGQA;
     static constexpr bool Use_TMA_KV = !PagedKV;
     static_assert(Use_TMA_KV || size(ClusterShape{}) == 1, "If not using TMA for KV, ClusterShape must be 1");
@@ -57,7 +56,11 @@ struct CollectiveMainloopFwd {
     static constexpr cute::GMMA::Major MmaMajorV = !Is_FP8 && !V_colmajor ? GMMA::Major::MN : GMMA::Major::K;
     static constexpr cute::GMMA::Major TmaMajorV = !V_colmajor ? GMMA::Major::MN : GMMA::Major::K;
 
-    using AtomLayoutMNK = Layout<Shape<Int<get<0>(TileShape_MNK{}) / 64>, _1, _1>>;
+    static constexpr int kBlockM = get<0>(TileShape_MNK{});
+    static constexpr int kBlockN = get<1>(TileShape_MNK{});
+    static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+
+    using AtomLayoutMNK = Layout<Shape<Int<kBlockM / 64>, _1, _1>>;
     using TiledMma0 = decltype(cute::make_tiled_mma(
         cute::GMMA::ss_op_selector<Element, Element, ElementAccum, TileShape_MNK>(),
         AtomLayoutMNK{}));
@@ -97,24 +100,20 @@ struct CollectiveMainloopFwd {
         make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{}),
         std::conditional_t<MmaMajorV == GMMA::Major::K, cute::Step<_1, _2, _3>, cute::Step<_2, _1, _3>>{}));
 
-    // Only used if we're using cp.async to load Q
+    // Only used if we're using cp.async to load V
     using SmemLayoutAtomVCpAsync = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<1>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
     using SmemLayoutVCpAsync = decltype(tile_to_shape(
         SmemLayoutAtomVCpAsync{},
         make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
 
-    // Only used if PagedKV
-    // using SmemLayoutPageTable = cute::Layout<cute::Shape<decltype(get<1>(TileShape_MNK{})), Int<kStages>>>;
-    using SmemLayoutPageTable = cute::Layout<cute::Shape<Int<2 * get<1>(TileShape_MNK{})>, Int<kStages>>>;
-
     // Use LDSM.T and STSM to transpose V in the case of FP8 and V being row-major.
     // For FP16/BF16 we don't do any transposing.
-    static_assert(!Transpose_V || (kHeadDim % 32 == 0 && CUTE_STATIC_V(get<1>(TileShape_MNK{})) % 32 == 0));
+    static_assert(!Transpose_V || (kHeadDim % 32 == 0 && kBlockN % 32 == 0));
     static constexpr bool kHeadDim_multiple_64 = kHeadDim % 64 == 0;
     // Either kHeadDim is a multiple of 64 (in which case we use a block size of 64 x 32 for the transpose),
     // or we need kBlockN to be a multiple of 64 (in which case we use a block size of 32 x 64 for the transpose).
-    static_assert(!Transpose_V || (kHeadDim_multiple_64 || CUTE_STATIC_V(get<1>(TileShape_MNK{})) % 64 == 0));
+    static_assert(!Transpose_V || (kHeadDim_multiple_64 || kBlockN % 64 == 0));
     using LDSM_thread_shape  = std::conditional_t<kHeadDim_multiple_64, Shape<_32, _4, _1, _1>, Shape<_16, _4, _1, _2>>;
     using LDSM_thread_stride = std::conditional_t<kHeadDim_multiple_64, Stride<_4, _1, _0, _0>, Stride<_4, _1, _0, _64>>;
     using LDSM_value_shape = Shape<_2, _2, _1, _4>;
@@ -156,10 +155,17 @@ struct CollectiveMainloopFwd {
     static_assert(cutlass::NumThreadsPerWarp % kGmemThreadsPerRow == 0, "kGmemThreadsPerRow must divide NumThreadsPerWarp");
     using GmemLayoutAtom = Layout<Shape <Int<NumMmaThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
+    // If AppendKV, we'll be loading Q for rotary, and we assume divisibility to avoid predication
+    static_assert(!AppendKV || kBlockM % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0, "kBlockM must be a multiple of NumMmaThreads / kGmemThreadsPerRow");
     using GmemTiledCopyAppendKV = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per store
+
+    using GmemTiledCopyRotary = decltype(
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<64>, Element>{},
+                        GmemLayoutAtom{},
+                        Layout<Shape<_1, Int<kGmemElemsPerLoad / 2>>>{}));  // Val layout, 4 or 8 vals per store
 
     using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
     using StrideQK = cute::Stride<int64_t, _1, int64_t, int64_t>;
@@ -169,6 +175,8 @@ struct CollectiveMainloopFwd {
     using StrideQPacked = std::conditional_t<!PackGQA, StrideQK, cute::Stride<cute::Stride<int64_t, int64_t>, _1, int64_t, int64_t>>;
     using ShapePageTable = cute::Shape<int32_t, int32_t>;  // (batch, max_num_pages_per_seq)
     using StridePageTable = cute::Stride<int64_t, _1>;
+    using ShapeRotary = cute::Shape<int32_t, int32_t>;  // (seqlen_ro, rotary_dim // 2)
+    using StrideRotary = cute::Stride<int64_t, _1>;
 
     using TMA_Q = decltype(make_tma_copy_A_sm90(
         GmemTiledCopyQ{},
@@ -207,7 +215,7 @@ struct CollectiveMainloopFwd {
     // If PackGQA, we use cp.async (instead of TMA) to load Q, so we want smem_q to be aligned
     // and have sQ being position_independent_swizzle_tensor.
     // If !Use_TMA_KV, we use cp.async (instead of TMA) to load K & V, so we want smem_k and smem_v to be aligned.
-    static constexpr size_t SmemAlignmentQ = Use_TMA_Q ? 128 : cutlass::detail::alignment_for_swizzle(SmemLayoutQ{});
+    static constexpr size_t SmemAlignmentQ = Use_TMA_Q && !AppendKV ? 128 : cutlass::detail::alignment_for_swizzle(SmemLayoutQ{});
     static constexpr size_t SmemAlignmentK = Use_TMA_KV && !AppendKV ? 128 : cutlass::detail::alignment_for_swizzle(SmemLayoutK{});
     static constexpr size_t SmemAlignmentVtNoTranspose = cutlass::detail::alignment_for_swizzle(SmemLayoutVt{});
     static_assert(SmemAlignmentQ >= 128 and SmemAlignmentK >= 128 && SmemAlignmentVtNoTranspose >= 128, "Require at least 128B alignment");
@@ -249,6 +257,11 @@ struct CollectiveMainloopFwd {
         StrideQK const stride_K_new;
         Element const* const ptr_V_new;
         StrideV const stride_V_new;
+        Element const* const ptr_rotary_cos;
+        ShapeRotary const shape_rotary;
+        StrideRotary const stride_rotary_cos;
+        Element const* const ptr_rotary_sin;
+        StrideRotary const stride_rotary_sin;
         int const* const ptr_pagetable;
         ShapePageTable const shape_pagetable;
         StridePageTable const stride_pagetable;
@@ -283,6 +296,11 @@ struct CollectiveMainloopFwd {
         StrideQK const stride_K_new;
         Element const* const ptr_V_new;
         StrideV const stride_V_new;
+        Element const* const ptr_rotary_cos;
+        ShapeRotary const shape_rotary;
+        StrideRotary const stride_rotary_cos;
+        Element const* const ptr_rotary_sin;
+        StrideRotary const stride_rotary_sin;
         int const* const ptr_pagetable;
         ShapePageTable const shape_pagetable;
         StridePageTable const stride_pagetable;
@@ -354,6 +372,9 @@ struct CollectiveMainloopFwd {
             args.stride_Q,
             make_stride(make_stride(get<2>(args.stride_Q), get<0>(args.stride_Q)), get<1>(args.stride_Q), get<2>(args.stride_Q) * qhead_per_khead, get<3>(args.stride_Q))
         );
+        if (get<1>(args.shape_rotary) > 0) {
+            assert(args.ptr_rotary_cos != nullptr && args.ptr_rotary_sin != nullptr);
+        }
         // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         // Right after this, we multiply by log2(e) before applying exp2.
         // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
@@ -362,6 +383,8 @@ struct CollectiveMainloopFwd {
         return {args.ptr_Q, args.shape_Q, args.stride_Q, shape_Q_packed, stride_Q_packed,
                 args.ptr_K, args.shape_K, args.stride_K, args.ptr_V, args.stride_V,
                 args.ptr_K_new, args.shape_K_new, args.stride_K_new, args.ptr_V_new, args.stride_V_new,
+                args.ptr_rotary_cos, args.shape_rotary, args.stride_rotary_cos,
+                args.ptr_rotary_sin, args.stride_rotary_sin,
                 args.ptr_pagetable, args.shape_pagetable, args.stride_pagetable,
                 cutlass::FastDivmod(int(get<0>(args.shape_K))),
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
@@ -861,6 +884,86 @@ struct CollectiveMainloopFwd {
         }
         typename cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(barrier_Q.try_wait(work_idx % 2));
         if (barrier_token == cutlass::BarrierStatus::WaitAgain) { barrier_Q.wait(work_idx % 2); }
+        if constexpr (AppendKV) {
+            if (get<1>(params.shape_rotary) > 0) {  // Apply rotary to Q
+                // TODO: load cos/sin before waiting for Q to be ready
+                int const leftpad_k = Varlen && params.leftpad_k ? params.leftpad_k[bidb] : 0;
+                int const seqlen_k_og = get_seqlen_k<true /*Seqlen_before_append_KV*/>(params, bidb);
+                // int const offset_rotary = seqlen_k_og + leftpad_k + (Is_causal || Is_local ? m_block * kBlockM : 0);
+                int const offset_rotary = seqlen_k_og + leftpad_k;
+                auto stride_rotary_cos = make_stride(cute::conditional_return<Is_causal || Is_local>(get<0>(params.stride_rotary_cos), _0{}), get<1>(params.stride_rotary_cos));
+                auto stride_rotary_sin = make_stride(cute::conditional_return<Is_causal || Is_local>(get<0>(params.stride_rotary_sin), _0{}), get<1>(params.stride_rotary_sin));
+                Tensor mCos = make_tensor(make_gmem_ptr(params.ptr_rotary_cos + offset_rotary * get<0>(params.stride_rotary_cos)), params.shape_rotary, stride_rotary_cos);
+                Tensor mSin = make_tensor(make_gmem_ptr(params.ptr_rotary_sin + offset_rotary * get<0>(params.stride_rotary_sin)), params.shape_rotary, stride_rotary_sin);
+
+                Tensor gCos = local_tile(mCos, Shape<Int<kBlockM>, Int<kHeadDim / 2>>{}, make_coord(m_block, _0{}));  // (M, K / 2)
+                Tensor gSin = local_tile(mSin, Shape<Int<kBlockM>, Int<kHeadDim / 2>>{}, make_coord(m_block, _0{}));  // (M, K / 2)
+
+                int const rotary_dim = get<1>(params.shape_rotary) * 2;
+                GmemTiledCopyRotary gmem_tiled_copy_rotary;
+                auto gmem_thr_copy_rotary = gmem_tiled_copy_rotary.get_thread_slice(thread_idx);
+                Tensor tRgCos = gmem_thr_copy_rotary.partition_S(gCos);
+                Tensor tRgSin = gmem_thr_copy_rotary.partition_S(gSin);
+                Tensor cR = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim / 2>>{});  // (BLK_N,BLK_K / 2)
+                Tensor tRcR = gmem_thr_copy_rotary.partition_D(cR);
+                Tensor tRpR = make_tensor<bool>(make_shape(size<2>(tRgCos)));
+                #pragma unroll
+                for (int k = 0; k < size(tRpR); ++k) { tRpR(k) = get<1>(tRcR(_0{}, _0{}, k)) < get<1>(params.shape_rotary); }
+
+                // make_tensor_like, not make_fragment_like. If the row_stride is _0{} we want to keep it that way
+                Tensor tRrCos = cute::make_tensor_like(tRgCos);
+                Tensor tRrSin = cute::make_tensor_like(tRgSin);
+                // If not causal/local, only copy the first row as we only need the cos/sin for position cache_seqlens
+                int const qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
+                #pragma unroll
+                for (int m = 0; m < (Is_causal || Is_local ? size<1>(tRgCos) : 1); ++m) {
+                    int const idx = m_block * kBlockM + get<0>(tRcR(_0{}, m, _0{}));
+                    if (idx < (!PackGQA ? seqlen_q : seqlen_q * qhead_per_khead)) {
+                        if constexpr (!PackGQA) {
+                            #pragma unroll
+                            for (int k = 0; k < size<2>(tRgCos); ++k) {
+                                if (tRpR(k)) {
+                                    cute::copy(gmem_tiled_copy_rotary, tRgCos(_, m, k), tRrCos(_, m, k));
+                                    cute::copy(gmem_tiled_copy_rotary, tRgSin(_, m, k), tRrSin(_, m, k));
+                                }
+                            }
+                        } else {
+                            int const row = params.qhead_per_khead_divmod.divide(idx);
+                            // if (thread_idx == 0) { printf("idx = %d, row = %d\n", idx, row); }
+                            Tensor mCos_copy = cute::tiled_divide(make_tensor(&mCos(row, _0{}), Shape<Int<kHeadDim / 2>>{}),
+                                                                  Shape<Int<kGmemElemsPerLoad / 2>>{});
+                            Tensor mSin_copy = cute::tiled_divide(make_tensor(&mSin(row, _0{}), Shape<Int<kHeadDim / 2>>{}),
+                                                                  Shape<Int<kGmemElemsPerLoad / 2>>{});
+                            #pragma unroll
+                            for (int k = 0; k < size<2>(tRgCos); ++k) {
+                                int const ki = get<1>(tRcR(_0{}, _0{}, k)) / (kGmemElemsPerLoad / 2);
+                                if (tRpR(k)) {
+                                    cute::copy(gmem_tiled_copy_rotary, mCos_copy(_, ki), tRrCos(_, m, k));
+                                    cute::copy(gmem_tiled_copy_rotary, mSin_copy(_, ki), tRrSin(_, m, k));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                GmemTiledCopyAppendKV gmem_tiled_copy_q;
+                auto gmem_thr_copy_q = gmem_tiled_copy_q.get_thread_slice(thread_idx);
+                Tensor tQsQ = gmem_thr_copy_q.partition_S(cute::as_position_independent_swizzle_tensor(sQ));
+                Tensor tQcQ = gmem_thr_copy_q.partition_S(cute::make_identity_tensor(select<0, 2>(TileShape_MNK{})));
+                Tensor tQrQ = make_fragment_like(tQsQ);
+                // TODO: only copy some rows, and only write some rows
+                cute::copy(gmem_tiled_copy_q, tQsQ, tQrQ);
+                // if (thread_idx == 0) { print(tRgCos); printf("\n"); print_tensor(tQrQ); print_tensor(tRrCos); print_tensor(tRrSin); }
+                flash::apply_rotary_interleaved(tQrQ, tRrCos, tRrSin, tQcQ,
+                                                std::min((!PackGQA ? seqlen_q : seqlen_q * qhead_per_khead) - m_block * kBlockM, kBlockM), rotary_dim);
+                // if (thread_idx == 0) { print_tensor(tQrQ); }
+                cute::copy(gmem_tiled_copy_q, tQrQ, tQsQ);
+                // SMEM fence to make sure the rotated Q is visible to GMMA
+                cutlass::arch::fence_view_async_shared();
+                cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<int>(FwdNamedBarriers::QueryRotated) /*id*/);
+                // if (thread_idx == 0) { print_tensor(sQ); }
+            }
+        }
 
         // TODO: check the case where n_block_max <= n_block_min but there are sink tokens
         if constexpr (true) {
@@ -993,7 +1096,9 @@ struct CollectiveMainloopFwd {
             //     fwd_step(n_block, mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<true>{} /*check_inf*/);
             // }
             // Tell warp 0 that smem_q is ready
-            cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
+            if constexpr (Use_TMA_Q) {  // If !Use_TMA_Q, we don't use the producer WG to load Q
+                cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
+            }
             Tensor scores_scale = softmax.finalize();
             softmax.rescale_o(tOrO, scores_scale);
 
@@ -1143,11 +1248,21 @@ struct CollectiveMainloopFwd {
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
         Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K), params.shape_K, params.stride_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
+        Tensor mCos = make_tensor(make_gmem_ptr(params.ptr_rotary_cos), params.shape_rotary, params.stride_rotary_cos);
+        Tensor mSin = make_tensor(make_gmem_ptr(params.ptr_rotary_sin), params.shape_rotary, params.stride_rotary_sin);
 
         int const leftpad_k = Varlen && params.leftpad_k ? params.leftpad_k[bidb] : 0;
-        int const offset_k = (!Varlen ? 0 : (params.cu_seqlens_k ? params.cu_seqlens_k[bidb] : 0) + leftpad_k) + get_seqlen_k<true/*Seqlen_before_append_KV*/>(params, bidb);
+        int const seqlen_k_og = get_seqlen_k<true /*Seqlen_before_append_KV*/>(params, bidb);
+
+        int const offset_k = (!Varlen ? 0 : (params.cu_seqlens_k ? params.cu_seqlens_k[bidb] : 0) + leftpad_k) + seqlen_k_og;
         Tensor gK = local_tile(domain_offset(make_coord(offset_k, _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
         Tensor gV = local_tile(domain_offset(make_coord(offset_k, _0{}), mV), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});
+        static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+        int const offset_rotary = seqlen_k_og + leftpad_k;
+        Tensor gCos = local_tile(domain_offset(make_coord(offset_rotary, _0{}), mCos), Shape<Int<kBlockN>, Int<kHeadDim / 2>>{}, make_coord(_, _0{}));  // (N, K / 2, _)
+        Tensor gSin = local_tile(domain_offset(make_coord(offset_rotary, _0{}), mSin), Shape<Int<kBlockN>, Int<kHeadDim / 2>>{}, make_coord(_, _0{}));  // (N, K / 2, _)
 
         int const seqlen_k_new = get_seqlen_k_new(params, bidb);
         PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element, true /*KV_Same_Iter*/> paged_kv_manager(
@@ -1164,25 +1279,51 @@ struct CollectiveMainloopFwd {
         Tensor tKgK = gmem_thr_copy_kv.partition_D(gK);
         Tensor tVsV = gmem_thr_copy_kv.partition_S(sV);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
         Tensor tVgV = gmem_thr_copy_kv.partition_D(gV);
-        // Construct identity layout for sK
         Tensor cK = cute::make_identity_tensor(select<1, 2>(TileShape_MNK{}));  // (BLK_N,BLK_K) -> (blk_n,blk_k)
-        // Repeat the partitioning with identity layouts
         Tensor tKcK = gmem_thr_copy_kv.partition_D(cK);
         Tensor tKpK = make_tensor<bool>(make_shape(size<2>(tKsK)));
         #pragma unroll
         for (int k = 0; k < size(tKpK); ++k) { tKpK(k) = get<1>(tKcK(_0{}, _0{}, k)) < get<1>(params.shape_K); }
 
-        static constexpr int kBlockN = get<1>(TileShape_MNK{});
+        int const rotary_dim = get<1>(params.shape_rotary) * 2;
+        GmemTiledCopyRotary gmem_tiled_copy_rotary;
+        auto gmem_thr_copy_rotary = gmem_tiled_copy_rotary.get_thread_slice(thread_idx);
+        Tensor tRgCos = gmem_thr_copy_rotary.partition_S(gCos);
+        Tensor tRgSin = gmem_thr_copy_rotary.partition_S(gSin);
+        Tensor cR = cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim / 2>>{});  // (BLK_N,BLK_K / 2)
+        Tensor tRcR = gmem_thr_copy_rotary.partition_D(cR);
+        Tensor tRpR = make_tensor<bool>(make_shape(size<2>(tRgCos)));
+        #pragma unroll
+        for (int k = 0; k < size(tRpR); ++k) { tRpR(k) = get<1>(tRcR(_0{}, _0{}, k)) < get<1>(params.shape_rotary); }
 
         auto store_K = [&] (int const n_block, auto const& smem_pipe_read, auto need_seqlenk_masking_type) {
             constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
+            Tensor tRrCos = make_fragment_like(tRgCos(_, _, _, _0{}));
+            Tensor tRrSin = make_fragment_like(tRgSin(_, _, _, _0{}));
+            if (rotary_dim > 0) {
+                #pragma unroll
+                for (int m = 0; m < size<1>(tRgCos); ++m) {
+                    if (get<0>(tRcR(_0{}, m, _0{})) < seqlen_k_new - n_block * kBlockN) {
+                        #pragma unroll
+                        for (int k = 0; k < size<2>(tRgCos); ++k) {
+                            if (tRpR(k)) {
+                                cute::copy(gmem_tiled_copy_rotary, tRgCos(_, m, k, n_block), tRrCos(_, m, k));
+                                cute::copy(gmem_tiled_copy_rotary, tRgSin(_, m, k, n_block), tRrSin(_, m, k));
+                            }
+                        }
+                    }
+                }
+            }
             pipeline_k_new.consumer_wait(smem_pipe_read);
             Tensor tKrK = make_fragment_like(tKsK(_, _, _, _0{}));
             // TODO: deal w the case where tKsK has size larger than sV (e.g. kBlockN = 176)
             // cute::copy(gmem_tiled_copy_kv, tKsK(_, _, _, smem_pipe_read.index()), tKrK);
-            flash::copy</*Is_even_MN=*/kBlockN % shape<0>(GmemLayoutAtom{}) == 0, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
+            // flash::copy</*Is_even_MN=*/kBlockN % shape<0>(GmemLayoutAtom{}) == 0, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
+            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
                 gmem_tiled_copy_kv, tKsK(_, _, _, smem_pipe_read.index()), tKrK, tKcK, tKpK, kBlockN
             );
+            // Without this sync I'm getting race condition when seqlen_k is large
+            cutlass::arch::fence_view_async_shared();
             // Very important: PipelineTmaAsync::consumer_release assumes that the warpgroup is synchronized
             // before calling.
             cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + cutlass::canonical_warp_group_idx() /*id*/);
@@ -1190,6 +1331,13 @@ struct CollectiveMainloopFwd {
             // if (thread_idx == 0) { print_tensor(sK(_, _, smem_pipe_read.index())); }
             // if (thread_idx == 0) { print(tKsK); printf("\n"); print(tKrK); printf("\n"); print(tKgK); printf("\n");}
             // if (thread_idx == 0) { print_tensor(tKpK); printf("\n"); printf("seqlen_limit = %d\n", seqlen_k_new - n_block * kBlockN);}
+            // if (thread_idx == 0) { print(tRgCos); printf("\n"); print(tRcR); printf("\n"); print_tensor(tRpR); print_tensor(tRrCos); }
+            if (rotary_dim > 0) {
+                flash::apply_rotary_interleaved(tKrK, tRrCos, tRrSin, tKcK,
+                                                std::min(seqlen_k_new - n_block * kBlockN, kBlockN), rotary_dim);
+            }
+            // if (thread_idx == 0) { print_tensor(tKrK); }
+
             if constexpr (!PagedKV) {
                 Tensor tKgK_cur = tKgK(_, _, _, n_block);
                 // Clear_OOB_K must be false since we don't want to write zeros to gmem
@@ -1209,6 +1357,7 @@ struct CollectiveMainloopFwd {
             flash::copy</*Is_even_MN=*/kBlockN % shape<0>(GmemLayoutAtom{}) == 0, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
                 gmem_tiled_copy_kv, tVsV(_, _, _, smem_pipe_read.index()), tVrV, tKcK, tKpK, kBlockN
             );
+            cutlass::arch::fence_view_async_shared();
             cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + cutlass::canonical_warp_group_idx() /*id*/);
             pipeline_v_new.consumer_release(smem_pipe_read);
             // if (thread_idx == 0) { print_tensor(sV(_, _, smem_pipe_read.index())); }

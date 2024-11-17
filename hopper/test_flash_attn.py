@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from einops import rearrange, repeat
 from flash_attn.bert_padding import pad_input, unpad_input
+from flash_attn.layers.rotary import apply_rotary_emb
 
 from flash_attn_interface import flash_attn_func, flash_attn_varlen_func, flash_attn_combine, flash_attn_with_kvcache
 
@@ -709,9 +710,9 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 # @pytest.mark.parametrize("rotary_interleaved", [False, True])
-@pytest.mark.parametrize("rotary_interleaved", [False])
-# @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("rotary_fraction", [0.0])
+@pytest.mark.parametrize("rotary_interleaved", [True])
+@pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
+# @pytest.mark.parametrize("rotary_fraction", [1.0])
 @pytest.mark.parametrize("page_size", [None, 1, 4, 128])
 # @pytest.mark.parametrize("page_size", [None])
 @pytest.mark.parametrize("has_leftpad", [False, True])
@@ -902,8 +903,8 @@ def test_flash_attn_kvcache(
         v_cache if page_size is None else v_cache_paged,
         k,
         v,
-        # rotary_cos=cos,
-        # rotary_sin=sin,
+        rotary_cos=cos,
+        rotary_sin=sin,
         cache_seqlens=cache_seqlens,
         cache_batch_idx=cache_batch_idx,
         cache_leftpad=cache_leftpad,
@@ -912,7 +913,7 @@ def test_flash_attn_kvcache(
         max_seqlen_q=max_seqlen_q,
         causal=causal,
         window_size=window_size,
-        # rotary_interleaved=rotary_interleaved,
+        rotary_interleaved=rotary_interleaved,
         num_splits=num_splits,
         return_softmax_lse=True
     )
@@ -983,9 +984,14 @@ def test_flash_attn_kvcache(
                 "(b nblocks) block_size ... -> b (nblocks block_size) ...",
                 b=batch_size,
             )[:, :seqlen_k]
-        # breakpoint()
-        assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
         assert torch.equal(v_cache_select, v_cache_ref)
+        # breakpoint()
+        if rotary_dim == 0:
+            assert torch.equal(k_cache_select, k_cache_ref)
+        else:
+            # if not torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3):
+            #     breakpoint()
+            assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
     mult = 3
     assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
 
