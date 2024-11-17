@@ -15,7 +15,8 @@
 
 // Copied from https://github.com/pytorch/pytorch/commit/7931eee5c5ebcdf468bff4d308510b03355cd909
 // This is so that we can pass in torch.dtype as a parameter to the function.
-// TODO: does it conflict if user compiles it with a recent version of Pytorch that has that commit?
+#if TORCH_VERSION_MAJOR < 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 4)
+
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -48,6 +49,8 @@ namespace pybind11::detail {
     };
 
 } // namespace pybind11::detail
+
+#endif
 
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
