@@ -31,8 +31,8 @@ struct CollectiveEpilogueFwd {
     static constexpr bool Use_smem = sizeof(Element) <= 2;
     static constexpr bool Use_TMA_O = !Varlen && Use_smem && !PackGQA;
 
-    static constexpr int kHeadDim = get<2>(TileShape_MNK{});
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
+    static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
     using GmemTiledCopyOTMA = cute::SM90_TMA_STORE;
 
@@ -51,6 +51,7 @@ struct CollectiveEpilogueFwd {
     static_assert(NumEpilogueThreads % kGmemThreadsPerRow == 0, "NumEpilogueThreads must be a multiple of kGmemThreadsPerRow");
     using GmemLayoutAtom = Layout<Shape <Int<NumEpilogueThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
+    static_assert(kBlockM % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0, "kBlockM must be a multiple of NumEpilogueThreads / kGmemThreadsPerRow");
     using GmemTiledCopyO = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
                         GmemLayoutAtom{},
@@ -184,7 +185,7 @@ struct CollectiveEpilogueFwd {
         // Technically we don't need this if we're not using smem, but the mainloop makes the assumption that
         // all epilogue threads sync at least once during the epilogue (so that we can start loading Q with
         // cp.async if we need).
-        cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, static_cast<int>(FwdNamedBarriers::ValueEmpty) /*id*/);
+        cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
         // Step 1: Write O from rmem -> smem
         if constexpr (Use_smem) {
@@ -213,9 +214,9 @@ struct CollectiveEpilogueFwd {
         int seqlen_o = !Varlen ? size<0>(params.shape_O) : (params.seqused ? params.seqused[bidb] : (params.cu_seqlens ? params.cu_seqlens[bidb + 1] - offset_o : size<0>(params.shape_O)));
 
         // Step 2: Write LSE from rmem -> gmem
-        Tensor caccO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));
         auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
-        Tensor taccOcO = thread_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
+        // (MMA,MMA_M,MMA_K)
+        Tensor taccOcO = thread_mma.partition_C(cute::make_identity_tensor(select<0, 2>(TileShape_MNK{})));
         static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
         static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
         // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the row indices.
@@ -267,15 +268,14 @@ struct CollectiveEpilogueFwd {
                 // Tensor tOsO = gmem_thr_copy_O.partition_S(sO_pi);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
                 Tensor tOrO = make_fragment_like(tOsO);
                 cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
+                cutlass::arch::fence_view_async_shared(); // ensure smem reads are done before next TMA to smem_v
                 #pragma unroll
                 for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
                     shared_storage.pipelines.barrier_O.arrive(cta_id);
                 }
                 if constexpr (!PackGQA) {
-                    // Construct identity layout for sO
-                    Tensor cO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));  // (BLK_M,BLK_K) -> (blk_m,blk_k)
-                    // Repeat the partitioning with identity layouts
-                    Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+                    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+                    Tensor tOcO = gmem_thr_copy_O.partition_D(cute::make_identity_tensor(select<0, 2>(TileShape_MNK{})));
                     Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOsO)));
                     #pragma unroll
                     for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(params.shape_O); }
@@ -345,10 +345,7 @@ struct CollectiveEpilogueFwd {
 
         GmemTiledCopyO gmem_tiled_copy_O;
         auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
-        // Construct identity layout for gO
-        Tensor cO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));  // (BLK_M,BLK_K) -> (blk_m,blk_k)
-        // Repeat the partitioning with identity layouts
-        Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+        Tensor tOcO = gmem_thr_copy_O.partition_D(cute::make_identity_tensor(select<0, 2>(TileShape_MNK{})));
         if constexpr (!PackGQA) {
             Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOcO)));
             #pragma unroll

@@ -319,6 +319,7 @@ public:
                     // TODO: do we need all these fences?
                     // asm volatile ("fence.proxy.async.global;");
                     // if (threadIdx.x == 0) { printf("Producer: After sync\n"); }
+                    // If we don't reset the state, the loads for the main attention might have the wrong phase.
                     smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
                 }
                 auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {

@@ -13,15 +13,14 @@ namespace flash {
 
 enum class FwdNamedBarriers {
     QueryEmpty = 0,
-    ValueEmpty = 1,
+    ProducerWG = 1,
     TileCountSmemEmpty = 2,
     TileCountSmemFull = 3,
     WarpSchedulerWG1 = 4,
     WarpSchedulerWG2 = 5,
     WarpSchedulerWG3 = 6,
-    ProducerWG = 7,
-    AppendKV = 8,
-    QueryRotated = 9,
+    AppendKV = 7,
+    QueryRotated = 8,
 };
 
 enum class BwdNamedBarriers {

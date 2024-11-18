@@ -770,8 +770,7 @@ struct CollectiveMainloopFwd {
         if constexpr (Use_TMA_Q) {
             cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
         }
-        // if AppendKV then this won't work because we're using the same NamedBarrier
-        if constexpr (UseSchedulerBarrier && !AppendKV) {
+        if constexpr (UseSchedulerBarrier) {
             // We have NamedBarrier for up to 3 WGs
             static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
             // WG1 needs the very first signal to start
@@ -795,15 +794,6 @@ struct CollectiveMainloopFwd {
         SharedStorage& shared_storage
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
-
-        if constexpr (UseSchedulerBarrier && AppendKV) {
-            // We have NamedBarrier for up to 3 WGs
-            static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
-            // WG1 needs the very first signal to start
-            if (cutlass::canonical_warp_group_idx() == 1) {
-                cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
-            }
-        }
 
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -1273,6 +1263,15 @@ struct CollectiveMainloopFwd {
             // passing offset_k instead of leftpad_k will move the PageTable pointer to the right position
         );
 
+        if constexpr (UseSchedulerBarrier) {
+            // WG1 already got the very first signal from mma_init(), but we'll be using the same NamedBarrier.
+            // So we'll need to "cancel it out" here and then re-signal it at the end.
+            if (cutlass::canonical_warp_group_idx() == 1) {
+                cutlass::arch::NamedBarrier::sync(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
+            }
+        }
+
+
         GmemTiledCopyAppendKV gmem_tiled_copy_kv;
         auto gmem_thr_copy_kv = gmem_tiled_copy_kv.get_thread_slice(thread_idx);
         Tensor tKsK = gmem_thr_copy_kv.partition_S(sK);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
@@ -1393,6 +1392,14 @@ struct CollectiveMainloopFwd {
             ++smem_pipe_read;
         }
         // if (thread_idx == 0) { printf("After for loop\n"); }
+
+        // Re-signaling the NamedBarrier that we "canceled out"
+        if constexpr (UseSchedulerBarrier) {
+            if (cutlass::canonical_warp_group_idx() == 1) {
+                cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
+            }
+        }
+
     }
 
 };
