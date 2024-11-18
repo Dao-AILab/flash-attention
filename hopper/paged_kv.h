@@ -65,17 +65,17 @@ struct PagedKVManager {
     using TensorPageOffset = decltype(make_tensor<cute::tuple<int, int>>(Shape<Int<kPageEntryPerThread>>{}));
     using TensorKVPtr = decltype(make_tensor<Element*>(Shape<Int<kPageEntryPerThread>>{}));
 
+    GmemTiledCopyKVCpAsync gmem_tiled_copy_kv;
     cutlass::FastDivmod const &page_size_divmod;
     int const thread_idx;
     int const seqlen_k;
     int const leftpad_k;
+    GmemThrCopyKVCpAsync const gmem_thr_copy_kv;
     TensorPageTable mPageTable;
     TensorKV mK_paged, mV_paged;
     TensortKpK tKpK;
     TensorPageOffset tPrPageOffset;
     TensorKVPtr tPrVPtr;
-    GmemTiledCopyKVCpAsync gmem_tiled_copy_kv;
-    GmemThrCopyKVCpAsync const gmem_thr_copy_kv;
 
 
     CUTLASS_DEVICE

@@ -41,8 +41,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             flash::DynamicPersistentTileScheduler<CollectiveMainloop::NumMmaThreads, CollectiveMainloop::NumProducerThreads, Split>>
     >;
     using SchedulerSingleTile = flash::SingleTileScheduler<Varlen, Split, PackGQA, kBlockM>;
-    // If Split or PagedKV then we probably don't have enough work for PersistentScheduler to be useful.
-    // If AppendKV, we *have to* use SingleTileScheduler to due the synchronization requirements.
+    // If Split, PagedKV, or AppendKV then we probably don't have enough work for PersistentScheduler to be useful.
     using Scheduler = std::conditional_t<Split || PagedKV || AppendKV, SchedulerSingleTile, SchedulerPersistent>;
     using AttnKernel = flash::FlashAttnFwd<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
 
@@ -166,7 +165,8 @@ void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
                     bool pack_gqa = params.pack_gqa >= 0  // if negative, we use a heuristic to decide
                         ? bool(params.pack_gqa)
                         // If varlen, we don't actually know seqlen_q but only max_seqlen_q.
-                        : params.h != params.h_k && (Varlen || should_pack_gqa(params.seqlen_q, params.h, params.h_k, kBlockM));
+                        // If causal, PackGQA always seems faster
+                        : params.h != params.h_k && (Varlen || Is_causal || should_pack_gqa(params.seqlen_q, params.h, params.h_k, kBlockM));
                     BOOL_SWITCH(pack_gqa, PackGQA, [&] {
                     //     BOOL_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
                     //         // Only use Cluster if number of tiles along seqlen_q is even and not varlen
