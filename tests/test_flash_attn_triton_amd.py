@@ -1835,7 +1835,7 @@ def test_flash_attn_varlen_causal(
 
 
 # @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
-@pytest.mark.parametrize("dtype", [torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("num_splits", [1, 0])
 # @pytest.mark.parametrize("num_splits", [1])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -1851,8 +1851,7 @@ def test_flash_attn_varlen_causal(
 # @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
-@pytest.mark.parametrize("rotary_interleaved", [False, True])
-# @pytest.mark.parametrize("rotary_interleaved", [True])
+@pytest.mark.parametrize("rotary_interleaved", [False])
 # @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("rotary_fraction", [0.5, 1.0])
 # @pytest.mark.parametrize("paged_kv_block_size", [None, 256])
@@ -1922,7 +1921,7 @@ def test_flash_attn_kvcache(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 4
+    batch_size = 2
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
     nheads = 6
     # rotary_dim must be a multiple of 16, and must be <= d

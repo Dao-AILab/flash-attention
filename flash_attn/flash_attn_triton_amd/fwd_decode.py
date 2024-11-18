@@ -456,6 +456,10 @@ def _fwd_kernel_splitK(
             Q.dtype.element_ty,
             0,
         )
+
+        # cast to q dtype otherwise ops will error for dtype mismatch
+        k, v = k.to(q.dtype), v.to(q.dtype)
+
         if PADDED_HEAD:
             k = tl.where(d_mask[:, None], k, 0.0)
             v = tl.where(d_mask[None, :], v, 0.0)
