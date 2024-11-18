@@ -1,4 +1,5 @@
 import argparse
+import math
 import torch
 import triton
 from flash_attn.flash_attn_triton_amd.utils import (
@@ -6,7 +7,7 @@ from flash_attn.flash_attn_triton_amd.utils import (
     input_helper,
     varlen_input_helper,
 )
-from flash_attn.flash_attn_triton_amd.interface_torch import attention_prefill, attention_decode
+from flash_attn.flash_attn_triton_amd.interface_torch import attention_decode
 
 ARGS_TO_TORCH_DTYPE = {
     "fp16": torch.float16,
@@ -15,7 +16,6 @@ ARGS_TO_TORCH_DTYPE = {
 }
 
 FUNCTIONS = {
-    "prefill": attention_prefill,
     "decode": attention_decode
 }
 
@@ -29,96 +29,92 @@ def get_benchmark_configs(args, varlen=False):
         return [(args.b, args.hq, hk, args.sq, sk)]
     elif varlen:
         return [
-            (2, 16, 4, 1024, 1024),
+            # (2, 16, 4, 1024, 1024),
             (8, 16, 2, 2048, 2048),
-            (4, 16, 8, 4096, 4096),
-            (2, 16, 4, 8192, 8192),
-            (2, 16, 8, 16384, 16384),
-            (2, 48, 12, 1024, 1024),
-            (2, 48, 24, 2048, 2048),
-            (2, 48, 8, 4096, 4096),
-            (2, 48, 4, 8192, 8192),
-            (2, 48, 2, 16384, 16384),
-            (2, 64, 32, 1024, 1024),
-            (4, 64, 16, 2048, 2048),
-            (4, 64, 8, 4096, 4096),
-            (4, 64, 32, 8192, 8192),
-            (4, 128, 16, 16384, 16384),
+            # (4, 16, 8, 4096, 4096),
+            # (2, 16, 4, 8192, 8192),
+            # (2, 16, 8, 16384, 16384),
+            # (2, 48, 12, 1024, 1024),
+            # (2, 48, 24, 2048, 2048),
+            # (2, 48, 8, 4096, 4096),
+            # (2, 48, 4, 8192, 8192),
+            # (2, 48, 2, 16384, 16384),
+            # (2, 64, 32, 1024, 1024),
+            # (4, 64, 16, 2048, 2048),
+            # (4, 64, 8, 4096, 4096),
+            # (4, 64, 32, 8192, 8192),
+            # (4, 128, 16, 16384, 16384),
         ]
     else:
         return [
             (16, 16, 16, 1024, 1024),
-            (8, 16, 16, 2048, 2048),
-            (4, 16, 16, 4096, 4096),
-            (1, 8, 8, 8192, 8192),
-            (1, 2, 2, 16384, 16384),
-            (2, 48, 48, 1024, 1024),
-            (2, 48, 48, 2048, 1024),
-            (1, 8, 8, 4096, 8192),
-            (1, 8, 8, 8192, 4096),
-            (2, 4, 4, 16384, 8192),
-            (2, 8, 8, 1989, 15344),
-            (4, 16, 16, 4097, 163),
-            (2, 16, 16, 8122, 2159),
-            (1, 16, 16, 16281, 7),
-            (2, 48, 48, 1021, 1020),
-            (2, 48, 48, 2001, 2048),
-            (2, 8, 8, 3996, 9639),
-            (2, 8, 8, 8181, 1021),
+            # (8, 16, 16, 2048, 2048),
+            # (4, 16, 16, 4096, 4096),
+            # (1, 8, 8, 8192, 8192),
+            # (1, 2, 2, 16384, 16384),
+            # (2, 48, 48, 1024, 1024),
+            # (2, 48, 48, 2048, 1024),
+            # (1, 8, 8, 4096, 8192),
+            # (1, 8, 8, 8192, 4096),
+            # (2, 4, 4, 16384, 8192),
+            # (2, 8, 8, 1989, 15344),
+            # (4, 16, 16, 4097, 163),
+            # (2, 16, 16, 8122, 2159),
+            # (1, 16, 16, 16281, 7),
+            # (2, 48, 48, 1021, 1020),
+            # (2, 48, 48, 2001, 2048),
+            # (2, 8, 8, 3996, 9639),
+            # (2, 8, 8, 8181, 1021),
         ]
 
-def gen_fn_inputs(fn_name, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device, layout, causal, rotary):
+def gen_fn_inputs(fn_name, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device, layout, causal, rotary_fraction=0.0, rotary_interleaved=False):
     flops_per_matmul = 0
 
-    if fn_name.startswith("prefill"):
-        if layout == "thd":
-            q, k, v, input_metadata = varlen_input_helper(
-                BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device=device)
-            for i in range(input_metadata.num_contexts):
-                seqlen_q = input_metadata.cu_seqlens_q[i + 1] - input_metadata.cu_seqlens_q[i]
-                seqlen_k = input_metadata.cu_seqlens_k[i + 1] - input_metadata.cu_seqlens_k[i]
-                flops_per_matmul += seqlen_q.item() * seqlen_k.item() * HQ * D_HEAD * 2
-        else:
-            q, k, v, input_metadata = input_helper(
-                BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout, device=device
+    q = torch.randn(
+        [BATCH, N_CTX_Q, HK, HQ // HK, D_HEAD],
+        device=device,
+        dtype=dtype,
+        requires_grad=False,
+    )
+    k = torch.randn(
+        [BATCH, N_CTX_K, HK, 1, D_HEAD],
+        device=device,
+        dtype=dtype,
+        requires_grad=False,
+    ).expand(-1, -1, -1, HQ // HK, -1)
+    v = torch.randn(
+        [BATCH, N_CTX_K, HK, 1, D_HEAD],
+        device=device,
+        dtype=dtype,
+        requires_grad=False,
+    ).expand(-1, -1, -1, HQ // HK, -1)
+    input_metadata = MetaData(sm_scale=1.3)
+    input_metadata.layout = "bsghd"
+
+    rotary_dim = math.floor(int(rotary_fraction * D_HEAD) / 16) * 16
+    if rotary_dim > 0:
+        angle = (
+            torch.rand(
+                N_CTX_K,
+                rotary_dim // 2,
+                device=device,
             )
-            flops_per_matmul = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * D_HEAD
-
-        if causal:
-            input_metadata.need_causal()
-
-        o = torch.empty_like(q)
-        input_data = (q, k, v, o, input_metadata)
-    elif fn_name.startswith("decode"):
-        q = torch.randn(
-            [BATCH, N_CTX_Q, HK, HQ // HK, D_HEAD],
-            device=device,
-            dtype=dtype,
-            requires_grad=False,
+            * 2
+            * math.pi
         )
-        k = torch.randn(
-            [BATCH, N_CTX_K, HK, 1, D_HEAD],
-            device=device,
-            dtype=dtype,
-            requires_grad=False,
-        ).expand(-1, -1, -1, HQ // HK, -1)
-        v = torch.randn(
-            [BATCH, N_CTX_K, HK, 1, D_HEAD],
-            device=device,
-            dtype=dtype,
-            requires_grad=False,
-        ).expand(-1, -1, -1, HQ // HK, -1)
-        input_metadata = MetaData(sm_scale=1.3)
-        input_metadata.layout = "bsghd"
+        cos = torch.cos(angle).to(dtype=dtype)
+        sin = torch.sin(angle).to(dtype=dtype)
 
+        # add rotary
+        input_metadata.need_rotary(rotary_dim, sin, cos, rotary_interleaved=rotary_interleaved)
+    
+    # Adjust flops calculation if needed
+    flops_per_matmul = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * D_HEAD
 
-        
-        # Adjust flops calculation if needed
-        flops_per_matmul = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * D_HEAD
+    input_data = (q, k, v, input_metadata)
 
-        input_data = (q, k, v, input_metadata)
-    else:
-        raise ValueError("Unsupported benchmark function")
+    print('meta', input_metadata)
+    
     return input_data, flops_per_matmul
 
 def run_benchmark(args, fn_name, fn, mode):
@@ -130,6 +126,8 @@ def run_benchmark(args, fn_name, fn, mode):
     dtype = ARGS_TO_TORCH_DTYPE[args.dtype]
     head_size = args.d if args.d else 128
     causal = args.causal
+    rotary_fraction = args.rotary_fraction
+    rotary_interleaved = args.rotary_interleaved
     varlen = args.layout == "thd"
     return_tflops = args.return_tflops
     line_names = "TFLOPS" if return_tflops else "Time (ms)"
@@ -152,6 +150,8 @@ def run_benchmark(args, fn_name, fn, mode):
                 "D_HEAD": head_size,
                 "dtype": dtype,
                 "causal": causal,
+                "rotary_fraction": rotary_fraction,
+                "rotary_interleaved": rotary_interleaved,
                 "mode": mode,
             },
         )
@@ -159,7 +159,7 @@ def run_benchmark(args, fn_name, fn, mode):
 
     @triton.testing.perf_report(configs)
     def bench_function(
-        BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, causal, mode, provider, device="cuda"
+        BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, causal, rotary_fraction, rotary_interleaved, mode, provider, device="cuda"
     ):
         warmup = 25
         rep = 100
@@ -167,7 +167,7 @@ def run_benchmark(args, fn_name, fn, mode):
 
         # generate function inputs
         fn_inputs, flops_per_matmul = gen_fn_inputs(
-            fn_name, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device, args.layout, causal
+            fn_name, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device, args.layout, causal, rotary_fraction, rotary_interleaved
         )
 
         # define the function to benchmark
@@ -228,6 +228,8 @@ def parse_args():
     )
     parser.add_argument("-d", type=int, default=0)
     parser.add_argument("-causal", action="store_true", default=False)
+    parser.add_argument("-rotary_fraction", type=float, default=0.0)
+    parser.add_argument("-rotary_interleaved", action="store_true", default=False)
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-return_tflops", action="store_true", default=False)
     parser.add_argument(

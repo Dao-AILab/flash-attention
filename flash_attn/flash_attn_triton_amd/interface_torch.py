@@ -91,6 +91,11 @@ class _attention_decode(torch.autograd.Function):
             metadata.new_kv,
             metadata.k_new,
             metadata.v_new,
+            metadata.rotary_cos,
+            metadata.rotary_sin,
+            metadata.rotary_dim,
+            metadata.rotary_interleaved,
+            metadata.rotary_conjugate
         )
         return output, softmax_lse
 

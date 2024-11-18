@@ -31,7 +31,7 @@ class MetaData():
     rotary_sin = None
     rotary_cos = None
     rotary_interleaved = False
-    rotary_conjunction = False
+    rotary_conjugate = False
     
 
     def __repr__(self) -> str:
@@ -44,6 +44,10 @@ class MetaData():
                 f"  bias={self.bias},\n"
                 f"  alibi_slopes={self.alibi_slopes},\n"
                 f"  causal={self.causal},\n"
+                f"  rotary_dim={self.rotary_dim},\n"
+                f"  rotary_interleaved={self.rotary_interleaved},\n"
+                f"  rotary_sin={self.rotary_sin.shape},\n"
+                f"  rotary_cos={self.rotary_cos.shape},\n"
                 f"  num_contexts={self.num_contexts},\n"
                 f"  varlen={self.varlen},\n"
                 f"  layout={self.layout},\n"
@@ -90,12 +94,12 @@ class MetaData():
     def need_causal(self):
         self.causal = True
 
-    def need_rotary(self, rotary_dim, sin, cos, rotary_interleaved, rotary_conjunction=False):
+    def need_rotary(self, rotary_dim, sin, cos, rotary_interleaved, rotary_conjugate=False):
         self.rotary_dim = rotary_dim
         self.rotary_sin = sin
         self.rotary_cos = cos
         self.rotary_interleaved = rotary_interleaved
-        self.rotary_conjunction = rotary_conjunction
+        self.rotary_conjugate = rotary_conjugate
 
     def need_dropout(self, dropout_p, return_scores):
         self.dropout_p = dropout_p

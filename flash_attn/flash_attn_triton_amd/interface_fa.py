@@ -581,6 +581,6 @@ def fwd_kvcache(
         metadata.rotary_sin,
         metadata.rotary_dim,
         metadata.rotary_interleaved,
-        metadata.rotary_conjunction
+        metadata.rotary_conjugate
     )
     return output, softmax_lse

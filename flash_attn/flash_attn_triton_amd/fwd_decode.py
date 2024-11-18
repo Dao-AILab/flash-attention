@@ -43,7 +43,7 @@ def rotary_kernel_splitk(
     Note: 
     - for K in splitk let BLOCK_M = BLOCK_N, and start_m=start_n
     """
-    # pdb.set_trace()
+    # import pdb; pdb.set_trace()
     range_m = start_m + tl.arange(0, BLOCK_M)
     range_d = tl.arange(0, BLOCK_K)
 
@@ -240,6 +240,8 @@ def _fwd_kernel_splitK(
     off_g_q = off_zhg % G_q
     splitk_idx = tl.program_id(2)
 
+    # import pdb; pdb.set_trace()
+
     # pick batch index
     if USE_CACHE_BATCH_IDX:
         cache_batch_idx = tl.load(Cache_batch_idx + off_z)
@@ -279,7 +281,7 @@ def _fwd_kernel_splitK(
     # Copy new Keys and Values into Cache
     if NEW_KV:
         knew_base = K_new + k_head_idx * stride_kn_h + off_z * stride_kn_z + off_g_q * stride_kn_g
-        
+
         # Determine the starting position for new data in the cache
         if USE_CACHE_SEQLENS:
             start_idx = tl.load(Cache_seqlens + off_z)
@@ -847,7 +849,7 @@ def attention_decode_forward_triton_impl(q, k, v,
         Metadata=metadata,
         K_new = k_new,
         V_new = v_new,
-        Cache_seqlens=cache_seqlens,
+        Cache_seqlens=cache_seqlens if use_cache_seqlens else 0,
         Cache_batch_idx=cache_batch_idx,
         Alibi_slopes=alibi_slopes,
         Rotary_cos=rotary_cos,
