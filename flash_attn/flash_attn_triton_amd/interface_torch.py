@@ -1,8 +1,12 @@
 import torch
+import os
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .bwd_prefill import attention_prefill_backward_triton_impl
 from .fwd_decode import attention_decode_forward_triton_impl
+from einops import rearrange, repeat, parse_shape
+from flash_attn.layers.rotary import apply_rotary_emb
 
+ENABLE_FUSED_ROTARY = os.environ.get('FLASH_ATTENTION_TRITON_AMD_ENABLE_FUSED_ROTARY', '0').lower() in ('1', 'true', 'yes')
 
 class _attention_prefill(torch.autograd.Function):
     @staticmethod
@@ -78,6 +82,48 @@ attention_prefill = _attention_prefill.apply
 class _attention_decode(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, metadata):
+        if not ENABLE_FUSED_ROTARY:
+            q_original_shape = parse_shape(q, 'b s g h d')
+            # Non-fused rotary kernel
+            if metadata.rotary_dim > 0.0:
+                if metadata.causal:     # NOTE: when local support is added. Add `or metadata.local`
+                    q_ro = apply_rotary_emb(
+                        q,
+                        metadata.rotary_cos,
+                        metadata.rotary_sin,
+                        seqlen_offsets=metadata.cache_seqlens if metadata.cache_seqlens else 0,
+                        interleaved=metadata.rotary_interleaved,
+                    )
+                else:
+                    q_ro = rearrange(
+                        apply_rotary_emb(
+                            rearrange(q, "b s g h d -> b 1 (s g h) d"),
+                            metadata.rotary_cos,
+                            metadata.rotary_sin,
+                            seqlen_offsets=metadata.cache_seqlens if metadata.cache_seqlens else 0,
+                            interleaved=metadata.rotary_interleaved,
+                        ),
+                        "b 1 (s g h) d -> b s g h d",
+                        s=q_original_shape['s'],
+                        g=q_original_shape['g'],
+                        h=q_original_shape['h']
+                    )
+
+                # NOTE: since we don't have new kv we don't need to rotate k
+
+                # k_ro = apply_rotary_emb(
+                #     metadata.k_new,
+                #     metadata.rotary_cos,
+                #     metadata.rotary_sin,
+                #     seqlen_offsets=metadata.cache_seqlens,
+                #     interleaved=metadata.rotary_interleaved,
+                # )
+
+                q, metadata.k_new = q_ro.to(q.dtype), None
+
+                # nullify rotary parameters so that the fused rotary implementation is not executed within the triton decode fwd kernel
+                metadata.need_rotary(0, None, None, False)
+
         output, softmax_lse = attention_decode_forward_triton_impl(
             q,
             k,

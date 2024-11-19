@@ -95,7 +95,7 @@ def gen_fn_inputs(fn_name, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, devic
     if rotary_dim > 0:
         angle = (
             torch.rand(
-                max(N_CTX_K, N_CTX_Q),
+                max(N_CTX_K, N_CTX_Q), # NOTE: must be the max otherwise segfaults when the longer one accesses the shorter one
                 rotary_dim // 2,
                 device=device,
             )
