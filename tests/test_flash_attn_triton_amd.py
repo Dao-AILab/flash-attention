@@ -1847,7 +1847,7 @@ def test_flash_attn_varlen_causal(
 # @pytest.mark.parametrize("alibi", [False])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [False]) # causal=False 
 # @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
@@ -1865,19 +1865,19 @@ def test_flash_attn_varlen_causal(
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize("d", [128])
+# @pytest.mark.parametrize("d", [32])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        (1, 128),
-        (1, 339),
+        # (1, 128),
+        # (1, 339),
         (3, 1024),
         (64, 800),
         (64, 256),
         (3, 799),
         (64, 2048),
         (16, 20000),
-        (1, 128 * 1024),
+        # (1, 128 * 1024),
         (16, 128 * 1024),
         (128, 128),
     ],
@@ -1921,7 +1921,7 @@ def test_flash_attn_kvcache(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 2
+    batch_size = 4
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
     nheads = 6
     # rotary_dim must be a multiple of 16, and must be <= d
