@@ -48,23 +48,23 @@ def get_benchmark_configs(args, varlen=False):
     else:
         return [
             (16, 16, 16, 1024, 1024),
-            # (8, 16, 16, 2048, 2048),
-            # (4, 16, 16, 4096, 4096),
-            # (1, 8, 8, 8192, 8192),
-            # (1, 2, 2, 16384, 16384),
-            # (2, 48, 48, 1024, 1024),
-            # (2, 48, 48, 2048, 1024),
-            # (1, 8, 8, 4096, 8192),
-            # (1, 8, 8, 8192, 4096),
-            # (2, 4, 4, 16384, 8192),
-            # (2, 8, 8, 1989, 15344),
-            # (4, 16, 16, 4097, 163),
-            # (2, 16, 16, 8122, 2159),
-            # (1, 16, 16, 16281, 7),
-            # (2, 48, 48, 1021, 1020),
-            # (2, 48, 48, 2001, 2048),
-            # (2, 8, 8, 3996, 9639),
-            # (2, 8, 8, 8181, 1021),
+            (8, 16, 16, 2048, 2048),
+            (4, 16, 16, 4096, 4096),
+            (1, 8, 8, 8192, 8192),
+            (1, 2, 2, 16384, 16384),
+            (2, 48, 48, 1024, 1024),
+            (2, 48, 48, 2048, 1024),
+            (1, 8, 8, 4096, 8192),
+            (1, 8, 8, 8192, 4096),
+            (2, 4, 4, 16384, 8192),
+            (2, 8, 8, 1989, 15344),
+            (4, 16, 16, 4097, 163),
+            (2, 16, 16, 8122, 2159),
+            (1, 16, 16, 16281, 7),
+            (2, 48, 48, 1021, 1020),
+            (2, 48, 48, 2001, 2048),
+            (2, 8, 8, 3996, 9639),
+            (2, 8, 8, 8181, 1021),
         ]
 
 def gen_fn_inputs(fn_name, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device, layout, causal, rotary_fraction=0.0, rotary_interleaved=False):
@@ -95,7 +95,7 @@ def gen_fn_inputs(fn_name, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, devic
     if rotary_dim > 0:
         angle = (
             torch.rand(
-                N_CTX_K,
+                max(N_CTX_K, N_CTX_Q),
                 rotary_dim // 2,
                 device=device,
             )
@@ -112,8 +112,6 @@ def gen_fn_inputs(fn_name, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, devic
     flops_per_matmul = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * D_HEAD
 
     input_data = (q, k, v, input_metadata)
-
-    print('meta', input_metadata)
     
     return input_data, flops_per_matmul
 
