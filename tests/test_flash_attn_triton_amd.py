@@ -2018,6 +2018,13 @@ def test_flash_attn_kvcache(
                 "b 1 (s h) d -> b s h d",
                 s=seqlen_q,
             )
+            q_ro = apply_rotary_emb(
+                q,
+                cos,
+                sin,
+                seqlen_offsets=cache_seqlens,
+                interleaved=rotary_interleaved,
+            )
         # q_ro = q
         k_ro = apply_rotary_emb(
             k, cos, sin, seqlen_offsets=cache_seqlens, interleaved=rotary_interleaved

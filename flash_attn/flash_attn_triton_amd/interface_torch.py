@@ -82,10 +82,10 @@ attention_prefill = _attention_prefill.apply
 class _attention_decode(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, metadata):
-        if not ENABLE_FUSED_ROTARY:
-            q_original_shape = parse_shape(q, 'b s g h d')
+        if not ENABLE_FUSED_ROTARY or True:
             # Non-fused rotary kernel
-            if metadata.rotary_dim > 0.0:
+            if metadata.rotary_dim > 0.0:    
+                q_original_shape = parse_shape(q, 'b s g h d')
                 if metadata.causal:     # NOTE: when local support is added. Add `or metadata.local`
                     q_ro = apply_rotary_emb(
                         q,

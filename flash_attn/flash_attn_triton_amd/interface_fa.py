@@ -549,6 +549,7 @@ def fwd_kvcache(
                     "b 1 (s h) d -> b s h d",
                     s=metadata.max_seqlens_q,
                 )
+
             k_ro = apply_rotary_emb(
                 metadata.k_new,
                 metadata.rotary_cos,
