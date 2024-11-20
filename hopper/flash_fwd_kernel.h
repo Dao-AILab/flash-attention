@@ -301,26 +301,17 @@ public:
                  work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
 
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
-                auto [m_block, _, bidb, split_idx] = block_coord;
-
-                // With Varlen it's possible to have n_block_max == 0. Loading K can cause illegal memory access.
-                if constexpr (Is_causal || Is_local || Varlen || Split) {
-                    auto [n_block_min, n_block_max] = collective_mainloop.get_n_block_min_max(params.mainloop, m_block, bidb, split_idx, params.mainloop.num_splits);
-                    if (n_block_max <= n_block_min) {
-                        scheduler.prefetch_next_work(params.scheduler, work_tile_info);
-                        continue;
-                    }
-                }
                 if constexpr (AppendKV) {
-                    collective_mainloop.load_kv_new(params.mainloop, pipeline_k_new, pipeline_v_new,
-                                                    smem_pipe_write, shared_storage, block_coord, work_idx);
-                    // if (threadIdx.x == 0) { printf("Producer: Before sync\n"); }
-                    cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
-                    // TODO: do we need all these fences?
-                    // asm volatile ("fence.proxy.async.global;");
-                    // if (threadIdx.x == 0) { printf("Producer: After sync\n"); }
-                    // If we don't reset the state, the loads for the main attention might have the wrong phase.
-                    smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
+                    bool tile_new_valid = collective_mainloop.load_kv_new(
+                        params.mainloop, pipeline_k_new, pipeline_v_new,
+                        smem_pipe_write, shared_storage, block_coord, work_idx);
+                    if (tile_new_valid) {
+                        // if (threadIdx.x == 0) { printf("Producer: Before sync\n"); }
+                        cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
+                        // if (threadIdx.x == 0) { printf("Producer: After sync\n"); }
+                        // If we don't reset the state, the loads for the main attention might have the wrong phase.
+                        smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
+                    }
                 }
                 auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
@@ -328,7 +319,6 @@ public:
                 // pipeline_vt won't be used if we don't need to transpose V.
                 collective_mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
                                          shared_storage, scheduler_prefetch, block_coord, work_idx);
-                ++work_idx;
             }
             collective_mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write);
         } else {  // Consumer
@@ -362,36 +352,33 @@ public:
                 flash::Softmax<2 * (2 * kBlockM / NumMmaThreads), /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
 
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
-                auto [m_block, _, bidb, split_idx] = block_coord;
-                if constexpr (Is_causal || Is_local || Varlen || Split) {
-                    auto [n_block_min, n_block_max] = collective_mainloop.get_n_block_min_max(params.mainloop, m_block, bidb, split_idx, params.mainloop.num_splits);
-                    // if (threadIdx.x == 128) { printf("bid.x = %d, bid.y = %d, bid.z = %d, split_idx = %d, n_block_min: %d, n_block_max: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, split_idx, n_block_min, n_block_max); }
-                    if (n_block_max <= n_block_min) {  // We exit early and write 0 to gO and -inf to gLSE.
-                        collective_epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
-                        continue;
+                if constexpr (AppendKV) {
+                    bool tile_new_valid = collective_mainloop.store_kv_new(
+                        params.mainloop, pipeline_k_new, pipeline_v_new, smem_pipe_read,
+                        threadIdx.x - MmaThreadOffset, shared_storage, block_coord);
+                    if (tile_new_valid) {
+                        // if (threadIdx.x == 128) { printf("Consumer: Before sync\n"); }
+                        // We need this sync so that the gmem write from the consumers is visible to the producer
+                        // that might do TMA read after that.
+                        asm volatile ("fence.proxy.async.global;");
+                        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
+                        // if (threadIdx.x == 128) { printf("Consumer: After sync\n"); }
+                        smem_pipe_read = PipelineState{};
                     }
                 }
-
-                if constexpr (AppendKV) {
-                    collective_mainloop.store_kv_new(params.mainloop, pipeline_k_new, pipeline_v_new, smem_pipe_read,
-                                                     threadIdx.x - MmaThreadOffset, shared_storage, block_coord);
-                    // if (threadIdx.x == 128) { printf("Consumer: Before sync\n"); }
-                    // We need this sync so that the gmem write from the consumers is visible to the producer
-                    // that might do TMA read after that.
-                    asm volatile ("fence.proxy.async.global;");
-                    cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
-                    // if (threadIdx.x == 128) { printf("Consumer: After sync\n"); }
-                    smem_pipe_read = PipelineState{};
+                bool tile_valid = collective_mainloop.mma(
+                    params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
+                    tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, block_coord, shared_storage);
+                if (tile_valid) {
+                    // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
+                    collective_epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
+                                            threadIdx.x - MmaThreadOffset, block_coord);
+                } else {
+                    // Write 0 to gO and -inf to gLSE.
+                    collective_epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
                 }
 
-                collective_mainloop.mma(params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
-                                        tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, block_coord, shared_storage);
-
-                // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
-                collective_epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
-                                          threadIdx.x - MmaThreadOffset, block_coord);
-
-                ++work_idx;
+                // ++work_idx;
             }
             collective_epilogue.store_tail();
         }

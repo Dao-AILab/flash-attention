@@ -482,8 +482,18 @@ struct CollectiveMainloopFwd {
          SharedStorage &shared_storage,
          SchedulerPrefetch const& scheduler_prefetch,
          cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
-         int work_idx
+         int &work_idx
          ) {
+
+        auto [m_block, bidh, bidb, split_idx] = block_coord;
+        auto [n_block_min, n_block_max] = get_n_block_min_max(params, m_block, bidb, split_idx, params.num_splits);
+        // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
+        if constexpr (Is_causal || Is_local || Varlen || Split) {
+            if (n_block_max <= n_block_min) {
+                scheduler_prefetch();
+                return;
+            }
+        }
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
@@ -508,7 +518,6 @@ struct CollectiveMainloopFwd {
             }
         }();
 
-        auto [m_block, bidh, bidb, split_idx] = block_coord;
         int const thread_idx = threadIdx.x % NumProducerThreads;
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
         int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
@@ -643,7 +652,6 @@ struct CollectiveMainloopFwd {
         static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
         bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync());
 
-        auto [n_block_min, n_block_max] = get_n_block_min_max(params, m_block, bidb, split_idx, params.num_splits);
         int n_block = n_block_max - 1;
 
         if (should_load_KV) {
@@ -724,6 +732,7 @@ struct CollectiveMainloopFwd {
         if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }
         ++smem_pipe_write;
         // At the end, all threads have the correct smem_pipe_write.
+        ++work_idx;
     }
 
     CUTLASS_DEVICE void
@@ -779,7 +788,7 @@ struct CollectiveMainloopFwd {
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
-    CUTLASS_DEVICE void
+    CUTLASS_DEVICE bool
     mma(Params const& params,
         MainloopPipelineK pipeline_k,
         MainloopPipelineV pipeline_v,
@@ -787,14 +796,23 @@ struct CollectiveMainloopFwd {
         FrgTensorO& tOrO,
         Softmax& softmax,
         int thread_idx,
-        int work_idx,
+        int &work_idx,
         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
-
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
+
+        // can't use auto [m_block, ...] = block_coord since structured binding cannot be captured in lambda
+        int m_block = get<0>(block_coord);
+        int bidb = get<2>(block_coord);
+        int split_idx = get<3>(block_coord);
+        auto [n_block_min, n_block_max] = get_n_block_min_max(params, m_block, bidb, split_idx, params.num_splits);
+        // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
+        if constexpr (Is_causal || Is_local || Varlen || Split) {
+            if (n_block_max <= n_block_min) { return false; }
+        }
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
@@ -828,13 +846,8 @@ struct CollectiveMainloopFwd {
         // clear(tOrO);
         tiled_mma1.accumulate_ = GMMA::ScaleOut::Zero;
 
-        // can't use auto [m_block, ...] = block_coord since structured binding cannot be captured in lambda
-        int m_block = get<0>(block_coord);
-        int bidb = get<2>(block_coord);
-        int split_idx = get<3>(block_coord);
         int const seqlen_q = get_seqlen_q(params, bidb);
         int const seqlen_k = get_seqlen_k(params, bidb);
-        auto [n_block_min, n_block_max] = get_n_block_min_max(params, m_block, bidb, split_idx, params.num_splits);
         int n_block = n_block_max - 1;
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma0> mask(
@@ -1043,6 +1056,8 @@ struct CollectiveMainloopFwd {
             Tensor scores_scale = softmax.finalize();
             softmax.rescale_o(tOrO, scores_scale);
         }
+        ++work_idx;
+        return true;
     }
 
     CUTLASS_DEVICE
@@ -1060,15 +1075,19 @@ struct CollectiveMainloopFwd {
     }
 
     template <typename SharedStorage>
-    CUTLASS_DEVICE void
+    CUTLASS_DEVICE bool
     load_kv_new(Params const& params,
          MainloopPipelineKVNew pipeline_k_new,
          MainloopPipelineKVNew pipeline_v_new,
          PipelineState& smem_pipe_write,
          SharedStorage &shared_storage,
          cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
-         int work_idx
+         int const work_idx
          ) {
+
+        auto [m_block, bidh, bidb, split_idx] = block_coord;
+        auto [n_block_new_min, n_block_new_max] = get_n_block_k_new_min_max(params, m_block, bidb, split_idx, params.num_splits);
+        if (n_block_new_max <= n_block_new_min) { return false; }
 
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
         Tensor sVt = [&] {
@@ -1079,9 +1098,6 @@ struct CollectiveMainloopFwd {
             }
         }();
 
-        auto [m_block, bidh, bidb, split_idx] = block_coord;
-        auto [n_block_new_min, n_block_new_max] = get_n_block_k_new_min_max(params, m_block, bidb, split_idx, params.num_splits);
-        if (n_block_new_max <= n_block_new_min) { return; }
 
         int const thread_idx = threadIdx.x % NumProducerThreads;
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
@@ -1153,10 +1169,11 @@ struct CollectiveMainloopFwd {
         }
         // if (thread_idx == 0) { printf("Producer: after for loop\n"); }
         // At the end, all threads have the correct smem_pipe_write.
+        return true;
     }
 
     template <typename SharedStorage>
-    CUTLASS_DEVICE void
+    CUTLASS_DEVICE bool
     store_kv_new(Params const& params,
                  MainloopPipelineKVNew pipeline_k_new,
                  MainloopPipelineKVNew pipeline_v_new,
@@ -1165,6 +1182,9 @@ struct CollectiveMainloopFwd {
                  SharedStorage &shared_storage,
                  cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord
     ) {
+        auto [m_block, bidh, bidb, split_idx] = block_coord;
+        auto [n_block_new_min, n_block_new_max] = get_n_block_k_new_min_max(params, m_block, bidb, split_idx, params.num_splits);
+        if (n_block_new_max <= n_block_new_min) { return false; }
 
         // as_position_independent_swizzle_tensor makes address calculation easier
         Tensor sK = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{}));
@@ -1176,10 +1196,6 @@ struct CollectiveMainloopFwd {
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVCpAsync{}));
             }
         }();
-
-        auto [m_block, bidh, bidb, split_idx] = block_coord;
-        auto [n_block_new_min, n_block_new_max] = get_n_block_k_new_min_max(params, m_block, bidb, split_idx, params.num_splits);
-        if (n_block_new_max <= n_block_new_min) { return; }
 
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
         int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
@@ -1313,6 +1329,8 @@ struct CollectiveMainloopFwd {
                 cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
             }
         }
+
+        return true;
 
     }
 
