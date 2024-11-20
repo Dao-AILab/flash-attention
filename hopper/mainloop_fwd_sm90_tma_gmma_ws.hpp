@@ -372,6 +372,7 @@ struct CollectiveMainloopFwd {
         if (get<1>(args.shape_rotary) > 0) {
             assert(args.ptr_rotary_cos != nullptr && args.ptr_rotary_sin != nullptr);
         }
+        assert(args.num_splits >= 1);
         // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         // Right after this, we multiply by log2(e) before applying exp2.
         // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val

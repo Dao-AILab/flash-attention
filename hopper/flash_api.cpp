@@ -326,6 +326,49 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
     }
 }
 
+// Find the number of splits that maximizes the occupancy. For example, if we have
+// batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
+// better than having 3 splits (efficiency = 0.67). However, we also don't want too many
+// splits as that would incur more HBM reads/writes.
+// So we find the best efficiency, then find the smallest number of splits that gets 85%
+// of the best efficiency.
+inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
+    // If we have enough to almost fill the SMs, then just use 1 split
+    if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
+    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
+    float max_efficiency = 0.f;
+    std::vector<float> efficiency;
+    efficiency.reserve(max_splits);
+    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
+    // Some splits are not eligible. For example, if we have 64 blocks and choose 11 splits,
+    // we'll have 6 * 10 + 4 blocks. If we choose 12 splits, we'll have 6 * 11 + (-2) blocks
+    // (i.e. it's 11 splits anyway).
+    // So we check if the number of blocks per split is the same as the previous num_splits.
+    auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
+        return num_splits == 1 || ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1);
+    };
+    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+        if (!is_split_eligible(num_splits)) {
+            efficiency.push_back(0.f);
+        } else {
+            float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
+            float eff = n_waves / ceil(n_waves);
+            // printf("num_splits = %d, eff = %f\n", num_splits, eff);
+            if (eff > max_efficiency) { max_efficiency = eff; }
+            efficiency.push_back(eff);
+        }
+    }
+    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+        if (!is_split_eligible(num_splits)) { continue; }
+        if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
+            // printf("num_splits chosen = %d\n", num_splits);
+            return num_splits;
+        }
+    }
+    return 1;
+}
+
+
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         // batch_size x seqlen_k x num_heads_k x head_size or num_pages x page_size x num_heads_k x head_size if there's a page_table.
@@ -1366,8 +1409,23 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
     params.sink_token_length = sink_token_length;
     params.b_k = batch_size_k;
 
+    if (num_splits <= 0) {
+        auto dprops = at::cuda::getCurrentDeviceProperties();
+        // This needs to match the kernel configs
+        // TODO: check that they match. TODO: change for FP8
+        // TODO: is_causal or is_local
+        // TODO: right now we assume PackGQA
+        int seqlen_q_packgqa = seqlen_q * (num_heads / num_heads_k);
+        const int kBlockM = head_size_rounded <= 64 ? 192 : 128;
+        const int kBlockN = head_size_rounded <= 64 ? 128
+            : (head_size_rounded <= 96 ? (is_causal ? 128 : 160)
+               : (head_size_rounded <= 128 ? (is_causal ? 128 : 176)
+                  : (head_size_rounded <= 192 ? 96 : 80)));
+        const int num_n_blocks = (seqlen_k + kBlockN - 1) / kBlockN;
+        const int num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
+        num_splits = num_splits_heuristic(batch_size * num_heads_k * num_m_blocks, dprops->multiProcessorCount, num_n_blocks, 128);
+    }
     params.num_splits = num_splits;
-    TORCH_CHECK(num_splits >= 1, "num_splits must be at least 1, there's no heuristic to automatically pick num_splits yet");
     at::Tensor out_accum, softmax_lse_accum;
     auto outaccum_type = at::ScalarType::Float;
     if (num_splits > 1) {
