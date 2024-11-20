@@ -1850,10 +1850,10 @@ def test_flash_attn_varlen_causal(
 # @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
-# @pytest.mark.parametrize("rotary_interleaved", [False, True])
-@pytest.mark.parametrize("rotary_interleaved", [False])
-# @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("rotary_fraction", [0.0])
+@pytest.mark.parametrize("rotary_interleaved", [False, True])
+# @pytest.mark.parametrize("rotary_interleaved", [False])
+@pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
+# @pytest.mark.parametrize("rotary_fraction", [0.0])
 # @pytest.mark.parametrize("paged_kv_block_size", [None, 256])
 # @pytest.mark.parametrize("paged_kv_block_size", [256, 512])
 @pytest.mark.parametrize("paged_kv_block_size", [None])
@@ -1907,9 +1907,6 @@ def test_flash_attn_kvcache(
 
         if local == True:
             pytest.skip("local sliding window attention not supported on AMD's Triton Backend yet")
-        
-        if rotary_interleaved == True or rotary_fraction > 0.0:
-            pytest.skip("rotary embedding not supported on AMD's Triton Backend yet")
 
         if has_leftpad == True:
             pytest.skip("cache_leftpad not supported on AMD's Triton Backend yet")
