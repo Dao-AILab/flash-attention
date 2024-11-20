@@ -162,11 +162,6 @@ struct CollectiveMainloopFwd {
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per store
 
-    using GmemTiledCopyRotary = decltype(
-        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<64>, Element>{},
-                        GmemLayoutAtom{},
-                        Layout<Shape<_1, Int<kGmemElemsPerLoad / 2>>>{}));  // Val layout, 4 or 8 vals per store
-
     using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
     using StrideQK = cute::Stride<int64_t, _1, int64_t, int64_t>;
     using StrideV = std::conditional_t<!V_colmajor, StrideQK, cute::Stride<_1, int64_t, int64_t, int64_t>>;
@@ -262,6 +257,7 @@ struct CollectiveMainloopFwd {
         StrideRotary const stride_rotary_cos;
         Element const* const ptr_rotary_sin;
         StrideRotary const stride_rotary_sin;
+        bool const is_rotary_interleaved;
         int const* const ptr_pagetable;
         ShapePageTable const shape_pagetable;
         StridePageTable const stride_pagetable;
@@ -301,6 +297,7 @@ struct CollectiveMainloopFwd {
         StrideRotary const stride_rotary_cos;
         Element const* const ptr_rotary_sin;
         StrideRotary const stride_rotary_sin;
+        bool const is_rotary_interleaved;
         int const* const ptr_pagetable;
         ShapePageTable const shape_pagetable;
         StridePageTable const stride_pagetable;
@@ -384,7 +381,7 @@ struct CollectiveMainloopFwd {
                 args.ptr_K, args.shape_K, args.stride_K, args.ptr_V, args.stride_V,
                 args.ptr_K_new, args.shape_K_new, args.stride_K_new, args.ptr_V_new, args.stride_V_new,
                 args.ptr_rotary_cos, args.shape_rotary, args.stride_rotary_cos,
-                args.ptr_rotary_sin, args.stride_rotary_sin,
+                args.ptr_rotary_sin, args.stride_rotary_sin, args.is_rotary_interleaved,
                 args.ptr_pagetable, args.shape_pagetable, args.stride_pagetable,
                 cutlass::FastDivmod(int(get<0>(args.shape_K))),
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
@@ -873,7 +870,7 @@ struct CollectiveMainloopFwd {
             barrier_Q.arrive();
         }
 
-        auto [rotary, tRrCos, tRrSin] = [&] {
+        auto [rotary, tRrCos, tRrSin, tRrCosCont, tRrSinCont] = [&] {
             if constexpr (AppendKV) {
                 int const leftpad_k = Varlen && params.leftpad_k ? params.leftpad_k[bidb] : 0;
                 int const seqlen_k_og = get_seqlen_k<true /*Seqlen_before_append_KV*/>(params, bidb);
@@ -881,11 +878,11 @@ struct CollectiveMainloopFwd {
                 using Rotary_t = Rotary<kBlockM, kHeadDim, NumMmaThreads, Element, !(Is_causal || Is_local) /*FixedPosition*/>;
                 Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
                                 params.ptr_rotary_sin, params.stride_rotary_sin,
-                                thread_idx, seqlen_q, offset_rotary);
-                auto [tRrCos, tRrSin] = cute::conditional_return<!PackGQA>(rotary.load_cos_sin(m_block), rotary.load_cos_sin_packgqa(m_block, params.qhead_per_khead_divmod));
-                return cute::make_tuple(rotary, tRrCos, tRrSin);
+                                params.is_rotary_interleaved, thread_idx, seqlen_q, offset_rotary);
+                auto [tRrCos, tRrSin, tRrCosCont, tRrSinCont] = cute::conditional_return<!PackGQA>(rotary.load_cos_sin(m_block), rotary.load_cos_sin_packgqa(m_block, params.qhead_per_khead_divmod));
+                return cute::make_tuple(rotary, tRrCos, tRrSin, tRrCosCont, tRrSinCont);
             } else {
-                return cute::make_tuple(nullptr, nullptr, nullptr);
+                return cute::make_tuple(nullptr, nullptr, nullptr, nullptr, nullptr);
             }
         }();
 
@@ -895,8 +892,13 @@ struct CollectiveMainloopFwd {
         if constexpr (AppendKV) {
             if (get<1>(params.shape_rotary) > 0) {  // Apply rotary to Q
                 Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
-                rotary.apply_Q(sQ_pi, tRrCos, tRrSin, m_block,
-                               !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor /*qhead_per_khead*/);
+                if (params.is_rotary_interleaved) {
+                    rotary.apply_Q_interleaved(sQ_pi, tRrCos, tRrSin, m_block,
+                        !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor /*qhead_per_khead*/);
+                } else {
+                    rotary.apply_Q_contiguous(sQ_pi, tRrCosCont, tRrSinCont, m_block,
+                        !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor /*qhead_per_khead*/);
+                }
                 // SMEM fence to make sure the rotated Q is visible to GMMA
                 cutlass::arch::fence_view_async_shared();
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<int>(FwdNamedBarriers::QueryRotated) /*id*/);
@@ -1200,7 +1202,7 @@ struct CollectiveMainloopFwd {
         using Rotary_t = Rotary<kBlockN, kHeadDim, NumMmaThreads, Element>;
         Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
                         params.ptr_rotary_sin, params.stride_rotary_sin,
-                        thread_idx, seqlen_k_new, offset_rotary);
+                        params.is_rotary_interleaved, thread_idx, seqlen_k_new, offset_rotary);
 
         PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element, true /*KV_Same_Iter*/> paged_kv_manager(
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
@@ -1231,13 +1233,21 @@ struct CollectiveMainloopFwd {
         for (int k = 0; k < size(tKpK); ++k) { tKpK(k) = get<1>(tKcK(_0{}, _0{}, k)) < get<1>(params.shape_K); }
 
         auto store_K = [&] (int const n_block, auto const& smem_pipe_read) {
-            auto [tRrCos, tRrSin] = rotary.load_cos_sin(n_block);
+            auto [tRrCos, tRrSin, tRrCosCont, tRrSinCont] = rotary.load_cos_sin(n_block);
             pipeline_k_new.consumer_wait(smem_pipe_read);
-            Tensor tKrK = make_fragment_like(tKsK(_, _, _, _0{}));
             int const n_limit = std::min(seqlen_k_new - n_block * kBlockN, kBlockN);
+            Tensor tKrK = make_fragment_like(tKsK(_, _, _, _0{}));
+            if (rotary_dim <= 0) {
             flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
                 gmem_tiled_copy_kv, tKsK(_, _, _, smem_pipe_read.index()), tKrK, tKcK, tKpK, n_limit
             );
+            } else {
+                if (params.is_rotary_interleaved) {
+                    rotary.apply_K_interleaved(sK(_, _, smem_pipe_read.index()), tKrK, tKpK, tRrCos, tRrSin, n_block);
+                } else {
+                    rotary.apply_K_contiguous(sK(_, _, smem_pipe_read.index()), tKrK, tKpK, tRrCosCont, tRrSinCont, n_block);
+                }
+            }
             // Without this sync I'm getting race condition when seqlen_k is large
             cutlass::arch::fence_view_async_shared();
             // Very important: PipelineTmaAsync::consumer_release assumes that the warpgroup is synchronized
@@ -1247,7 +1257,11 @@ struct CollectiveMainloopFwd {
             // if (thread_idx == 0) { print_tensor(sK(_, _, smem_pipe_read.index())); }
             // if (thread_idx == 0) { print(tKsK); printf("\n"); print(tKrK); printf("\n"); print(tKgK); printf("\n");}
             // if (thread_idx == 0) { print_tensor(tKpK); printf("\n"); printf("seqlen_limit = %d\n", seqlen_k_new - n_block * kBlockN);}
-            if (rotary_dim > 0) { flash::apply_rotary_interleaved(tKrK, tRrCos, tRrSin, tKcK, n_limit, rotary_dim); }
+            // if (rotary_dim > 0) {
+            //     if (params.is_rotary_interleaved) {
+            //         flash::apply_rotary_interleaved(tKrK, tRrCos, tRrSin, tKcK, n_limit, rotary_dim);
+            //     }
+            // }
 
             if constexpr (!PagedKV) {
                 Tensor tKgK_cur = tKgK(_, _, _, n_block);

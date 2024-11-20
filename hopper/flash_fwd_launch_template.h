@@ -75,6 +75,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         {params.rotary_dim / 2, _1{}},  // stride_rotary_cos
         static_cast<Element const*>(params.rotary_sin_ptr),
         {params.rotary_dim / 2, _1{}},  // stride_rotary_sin
+        params.is_rotary_interleaved,
         params.page_table,
         // if page_size is not set, avoid dividing by zero
         {params.kv_batch_idx ? params.b_k : params.b, !PagedKV ? 0 : params.seqlen_k / params.page_size}, // shape_page_table
@@ -149,10 +150,10 @@ template<typename T, int kBlockM, int kBlockN, int kHeadDim, int kStages,
          bool Is_causal, bool Is_local, bool V_colmajor, bool Enable_cluster>
 void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
     auto should_pack_gqa = [](int seqlen_q, int h, int h_k, int blockM) {
+        // Heuristic: PackGQA is a bit slower but can help if seqlen_q is small or not near a multiple of kBlockM
         int qhead_per_khead = h / h_k;
         float nopack_gqa_efficiency = float(seqlen_q) / float(cute::round_up(seqlen_q, blockM));
         float pack_gqa_efficiency = float(seqlen_q * qhead_per_khead) / float(cute::round_up(seqlen_q * qhead_per_khead, blockM));
-        // Heuristic: PackGQA is a bit slower but can help if seqlen_q is small or not near a multiple of kBlockM
         // std::cout << "nopack_gqa_efficiency = " << nopack_gqa_efficiency << ", pack_gqa_efficiency = " << pack_gqa_efficiency << std::endl;
         return nopack_gqa_efficiency < 0.95 * pack_gqa_efficiency;
     };
@@ -173,7 +174,7 @@ void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
                     //         BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, UseCluster, [&] {
                                 // run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, !Is_causal && !Is_local && !Varlen && !Split && Enable_cluster && UseCluster ? 2 : 1, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PackGQA /*PackGQA*/, Split /*Split*/, false /*V_colmajor*/>(params, stream);
                                 // run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, !Is_causal && !Is_local && !Varlen && !Split && Enable_cluster && UseCluster ? 2 : 1, T, T_out, Is_causal, false, false, false /*Varlen*/, true /*PagedKV*/, false /*PackGQA*/, false /*Split*/, false /*V_colmajor*/>(params, stream);
-                        run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, 1, T, T_out, Is_causal, false, false, Varlen /*Varlen*/, PagedKV /*PagedKV*/, AppendKV && Varlen /*AppendKV*/, PackGQA /*PackGQA*/, Split /*Split*/, false /*V_colmajor*/>(params, stream);
+                        run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, 1, T, T_out, Is_causal, false, false, true /*Varlen*/, PagedKV /*PagedKV*/, AppendKV && true /*AppendKV*/, PackGQA /*PackGQA*/, Split /*Split*/, false /*V_colmajor*/>(params, stream);
                     //         });
                     //     });
                     });
