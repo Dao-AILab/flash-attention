@@ -9,6 +9,7 @@ import ast
 from pathlib import Path
 from packaging.version import parse, Version
 import platform
+import itertools
 
 from setuptools import setup, find_packages
 import subprocess
@@ -108,35 +109,18 @@ if not SKIP_CUDA_BUILD:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
     repo_dir = Path(this_dir).parent
     cutlass_dir = repo_dir / "csrc" / "cutlass"
+    DTYPE_FWD = ["fp16", "bf16", "e4m3"]
+    DTYPE_BWD = ["fp16", "bf16"]
+    HEAD_DIMENSIONS = [64, 96, 128, 192, 256]
+    SPLIT = ["", "_split"]
+    sources_fwd = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{split}_sm90.cu"
+                   for hdim, dtype, split in itertools.product(HEAD_DIMENSIONS, DTYPE_FWD, SPLIT)]
+    sources_bwd = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}_sm90.cu"
+                   for hdim, dtype in itertools.product(HEAD_DIMENSIONS, DTYPE_BWD)]
     sources = [
         "flash_api.cpp",
-        "flash_fwd_hdim64_fp16_sm90.cu",
-        "flash_fwd_hdim64_bf16_sm90.cu",
-        "flash_fwd_hdim96_fp16_sm90.cu",
-        "flash_fwd_hdim96_bf16_sm90.cu",
-        "flash_fwd_hdim128_fp16_sm90.cu",
-        "flash_fwd_hdim128_bf16_sm90.cu",
-        "flash_fwd_hdim192_fp16_sm90.cu",
-        "flash_fwd_hdim192_bf16_sm90.cu",
-        "flash_fwd_hdim256_fp16_sm90.cu",
-        "flash_fwd_hdim256_bf16_sm90.cu",
-        "flash_bwd_hdim64_fp16_sm90.cu",
-        "flash_bwd_hdim96_fp16_sm90.cu",
-        "flash_bwd_hdim128_fp16_sm90.cu",
-        "flash_bwd_hdim192_fp16_sm90.cu",
-        "flash_bwd_hdim256_fp16_sm90.cu",
-        "flash_bwd_hdim64_bf16_sm90.cu",
-        "flash_bwd_hdim96_bf16_sm90.cu",
-        "flash_bwd_hdim128_bf16_sm90.cu",
-        "flash_bwd_hdim192_bf16_sm90.cu",
-        "flash_bwd_hdim256_bf16_sm90.cu",
-        "flash_fwd_hdim64_e4m3_sm90.cu",
-        "flash_fwd_hdim96_e4m3_sm90.cu",
-        "flash_fwd_hdim128_e4m3_sm90.cu",
-        "flash_fwd_hdim192_e4m3_sm90.cu",
-        "flash_fwd_hdim256_e4m3_sm90.cu",
         "flash_fwd_combine_sm80.cu",
-    ]
+    ] + sources_fwd + sources_bwd
     nvcc_flags = [
         "-O3",
         # "-O0",
@@ -166,12 +150,8 @@ if not SKIP_CUDA_BUILD:
             ]
         )
     include_dirs = [
-        # Path(this_dir) / "fmha-pipeline",
-        # repo_dir / "lib",
-        # repo_dir / "include",
+        Path(this_dir),
         cutlass_dir / "include",
-        # cutlass_dir / "examples" / "common",
-        # cutlass_dir / "tools" / "util" / "include",
     ]
 
     ext_modules.append(
@@ -190,21 +170,6 @@ if not SKIP_CUDA_BUILD:
             libraries=["cuda"]
         )
     )
-    # ext_modules.append(
-    #     CUDAExtension(
-    #         name="flashattn_hopper_cuda_ws",
-    #         sources=sources,
-    #         extra_compile_args={
-    #             "cxx": ["-O3", "-std=c++17"],
-    #             "nvcc": append_nvcc_threads(
-    #                 nvcc_flags + ["-DEXECMODE=1"] + cc_flag
-    #             ),
-    #         },
-    #         include_dirs=include_dirs,
-    #         # Without this we get and error about cuTensorMapEncodeTiled not defined
-    #         libraries=["cuda"]
-    #     )
-    # )
 
 
 def get_package_version():
