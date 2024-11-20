@@ -6,5 +6,5 @@
 
 template<>
 void run_mha_fwd_<cutlass::half_t, 64, true>(Flash_fwd_params &params, cudaStream_t stream) {
-    run_mha_fwd_hdim64<cutlass::half_t, true>(params, stream);
+    run_mha_fwd_hdim_16b<cutlass::half_t, 64, true>(params, stream);
 }

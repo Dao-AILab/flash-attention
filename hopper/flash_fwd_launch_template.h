@@ -13,6 +13,7 @@
 
 #include "static_switch.h"
 #include "flash.h"
+#include "tile_size.h"
 #include "tile_scheduler.hpp"
 #include "flash_fwd_kernel.h"
 #include "mainloop_fwd_sm90_tma_gmma_ws.hpp"
@@ -149,24 +150,22 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T, int kBlockM, int kBlockN, int kHeadDim, int kStages,
         bool Is_causal, bool Is_local, bool Split, bool V_colmajor, bool Enable_cluster>
 void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
-    auto should_pack_gqa = [](int seqlen_q, int h, int h_k, int blockM) {
+    auto should_pack_gqa = [](int seqlen_q, int qhead_per_khead, int blockM) {
         // Heuristic: PackGQA is a bit slower but can help if seqlen_q is small or not near a multiple of kBlockM
-        int qhead_per_khead = h / h_k;
         float nopack_gqa_efficiency = float(seqlen_q) / float(cute::round_up(seqlen_q, blockM));
         float pack_gqa_efficiency = float(seqlen_q * qhead_per_khead) / float(cute::round_up(seqlen_q * qhead_per_khead, blockM));
-        // std::cout << "nopack_gqa_efficiency = " << nopack_gqa_efficiency << ", pack_gqa_efficiency = " << pack_gqa_efficiency << std::endl;
         return nopack_gqa_efficiency < 0.95 * pack_gqa_efficiency;
     };
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
+    using T_out = std::conditional_t<!Split, std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>, float>;
     BOOL_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
+        bool pack_gqa = params.pack_gqa >= 0  // if negative, we use a heuristic to decide
+            ? bool(params.pack_gqa)
+            // If varlen, we don't actually know seqlen_q but only max_seqlen_q.
+            // If causal, PackGQA always seems faster
+            : params.h != params.h_k && (Varlen || Is_causal || should_pack_gqa(params.seqlen_q, params.h / params.h_k, kBlockM));
         BOOL_SWITCH(params.page_table, PagedKV, [&] {
             BOOL_SWITCH(params.knew_ptr, AppendKV, [&] {
-                using T_out = std::conditional_t<!Split, std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>, float>;
-                bool pack_gqa = params.pack_gqa >= 0  // if negative, we use a heuristic to decide
-                    ? bool(params.pack_gqa)
-                    // If varlen, we don't actually know seqlen_q but only max_seqlen_q.
-                    // If causal, PackGQA always seems faster
-                    : params.h != params.h_k && (Varlen || Is_causal || should_pack_gqa(params.seqlen_q, params.h, params.h_k, kBlockM));
                 BOOL_SWITCH(pack_gqa, PackGQA, [&] {
                 //     BOOL_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
                 //         // Only use Cluster if number of tiles along seqlen_q is even and not varlen
@@ -182,40 +181,13 @@ void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
     });
 }
 
-template<typename T, bool Split>
-void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
+template<typename T, int kHeadDim, bool Split>
+void run_mha_fwd_hdim_16b(Flash_fwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        run_mha_fwd_dispatch<T, 192, 128, 64, 2, Is_causal, Is_local, Split, false /*V_colmajor*/, false /*Enable_cluster*/>(params, stream);
-    });
-}
-
-template<typename T, bool Split>
-void run_mha_fwd_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
-    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        run_mha_fwd_dispatch<T, 128, Is_causal || Is_local ? 128 : 160, 96, 2, Is_causal, Is_local, Split, false /*V_colmajor*/, false /*Enable_cluster*/>(params, stream);
-    });
-}
-
-template<typename T, bool Split>
-void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
-    // Using Cluster is sometimes a tiny bit (10TFLOPS) faster, depending on the exact version of the code.
-    // Currently Cluster is a tiny bit slower, so we don't use it (also to reduce compile time).
-    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        run_mha_fwd_dispatch<T, 128, Is_causal || Is_local ? 128 : 176, 128, 2, Is_causal, Is_local, Split, false /*V_colmajor*/, false /*Enable_cluster*/>(params, stream);
-    });
-}
-
-template<typename T, bool Split>
-void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
-    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        run_mha_fwd_dispatch<T, 128, 96, 192, 2, Is_causal, Is_local, Split, false /*V_colmajor*/, true /*Enable_cluster*/>(params, stream);
-    });
-}
-
-template<typename T, bool Split>
-void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
-    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        run_mha_fwd_dispatch<T, 128, 80, 256, 2, Is_causal, Is_local, Split, false /*V_colmajor*/, true /*Enable_cluster*/>(params, stream);
+        // Can't use structured binding since it's not compatible with constexpr
+        static constexpr std::tuple<int, int> kBlockM_N = tile_size_fwd(kHeadDim, Is_causal || Is_local, sizeof(T) /*element_size*/);
+        static constexpr bool Enable_cluster = kHeadDim >= 192 && !Is_causal && !Is_local && !Split;
+        run_mha_fwd_dispatch<T, std::get<0>(kBlockM_N), std::get<1>(kBlockM_N), kHeadDim, 2, Is_causal, Is_local, Split, false /*V_colmajor*/, Enable_cluster>(params, stream);
     });
 }
 

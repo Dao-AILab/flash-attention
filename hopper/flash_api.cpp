@@ -13,6 +13,7 @@
 
 #include "flash.h"
 #include "static_switch.h"
+#include "tile_size.h"
 
 // Copied from https://github.com/pytorch/pytorch/commit/7931eee5c5ebcdf468bff4d308510b03355cd909
 // This is so that we can pass in torch.dtype as a parameter to the function.
@@ -1414,14 +1415,10 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         auto dprops = at::cuda::getCurrentDeviceProperties();
         // This needs to match the kernel configs
         // TODO: check that they match. TODO: change for FP8
-        // TODO: is_causal or is_local
         // TODO: right now we assume PackGQA
+        bool const is_causal_or_local = is_causal || (window_size_left >= 0 || window_size_right >= 0);
+        auto [kBlockM, kBlockN] = tile_size_fwd(head_size_rounded, is_causal_or_local);
         int seqlen_q_packgqa = seqlen_q * (num_heads / num_heads_k);
-        const int kBlockM = head_size_rounded <= 64 ? 192 : 128;
-        const int kBlockN = head_size_rounded <= 64 ? 128
-            : (head_size_rounded <= 96 ? (is_causal ? 128 : 160)
-               : (head_size_rounded <= 128 ? (is_causal ? 128 : 176)
-                  : (head_size_rounded <= 192 ? 96 : 80)));
         const int num_n_blocks = (seqlen_k + kBlockN - 1) / kBlockN;
         const int num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
         num_splits = num_splits_heuristic(batch_size * num_heads_k * num_m_blocks, dprops->multiProcessorCount, num_n_blocks, 128);
