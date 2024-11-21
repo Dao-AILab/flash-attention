@@ -82,7 +82,7 @@ attention_prefill = _attention_prefill.apply
 class _attention_decode(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, metadata):
-        if not ENABLE_FUSED_ROTARY or True:
+        if not ENABLE_FUSED_ROTARY:
             # Non-fused rotary kernel
             if metadata.rotary_dim > 0.0:    
                 q_original_shape = parse_shape(q, 'b s g h d')
@@ -122,27 +122,49 @@ class _attention_decode(torch.autograd.Function):
                 q, metadata.k_new = q_ro.to(q.dtype), None
 
                 # nullify rotary parameters so that the fused rotary implementation is not executed within the triton decode fwd kernel
-                metadata.need_rotary(0, None, None, False)
+                # metadata.need_rotary(0, None, None, False)
 
-        output, softmax_lse = attention_decode_forward_triton_impl(
-            q,
-            k,
-            v,
-            metadata.sm_scale,
-            metadata.causal,
-            metadata.alibi_slopes,
-            metadata.layout,
-            metadata.cache_seqlens,
-            metadata.cache_batch_idx,
-            metadata.new_kv,
-            metadata.k_new,
-            metadata.v_new,
-            metadata.rotary_cos,
-            metadata.rotary_sin,
-            metadata.rotary_dim,
-            metadata.rotary_interleaved,
-            metadata.rotary_conjugate
-        )
-        return output, softmax_lse
+            output, softmax_lse = attention_decode_forward_triton_impl(
+                q,
+                k,
+                v,
+                metadata.sm_scale,
+                metadata.causal,
+                metadata.alibi_slopes,
+                metadata.layout,
+                metadata.cache_seqlens,
+                metadata.cache_batch_idx,
+                metadata.new_kv,
+                metadata.k_new,
+                metadata.v_new,
+                None,
+                None,
+                0,
+                False,
+                False
+            )
+            return output, softmax_lse
+        else:
+            output, softmax_lse = attention_decode_forward_triton_impl(
+                q,
+                k,
+                v,
+                metadata.sm_scale,
+                metadata.causal,
+                metadata.alibi_slopes,
+                metadata.layout,
+                metadata.cache_seqlens,
+                metadata.cache_batch_idx,
+                metadata.new_kv,
+                metadata.k_new,
+                metadata.v_new,
+                metadata.rotary_cos,
+                metadata.rotary_sin,
+                metadata.rotary_dim,
+                metadata.rotary_interleaved,
+                metadata.rotary_conjugate
+            )
+            return output, softmax_lse
+
 
 attention_decode = _attention_decode.apply
