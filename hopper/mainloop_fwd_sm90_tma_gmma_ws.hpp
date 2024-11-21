@@ -15,6 +15,7 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 
 #include "named_barrier.hpp"
+#include "seqlen.h"
 #include "mask.h"
 #include "pack_gqa.h"
 #include "paged_kv.h"
@@ -50,6 +51,7 @@ struct CollectiveMainloopFwd {
     static constexpr bool Use_TMA_KV = !PagedKV;
     static_assert(Use_TMA_KV || size(ClusterShape{}) == 1, "If not using TMA for KV, ClusterShape must be 1");
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
+    using SeqlenInfo_t = flash::SeqlenInfo<Varlen, AppendKV>;
 
     static_assert(ArchTag::kMinComputeCapability >= 90);
 
@@ -414,40 +416,12 @@ struct CollectiveMainloopFwd {
     }
 
     CUTLASS_DEVICE
-    int get_seqlen_q(Params const& params, int bidb) {
-        if constexpr (!Varlen) {
-            return size<0>(params.shape_Q);
-        } else {
-            return params.seqused_q ? params.seqused_q[bidb] : (params.cu_seqlens_q ? params.cu_seqlens_q[bidb + 1] - params.cu_seqlens_q[bidb] : size<0>(params.shape_Q));
-        }
-    }
-
-    template<bool Seqlen_before_append_KV=false>
-    CUTLASS_DEVICE
-    int get_seqlen_k(Params const& params, int bidb) {
-        int const seqlen_k_novarlen = !PagedKV ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable);
-        if constexpr (!Varlen) {
-            return seqlen_k_novarlen;
-        } else {
-            int const leftpad = params.leftpad_k ? params.leftpad_k[bidb] : 0;
-            int seqlen_k = (params.seqused_k ? params.seqused_k[bidb] : (params.cu_seqlens_k ? params.cu_seqlens_k[bidb + 1] - params.cu_seqlens_k[bidb] : seqlen_k_novarlen)) - leftpad;
-            if constexpr (AppendKV && !Seqlen_before_append_KV) { seqlen_k += get_seqlen_k_new(params, bidb); }
-            return seqlen_k;
-        }
-    }
-
-    CUTLASS_DEVICE
-    int get_seqlen_k_new(Params const& params, int bidb) {
-        // If there's K_new then it must be varlen
-        return params.cu_seqlens_k_new ? params.cu_seqlens_k_new[bidb + 1] - params.cu_seqlens_k_new[bidb] : size<0>(params.shape_K_new);
-    }
-
-    CUTLASS_DEVICE
-    cute::tuple<int, int> get_n_block_min_max(Params const& params, int m_block, int bidb, int split_idx=0, int num_splits=1) {
+    cute::tuple<int, int> get_n_block_min_max(Params const& params, SeqlenInfo_t const& seqlen_info,
+                                              int m_block, int bidb, int split_idx=0, int num_splits=1) {
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        int const seqlen_k = get_seqlen_k(params, bidb);
-        int const seqlen_q = get_seqlen_q(params, bidb);
+        int const seqlen_k = seqlen_info.seqlen_k;
+        int const seqlen_q = seqlen_info.seqlen_q;
         int n_block_max = cute::ceil_div(seqlen_k, kBlockN);
         if constexpr (Is_causal || Is_local) {
             int m_idx_max = (m_block + 1) * kBlockM;
@@ -481,12 +455,13 @@ struct CollectiveMainloopFwd {
          PipelineState& smem_pipe_write,
          SharedStorage &shared_storage,
          SchedulerPrefetch const& scheduler_prefetch,
+         SeqlenInfo_t const& seqlen_info,
          cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
          int &work_idx
          ) {
 
         auto [m_block, bidh, bidb, split_idx] = block_coord;
-        auto [n_block_min, n_block_max] = get_n_block_min_max(params, m_block, bidb, split_idx, params.num_splits);
+        auto [n_block_min, n_block_max] = get_n_block_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) {
@@ -533,12 +508,10 @@ struct CollectiveMainloopFwd {
         Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(select<1, 0, 2, 3>(params.shape_K))(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
 
-        Tensor gQ = local_tile(domain_offset(make_coord(!is_varlen_q ? 0 : params.cu_seqlens_q[bidb], _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
-        int const leftpad_k = Varlen && params.leftpad_k ? params.leftpad_k[bidb] : 0;
+        Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
         // if (cute::thread0()) { printf("Varlen = %d, params.leftpad_k = %p, leftpad_k = %d\n", Varlen, params.leftpad_k, leftpad_k); }
-        int const offset_k = !Varlen ? 0 : (params.cu_seqlens_k ? params.cu_seqlens_k[bidb] : 0) + leftpad_k;
-        Tensor gK_TMA = local_tile(domain_offset(make_coord(offset_k, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
-        Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, offset_k), mVt_TMA), select<2, 1>(TileShape_MNK{}), make_coord(_0{}, _));  // (K, N, _)
+        Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+        Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k), mVt_TMA), select<2, 1>(TileShape_MNK{}), make_coord(_0{}, _));  // (K, N, _)
 
         auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
         Tensor tQgQ = group_modes<0, 3>(block_tma_Q.partition_S(gQ));  // (TMA)
@@ -555,7 +528,7 @@ struct CollectiveMainloopFwd {
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
             params.ptr_V, params.stride_V,
-            params.page_size_divmod, bidb_kv, bidh_kv, thread_idx, get_seqlen_k(params, bidb), leftpad_k
+            params.page_size_divmod, bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k
         );
 
         // Set up for transposing V, only used if Transpose_V
@@ -797,6 +770,7 @@ struct CollectiveMainloopFwd {
         Softmax& softmax,
         int thread_idx,
         int &work_idx,
+        SeqlenInfo_t const& seqlen_info,
         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage
         ) {
@@ -808,7 +782,7 @@ struct CollectiveMainloopFwd {
         int m_block = get<0>(block_coord);
         int bidb = get<2>(block_coord);
         int split_idx = get<3>(block_coord);
-        auto [n_block_min, n_block_max] = get_n_block_min_max(params, m_block, bidb, split_idx, params.num_splits);
+        auto [n_block_min, n_block_max] = get_n_block_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -846,8 +820,8 @@ struct CollectiveMainloopFwd {
         // clear(tOrO);
         tiled_mma1.accumulate_ = GMMA::ScaleOut::Zero;
 
-        int const seqlen_q = get_seqlen_q(params, bidb);
-        int const seqlen_k = get_seqlen_k(params, bidb);
+        int const seqlen_q = seqlen_info.seqlen_q;
+        int const seqlen_k = seqlen_info.seqlen_k;
         int n_block = n_block_max - 1;
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma0> mask(
@@ -875,8 +849,7 @@ struct CollectiveMainloopFwd {
             // writing to smem_o.
             int const bidh = get<1>(block_coord);
             bool const is_varlen_q = Varlen && params.cu_seqlens_q != nullptr;
-            int const offset_q = !is_varlen_q ? 0 : params.cu_seqlens_q[bidb];
-            Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
+            Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
             Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
             using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element>;
             PackGQAt::load_Q(mQ, sQ_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_q, m_block);
@@ -886,9 +859,7 @@ struct CollectiveMainloopFwd {
 
         auto [rotary, tRrCos, tRrSin, tRrCosCont, tRrSinCont] = [&] {
             if constexpr (AppendKV) {
-                int const leftpad_k = Varlen && params.leftpad_k ? params.leftpad_k[bidb] : 0;
-                int const seqlen_k_og = get_seqlen_k<true /*Seqlen_before_append_KV*/>(params, bidb);
-                int const offset_rotary = seqlen_k_og + leftpad_k;
+                int const offset_rotary = seqlen_info.seqlen_k_og + seqlen_info.leftpad_k;
                 using Rotary_t = Rotary<kBlockM, kHeadDim, NumMmaThreads, Element, !(Is_causal || Is_local) /*FixedPosition*/>;
                 Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
                                 params.ptr_rotary_sin, params.stride_rotary_sin,
@@ -1061,13 +1032,12 @@ struct CollectiveMainloopFwd {
     }
 
     CUTLASS_DEVICE
-    cute::tuple<int, int> get_n_block_k_new_min_max(Params const& params, int m_block, int bidb, int split_idx=0, int num_splits=1) {
+    cute::tuple<int, int> get_n_block_k_new_min_max(Params const& params, SeqlenInfo_t const& seqlen_info,
+                                                    int m_block, int bidb, int split_idx=0, int num_splits=1) {
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        int const seqlen_k_new = get_seqlen_k_new(params, bidb);
-        int const seqlen_k_og = get_seqlen_k<true /*Seqlen_before_append_KV*/>(params, bidb);
-        auto [n_block_min, n_block_max] = get_n_block_min_max(params, m_block, bidb, split_idx, num_splits);
-        int const idx_k_new_min = std::max(n_block_min * kBlockN - seqlen_k_og, 0);
-        int const idx_k_new_max = std::min(n_block_max * kBlockN - seqlen_k_og, seqlen_k_new);
+        auto [n_block_min, n_block_max] = get_n_block_min_max(params, seqlen_info, m_block, bidb, split_idx, num_splits);
+        int const idx_k_new_min = std::max(n_block_min * kBlockN - seqlen_info.seqlen_k_og, 0);
+        int const idx_k_new_max = std::min(n_block_max * kBlockN - seqlen_info.seqlen_k_og, seqlen_info.seqlen_k_new);
         int const n_block_new_min = idx_k_new_min / kBlockN;
         int const n_block_new_max = idx_k_new_max > idx_k_new_min ? cute::ceil_div(idx_k_new_max, kBlockN) : n_block_new_min;
         // if (threadIdx.x == 128 && m_block == 0) { printf("bidb = %d, seqlen_k_new = %d, seqlen_k_og = %d, n_block_min = %d, n_block_max = %d, idx_k_new_min = %d, idx_k_new_max = %d, n_block_new_min = %d, n_block_new_max = %d\n", bidb, seqlen_k_new, seqlen_k_og, n_block_min, n_block_max, idx_k_new_min, idx_k_new_max, n_block_new_min, n_block_new_max);}
@@ -1081,12 +1051,13 @@ struct CollectiveMainloopFwd {
          MainloopPipelineKVNew pipeline_v_new,
          PipelineState& smem_pipe_write,
          SharedStorage &shared_storage,
+         SeqlenInfo_t const& seqlen_info,
          cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
          int const work_idx
          ) {
 
         auto [m_block, bidh, bidb, split_idx] = block_coord;
-        auto [n_block_new_min, n_block_new_max] = get_n_block_k_new_min_max(params, m_block, bidb, split_idx, params.num_splits);
+        auto [n_block_new_min, n_block_new_max] = get_n_block_k_new_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
         if (n_block_new_max <= n_block_new_min) { return false; }
 
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
@@ -1098,8 +1069,7 @@ struct CollectiveMainloopFwd {
             }
         }();
 
-
-        int const thread_idx = threadIdx.x % NumProducerThreads;
+        // int const thread_idx = threadIdx.x % NumProducerThreads;
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
 
         // Prepare the TMA loads
@@ -1111,9 +1081,8 @@ struct CollectiveMainloopFwd {
         Tensor mKnew_TMA = params.tma_load_K_new.get_tma_tensor(params.shape_K_new)(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
         Tensor mVnewt_TMA = params.tma_load_V_new.get_tma_tensor(select<1, 0, 2, 3>(params.shape_K_new))(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
 
-        int const offset_k_new = !Varlen ? 0 : (params.cu_seqlens_k_new ? params.cu_seqlens_k_new[bidb] : 0);
-        Tensor gKnew_TMA = local_tile(domain_offset(make_coord(offset_k_new, _0{}), mKnew_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
-        Tensor gVnewt_TMA = local_tile(domain_offset(make_coord(_0{}, offset_k_new), mVnewt_TMA), select<2, 1>(TileShape_MNK{}), make_coord(_0{}, _));  // (K, N, _)
+        Tensor gKnew_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k_new, _0{}), mKnew_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+        Tensor gVnewt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k_new), mVnewt_TMA), select<2, 1>(TileShape_MNK{}), make_coord(_0{}, _));  // (K, N, _)
 
         auto block_tma_K_new = params.tma_load_K_new.get_slice(cluster_local_block_id.x);
         Tensor tKgKnew_TMA = group_modes<0, 3>(block_tma_K_new.partition_S(gKnew_TMA));  // (TMA, k)
@@ -1180,10 +1149,11 @@ struct CollectiveMainloopFwd {
                  PipelineState& smem_pipe_read,
                  int const thread_idx,
                  SharedStorage &shared_storage,
+                 SeqlenInfo_t const& seqlen_info,
                  cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord
     ) {
         auto [m_block, bidh, bidb, split_idx] = block_coord;
-        auto [n_block_new_min, n_block_new_max] = get_n_block_k_new_min_max(params, m_block, bidb, split_idx, params.num_splits);
+        auto [n_block_new_min, n_block_new_max] = get_n_block_k_new_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
         if (n_block_new_max <= n_block_new_min) { return false; }
 
         // as_position_independent_swizzle_tensor makes address calculation easier
@@ -1204,17 +1174,14 @@ struct CollectiveMainloopFwd {
         Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K), params.shape_K, params.stride_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
 
-        int const leftpad_k = Varlen && params.leftpad_k ? params.leftpad_k[bidb] : 0;
-        int const seqlen_k_og = get_seqlen_k<true /*Seqlen_before_append_KV*/>(params, bidb);
-
-        int const offset_k = (!Varlen ? 0 : (params.cu_seqlens_k ? params.cu_seqlens_k[bidb] : 0) + leftpad_k) + seqlen_k_og;
+        int const offset_k = seqlen_info.offset_k + seqlen_info.seqlen_k_og;
         Tensor gK = local_tile(domain_offset(make_coord(offset_k, _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
         Tensor gV = local_tile(domain_offset(make_coord(offset_k, _0{}), mV), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
 
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
         static constexpr int kHeadDim = get<2>(TileShape_MNK{});
-        int const offset_rotary = seqlen_k_og + leftpad_k;
-        int const seqlen_k_new = get_seqlen_k_new(params, bidb);
+        int const offset_rotary = seqlen_info.seqlen_k_og + seqlen_info.leftpad_k;
+        int const seqlen_k_new = seqlen_info.seqlen_k_new;
         int const rotary_dim = get<1>(params.shape_rotary) * 2;
         using Rotary_t = Rotary<kBlockN, kHeadDim, NumMmaThreads, Element>;
         Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
@@ -1255,9 +1222,9 @@ struct CollectiveMainloopFwd {
             int const n_limit = std::min(seqlen_k_new - n_block * kBlockN, kBlockN);
             Tensor tKrK = make_fragment_like(tKsK(_, _, _, _0{}));
             if (rotary_dim <= 0) {
-            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
-                gmem_tiled_copy_kv, tKsK(_, _, _, smem_pipe_read.index()), tKrK, tKcK, tKpK, n_limit
-            );
+                flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
+                    gmem_tiled_copy_kv, tKsK(_, _, _, smem_pipe_read.index()), tKrK, tKcK, tKpK, n_limit
+                );
             } else {
                 if (params.is_rotary_interleaved) {
                     rotary.apply_K_interleaved(sK(_, _, smem_pipe_read.index()), tKrK, tKpK, tRrCos, tRrSin, n_block);

@@ -14,6 +14,7 @@
 #include <cutlass/kernel_hardware_info.h>
 #include "cutlass/pipeline/pipeline.hpp"
 
+#include "seqlen.h"
 #include "utils.h"
 #include "softmax.h"
 
@@ -34,6 +35,7 @@ public:
     static_assert(CollectiveMainloop::Varlen == CollectiveEpilogue::Varlen);
     static constexpr bool Has_softcap = CollectiveMainloop::Has_softcap;
     static constexpr bool Varlen = CollectiveMainloop::Varlen;
+    static constexpr bool PagedKV = CollectiveMainloop::PagedKV;
     static constexpr bool Split = CollectiveMainloop::Split;
     static constexpr bool Is_FP8 = CollectiveMainloop::Is_FP8;
     static constexpr bool Transpose_V = CollectiveMainloop::Transpose_V;
@@ -42,6 +44,7 @@ public:
     static constexpr bool Use_TMA_KV = CollectiveMainloop::Use_TMA_KV;
     static constexpr bool Use_TMA_O = CollectiveEpilogue::Use_TMA_O;
     static constexpr int NumProducerThreads = CollectiveMainloop::NumProducerThreads;
+    using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
 
     // Mainloop derived types
     using TileShape_MNK = typename CollectiveMainloop::TileShape_MNK;
@@ -301,10 +304,18 @@ public:
                  work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
 
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
+                SeqlenInfo_t seqlen_info{
+                    get<2>(block_coord) /*bidb*/,
+                    get<0>(params.mainloop.shape_Q),
+                    !PagedKV ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
+                    get<0>(params.mainloop.shape_K_new),
+                    params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
+                    params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
+                };
                 if constexpr (AppendKV) {
                     bool tile_new_valid = collective_mainloop.load_kv_new(
                         params.mainloop, pipeline_k_new, pipeline_v_new,
-                        smem_pipe_write, shared_storage, block_coord, work_idx);
+                        smem_pipe_write, shared_storage, seqlen_info, block_coord, work_idx);
                     if (tile_new_valid) {
                         // if (threadIdx.x == 0) { printf("Producer: Before sync\n"); }
                         cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
@@ -318,7 +329,7 @@ public:
                 };
                 // pipeline_vt won't be used if we don't need to transpose V.
                 collective_mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
-                                         shared_storage, scheduler_prefetch, block_coord, work_idx);
+                                         shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
             }
             collective_mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write);
         } else {  // Consumer
@@ -352,10 +363,18 @@ public:
                 flash::Softmax<2 * (2 * kBlockM / NumMmaThreads), /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
 
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
+                SeqlenInfo_t seqlen_info{
+                    get<2>(block_coord) /*bidb*/,
+                    get<0>(params.mainloop.shape_Q),
+                    !PagedKV ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
+                    get<0>(params.mainloop.shape_K_new),
+                    params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
+                    params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
+                };
                 if constexpr (AppendKV) {
                     bool tile_new_valid = collective_mainloop.store_kv_new(
                         params.mainloop, pipeline_k_new, pipeline_v_new, smem_pipe_read,
-                        threadIdx.x - MmaThreadOffset, shared_storage, block_coord);
+                        threadIdx.x - MmaThreadOffset, shared_storage, seqlen_info, block_coord);
                     if (tile_new_valid) {
                         // if (threadIdx.x == 128) { printf("Consumer: Before sync\n"); }
                         // We need this sync so that the gmem write from the consumers is visible to the producer
@@ -368,7 +387,7 @@ public:
                 }
                 bool tile_valid = collective_mainloop.mma(
                     params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
-                    tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, block_coord, shared_storage);
+                    tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
                 if (tile_valid) {
                     // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
                     collective_epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma1,

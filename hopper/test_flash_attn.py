@@ -697,7 +697,7 @@ def test_flash_attn_varlen_output(
 
 # @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("num_splits", [1, 2])
+@pytest.mark.parametrize("num_splits", [1, 0])
 # @pytest.mark.parametrize("num_splits", [1])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
@@ -712,7 +712,7 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("rotary_interleaved", [False, True])
 # @pytest.mark.parametrize("rotary_interleaved", [False])
 @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
-# @pytest.mark.parametrize("rotary_fraction", [1.0])
+# @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize("page_size", [None, 1, 4, 128])
 # @pytest.mark.parametrize("page_size", [None])
 @pytest.mark.parametrize("has_leftpad", [False, True])

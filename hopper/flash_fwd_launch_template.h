@@ -185,9 +185,9 @@ template<typename T, int kHeadDim, bool Split>
 void run_mha_fwd_hdim_16b(Flash_fwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         // Can't use structured binding since it's not compatible with constexpr
-        static constexpr std::tuple<int, int> kBlockM_N = tile_size_fwd(kHeadDim, Is_causal || Is_local, sizeof(T) /*element_size*/);
+        static constexpr std::tuple<int, int> kBlock_MN = tile_size_fwd(kHeadDim, Is_causal || Is_local, sizeof(T) /*element_size*/);
         static constexpr bool Enable_cluster = kHeadDim >= 192 && !Is_causal && !Is_local && !Split;
-        run_mha_fwd_dispatch<T, std::get<0>(kBlockM_N), std::get<1>(kBlockM_N), kHeadDim, 2, Is_causal, Is_local, Split, false /*V_colmajor*/, Enable_cluster>(params, stream);
+        run_mha_fwd_dispatch<T, std::get<0>(kBlock_MN), std::get<1>(kBlock_MN), kHeadDim, 2, Is_causal, Is_local, Split, false /*V_colmajor*/, Enable_cluster>(params, stream);
     });
 }
 
