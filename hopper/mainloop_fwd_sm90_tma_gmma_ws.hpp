@@ -857,36 +857,31 @@ struct CollectiveMainloopFwd {
             barrier_Q.arrive();
         }
 
-        auto [rotary, tRrCos, tRrSin, tRrCosCont, tRrSinCont] = [&] {
-            if constexpr (AppendKV) {
+        if constexpr (!AppendKV) {
+            barrier_Q.wait(work_idx % 2);
+        } else {
+            if (get<1>(params.shape_rotary) > 0) {  // Apply rotary to Q
                 int const offset_rotary = seqlen_info.seqlen_k_og + seqlen_info.leftpad_k;
                 using Rotary_t = Rotary<kBlockM, kHeadDim, NumMmaThreads, Element, !(Is_causal || Is_local) /*FixedPosition*/>;
                 Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
                                 params.ptr_rotary_sin, params.stride_rotary_sin,
                                 params.is_rotary_interleaved, thread_idx, seqlen_q, offset_rotary);
-                auto [tRrCos, tRrSin, tRrCosCont, tRrSinCont] = cute::conditional_return<!PackGQA>(rotary.load_cos_sin(m_block), rotary.load_cos_sin_packgqa(m_block, params.qhead_per_khead_divmod));
-                return cute::make_tuple(rotary, tRrCos, tRrSin, tRrCosCont, tRrSinCont);
-            } else {
-                return cute::make_tuple(nullptr, nullptr, nullptr, nullptr, nullptr);
-            }
-        }();
-
-        typename cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(barrier_Q.try_wait(work_idx % 2));
-        if (barrier_token == cutlass::BarrierStatus::WaitAgain) { barrier_Q.wait(work_idx % 2); }
-
-        if constexpr (AppendKV) {
-            if (get<1>(params.shape_rotary) > 0) {  // Apply rotary to Q
                 Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
+                int const qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
                 if (params.is_rotary_interleaved) {
-                    rotary.apply_Q_interleaved(sQ_pi, tRrCos, tRrSin, m_block,
-                        !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor /*qhead_per_khead*/);
+                    auto [tRrCos, tRrSin] = cute::conditional_return<!PackGQA>(rotary.load_cos_sin_interleaved(m_block), rotary.load_cos_sin_packgqa_interleaved(m_block, params.qhead_per_khead_divmod));
+                    barrier_Q.wait(work_idx % 2);
+                    rotary.apply_Q_interleaved(sQ_pi, tRrCos, tRrSin, m_block, qhead_per_khead);
                 } else {
-                    rotary.apply_Q_contiguous(sQ_pi, tRrCosCont, tRrSinCont, m_block,
-                        !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor /*qhead_per_khead*/);
+                    auto [tRrCosCont, tRrSinCont] = cute::conditional_return<!PackGQA>(rotary.load_cos_sin_contiguous(m_block), rotary.load_cos_sin_packgqa_contiguous(m_block, params.qhead_per_khead_divmod));
+                    barrier_Q.wait(work_idx % 2);
+                    rotary.apply_Q_contiguous(sQ_pi, tRrCosCont, tRrSinCont, m_block, qhead_per_khead);
                 }
                 // SMEM fence to make sure the rotated Q is visible to GMMA
                 cutlass::arch::fence_view_async_shared();
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<int>(FwdNamedBarriers::QueryRotated) /*id*/);
+            } else {
+                barrier_Q.wait(work_idx % 2);
             }
         }
 
@@ -1182,7 +1177,6 @@ struct CollectiveMainloopFwd {
         static constexpr int kHeadDim = get<2>(TileShape_MNK{});
         int const offset_rotary = seqlen_info.seqlen_k_og + seqlen_info.leftpad_k;
         int const seqlen_k_new = seqlen_info.seqlen_k_new;
-        int const rotary_dim = get<1>(params.shape_rotary) * 2;
         using Rotary_t = Rotary<kBlockN, kHeadDim, NumMmaThreads, Element>;
         Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
                         params.ptr_rotary_sin, params.stride_rotary_sin,
@@ -1217,18 +1211,22 @@ struct CollectiveMainloopFwd {
         for (int k = 0; k < size(tKpK); ++k) { tKpK(k) = get<1>(tKcK(_0{}, _0{}, k)) < get<1>(params.shape_K); }
 
         auto store_K = [&] (int const n_block, auto const& smem_pipe_read) {
-            auto [tRrCos, tRrSin, tRrCosCont, tRrSinCont] = rotary.load_cos_sin(n_block);
-            pipeline_k_new.consumer_wait(smem_pipe_read);
+            // auto [tRrCos, tRrSin, tRrCosCont, tRrSinCont] = rotary.load_cos_sin(n_block);
             int const n_limit = std::min(seqlen_k_new - n_block * kBlockN, kBlockN);
             Tensor tKrK = make_fragment_like(tKsK(_, _, _, _0{}));
-            if (rotary_dim <= 0) {
+            if (get<1>(params.shape_rotary) <= 0) {
+                pipeline_k_new.consumer_wait(smem_pipe_read);
                 flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
                     gmem_tiled_copy_kv, tKsK(_, _, _, smem_pipe_read.index()), tKrK, tKcK, tKpK, n_limit
                 );
             } else {
                 if (params.is_rotary_interleaved) {
+                    auto [tRrCos, tRrSin] = rotary.load_cos_sin_interleaved(n_block);
+                    pipeline_k_new.consumer_wait(smem_pipe_read);
                     rotary.apply_K_interleaved(sK(_, _, smem_pipe_read.index()), tKrK, tKpK, tRrCos, tRrSin, n_block);
                 } else {
+                    auto [tRrCosCont, tRrSinCont] = rotary.load_cos_sin_contiguous(n_block);
+                    pipeline_k_new.consumer_wait(smem_pipe_read);
                     rotary.apply_K_contiguous(sK(_, _, smem_pipe_read.index()), tKrK, tKpK, tRrCosCont, tRrSinCont, n_block);
                 }
             }
@@ -1241,11 +1239,6 @@ struct CollectiveMainloopFwd {
             // if (thread_idx == 0) { print_tensor(sK(_, _, smem_pipe_read.index())); }
             // if (thread_idx == 0) { print(tKsK); printf("\n"); print(tKrK); printf("\n"); print(tKgK); printf("\n");}
             // if (thread_idx == 0) { print_tensor(tKpK); printf("\n"); printf("seqlen_limit = %d\n", seqlen_k_new - n_block * kBlockN);}
-            // if (rotary_dim > 0) {
-            //     if (params.is_rotary_interleaved) {
-            //         flash::apply_rotary_interleaved(tKrK, tRrCos, tRrSin, tKcK, n_limit, rotary_dim);
-            //     }
-            // }
 
             if constexpr (!PagedKV) {
                 Tensor tKgK_cur = tKgK(_, _, _, n_block);

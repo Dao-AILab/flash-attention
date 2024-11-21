@@ -14,51 +14,6 @@ using namespace cute;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename Engine1, typename Layout1, typename Engine2, typename Layout2, typename Engine3, typename Layout3>
-CUTLASS_DEVICE void
-apply_rotary_interleaved(Tensor<Engine1, Layout1> &tKrK,
-                         Tensor<Engine2, Layout2> const &tRrCos,
-                         Tensor<Engine2, Layout2> const &tRrSin,
-                         Tensor<Engine3, Layout3> const &tKcK,
-                         int const max_MN, int const rotary_dim) {
-    CUTE_STATIC_ASSERT_V(rank(tKrK) == _3{});
-    CUTE_STATIC_ASSERT_V(rank(tRrCos) == _3{});
-    CUTE_STATIC_ASSERT_V(rank(tRrSin) == _3{});
-    CUTE_STATIC_ASSERT_V(size<1>(tKrK) == size<1>(tRrCos));                     // MMA_M
-    CUTE_STATIC_ASSERT_V(size<2>(tKrK) == size<2>(tRrCos));                     // MMA_K
-    CUTE_STATIC_ASSERT_V(size<1>(tKrK) == size<1>(tRrSin));                     // MMA_M
-    CUTE_STATIC_ASSERT_V(size<2>(tKrK) == size<2>(tRrSin));                     // MMA_K
-    CUTE_STATIC_ASSERT_V(size<0>(tRrCos) == size<0>(tRrSin));
-    static_assert(decltype(size<0>(tKrK))::value == decltype(size<0>(tRrCos))::value * 2);
-    static_assert(decltype(size<0>(tRrCos))::value % 2 == 0);  // Since we do fast conversion from fp16/bf16 to fp32
-    Tensor tRpR = make_tensor<bool>(make_shape(size<2>(tKrK)));
-    #pragma unroll
-    for (int k = 0; k < size(tRpR); ++k) { tRpR(k) = get<1>(tKcK(_0{}, _0{}, k)) < rotary_dim; }
-    #pragma unroll
-    for (int m = 0; m < size<1>(tKrK); ++m) {
-        if (get<0>(tKcK(_0{}, m, _0{})) < max_MN) {
-            #pragma unroll
-            for (int k = 0; k < size<2>(tKrK); ++k) {
-                if (tRpR(k)) {
-                    Tensor K_fp32 = convert_type<float>(tKrK(_, m, k));
-                    Tensor cos_fp32 = convert_type<float>(tRrCos(_, m, k));
-                    Tensor sin_fp32 = convert_type<float>(tRrSin(_, m, k));
-                    #pragma unroll
-                    for (int i = 0; i < size<0>(tKrK) / 2; ++i) {
-                        float real = K_fp32[2 * i] * cos_fp32[i] - K_fp32[2 * i + 1] * sin_fp32[i];
-                        float imag = K_fp32[2 * i] * sin_fp32[i] + K_fp32[2 * i + 1] * cos_fp32[i];
-                        K_fp32[2 * i] = real;
-                        K_fp32[2 * i + 1] = imag;
-                    }
-                    cute::copy(convert_type<Engine1::value_type>(K_fp32), tKrK(_, m, k));
-                }
-            }
-        }
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 template <int kBlockMN, int kHeadDim, int NumThreads, typename Element, bool FixedPosition=false>
 struct Rotary {
 
@@ -93,7 +48,6 @@ struct Rotary {
     using GmemThrCopyRotary = decltype(GmemTiledCopyRotary{}.get_thread_slice(int(0)));
     using GmemThrCopyRotaryCont = decltype(GmemTiledCopyRotaryCont{}.get_thread_slice(int(0)));
     using TensortRcR = decltype(GmemTiledCopyRotary{}.get_thread_slice(int(0)).partition_D(cute::make_identity_tensor(Shape<Int<kBlockMN>, Int<kHeadDim / 2>>{})));
-    using TensortRcRCont = decltype(GmemTiledCopyRotaryCont{}.get_thread_slice(int(0)).partition_D(cute::make_identity_tensor(Shape<Int<kBlockMN>, Int<kHeadDim>>{})));
     using TensortRpR = decltype(make_tensor<bool>(make_shape(size<2>(TensortRcR{}))));
     using TensormR = decltype(make_tensor(
         make_gmem_ptr((Element const*)nullptr),
@@ -157,114 +111,154 @@ struct Rotary {
     };
 
     CUTLASS_DEVICE
-    auto load_cos_sin(int const block) {
+    auto load_cos_sin_interleaved(int const block) {
+        Tensor tRgCosCur = tRgCos(_, _, _, block);
+        Tensor tRgSinCur = tRgSin(_, _, _, block);
         // make_tensor_like, not make_fragment_like. If the row_stride is _0{} we want to keep it that way
-        Tensor tRrCos = make_tensor_like(tRgCos(_, _, _, _0{}));
-        Tensor tRrSin = make_tensor_like(tRgSin(_, _, _, _0{}));
-        Tensor tRrCosCont = make_tensor_like(tRgCosCont(_, _, _, _0{}));
-        Tensor tRrSinCont = make_tensor_like(tRgSinCont(_, _, _, _0{}));
-        if (rotary_dim <= 0) { return cute::make_tuple(tRrCos, tRrSin, tRrCosCont, tRrSinCont); }
-        if (is_rotary_interleaved) {
-            Tensor cR = cute::make_identity_tensor(Shape<Int<kBlockMN>, Int<kHeadDim / 2>>{});  // (BLK_N,BLK_K / 2)
-            Tensor tRcR = gmem_thr_copy_rotary.partition_D(cR);
-            // If FixedPosition, only copy the first row as we only need the cos/sin for position cache_seqlens
-            #pragma unroll
-            for (int m = 0; m < (!FixedPosition ? size<1>(tRgCos) : 1); ++m) {
-                if (get<0>(tRcR(_0{}, m, _0{})) < max_seqlen - block * kBlockMN) {
-                    #pragma unroll
-                    for (int k = 0; k < size<2>(tRgCos); ++k) {
-                        if (tRpR(k)) {
-                            cute::copy(gmem_tiled_copy_rotary, tRgCos(_, m, k, block), tRrCos(_, m, k));
-                            cute::copy(gmem_tiled_copy_rotary, tRgSin(_, m, k, block), tRrSin(_, m, k));
-                        }
-                    }
-                }
-            }
-        } else {
-            Tensor cR = cute::make_identity_tensor(Shape<Int<kBlockMN>, Int<kHeadDim>>{});  // (BLK_N,BLK_K / 2)
-            Tensor tRcR = gmem_thr_copy_rotary_cont.partition_D(cR);
-            #pragma unroll
-            for (int m = 0; m < (!FixedPosition ? size<1>(tRgCosCont) : 1); ++m) {
-                if (get<0>(tRcR(_0{}, m, _0{})) < max_seqlen - block * kBlockMN) {
-                    #pragma unroll
-                    for (int k = 0; k < size<2>(tRgCosCont); ++k) {
-                        if (get<1>(tRcR(_0{}, _0{}, k)) < rotary_dim) {
-                            const bool is_left = get<1>(tRcR(_0{}, _0{}, k)) < rotary_dim / 2;
-                            Tensor gCos = domain_offset(make_coord(is_left ? 0 : -rotary_dim / 2), tRgCosCont(_, m, k, block));
-                            Tensor gSin = domain_offset(make_coord(is_left ? 0 : -rotary_dim / 2), tRgSinCont(_, m, k, block));
-                            // Tensor gCos = make_tensor(tRgCosCont(_, m, k, block).data() + (is_left ? 0 : -rotary_dim / 2), tRgCosCont(_, m, k, block).layout());
-                            // Tensor gSin = make_tensor(tRgSinCont(_, m, k, block).data() + (is_left ? 0 : -rotary_dim / 2), tRgSinCont(_, m, k, block).layout());
-                            // if (thread_idx == 0) { printf("is_left = %d, k_coord = %d\n", is_left, get<1>(tRcR(_0{}, _0{}, k))); print(tRgCosCont(_, m, k, block)); printf("\n"); print(gCos); printf("\n");}
-                            cute::copy(gmem_tiled_copy_rotary_cont, gCos, tRrCosCont(_, m, k));
-                            cute::copy(gmem_tiled_copy_rotary_cont, gSin, tRrSinCont(_, m, k));
-                            // if (thread_idx == 0) { print_tensor(tRrCosCont(_, m, k));}
-                        }
+        Tensor tRrCos = make_tensor_like(tRgCosCur);
+        Tensor tRrSin = make_tensor_like(tRgSinCur);
+        Tensor cR = cute::make_identity_tensor(Shape<Int<kBlockMN>, Int<kHeadDim / 2>>{});  // (BLK_N,BLK_K / 2)
+        Tensor tRcR = gmem_thr_copy_rotary.partition_D(cR);
+        // If FixedPosition, only copy the first row as we only need the cos/sin for position cache_seqlens
+        #pragma unroll
+        for (int m = 0; m < (!FixedPosition ? size<1>(tRgCos) : 1); ++m) {
+            if (get<0>(tRcR(_0{}, m, _0{})) < std::min(max_seqlen - block * kBlockMN, kBlockMN)) {
+                #pragma unroll
+                for (int k = 0; k < size<2>(tRgCos); ++k) {
+                    if (tRpR(k)) {
+                        cute::copy(gmem_tiled_copy_rotary, tRgCosCur(_, m, k), tRrCos(_, m, k));
+                        cute::copy(gmem_tiled_copy_rotary, tRgSinCur(_, m, k), tRrSin(_, m, k));
                     }
                 }
             }
         }
-        return cute::make_tuple(tRrCos, tRrSin, tRrCosCont, tRrSinCont);;
+        return cute::make_tuple(tRrCos, tRrSin);;
     }
 
     CUTLASS_DEVICE
-    auto load_cos_sin_packgqa(int const block, cutlass::FastDivmod const &qhead_per_khead_divmod) {
+    auto load_cos_sin_packgqa_interleaved(int const block, cutlass::FastDivmod const &qhead_per_khead_divmod) {
         // make_tensor_like, not make_fragment_like. If the row_stride is _0{} we want to keep it that way
         Tensor tRrCos = make_tensor_like(tRgCos(_, _, _, _0{}));
         Tensor tRrSin = make_tensor_like(tRgSin(_, _, _, _0{}));
-        Tensor tRrCosCont = make_tensor_like(tRgCosCont(_, _, _, _0{}));
-        Tensor tRrSinCont = make_tensor_like(tRgSinCont(_, _, _, _0{}));
-        if (rotary_dim <= 0) { return cute::make_tuple(tRrCos, tRrSin, tRrCosCont, tRrSinCont); }
         int const qhead_per_khead = qhead_per_khead_divmod.divisor;
-        if (is_rotary_interleaved) {
-            Tensor cR = cute::make_identity_tensor(Shape<Int<kBlockMN>, Int<kHeadDim / 2>>{});  // (BLK_N,BLK_K / 2)
-            Tensor tRcR = gmem_thr_copy_rotary.partition_D(cR);
-            #pragma unroll
-            for (int m = 0; m < (!FixedPosition ? size<1>(tRgCos) : 1); ++m) {
-                int const idx = block * kBlockMN + get<0>(tRcR(_0{}, m, _0{}));
-                if (idx < max_seqlen * qhead_per_khead) {
-                    int const row = qhead_per_khead_divmod.divide(idx);
-                    Tensor mCos_copy = cute::tiled_divide(make_tensor(&mCos(row, _0{}), Shape<Int<kHeadDim / 2>>{}),
-                                                        Shape<Int<kGmemElemsPerLoad / 2>>{});
-                    Tensor mSin_copy = cute::tiled_divide(make_tensor(&mSin(row, _0{}), Shape<Int<kHeadDim / 2>>{}),
-                                                        Shape<Int<kGmemElemsPerLoad / 2>>{});
-                    #pragma unroll
-                    for (int k = 0; k < size<2>(tRgCos); ++k) {
-                        int const ki = get<1>(tRcR(_0{}, _0{}, k)) / (kGmemElemsPerLoad / 2);
-                        if (tRpR(k)) {
-                            cute::copy(gmem_tiled_copy_rotary, mCos_copy(_, ki), tRrCos(_, m, k));
-                            cute::copy(gmem_tiled_copy_rotary, mSin_copy(_, ki), tRrSin(_, m, k));
-                        }
-                    }
-                }
-            }
-        } else {
-            Tensor cR = cute::make_identity_tensor(Shape<Int<kBlockMN>, Int<kHeadDim>>{});  // (BLK_N,BLK_K / 2)
-            Tensor tRcR = gmem_thr_copy_rotary_cont.partition_D(cR);
-            #pragma unroll
-            for (int m = 0; m < (!FixedPosition ? size<1>(tRgCos) : 1); ++m) {
-                int const idx = block * kBlockMN + get<0>(tRcR(_0{}, m, _0{}));
-                if (idx < max_seqlen * qhead_per_khead) {
-                    int const row = qhead_per_khead_divmod.divide(idx);
-                    Tensor mCos_copy = cute::tiled_divide(make_tensor(&mCos(row, _0{}), Shape<Int<kHeadDim>>{}),
-                                                        Shape<Int<kGmemElemsPerLoad>>{});
-                    Tensor mSin_copy = cute::tiled_divide(make_tensor(&mSin(row, _0{}), Shape<Int<kHeadDim>>{}),
-                                                        Shape<Int<kGmemElemsPerLoad>>{});
-                    #pragma unroll
-                    for (int k = 0; k < size<2>(tRgCos); ++k) {
-                        int const ki = get<1>(tRcR(_0{}, _0{}, k)) / kGmemElemsPerLoad;
-                        if (get<1>(tRcR(_0{}, _0{}, k)) < rotary_dim) {
-                            const bool is_left = get<1>(tRcR(_0{}, _0{}, k)) < rotary_dim / 2;
-                            Tensor gCos = domain_offset(make_coord(is_left ? 0 : -rotary_dim / 2), mCos_copy(_, ki));
-                            Tensor gSin = domain_offset(make_coord(is_left ? 0 : -rotary_dim / 2), mSin_copy(_, ki));
-                            cute::copy(gmem_tiled_copy_rotary_cont, gCos, tRrCosCont(_, m, k));
-                            cute::copy(gmem_tiled_copy_rotary_cont, gSin, tRrSinCont(_, m, k));
-                        }
+        Tensor cR = cute::make_identity_tensor(Shape<Int<kBlockMN>, Int<kHeadDim / 2>>{});  // (BLK_N,BLK_K / 2)
+        Tensor tRcR = gmem_thr_copy_rotary.partition_D(cR);
+
+        // The main bottleneck here is actually instruction cache misses.
+
+        // Similar to PagedKV, it's expensive to compute the pointers.
+        // We split the work among threads loading the same row, then __shfl_sync the pointers.
+        static constexpr int NumPtrPerThread = cute::ceil_div(CUTE_STATIC_V(cute::size<1>(tRrCos)), kGmemThreadsPerRow);
+        Tensor tPrCosPtr = make_tensor<Element const*>(Shape<Int<NumPtrPerThread>>{});
+        Tensor tPrSinPtr = make_tensor<Element const*>(Shape<Int<NumPtrPerThread>>{});
+        #pragma unroll
+        for (int i = 0; i < NumPtrPerThread; ++i) {
+            int const row = i * NumThreads + get<0>(tRcR(_0{}, thread_idx % kGmemThreadsPerRow, _0{}));
+            int const idx = block * kBlockMN + row;
+            int row_actual = qhead_per_khead_divmod.divide(idx);
+            tPrCosPtr[i] = &mCos(row_actual, _0{});
+            tPrSinPtr[i] = &mSin(row_actual, _0{});
+        }
+
+        #pragma unroll
+        for (int m = 0; m < (!FixedPosition ? size<1>(tRgCos) : 1); ++m) {
+            int const idx = block * kBlockMN + get<0>(tRcR(_0{}, m, _0{}));
+            Element const* cos_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrCosPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
+            Element const* sin_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrSinPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
+            if (idx < max_seqlen * qhead_per_khead) {
+                Tensor mCos_copy = cute::tiled_divide(make_tensor(make_gmem_ptr(cos_ptr), Shape<Int<kHeadDim / 2>>{}),
+                                                    Shape<Int<kGmemElemsPerLoad / 2>>{});
+                Tensor mSin_copy = cute::tiled_divide(make_tensor(make_gmem_ptr(sin_ptr), Shape<Int<kHeadDim / 2>>{}),
+                                                    Shape<Int<kGmemElemsPerLoad / 2>>{});
+                #pragma unroll
+                for (int k = 0; k < size<2>(tRgCos); ++k) {
+                    int const ki = get<1>(tRcR(_0{}, _0{}, k)) / (kGmemElemsPerLoad / 2);
+                    if (tRpR(k)) {
+                        cute::copy(gmem_tiled_copy_rotary, mCos_copy(_, ki), tRrCos(_, m, k));
+                        cute::copy(gmem_tiled_copy_rotary, mSin_copy(_, ki), tRrSin(_, m, k));
                     }
                 }
             }
         }
-        // if (thread_idx == 0) { print_tensor(tRrCosCont); print_tensor(tRrSinCont); }
-        return cute::make_tuple(tRrCos, tRrSin, tRrCosCont, tRrSinCont);
+        return cute::make_tuple(tRrCos, tRrSin);
+    }
+
+    CUTLASS_DEVICE
+    auto load_cos_sin_contiguous(int const block) {
+        Tensor tRgCosContCur = tRgCosCont(_, _, _, block);
+        Tensor tRgSinContCur = tRgSinCont(_, _, _, block);
+        // make_tensor_like, not make_fragment_like. If the row_stride is _0{} we want to keep it that way
+        Tensor tRrCosCont = make_tensor_like(tRgCosContCur);
+        Tensor tRrSinCont = make_tensor_like(tRgSinContCur);
+        Tensor cR = cute::make_identity_tensor(Shape<Int<kBlockMN>, Int<kHeadDim>>{});  // (BLK_N,BLK_K / 2)
+        Tensor tRcR = gmem_thr_copy_rotary_cont.partition_D(cR);
+        #pragma unroll
+        for (int m = 0; m < (!FixedPosition ? size<1>(tRgCosCont) : 1); ++m) {
+            if (get<0>(tRcR(_0{}, m, _0{})) < std::min(max_seqlen - block * kBlockMN, kBlockMN)) {
+                #pragma unroll
+                for (int k = 0; k < size<2>(tRgCosCont); ++k) {
+                    if (get<1>(tRcR(_0{}, _0{}, k)) < rotary_dim) {
+                        const bool is_left = get<1>(tRcR(_0{}, _0{}, k)) < rotary_dim / 2;
+                        Tensor gCos = domain_offset(make_coord(is_left ? 0 : -rotary_dim / 2), tRgCosContCur(_, m, k));
+                        Tensor gSin = domain_offset(make_coord(is_left ? 0 : -rotary_dim / 2), tRgSinContCur(_, m, k));
+                        // if (thread_idx == 0) { printf("is_left = %d, k_coord = %d\n", is_left, get<1>(tRcR(_0{}, _0{}, k))); print(tRgCosCont(_, m, k, block)); printf("\n"); print(gCos); printf("\n");}
+                        cute::copy(gmem_tiled_copy_rotary_cont, gCos, tRrCosCont(_, m, k));
+                        cute::copy(gmem_tiled_copy_rotary_cont, gSin, tRrSinCont(_, m, k));
+                        // if (thread_idx == 0) { print_tensor(tRrCosCont(_, m, k));}
+                    }
+                }
+            }
+        }
+        return cute::make_tuple(tRrCosCont, tRrSinCont);;
+    }
+
+    CUTLASS_DEVICE
+    auto load_cos_sin_packgqa_contiguous(int const block, cutlass::FastDivmod const &qhead_per_khead_divmod) {
+        // make_tensor_like, not make_fragment_like. If the row_stride is _0{} we want to keep it that way
+        Tensor tRrCosCont = make_tensor_like(tRgCosCont(_, _, _, _0{}));
+        Tensor tRrSinCont = make_tensor_like(tRgSinCont(_, _, _, _0{}));
+        int const qhead_per_khead = qhead_per_khead_divmod.divisor;
+        Tensor cR = cute::make_identity_tensor(Shape<Int<kBlockMN>, Int<kHeadDim>>{});  // (BLK_N,BLK_K / 2)
+        Tensor tRcR = gmem_thr_copy_rotary_cont.partition_D(cR);
+
+        // Similar to PagedKV, it's expensive to compute the pointers.
+        // We split the work among threads loading the same row, then __shfl_sync the pointers.
+        static constexpr int NumPtrPerThread = cute::ceil_div(CUTE_STATIC_V(cute::size<1>(tRrCosCont)), kGmemThreadsPerRow);
+        Tensor tPrCosPtr = make_tensor<Element const*>(Shape<Int<NumPtrPerThread>>{});
+        Tensor tPrSinPtr = make_tensor<Element const*>(Shape<Int<NumPtrPerThread>>{});
+        #pragma unroll
+        for (int i = 0; i < NumPtrPerThread; ++i) {
+            int const row = i * NumThreads + get<0>(tRcR(_0{}, thread_idx % kGmemThreadsPerRow, _0{}));
+            int const idx = block * kBlockMN + row;
+            int row_actual = qhead_per_khead_divmod.divide(idx);
+            tPrCosPtr[i] = &mCos(row_actual, _0{});
+            tPrSinPtr[i] = &mSin(row_actual, _0{});
+        }
+
+        #pragma unroll
+        for (int m = 0; m < (!FixedPosition ? size<1>(tRgCos) : 1); ++m) {
+            int const idx = block * kBlockMN + get<0>(tRcR(_0{}, m, _0{}));
+            Element const* cos_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrCosPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
+            Element const* sin_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrSinPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
+            if (idx < max_seqlen * qhead_per_khead) {
+                Tensor mCos_copy = cute::tiled_divide(make_tensor(make_gmem_ptr(cos_ptr), Shape<Int<kHeadDim>>{}),
+                                                    Shape<Int<kGmemElemsPerLoad>>{});
+                Tensor mSin_copy = cute::tiled_divide(make_tensor(make_gmem_ptr(sin_ptr), Shape<Int<kHeadDim>>{}),
+                                                    Shape<Int<kGmemElemsPerLoad>>{});
+                #pragma unroll
+                for (int k = 0; k < size<2>(tRgCos); ++k) {
+                    int const ki = get<1>(tRcR(_0{}, _0{}, k)) / kGmemElemsPerLoad;
+                    if (get<1>(tRcR(_0{}, _0{}, k)) < rotary_dim) {
+                        const bool is_left = get<1>(tRcR(_0{}, _0{}, k)) < rotary_dim / 2;
+                        Tensor gCos = domain_offset(make_coord(is_left ? 0 : -rotary_dim / 2), mCos_copy(_, ki));
+                        Tensor gSin = domain_offset(make_coord(is_left ? 0 : -rotary_dim / 2), mSin_copy(_, ki));
+                        cute::copy(gmem_tiled_copy_rotary_cont, gCos, tRrCosCont(_, m, k));
+                        cute::copy(gmem_tiled_copy_rotary_cont, gSin, tRrSinCont(_, m, k));
+                    }
+                }
+            }
+        }
+        return cute::make_tuple(tRrCosCont, tRrSinCont);
     }
 
     template <typename TensorsQ, typename TensortRrR>
@@ -275,23 +269,20 @@ struct Rotary {
                         TensortRrR const &tRrSin,   // (kBlockM, kHeadDim / 2) split according to GmemThrCopyRotary
                         int const m_block, int const qhead_per_khead=1)
     {
-        if (rotary_dim <= 0) { return; }
-
         GmemTiledCopyQK gmem_tiled_copy_q;
         auto gmem_thr_copy_q = gmem_tiled_copy_q.get_thread_slice(thread_idx);
         Tensor tQsQ = gmem_thr_copy_q.partition_S(sQ);
         Tensor tQcQ = gmem_thr_copy_q.partition_S(cute::make_identity_tensor(Shape<Int<kBlockMN>, Int<kHeadDim>>{}));
-        Tensor tQrQ = make_fragment_like(tQsQ);
 
-        CUTE_STATIC_ASSERT_V(rank(tQrQ) == _3{});
+        CUTE_STATIC_ASSERT_V(rank(tQsQ) == _3{});
         CUTE_STATIC_ASSERT_V(rank(tRrCos) == _3{});
         CUTE_STATIC_ASSERT_V(rank(tRrSin) == _3{});
-        CUTE_STATIC_ASSERT_V(size<1>(tQrQ) == size<1>(tRrCos));
-        CUTE_STATIC_ASSERT_V(size<2>(tQrQ) == size<2>(tRrCos));
-        CUTE_STATIC_ASSERT_V(size<1>(tQrQ) == size<1>(tRrSin));
-        CUTE_STATIC_ASSERT_V(size<2>(tQrQ) == size<2>(tRrSin));
+        CUTE_STATIC_ASSERT_V(size<1>(tQsQ) == size<1>(tRrCos));
+        CUTE_STATIC_ASSERT_V(size<2>(tQsQ) == size<2>(tRrCos));
+        CUTE_STATIC_ASSERT_V(size<1>(tQsQ) == size<1>(tRrSin));
+        CUTE_STATIC_ASSERT_V(size<2>(tQsQ) == size<2>(tRrSin));
         CUTE_STATIC_ASSERT_V(size<0>(tRrCos) == size<0>(tRrSin));
-        static_assert(decltype(size<0>(tQrQ))::value == decltype(size<0>(tRrCos))::value * 2);
+        static_assert(decltype(size<0>(tQsQ))::value == decltype(size<0>(tRrCos))::value * 2);
         static_assert(decltype(size<0>(tRrCos))::value % 2 == 0);  // Since we do fast conversion from fp16/bf16 to fp32
 
         #pragma unroll
@@ -300,8 +291,9 @@ struct Rotary {
                 #pragma unroll
                 for (int k = 0; k < size<2>(tQsQ); ++k) {
                     if (tRpR(k)) {
-                        cute::copy(gmem_tiled_copy_q, tQsQ(_, m, k), tQrQ(_, m, k));
-                        Tensor Q_fp32 = convert_type<float>(tQrQ(_, m, k));
+                        Tensor rQ = make_fragment_like(tQsQ(_, m, k));
+                        cute::copy(gmem_tiled_copy_q, tQsQ(_, m, k), rQ);
+                        Tensor Q_fp32 = convert_type<float>(rQ);
                         Tensor cos_fp32 = convert_type<float>(tRrCos(_, m, k));
                         Tensor sin_fp32 = convert_type<float>(tRrSin(_, m, k));
                         #pragma unroll
@@ -326,23 +318,21 @@ struct Rotary {
                        TensortRrR const &tRrSinCont,   // (kBlockM, kHeadDim) split according to GmemThrCopyRotaryCont
                        int const m_block, int const qhead_per_khead=1)
     {
-        if (rotary_dim <= 0) { return; }
-
         GmemTiledCopyQK gmem_tiled_copy_q;
         auto gmem_thr_copy_q = gmem_tiled_copy_q.get_thread_slice(thread_idx);
         Tensor tQsQ = gmem_thr_copy_q.partition_S(sQ);
         Tensor tQcQ = gmem_thr_copy_q.partition_S(cute::make_identity_tensor(Shape<Int<kBlockMN>, Int<kHeadDim>>{}));
         Tensor tQrQ = make_fragment_like(tQsQ);
 
-        CUTE_STATIC_ASSERT_V(rank(tQrQ) == _3{});
+        CUTE_STATIC_ASSERT_V(rank(tQsQ) == _3{});
         CUTE_STATIC_ASSERT_V(rank(tRrCosCont) == _3{});
         CUTE_STATIC_ASSERT_V(rank(tRrSinCont) == _3{});
-        CUTE_STATIC_ASSERT_V(size<1>(tQrQ) == size<1>(tRrCosCont));
-        CUTE_STATIC_ASSERT_V(size<2>(tQrQ) == size<2>(tRrCosCont));
-        CUTE_STATIC_ASSERT_V(size<1>(tQrQ) == size<1>(tRrSinCont));
-        CUTE_STATIC_ASSERT_V(size<2>(tQrQ) == size<2>(tRrSinCont));
+        CUTE_STATIC_ASSERT_V(size<1>(tQsQ) == size<1>(tRrCosCont));
+        CUTE_STATIC_ASSERT_V(size<2>(tQsQ) == size<2>(tRrCosCont));
+        CUTE_STATIC_ASSERT_V(size<1>(tQsQ) == size<1>(tRrSinCont));
+        CUTE_STATIC_ASSERT_V(size<2>(tQsQ) == size<2>(tRrSinCont));
         CUTE_STATIC_ASSERT_V(size<0>(tRrCosCont) == size<0>(tRrSinCont));
-        static_assert(decltype(size<0>(tQrQ))::value == decltype(size<0>(tRrCosCont))::value);
+        static_assert(decltype(size<0>(tQsQ))::value == decltype(size<0>(tRrCosCont))::value);
         static_assert(decltype(size<0>(tRrCosCont))::value % 2 == 0);  // Since we do fast conversion from fp16/bf16 to fp32
 
         // Tensor membermask_k = make_tensor<uint32_t>(make_shape(size<2>(tQsQ)));
@@ -353,10 +343,10 @@ struct Rotary {
         #pragma unroll
         for (int m = 0; m < size<1>(tQsQ); ++m) {
             int const row = get<0>(tQcQ(_0{}, m, _0{}));
-            // bool valid_m = row < std::min(max_seqlen * qhead_per_khead - m_block * kBlockMN, kBlockMN);
-            // uint32_t membermask_m = __ballot_sync(0xffffffff, valid_m);
-            if (row < std::min(max_seqlen * qhead_per_khead - m_block * kBlockMN, kBlockMN)) {
-            // if (valid_m) {
+            bool valid_m = row < std::min(max_seqlen * qhead_per_khead - m_block * kBlockMN, kBlockMN);
+            uint32_t membermask_m = __ballot_sync(0xffffffff, valid_m);
+            // if (row < std::min(max_seqlen * qhead_per_khead - m_block * kBlockMN, kBlockMN)) {
+            if (valid_m) {
                 #pragma unroll
                 for (int k = 0; k < size<2>(tQsQ); ++k) {
                     int const col = get<1>(tQcQ(_0{}, _0{}, k));
@@ -379,12 +369,7 @@ struct Rotary {
                         cute::copy(convert_type<TensorsQ::value_type>(Q_fp32), tQrQ(_, m, k));
                     }
                 }
-            }
-        }
-        __syncwarp();  // All smem reads are within the same warp
-        #pragma unroll
-        for (int m = 0; m < size<1>(tQsQ); ++m) {
-            if (get<0>(tQcQ(_0{}, m, _0{})) < std::min(max_seqlen * qhead_per_khead - m_block * kBlockMN, kBlockMN)) {
+                __syncwarp(membermask_m);
                 #pragma unroll
                 for (int k = 0; k < size<2>(tQsQ); ++k) {
                     if (tRpR(k)) {
@@ -393,6 +378,18 @@ struct Rotary {
                 }
             }
         }
+        // __syncwarp();  // All smem reads are within the same warp
+        // #pragma unroll
+        // for (int m = 0; m < size<1>(tQsQ); ++m) {
+        //     if (get<0>(tQcQ(_0{}, m, _0{})) < std::min(max_seqlen * qhead_per_khead - m_block * kBlockMN, kBlockMN)) {
+        //         #pragma unroll
+        //         for (int k = 0; k < size<2>(tQsQ); ++k) {
+        //             if (tRpR(k)) {
+        //                 cute::copy(gmem_tiled_copy_q, tQrQ(_, m, k), tQsQ(_, m, k));
+        //             }
+        //         }
+        //     }
+        // }
         // if (thread_idx == 0) { print_tensor(tRrCosCont); print_tensor(tRrSinCont); print_tensor(tQrQ); }
     };
 
