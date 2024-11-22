@@ -876,9 +876,7 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
         (1023, 1024),
     ],
 )
-# TODO: Support paged_kv_block
-# @pytest.mark.parametrize("paged_kv_block_size", [None, 256, 512])
-@pytest.mark.parametrize("paged_kv_block_size", [None])
+@pytest.mark.parametrize("paged_kv_block_size", [None, 256, 512])
 def test_flash_attn_varlen_causal(
     seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, dtype
 ):
