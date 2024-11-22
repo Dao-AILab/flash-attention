@@ -42,7 +42,8 @@ struct CollectiveEpilogueFwd {
     // We want each "row" to have 64 elements (128 bytes, i.e. 1 cache line). We want each thread to have 4 elements
     // in the M direction and 2 elements in the K direction. In the case of PackGQA, this reduces the number of times
     // we need to call divmod.
-    static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? (128 / sizeof(Element)) : (kHeadDim % 64 == 0 ? 64 : 32);
+    static constexpr int kBytePerRow = kHeadDim * sizeof(Element);
+    static constexpr int kBlockKGmem = (kBytePerRow % 128 == 0 ? 128 : (kBytePerRow % 64 == 0 ? 64 : 32)) / sizeof(Element);
     // static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
     // static constexpr int kGmemThreadsPerRow = cutlass::gcd(kHeadDim / kGmemElemsPerStore, NumEpilogueThreads);
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerStore;
