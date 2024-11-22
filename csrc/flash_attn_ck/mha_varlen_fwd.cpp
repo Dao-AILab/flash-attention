@@ -183,17 +183,15 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
                                                           at::Tensor out_acc)
 {
     // q: (total_q, nheads, d)
-    // k: (total_k, nheads_k, d)
-    // v: (total_k, nheads_k, d)
+    // k: (num_blocks, page_block_size, num_heads_k, d)
+    // v: (num_blocks, page_block_size, num_heads_k, d)
     // o: (total_q, nheads, d)
 
     // alibi_slopes:(batch_size, nheads) or (nhead)
     // lse: (nheads, total_q)
     // lse_acc: (nheads, split, total_q)
     // o_acc: (nheads, split, total_q, d)
-
-    ck_tile::index_t total_q = q.size(0);
-    ck_tile::index_t total_k = k.size(0);
+    // block_table: (batch_size, max_num_blocks_per_seq)
 
     fmha_fwd_splitkv_args args;
     args.q_ptr = q.data_ptr();
@@ -225,8 +223,6 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     args.seqstart_k_ptr = seqlens_k.data_ptr();
     args.seqlen_k_ptr = nullptr;
 
-    args.seqlen_q = total_q;
-    args.seqlen_k = total_k;
     args.batch = b;
     args.max_seqlen_q = max_seqlen_q;
     args.hdim_q = d;
@@ -243,13 +239,13 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     args.stride_q = q.stride(0);
     args.nhead_stride_q = q.stride(1);
 
-    args.batch_stride_k = 0;
-    args.stride_k = k.stride(0);
-    args.nhead_stride_k = k.stride(1);
+    args.batch_stride_k = k.stride(0);
+    args.stride_k = k.stride(1);
+    args.nhead_stride_k = k.stride(2);
 
-    args.batch_stride_v = 0;
-    args.stride_v = v.stride(0);
-    args.nhead_stride_v = v.stride(1);
+    args.batch_stride_v = v.stride(0);
+    args.stride_v = v.stride(1);
+    args.nhead_stride_v = v.stride(2);
 
     args.batch_stride_o = 0;
     args.stride_o = out.stride(0);
