@@ -1538,8 +1538,8 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
     params.pack_gqa = pack_gqa_.has_value() ? int (pack_gqa_.value()) : -1;
 
     at::Tensor tile_count_semaphore;
-    // We don't use the persistent scheduler if Split or PagedKV
-    if ((params.is_causal || params.is_local || seqused_k_.has_value() || leftpad_k_.has_value()) && params.num_splits == 1 && !paged_KV) {
+    // We don't use the persistent scheduler if Split or PagedKV or AppendKV
+    if ((params.is_causal || params.is_local || seqused_k_.has_value() || leftpad_k_.has_value()) && params.num_splits == 1 && !paged_KV && !k_.has_value()) {
         tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32));
         params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
     } else {

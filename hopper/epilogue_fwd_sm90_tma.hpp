@@ -261,6 +261,7 @@ struct CollectiveEpilogueFwd {
             }
         } else {  // Don't use TMA since we don't want to overwrite the output of another sequence
             Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset_o * get<0>(params.stride_O)), params.shape_O_packed, params.stride_O_packed)(_, _, bidh, !is_varlen ? bidb : 0, split_idx);
+            Tensor gO = local_tile(mO, select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
             // if (thread_idx == 0) { printf("Before O write, m_block: %d, bidh: %d, bidb: %d, split_idx: %d, offset_o: %d, seqlen_o: %d, mO_addr = %p, addr diff = %d\n", m_block, bidh, bidb, split_idx, offset_o, seqlen_o, mO.data(), reinterpret_cast<int>(&mO(0)) - reinterpret_cast<int>(params.ptr_O)); }
             if constexpr (Use_smem) {
                 GmemTiledCopyO gmem_tiled_copy_O;
@@ -280,7 +281,6 @@ struct CollectiveEpilogueFwd {
                     Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOsO)));
                     #pragma unroll
                     for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(params.shape_O); }
-                    Tensor gO = local_tile(mO, select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
                     Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
                     // Clear_OOB_K must be false since we don't want to write zeros to gmem
                     flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
@@ -297,6 +297,7 @@ struct CollectiveEpilogueFwd {
                 // Reshape acc from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
                 Tensor tOrO_rowcol = make_tensor(tOrO_out.data(), flash::convert_layout_acc_rowcol(tOrO.layout()));
                 Tensor tOrO_copy = cute::tiled_divide(tOrO_rowcol, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});
+                // TODO: we can just use thr_mma to partition here
                 Tensor mO_copy = cute::tiled_divide(mO, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});
                 // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the row indices.
                 Tensor taccOcO_col = taccOcO(make_coord(_, _0{}, _), _0{}, _);
@@ -328,6 +329,7 @@ struct CollectiveEpilogueFwd {
     }
 
     // Write 0 to output and -inf to LSE
+    template <bool Clear_O=true>
     CUTLASS_DEVICE void
     store_zero(
          Params const& params,
@@ -343,6 +345,23 @@ struct CollectiveEpilogueFwd {
         Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset_o * get<0>(params.stride_O)), params.shape_O_packed, params.stride_O_packed)(_, _, bidh, !is_varlen ? bidb : 0, split_idx);
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE + offset_o * get<0>(params.stride_LSE)), params.shape_LSE_packed, params.stride_LSE_packed)(_, bidh, !is_varlen ? bidb : 0, split_idx);
         Tensor gLSE = local_tile(mLSE, Shape<Int<kBlockM>>{}, make_coord(m_block));
+
+        static_assert(kBlockM <= NumEpilogueThreads);
+        if (thread_idx < kBlockM) {
+            const int row = m_block * kBlockM + thread_idx;
+            if constexpr (!PackGQA) {
+                if (row < seqlen_o) { mLSE(row) = -INFINITY; }
+            } else {
+                if (row < seqlen_o * qhead_per_khead) {
+                    int m_idx, h_idx;
+                    m_idx = params.qhead_per_khead_divmod.divmod(h_idx, row);
+                    // mLSE shape shape ((qhead_per_khead, seqlen_q)) and it's unhappy with just 1 "make_coord"
+                    mLSE(make_coord(make_coord(h_idx, m_idx))) = -INFINITY;
+                }
+            }
+        }
+
+        if constexpr (!Clear_O) { return; }
 
         GmemTiledCopyO gmem_tiled_copy_O;
         auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
@@ -369,20 +388,6 @@ struct CollectiveEpilogueFwd {
             // TODO: check correctness
         }
 
-        static_assert(kBlockM <= NumEpilogueThreads);
-        if (thread_idx < kBlockM) {
-            const int row = m_block * kBlockM + thread_idx;
-            if constexpr (!PackGQA) {
-                if (row < seqlen_o) { mLSE(row) = -INFINITY; }
-            } else {
-                if (row < seqlen_o * qhead_per_khead) {
-                    int m_idx, h_idx;
-                    m_idx = params.qhead_per_khead_divmod.divmod(h_idx, row);
-                    // mLSE shape shape ((qhead_per_khead, seqlen_q)) and it's unhappy with just 1 "make_coord"
-                    mLSE(make_coord(make_coord(h_idx, m_idx))) = -INFINITY;
-                }
-            }
-        }
     }
 
 };

@@ -106,6 +106,7 @@ public:
     // have have 64 such quads.
     static_assert(MaxThreadsPerBlock % kBlockMSmem == 0, "MaxThreadsPerBlock must be a multiple of kBlockMSmem");
     static constexpr int kSmemThreadsPerColLSEt = MaxThreadsPerBlock / kBlockMSmem;
+    static_assert(cutlass::NumThreadsPerWarp % kSmemThreadsPerColLSEt == 0, "kSmemThreadsPerColLSEt must divide NumThreadsPerWarp");
     using S2RLayoutAtomLSE = Layout<Shape<Int<kSmemThreadsPerColLSEt>, Int<MaxThreadsPerBlock / kSmemThreadsPerColLSEt>>>;
     using S2RTiledCopyLSE = decltype(make_tiled_copy(cute::Copy_Atom<cute::DefaultCopy, float>{}, S2RLayoutAtomLSE{}, Layout<_1>{}));
 
@@ -120,6 +121,7 @@ public:
 
     struct SharedStorage : cute::aligned_struct<128> {
         cute::array_aligned<float, cute::cosize_v<SmemLayoutLSE>> smem_lse_partial;
+        cute::array_aligned<int, kBlockM> smem_max_valid_split;
         cute::array_aligned<ElementPartial, cute::cosize_v<SmemLayoutO>> smem_o_partial;
     };
 
@@ -187,6 +189,7 @@ public:
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
         Tensor sLSE = make_tensor(make_smem_ptr(shared_storage.smem_lse_partial.data()), SmemLayoutLSE{});
+        Tensor sMaxValidSplit = make_tensor(make_smem_ptr(shared_storage.smem_max_valid_split.data()), Shape<Int<kBlockM>>{});
         Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o_partial.data()), SmemLayoutO{});
 
         int const thread_idx = threadIdx.x;
@@ -228,7 +231,7 @@ public:
                 #pragma unroll
                 for (int s = 0; s < size<1>(tLSEcLSE); ++s) {
                     int si = get<0>(tLSEcLSE(_0{}, s, _0{}));
-                    // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && thread_idx < 32) { printf("tidx = %d, m = %d, s = %d, addr = %p, bank = %d\n", thread_idx, m, s, reinterpret_cast<float *>(&(tLSEsLSE(_0{}, s, m))), reinterpret_cast<int>(&(tLSEsLSE(_0{}, s, m))) / 4 % 32);}
+                    // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && thread_idx < 32) { printf("thread_idx = %d, m = %d, s = %d, addr = %p, bank = %d\n", thread_idx, m, s, reinterpret_cast<float *>(&(tLSEsLSE(_0{}, s, m))), reinterpret_cast<int>(&(tLSEsLSE(_0{}, s, m))) / 4 % 32);}
                     if (si < num_splits) {
                         cute::copy(gmem_tiled_copy_LSE, mLSEpartial_cur_copy(_, si), tLSEsLSE(_, s, m));
                     } else {
@@ -318,6 +321,9 @@ public:
 
         // Step 4: compute the final LSE along the split dimension
         Tensor lse_sum = make_tensor<float>(make_shape(size<2>(ts2rrLSE)));
+        Tensor ts2rcLSE = s2r_thr_copy_LSE.partition_D(cLSE);
+        // We compute the max valid split for each row to short-circuit the computation later
+        Tensor max_valid_split = make_tensor<int>(make_shape(size<2>(ts2rrLSE)));
         static_assert(CUTE_STATIC_V(size<0>(ts2rrLSE)) == 1);
         #pragma unroll
         for (int m = 0; m < size<2>(ts2rrLSE); ++m) {
@@ -326,13 +332,20 @@ public:
             for (int s = 1; s < size<1>(ts2rrLSE); ++s) { lse_max = max(lse_max, ts2rrLSE(_0{}, s, m)); }
             MaxOp<float> max_op;
             lse_max = Allreduce<kSmemThreadsPerColLSEt>::run(lse_max, max_op);
+            int max_valid_idx = -1;
+            #pragma unroll
+            for (int s = 0; s < size<1>(ts2rrLSE); ++s) {
+                if (ts2rrLSE(_0{}, s, m) != -INFINITY) { max_valid_idx = get<0>(ts2rcLSE(_0{}, s, _0{})); }
+            }
+            MaxOp<int> max_int_op;
+            max_valid_split[m] = Allreduce<kSmemThreadsPerColLSEt>::run(max_valid_idx, max_int_op);
             float lse_max_cur = lse_max == -INFINITY ? 0.0f : lse_max;  // In case all local LSEs are -inf
             float lse_sum_cur = 0.f;
             #pragma unroll
             for (int s = 0; s < size<1>(ts2rrLSE); ++s) {
                 float scale = expf(ts2rrLSE(_0{}, s, m) - lse_max_cur);
                 lse_sum_cur += scale;
-                // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && thread_idx < 32) { printf("tidx = %d, m = %d, s = %d, addr = %p, bank = %d\n", thread_idx, m, s, reinterpret_cast<float *>(&(ts2rsLSE(_0{}, s, m))), reinterpret_cast<int>(&(ts2rsLSE(_0{}, s, m))) / 4 % 32);}
+                // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && thread_idx < 32) { printf("thread_idx = %d, m = %d, s = %d, addr = %p, bank = %d\n", thread_idx, m, s, reinterpret_cast<float *>(&(ts2rsLSE(_0{}, s, m))), reinterpret_cast<int>(&(ts2rsLSE(_0{}, s, m))) / 4 % 32);}
                 // ts2rsLSE(_0{}, m, s) = scale;
                 ts2rrLSE(_0{}, s, m) = scale;
             }
@@ -350,8 +363,6 @@ public:
         // Step 5: store final LSE back to gmem
         auto shape_LSE = select<0, 2, 3>(params.shape_LSE_partial);
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE + offset * get<0>(params.stride_LSE)), shape_LSE, params.stride_LSE);
-        // Repeat the partitioning with identity layouts
-        Tensor ts2rcLSE = s2r_thr_copy_LSE.partition_S(cLSE);
         #pragma unroll
         for (int m = 0; m < size<2>(ts2rrLSE); ++m) {
             if (get<0>(ts2rcLSE(_0{}, _0{}, m)) == 0) {  // Only the thread responsible for s=0 writes to gmem
@@ -365,24 +376,28 @@ public:
                         bidh = seqlen_divmod_dynamic.divmod(m_idx, idx);
                         bidb = 0;
                     }
-                    // printf("tidx = %d, m = %d, mi = %d, idx = %d, m_idx = %d, bidh = %d, bidb = %d, lse_sum = %f\n", thread_idx, m, mi, idx, m_idx, bidh, bidb, lse_sum(m));
+                    // printf("thread_idx = %d, m = %d, mi = %d, idx = %d, m_idx = %d, bidh = %d, bidb = %d, lse_sum = %f\n", thread_idx, m, mi, idx, m_idx, bidh, bidb, lse_sum(m));
                     mLSE(m_idx, bidh, bidb) = lse_sum(m);
                 }
+                if (mi < kBlockM) { sMaxValidSplit[mi] = max_valid_split[m]; }
             }
         }
         // if (blockIdx.x == 0 && blockIdx.z == 0 && thread_idx == 0) { print(mLSE); printf("\n"); print(gLSE); printf("\n"); }
 
         // Step 6: read O_partial from gmem -> smem -> rmem and accumulate the final O
         __syncthreads();
-        auto tOrOpartial_layout = gmem_thr_copy_O_partial.partition_S(make_tensor<ElementPartial>(TileShape_MK{})).layout();
+        int thr_max_valid_split = sMaxValidSplit[get<0>(tOcO(_0{}, _0{}, _0{}))];
+        #pragma unroll
+        for (int m = 1; m < size<1>(tOcO); ++m) { thr_max_valid_split = max(thr_max_valid_split, sMaxValidSplit[get<0>(tOcO(_0{}, m, _0{}))]); }
+        Layout tOrOpartial_layout = gmem_thr_copy_O_partial.partition_S(make_tensor<ElementPartial>(TileShape_MK{})).layout();
         Tensor tOrOpartial = make_fragment_like<ElementPartial>(tOrOpartial_layout);
         Tensor tOrO = make_fragment_like<float>(tOrOpartial);
         clear(tOrO);
         int stage_load = kStages - 1, stage_compute = 0;
         #pragma unroll 4 // Already tuned for speed
-        for (int s = 0; s < num_splits; ++s) {
+        for (int s = 0; s <= thr_max_valid_split; ++s) {
             Tensor scale_load = make_tensor<float>(make_shape(size<1>(tOrOpartial)));
-            if (s + kStages - 1 < num_splits) {
+            if (s + kStages - 1 <= thr_max_valid_split) {
                 #pragma unroll
                 for (int m = 0; m < size<1>(tOrOpartial); ++m) {
                     scale_load(m) = sLSE(s + kStages - 1, get<0>(tOcO(_0{}, m, _0{})));
@@ -393,11 +408,11 @@ public:
             for (int m = 0; m < size<1>(tOrOpartial); ++m) { scale(m) = sLSE(s, get<0>(tOcO(_0{}, m, _0{}))); }
 
             // if (s + 1 < num_splits) { load_O_partial(s + 1, (s + 1) % 2); }
-            if (s + kStages - 1 < num_splits) {
+            if (s + kStages - 1 <= thr_max_valid_split) {
                 #pragma unroll
                 for (int m = 0; m < size<1>(tOcO); ++m) {
-                    if (tObidb(m) >= 0 && scale_load(m) > 0.f)  {
-                    // if (tObidb(m) >= 0)  {
+                    // if (tObidb(m) >= 0 && scale_load(m) > 0.f)  {
+                    if (tObidb(m) >= 0)  {
                         Tensor mOpartial_cur = make_tensor(make_gmem_ptr(tOrOptr[m]), mOpartial(_0{}, _, _, _0{}, _0{}).layout());
                         Tensor mOpartial_cur_copy = cute::tiled_divide(mOpartial_cur, Shape<Int<kGmemElemsPerLoad>>{});
                         #pragma unroll

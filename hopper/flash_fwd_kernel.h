@@ -394,6 +394,9 @@ public:
                                             threadIdx.x - MmaThreadOffset, block_coord);
                 } else {
                     // Write 0 to gO and -inf to gLSE.
+                    // If Split, we don't have to write 0 to O if the mha_combine kernel is used, since it will
+                    // not use the value of O if LSE is -inf. However this doesn't seem to speed things up.
+                    // collective_epilogue.template store_zero<!Split /*Clear_O*/>(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
                     collective_epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
                 }
 

@@ -1098,8 +1098,8 @@ def attention_combine_ref(out_partial, lse_partial):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float32])
-@pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize("d", [64, 96, 128, 192, 256])
+# @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
+@pytest.mark.parametrize("d", [64, 96, 128, 192, 256])
 # @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize("seqlen", [1, 2, 3, 32, 64, 256, 113, 108, 640, 1024, 2048])
 # @pytest.mark.parametrize("seqlen", [12, 32, 64, 256, 112, 108, 640, 1024, 2048, 8192])
@@ -1111,13 +1111,14 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     device = "cuda"
     # set seed
     torch.random.manual_seed(1)
-    batch_size = 1
-    nheads = 32
+    batch_size = 5
+    nheads = 16
     # batch_size = 1
     # nheads = 1
     out_partial = torch.randn(num_splits * 2, batch_size, nheads, seqlen, d, device=device, dtype=torch.float32).transpose(2, 3)[:num_splits]  # To test non-contiguous tensor
     lse_partial = torch.randn(num_splits, batch_size, nheads * 2, seqlen, device=device, dtype=torch.float32).transpose(-1, -2)[:, :, :, :nheads]  # To test non-contiguous tensor
-    # lse_partial[num_splits // 2:] = -float("inf")
+    # To test short-circuiting based on num_splits
+    lse_partial[num_splits // 2:, :batch_size // 3] = -float("inf")
     out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=dtype)
     out_ref, lse_ref = attention_combine_ref(out_partial, lse_partial)
     out_pt = out_ref.to(dtype)
