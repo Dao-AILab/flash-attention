@@ -205,7 +205,6 @@ public:
         // Step 1: load LSE_partial from gmem -> smem
         Tensor mLSEpartial = make_tensor(make_gmem_ptr(params.ptr_LSE_partial + offset * get<0>(params.stride_LSE_partial)), select<1, 0, 2, 3>(params.shape_LSE_partial), select<1, 0, 2, 3>(params.stride_LSE_partial));  // (num_splits, seqlen, head, batch)
         Tensor mLSEpartial_copy = cute::tiled_divide(mLSEpartial, Shape<_1, Int<kGmemElemsPerLoadLSE>>{});
-        // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && thread_idx == 0) { print(mLSEpartial); printf("\n"); }
         GmemTiledCopyLSE gmem_tiled_copy_LSE;
         auto gmem_thr_copy_LSE = gmem_tiled_copy_LSE.get_thread_slice(thread_idx);
         Tensor tLSEsLSE = gmem_thr_copy_LSE.partition_D(sLSE);
@@ -283,7 +282,6 @@ public:
         }
 
         Tensor tOsOpartial = gmem_thr_copy_O_partial.partition_D(sO);
-        // if (cute::thread0()) { print(tOsOpartial); printf("\n"); }
 
         auto load_O_partial = [&] (int split, int stage) {
             Tensor tOsOpartial_cur = tOsOpartial(_, _, _, stage);
@@ -317,7 +315,6 @@ public:
         Tensor ts2rsLSE = s2r_thr_copy_LSE.partition_S(sLSE);
         Tensor ts2rrLSE = make_fragment_like(ts2rsLSE);
         cute::copy(s2r_tiled_copy_LSE, ts2rsLSE, ts2rrLSE);
-        // if (cute::thread0()) { print(ts2rsLSE); printf("\n"); print_tensor(ts2rrLSE); printf("\n"); }
 
         // Step 4: compute the final LSE along the split dimension
         Tensor lse_sum = make_tensor<float>(make_shape(size<2>(ts2rrLSE)));
@@ -358,7 +355,6 @@ public:
         }
         // Store the scales exp(lse - lse_logsum) back to smem
         cute::copy(s2r_tiled_copy_LSE, ts2rrLSE, ts2rsLSE);
-        // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && thread_idx == 0) { print_tensor(lse_sum); printf("\n"); }
 
         // Step 5: store final LSE back to gmem
         auto shape_LSE = select<0, 2, 3>(params.shape_LSE_partial);
@@ -382,7 +378,6 @@ public:
                 if (mi < kBlockM) { sMaxValidSplit[mi] = max_valid_split[m]; }
             }
         }
-        // if (blockIdx.x == 0 && blockIdx.z == 0 && thread_idx == 0) { print(mLSE); printf("\n"); print(gLSE); printf("\n"); }
 
         // Step 6: read O_partial from gmem -> smem -> rmem and accumulate the final O
         __syncthreads();
@@ -396,46 +391,19 @@ public:
         int stage_load = kStages - 1, stage_compute = 0;
         #pragma unroll 4 // Already tuned for speed
         for (int s = 0; s <= thr_max_valid_split; ++s) {
-            Tensor scale_load = make_tensor<float>(make_shape(size<1>(tOrOpartial)));
-            if (s + kStages - 1 <= thr_max_valid_split) {
-                #pragma unroll
-                for (int m = 0; m < size<1>(tOrOpartial); ++m) {
-                    scale_load(m) = sLSE(s + kStages - 1, get<0>(tOcO(_0{}, m, _0{})));
-                }
-            }
             Tensor scale = make_tensor<float>(make_shape(size<1>(tOrOpartial)));
             #pragma unroll
             for (int m = 0; m < size<1>(tOrOpartial); ++m) { scale(m) = sLSE(s, get<0>(tOcO(_0{}, m, _0{}))); }
 
-            // if (s + 1 < num_splits) { load_O_partial(s + 1, (s + 1) % 2); }
-            if (s + kStages - 1 <= thr_max_valid_split) {
-                #pragma unroll
-                for (int m = 0; m < size<1>(tOcO); ++m) {
-                    // if (tObidb(m) >= 0 && scale_load(m) > 0.f)  {
-                    if (tObidb(m) >= 0)  {
-                        Tensor mOpartial_cur = make_tensor(make_gmem_ptr(tOrOptr[m]), mOpartial(_0{}, _, _, _0{}, _0{}).layout());
-                        Tensor mOpartial_cur_copy = cute::tiled_divide(mOpartial_cur, Shape<Int<kGmemElemsPerLoad>>{});
-                        #pragma unroll
-                        for (int k = 0; k < size<2>(tOcO); ++k) {
-                            int k_idx = get<1>(tOcO(_0{}, _0{}, k)) / kGmemElemsPerLoad;
-                            if (Is_even_K || tOpO(k)) {
-                                cute::copy(gmem_tiled_copy_O_partial, mOpartial_cur_copy(_, k_idx, s + kStages - 1), tOsOpartial(_, m, k, stage_load));
-                            }
-                        }
-                    }
-                }
-            }
-            // if (cute::thread0()) { print(tOsOpartial); printf("stage_load = %d, state_compute = %d\n", stage_load, stage_compute);}
+            if (s + kStages - 1 <= thr_max_valid_split) { load_O_partial(s + kStages - 1, stage_load); }
             if constexpr (Has_cp_async) { cute::cp_async_fence(); }
             stage_load = stage_load < kStages - 1 ? stage_load + 1 : 0;
-
             if constexpr (Has_cp_async) { cutlass::arch::cp_async_wait<kStages - 1>(); }
             // We don't need __syncthreads() because each thread is just reading its own data from smem
             cute::copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementPartial>{},
                        tOsOpartial(_, _, _, stage_compute), tOrOpartial);
             stage_compute = stage_compute < kStages - 1 ? stage_compute + 1 : 0;
 
-            // if (cute::thread0()) { print_tensor(tOrOpartial); }
             #pragma unroll
             for (int m = 0; m < size<1>(tOrOpartial); ++m) {
                 if (tObidb(m) >= 0 && scale(m) > 0.f) {

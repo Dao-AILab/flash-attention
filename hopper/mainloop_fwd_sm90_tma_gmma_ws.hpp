@@ -994,8 +994,8 @@ struct CollectiveMainloopFwd {
             // WIP: a version without intra-warpgroup overlap, for benchmarking / didactic purposes
 
             auto fwd_step = [&](int const n_block, auto mask_fn, auto is_first_iter_type, auto check_inf_type) {
-                static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
-                static constexpr bool Check_inf = decltype(check_inf_type)::value;
+                // static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
+                // static constexpr bool Check_inf = decltype(check_inf_type)::value;
                 Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);

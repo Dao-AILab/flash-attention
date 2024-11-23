@@ -384,8 +384,6 @@ struct CollectiveEpilogueFwd {
             Tensor tOrO = make_tensor<Element>(make_shape(Shape<_1, Int<kGmemElemsPerStore>>{}, size<1>(tOcO), size<2>(tOcO)));
             cute::clear(tOrO);
             PackGQAt::store_O(mO, tOrO, params.qhead_per_khead_divmod, thread_idx, seqlen_o, m_block);
-
-            // TODO: check correctness
         }
 
     }
