@@ -113,8 +113,9 @@ if not SKIP_CUDA_BUILD:
     DTYPE_BWD = ["fp16", "bf16"]
     HEAD_DIMENSIONS = [64, 96, 128, 192, 256]
     SPLIT = ["", "_split"]
-    sources_fwd = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{split}_sm90.cu"
-                   for hdim, dtype, split in itertools.product(HEAD_DIMENSIONS, DTYPE_FWD, SPLIT)]
+    PAGEDKV = ["", "_paged"]
+    sources_fwd = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}_sm90.cu"
+                   for hdim, dtype, split, paged in itertools.product(HEAD_DIMENSIONS, DTYPE_FWD, SPLIT, PAGEDKV)]
     sources_bwd = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}_sm90.cu"
                    for hdim, dtype in itertools.product(HEAD_DIMENSIONS, DTYPE_BWD)]
     sources = [

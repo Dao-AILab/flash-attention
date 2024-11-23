@@ -22,20 +22,21 @@ DTYPE_MAP_BWD = {
 
 SM = [90]  # Sm80 kernels support up to
 HEAD_DIMENSIONS = [64, 96, 128, 192, 256]
+PAGEDKV = ["false", "true"]
 SPLIT = ["false", "true"]
 KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_launch_template.h"
 
 template<>
-void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {SPLIT}>(Flash_fwd_params &params, cudaStream_t stream) {{
-    run_mha_fwd_hdim_16b<{DTYPE}, {HEAD_DIM}, {SPLIT}>(params, stream);
+void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}>(Flash_fwd_params &params, cudaStream_t stream) {{
+    run_mha_fwd_hdim_16b<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}>(params, stream);
 }}
 """
 
 KERNEL_IMPL_TEMPLATE_FWD_FP8 = """#include "flash_fwd_launch_template.h"
 
 template<>
-void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {SPLIT}>(Flash_fwd_params &params, cudaStream_t stream) {{
-    run_mha_fwd_fp8_hdim{HEAD_DIM}<{DTYPE}, {SPLIT}>(params, stream);
+void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}>(Flash_fwd_params &params, cudaStream_t stream) {{
+    run_mha_fwd_fp8_hdim{HEAD_DIM}<{DTYPE}, {SPLIT}, {PAGEDKV}>(params, stream);
 }}
 """
 
@@ -53,18 +54,19 @@ class Kernel:
     sm: int
     dtype: str
     head_dim: int
-    split: bool
+    split: str
+    paged_kv: str
     direction: str
 
     @property
     def template(self) -> str:
         if self.direction == "fwd" and self.dtype != "e4m3":
             return KERNEL_IMPL_TEMPLATE_FWD.format(
-                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim, SPLIT=self.split
+                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim, SPLIT=self.split, PAGEDKV=self.paged_kv
             )
         if self.direction == "fwd":
             return KERNEL_IMPL_TEMPLATE_FWD_FP8.format(
-                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim, SPLIT=self.split
+                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim, SPLIT=self.split, PAGEDKV=self.paged_kv
             )
         elif self.direction == "bwd":
             return KERNEL_IMPL_TEMPLATE_BWD.format(
@@ -73,14 +75,14 @@ class Kernel:
 
     @property
     def filename(self) -> str:
-        return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}_{'split_' if self.split == 'true' else ''}sm{self.sm}.cu"
+        return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}_{'paged_' if self.paged_kv == 'true' else ''}{'split_' if self.split == 'true' else ''}sm{self.sm}.cu"
 
 
 def get_all_kernels() -> List[Kernel]:
-    for dtype, head_dim, split, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SPLIT, SM):
-        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=split, direction="fwd")
+    for dtype, head_dim, split, paged_kv, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SPLIT, PAGEDKV, SM):
+        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=split, paged_kv=paged_kv, direction="fwd")
     for dtype, head_dim, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SM):
-        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=False, direction="bwd")
+        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split='false', paged_kv='false', direction="bwd")
 
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:
