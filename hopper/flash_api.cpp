@@ -305,27 +305,27 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
     // so that kBlockM is smaller and we have more parallelism.
     if (params.is_fp32) {
         if (params.d <= 64) {
-            run_mha_fwd_combine_<float, 64>(params, stream);
+            run_mha_fwd_combine_<float, float, 64>(params, stream);
         } else if (params.d <= 128) {
-            run_mha_fwd_combine_<float, 128>(params, stream);
+            run_mha_fwd_combine_<float, float, 128>(params, stream);
         } else {
-            run_mha_fwd_combine_<float, 256>(params, stream);
+            run_mha_fwd_combine_<float, float, 256>(params, stream);
         }
     } else if (params.is_bf16) {
         if (params.d <= 64) {
-            run_mha_fwd_combine_<cutlass::bfloat16_t, 64>(params, stream);
+            run_mha_fwd_combine_<cutlass::bfloat16_t, float, 64>(params, stream);
         } else if (params.d <= 128) {
-            run_mha_fwd_combine_<cutlass::bfloat16_t, 128>(params, stream);
+            run_mha_fwd_combine_<cutlass::bfloat16_t, float, 128>(params, stream);
         } else {
-            run_mha_fwd_combine_<cutlass::bfloat16_t, 256>(params, stream);
+            run_mha_fwd_combine_<cutlass::bfloat16_t, float, 256>(params, stream);
         }
     } else {
         if (params.d <= 64) {
-            run_mha_fwd_combine_<cutlass::half_t, 64>(params, stream);
+            run_mha_fwd_combine_<cutlass::half_t, float, 64>(params, stream);
         } else if (params.d <= 128) {
-            run_mha_fwd_combine_<cutlass::half_t, 128>(params, stream);
+            run_mha_fwd_combine_<cutlass::half_t, float, 128>(params, stream);
         } else {
-            run_mha_fwd_combine_<cutlass::half_t, 256>(params, stream);
+            run_mha_fwd_combine_<cutlass::half_t, float, 256>(params, stream);
         }
     }
 }
