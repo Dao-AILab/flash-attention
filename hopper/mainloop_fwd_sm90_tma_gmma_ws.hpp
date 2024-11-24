@@ -710,9 +710,13 @@ struct CollectiveMainloopFwd {
         ++work_idx;
     }
 
+    template <typename SharedStorage>
     CUTLASS_DEVICE void
     load_tail(MainloopPipelineK pipeline_k, MainloopPipelineV pipeline_v, MainloopPipelineVt pipeline_vt,
-              PipelineState& smem_pipe_write) {
+              PipelineState& smem_pipe_write, SharedStorage &shared_storage, int const work_idx) {
+        // If we don't wait for barrier_O here, when using Cluster, CTA0 might exit early and CTA1 will
+        // try to arrive on barrier_O of CTA0, causing "unspecified launch failure".
+        shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         // Issue the epilogue waits
         // TODO: check if this should be called by 1 thread or more

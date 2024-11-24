@@ -1041,6 +1041,30 @@ def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, device
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize('causal', [False])
+@pytest.mark.parametrize('d', [128])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (64, 8192),
+    ],
+)
+def test_flash_attn_cluster(seqlen_q, seqlen_k, d, causal, dtype):
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size = 2
+    nheads = 16
+    nheads_kv = 4
+    # There was a bug where this would cause "unspecified launch failure" due to Cluster
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    for _ in range(100):
+        flash_attn_func(q, k, v, causal=causal)
+
+
 # @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
