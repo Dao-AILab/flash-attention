@@ -622,12 +622,12 @@ struct CollectiveMainloopFwd {
             pipeline_vt.consumer_release(smem_pipe_read);
         };
 
+        int n_block = n_block_max - 1;
+
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         // If this is true, we're guaranteed that only the first warp will execute this function
         static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
         bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync());
-
-        int n_block = n_block_max - 1;
 
         if (should_load_KV) {
             if constexpr (PagedKV) {
