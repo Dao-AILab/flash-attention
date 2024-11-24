@@ -297,21 +297,19 @@ struct CollectiveEpilogueFwd {
                 // Reshape acc from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
                 Tensor tOrO_rowcol = make_tensor(tOrO_out.data(), flash::convert_layout_acc_rowcol(tOrO.layout()));
                 Tensor tOrO_copy = cute::tiled_divide(tOrO_rowcol, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});
-                // TODO: we can just use thr_mma to partition here
-                Tensor mO_copy = cute::tiled_divide(mO, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});
+                Tensor tOgO = thread_mma.partition_C(gO);
+                Tensor tOgO_rowcol = make_tensor(tOgO.data(), flash::convert_layout_acc_rowcol(tOgO.layout()));
+                Tensor tOgO_copy = cute::tiled_divide(tOgO_rowcol, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});
                 // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the row indices.
                 Tensor taccOcO_col = taccOcO(make_coord(_, _0{}, _), _0{}, _);
                 if constexpr (!PackGQA) {
                     #pragma unroll
                     for (int m = 0; m < size(taccOcO_row); ++m) {
-                        int row = get<0>(taccOcO_row(m)) + m_block * kBlockM;
-                        if (row < seqlen_o) {
+                        if (get<0>(taccOcO_row(m)) < seqlen_o - m_block * kBlockM) {
                             #pragma unroll
                             for (int k = 0; k < size(taccOcO_col) / kGmemElemsPerStoreDirect; ++k) {
-                                int col = get<1>(taccOcO_col(k * kGmemElemsPerStoreDirect));
-                                if (col < get<1>(params.shape_O)) {
-                                    cute::copy(gmem_copy_direct,
-                                            tOrO_copy(_, m, k), mO_copy(_, row, col / kGmemElemsPerStoreDirect));
+                                if (get<1>(taccOcO_col(k * kGmemElemsPerStoreDirect)) < get<1>(params.shape_O)) {
+                                    cute::copy(gmem_copy_direct, tOrO_copy(_, m, k), tOgO_copy(_, m, k));
                                 }
                             }
                         }
