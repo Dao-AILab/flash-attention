@@ -168,11 +168,12 @@ void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
             BOOL_SWITCH(pack_gqa, PackGQA, [&] {
             //     BOOL_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
             //         // Only use Cluster if number of tiles along seqlen_q is even and not varlen
-            //         BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, UseCluster, [&] {
-                        // run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, !Is_causal && !Is_local && !Varlen && !Split && Enable_cluster && UseCluster ? 2 : 1, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PackGQA /*PackGQA*/, Split /*Split*/, false /*V_colmajor*/>(params, stream);
-                        // run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, !Is_causal && !Is_local && !Varlen && !Split && Enable_cluster && UseCluster ? 2 : 1, T, T_out, Is_causal, false, false, false /*Varlen*/, true /*PagedKV*/, false /*PackGQA*/, false /*Split*/, false /*V_colmajor*/>(params, stream);
-                run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, 1, T, T_out, Is_causal, false, false, Varlen /*Varlen*/, PagedKV /*PagedKV*/, AppendKV && Varlen /*AppendKV*/, PackGQA /*PackGQA*/, Split /*Split*/, false /*V_colmajor*/>(params, stream);
-            //         });
+                    BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
+                        static constexpr int ClusterM = !Varlen && Enable_cluster && Use_cluster ? 2 : 1;
+                        // run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, !Is_causal && !Is_local && !Varlen && !Split && Enable_cluster && Use_cluster ? 2 : 1, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PackGQA /*PackGQA*/, Split /*Split*/, false /*V_colmajor*/>(params, stream);
+                        // run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, !Is_causal && !Is_local && !Varlen && !Split && Enable_cluster && Use_cluster ? 2 : 1, T, T_out, Is_causal, false, false, false /*Varlen*/, true /*PagedKV*/, false /*PackGQA*/, false /*Split*/, false /*V_colmajor*/>(params, stream);
+                        run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, ClusterM, T, T_out, Is_causal, false, false, Varlen /*Varlen*/, PagedKV /*PagedKV*/, AppendKV && Varlen /*AppendKV*/, PackGQA /*PackGQA*/, Split /*Split*/, false /*V_colmajor*/>(params, stream);
+                    });
             //     });
             });
         });
@@ -180,58 +181,23 @@ void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, int kHeadDim, bool Split, bool PagedKV>
-void run_mha_fwd_hdim_16b(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_16b(Flash_fwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         // Can't use structured binding since it's not compatible with constexpr
-        static constexpr std::tuple<int, int> kBlock_MN = tile_size_fwd(kHeadDim, Is_causal || Is_local, sizeof(T) /*element_size*/);
-        static constexpr bool Enable_cluster = kHeadDim >= 192 && !Is_causal && !Is_local && !Split && !PagedKV;
+        static constexpr std::tuple<int, int> kBlock_MN = tile_size_fwd(kHeadDim, Is_causal || Is_local, sizeof(T) /*element_size*/, false /*V_colmajor*/, PagedKV);
+        static constexpr bool Enable_cluster = kHeadDim >= 128 && !Is_causal && !Is_local && !Split && !PagedKV;
         run_mha_fwd_dispatch<T, std::get<0>(kBlock_MN), std::get<1>(kBlock_MN), kHeadDim, 2, Is_causal, Is_local, PagedKV, Split, false /*V_colmajor*/, Enable_cluster>(params, stream);
     });
 }
 
-template<typename T, bool Split, bool PagedKV>
-void run_mha_fwd_fp8_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
-    // CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-    //     BOOL_SWITCH(params.v_dim_stride != 1, V_colmajor, [&] {
-    //         run_mha_fwd_dispatch<T, 192, 160, 64, 3, Is_causal, Is_local, PagedKV, Split, V_colmajor, false /*Enable_cluster*/>(params, stream);
-    //     });
-    // });
+template<typename T, int kHeadDim, bool Split, bool PagedKV>
+void run_mha_fwd_8b(Flash_fwd_params &params, cudaStream_t stream) {
+    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
+        BOOL_SWITCH(params.v_dim_stride != 1, V_colmajor, [&] {
+            // Can't use structured binding since it's not compatible with constexpr
+            static constexpr std::tuple<int, int> kBlock_MN = tile_size_fwd(kHeadDim, Is_causal || Is_local, sizeof(T) /*element_size*/, V_colmajor /*V_colmajor*/, PagedKV);
+            static constexpr bool Enable_cluster = kHeadDim == 192 && !Is_causal && !Is_local && !Split && !PagedKV;
+            run_mha_fwd_dispatch<T, std::get<0>(kBlock_MN), std::get<1>(kBlock_MN), kHeadDim, 2, Is_causal, Is_local, PagedKV, Split, V_colmajor, Enable_cluster>(params, stream);
+        });
+    });
 }
-
-template<typename T, bool Split, bool PagedKV>
-void run_mha_fwd_fp8_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
-    // CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-    //     BOOL_SWITCH(params.v_dim_stride != 1, V_colmajor, [&] {
-    //         run_mha_fwd_dispatch<T, 192, 128, 96, 3, Is_causal, Is_local, PagedKV, Split, V_colmajor, false /*Enable_cluster*/>(params, stream);
-    //     });
-    // });
-}
-
-
-template<typename T, bool Split, bool PagedKV>
-void run_mha_fwd_fp8_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
-    // CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-    //     BOOL_SWITCH(params.v_dim_stride != 1, V_colmajor, [&] {
-    //         run_mha_fwd_dispatch<T, 128, V_colmajor ? 192 : 224, 128, 2, Is_causal, Is_local, PagedKV, Split, V_colmajor, false /*Enable_cluster*/>(params, stream);
-    //     });
-    // });
-}
-
-template<typename T, bool Split, bool PagedKV>
-void run_mha_fwd_fp8_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
-    // CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-    //     BOOL_SWITCH(params.v_dim_stride != 1, V_colmajor, [&] {
-    //         run_mha_fwd_dispatch<T, 128, 160, 192, 2, Is_causal, Is_local, PagedKV, Split, V_colmajor, true /*Enable_cluster*/>(params, stream);
-    //     });
-    // });
-}
-
-template<typename T, bool Split, bool PagedKV>
-void run_mha_fwd_fp8_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
-    // CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-    //     BOOL_SWITCH(params.v_dim_stride != 1, V_colmajor, [&] {
-    //         run_mha_fwd_dispatch<T, 128, 128, 256, 2, Is_causal, Is_local, PagedKV, Split, V_colmajor, true /*Enable_cluster*/>(params, stream);
-    //     });
-    // });
-}
-

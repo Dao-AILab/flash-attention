@@ -1416,10 +1416,9 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
     if (num_splits <= 0) {
         auto dprops = at::cuda::getCurrentDeviceProperties();
         // This needs to match the kernel configs
-        // TODO: check that they match. TODO: change for FP8
         // TODO: right now we assume PackGQA
         bool const is_causal_or_local = is_causal || (window_size_left >= 0 || window_size_right >= 0);
-        auto [kBlockM, kBlockN] = tile_size_fwd(head_size_rounded, is_causal_or_local);
+        auto [kBlockM, kBlockN] = tile_size_fwd(head_size_rounded, is_causal_or_local, torch::elementSize(q_type) /*element_size*/, false /*v_colmajor*/, page_table_.has_value());
         int seqlen_q_packgqa = seqlen_q * (num_heads / num_heads_k);
         const int num_n_blocks = (seqlen_k + kBlockN - 1) / kBlockN;
         const int num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;

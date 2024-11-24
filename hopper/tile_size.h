@@ -7,7 +7,7 @@
 #include <tuple>
 
 constexpr std::tuple<int, int> tile_size_fwd(int headdim, bool is_causal_or_local,
-                                             int element_size=2, bool v_colmajor=false) {
+                                             int element_size=2, bool v_colmajor=false, bool paged_kv=false) {
     if (element_size == 2) {
         if (headdim <= 64) {
             return {192, 128};
@@ -30,7 +30,7 @@ constexpr std::tuple<int, int> tile_size_fwd(int headdim, bool is_causal_or_loca
         } else if (headdim <= 192) {
             return {128, 160};
         } else {
-            return {128, 128};
+            return {128, !paged_kv ? 128 : 96};
         }
     }
 }

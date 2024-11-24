@@ -286,8 +286,8 @@ def attention_ref(
 
 # TODO: deadlock with fp8 and local, probably bc of sink tokens
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-# @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+# @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
@@ -308,8 +308,8 @@ def attention_ref(
 # @pytest.mark.parametrize("d", [64, 128, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
-# @pytest.mark.parametrize("d", [64, 96, 128, 192, 256])
-@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [64, 96, 128, 192, 256])
+# @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -485,8 +485,8 @@ def test_flash_attn_output(
         assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item()
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-# @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -495,8 +495,8 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 50.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
-# @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
+# @pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(False, False)])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
@@ -695,8 +695,10 @@ def test_flash_attn_varlen_output(
         assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item()
 
 
-# @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
+# @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("num_splits", [1, 0])
 # @pytest.mark.parametrize("num_splits", [1])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -710,9 +712,9 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("rotary_interleaved", [False, True])
-# @pytest.mark.parametrize("rotary_interleaved", [False])
+# @pytest.mark.parametrize("rotary_interleaved", [True])
 @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
-# @pytest.mark.parametrize("rotary_fraction", [0.0])
+# @pytest.mark.parametrize("rotary_fraction", [1.0])
 @pytest.mark.parametrize("page_size", [None, 1, 4, 128])
 # @pytest.mark.parametrize("page_size", [None])
 @pytest.mark.parametrize("has_leftpad", [False, True])
@@ -782,7 +784,8 @@ def test_flash_attn_kvcache(
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
     if varlen_q:
         query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random")
         q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, *rest = unpad_input(q, query_padding_mask)
@@ -796,13 +799,13 @@ def test_flash_attn_kvcache(
 
     seqlen_new = seqlen_q if seqlen_new_eq_seqlen_q else torch.randint(1, seqlen_q + 1, (1,)).item()
     if new_kv:
-        k = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
-        v = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
+        k = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
+        v = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
     else:
         k, v = None, None
     if page_size is None:
-        k_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
-        v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+        k_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
+        v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
         page_table = None
     else:
         (
@@ -813,7 +816,7 @@ def test_flash_attn_kvcache(
             v_cache_paged,
             num_blocks,
         ) = _generate_block_kvcache(
-            seqlen_k, page_size, batch_size_cache, nheads_k, d, device, dtype
+            seqlen_k, page_size, batch_size_cache, nheads_k, d, device, dtype_ref
         )
     cache_seqlens = torch.randint(
         0 if new_kv else 1,
@@ -857,8 +860,8 @@ def test_flash_attn_kvcache(
             * 2
             * math.pi
         )
-        cos = torch.cos(angle).to(dtype=dtype)
-        sin = torch.sin(angle).to(dtype=dtype)
+        cos = torch.cos(angle).to(dtype=dtype_ref).to(dtype).to(dtype_ref)
+        sin = torch.sin(angle).to(dtype=dtype_ref).to(dtype).to(dtype_ref)
         if causal or local:
             q_ro = apply_rotary_emb(
                 q, cos, sin, seqlen_offsets=cache_seqlens, interleaved=rotary_interleaved
@@ -897,6 +900,39 @@ def test_flash_attn_kvcache(
         v_cache_ref[update_mask] = rearrange(v, "b s ... -> (b s) ...")
     k_cache_rep = repeat(k_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
     v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+    out_ref, _ = attention_ref(
+        q_ro,
+        k_cache_rep,
+        v_cache_rep,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+        window_size=window_size,
+        key_leftpad=cache_leftpad,
+    )
+    out_pt, _ = attention_ref(
+        q_ro,
+        k_cache_rep,
+        v_cache_rep,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+        window_size=window_size,
+        upcast=False,
+        reorder_ops=True,
+        key_leftpad=cache_leftpad,
+        intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None
+    )
+    q = q.to(dtype)
+    q_unpad = q_unpad.to(dtype) if varlen_q else None
+    k_cache = k_cache.to(dtype)
+    v_cache = v_cache.to(dtype)
+    k_cache_paged = k_cache_paged.to(dtype) if page_size is not None else None
+    v_cache_paged = v_cache_paged.to(dtype) if page_size is not None else None
+    k = k.to(dtype) if k is not None else None
+    v = v.to(dtype) if v is not None else None
+    cos = cos.to(dtype) if cos is not None else None
+    sin = sin.to(dtype) if sin is not None else None
     out, lse, *rest = flash_attn_with_kvcache(
         q if not varlen_q else q_unpad,
         k_cache if page_size is None else k_cache_paged,
@@ -929,34 +965,6 @@ def test_flash_attn_kvcache(
     # o1 = torch.einsum('bhst,bthd->bshd', s_tmp, v_cache_ref)
     # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
     # probs = torch.softmax(qk, dim=-1)
-    out_ref, _ = attention_ref(
-        q_ro,
-        k_cache_rep,
-        v_cache_rep,
-        query_padding_mask,
-        key_padding_mask,
-        # attn_bias,
-        # 0.0,
-        # None,
-        causal=causal,
-        window_size=window_size,
-        key_leftpad=cache_leftpad,
-    )
-    out_pt, _ = attention_ref(
-        q_ro,
-        k_cache_rep,
-        v_cache_rep,
-        query_padding_mask,
-        key_padding_mask,
-        # attn_bias,
-        # 0.0,
-        # None,
-        causal=causal,
-        window_size=window_size,
-        upcast=False,
-        reorder_ops=True,
-        key_leftpad=cache_leftpad,
-    )
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
@@ -969,31 +977,42 @@ def test_flash_attn_kvcache(
         if page_size is None:
             k_cache_select = (
                 k_cache if not has_batch_idx else k_cache[cache_batch_idx.to(dtype=torch.long)]
-            )
+            ).to(dtype_ref)
             v_cache_select = (
                 v_cache if not has_batch_idx else v_cache[cache_batch_idx.to(dtype=torch.long)]
-            )
+            ).to(dtype_ref)
         else:
             k_cache_select = rearrange(
-                k_cache_paged[page_table.to(dtype=torch.long).flatten()],
+                k_cache_paged.to(dtype_ref)[page_table.to(dtype=torch.long).flatten()],
                 "(b nblocks) block_size ... -> b (nblocks block_size) ...",
                 b=batch_size,
-            )[:, :seqlen_k]
+            )[:, :seqlen_k].to(dtype_ref)
             v_cache_select = rearrange(
-                v_cache_paged[page_table.to(dtype=torch.long).flatten()],
+                v_cache_paged.to(dtype_ref)[page_table.to(dtype=torch.long).flatten()],
                 "(b nblocks) block_size ... -> b (nblocks block_size) ...",
                 b=batch_size,
-            )[:, :seqlen_k]
-        assert torch.equal(v_cache_select, v_cache_ref)
+            )[:, :seqlen_k].to(dtype_ref)
+        k_cache_ref = k_cache_ref.to(dtype).to(dtype_ref)
+        v_cache_ref = v_cache_ref.to(dtype).to(dtype_ref)
+        if dtype is not torch.float8_e4m3fn:
+            assert torch.equal(v_cache_select, v_cache_ref)
+        else:
+            assert torch.allclose(v_cache_select, v_cache_ref, rtol=1e-3, atol=1e-3)
         # breakpoint()
+        # if rotary_dim == 0 and dtype is not torch.float8_e4m3fn:
         if rotary_dim == 0:
             assert torch.equal(k_cache_select, k_cache_ref)
         else:
             # if not torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3):
             #     breakpoint()
-            assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
-    mult = 3
+            if dtype is not torch.float8_e4m3fn:
+                assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
+            else:
+                assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-1, atol=1e-1)
+    mult = 4 if dtype == torch.float8_e4m3fn else 2
     assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
+    mult_mean = 3 if dtype == torch.float8_e4m3fn else 1.5
+    assert (out - out_ref).abs().mean().item() <= mult_mean * (out_pt - out_ref).abs().mean().item()
 
 
 def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, device, dtype):

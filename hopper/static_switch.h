@@ -44,31 +44,6 @@
     }                                                                                          \
   }()
 
-#define PREC_SWITCH(PRECTYPE, ...)                                             \
-  [&] {                                                                        \
-    if (PRECTYPE == 1) {                                                       \
-      using kPrecType = cutlass::half_t;                                       \
-      constexpr static bool kSoftFp16 = false;                                 \
-      constexpr static bool kHybrid = false;                                   \
-      return __VA_ARGS__();                                                    \
-    } else if (PRECTYPE == 2) {                                                \
-      using kPrecType = cutlass::float_e4m3_t;                                 \
-      constexpr static bool kSoftFp16 = false;                                 \
-      constexpr static bool kHybrid = false;                                   \
-      return __VA_ARGS__();                                                    \
-    } else if (PRECTYPE == 3) {                                                \
-      using kPrecType = cutlass::float_e4m3_t;                                 \
-      constexpr static bool kSoftFp16 = false;                                 \
-      constexpr static bool kHybrid = true;                                    \
-      return __VA_ARGS__();                                                    \
-    } else if (PRECTYPE == 4) {                                                \
-      using kPrecType = cutlass::float_e4m3_t;                                 \
-      constexpr static bool kSoftFp16 = true;                                  \
-      constexpr static bool kHybrid = false;                                   \
-      return __VA_ARGS__();                                                    \
-    }                                                                          \
-  }()
-
 #define HEADDIM_SWITCH(HEADDIM, ...)                                           \
   [&] {                                                                        \
     if (HEADDIM == 64) {                                                       \
@@ -89,18 +64,3 @@
     }                                                                          \
   }()
 
-#define SEQLEN_SWITCH(USE_VAR_SEQ_LEN, SEQ_LEN_OUT_OF_BOUND_CHECK, ...)        \
-  [&] {                                                                        \
-    if (!USE_VAR_SEQ_LEN) {                                                    \
-      if (SEQ_LEN_OUT_OF_BOUND_CHECK) {                                        \
-        using kSeqLenTraitsType = FixedSeqLenTraits<true>;                     \
-        return __VA_ARGS__();                                                  \
-      } else {                                                                 \
-        using kSeqLenTraitsType = FixedSeqLenTraits<false>;                    \
-        return __VA_ARGS__();                                                  \
-      }                                                                        \
-    } else {                                                                   \
-      using kSeqLenTraitsType = VarSeqLenTraits;                               \
-      return __VA_ARGS__();                                                    \
-    }                                                                          \
-  }() 

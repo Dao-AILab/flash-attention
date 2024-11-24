@@ -28,7 +28,7 @@ KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_launch_template.h"
 
 template<>
 void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}>(Flash_fwd_params &params, cudaStream_t stream) {{
-    run_mha_fwd_hdim_16b<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}>(params, stream);
+    run_mha_fwd_16b<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}>(params, stream);
 }}
 """
 
@@ -36,7 +36,7 @@ KERNEL_IMPL_TEMPLATE_FWD_FP8 = """#include "flash_fwd_launch_template.h"
 
 template<>
 void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}>(Flash_fwd_params &params, cudaStream_t stream) {{
-    run_mha_fwd_fp8_hdim{HEAD_DIM}<{DTYPE}, {SPLIT}, {PAGEDKV}>(params, stream);
+    run_mha_fwd_8b<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}>(params, stream);
 }}
 """
 

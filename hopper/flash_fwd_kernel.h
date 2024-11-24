@@ -82,20 +82,21 @@ public:
     // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 232 : 152;
 
     // Kernel level shared memory storage
+    // We overlap the shared memory for the mainloop and epilogue. However, we only want smem_o to overlap with smem_v
+    // and nothing else, so we'll pad in case sizeof(smem_o) > sizeof(smem_v).
+    static constexpr int mainloop_smem_padding_ = int(sizeof(typename CollectiveEpilogue::TensorStorage)) - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)));
+    static constexpr int mainloop_smem_padding = mainloop_smem_padding_ < 0 ? 0 : mainloop_smem_padding_;
     struct SharedStorage {
         struct TensorStorage : cute::aligned_struct<128> {
             union {
-                typename CollectiveMainloop::TensorStorage mainloop;
+                struct {
+                    cute::array<uint32_t, mainloop_smem_padding / sizeof(uint32_t)> padding_;
+                    typename CollectiveMainloop::TensorStorage mainloop;
+                };
                 // We want smem_o to line up with the start of smem_v
                 typename CollectiveEpilogue::TensorStorage epilogue;
             };
         } tensors;
-        static_assert(sizeof(typename CollectiveEpilogue::TensorStorage)
-                        <= sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)));
-        // Since smem_o is aligned to e.g. 512B or 1024B, we need to make sure that it doesn't go over smem_v
-        // and start touching smem_k.
-        // static_assert(1024 + sizeof(typename CollectiveEpilogue::TensorStorage)
-        //               <= sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)));
 
         struct PipelineStorage : cute::aligned_struct<16> {
             alignas(16) BarrierQ barrier_Q;
