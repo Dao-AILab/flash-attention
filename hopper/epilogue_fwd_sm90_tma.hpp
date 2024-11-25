@@ -292,17 +292,17 @@ struct CollectiveEpilogueFwd {
                 }
             } else {
                 // We already arrived on barrier_O earlier
-                static constexpr int kGmemElemsPerStoreDirect = 2;
-                cute::Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element> gmem_copy_direct;
-                // Reshape acc from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
-                Tensor tOrO_rowcol = make_tensor(tOrO_out.data(), flash::convert_layout_acc_rowcol(tOrO.layout()));
-                Tensor tOrO_copy = cute::tiled_divide(tOrO_rowcol, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});
-                Tensor tOgO = thread_mma.partition_C(gO);
-                Tensor tOgO_rowcol = make_tensor(tOgO.data(), flash::convert_layout_acc_rowcol(tOgO.layout()));
-                Tensor tOgO_copy = cute::tiled_divide(tOgO_rowcol, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});
-                // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the row indices.
-                Tensor taccOcO_col = taccOcO(make_coord(_, _0{}, _), _0{}, _);
                 if constexpr (!PackGQA) {
+                    static constexpr int kGmemElemsPerStoreDirect = 2;
+                    cute::Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element> gmem_copy_direct;
+                    // Reshape acc from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
+                    Tensor tOrO_rowcol = make_tensor(tOrO_out.data(), flash::convert_layout_acc_rowcol(tOrO.layout()));
+                    Tensor tOrO_copy = cute::tiled_divide(tOrO_rowcol, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});
+                    Tensor tOgO = thread_mma.partition_C(gO);
+                    Tensor tOgO_rowcol = make_tensor(tOgO.data(), flash::convert_layout_acc_rowcol(tOgO.layout()));
+                    Tensor tOgO_copy = cute::tiled_divide(tOgO_rowcol, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});
+                    // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the col indices.
+                    Tensor taccOcO_col = taccOcO(make_coord(_, _0{}, _), _0{}, _);
                     #pragma unroll
                     for (int m = 0; m < size(taccOcO_row); ++m) {
                         if (get<0>(taccOcO_row(m)) < seqlen_o - m_block * kBlockM) {
