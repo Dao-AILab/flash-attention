@@ -136,8 +136,8 @@ if not SKIP_CUDA_BUILD:
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
         "--use_fast_math",
-        "--ptxas-options=-v",  # printing out number of registers
-        "--ptxas-options=--verbose,--register-usage-level=5,--warn-on-local-memory-usage",  # printing out number of registers
+        # "--ptxas-options=--verbose,--warn-on-local-memory-usage",  # printing out number of registers
+        "--ptxas-options=--verbose",  # printing out number of registers
         "-lineinfo",
         "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",  # Necessary for the WGMMA shapes that we use
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
@@ -161,7 +161,6 @@ if not SKIP_CUDA_BUILD:
             sources=sources,
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
-                # "cxx": ["-O0", "-std=c++17"],
                 "nvcc": append_nvcc_threads(
                     nvcc_flags + cc_flag
                 ),

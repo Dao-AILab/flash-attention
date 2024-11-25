@@ -344,8 +344,8 @@ public:
             // We don't need separate variables smem_pipe_release_k and smem_pipe_release_v
             // (like in Cutlass's gemm) because the read and release pipeline states are always the same.
 
-            collective_mainloop.mma_init();
             scheduler.init_consumer();
+            collective_mainloop.mma_init();
 
             int work_idx = 0;
             CUTLASS_PRAGMA_NO_UNROLL

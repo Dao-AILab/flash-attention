@@ -27,7 +27,8 @@ namespace flash {
 using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, class Element_, class ElementAccum_, class ArchTag_,
-          bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_, bool PackGQA_, bool Split_, bool V_colmajor_>
+        bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
+        bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_>
 struct CollectiveMainloopFwd {
 
     static constexpr int kStages = Stages;
@@ -238,7 +239,9 @@ struct CollectiveMainloopFwd {
     using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose, TensorStorageTransposeV>;
 
     // These are tuned for speed. They don't affect correctness.
-    static constexpr bool UseSchedulerBarrier = (NumMmaWarpGroups >= 2) && (!Is_FP8 ? kHeadDim <= 128 : kHeadDim >= 128);
+    static constexpr bool UseSchedulerBarrier = IntraWGOverlap
+        ? (NumMmaWarpGroups >= 2) && (!Is_FP8 ? kHeadDim <= 128 : kHeadDim >= 128)
+        : NumMmaWarpGroups == 2;
     static constexpr bool RescaleOBeforeGemm = kHeadDim > 128 && (!Is_FP8 || V_colmajor);
 
     // Host side kernel arguments
@@ -526,7 +529,8 @@ struct CollectiveMainloopFwd {
         Tensor tVgVt_TMA = group_modes<0, 3>(block_tma_V.partition_S(gVt_TMA));  // (TMA, k)
         Tensor tVsVt_TMA = group_modes<0, 3>(block_tma_V.partition_D(sVt));  // (TMA, PIPE)
 
-        PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumProducerThreads, Element, Transpose_V> paged_kv_manager(
+        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumProducerThreads, Element, Transpose_V || !IntraWGOverlap /*KV_Same_Iter*/>;
+        PagedKVManager_t paged_kv_manager(
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
             params.ptr_V, params.stride_V,
@@ -653,13 +657,16 @@ struct CollectiveMainloopFwd {
             }
         }
 
-        // Wait for warp 1 to signal that smem_v are ready and V can be copied from gmem
+        // Wait for the MMA WGs to signal that smem_v are ready and V can be copied from gmem
         // Need ClusterBarrier, not just NamedBarrier. Otherwise we might have CTA 0 finishing the
         // TMA store on O first, call TMA multicast load on V, before CTA 1 can finishing TMA store on O.
         // if (thread_idx == 0) { printf("Producer: main load, before barrier_O\n");}
         shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
         // if (thread_idx == 0) { printf("Producer: main load, after barrier_O\n");}
 
+        if constexpr (!Transpose_V && !IntraWGOverlap) {
+            if (should_load_KV) { load_V(n_block, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/); }
+        }
         int n_block_prev = n_block;
         --n_block;
         #pragma unroll (!Transpose_V && Use_TMA_KV ? 2 : 1)
@@ -672,12 +679,18 @@ struct CollectiveMainloopFwd {
                 }
                 if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/); }
                 load_K(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/);
-                if constexpr (!Transpose_V) { load_V(n_block_prev, smem_pipe_write_v, cute::bool_constant<true>{} /*Seqlenk_mask*/); }
+                if constexpr (!Transpose_V) {
+                    if constexpr (IntraWGOverlap) {
+                        load_V(n_block_prev, smem_pipe_write_v, cute::bool_constant<true>{} /*Seqlenk_mask*/);
+                    } else {
+                        load_V(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/);
+                    }
+                }
             }
             n_block_prev = n_block;
             if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
         }
-        if (Is_local) {
+        if constexpr (Is_local) {
             static constexpr int kBlockN = get<1>(TileShape_MNK{});
             int n_block_sink_max = cute::ceil_div(params.sink_token_length, kBlockN);
             #pragma unroll 1
@@ -690,19 +703,21 @@ struct CollectiveMainloopFwd {
                     }
                     if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/); }
                     load_K(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/);
-                    if constexpr (!Transpose_V) { load_V(n_block_prev, smem_pipe_write_v, cute::bool_constant<true>{} /*Seqlenk_mask*/); }
+                    if constexpr (!Transpose_V) {
+                        if constexpr (IntraWGOverlap) {
+                            load_V(n_block_prev, smem_pipe_write_v, cute::bool_constant<true>{} /*Seqlenk_mask*/);
+                        } else {
+                            load_V(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/);
+                        }
+                    }
                 }
                 n_block_prev = n_block;
                 if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
             }
         }
         scheduler_prefetch();
-        if (should_load_KV) {
-            if constexpr (!Transpose_V) {
-                // if (thread_idx == 0) { printf("Producer: main load, before load_V, index = %d\n", smem_pipe_write.index());}
-                load_V(n_block_prev, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/);
-                // if (thread_idx == 0) { printf("Producer: main load, after load V, index = %d\n", smem_pipe_write.index());}
-            }
+        if constexpr (!Transpose_V && IntraWGOverlap) {
+            if (should_load_KV) { load_V(n_block_prev, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/); }
         }
         if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }
         ++smem_pipe_write;
@@ -898,10 +913,9 @@ struct CollectiveMainloopFwd {
         }
 
         // TODO: check the case where n_block_max <= n_block_min but there are sink tokens
-        if constexpr (true) {
+        if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read);
-            // if (thread_idx == 0) { print_tensor(sK(_, _, _0{})); }
             warp_scheduler_barrier_sync();
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
             warp_scheduler_barrier_arrive();
@@ -931,9 +945,6 @@ struct CollectiveMainloopFwd {
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
                 warp_scheduler_barrier_arrive();
                 warpgroup_wait<1>();
-                // if (thread_idx == 0) { print_tensor(sK(_, _, smem_pipe_read.index())); }
-                // Tensor scores = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
-                // if (thread_idx == 0 && m_block == 0) { print_tensor(scores); }
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block - 1);
@@ -994,45 +1005,73 @@ struct CollectiveMainloopFwd {
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
             ++smem_pipe_read;
 
-        } else {
-            // WIP: a version without intra-warpgroup overlap, for benchmarking / didactic purposes
+        } else {  // No intra-WG overlap
+
+            warp_scheduler_barrier_sync();
 
             auto fwd_step = [&](int const n_block, auto mask_fn, auto is_first_iter_type, auto check_inf_type) {
-                // static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
-                // static constexpr bool Check_inf = decltype(check_inf_type)::value;
+                static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
+                static constexpr bool Check_inf = decltype(check_inf_type)::value;
                 Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                warp_scheduler_barrier_arrive();
                 warpgroup_wait<0>();
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
                 scoremod_premask_fn(tSrS);
-                mask_fn(tSrS, n_block - 1);
-                Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/false>(tSrS);
-                warp_scheduler_barrier_sync();
-                softmax.template online_softmax</*Is_first=*/false>(tSrS);
+                mask_fn(tSrS, n_block);
+                Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
                 Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(), flash::convert_layout_acc_Aregs<TiledMma1>(tSrS.layout()));
                 if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
-                warp_scheduler_barrier_arrive();
-                softmax.rescale_o(tOrO, scores_scale);
+                if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
                 consumer_wait(pipeline_v, smem_pipe_read);
+                warp_scheduler_barrier_sync();
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 warpgroup_wait<0>();
                 pipeline_v.consumer_release(smem_pipe_read);  // release V
                 ++smem_pipe_read;
             };
-            // fwd_step(n_block, mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>, cute::bool_constant<true>{} /*is_first_iter*/, cute::bool_constant<true>{} /*check_inf*/);
-            // --n_block;
-            // #pragma unroll 1
-            // for (; n_block >= n_block_min; --n_block) {
-            //     fwd_step(n_block, mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<true>{} /*check_inf*/);
-            // }
+
+            auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+            fwd_step(n_block, first_iter_mask_fn, cute::bool_constant<true>{} /*is_first_iter*/, cute::bool_constant<true>{} /*check_inf*/);
+            --n_block;
+            if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
+                auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+                constexpr int n_masking_steps = cute::ceil_div(kBlockM, kBlockN) + 1;
+                #pragma unroll 1
+                for (int masking_step = 0; masking_step < n_masking_steps - 1 && n_block >= n_block_min; ++masking_step, --n_block) {
+                    fwd_step(n_block, mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<true>{} /*check_inf*/);
+                }
+            }
+            static constexpr int n_local_left_steps = !Is_local ? 0 : cute::ceil_div(kBlockM, kBlockN) + 1;
+            auto no_mask_fn = [](auto& tSrS, int n_block) { };
+            #pragma unroll 1
+            for (; n_block >= n_block_min + n_local_left_steps; --n_block) {
+                fwd_step(n_block, no_mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<false>{} /*check_inf*/);
+            }
+            // Separate masking iterations on the left for local attention
+            if constexpr (Is_local) {
+                auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+                #pragma unroll 1
+                for (; n_block >= n_block_min; --n_block) {
+                    fwd_step(n_block, local_mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
+                }
+                int n_block_sink_max = cute::ceil_div(params.sink_token_length, kBlockN);
+                #pragma unroll 1
+                for (n_block = std::min(n_block, n_block_sink_max - 1); n_block >= 0; --n_block) {
+                    fwd_step(n_block, local_mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
+                }
+            }
+            warp_scheduler_barrier_arrive();
             // Tell warp 0 that smem_q is ready
             if constexpr (Use_TMA_Q) {  // If !Use_TMA_Q, we don't use the producer WG to load Q
                 cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
             }
-            Tensor scores_scale = softmax.finalize();
+            Tensor scores_scale = softmax.finalize(!Is_FP8 || params.ptr_v_descale == nullptr ? 1.f : *params.ptr_v_descale);
             softmax.rescale_o(tOrO, scores_scale);
+            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
         }
         ++work_idx;
         return true;
@@ -1237,7 +1276,7 @@ struct CollectiveMainloopFwd {
                         gmem_tiled_copy_kv, tKsK_cur, tKgK_cur, tKcK, tKpK, std::min(seqlen_k_new - n_block * kBlockN, kBlockN)
                     );
                 } else {
-                    paged_kv_manager.template store_K<true /*Seqlenk_mask*/>(n_block, tKsK_cur);
+                    paged_kv_manager.store_K(n_block, tKsK_cur);
                 }
             } else {
                 Tensor gK_cur = gK(_, _, n_block);
@@ -1272,7 +1311,7 @@ struct CollectiveMainloopFwd {
                 flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
                     gmem_tiled_copy_kv, tVsV_cur, tVgV_cur, tKcK, tKpK, n_limit);
             } else {
-                paged_kv_manager.template store_V<true /*Seqlenk_mask*/>(n_block, tVsV_cur);
+                paged_kv_manager.store_V(n_block, tVsV_cur);
             }
             cutlass::arch::fence_view_async_shared();
             cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + cutlass::canonical_warp_group_idx() /*id*/);

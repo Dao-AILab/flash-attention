@@ -350,10 +350,10 @@ def test_flash_attn_output(
     batch_size = 9 if seqlen_k <= 2048 else 2
     # batch_size = 1
     nheads = 6
-    # batch_size = 1
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+    num_splits = 1
     q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref).requires_grad_()
     if softcap > 0.0:
         # Ensure the values of qk are at least within softcap range.
@@ -379,6 +379,7 @@ def test_flash_attn_output(
         window_size=window_size,
         sink_token_length=sink_token_length,
         softcap=softcap,
+        num_splits=num_splits
     )
     out_ref, attn_ref = attention_ref(
         q_ref,
@@ -696,15 +697,15 @@ def test_flash_attn_varlen_output(
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-# @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
+# @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("num_splits", [1, 0])
 # @pytest.mark.parametrize("num_splits", [1])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False, True])
-# @pytest.mark.parametrize("new_kv", [True])
+# @pytest.mark.parametrize("new_kv", [False])
 # @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
@@ -714,7 +715,7 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("rotary_interleaved", [False, True])
 # @pytest.mark.parametrize("rotary_interleaved", [True])
 @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
-# @pytest.mark.parametrize("rotary_fraction", [1.0])
+# @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize("page_size", [None, 1, 4, 128])
 # @pytest.mark.parametrize("page_size", [None])
 @pytest.mark.parametrize("has_leftpad", [False, True])
