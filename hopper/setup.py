@@ -167,6 +167,7 @@ if not SKIP_CUDA_BUILD:
         "--use_fast_math",
         # "--ptxas-options=--verbose,--warn-on-local-memory-usage",  # printing out number of registers
         "--ptxas-options=--verbose",  # printing out number of registers
+        f"--split-compile={os.getenv('NVCC_THREADS', '4')}",  # split-compile is faster
         "-lineinfo",
         "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",  # Necessary for the WGMMA shapes that we use
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
