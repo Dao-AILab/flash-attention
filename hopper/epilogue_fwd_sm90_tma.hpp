@@ -178,8 +178,8 @@ struct CollectiveEpilogueFwd {
         Tensor sO = make_tensor(make_smem_ptr(shared_storage.tensors.epilogue.smem_o.data()), SmemLayoutO{});
         // Tensor sO_pi = cute::as_position_independent_swizzle_tensor(sO);
 
-        // Tensor tOrO_out = flash::convert_type<Element>(tOrO);
-        Tensor tOrO_out = flash::convert_type_safe<Element>(tOrO);
+        Tensor tOrO_out = make_tensor_like<Element>(tOrO);
+        flash::convert_type_out(tOrO, tOrO_out);
         if constexpr (FP8PermuteCol && (sizeof(Element) == 2 || sizeof(Element) == 4)) { flash::permute_output_fp8_Vcolmajor(tOrO_out); }
 
         // Make sure all WGs have finished reading V

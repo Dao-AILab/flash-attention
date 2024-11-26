@@ -191,8 +191,12 @@ public:
 
         // Reshape from e.g. (8, kBlockM / 32, kHeadDim / 64) to (kBlockM / 32, (8, kHeadDim / 64))
         Layout l = make_layout(get<1>(tOrO.layout()), make_layout(get<0>(tOrO.layout()), get<2>(tOrO.layout())));
-        Tensor o_fp32 = flash::convert_type<float>(make_tensor(tOrO.data(), l));
-        Tensor do_fp32 = flash::convert_type<float>(make_tensor(tOrdO.data(), l));
+        Tensor tOrO_l = make_tensor(tOrO.data(), l);
+        Tensor o_fp32 = make_tensor_like<float>(tOrO_l);
+        flash::convert_type_out(tOrO_l, o_fp32);
+        Tensor tOrdO_l = make_tensor(tOrdO.data(), l);
+        Tensor do_fp32 = make_tensor_like<float>(tOrdO_l);
+        flash::convert_type_out(tOrdO_l, do_fp32);
         // Sum across the last dimension
         Tensor dP_sum = make_tensor<float>(make_shape(size<0>(o_fp32)));
         #pragma unroll

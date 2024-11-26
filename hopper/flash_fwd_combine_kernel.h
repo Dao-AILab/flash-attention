@@ -410,7 +410,8 @@ public:
                     #pragma unroll
                     for (int k = 0; k < size<2>(tOrOpartial); ++k) {
                         if (Is_even_K || tOpO(k)) {
-                            Tensor rOpartial = flash::convert_type<float>(tOrOpartial(_, m, k));
+                            Tensor rOpartial = make_tensor_like<float>(tOrOpartial(_, m, k));
+                            flash::convert_type_out(tOrOpartial(_, m, k), rOpartial);
                             #pragma unroll
                             for (int i = 0; i < size<0>(tOrOpartial); ++i) {
                                 tOrO(i, m, k) += scale(m) * rOpartial[i];
@@ -422,7 +423,8 @@ public:
         }
 
         // Step 7: Write the final O to gmem
-        Tensor rO = flash::convert_type<Element>(tOrO);
+        Tensor rO = make_tensor_like<Element>(tOrO);
+        flash::convert_type_out(tOrO, rO);
         auto shape_O = select<0, 1, 3, 4>(params.shape_O_partial);
         Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset * get<0>(params.stride_O)), shape_O, params.stride_O);
         Tensor mO_copy = cute::tiled_divide(mO, Shape<_1, Int<kGmemElemsPerLoad>>{});

@@ -25,9 +25,12 @@ apply_rotary_interleaved(Tensor<Engine1, Layout1> &rK,
     CUTE_STATIC_ASSERT_V(size<0>(rCos) == size<0>(rSin));
     static_assert(decltype(size<0>(rK))::value == decltype(size<0>(rCos))::value * 2);
     static_assert(decltype(size<0>(rCos))::value % 2 == 0);  // Since we do fast conversion from fp16/bf16 to fp32
-    Tensor K_fp32 = convert_type<float>(rK);
-    Tensor cos_fp32 = convert_type<float>(rCos);
-    Tensor sin_fp32 = convert_type<float>(rSin);
+    Tensor K_fp32 = make_tensor_like<float>(rK);
+    convert_type_out(rK, K_fp32);
+    Tensor cos_fp32 = make_tensor_like<float>(rCos);
+    convert_type_out(rCos, cos_fp32);
+    Tensor sin_fp32 = make_tensor_like<float>(rSin);
+    convert_type_out(rSin, sin_fp32);
     #pragma unroll
     for (int i = 0; i < size<0>(K_fp32) / 2; ++i) {
         float real = K_fp32[2 * i] * cos_fp32[i] - K_fp32[2 * i + 1] * sin_fp32[i];
@@ -35,7 +38,7 @@ apply_rotary_interleaved(Tensor<Engine1, Layout1> &rK,
         K_fp32[2 * i] = real;
         K_fp32[2 * i + 1] = imag;
     }
-    cute::copy(convert_type<Engine1::value_type>(K_fp32), rK);
+    convert_type_out(K_fp32, rK);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -54,10 +57,14 @@ apply_rotary_contiguous(Tensor<Engine1, Layout1> &rK_left,
     CUTE_STATIC_ASSERT_V(size<0>(rK_left) == size<0>(rCos));
     CUTE_STATIC_ASSERT_V(size<0>(rCos) == size<0>(rSin));
     static_assert(decltype(size<0>(rCos))::value % 2 == 0);  // Since we do fast conversion from fp16/bf16 to fp32
-    Tensor K_left_fp32 = convert_type<float>(rK_left);
-    Tensor K_right_fp32 = convert_type<float>(rK_right);
-    Tensor cos_fp32 = convert_type<float>(rCos);
-    Tensor sin_fp32 = convert_type<float>(rSin);
+    Tensor K_left_fp32 = make_tensor_like<float>(rK_left);
+    convert_type_out(rK_left, K_left_fp32);
+    Tensor K_right_fp32 = make_tensor_like<float>(rK_right);
+    convert_type_out(rK_right, K_right_fp32);
+    Tensor cos_fp32 = make_tensor_like<float>(rCos);
+    convert_type_out(rCos, cos_fp32);
+    Tensor sin_fp32 = make_tensor_like<float>(rSin);
+    convert_type_out(rSin, sin_fp32);
     #pragma unroll
     for (int i = 0; i < size<0>(K_left_fp32); ++i) {
         float real = K_left_fp32[i] * cos_fp32[i] - K_right_fp32[i] * sin_fp32[i];
@@ -65,8 +72,8 @@ apply_rotary_contiguous(Tensor<Engine1, Layout1> &rK_left,
         K_left_fp32[i] = real;
         K_right_fp32[i] = imag;
     }
-    cute::copy(convert_type<Engine1::value_type>(K_left_fp32), rK_left);
-    cute::copy(convert_type<Engine1::value_type>(K_right_fp32), rK_right);
+    convert_type_out(K_left_fp32, rK_left);
+    convert_type_out(K_right_fp32, rK_right);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

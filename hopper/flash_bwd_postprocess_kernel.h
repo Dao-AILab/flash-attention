@@ -204,7 +204,8 @@ public:
         #pragma unroll
         for (int i = 0; i < size(taccdQrdQaccum); ++i) { taccdQrdQaccum(i) *= params.softmax_scale; }
         // Convert tdQrdQ from fp32 to fp16
-        Tensor rdQ = flash::convert_type<Element>(taccdQrdQaccum);
+        Tensor rdQ = make_tensor_like<Element>(taccdQrdQaccum);
+        flash::convert_type_out(taccdQrdQaccum, rdQ);
 
         // Step 3: Copy dQ from register to smem
         auto smem_tiled_copy_dQ = make_tiled_copy_C(SmemCopyAtomdQ{}, tiled_mma_dQ);

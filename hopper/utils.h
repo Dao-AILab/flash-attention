@@ -168,35 +168,32 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout0 acc_layout) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename To_type, typename Engine, typename Layout>
-__forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tensor) {
+CUTLASS_DEVICE auto convert_type_unsafe(Tensor<Engine, Layout> const &tensor) {
     using From_type = typename Engine::value_type;
-    constexpr int numel = decltype(size(tensor))::value;
+    static constexpr int numel = decltype(size(tensor))::value;
     cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
     // HACK: this requires tensor to be "contiguous"
     auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
     return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+    // Unsafe because we're returning a tensor with memory allocated on the stack. If the compiler does not
+    // inline this function, then the memory might not be valid.
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename To_type, typename Engine, typename Layout>
-__forceinline__ __device__ auto convert_type_safe(Tensor<Engine, Layout> const &tensor) {
+template <typename Engine, typename Layout, typename EngineOut>
+CUTLASS_DEVICE void convert_type_out(Tensor<Engine, Layout> const &tensor, Tensor<EngineOut, Layout> &out) {
+    // Somehow if we allocate out inside this function and return it, e2e is slower and the output can be wrong.
     using From_type = typename Engine::value_type;
-    Tensor out = make_fragment_like<To_type>(tensor);
-    constexpr int FragmentSize = std::max(sizeof(From_type) / sizeof(To_type), sizeof(To_type) / sizeof(From_type));
-    static_assert(CUTE_STATIC_V(size<0>(tensor)) % FragmentSize == 0, "Fragment size does not vectorize properly");
-    Tensor frag = recast<cutlass::Array<From_type, FragmentSize>>(tensor);
+    using To_type = typename EngineOut::value_type;
+    static constexpr int FragmentSize = std::max(sizeof(From_type) / sizeof(To_type), sizeof(To_type) / sizeof(From_type));
+    static_assert(CUTE_STATIC_V(size(tensor)) % FragmentSize == 0, "Fragment size does not vectorize properly");
+    Tensor frag = recast<cutlass::Array<From_type, FragmentSize> const>(tensor);
     Tensor out_frg = recast<cutlass::Array<To_type, FragmentSize>>(out);
     static_assert(size(frag) == size(out_frg));
     cutlass::NumericArrayConverter<To_type, From_type, FragmentSize> convert_op;
     #pragma unroll
-    for (int i = 0; i < size(frag); ++i) { out_frg(i) = convert_op(frag(i)); }
-    // Tensor frag_32b = recast<uint32_t>(make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout()));
-    // Tensor out_32b = recast<uint32_t>(out);
-    // // cute::copy(frag_32b, out_32b);
-    // #pragma unroll
-    // for (int i = 0; i < size(frag_32b); ++i) { out_32b[i] = frag_32b[i]; }
-    return out;
+    for (int i = 0; i < size(frag); ++i) { out_frg[i] = convert_op(frag[i]); }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -927,7 +927,9 @@ struct CollectiveMainloopFwd {
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
-            Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(), flash::convert_layout_acc_Aregs<TiledMma1>(tSrS.layout()));
+            Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma1>(tSrS.layout()));
+            Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
+            convert_type_out(tOrP_acc, tOrP);
             if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
 
             // Each step does gemm0 for iter n_block - 1, gemm1 for iter n_block, and softmax for iter n_block - 1.
@@ -953,7 +955,7 @@ struct CollectiveMainloopFwd {
                 warpgroup_wait<0>();
                 pipeline_v.consumer_release(smem_pipe_read_v);  // release V
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
-                cute::copy(make_tensor(convert_type<Element>(tSrS).data(), tOrP.layout()), tOrP);
+                convert_type_out(make_tensor(tSrS.data(), tOrP.layout()), tOrP);
                 if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
             };
@@ -1023,7 +1025,9 @@ struct CollectiveMainloopFwd {
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
-                Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(), flash::convert_layout_acc_Aregs<TiledMma1>(tSrS.layout()));
+                Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma1>(tSrS.layout()));
+                Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
+                convert_type_out(tOrP_acc, tOrP);
                 if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
                 consumer_wait(pipeline_v, smem_pipe_read);

@@ -985,13 +985,15 @@ struct CollectiveMainloopBwd {
             }
 
             // Convert scores from fp32 to fp16/bf16
-            Tensor rP = flash::convert_type<Element>(tSrS);
+            Tensor rP = make_tensor_like<Element>(tSrS);
+            flash::convert_type_out(tSrS, rP);
             if constexpr (!Mma_dKV_is_RS) {
                 Tensor tPaP = smem_thr_copy_PdS.retile_S(rP);     // ((Atom,AtomNum), MMA_N, MMA_N)
                 cute::copy(smem_tiled_copy_PdS, tPaP, tPsP(_, _, _, cute::conditional_return<kStages_dS==1>(_0{}, smem_pipe_read.index())));
                 cutlass::arch::fence_view_async_shared();
             }
-            Tensor rdS = flash::convert_type<Element>(tdPrdP);
+            Tensor rdS = make_tensor_like<Element>(tdPrdP);
+            flash::convert_type_out(tdPrdP, rdS);
             Tensor tdSadS = smem_thr_copy_PdS.retile_S(rdS);     // ((Atom,AtomNum), MMA_N, MMA_N)
             // If there's double buffering on dS, we don't need to sync here.
             // Otherwise we might have WG1 writing to dS before WG2 is done reading from it during MmadQ.
