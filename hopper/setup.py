@@ -36,10 +36,19 @@ BASE_WHEEL_URL = "https://github.com/Dao-AILab/flash-attention/releases/download
 
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
-FORCE_BUILD = os.getenv("FAHOPPER_FORCE_BUILD", "FALSE") == "TRUE"
-SKIP_CUDA_BUILD = os.getenv("FAHOPPER_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
+FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
+SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
-FORCE_CXX11_ABI = os.getenv("FAHOPPER_FORCE_CXX11_ABI", "FALSE") == "TRUE"
+FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
+
+DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
+DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
+DISABLE_PAGEDKV = os.getenv("FLASH_ATTENTION_DISABLE_PAGEDKV", "FALSE") == "TRUE"
+DISABLE_APPENDKV = os.getenv("FLASH_ATTENTION_DISABLE_APPENDKV", "FALSE") == "TRUE"
+DISABLE_LOCAL = os.getenv("FLASH_ATTENTION_DISABLE_LOCAL", "FALSE") == "TRUE"
+DISABLE_PACKGQA = os.getenv("FLASH_ATTENTION_DISABLE_PACKGQA", "FALSE") == "TRUE"
+DISABLE_FP16 = os.getenv("FLASH_ATTENTION_DISABLE_FP16", "FALSE") == "TRUE"
+DISABLE_FP8 = os.getenv("FLASH_ATTENTION_DISABLE_FP8", "FALSE") == "TRUE"
 
 
 def get_platform():
@@ -78,8 +87,9 @@ def check_if_cuda_home_none(global_option: str) -> None:
     )
 
 
-def append_nvcc_threads(nvcc_extra_args):
-    return nvcc_extra_args + ["--threads", "4"]
+def nvcc_threads_args():
+    nvcc_threads = os.getenv("NVCC_THREADS") or "4"
+    return ["--threads", nvcc_threads]
 
 
 cmdclass = {}
@@ -109,22 +119,35 @@ if not SKIP_CUDA_BUILD:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
     repo_dir = Path(this_dir).parent
     cutlass_dir = repo_dir / "csrc" / "cutlass"
-    DTYPE_FWD = ["fp16", "bf16", "e4m3"]
-    DTYPE_BWD = ["fp16", "bf16"]
+
+    feature_args = (
+        []
+        + (["-DFLASHATTENTION_DISABLE_BACKWARD"] if DISABLE_BACKWARD else [])
+        + (["-DFLASHATTENTION_DISABLE_PAGEDKV"] if DISABLE_PAGEDKV else [])
+        + (["-DFLASHATTENTION_DISABLE_SPLIT"] if DISABLE_SPLIT else [])
+        + (["-DFLASHATTENTION_DISABLE_APPENDKV"] if DISABLE_APPENDKV else [])
+        + (["-DFLASHATTENTION_DISABLE_LOCAL"] if DISABLE_LOCAL else [])
+        + (["-DFLASHATTENTION_DISABLE_PACKGQA"] if DISABLE_PACKGQA else [])
+        + (["-DFLASHATTENTION_DISABLE_FP16"] if DISABLE_FP16 else [])
+        + (["-DFLASHATTENTION_DISABLE_FP8"] if DISABLE_FP8 else [])
+    )
+
+    DTYPE_FWD = ["bf16"] + (["fp16"] if not DISABLE_FP16 else []) + (["e4m3"] if not DISABLE_FP8 else [])
+    DTYPE_BWD = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
     HEAD_DIMENSIONS = [64, 96, 128, 192, 256]
-    SPLIT = ["", "_split"]
-    PAGEDKV = ["", "_paged"]
+    SPLIT = [""] + (["_split"] if not DISABLE_SPLIT else [])
+    PAGEDKV = [""] + (["_paged"] if not DISABLE_PAGEDKV else [])
     sources_fwd = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}_sm90.cu"
                    for hdim, dtype, split, paged in itertools.product(HEAD_DIMENSIONS, DTYPE_FWD, SPLIT, PAGEDKV)]
     sources_bwd = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}_sm90.cu"
                    for hdim, dtype in itertools.product(HEAD_DIMENSIONS, DTYPE_BWD)]
-    sources = [
-        "flash_api.cpp",
-        "flash_fwd_combine_sm80.cu",
-    ] + sources_fwd + sources_bwd
+    if DISABLE_BACKWARD:
+        sources_bwd = []
+    sources = ["flash_api.cpp"] + sources_fwd + sources_bwd
+    if not DISABLE_SPLIT:
+        sources += ["flash_fwd_combine_sm80.cu"]
     nvcc_flags = [
         "-O3",
-        # "-O0",
         "-std=c++17",
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
@@ -160,10 +183,9 @@ if not SKIP_CUDA_BUILD:
             name="flashattn_hopper_cuda",
             sources=sources,
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
-                "nvcc": append_nvcc_threads(
-                    nvcc_flags + cc_flag
-                ),
+                "cxx": ["-O3", "-std=c++17"] + feature_args,
+                "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args
+,
             },
             include_dirs=include_dirs,
             # Without this we get and error about cuTensorMapEncodeTiled not defined

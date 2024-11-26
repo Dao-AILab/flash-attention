@@ -255,8 +255,8 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     // HEADDIM_SWITCH(params.d, [&] {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
-    BOOL_SWITCH(params.num_splits > 1, Split, [&] {
-        BOOL_SWITCH(params.page_table, PagedKV, [&] {
+    SPLIT_SWITCH(params.num_splits > 1, Split, [&] {
+        PAGEDKV_SWITCH(params.page_table, PagedKV, [&] {
             if (!params.is_e4m3) {
                 if (params.is_bf16) {
                     if (params.d <= 64) {
@@ -271,6 +271,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
                         run_mha_fwd_<cutlass::bfloat16_t, 256, Split, PagedKV>(params, stream);
                     }
                 } else {
+                    #ifndef FLASHATTENTION_DISABLE_FP16
                     if (params.d <= 64) {
                         run_mha_fwd_<cutlass::half_t, 64, Split, PagedKV>(params, stream);
                     } else if (params.d <= 96) {
@@ -282,8 +283,12 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
                     } else {
                         run_mha_fwd_<cutlass::half_t, 256, Split, PagedKV>(params, stream);
                     }
+                    #else
+                    TORCH_CHECK(false, "This flash attention build does not support FP16.");
+                    #endif
                 }
             } else {
+                #ifndef FLASHATTENTION_DISABLE_FP8
                 if (params.d <= 64) {
                     run_mha_fwd_<cutlass::float_e4m3_t, 64, Split, PagedKV>(params, stream);
                 } else if (params.d <= 96) {
@@ -295,12 +300,16 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
                 } else {
                     run_mha_fwd_<cutlass::float_e4m3_t, 256, Split, PagedKV>(params, stream);
                 }
+                #else
+                TORCH_CHECK(false, "This flash attention build does not support FP8.");
+                #endif
             }
         });
     });
 }
 
 void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
+    #ifndef FLASHATTENTION_DISABLE_SPLIT
     // If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
     // so that kBlockM is smaller and we have more parallelism.
     if (params.is_fp32) {
@@ -328,6 +337,9 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
             run_mha_fwd_combine_<cutlass::half_t, float, 256>(params, stream);
         }
     }
+    #else
+    TORCH_CHECK(false, "This flash attention build does not support combine kernels.");
+    #endif
 }
 
 // Find the number of splits that maximizes the occupancy. For example, if we have
@@ -544,6 +556,16 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         }
     }
 
+    #ifdef FLASHATTENTION_DISABLE_LOCAL
+    TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
+    #endif
+    #ifdef FLASHATTENTION_DISABLE_SPLIT
+    TORCH_CHECK(params.num_splits == 1, "This flash attention build does not support splits.");
+    #endif
+    #ifdef FLASHATTENTION_DISABLE_PACKGQA
+    TORCH_CHECK(params.pack_gqa == -1 || params.pack_gqa == 0, "This flash attention build does not support pack_gqa.");
+    #endif
+
     if (seqlen_k > 0 && batch_size > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
@@ -757,6 +779,16 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
         }
     }
 
+    #ifdef FLASHATTENTION_DISABLE_LOCAL
+    TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
+    #endif
+    #ifdef FLASHATTENTION_DISABLE_SPLIT
+    TORCH_CHECK(params.num_splits == 1, "This flash attention build does not support splits.");
+    #endif
+    #ifdef FLASHATTENTION_DISABLE_PACKGQA
+    TORCH_CHECK(params.pack_gqa == -1 || params.pack_gqa == 0, "This flash attention build does not support pack_gqa.");
+    #endif
+
     if (max_seqlen_k > 0 && batch_size > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
@@ -787,36 +819,42 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
 }
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
-    // FP16_SWITCH(!params.is_bf16, [&] {
-    //     HEADDIM_SWITCH(params.d, [&] {
-    //         run_mha_bwd_<elem_type, kHeadDim>(params, stream);
-    //     });
-    // });
-    if (!params.is_bf16) {
-        if (params.d <= 64) {
-            run_mha_bwd_<cutlass::half_t, 64>(params, stream);
-        } else if (params.d <= 96) {
-            run_mha_bwd_<cutlass::half_t, 96>(params, stream);
-        } else if (params.d <= 128) {
-            run_mha_bwd_<cutlass::half_t, 128>(params, stream);
-        } else if (params.d <= 192) {
-            run_mha_bwd_<cutlass::half_t, 192>(params, stream);
+    #ifndef FLASHATTENTION_DISABLE_BACKWARD
+        // FP16_SWITCH(!params.is_bf16, [&] {
+        //     HEADDIM_SWITCH(params.d, [&] {
+        //         run_mha_bwd_<elem_type, kHeadDim>(params, stream);
+        //     });
+        // });
+        if (!params.is_bf16) {
+            #ifndef FLASHATTENTION_DISABLE_FP16
+            if (params.d <= 64) {
+                run_mha_bwd_<cutlass::half_t, 64>(params, stream);
+            } else if (params.d <= 96) {
+                run_mha_bwd_<cutlass::half_t, 96>(params, stream);
+            } else if (params.d <= 128) {
+                run_mha_bwd_<cutlass::half_t, 128>(params, stream);
+            } else if (params.d <= 192) {
+                run_mha_bwd_<cutlass::half_t, 192>(params, stream);
+            } else {
+                run_mha_bwd_<cutlass::half_t, 256>(params, stream);
+            }
+            #else
+            TORCH_CHECK(false, "This flash attention build does not support FP16.");
+            #endif
         } else {
-            run_mha_bwd_<cutlass::half_t, 256>(params, stream);
+            if (params.d <= 64) {
+                run_mha_bwd_<cutlass::bfloat16_t, 64>(params, stream);
+            } else if (params.d <= 96) {
+                run_mha_bwd_<cutlass::bfloat16_t, 96>(params, stream);
+            } else if (params.d <= 128) {
+                run_mha_bwd_<cutlass::bfloat16_t, 128>(params, stream);
+            } else if (params.d <= 192) {
+                run_mha_bwd_<cutlass::bfloat16_t, 192>(params, stream);
+            } else {
+                run_mha_bwd_<cutlass::bfloat16_t, 256>(params, stream);
+            }
         }
-    } else {
-        if (params.d <= 64) {
-            run_mha_bwd_<cutlass::bfloat16_t, 64>(params, stream);
-        } else if (params.d <= 96) {
-            run_mha_bwd_<cutlass::bfloat16_t, 96>(params, stream);
-        } else if (params.d <= 128) {
-            run_mha_bwd_<cutlass::bfloat16_t, 128>(params, stream);
-        } else if (params.d <= 192) {
-            run_mha_bwd_<cutlass::bfloat16_t, 192>(params, stream);
-        } else {
-            run_mha_bwd_<cutlass::bfloat16_t, 256>(params, stream);
-        }
-    }
+    #endif
 }
 
 std::vector<at::Tensor>
@@ -993,6 +1031,10 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         params.dk_semaphore = dk_semaphore.data_ptr<int>();
         params.dv_semaphore = dv_semaphore.data_ptr<int>();
     }
+
+    #ifdef FLASHATTENTION_DISABLE_LOCAL
+    TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
+    #endif
 
     if (seqlen_q > 0) {
         run_mha_bwd(params, stream);
@@ -1215,6 +1257,10 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
         params.dk_semaphore = dk_semaphore.data_ptr<int>();
         params.dv_semaphore = dv_semaphore.data_ptr<int>();
     }
+
+    #ifdef FLASHATTENTION_DISABLE_LOCAL
+    TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
+    #endif
 
     if (max_seqlen_q > 0) {
         run_mha_bwd(params, stream);
@@ -1571,6 +1617,22 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
             params.v_descale_ptr = nullptr;
         }
     }
+
+    #ifdef FLASHATTENTION_DISABLE_LOCAL
+    TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
+    #endif
+    #ifdef FLASHATTENTION_DISABLE_SPLIT
+    TORCH_CHECK(params.num_splits == 1, "This flash attention build does not support splits.");
+    #endif
+    #ifdef FLASHATTENTION_DISABLE_PACKGQA
+    TORCH_CHECK(params.pack_gqa == -1 || params.pack_gqa == 0, "This flash attention build does not support pack_gqa.");
+    #endif
+    #ifdef FLASHATTENTION_DISABLE_PAGEDKV
+    TORCH_CHECK(!paged_KV, "This flash attention build does not support paged KV.");
+    #endif
+    #ifdef FLASHATTENTION_DISABLE_APPENDKV
+    TORCH_CHECK(!k_.has_value(), "This flash attention build does not support appending KV.");
+    #endif
 
     if (seqlen_q > 0 && total_q > 0 && seqlen_k > 0 && batch_size > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();

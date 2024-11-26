@@ -1,3 +1,4 @@
+import os
 import math
 
 import pytest
@@ -12,6 +13,15 @@ from flash_attn_interface import flash_attn_func, flash_attn_varlen_func, flash_
 
 ABS_TOL = 5e-3
 REL_TOL = 1e-1
+
+DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
+DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
+DISABLE_PAGEDKV = os.getenv("FLASH_ATTENTION_DISABLE_PAGEDKV", "FALSE") == "TRUE"
+DISABLE_APPENDKV = os.getenv("FLASH_ATTENTION_DISABLE_APPENDKV", "FALSE") == "TRUE"
+DISABLE_LOCAL = os.getenv("FLASH_ATTENTION_DISABLE_LOCAL", "FALSE") == "TRUE"
+DISABLE_PACKGQA = os.getenv("FLASH_ATTENTION_DISABLE_PACKGQA", "FALSE") == "TRUE"
+DISABLE_FP16 = os.getenv("FLASH_ATTENTION_DISABLE_FP16", "FALSE") == "TRUE"
+DISABLE_FP8 = os.getenv("FLASH_ATTENTION_DISABLE_FP8", "FALSE") == "TRUE"
 
 
 def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random"):
@@ -285,7 +295,7 @@ def attention_ref(
 
 # TODO: deadlock with fp8 and local, probably bc of sink tokens
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -294,7 +304,7 @@ def attention_ref(
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 50.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(False, False)])
 # @pytest.mark.parametrize("causal", [False])
@@ -423,7 +433,7 @@ def test_flash_attn_output(
     #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
     # breakpoint()
 
-    if dtype != torch.float8_e4m3fn and not V_colmajor:
+    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor:
         g = torch.randn_like(out)
         do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
         import flashattn_hopper_cuda
@@ -478,7 +488,7 @@ def test_flash_attn_output(
     multiple = 2 if dtype != torch.float8_e4m3fn else (3 if softcap == 0.0 else 6)
     assert (out - out_ref).abs().max().item() <= multiple * (out_pt - out_ref).abs().max().item()
 
-    if dtype != torch.float8_e4m3fn and not V_colmajor:
+    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor:
         multiple = 2 if softcap == 0.0 else 4
         assert (dq - dq_ref).abs().max().item() <= multiple * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item()
@@ -486,7 +496,7 @@ def test_flash_attn_output(
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -495,7 +505,7 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 50.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(False, False)])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -623,7 +633,7 @@ def test_flash_attn_varlen_output(
     #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
     # breakpoint()
 
-    if dtype != torch.float8_e4m3fn:
+    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn:
         g_unpad = torch.randn_like(out_unpad)
         do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
         import flashattn_hopper_cuda
@@ -687,7 +697,7 @@ def test_flash_attn_varlen_output(
     # of a Pytorch implementation.
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
-    if dtype != torch.float8_e4m3fn:
+    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn:
         multiple = 2 if softcap == 0.0 else 4
         assert (dq - dq_ref).abs().max().item() <= multiple * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item()
@@ -695,26 +705,26 @@ def test_flash_attn_varlen_output(
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
-@pytest.mark.parametrize("num_splits", [1, 0])
+@pytest.mark.parametrize("num_splits", [1] + ([0] if not DISABLE_SPLIT else []))
 # @pytest.mark.parametrize("num_splits", [1])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("new_kv", [False, True])
+@pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
 # @pytest.mark.parametrize("new_kv", [False])
 # @pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(False, False)])
-@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
+@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
-@pytest.mark.parametrize("rotary_interleaved", [False, True])
+@pytest.mark.parametrize("rotary_interleaved", [False, True] if not DISABLE_APPENDKV else [False])
 # @pytest.mark.parametrize("rotary_interleaved", [True])
-@pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0] if not DISABLE_APPENDKV else [0.0])
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
-@pytest.mark.parametrize("page_size", [None, 1, 4, 128])
+@pytest.mark.parametrize("page_size", [None] + ([1, 4, 128] if not DISABLE_PAGEDKV else []))
 # @pytest.mark.parametrize("page_size", [None])
 @pytest.mark.parametrize("has_leftpad", [False, True])
 # @pytest.mark.parametrize("has_leftpad", [False])
@@ -1151,6 +1161,8 @@ def attention_combine_ref(out_partial, lse_partial):
 # @pytest.mark.parametrize("num_splits", [1, 2, 3, 5, 11])
 # @pytest.mark.parametrize("num_splits", [128])
 def test_flash_attn_combine(num_splits, seqlen, d, dtype):
+    if DISABLE_SPLIT:
+        pytest.skip()
     device = "cuda"
     # set seed
     torch.random.manual_seed(1)

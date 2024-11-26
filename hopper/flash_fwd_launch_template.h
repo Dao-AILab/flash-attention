@@ -166,8 +166,8 @@ void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
             // If varlen, we don't actually know seqlen_q but only max_seqlen_q.
             // If causal, PackGQA always seems faster
             : params.h != params.h_k && (Varlen || Is_causal || should_pack_gqa(params.seqlen_q, params.h / params.h_k, kBlockM));
-        BOOL_SWITCH(params.knew_ptr, AppendKV, [&] {
-            BOOL_SWITCH(pack_gqa, PackGQA, [&] {
+        APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
+            PACKGQA_SWITCH(pack_gqa, PackGQA, [&] {
             //     BOOL_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
             //         // Only use Cluster if number of tiles along seqlen_q is even and not varlen
                     BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
