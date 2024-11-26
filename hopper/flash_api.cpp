@@ -421,6 +421,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     TORCH_CHECK(v.stride(-1) == 1 || v.stride(-3) == 1, "Input tensor V must have contiguous last dimension or contiguous seqlen dimension");
     if (v.stride(-1) != 1) {
         TORCH_CHECK(q_type == at::ScalarType::Float8_e4m3fn, "Only fp8_e4m3 data type supports input tensor V having contiguous seqlen dimension")
+        #ifndef FLASHATTENTION_ENABLE_VCOLMAJOR
+        TORCH_CHECK(false, "This flash attention build does not support V having contiguous seqlen dimension.");
+        #endif
     }
 
     const auto sizes = q.sizes();
@@ -611,6 +614,10 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
                int num_splits,
                c10::optional<bool> pack_gqa_
                ) {
+
+    #ifdef FLASHATTENTION_DISABLE_VARLEN
+        TORCH_CHECK(false, "This flash attention build does not support varlen.");
+    #endif
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
@@ -1080,6 +1087,10 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
     #endif
+    #ifdef FLASHATTENTION_DISABLE_VARLEN
+        TORCH_CHECK(false, "This flash attention build does not support varlen.");
+    #endif
+
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm9x = dprops->major == 9 && dprops->minor >= 0;
     TORCH_CHECK(is_sm9x, "FlashAttentionHopper only supports Hopper GPUs or newer.");
@@ -1632,6 +1643,9 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
     #endif
     #ifdef FLASHATTENTION_DISABLE_APPENDKV
     TORCH_CHECK(!k_.has_value(), "This flash attention build does not support appending KV.");
+    #endif
+    #ifdef FLASHATTENTION_DISABLE_VARLEN
+    TORCH_CHECK(!seqused_k_.has_value() && !leftpad_k_.has_value() && !k_.has_value() && !cu_seqlens_q_.has_value(), "This flash attention build does not support varlen.");
     #endif
 
     if (seqlen_q > 0 && total_q > 0 && seqlen_k > 0 && batch_size > 0) {

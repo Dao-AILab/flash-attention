@@ -160,7 +160,7 @@ void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
     };
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
     using T_out = std::conditional_t<!Split, std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>, float>;
-    BOOL_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
+    VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
         bool pack_gqa = params.pack_gqa >= 0  // if negative, we use a heuristic to decide
             ? bool(params.pack_gqa)
             // If varlen, we don't actually know seqlen_q but only max_seqlen_q.
@@ -170,9 +170,9 @@ void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
             PACKGQA_SWITCH(pack_gqa, PackGQA, [&] {
             //     BOOL_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
             //         // Only use Cluster if number of tiles along seqlen_q is even and not varlen
-                    BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
+                    CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
                         static constexpr int ClusterM = !Varlen && Enable_cluster && Use_cluster ? 2 : 1;
-                        run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, ClusterM, T, T_out, Is_causal, Is_local, false, Varlen /*Varlen*/, PagedKV /*PagedKV*/, AppendKV && Varlen /*AppendKV*/, IntraWGOverlap, PackGQA /*PackGQA*/, Split /*Split*/, false /*V_colmajor*/>(params, stream);
+                        run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, ClusterM, T, T_out, Is_causal, Is_local, false, Varlen, PagedKV, AppendKV && Varlen, IntraWGOverlap, PackGQA, Split, V_colmajor>(params, stream);
                     });
             //     });
             });
@@ -194,7 +194,7 @@ void run_mha_fwd_16b(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T, int kHeadDim, bool Split, bool PagedKV>
 void run_mha_fwd_8b(Flash_fwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        BOOL_SWITCH(params.v_dim_stride != 1, V_colmajor, [&] {
+        VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor, [&] {
             // Can't use structured binding since it's not compatible with constexpr
             static constexpr std::tuple<int, int, bool> kBlockMN_IntraWGOverlap = tile_size_fwd(kHeadDim, Is_causal || Is_local, sizeof(T) /*element_size*/, V_colmajor /*V_colmajor*/, PagedKV);
             static constexpr bool Enable_cluster = kHeadDim == 192 && !Is_causal && !Is_local && !Split && !PagedKV;
