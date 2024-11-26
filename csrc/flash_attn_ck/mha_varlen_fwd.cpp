@@ -217,6 +217,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
         args.page_block_size = 0;
     }
 
+    args.is_gappy = false;
     args.cache_batch_idx = nullptr;
 
     args.seqstart_q_ptr = seqlens_q.data_ptr();
