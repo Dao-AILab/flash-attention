@@ -121,7 +121,7 @@ container from ROCm, which has all the required tools to install FlashAttention.
 FlashAttention-2 with ROCm currently supports:
 1. MI200 or MI300 GPUs.
 2. Datatype fp16 and bf16
-3. Forward's head dimensions up to 256. Backward head dimensions up to 128.
+3. Both forward's and backward's head dimensions up to 256.
 
 
 ## How to use FlashAttention
