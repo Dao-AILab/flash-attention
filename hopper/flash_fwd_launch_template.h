@@ -172,7 +172,7 @@ void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
             //         // Only use Cluster if number of tiles along seqlen_q is even and not varlen
                     BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
                         static constexpr int ClusterM = !Varlen && Enable_cluster && Use_cluster ? 2 : 1;
-                        run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, ClusterM, T, T_out, Is_causal, false, false, Varlen /*Varlen*/, PagedKV /*PagedKV*/, AppendKV && Varlen /*AppendKV*/, IntraWGOverlap, PackGQA /*PackGQA*/, Split /*Split*/, false /*V_colmajor*/>(params, stream);
+                        run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, ClusterM, T, T_out, Is_causal, Is_local, false, Varlen /*Varlen*/, PagedKV /*PagedKV*/, AppendKV && Varlen /*AppendKV*/, IntraWGOverlap, PackGQA /*PackGQA*/, Split /*Split*/, false /*V_colmajor*/>(params, stream);
                     });
             //     });
             });

@@ -251,7 +251,7 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
         BOOL_SWITCH(params.h != params.h_k, GQA, [&] {
 //             BOOL_SWITCH(params.deterministic, Deterministic, [&] {
             // run_flash_bwd<kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen, false, GQA, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);
-            run_flash_bwd<kHeadDim, kBlockM, kBlockN, T, Is_causal, false, false, Varlen /*Varlen*/, false /*Deterministic*/, GQA, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);
+            run_flash_bwd<kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, false, Varlen /*Varlen*/, false /*Deterministic*/, GQA, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);
 //             });
         });
     });

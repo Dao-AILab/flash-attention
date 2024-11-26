@@ -283,7 +283,6 @@ def attention_ref(
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
-
 # TODO: deadlock with fp8 and local, probably bc of sink tokens
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
@@ -295,8 +294,8 @@ def attention_ref(
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 50.0])
 @pytest.mark.parametrize("softcap", [0.0])
-# @pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
-@pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
+@pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
+# @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(False, False)])
 # @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("V_colmajor", [False, True])
@@ -496,8 +495,8 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 50.0])
 @pytest.mark.parametrize("softcap", [0.0])
-# @pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
-@pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
+@pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
+# @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(False, False)])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
@@ -528,7 +527,6 @@ def test_flash_attn_output(
         (8192, 8192),
     ],
 )
-# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_varlen_output(
         seqlen_q, seqlen_k, d, causal, local, softcap, deterministic, mha_type, dtype
 ):
@@ -707,9 +705,9 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("new_kv", [False, True])
 # @pytest.mark.parametrize("new_kv", [False])
 # @pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
+# @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
+# @pytest.mark.parametrize("causal,local", [(False, False)])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("rotary_interleaved", [False, True])
@@ -784,7 +782,6 @@ def test_flash_attn_kvcache(
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
-    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
     if varlen_q:
@@ -797,6 +794,8 @@ def test_flash_attn_kvcache(
         query_padding_mask = None
         q_unpad = q
         cu_seqlens_q, max_seqlen_q = None, None
+    # Put window_size after QKV randn so that window_size changes from test to test
+    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
     seqlen_new = seqlen_q if seqlen_new_eq_seqlen_q else torch.randint(1, seqlen_q + 1, (1,)).item()
     if new_kv:
