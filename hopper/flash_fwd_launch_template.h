@@ -168,13 +168,13 @@ void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
             : params.h != params.h_k && (Varlen || Is_causal || should_pack_gqa(params.seqlen_q, params.h / params.h_k, kBlockM));
         APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
             PACKGQA_SWITCH(pack_gqa, PackGQA, [&] {
-            //     BOOL_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
-            //         // Only use Cluster if number of tiles along seqlen_q is even and not varlen
+                SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
+                    // Only use Cluster if number of tiles along seqlen_q is even and not varlen
                     CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
                         static constexpr int ClusterM = !Varlen && Enable_cluster && Use_cluster ? 2 : 1;
-                        run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, ClusterM, T, T_out, Is_causal, Is_local, false, Varlen, PagedKV, AppendKV && Varlen, IntraWGOverlap, PackGQA, Split, V_colmajor>(params, stream);
+                        run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV && Varlen, IntraWGOverlap, PackGQA, Split, V_colmajor>(params, stream);
                     });
-            //     });
+                });
             });
         });
     });

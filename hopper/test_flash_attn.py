@@ -19,6 +19,7 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 DISABLE_PAGEDKV = os.getenv("FLASH_ATTENTION_DISABLE_PAGEDKV", "FALSE") == "TRUE"
 DISABLE_APPENDKV = os.getenv("FLASH_ATTENTION_DISABLE_APPENDKV", "FALSE") == "TRUE"
 DISABLE_LOCAL = os.getenv("FLASH_ATTENTION_DISABLE_LOCAL", "FALSE") == "TRUE"
+DISABLE_SOFTCAP = os.getenv("FLASH_ATTENTION_DISABLE_SOFTCAP", "FALSE") == "TRUE"
 DISABLE_PACKGQA = os.getenv("FLASH_ATTENTION_DISABLE_PACKGQA", "FALSE") == "TRUE"
 DISABLE_FP16 = os.getenv("FLASH_ATTENTION_DISABLE_FP16", "FALSE") == "TRUE"
 DISABLE_FP8 = os.getenv("FLASH_ATTENTION_DISABLE_FP8", "FALSE") == "TRUE"
@@ -302,8 +303,8 @@ def attention_ref(
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
-# @pytest.mark.parametrize("softcap", [0.0, 50.0])
-@pytest.mark.parametrize("softcap", [0.0])
+@pytest.mark.parametrize("softcap", [0.0] + ([30.0]) if not DISABLE_SOFTCAP else [])
+# @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(False, False)])
@@ -503,8 +504,8 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
-# @pytest.mark.parametrize("softcap", [0.0, 50.0])
-@pytest.mark.parametrize("softcap", [0.0])
+@pytest.mark.parametrize("softcap", [0.0] + ([30.0]) if not DISABLE_SOFTCAP else [])
+# @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(False, False)])

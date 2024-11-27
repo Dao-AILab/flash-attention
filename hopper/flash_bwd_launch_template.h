@@ -251,7 +251,7 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
         BOOL_SWITCH(params.h != params.h_k, GQA, [&] {
 //             BOOL_SWITCH(params.deterministic, Deterministic, [&] {
             // run_flash_bwd<kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen, false, GQA, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);
-            run_flash_bwd<kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, false, Varlen /*Varlen*/, false /*Deterministic*/, GQA, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);
+            run_flash_bwd<kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen /*Varlen*/, false /*Deterministic*/, GQA, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);
 //             });
         });
     });
@@ -261,19 +261,21 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
 template<typename T>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        if (params.softcap == 0.f) {
-            run_mha_bwd_dispatch<T, 128, 128, 64, Is_causal, Is_local, /*Has_softcap=*/false, 2, 2, true, false, false, 2, 1, 2, 2>(params, stream);
-        } else {
-            // register spill with 128 x 128
-            run_mha_bwd_dispatch<T, 96, 128, 64, Is_causal, Is_local, /*Has_softcap=*/true, 2, 2, true, false, true, 2, 1, 2, 2>(params, stream);
-        }
+        SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
+            if constexpr (!Has_softcap) {
+                run_mha_bwd_dispatch<T, 128, 128, 64, Is_causal, Is_local, /*Has_softcap=*/false, 2, 2, true, false, false, 2, 1, 2, 2>(params, stream);
+            } else {
+                // register spill with 128 x 128
+                run_mha_bwd_dispatch<T, 96, 128, 64, Is_causal, Is_local, /*Has_softcap=*/true, 2, 2, true, false, true, 2, 1, 2, 2>(params, stream);
+            }
+        });
     });
 }
 
 template<typename T>
 void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        BOOL_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
+        SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
             run_mha_bwd_dispatch<T, 64, 128, 96, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1>(params, stream);
         });
     });
@@ -282,7 +284,7 @@ void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
 template<typename T>
 void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        BOOL_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
+        SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
             run_mha_bwd_dispatch<T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1>(params, stream);
         });
     });
@@ -302,7 +304,7 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
 template<typename T>
 void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        BOOL_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
+        SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
             run_mha_bwd_dispatch<T, 64, 96, 192, Is_causal, Is_local, Has_softcap, 1, 1, false, true, false, 3, 1, 1, 1>(params, stream);
         });
     });
@@ -311,7 +313,7 @@ void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
 template<typename T>
 void run_mha_bwd_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        BOOL_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
+        SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
             run_mha_bwd_dispatch<T, 64, 80, 256, Is_causal, Is_local, Has_softcap, 1, 1, false, true, true, 2, 1, 1, 1>(params, stream);
         });
     });

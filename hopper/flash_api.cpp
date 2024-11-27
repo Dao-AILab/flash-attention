@@ -568,6 +568,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
     TORCH_CHECK(params.pack_gqa == -1 || params.pack_gqa == 0, "This flash attention build does not support pack_gqa.");
     #endif
+    #ifdef FLASHATTENTION_DISABLE_SOFTCAP
+    TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
+    #endif
 
     if (seqlen_k > 0 && batch_size > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -794,6 +797,9 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
     #endif
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
     TORCH_CHECK(params.pack_gqa == -1 || params.pack_gqa == 0, "This flash attention build does not support pack_gqa.");
+    #endif
+    #ifdef FLASHATTENTION_DISABLE_SOFTCAP
+    TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
     #endif
 
     if (max_seqlen_k > 0 && batch_size > 0) {
@@ -1042,6 +1048,9 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     #ifdef FLASHATTENTION_DISABLE_LOCAL
     TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
     #endif
+    #ifdef FLASHATTENTION_DISABLE_SOFTCAP
+    TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
+    #endif
 
     if (seqlen_q > 0) {
         run_mha_bwd(params, stream);
@@ -1271,6 +1280,9 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
     TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
+    #endif
+    #ifdef FLASHATTENTION_DISABLE_SOFTCAP
+    TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
     #endif
 
     if (max_seqlen_q > 0) {
@@ -1631,6 +1643,9 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
     TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
+    #endif
+    #ifdef FLASHATTENTION_DISABLE_SOFTCAP
+    TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_SPLIT
     TORCH_CHECK(params.num_splits == 1, "This flash attention build does not support splits.");
