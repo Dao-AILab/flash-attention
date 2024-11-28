@@ -217,6 +217,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
         args.page_block_size = 0;
     }
 
+    args.is_gappy = false;
     args.cache_batch_idx = nullptr;
 
     args.seqstart_q_ptr = seqlens_q.data_ptr();
@@ -442,7 +443,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         if (return_dropout_randval) {p.zero_();}
     }
 
-    int num_splits = 1;
+    int num_splits = 0;
     num_splits = flash::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size, 0, num_splits);
     TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
     TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
