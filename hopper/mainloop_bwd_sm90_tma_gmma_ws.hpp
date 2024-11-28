@@ -16,6 +16,7 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 
 #include "named_barrier.hpp"
+#include "mask.h"
 #include "softmax.h"
 #include "utils.h"
 
@@ -161,11 +162,13 @@ struct CollectiveMainloopBwd {
         std::conditional_t<PdS_Major == GMMA::Major::K, cute::Step<_1, _2, _3>, cute::Step<_2, _1, _3>>{}));
 
     // Need stride to be multiple of 32, otherwise we get error (misaligned address) when doing TMA if e.g. kBlockM=80
-    using SmemLayoutLSE = cute::Layout<cute::Shape<Int<kBlockM>, Int<kStages>>, cute::Stride<_1, Int<cute::round_up(kBlockM, 32)>>>;
+    // We set stride to be multiple of 64 so that if ShuffleLSE, even if threads read from sLSE but out of bounds,
+    // it's still a valid smem address.
+    using SmemLayoutLSE = cute::Layout<cute::Shape<Int<kBlockM>, Int<kStages>>, cute::Stride<_1, Int<cute::round_up(kBlockM, 64)>>>;
     using SmemLayoutLSEMma = std::conditional_t<
         SdP_swapAB,
-        cute::Layout<cute::Shape<Int<kBlockN>, Int<kBlockM>, Int<kStages>>, cute::Stride<_0, _1, Int<cute::round_up(kBlockM, 32)>>>,
-        cute::Layout<cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kStages>>, cute::Stride<_1, _0, Int<cute::round_up(kBlockM, 32)>>>
+        cute::Layout<cute::Shape<Int<kBlockN>, Int<kBlockM>, Int<kStages>>, cute::Stride<_0, _1, Int<cute::round_up(kBlockM, 64)>>>,
+        cute::Layout<cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kStages>>, cute::Stride<_1, _0, Int<cute::round_up(kBlockM, 64)>>>
     >;
 
     // Note this is the transpose in terms of the view, not in terms of memory.
@@ -187,10 +190,10 @@ struct CollectiveMainloopBwd {
                                                make_stride(Int<kBlockM>{}, _1{}, Int<kBlockM * kBlockN>{}))));
 
     // Thread layout, 256 or 384 threads per row
-    using R2SLayoutAtomdQaccum = Layout<Shape<Int<kNThreadsdQ>>, Stride<_1>>;
+    using R2SLayoutAtomdQaccum = Layout<Shape<Int<kNThreadsdQ>>>;
     using R2STiledCopydQaccum = decltype(make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{}, R2SLayoutAtomdQaccum{},
                                                          Layout<Shape < _4>>{}));  // Val layout, 4 vals per store
-    using SmemLayoutdQaccum = Layout<Shape<Int<kBlockM * kHeadDim>>, Stride<_1>>;
+    using SmemLayoutdQaccum = Layout<Shape<Int<kBlockM * kHeadDim>>>;
     using SmemLayoutAtomdQaccumTMA =
         decltype(composition(Swizzle<0, 4, 3>{},  // We don't want any swizzle
                              Layout<Shape<Int<8>, Int<kHeadDim>>,
@@ -287,25 +290,31 @@ struct CollectiveMainloopBwd {
     static_assert(SmemAlignmentP >= 128 && SmemAlignmentdS >= 128, "Require at least 128B alignment");
 
     // TODO: do we have to worry that smem_dk and smem_dv in the epilogue don't line up w smem_k and smem_v due to alignment?
+    using SmemdQacc_t = std::conditional_t<!dQacc_use_TMA, cute::array<Element, 0>, cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutdQaccum>>>;
+    using SmemP_t = std::conditional_t<Mma_dKV_is_RS, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutPdS>, SmemAlignmentP>>;
     struct TensorStorage : cute::aligned_struct<cute::max(SmemAlignmentP, SmemAlignmentdS, SmemAlignmentQKVdO)> {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentQKVdO> smem_k;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>, SmemAlignmentQKVdO> smem_v;
-        cute::array_aligned<ElementAccum, dQacc_use_TMA ? cute::cosize_v<SmemLayoutdQaccum> : 0> smem_dqacc;
+        SmemdQacc_t smem_dqacc;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQKVdO> smem_q;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutdO>, SmemAlignmentQKVdO> smem_do;
-        cute::array_aligned<Element, Mma_dKV_is_RS ? 0 : cute::cosize_v<SmemLayoutPdS>, SmemAlignmentP> smem_p;
-        cute::array_aligned<Element, cute::cosize_v<SmemLayoutPdS>, SmemAlignmentdS> smem_ds;
         cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutLSE>, 128> smem_lse;
         cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutLSE>, 128> smem_dpsum;
+        SmemP_t smem_p;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutPdS>, SmemAlignmentdS> smem_ds;
     };
-
-    static constexpr int SharedStorageQdOSize = sizeof(decltype((TensorStorage{}).smem_q)) + sizeof(decltype((TensorStorage{}).smem_do)) + sizeof(decltype((TensorStorage{}).smem_ds)) + sizeof(decltype((TensorStorage{}).smem_dqacc));
 
     // These are tuned for speed. They don't affect correctness.
     // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
     // this helps quite a bit to not have to do causal masking for most of the iterations.
     // For hdim 192, separating masking iterations results in register spills.
     static constexpr bool SeparateMaskingIterations = kHeadDim <= 64;
+    // Do we keep the LSE and dPsum in each thread, or split them across 8 threads that share them and then
+    // shuffle to get the value whenever we need. This can reduce register pressure when SdP_swapAB, where each
+    // thread needs to keep statistics for (kBlockM / 4) rows. If !SdP_swapAB, each thread only needs to keep
+    // statistic for 2 rows.
+    static constexpr bool ShuffleLSE = SdP_swapAB && kHeadDim <= 64;
+    static constexpr bool ShuffledPSum = SdP_swapAB && kHeadDim <= 64;
     // For hdim256, we want to slice the dQ MMA (64 x 256 on 2 WGs) into two (64 x 128 on 2 WGs) so that we can
     // do atomic add on one half before doing the other half of the MMA, to reduce register pressure.
     static constexpr bool Slice_dQKV_Mma = kHeadDim == 256 && !dQacc_use_TMA && dQ_swapAB && AtomLayoutMdQ == 1 && NumMmaWarpGroups == 2;
@@ -842,6 +851,8 @@ struct CollectiveMainloopBwd {
             group_modes<0, 2>(thread_mma_SdP.partition_C(sdPsumMma)(make_coord(_0{}, _, _0{}), _, _0{}, _)),
             group_modes<0, 3>(thread_mma_SdP.partition_C(sdPsumMma)(make_coord(_, _0{}, _), _0{}, _, _)));
         // if (blockIdx.x == 0 && threadIdx.x == 128) { print(sLSEMma); printf("\n"); print(tLSEsLSE); printf("\n"); }
+        // If we want to split the stats among the 8 threads that share the same rows.
+        static constexpr int kStatsPerThread = cute::ceil_div(decltype(size(tLSEsLSE))::value, 8);
 
         auto consumer_wait = [](auto& pipeline, auto& smem_pipe_read) {
             auto barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
@@ -850,12 +861,13 @@ struct CollectiveMainloopBwd {
 
         int n_block = get<0>(block_coord);
         int bidb = get<2>(block_coord);
+        int bidh = get<1>(block_coord);
         int const seqlen_q = get_seqlen_q(params, bidb);
         int const seqlen_k = get_seqlen_k(params, bidb);
 
         // For the case where we do atomicAdd directly to gdQaccum instead of using TMA
         Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.ptr_dQaccum)),
-                                      params.shape_dQaccum, params.stride_dQaccum)(_, _, get<1>(block_coord), !Varlen ? bidb : 0);
+                                      params.shape_dQaccum, params.stride_dQaccum)(_, _, bidh, !Varlen ? bidb : 0);
         int const offset_padded = !Varlen ? 0 : (params.cu_seqlens_q[bidb] + bidb * kBlockM) / kBlockM * kBlockM;
         Tensor gdQaccum = local_tile(domain_offset(make_coord(offset_padded, _0{}), mdQaccum), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)
         // if (blockIdx.x == 0 && threadIdx.x == 128) { print(mdQaccum); printf("\n"); print(gdQaccum); printf("\n"); }
@@ -865,78 +877,10 @@ struct CollectiveMainloopBwd {
         // if (blockIdx.x == 0 && threadIdx.x == 128) { print(gmem_tiled_copy_dQaccum); printf("\n"); }
         Tensor tdQgdQaccum = gmem_thr_copy_dQaccum.partition_D(gdQaccum);
 
-        auto causal_local_mask_fn = [&](auto& tSrS, int const m_block, auto is_causal_type, auto is_local_type) {
-            static constexpr int Row = !SdP_swapAB ? 0 : 1, Col = !SdP_swapAB ? 1 : 0;
-            constexpr bool Is_causal = decltype(is_causal_type)::value;
-            constexpr bool Is_local = decltype(is_local_type)::value;
-            Tensor cS = cute::make_identity_tensor(select<Row, Col>(TileShape_MNK{}));
-            Tensor tScS = thread_mma_SdP.partition_C(cS);
-            Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(tSrS.layout()));
-            Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(tScS.layout()));
-            Tensor t0ScS = thread0_mma_SdP.partition_C(cS);
-            Tensor t0ScS_rowcol = make_tensor(t0ScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(t0ScS.layout()));
-            int const thread_col_offset = get<Col>(tScS_rowcol(_0{}, _0{}));
-            int const seqlenk_col_limit = seqlen_k - n_block * kBlockN - thread_col_offset;
-            if constexpr (!Is_causal && !Is_local) {
-                // #pragma unroll
-                // for (int i = 0; i < size(tSrS); ++i) {
-                //     if (int(get<Col>(tScS(i))) >= int(seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
-                // }
-                #pragma unroll
-                for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-                    if (int(get<Col>(t0ScS_rowcol(_0{}, n))) >= seqlenk_col_limit) {
-                        #pragma unroll
-                        for (int m = 0; m < size<0>(tSrS_rowcol); ++m) { tSrS_rowcol(m, n) = -INFINITY; }
-                    }
-                }
-            } else {
-                int const thread_row_offset = get<Row>(tScS_rowcol(_0{}, _0{}));
-                if constexpr (Is_causal) {
-                    int causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
-                    #pragma unroll
-                    for (int i = 0; i < size(tSrS); ++i) {
-                        // Somehow __viaddmin_s32 is a tiny bit (5 TFLOPS) slower for hdim 128 but
-                        // faster for hdim 64 (20 TFLOPS).
-                        int col_limit_right = !SeparateMaskingIterations
-                            ? std::min(int(get<Row>(tScS(i))) + causal_row_offset, seqlen_k - n_block * kBlockN)
-                            : __viaddmin_s32(int(get<Row>(tScS(i))), causal_row_offset, seqlen_k - n_block * kBlockN);
-                        if (int(get<Col>(tScS(i))) >= col_limit_right) { tSrS(i) = -INFINITY; }
-                    }
-                    // int causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM - thread_col_offset + thread_row_offset;
-                    // #pragma unroll
-                    // for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
-                    //     // int col_limit_right = std::min(int(get<Row>(t0ScS_rowcol(m, _0{}))) + causal_row_offset, seqlenk_col_limit);
-                    //     int col_limit_right = __viaddmin_s32(int(get<Row>(t0ScS_rowcol(m, _0{}))), causal_row_offset, seqlenk_col_limit);
-                    //     #pragma unroll
-                    //     for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-                    //         if (int(get<Col>(t0ScS_rowcol(_0{}, n))) >= col_limit_right) { tSrS_rowcol(m, n) = -INFINITY; }
-                    //     }
-                    // }
-                    // #pragma unroll
-                    // for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-                    //     int row_limit_top = int(get<Col>(t0ScS_rowcol(_0{}, n))) - causal_row_offset;
-                    //     #pragma unroll
-                    //     for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
-                    //         if (int(get<Row>(t0ScS_rowcol(_0{}, n))) <= row_limit_top) { tSrS_rowcol(m, n) = -INFINITY; }
-                    //     }
-                    // }
-                } else {
-                    int causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
-                    int local_row_offset_right = causal_row_offset + params.window_size_right;
-                    int local_row_offset_left = causal_row_offset - 1 - params.window_size_left;
-                    int col_limit_sink = params.sink_token_length - n_block * kBlockN;
-                    #pragma unroll
-                    for (int i = 0; i < size(tSrS); ++i) {
-                        int col_limit_right = std::min(int(get<Row>(tScS(i))) + local_row_offset_right, seqlen_k - n_block * kBlockN);
-                        // int col_limit_right = __viaddmin_s32(int(get<Row>(tScS(i))), local_row_offset_right, seqlen_k - n_block * kBlockN);
-                        int col_limit_left = int(get<Row>(tScS(i))) + local_row_offset_left;
-                        int col_idx = int(get<Col>(tScS(i)));
-                        if (col_idx >= col_limit_right) { tSrS(i) = -INFINITY; }
-                        if (col_idx < col_limit_left && col_idx >= col_limit_sink) { tSrS(i) = -INFINITY; }
-                    }
-                }
-            }
-        };
+        flash::Mask<kBlockM, kBlockN, false /*PackGQA*/, TiledMmaSdP, SdP_swapAB> mask(
+            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
+            params.qhead_per_khead_divmod
+        );
 
         int m_block_max = get_m_block_max(params, n_block, bidb);
         int m_block_min = get_m_block_min(params, n_block, bidb);
@@ -953,13 +897,21 @@ struct CollectiveMainloopBwd {
             Tensor tSrS = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
             pipeline_q.consumer_wait(smem_pipe_read);
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/SdP_swapAB>(tiled_mma_SdP, tSrQ(_, _, _, smem_pipe_read.index()), tSrK, tSrS);
-            Tensor tLSErLSE = make_fragment_like(tLSEsLSE(_, _0{}));
-            cute::copy(tLSEsLSE(_, smem_pipe_read.index()), tLSErLSE);
-
+            Tensor tLSErLSE = cute::conditional_return<!ShuffleLSE>(make_fragment_like(tLSEsLSE(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
+            if constexpr (!ShuffleLSE) {
+                cute::copy(tLSEsLSE(_, smem_pipe_read.index()), tLSErLSE);
+            } else {
+                #pragma unroll
+                for (int i = 0; i < kStatsPerThread; ++i) {
+                    // It's ok to read OOB, since we made sure sLSE is large enough and we won't use the OOB values
+                    tLSErLSE(i) = tLSEsLSE((thread_idx % 32) / 4 + i * 8, smem_pipe_read.index());
+                }
+            }
             Tensor tdPrdP = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
             PipelineState_dO smem_pipe_read_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_read, smem_pipe_read_do);
             pipeline_do.consumer_wait(smem_pipe_read_do_cur);
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/1, /*SwapAB=*/SdP_swapAB>(tiled_mma_SdP, tdPrdO(_, _, _, smem_pipe_read_do_cur.index()), tdPrV, tdPrdP);
+            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/SdP_swapAB>(tiled_mma_SdP, tdPrdO(_, _, _, smem_pipe_read_do_cur.index()), tdPrV, tdPrdP);
+            warpgroup_wait<1>();
             if constexpr (Has_softcap) { flash::apply_softcap(tSrS, params.softcap_val); }
 
             // Reshape tSrS from ((2, 2, V), MMA_N, MMA_M) to (nrow=(2, V, MMA_M), ncol=(2, MMA_N))
@@ -967,19 +919,40 @@ struct CollectiveMainloopBwd {
             // dtanh needs to happen before masking, otherwise we get 1 - (-inf)^2 = NaN in the dtanh
             auto dtanh = [&] {if constexpr (Has_softcap) return flash::calculate_dtanh(scores);  else return nullptr; }();
             mask_fn(tSrS, m_block);
-            flash::scale_apply_exp2</*Scale_max=*/false, /*Check_inf=*/false>(scores, tLSErLSE, params.softmax_scale_log2);
+            #pragma unroll
+            for (int mi = 0; mi < size<0>(scores); ++mi) {
+                float const lse_scaled = [&] {
+                    if constexpr (!ShuffleLSE) return tLSErLSE(mi);
+                    else return __shfl_sync(0xffffffff, tLSErLSE(mi / 8), (mi % 8) * 4 + (thread_idx % 4));
+                }();
+                #pragma unroll
+                for (int ni = 0; ni < size<1>(scores); ++ni) {
+                    scores(mi, ni) = exp2f(scores(mi, ni) * params.softmax_scale_log2 - lse_scaled);
+                }
+            }
 
-            Tensor tLSErdPsum = make_fragment_like(tLSEsdPsum(_, _0{}));
-            cute::copy(tLSEsdPsum(_, smem_pipe_read_do_cur.index()), tLSErdPsum);
+            Tensor tLSErdPsum = cute::conditional_return<!ShuffledPSum>(make_fragment_like(tLSEsdPsum(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
+            if constexpr (!ShuffledPSum) {
+                cute::copy(tLSEsdPsum(_, smem_pipe_read.index()), tLSErdPsum);
+            } else {
+                #pragma unroll
+                for (int i = 0; i < kStatsPerThread; ++i) {
+                    tLSErdPsum(i) = tLSEsdPsum((thread_idx % 32) / 4 + i * 8, smem_pipe_read.index());
+                }
+            }
 
             warpgroup_wait<0>();
             // Reshape tdPrdP from ((2, 2, V), MMA_N, MMA_M) to (nrow=(2, V, MMA_M), ncol=(2, MMA_N))
             Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
             #pragma unroll
             for (int mi = 0; mi < size<0>(dS); ++mi) {
+                float const dP_sum_cur = [&] {
+                    if constexpr (!ShuffledPSum) return tLSErdPsum(mi);
+                    else return __shfl_sync(0xffffffff, tLSErdPsum(mi / 8), (mi % 8) * 4 + (thread_idx % 4));
+                }();
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(dS); ++ni) {
-                    dS(mi, ni) = scores(mi, ni) * (dS(mi, ni) - tLSErdPsum(mi));
+                    dS(mi, ni) = scores(mi, ni) * (dS(mi, ni) - dP_sum_cur);
                     if constexpr (Has_softcap) { dS(mi, ni) *= dtanh(mi, ni); }
                 }
             }
@@ -1094,7 +1067,7 @@ struct CollectiveMainloopBwd {
         // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
         // this helps quite a bit to not have to do causal masking for most of the iterations.
         if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {
-            auto mask_fn = [&](auto& tSrS, int m_block) { causal_local_mask_fn(tSrS, m_block, cute::bool_constant<Is_causal>{}, cute::bool_constant<Is_local>{}); };
+            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
             static constexpr int n_masking_steps = cute::ceil_div(kBlockN, kBlockM) + 1;
             CUTLASS_PRAGMA_NO_UNROLL
             for (; m_block < std::min(m_block_max, m_block_min + n_masking_steps); ++m_block) {
@@ -1114,14 +1087,14 @@ struct CollectiveMainloopBwd {
                // We need to apply local mask starting from m_block_max_og - (cute::ceil_div(kBlockN, kBlockM) + 1)
                : m_block_max - std::min(cute::ceil_div(seqlen_q, kBlockM), cute::ceil_div((n_block + 1) * kBlockN + seqlen_q - seqlen_k + params.window_size_left, kBlockM)));
 
-        auto mask_fn = [&](auto& tSrS, int m_block) { causal_local_mask_fn(tSrS, m_block, cute::bool_constant<Is_causal && !SeparateMaskingIterations>{}, cute::bool_constant<Is_local && !SeparateMaskingIterations>{}); };
+        auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
         CUTLASS_PRAGMA_NO_UNROLL
         for (; m_block < m_block_max - n_local_bottom_steps; ++m_block) {
             bwd_step(m_block, mask_fn);
         }
 
         if constexpr (Is_local && SeparateMaskingIterations) {
-            auto mask_fn = [&](auto& tSrS, int m_block) { causal_local_mask_fn(tSrS, m_block, cute::bool_constant<false>{} /*is_causal*/, cute::bool_constant<Is_local>{}); };
+            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
             CUTLASS_PRAGMA_NO_UNROLL
             for (; m_block < m_block_max; ++m_block) {
                 bwd_step(m_block, mask_fn);

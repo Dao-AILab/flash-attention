@@ -1032,8 +1032,7 @@ struct CollectiveMainloopFwd {
                 if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
                 consumer_wait(pipeline_v, smem_pipe_read);
                 warp_scheduler_barrier_sync();
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-                warpgroup_wait<0>();
+                flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 pipeline_v.consumer_release(smem_pipe_read);  // release V
                 ++smem_pipe_read;
             };

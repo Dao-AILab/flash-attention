@@ -931,7 +931,9 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size_rounded = head_size <= 64 ? 64 : (head_size <= 128 ? round_multiple(head_size, 32) : round_multiple(head_size, 64));
     // This needs to match the kernel configs
-    const int kBlockM = head_size_rounded <= 64 ? (softcap == 0.0 ? 128 : 96) : 64;
+    // const int kBlockM = head_size_rounded <= 64 ? 128 : 64;
+    bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    const int kBlockM = head_size_rounded <= 64 ? 128 : (head_size_rounded <= 128 ? (is_causal || is_local ? 64 : 80) : 64);
     const int kBlockN = head_size_rounded <= 128 ? 128 : (head_size_rounded <= 192 ? 96 : 80);
     const int seqlen_q_rounded = round_multiple(seqlen_q, kBlockM);
     const int seqlen_k_rounded = round_multiple(seqlen_k, kBlockN);
@@ -1145,7 +1147,9 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size_rounded = head_size <= 64 ? 64 : (head_size <= 128 ? round_multiple(head_size, 32) : round_multiple(head_size, 64));
     // This needs to match the kernel configs
-    const int kBlockM = head_size_rounded <= 64 ? (softcap == 0.0 ? 128 : 96) : 64;
+    // const int kBlockM = head_size_rounded <= 64 ? 128 : 64;
+    bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    const int kBlockM = head_size_rounded <= 64 ? 128 : (head_size_rounded <= 128 ? (is_causal || is_local ? 64 : 80) : 64);
     const int kBlockN = head_size_rounded <= 128 ? 128 : (head_size_rounded <= 192 ? 96 : 80);
     const int seqlen_q_rounded = round_multiple(max_seqlen_q, kBlockM);
     const int seqlen_k_rounded = round_multiple(max_seqlen_k, kBlockN);

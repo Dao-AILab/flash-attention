@@ -140,14 +140,15 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();
     int smem_size = AttnKernel::SharedStorageSize;
-    // int smem_size_q = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_q));
-    // int smem_size_do = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_do));
-    // int smem_size_ds = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_ds));
-    // int smem_size_dqacc = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_dqacc));
-    // int smem_size_k = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_k));
-    // int smem_size_v = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_v));
-    // printf("smem_size = %d, q = %d, k = %d, v = %d, do = %d, ds = %d, dqacc = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v, smem_size_do, smem_size_ds, smem_size_dqacc);
-    // Get the ptr to kernel function.
+    // int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
+    // int smem_size_do = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_do));
+    // int smem_size_ds = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_ds));
+    // int smem_size_dqacc = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_dqacc));
+    // int smem_size_k = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k));
+    // int smem_size_v = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v));
+    // int smem_size_lse = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_lse));
+    // int smem_size_dpsum = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_dpsum));
+    // printf("smem_size = %d, q = %d, k = %d, v = %d, do = %d, ds = %d, dqacc = %d, lse = %d, dpsum = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v, smem_size_do, smem_size_ds, smem_size_dqacc, smem_size_lse, smem_size_dpsum);
     if constexpr (size(ClusterShape{}) > 1) {
         void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
         if (smem_size >= 48 * 1024) {
@@ -262,12 +263,8 @@ template<typename T>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
-            if constexpr (!Has_softcap) {
-                run_mha_bwd_dispatch<T, 128, 128, 64, Is_causal, Is_local, /*Has_softcap=*/false, 2, 2, true, false, false, 2, 1, 2, 2>(params, stream);
-            } else {
-                // register spill with 128 x 128
-                run_mha_bwd_dispatch<T, 96, 128, 64, Is_causal, Is_local, /*Has_softcap=*/true, 2, 2, true, false, true, 2, 1, 2, 2>(params, stream);
-            }
+            // With ShuffleStats we no longer have register spilling when Has_softcap and using 128 x 128 block.
+            run_mha_bwd_dispatch<T, 128, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 2>(params, stream);
         });
     });
 }
@@ -285,7 +282,11 @@ template<typename T>
 void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
-            run_mha_bwd_dispatch<T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1>(params, stream);
+            if constexpr (Is_causal || Is_local) {
+                run_mha_bwd_dispatch<T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1>(params, stream);
+            } else {
+                run_mha_bwd_dispatch<T, 80, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 1>(params, stream);
+            }
         });
     });
     // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, false, 2, 1, 2, 1, T>, false>(params, stream);
