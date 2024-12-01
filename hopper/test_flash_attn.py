@@ -504,7 +504,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
-@pytest.mark.parametrize("softcap", [0.0] + ([30.0]) if not DISABLE_SOFTCAP else [])
+@pytest.mark.parametrize("softcap", [0.0] + ([30.0] if not DISABLE_SOFTCAP else []))
 # @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
@@ -714,7 +714,7 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
-# @pytest.mark.parametrize("new_kv", [False])
+# @pytest.mark.parametrize("new_kv", [True])
 # @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
@@ -729,8 +729,8 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("page_size", [None])
 @pytest.mark.parametrize("has_leftpad", [False, True])
 # @pytest.mark.parametrize("has_leftpad", [False])
-# @pytest.mark.parametrize("has_batch_idx", [False, True])
-@pytest.mark.parametrize("has_batch_idx", [False])
+@pytest.mark.parametrize("has_batch_idx", [False, True])
+# @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [False, True])
 # @pytest.mark.parametrize("varlen_q", [False])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
@@ -897,12 +897,8 @@ def test_flash_attn_kvcache(
         cos, sin = None, None
         q_ro, k_ro = q, k
     # k_cache[:, 64:] = -1
-    k_cache_ref = (
-        k_cache if not has_batch_idx else k_cache[cache_batch_idx.to(dtype=torch.long)]
-    ).clone()
-    v_cache_ref = (
-        v_cache if not has_batch_idx else v_cache[cache_batch_idx.to(dtype=torch.long)]
-    ).clone()
+    k_cache_ref = (k_cache if not has_batch_idx else k_cache[cache_batch_idx]).clone()
+    v_cache_ref = (v_cache if not has_batch_idx else v_cache[cache_batch_idx]).clone()
     if new_kv:
         update_mask = torch.logical_and(
             cache_seqlens_expanded <= arange, arange < cache_seqlens_expanded + seqlen_new
@@ -987,19 +983,19 @@ def test_flash_attn_kvcache(
     if new_kv:
         if page_size is None:
             k_cache_select = (
-                k_cache if not has_batch_idx else k_cache[cache_batch_idx.to(dtype=torch.long)]
-            ).to(dtype_ref)
+                k_cache.to(dtype_ref) if not has_batch_idx else k_cache.to(dtype_ref)[cache_batch_idx]
+            )
             v_cache_select = (
-                v_cache if not has_batch_idx else v_cache[cache_batch_idx.to(dtype=torch.long)]
-            ).to(dtype_ref)
+                v_cache.to(dtype_ref) if not has_batch_idx else v_cache.to(dtype_ref)[cache_batch_idx]
+            )
         else:
             k_cache_select = rearrange(
-                k_cache_paged.to(dtype_ref)[page_table.to(dtype=torch.long).flatten()],
+                k_cache_paged.to(dtype_ref)[(page_table if not has_batch_idx else page_table[cache_batch_idx]).flatten()],
                 "(b nblocks) block_size ... -> b (nblocks block_size) ...",
                 b=batch_size,
             )[:, :seqlen_k].to(dtype_ref)
             v_cache_select = rearrange(
-                v_cache_paged.to(dtype_ref)[page_table.to(dtype=torch.long).flatten()],
+                v_cache_paged.to(dtype_ref)[(page_table if not has_batch_idx else page_table[cache_batch_idx]).flatten()],
                 "(b nblocks) block_size ... -> b (nblocks block_size) ...",
                 b=batch_size,
             )[:, :seqlen_k].to(dtype_ref)
