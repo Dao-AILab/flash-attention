@@ -480,7 +480,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // if (cute::thread(32, 0)) { print(scores); }
 
         // Softcapping - calculating dTanh and scaling dS later with it
-        Tensor dtanh = make_tensor_like(scores);
+        [[maybe_unused]] Tensor dtanh = make_tensor_like(scores);
         if constexpr (Is_softcap) {
             flash::calculate_dtanh(scores, dtanh, params.softcap);
         }
