@@ -8,8 +8,8 @@
 #include <cutlass/fast_math.h>  // For FastDivMod
 #include "cute/tensor.hpp"
 
-#include "cutlass/gemm/collective/collective_builder.hpp"
-#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/gemm/collective/builders/sm90_common.inl"
+#include "cutlass/epilogue/collective/builders/sm90_common.inl"
 
 #include "named_barrier.hpp"
 #include "pack_gqa.h"

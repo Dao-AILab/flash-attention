@@ -40,7 +40,7 @@ template<typename Engine0, typename Layout0, typename Engine1, typename Layout1,
 __device__ __forceinline__ void quad_allreduce_(Tensor<Engine0, Layout0> &dst, Tensor<Engine1, Layout1> &src, Operator &op) {
     CUTE_STATIC_ASSERT_V(size(dst) == size(src));
     #pragma unroll
-    for (int i = 0; i < size(dst); i++){
+    for (int i = 0; i < size(dst); i++) {
         dst(i) = Allreduce<4>::run(src(i), op);
     }
 }

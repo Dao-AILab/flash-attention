@@ -8,7 +8,7 @@
 #include <cutlass/barrier.h>
 #include "cute/tensor.hpp"
 
-#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/gemm/collective/builders/sm90_common.inl"
 
 #include "named_barrier.hpp"
 #include "utils.h"

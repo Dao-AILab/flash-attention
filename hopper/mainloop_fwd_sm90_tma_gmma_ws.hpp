@@ -12,7 +12,7 @@
 
 #include "cute/tensor.hpp"
 
-#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/gemm/collective/builders/sm90_common.inl"
 
 #include "named_barrier.hpp"
 #include "seqlen.h"
@@ -749,7 +749,7 @@ struct CollectiveMainloopFwd {
     CUTLASS_DEVICE void
     warp_scheduler_barrier_sync() {
         if constexpr (UseSchedulerBarrier) {
-            cutlass::arch::NamedBarrier::sync(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + cutlass::canonical_warp_group_idx() /*id*/);
+            cutlass::arch::NamedBarrier::sync(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + flash::canonical_warp_group_idx_nosync() /*id*/);
         }
     }
 
@@ -757,7 +757,7 @@ struct CollectiveMainloopFwd {
     warp_scheduler_barrier_arrive() {
         if constexpr (UseSchedulerBarrier) {
             static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
-            int const cur_WG = cutlass::canonical_warp_group_idx();
+            int const cur_WG = flash::canonical_warp_group_idx_nosync();
             int const next_WG = NumMmaWarpGroups == 2
                 ? 3 - cur_WG
                 : (cur_WG <= NumMmaWarpGroups - 1 ? cur_WG + 1 : cur_WG + 1 - NumMmaWarpGroups);
@@ -775,7 +775,7 @@ struct CollectiveMainloopFwd {
             // We have NamedBarrier for up to 3 WGs
             static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
             // WG1 needs the very first signal to start
-            if (cutlass::canonical_warp_group_idx() == 1) {
+            if (flash::canonical_warp_group_idx_nosync() == 1) {
                 cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
             }
         }
@@ -1248,7 +1248,7 @@ struct CollectiveMainloopFwd {
         if constexpr (UseSchedulerBarrier) {
             // WG1 already got the very first signal from mma_init(), but we'll be using the same NamedBarrier.
             // So we'll need to "cancel it out" here and then re-signal it at the end.
-            if (cutlass::canonical_warp_group_idx() == 1) {
+            if (flash::canonical_warp_group_idx_nosync() == 1) {
                 cutlass::arch::NamedBarrier::sync(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
             }
         }
@@ -1298,7 +1298,7 @@ struct CollectiveMainloopFwd {
             cutlass::arch::fence_view_async_shared();
             // Very important: PipelineTmaAsync::consumer_release assumes that the warpgroup is synchronized
             // before calling.
-            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + cutlass::canonical_warp_group_idx() /*id*/);
+            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + flash::canonical_warp_group_idx_nosync() /*id*/);
             pipeline_k_new.consumer_release(smem_pipe_read);
             // if (thread_idx == 0) { print_tensor(tKpK); printf("\n"); printf("seqlen_limit = %d\n", seqlen_k_new - n_block * kBlockN);}
         };
@@ -1317,7 +1317,7 @@ struct CollectiveMainloopFwd {
                 paged_kv_manager.store_V(n_block, tVsV_cur);
             }
             cutlass::arch::fence_view_async_shared();
-            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + cutlass::canonical_warp_group_idx() /*id*/);
+            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + flash::canonical_warp_group_idx_nosync() /*id*/);
             pipeline_v_new.consumer_release(smem_pipe_read);
         };
 
@@ -1334,7 +1334,7 @@ struct CollectiveMainloopFwd {
 
         // Re-signaling the NamedBarrier that we "canceled out"
         if constexpr (UseSchedulerBarrier) {
-            if (cutlass::canonical_warp_group_idx() == 1) {
+            if (flash::canonical_warp_group_idx_nosync() == 1) {
                 cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
             }
         }
