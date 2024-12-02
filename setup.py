@@ -28,7 +28,6 @@ from torch.utils.cpp_extension import (
     IS_HIP_EXTENSION,
 )
 
-
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
@@ -169,6 +168,10 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     # cc_flag.append("arch=compute_75,code=sm_75")
     cc_flag.append("-gencode")
     cc_flag.append("arch=compute_80,code=sm_80")
+    cc_flag.append("-gencode")
+    cc_flag.append("arch=compute_86,code=sm_86")
+    cc_flag.append("-gencode")
+    cc_flag.append("arch=compute_89,code=sm_89")
     if CUDA_HOME is not None:
         if bare_metal_version >= Version("11.8"):
             cc_flag.append("-gencode")
