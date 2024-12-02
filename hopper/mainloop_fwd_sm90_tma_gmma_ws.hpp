@@ -205,12 +205,8 @@ struct CollectiveMainloopFwd {
         int const* cache_batch_idx;
         cutlass::FastDivmod num_splits_divmod;
         // Paged Attention block table data
-        int * block_table; // may be nullptr if not paged
-        int64_t block_table_batch_stride;
-        int page_block_size;
-        int num_blocks; // num_block
+        const PagedCopyArgs paged_copy_args;
     };
-
 
     static Params
     to_underlying_arguments(Arguments const& args) {
@@ -246,7 +242,7 @@ struct CollectiveMainloopFwd {
                 args.window_size_left, args.window_size_right,
                 args.cache_batch_idx,
                 cutlass::FastDivmod(args.num_splits),
-                args.block_table, args.block_table_batch_stride, args.page_block_size, args.num_blocks};
+                {args.block_table_batch_stride, args.page_block_size, args.block_table }};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -384,15 +380,12 @@ struct CollectiveMainloopFwd {
             }
         }
 
-
-        PagedCopyArgs const paged_copy_args = {mainloop_params.block_table_batch_stride, mainloop_params.page_block_size, mainloop_params.block_table};
-
         int n_block = n_block_max - 1;
 
         int lane_predicate = cute::elect_one_sync();
         if (lane_predicate) {
             pipeline_k.producer_acquire(smem_pipe_write_k);
-            copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv, paged_copy_args),
+            copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv, mainloop_params.paged_copy_args),
                 tKgK(_, n_block), tKsK(_, smem_pipe_write_k.index()));
             ++smem_pipe_write_k;
         }
@@ -414,11 +407,11 @@ struct CollectiveMainloopFwd {
             #pragma unroll 2
             for (; n_block > n_block_min; --n_block) {
                 pipeline_k.producer_acquire(smem_pipe_write_k);
-                copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv, paged_copy_args),
+                copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv, mainloop_params.paged_copy_args),
                     tKgK(_, n_block - 1), tKsK(_, smem_pipe_write_k.index()));
                 ++smem_pipe_write_k;
                 pipeline_v.producer_acquire(smem_pipe_write_v);
-                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv, paged_copy_args),
+                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv, mainloop_params.paged_copy_args),
                     tVgV(_, n_block), tVsV(_, smem_pipe_write_v.index()));
                 ++smem_pipe_write_v;
             }
@@ -427,7 +420,7 @@ struct CollectiveMainloopFwd {
         scheduler.prefetch_next_work(scheduler_params, work_tile_info);
         if (lane_predicate) {
             pipeline_v.producer_acquire(smem_pipe_write_v);
-            copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv, paged_copy_args),
+            copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv, mainloop_params.paged_copy_args),
                 tVgV(_, n_block), tVsV(_, smem_pipe_write_v.index()));
             ++smem_pipe_write_v;
         }
@@ -524,15 +517,13 @@ struct CollectiveMainloopFwd {
             }
         }
 
-        PagedCopyArgs const paged_copy_args = {mainloop_params.block_table_batch_stride, mainloop_params.page_block_size, mainloop_params.block_table};
-
         int n_block = n_block_max - 1;
 
         int lane_predicate = cute::elect_one_sync();
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         if (warp_idx_in_warpgroup == 0 && lane_predicate) {
             pipeline_k.producer_acquire(smem_pipe_write);
-            copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, paged_copy_args),
+            copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, mainloop_params.paged_copy_args),
                 tKgK(_, n_block), tKsK(_, smem_pipe_write.index()));
         }
 
@@ -545,7 +536,7 @@ struct CollectiveMainloopFwd {
             copy(mainloop_params.tma_load_Q.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.barrier_Q), 0 /*mcast_mask*/), tQgQ, tQsQ);
             if constexpr(!Ktraits::VO_union_all) {
                 pipeline_v.producer_acquire(smem_pipe_write);
-                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv, paged_copy_args),
+                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv, mainloop_params.paged_copy_args),
                     tVgV(_, n_block), tVsV(_, smem_pipe_write.index()));
             }
 
@@ -559,7 +550,7 @@ struct CollectiveMainloopFwd {
         if constexpr(Ktraits::VO_union_all) {
             if (warp_idx_in_warpgroup == 0 && lane_predicate) {
                 pipeline_v.producer_acquire(smem_pipe_write);
-                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv, paged_copy_args),
+                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv, mainloop_params.paged_copy_args),
                     tVgV(_, n_block), tVsV(_, smem_pipe_write.index()));
             }
         }
@@ -577,10 +568,10 @@ struct CollectiveMainloopFwd {
             
             if (warp_idx_in_warpgroup == 0 && lane_predicate) {
                 pipeline_k.producer_acquire(smem_pipe_write);
-                copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, paged_copy_args),
+                copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, mainloop_params.paged_copy_args),
                     tKgK(_, n_block-1), tKsK(_, smem_pipe_write.index()));
                 pipeline_v.producer_acquire(smem_pipe_write);
-                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv, paged_copy_args),
+                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv, mainloop_params.paged_copy_args),
                     tVgV(_, n_block-1), tVsV(_, smem_pipe_write.index()));
             }                                                                
         }       
