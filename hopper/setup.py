@@ -9,6 +9,8 @@ import ast
 from pathlib import Path
 from packaging.version import parse, Version
 import platform
+import sysconfig
+import tarfile
 import itertools
 
 from setuptools import setup, find_packages
@@ -91,9 +93,85 @@ def check_if_cuda_home_none(global_option: str) -> None:
     )
 
 
+# Taken from https://github.com/pytorch/pytorch/blob/master/tools/setup_helpers/env.py
+def check_env_flag(name: str, default: str = "") -> bool:
+    return os.getenv(name, default).upper() in ["ON", "1", "YES", "TRUE", "Y"]
+
+
+# Copied from https://github.com/triton-lang/triton/blob/main/python/setup.py
+def is_offline_build() -> bool:
+    """
+    Downstream projects and distributions which bootstrap their own dependencies from scratch
+    and run builds in offline sandboxes
+    may set `FLASH_ATTENTION_OFFLINE_BUILD` in the build environment to prevent any attempts at downloading
+    pinned dependencies from the internet or at using dependencies vendored in-tree.
+
+    Dependencies must be defined using respective search paths (cf. `syspath_var_name` in `Package`).
+    Missing dependencies lead to an early abortion.
+    Dependencies' compatibility is not verified.
+
+    Note that this flag isn't tested by the CI and does not provide any guarantees.
+    """
+    return check_env_flag("FLASH_ATTENTION_OFFLINE_BUILD", "")
+
+
+# Copied from https://github.com/triton-lang/triton/blob/main/python/setup.py
+def get_flashattn_cache_path():
+    user_home = os.getenv("FLASH_ATTENTION_HOME")
+    if not user_home:
+        user_home = os.getenv("HOME") or os.getenv("USERPROFILE") or os.getenv("HOMEPATH") or None
+    if not user_home:
+        raise RuntimeError("Could not find user home directory")
+    return os.path.join(user_home, ".flashattn")
+
+
+def open_url(url):
+    user_agent = 'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0'
+    headers = {
+        'User-Agent': user_agent,
+    }
+    request = urllib.request.Request(url, None, headers)
+    # Set timeout to 300 seconds to prevent the request from hanging forever.
+    return urllib.request.urlopen(request, timeout=300)
+
+
+def download_and_copy(name, src_path, dst_path, version, url_func):
+    if is_offline_build():
+        return
+    flashattn_cache_path = get_flashattn_cache_path()
+    base_dir = os.path.dirname(__file__)
+    system = platform.system()
+    try:
+        arch = {"x86_64": "64", "arm64": "aarch64", "aarch64": "aarch64"}[platform.machine()]
+    except KeyError:
+        arch = platform.machine()
+    supported = {"Linux": "linux", "Darwin": "linux"}
+    url = url_func(supported[system], arch, version)
+    tmp_path = os.path.join(flashattn_cache_path, "nvidia", name)  # path to cache the download
+    dst_path = os.path.join(base_dir, os.pardir, "third_party", "nvidia", "backend", dst_path)  # final binary path
+    platform_name = "sbsa-linux" if arch == "aarch64" else "x86_64-linux"
+    src_path = src_path(platform_name, version) if callable(src_path) else src_path
+    src_path = os.path.join(tmp_path, src_path)
+    download = not os.path.exists(src_path)
+    if download:
+        print(f'downloading and extracting {url} ...')
+        file = tarfile.open(fileobj=open_url(url), mode="r|*")
+        file.extractall(path=tmp_path)
+    os.makedirs(os.path.split(dst_path)[0], exist_ok=True)
+    print(f'copy {src_path} to {dst_path} ...')
+    if os.path.isdir(src_path):
+        shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+    else:
+        shutil.copy(src_path, dst_path)
+
+
 def nvcc_threads_args():
     nvcc_threads = os.getenv("NVCC_THREADS") or "4"
     return ["--threads", nvcc_threads]
+
+
+NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.3.107"}
+exe_extension = sysconfig.get_config_var("EXE")
 
 
 cmdclass = {}
@@ -109,10 +187,31 @@ if not SKIP_CUDA_BUILD:
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
     check_if_cuda_home_none("--fahopper")
-    cc_flag = []
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
     if bare_metal_version < Version("12.3"):
         raise RuntimeError("FA Hopper is only supported on CUDA 12.3 and above")
+
+    if bare_metal_version != Version("12.3"):  # nvcc 12.3 gives the best perf currently
+        download_and_copy(
+            name="nvcc", src_path=f"bin", dst_path="bin",
+            version=NVIDIA_TOOLCHAIN_VERSION["nvcc"], url_func=lambda system, arch, version:
+            ((lambda version_major, version_minor1, version_minor2:
+            f"https://anaconda.org/nvidia/cuda-nvcc/{version}/download/{system}-{arch}/cuda-nvcc-{version}-0.tar.bz2")
+            (*version.split('.'))))
+        download_and_copy(
+            name="nvcc", src_path=f"nvvm/bin", dst_path="bin",
+            version=NVIDIA_TOOLCHAIN_VERSION["nvcc"], url_func=lambda system, arch, version:
+            ((lambda version_major, version_minor1, version_minor2:
+            f"https://anaconda.org/nvidia/cuda-nvcc/{version}/download/{system}-{arch}/cuda-nvcc-{version}-0.tar.bz2")
+            (*version.split('.'))))
+        base_dir = os.path.dirname(__file__)
+        ctk_path_new = os.path.join(base_dir, os.pardir, "third_party", "nvidia", "backend", "bin")
+        nvcc_path_new = os.path.join(ctk_path_new, f"nvcc{exe_extension}")
+        # Need to append to path otherwise nvcc can't find cicc in nvvm/bin/cicc
+        os.environ["PATH"] = ctk_path_new + os.pathsep + os.environ["PATH"]
+        os.environ["PYTORCH_NVCC"] = nvcc_path_new
+
+    cc_flag = []
     cc_flag.append("-gencode")
     cc_flag.append("arch=compute_90a,code=sm_90a")
 
