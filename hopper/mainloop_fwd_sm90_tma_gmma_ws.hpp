@@ -1000,7 +1000,7 @@ struct CollectiveMainloopFwd {
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
             consumer_wait(pipeline_v, smem_pipe_read);
             flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-            cute::copy(softmax.finalize(!Is_FP8 || params.ptr_v_descale == nullptr ? 1.f : *params.ptr_v_descale), scores_scale);
+            cute::copy(softmax.finalize(!Is_FP8 || params.ptr_v_descale == nullptr ? 1.f : params.ptr_v_descale[(params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb])]), scores_scale);
             warpgroup_wait<0>();
             pipeline_v.consumer_release(smem_pipe_read);  // release V, otherwise producers will hang
             softmax.rescale_o(tOrO, scores_scale);

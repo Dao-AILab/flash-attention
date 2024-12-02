@@ -571,6 +571,9 @@ def flash_attn_with_kvcache(
     max_seqlen_q: Optional[int] = None,
     softmax_scale=None,
     causal=False,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
     window_size=(-1, -1),  # -1 means infinite context window
     sink_token_length=0,
     softcap=0.0, # 0.0 means deactivated
@@ -694,7 +697,9 @@ def flash_attn_with_kvcache(
         max_seqlen_q,
         softmax_scale,
         causal,
-        None, None, None,  # qkv_descale
+        q_descale,
+        k_descale,
+        v_descale,
         window_size[0],
         window_size[1],
         sink_token_length,

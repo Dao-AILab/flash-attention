@@ -194,7 +194,6 @@ def print_diffs(out, out_ref):
         if abs_diff > ABS_TOL or relative_diff > REL_TOL:
             print(f"==== diff ==== {idx}, test: {e_o}, ref: {e_o_ref}")
 
-
 def attention_ref(
     q,
     k,
@@ -225,6 +224,11 @@ def attention_ref(
         dropout_p: float
         dropout_mask: (batch_size, nheads, seqlen_q, seqlen_k)
         causal: whether to apply causal masking
+        q_descale: (batch_size,) tensor of descaling factors for q
+        k_descale: (batch_size,) tensor of descaling factors for k. If there is a cache_batch_idx, then
+           this will typically be a slice of a larger descale tensor of size (batch_size_cache,)
+        v_descale: (batch_size,) tensor of descaling factors for v. If there is a cache_batch_idx, then
+           this will typically be a slice of a larger descale tensor of size (batch_size_cache,)
         upcast: whether to cast all inputs to fp32, do all computation in fp32, then cast
             output back to fp16/bf16.
         reorder_ops: whether to change the order of operations (scaling k instead of scaling k, etc.)
@@ -240,11 +244,14 @@ def attention_ref(
     if upcast:
         q, k, v = q.float(), k.float(), v.float()
     if q_descale is not None:
-        q = (q.float() * q_descale).to(dtype=q.dtype)
+        q_descale_expanded = rearrange(q_descale, 'b -> b 1 1 1')
+        q = (q.float() * q_descale_expanded).to(dtype=q.dtype)
     if k_descale is not None:
-        k = (k.float() * k_descale).to(dtype=k.dtype)
+        k_descale_expanded = rearrange(k_descale, 'b -> b 1 1 1')
+        k = (k.float() * k_descale_expanded).to(dtype=k.dtype)
     if v_descale is not None:
-        v = (v.float() * v_descale).to(dtype=v.dtype)
+        v_descale_expanded = rearrange(v_descale, 'b -> b 1 1 1')
+        v = (v.float() * v_descale[:, None, None, None]).to(dtype=v.dtype)
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
     k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
@@ -292,7 +299,6 @@ def attention_ref(
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
-
 
 # TODO: deadlock with fp8 and local, probably bc of sink tokens
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
@@ -374,7 +380,7 @@ def test_flash_attn_output(
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     # window_size = (-1, -1) if not local else (16, 0)
     if dtype == torch.float8_e4m3fn:
-        q_descale, k_descale, v_descale = [torch.rand(1, device=device, dtype=torch.float32) * 2 for _ in range(3)]
+        q_descale, k_descale, v_descale = [torch.rand(batch_size, device=device, dtype=torch.float32) * 2 for _ in range(3)]
     else:
         q_descale, k_descale, v_descale = None, None, None
     q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
@@ -704,7 +710,6 @@ def test_flash_attn_varlen_output(
         assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item()
 
-
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -731,6 +736,7 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False, True])
 # @pytest.mark.parametrize("has_batch_idx", [False])
+# @pytest.mark.parametrize("has_batch_idx", [True])
 @pytest.mark.parametrize("varlen_q", [False, True])
 # @pytest.mark.parametrize("varlen_q", [False])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
@@ -896,9 +902,18 @@ def test_flash_attn_kvcache(
     else:
         cos, sin = None, None
         q_ro, k_ro = q, k
+    if dtype == torch.float8_e4m3fn:
+        dtype_descale = torch.float32
+        q_descale = torch.rand((batch_size,), dtype = dtype_descale, device = device)
+        k_descale = torch.rand((batch_size_cache,), dtype = dtype_descale, device = device)
+        v_descale = torch.rand((batch_size_cache,), dtype = dtype_descale, device = device)
+    else:
+        q_descale, k_descale, v_descale = None, None, None
     # k_cache[:, 64:] = -1
     k_cache_ref = (k_cache if not has_batch_idx else k_cache[cache_batch_idx]).clone()
     v_cache_ref = (v_cache if not has_batch_idx else v_cache[cache_batch_idx]).clone()
+    k_descale_sliced = None if k_descale is None else (k_descale if cache_batch_idx is None else k_descale[cache_batch_idx.to(dtype=torch.long)])
+    v_descale_sliced = None if v_descale is None else (v_descale if cache_batch_idx is None else v_descale[cache_batch_idx.to(dtype=torch.long)])
     if new_kv:
         update_mask = torch.logical_and(
             cache_seqlens_expanded <= arange, arange < cache_seqlens_expanded + seqlen_new
@@ -914,6 +929,9 @@ def test_flash_attn_kvcache(
         query_padding_mask,
         key_padding_mask,
         causal=causal,
+        q_descale=q_descale,
+        k_descale=k_descale_sliced,
+        v_descale=v_descale_sliced,
         window_size=window_size,
         key_leftpad=cache_leftpad,
     )
@@ -924,6 +942,9 @@ def test_flash_attn_kvcache(
         query_padding_mask,
         key_padding_mask,
         causal=causal,
+        q_descale=q_descale,
+        k_descale=k_descale_sliced,
+        v_descale=v_descale_sliced,
         window_size=window_size,
         upcast=False,
         reorder_ops=True,
@@ -955,6 +976,9 @@ def test_flash_attn_kvcache(
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=max_seqlen_q,
         causal=causal,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         window_size=window_size,
         rotary_interleaved=rotary_interleaved,
         num_splits=num_splits,

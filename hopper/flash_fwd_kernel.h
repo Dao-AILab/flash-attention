@@ -355,15 +355,16 @@ public:
                 // Attention output (GEMM-II) accumulator.
                 Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 2>(TileShape_MNK{}));
                 float softmax_scale_log2 = params.mainloop.softmax_scale_log2;
+                auto block_coord = work_tile_info.get_block_coord(params.scheduler);
+
                 // If there's tanh softcap, the scaling will be done before tanh.
                 if constexpr (Is_FP8 && !Has_softcap) {
-                    float const q_descale = params.mainloop.ptr_q_descale == nullptr ? 1.0f : *params.mainloop.ptr_q_descale;
-                    float const k_descale = params.mainloop.ptr_k_descale == nullptr ? 1.0f : *params.mainloop.ptr_k_descale;
-                    softmax_scale_log2 *= q_descale * k_descale;
+                    float const q_descale_local = params.mainloop.ptr_q_descale == nullptr ? 1.0f : params.mainloop.ptr_q_descale[get<2>(block_coord) /*bidb*/];
+                    float const k_descale_local = params.mainloop.ptr_k_descale == nullptr ? 1.0f : params.mainloop.ptr_k_descale[(params.mainloop.kv_batch_idx == nullptr ? get<2>(block_coord) /*bidb*/ : params.mainloop.kv_batch_idx[get<2>(block_coord) /*bidb*/])];
+                    softmax_scale_log2 *= q_descale_local * k_descale_local;
                 }
                 flash::Softmax<2 * (2 * kBlockM / NumMmaThreads), /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
 
-                auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 SeqlenInfo_t seqlen_info{
                     get<2>(block_coord) /*bidb*/,
                     get<0>(params.mainloop.shape_Q),

@@ -536,7 +536,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         if (q_descale_.has_value()) {
             auto q_descale = q_descale_.value();
             CHECK_DEVICE(q_descale);
-            CHECK_SHAPE(q_descale, 1);
+            CHECK_SHAPE(q_descale, batch_size);
             params.q_descale_ptr = q_descale.data_ptr<float>();
         } else {
             params.q_descale_ptr = nullptr;
@@ -544,7 +544,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         if (k_descale_.has_value()) {
             auto k_descale = k_descale_.value();
             CHECK_DEVICE(k_descale);
-            CHECK_SHAPE(k_descale, 1);
+            CHECK_SHAPE(k_descale, batch_size);
             params.k_descale_ptr = k_descale.data_ptr<float>();
         } else {
             params.k_descale_ptr = nullptr;
@@ -552,7 +552,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         if (v_descale_.has_value()) {
             auto v_descale = v_descale_.value();
             CHECK_DEVICE(v_descale);
-            CHECK_SHAPE(v_descale, 1);
+            CHECK_SHAPE(v_descale, batch_size);
             params.v_descale_ptr = v_descale.data_ptr<float>();
         } else {
             params.v_descale_ptr = nullptr;
@@ -1426,13 +1426,13 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
     }
 
     int const alignment = q_type == torch::kFloat8_e4m3fn ? 16 : 8;
-    at::Tensor q_padded, k_padded, v_padded;
+    at::Tensor q_padded, kcache_padded, vcache_padded;
     auto pad = [](at::Tensor x, int alignment) {
         return x.size(-1) % alignment == 0 ? x : torch::nn::functional::pad(x, torch::nn::functional::PadFuncOptions({0, alignment - x.size(-1) % alignment}));
     };
     q_padded = pad(q, alignment);
-    k_padded = pad(kcache, alignment);
-    v_padded = pad(vcache, alignment);
+    kcache_padded = pad(kcache, alignment);
+    vcache_padded = pad(vcache, alignment);
 
     auto opts = q.options();
     auto out_type = q_type == at::ScalarType::Float8_e4m3fn ? at::ScalarType::BFloat16 : q_type;
@@ -1471,7 +1471,7 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
                      seqlen_q_rounded, seqlen_k_rounded,
                      num_heads, num_heads_k,
                      head_size, head_size_rounded,
-                     q_padded, k_padded, v_padded, out,
+                     q_padded, kcache_padded, vcache_padded, out,
                      /*cu_seqlens_q_d=*/!is_varlen_q ? nullptr : cu_seqlens_q.data_ptr(),
                      /*cu_seqlens_k_d=*/nullptr,
                      /*seqused_q_=*/nullptr,
@@ -1529,37 +1529,32 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
     params.num_pages = num_pages;
 
     if (k_.has_value()) {
-        at::Tensor k, v, k_padded, v_padded;
+        at::Tensor knew, vnew, knew_padded, vnew_padded;
         TORCH_CHECK(v_.has_value(), "If key is supplied, value must also be passed in");
         TORCH_CHECK(seqused_k_.has_value(), "If key is supplied, seqlens_k must also be passed in");
         TORCH_CHECK(seqlen_q <= seqlen_k, "If key is supplied, it must have seqlen <= the seqlen of the KV cache");
-        k = k_.value();
-        v = v_.value();
-        TORCH_CHECK(k.dtype() == q_type, "Key must have the same dtype as query");
-        TORCH_CHECK(v.dtype() == q_type, "Value must have the same dtype as query");
-        CHECK_DEVICE(k); CHECK_DEVICE(v);
-        TORCH_CHECK(k.stride(-1) == 1, "Key tensor must have contiguous last dimension");
-        TORCH_CHECK(v.stride(-1) == 1, "Value tensor must have contiguous last dimension");
-        int seqlen_knew = k.size(1);
-        CHECK_SHAPE(k, batch_size, seqlen_knew, num_heads_k, head_size_og);
-        CHECK_SHAPE(v, batch_size, seqlen_knew, num_heads_k, head_size_og);
-        if (head_size_og % 8 != 0) {
-            k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-            v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-        } else {
-            k_padded = k;
-            v_padded = v;
-        }
+        knew = k_.value();
+        vnew = v_.value();
+        TORCH_CHECK(knew.dtype() == q_type, "Key must have the same dtype as query");
+        TORCH_CHECK(vnew.dtype() == q_type, "Value must have the same dtype as query");
+        CHECK_DEVICE(knew); CHECK_DEVICE(vnew);
+        TORCH_CHECK(knew.stride(-1) == 1, "Key tensor must have contiguous last dimension");
+        TORCH_CHECK(vnew.stride(-1) == 1, "Value tensor must have contiguous last dimension");
+        int seqlen_knew = knew.size(1);
+        CHECK_SHAPE(knew, batch_size, seqlen_knew, num_heads_k, head_size_og);
+        CHECK_SHAPE(vnew, batch_size, seqlen_knew, num_heads_k, head_size_og);
+        knew_padded = pad(knew, alignment);
+        vnew_padded = pad(vnew, alignment);
         params.seqlen_knew = seqlen_knew;
-        params.knew_ptr = k_padded.data_ptr();
-        params.vnew_ptr = v_padded.data_ptr();
+        params.knew_ptr = knew_padded.data_ptr();
+        params.vnew_ptr = vnew_padded.data_ptr();
         // All stride are in elements, not bytes.
-        params.knew_batch_stride = k_padded.stride(0);
-        params.vnew_batch_stride = v_padded.stride(0);
-        params.knew_row_stride = k_padded.stride(-3);
-        params.vnew_row_stride = v_padded.stride(-3);
-        params.knew_head_stride = k_padded.stride(-2);
-        params.vnew_head_stride = v_padded.stride(-2);
+        params.knew_batch_stride = knew_padded.stride(0);
+        params.vnew_batch_stride = vnew_padded.stride(0);
+        params.knew_row_stride   = knew_padded.stride(-3);
+        params.vnew_row_stride   = vnew_padded.stride(-3);
+        params.knew_head_stride  = knew_padded.stride(-2);
+        params.vnew_head_stride  = vnew_padded.stride(-2);
     }
 
     if (leftpad_k_.has_value()) {
@@ -1622,7 +1617,7 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         if (q_descale_.has_value()) {
             auto q_descale = q_descale_.value();
             CHECK_DEVICE(q_descale);
-            CHECK_SHAPE(q_descale, 1);
+            CHECK_SHAPE(q_descale, batch_size);
             params.q_descale_ptr = q_descale.data_ptr<float>();
         } else {
             params.q_descale_ptr = nullptr;
@@ -1630,7 +1625,7 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         if (k_descale_.has_value()) {
             auto k_descale = k_descale_.value();
             CHECK_DEVICE(k_descale);
-            CHECK_SHAPE(k_descale, 1);
+            CHECK_SHAPE(k_descale, batch_size_k);
             params.k_descale_ptr = k_descale.data_ptr<float>();
         } else {
             params.k_descale_ptr = nullptr;
@@ -1638,7 +1633,7 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         if (v_descale_.has_value()) {
             auto v_descale = v_descale_.value();
             CHECK_DEVICE(v_descale);
-            CHECK_SHAPE(v_descale, 1);
+            CHECK_SHAPE(v_descale, batch_size_k);
             params.v_descale_ptr = v_descale.data_ptr<float>();
         } else {
             params.v_descale_ptr = nullptr;
