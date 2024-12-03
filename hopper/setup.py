@@ -290,8 +290,6 @@ if not SKIP_CUDA_BUILD:
 ,
             },
             include_dirs=include_dirs,
-            # Without this we get and error about cuTensorMapEncodeTiled not defined
-            libraries=["cuda"]
         )
     )
 
