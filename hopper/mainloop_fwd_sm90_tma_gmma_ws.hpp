@@ -973,10 +973,14 @@ struct CollectiveMainloopFwd {
                 }
             }
 
-            static constexpr int n_local_left_steps = !Is_local ? 0 : cute::ceil_div(kBlockM, kBlockN) + 1;
+            int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : params.qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
+            int const n_block_min_before_local_mask = !Is_local
+                ? n_block_min
+                : std::max(n_block_min,
+                           cute::ceil_div(m_idx_max + seqlen_k - seqlen_q - params.window_size_left, kBlockN));
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
-            for (; n_block > n_block_min + n_local_left_steps; --n_block) {
+            for (; n_block > n_block_min_before_local_mask; --n_block) {
                 fwd_step(n_block, no_mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<false>{} /*check_inf*/);
             }
             // Separate masking iterations on the left for local attention
@@ -1048,10 +1052,14 @@ struct CollectiveMainloopFwd {
                     fwd_step(n_block, mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<true>{} /*check_inf*/);
                 }
             }
-            static constexpr int n_local_left_steps = !Is_local ? 0 : cute::ceil_div(kBlockM, kBlockN) + 1;
+            int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : params.qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
+            int const n_block_min_before_local_mask = !Is_local
+                ? n_block_min
+                : std::max(n_block_min,
+                           cute::ceil_div(m_idx_max + seqlen_k - seqlen_q - params.window_size_left, kBlockN));
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
-            for (; n_block >= n_block_min + n_local_left_steps; --n_block) {
+            for (; n_block >= n_block_min_before_local_mask; --n_block) {
                 fwd_step(n_block, no_mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<false>{} /*check_inf*/);
             }
             // Separate masking iterations on the left for local attention

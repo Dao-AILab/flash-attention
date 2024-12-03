@@ -149,7 +149,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, int kBlockM, int kBlockN, int kHeadDim, int kStages,
-         bool Is_causal, bool Is_local, bool PagedKV, bool IntraWGOverlap,
+         bool Is_causal, bool Is_local, bool Has_softcap, bool PagedKV, bool IntraWGOverlap,
          bool Split, bool V_colmajor, bool Enable_cluster>
 void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
     auto should_pack_gqa = [](int seqlen_q, int qhead_per_khead, int blockM) {
@@ -168,12 +168,10 @@ void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
             : params.h != params.h_k && (Varlen || Is_causal || should_pack_gqa(params.seqlen_q, params.h / params.h_k, kBlockM));
         APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
             PACKGQA_SWITCH(pack_gqa, PackGQA, [&] {
-                SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
-                    // Only use Cluster if number of tiles along seqlen_q is even and not varlen
-                    CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
-                        static constexpr int ClusterM = !Varlen && Enable_cluster && Use_cluster ? 2 : 1;
-                        run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV && Varlen, IntraWGOverlap, PackGQA, Split, V_colmajor>(params, stream);
-                    });
+                // Only use Cluster if number of tiles along seqlen_q is even and not varlen
+                CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
+                    static constexpr int ClusterM = !Varlen && Enable_cluster && Use_cluster ? 2 : 1;
+                    run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV && Varlen, IntraWGOverlap, PackGQA, Split, V_colmajor>(params, stream);
                 });
             });
         });
@@ -183,11 +181,13 @@ void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T, int kHeadDim, bool Split, bool PagedKV>
 void run_mha_fwd_16b(Flash_fwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        // Can't use structured binding since it's not compatible with constexpr
-        static constexpr std::tuple<int, int, bool> kBlockMN_IntraWGOverlap = tile_size_fwd(kHeadDim, Is_causal || Is_local, sizeof(T) /*element_size*/, false /*V_colmajor*/, PagedKV);
-        static constexpr bool Enable_cluster = kHeadDim >= 128 && !Is_causal && !Is_local && !Split && !PagedKV;
-        run_mha_fwd_dispatch<T, std::get<0>(kBlockMN_IntraWGOverlap), std::get<1>(kBlockMN_IntraWGOverlap), kHeadDim, 2,
-            Is_causal, Is_local, PagedKV, std::get<2>(kBlockMN_IntraWGOverlap), Split, false /*V_colmajor*/, Enable_cluster>(params, stream);
+        SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
+            // Can't use structured binding since it's not compatible with constexpr
+            static constexpr std::tuple<int, int, bool> kBlockMN_IntraWGOverlap = tile_size_fwd(kHeadDim, Is_causal, Is_local, sizeof(T) /*element_size*/, false /*V_colmajor*/, PagedKV, Has_softcap);
+            static constexpr bool Enable_cluster = kHeadDim >= 128 && !Is_causal && !Is_local && !Split && !PagedKV;
+            run_mha_fwd_dispatch<T, std::get<0>(kBlockMN_IntraWGOverlap), std::get<1>(kBlockMN_IntraWGOverlap), kHeadDim, 2,
+                Is_causal, Is_local, Has_softcap, PagedKV, std::get<2>(kBlockMN_IntraWGOverlap), Split, false /*V_colmajor*/, Enable_cluster>(params, stream);
+        });
     });
 }
 
@@ -195,10 +195,12 @@ template<typename T, int kHeadDim, bool Split, bool PagedKV>
 void run_mha_fwd_8b(Flash_fwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor, [&] {
-            // Can't use structured binding since it's not compatible with constexpr
-            static constexpr std::tuple<int, int, bool> kBlockMN_IntraWGOverlap = tile_size_fwd(kHeadDim, Is_causal || Is_local, sizeof(T) /*element_size*/, V_colmajor /*V_colmajor*/, PagedKV);
-            static constexpr bool Enable_cluster = kHeadDim == 192 && !Is_causal && !Is_local && !Split && !PagedKV;
-            run_mha_fwd_dispatch<T, std::get<0>(kBlockMN_IntraWGOverlap), std::get<1>(kBlockMN_IntraWGOverlap), kHeadDim, 2, Is_causal, Is_local, PagedKV, std::get<2>(kBlockMN_IntraWGOverlap), Split, V_colmajor, Enable_cluster>(params, stream);
+            SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
+                // Can't use structured binding since it's not compatible with constexpr
+                static constexpr std::tuple<int, int, bool> kBlockMN_IntraWGOverlap = tile_size_fwd(kHeadDim, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor /*V_colmajor*/, PagedKV, Has_softcap);
+                static constexpr bool Enable_cluster = kHeadDim == 192 && !Is_causal && !Is_local && !Split && !PagedKV;
+                run_mha_fwd_dispatch<T, std::get<0>(kBlockMN_IntraWGOverlap), std::get<1>(kBlockMN_IntraWGOverlap), kHeadDim, 2, Is_causal, Is_local, Has_softcap, PagedKV, std::get<2>(kBlockMN_IntraWGOverlap), Split, V_colmajor, Enable_cluster>(params, stream);
+            });
         });
     });
 }
