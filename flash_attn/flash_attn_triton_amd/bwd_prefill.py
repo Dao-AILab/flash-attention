@@ -149,8 +149,8 @@ def _bwd_kernel_one_col_block(
     # load k and v once per column block
     k_ptrs = k_offset + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
     v_ptrs = v_offset + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
-    k = tl.load(k_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
-    v = tl.load(v_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+    k = tl.load(k_ptrs, mask=kv_mask, other=0.0)
+    v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
 
     # loop over rows
     for start_m in range(lo, num_block_m * BLOCK_M, BLOCK_M):
@@ -164,8 +164,8 @@ def _bwd_kernel_one_col_block(
         q_mask = mask_m[:, None] & mask_d[None, :]
 
         # load q, k, v, do on-chip
-        q = tl.load(q_ptrs, mask=q_mask, other=0.0).to(tl.float32)
-        do = tl.load(do_ptrs, mask=q_mask, other=0.0).to(tl.float32)
+        q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+        do = tl.load(do_ptrs, mask=q_mask, other=0.0)
 
         # recompute p = softmax(qk, dim=-1).T
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -192,7 +192,7 @@ def _bwd_kernel_one_col_block(
         # mask block in the cases where the data is smaller the block size
         p_mask = mask_m[:, None] & mask_n[None, :]
         p = tl.where(p_mask, p, 0.0)
-        p = p.to(tl.float32)
+        p = p.to(tl.float16)
         
         # compute dv
         dv += tl.dot(tl.trans(p), do)
@@ -205,6 +205,7 @@ def _bwd_kernel_one_col_block(
         Di = tl.load(d_ptrs, mask=mask_m)
         ds = (p * (dp - Di[:, None])) * sm_scale
         ds = tl.where(p_mask, ds, 0.0)
+        ds = ds.to(tl.float16)
         
         # compute dk = dot(ds.T, q)
         dk += tl.dot(tl.trans(ds), q)
