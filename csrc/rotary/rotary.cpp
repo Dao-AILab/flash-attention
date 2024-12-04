@@ -30,8 +30,7 @@ void apply_rotary(const torch::Tensor x1, const torch::Tensor x2,
     TORCH_CHECK(out1.sizes() == out2.sizes());
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)x1.get_device()};
+    at::cuda::CUDAGuard device_guard{x1.device()};
 
     apply_rotary_cuda(x1, x2, cos, sin, out1, out2, conj);
 }

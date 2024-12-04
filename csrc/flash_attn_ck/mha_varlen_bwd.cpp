@@ -327,8 +327,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         dv = torch::empty_like(v);
     }
 
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
