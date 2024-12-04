@@ -36,6 +36,7 @@ public:
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(get<1>(TileShape_MK{}) % kGmemElemsPerLoad == 0, "Headdim must be a multiple of kGmemElemsPerLoad");
+    static constexpr int kBlockM = get<0>(TileShape_MK{});
     static constexpr int kHeadDim = get<1>(TileShape_MK{});
     // We want kBlockKGmem to be a power of 2 so that when we do the summing,
     // it's just between threads in the same warp
@@ -50,20 +51,19 @@ public:
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per load
 
     static constexpr int kGmemElemsPerLoadAccum = sizeof(cute::uint128_t) / sizeof(ElementAccum);
-    static_assert(get<1>(TileShape_MK{}) % kGmemElemsPerLoadAccum == 0, "Headdim must be a multiple of kGmemElemsPerLoadAccum");
-    static constexpr int kGmemThreadsPerRowAccum = kBlockKGmem / kGmemElemsPerLoadAccum;
-    static_assert(MaxThreadsPerBlock % kGmemThreadsPerRowAccum == 0, "MaxThreadsPerBlock must be a multiple of kGmemThreadsPerRowAccum");
-    using GmemLayoutAtomAccum = Layout<Shape <Int<MaxThreadsPerBlock / kGmemThreadsPerRowAccum>, Int<kGmemThreadsPerRowAccum>>,
-                                       Stride<Int<kGmemThreadsPerRowAccum>, _1>>;
+    static_assert((kBlockM * kHeadDim / kGmemElemsPerLoadAccum) % MaxThreadsPerBlock == 0, "MaxThreadsPerBlock must divide kBlockM * kHeadDim / kGmemElemsPerLoadAccum");
+    using GmemLayoutAtomAccum = Layout<Shape<Int<MaxThreadsPerBlock>>>;
     using GmemTiledCopyAccum = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
                         GmemLayoutAtomAccum{},
-                        Layout<Shape<_1, Int<kGmemElemsPerLoadAccum>>>{}));  // Val layout, 4 vals per store
+                        Layout<Shape<Int<kGmemElemsPerLoadAccum>>>{}));  // Val layout, 4 vals per store
 
     using ShapeO = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen_q, d, head, batch)
     using StrideO = cute::Stride<int64_t, _1, int64_t, int64_t>;
     using ShapedPsum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q, head, batch)
     using StridedPsum = cute::Stride<_1, int64_t, int64_t>;
+    using ShapedQaccum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
+    using StridedQaccum = cute::Stride<_1, int64_t, int64_t>;
 
     // Device side arguments
     struct Arguments {
@@ -80,8 +80,8 @@ public:
         float *ptr_LSE_log2;
         StridedPsum const stride_LSE_log2;
         ElementAccum* ptr_dQaccum;
-        ShapeO const shape_dQaccum;
-        StrideO const stride_dQaccum;
+        ShapedQaccum const shape_dQaccum;
+        StridedQaccum const stride_dQaccum;
         int num_batch;  // We need this to know the size of dq_semaphore in case of varlen
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
@@ -103,8 +103,8 @@ public:
         float* ptr_LSE_log2;
         StridedPsum const stride_LSE_log2;
         ElementAccum* ptr_dQaccum;
-        ShapeO const shape_dQaccum;
-        StrideO const stride_dQaccum;
+        ShapedQaccum const shape_dQaccum;
+        StridedQaccum const stride_dQaccum;
         int num_batch;
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
@@ -217,10 +217,10 @@ public:
         int const offset_padded = !is_varlen ? 0 : (params.cu_seqlens[bidb] + bidb * kBlockM) / kBlockM * kBlockM;
         Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_dPsum, params.stride_dPsum)(_, bidh, !is_varlen ? bidb : 0);
         Tensor gdPsum = local_tile(cute::domain_offset(make_coord(offset_padded), mdPsum), Shape<Int<kBlockM>>{}, make_coord(m_block));
-        if (thread_idx % kGmemThreadsPerRow == 0) {
+        if (get<1>(tOcO(_0{}, _0{}, _0{})) == 0) {
             #pragma unroll
             for (int mi = 0; mi < size(dP_sum); ++mi) {
-                int row = thread_idx / kGmemThreadsPerRow + mi * MaxThreadsPerBlock / kGmemThreadsPerRow;
+                int const row = get<0>(tOcO(_0{}, mi, _0{}));
                 gdPsum(row) = row < seqlen_o - m_block * kBlockM ? dP_sum(mi) : 0;
             }
         }
@@ -233,23 +233,19 @@ public:
         }
 
         if constexpr (Clear_dQaccum) {
-            Tensor mdQaccum = make_tensor(make_gmem_ptr(params.ptr_dQaccum), params.shape_dQaccum, params.stride_dQaccum)(_, _, bidh, !is_varlen ? bidb : 0);
-            Tensor gdQaccum = local_tile(cute::domain_offset(make_coord(offset_padded, _0{}), mdQaccum), TileShape_MK{}, make_coord(m_block, _0{}));
+            Tensor mdQaccum = make_tensor(make_gmem_ptr(params.ptr_dQaccum), params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
+            Tensor gdQaccum = local_tile(cute::domain_offset(make_coord(offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));
             GmemTiledCopyAccum gmem_tiled_copy_dQaccum;
             auto gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_thread_slice(thread_idx);
             Tensor tdQgdQaccum = gmem_thr_copy_dQaccum.partition_D(gdQaccum);
             Tensor zero = make_fragment_like(tdQgdQaccum);
             clear(zero);
-            // cute::copy(zero, tdQgdQaccum);  // Somehow this doesn't vectorize the write
-            #pragma unroll
-            for (int m = 0; m < size<1>(zero); ++m) {
-                cute::copy(zero(_, m, _), tdQgdQaccum(_, m, _));
-            }
+            cute::copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{}, zero, tdQgdQaccum);
         }
 
         if (params.dq_semaphore != nullptr && thread_idx == 0) {
             int const num_batch = params.num_batch;
-            int const num_head = get<2>(params.shape_dQaccum);
+            int const num_head = get<2>(params.shape_O);
             params.dq_semaphore[bidh + bidb * num_head + m_block * num_head * num_batch] = 0;
         }
 

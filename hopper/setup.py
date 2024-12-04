@@ -286,8 +286,7 @@ if not SKIP_CUDA_BUILD:
             sources=sources,
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"] + feature_args,
-                "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args
-,
+                "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
             },
             include_dirs=include_dirs,
         )

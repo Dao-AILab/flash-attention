@@ -18,8 +18,7 @@ namespace flash {
 
 using namespace cute;
 
-template <class TileShape_MK_, class Element, class ElementAccum, class ArchTag_, int kNThreads, class SmemLayoutdQaccumTMA,
-          class TiledMma, bool dQ_swapAB>
+template <class TileShape_MK_, class Element, class ElementAccum, class ArchTag_, int kNThreads, class TiledMma, bool dQ_swapAB>
 class FlashAttnBwdPostprocessConvertdQ {
 
 public:
@@ -33,13 +32,16 @@ public:
     static constexpr uint32_t MaxThreadsPerBlock = kNThreads;
     static constexpr uint32_t MinBlocksPerMultiprocessor = 2;
 
+    static constexpr int kBlockM = get<0>(TileShape_MK{});
     static constexpr int kHeadDim = get<1>(TileShape_MK{});
-    using R2SLayoutAtomdQaccum = Layout<Shape<Int<kNThreads>>, Stride<_1>>;
+    static_assert(kNThreads % cutlass::NumThreadsPerWarpGroup == 0, "kNThreads must be a multiple of NumThreadsPerWarpGroup");
+    static constexpr int NumdQWarpGgroups = kNThreads / cutlass::NumThreadsPerWarpGroup;
+    using R2SLayoutAtomdQaccum = Layout<Shape<Int<cutlass::NumThreadsPerWarpGroup>, Int<NumdQWarpGgroups>>>;
     using R2STiledCopydQaccum = decltype(make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{}, R2SLayoutAtomdQaccum{},
                                                          Layout<Shape < _4>>{}));  // Val layout, 4 vals per read
     static constexpr int SmemdQaccumSize = size(TileShape_MK{});
-    static_assert(size(TileShape_MK{}) == size(SmemLayoutdQaccumTMA{}), "TileShape_MK and SmemLayoutdQaccumTMA must have the same size");
-    using SmemLayoutdQaccum = Layout<Shape<Int<SmemdQaccumSize>>, Stride<_1>>;
+    using SmemLayoutdQaccumFlat = Layout<Shape<Int<SmemdQaccumSize>>>;
+    using SmemLayoutdQaccum = Layout<Shape<Int<kBlockM * kHeadDim / NumdQWarpGgroups>, Int<NumdQWarpGgroups>>>;
 
     // We can't just use kHeadDim here. E.g. if MMA shape is 64 x 96 but split across 2 WGs,
     // then setting kBlockKSmem to 32 will cause "Static shape_div failure".
@@ -72,10 +74,8 @@ public:
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per load
 
-    using GmemTiledCopydQaccum = cute::SM90_TMA_LOAD;
-
     struct SharedStorage : cute::aligned_struct<128> {
-        cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutdQaccumTMA>, 1024> smem_dqacc;
+        cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutdQaccum>> smem_dqacc;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutdQ>> smem_dq;
         alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_dQaccum;
     };
@@ -84,19 +84,14 @@ public:
 
     using ShapedQ = cute::Shape<int32_t, int32_t, int32_t, int32_t>;   // (seqlen_q, d, head, batch)
     using StridedQ = cute::Stride<int64_t, _1, int64_t, int64_t>;
-
-    using TMA_dQaccum = decltype(make_tma_copy(
-        GmemTiledCopydQaccum{},
-        make_tensor(make_gmem_ptr(static_cast<ElementAccum*>(nullptr)), ShapedQ{}, StridedQ{}),
-        SmemLayoutdQaccumTMA{},
-        TileShape_MK{},
-        _1{})); // no mcast for dQ
+    using ShapedQaccum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
+    using StridedQaccum = cute::Stride<_1, int64_t, int64_t>;
 
     // Device side arguments
     struct Arguments {
         ElementAccum const* ptr_dQaccum;
-        ShapedQ const shape_dQaccum;
-        StridedQ const stride_dQaccum;
+        ShapedQaccum const shape_dQaccum;
+        StridedQaccum const stride_dQaccum;
         Element* ptr_dQ;
         ShapedQ const shape_dQ;
         StridedQ const stride_dQ;
@@ -107,8 +102,9 @@ public:
 
     // Kernel entry point API
     struct Params {
-        TMA_dQaccum tma_load_dQaccum;
-        ShapedQ const shape_dQaccum;
+        ElementAccum const* ptr_dQaccum;
+        ShapedQaccum const shape_dQaccum;
+        StridedQaccum const stride_dQaccum;
         Element* ptr_dQ;
         ShapedQ const shape_dQ;
         StridedQ const stride_dQ;
@@ -121,16 +117,10 @@ public:
     static
     Params
     to_underlying_arguments(Arguments const& args) {
-        Tensor mdQaccum = make_tensor(make_gmem_ptr(args.ptr_dQaccum), args.shape_dQaccum, args.stride_dQaccum);
-        TMA_dQaccum tma_load_dQaccum = make_tma_copy(
-            GmemTiledCopydQaccum{},
-            mdQaccum,
-            SmemLayoutdQaccumTMA{},
-            TileShape_MK{},
-            _1{}); // no mcast for dQaccum
         return {
-            tma_load_dQaccum,
+            args.ptr_dQaccum,
             args.shape_dQaccum,
+            args.stride_dQaccum,
             args.ptr_dQ,
             args.shape_dQ,
             args.stride_dQ,
@@ -147,9 +137,8 @@ public:
         static constexpr int kBlockM = get<0>(TileShape_MK{});
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
-        Tensor sdQaccumTMA = make_tensor(make_smem_ptr(shared_storage.smem_dqacc.data()), SmemLayoutdQaccumTMA{});
-        // Tensor sdQaccumTMAnoswizzle = make_tensor(make_smem_ptr(shared_storage.smem_dqacc.data()), SmemLayoutdQaccumTMANoSwizzle{});
         Tensor sdQaccum = make_tensor(make_smem_ptr(shared_storage.smem_dqacc.data()), SmemLayoutdQaccum{});
+        Tensor sdQaccum_flat = make_tensor(make_smem_ptr(shared_storage.smem_dqacc.data()), SmemLayoutdQaccumFlat{});
         Tensor sdQ = make_tensor(make_smem_ptr(shared_storage.smem_dq.data()), SmemLayoutdQ{});
         Tensor sdQt = make_tensor(make_smem_ptr(shared_storage.smem_dq.data()), SmemLayoutdQt{});
 
@@ -162,31 +151,22 @@ public:
         int const seqlen = !is_varlen ? get<0>(params.shape_dQ) : (params.seqused ? params.seqused[bidb] : params.cu_seqlens[bidb + 1] - params.cu_seqlens[bidb]);
         if (is_varlen && m_block * kBlockM >= seqlen) { return; }
 
-        int lane_predicate = cute::elect_one_sync();
-        int warp_idx = cutlass::canonical_warp_idx_sync();
-        // Issue Tma Descriptor Prefetch from a single thread
-        if (warp_idx == 0 && lane_predicate) {
-            cute::prefetch_tma_descriptor(params.tma_load_dQaccum.get_tma_descriptor());
+        // Step 1: Bulk copy to load dQaccum from gmem to smem
+        int const offset_padded = !is_varlen ? 0 : (params.cu_seqlens[bidb] + bidb * kBlockM) / kBlockM * kBlockM;
+        Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum const*>(params.ptr_dQaccum)),
+                                      params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
+        Tensor gdQaccum = local_tile(domain_offset(make_coord(offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));  // (M * K)
+        static constexpr uint32_t TmaTransactionBytesdQaccum = static_cast<uint32_t>(size(SmemLayoutdQaccumFlat{}) * cute::sizeof_bits_v<ElementAccum> / 8);
+        auto bulk_copy = Copy_Traits<SM90_BULK_COPY_AUTO>{};
+        // if (thread0()) { print(gdQaccum); printf("\n"); print(sdQaccum_flat); printf("\n"); }
+        if (thread_idx == 0) {
             shared_storage.barrier_dQaccum.init(1 /*numThreads*/);
+            shared_storage.barrier_dQaccum.arrive_and_expect_tx(TmaTransactionBytesdQaccum);
+            copy(bulk_copy.with(*reinterpret_cast<uint64_t*>(&shared_storage.barrier_dQaccum)), gdQaccum, sdQaccum_flat);
         }
         __syncthreads();
-
-        // Step 1: TMA to load dQaccum from gmem to smem
-        int const offset_padded = !is_varlen ? 0 : (params.cu_seqlens[bidb] + bidb * kBlockM) / kBlockM * kBlockM;
-        Tensor mdQaccum = params.tma_load_dQaccum.get_tma_tensor(params.shape_dQaccum)(_, _, bidh, !is_varlen ? bidb : 0);
-        Tensor gdQaccum = local_tile(domain_offset(make_coord(offset_padded, _0{}), mdQaccum), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
-        auto block_tma_dQ = params.tma_load_dQaccum.get_slice(_0{});
-        Tensor tdQgdQaccumTMA = block_tma_dQ.partition_D(gdQaccum);  // (TMA, TMA_M, TMA_K)
-        Tensor tdQsdQaccumTMA = block_tma_dQ.partition_S(sdQaccumTMA); // (TMA, TMA_M, TMA_K)
-        static constexpr uint32_t TmaTransactionBytesdQaccum = static_cast<uint32_t>(size(SmemLayoutdQaccumTMA{}) * cute::sizeof_bits_v<ElementAccum> / 8);
-        if (warp_idx == 0 && lane_predicate) {
-            shared_storage.barrier_dQaccum.arrive_and_expect_tx(TmaTransactionBytesdQaccum);
-            copy(params.tma_load_dQaccum.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.barrier_dQaccum), 0 /*mcast_mask*/), tdQgdQaccumTMA, tdQsdQaccumTMA);
-        }
         shared_storage.barrier_dQaccum.wait(0);
 
-        // __syncthreads(); if (cute::thread0()) { print_tensor(sdQaccumTMA); }
-        // __syncthreads(); if (cute::thread0()) { print_tensor(sdQaccumTMAnoswizzle); }
         // __syncthreads(); if (cute::thread0()) { print_tensor(sdQaccum); }
 
         // Step 2: Load dQaccum from smem to register, then convert fp32 -> fp16/bf16
@@ -214,13 +194,8 @@ public:
         // if (cute::thread0()) { print(smem_tiled_copy_dQ); }
         // if (cute::thread0()) { print(smem_thr_copy_dQ); }
         // if (cute::thread0()) { print(sdQ); }
-        if constexpr (!dQ_swapAB) {
-            Tensor taccdQsdQ = smem_thr_copy_dQ.partition_D(sdQ);  // ((Atom,AtomNum),PIPE_M,PIPE_N)
-            cute::copy(smem_tiled_copy_dQ, taccdQrdQ, taccdQsdQ);
-        } else {
-            Tensor taccdQsdQt = smem_thr_copy_dQ.partition_D(sdQt);  // ((Atom,AtomNum),PIPE_M,PIPE_N)
-            cute::copy(smem_tiled_copy_dQ, taccdQrdQ, taccdQsdQt);
-        }
+        Tensor taccdQsdQ = smem_thr_copy_dQ.partition_D(cute::conditional_return<!dQ_swapAB>(sdQ, sdQt));  // ((Atom,AtomNum),PIPE_M,PIPE_N)
+        cute::copy(smem_tiled_copy_dQ, taccdQrdQ, taccdQsdQ);
         __syncthreads();
 
         // Step 4: Copy dQ from smem to register to prepare for coalesced write to gmem
@@ -236,10 +211,7 @@ public:
         cute::copy(gmem_tiled_copy_dQ, tdQsdQ, tdQrdQ);
 
         // Step 5: Copy dQ from register to gmem
-        // Construct identity layout for gdQ
-        Tensor cdQ = cute::make_identity_tensor(TileShape_MK{});  // (BLK_M,BLK_K) -> (blk_m,blk_k)
-        // Repeat the partitioning with identity layouts
-        Tensor tdQcdQ = gmem_thr_copy_dQ.partition_D(cdQ);
+        Tensor tdQcdQ = gmem_thr_copy_dQ.partition_D(cute::make_identity_tensor(TileShape_MK{}));
         Tensor tdQpdQ = make_tensor<bool>(make_shape(size<2>(tdQgdQ)));
         #pragma unroll
         for (int k = 0; k < size(tdQpdQ); ++k) { tdQpdQ(k) = get<1>(tdQcdQ(_0{}, _0{}, k)) < get<1>(params.shape_dQ); }

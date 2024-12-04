@@ -300,35 +300,27 @@ struct CollectiveEpilogueBwdGQA {
     static constexpr int NumEpilogueThreads = NumEpilogueThreads_;
     static constexpr bool Varlen = Varlen_;
 
-    using GmemTiledCopydKVTMA = cute::SM90_TMA_REDUCE_ADD;
-
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
-    using SmemLayoutAtomdKVaccumTMA =
-        decltype(composition(Swizzle<0, 4, 3>{},  // We don't want any swizzle
-                             Layout<Shape<Int<8>, Int<kHeadDim>>,
-                             Stride<Int<kHeadDim>, _1>>{}));
-    using SmemLayoutdKVaccumTMA = decltype(tile_to_shape(SmemLayoutAtomdKVaccumTMA{}, select<1, 2>(TileShape_MNK{})));
-    // Thread layout, 256 threads per row
-    using R2SLayoutAtomdKVaccum = Layout<Shape<Int<NumEpilogueThreads>>, Stride<_1>>;
+    static_assert(NumEpilogueThreads % cutlass::NumThreadsPerWarp == 0, "NumEpilogueThreads must be a multiple of NumThreadsPerWarp");
+    static constexpr int NumWarpGroups = NumEpilogueThreads / cutlass::NumThreadsPerWarpGroup;
+    // Thread layout, 256 or 384 threads per row
+    // We split into NumWarpGroups so that we can use the some postprocessing kernel as dQ
+    using R2SLayoutAtomdKVaccum = Layout<Shape<Int<cutlass::NumThreadsPerWarpGroup>, Int<NumWarpGroups>>>;
     using R2STiledCopydKVaccum = decltype(make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{}, R2SLayoutAtomdKVaccum{},
                                                          Layout<Shape < _4>>{}));  // Val layout, 4 vals per store
-    using SmemLayoutdKVaccum = Layout<Shape<Int<kBlockN * kHeadDim>>, Stride<_1>>;
-    static_assert(size(SmemLayoutdKVaccumTMA{}) == size(SmemLayoutdKVaccum{}), "SmemLayoutdKVaccumTMA and SmemLayoutdKVaccum must have the same size");
+    using SmemLayoutdKVaccum = Layout<Shape<Int<kBlockN * kHeadDim / NumWarpGroups>, Int<NumWarpGroups>>>;
+    using SmemLayoutdKVaccumFlat = Layout<Shape<Int<kBlockN * kHeadDim>>>;
 
-    struct TensorStorage : cute::aligned_struct<128> {
-        cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutdKVaccumTMA>> smem_dkv;
+    // Strangely without this SmemAlignment, the total smem for hdim 128 (80 x 128) is 228KB even though we
+    // only need 227KB. We use the same alignment as the non-GQA epilogue to avoid this issue.
+    static constexpr int SmemAlignment = kHeadDim % 64 == 0 ? 1024 : (kHeadDim % 32 == 0 ? 512 : 256);
+    struct TensorStorage : cute::aligned_struct<SmemAlignment> {
+        cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutdKVaccum>, SmemAlignment> smem_dkv;
     };
 
-    using ShapedKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen_k, d, head, batch)
-    using StridedKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
-
-    using TMA_add_dKV = decltype(make_tma_copy(
-        GmemTiledCopydKVTMA{},
-        make_tensor(make_gmem_ptr(static_cast<ElementAccum*>(nullptr)), ShapedKV{}, StridedKV{}),
-        SmemLayoutdKVaccumTMA{},
-        select<1, 2>(TileShape_MNK{}),
-        _1{}));  // no mcast for dKV
+    using ShapedKV = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_k_rounded * d, head, batch)
+    using StridedKV = cute::Stride<_1, int64_t, int64_t>;
 
     // Host side kernel arguments
     struct Arguments {
@@ -346,8 +338,11 @@ struct CollectiveEpilogueBwdGQA {
 
     // Device side kernel params
     struct Params {
+        ElementAccum* ptr_dKaccum;
         ShapedKV const shape_dKaccum;
-        TMA_add_dKV tma_add_dK, tma_add_dV;
+        StridedKV const stride_dKaccum;
+        ElementAccum* ptr_dVaccum;
+        StridedKV const stride_dVaccum;
         cutlass::FastDivmod qhead_per_khead_divmod;
         int* dk_semaphore;
         int* dv_semaphore;
@@ -360,20 +355,6 @@ struct CollectiveEpilogueBwdGQA {
         if constexpr (Varlen) {
             assert (args.cu_seqlens != nullptr);
         }
-        Tensor mdKaccum = make_tensor(make_gmem_ptr(args.ptr_dKaccum), args.shape_dKaccum, args.stride_dKaccum);
-        Tensor mdVaccum = make_tensor(make_gmem_ptr(args.ptr_dVaccum), args.shape_dKaccum, args.stride_dVaccum);
-        TMA_add_dKV tma_add_dK = make_tma_copy(
-            GmemTiledCopydKVTMA{},
-            mdKaccum,
-            SmemLayoutdKVaccumTMA{},
-            select<1, 2>(TileShape_MNK{}),
-            _1{}); // no mcast for dKV
-        TMA_add_dKV tma_add_dV = make_tma_copy(
-            GmemTiledCopydKVTMA{},
-            mdVaccum,
-            SmemLayoutdKVaccumTMA{},
-            select<1, 2>(TileShape_MNK{}),
-            _1{}); // no mcast for dKV
         if constexpr (Deterministic) {
             assert(args.dk_semaphore != nullptr);
             assert(args.dv_semaphore != nullptr);
@@ -381,8 +362,8 @@ struct CollectiveEpilogueBwdGQA {
         if constexpr (Varlen) {
             assert(args.cu_seqlens != nullptr);
         }
-        return {args.shape_dKaccum, tma_add_dK, tma_add_dV,
-                cutlass::FastDivmod(cute::ceil_div(args.num_heads_q, get<2>(args.shape_dKaccum))),
+        return {args.ptr_dKaccum, args.shape_dKaccum, args.stride_dKaccum, args.ptr_dVaccum, args.stride_dVaccum,
+                cutlass::FastDivmod(cute::ceil_div(args.num_heads_q, get<1>(args.shape_dKaccum))),
                 args.dk_semaphore, args.dv_semaphore,
                 args.cu_seqlens, args.seqused};
     }
@@ -390,8 +371,6 @@ struct CollectiveEpilogueBwdGQA {
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
     CUTLASS_DEVICE
     static void prefetch_tma_descriptors(Params const& params) {
-        cute::prefetch_tma_descriptor(params.tma_add_dK.get_tma_descriptor());
-        cute::prefetch_tma_descriptor(params.tma_add_dV.get_tma_descriptor());
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename TiledMma>
@@ -407,22 +386,16 @@ struct CollectiveEpilogueBwdGQA {
 
         auto [n_block, bidh, bidb] = block_coord;
         int bidh_idx_in_group;
-        // int bidh_kv = params.qhead_per_khead_divmod.divide(bidh);
         int bidh_kv = params.qhead_per_khead_divmod.divmod(bidh_idx_in_group, bidh);
         Tensor sdKV = make_tensor(make_smem_ptr(shared_storage.tensors.epilogue.smem_dkv.data()), SmemLayoutdKVaccum{});
-        Tensor sdKVTMA = make_tensor(make_smem_ptr(shared_storage.tensors.epilogue.smem_dkv.data()), SmemLayoutdKVaccumTMA{});
+        Tensor sdKV_flat = make_tensor(make_smem_ptr(shared_storage.tensors.epilogue.smem_dkv.data()), SmemLayoutdKVaccumFlat{});
+        static constexpr int dKV_TMA_num_bytes = CUTE_STATIC_V(size(sdKV_flat)) * sizeof(ElementAccum);
 
         int const offset_padded = !Varlen ? 0 : (params.cu_seqlens[bidb] + bidb * kBlockN) / kBlockN * kBlockN;
-        Tensor mdKaccum = params.tma_add_dK.get_tma_tensor(params.shape_dKaccum)(_, _, bidh_kv, !Varlen ? bidb : 0);
-        Tensor mdVaccum = params.tma_add_dV.get_tma_tensor(params.shape_dKaccum)(_, _, bidh_kv, !Varlen ? bidb : 0);
-        Tensor gdKaccum = local_tile(domain_offset(make_coord(offset_padded, _0{}), mdKaccum), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
-        Tensor gdVaccum = local_tile(domain_offset(make_coord(offset_padded, _0{}), mdVaccum), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
-        auto block_tma_dK = params.tma_add_dK.get_slice(_0{});
-        auto block_tma_dV = params.tma_add_dV.get_slice(_0{});
-        Tensor tdKgdK = block_tma_dK.partition_D(gdKaccum);  // (TMA, TMA_M, TMA_K)
-        Tensor tdKsdK = block_tma_dK.partition_S(sdKVTMA); // (TMA, TMA_M, TMA_K)
-        Tensor tdVgdV = block_tma_dV.partition_D(gdVaccum);  // (TMA, TMA_M, TMA_K)
-        Tensor tdVsdV = block_tma_dV.partition_S(sdKVTMA); // (TMA, TMA_M, TMA_K)
+        Tensor mdKaccum = make_tensor(make_gmem_ptr(params.ptr_dKaccum), params.shape_dKaccum, params.stride_dKaccum)(_, bidh_kv, !Varlen ? bidb : 0);
+        Tensor mdVaccum = make_tensor(make_gmem_ptr(params.ptr_dVaccum), params.shape_dKaccum, params.stride_dVaccum)(_, bidh_kv, !Varlen ? bidb : 0);
+        Tensor gdKaccum = local_tile(domain_offset(make_coord(offset_padded * kHeadDim), mdKaccum), Shape<Int<kBlockN * kHeadDim>>{}, make_coord(n_block));  // (M * K)
+        Tensor gdVaccum = local_tile(domain_offset(make_coord(offset_padded * kHeadDim), mdVaccum), Shape<Int<kBlockN * kHeadDim>>{}, make_coord(n_block));  // (M * K)
 
         R2STiledCopydKVaccum r2s_tiled_copy_dKVaccum;
         auto r2s_thr_copy_dKVaccum = r2s_tiled_copy_dKVaccum.get_thread_slice(thread_idx);
@@ -435,8 +408,8 @@ struct CollectiveEpilogueBwdGQA {
         cute::copy(r2s_tiled_copy_dKVaccum, taccdKVrdV, tdKVsdKVaccum);
 
         // int const num_batch = params.num_batch;
-        int const num_batch = get<3>(params.shape_dKaccum);
-        int const num_head_kv = get<2>(params.shape_dKaccum);
+        int const num_batch = get<2>(params.shape_dKaccum);
+        int const num_head_kv = get<1>(params.shape_dKaccum);
         int *lock_ptr = !Deterministic ? nullptr : params.dv_semaphore + bidb * num_head_kv + bidh_kv;
         using Barrier = cutlass::GenericBarrier<cutlass::detail::SyncwarpSync>;
 
@@ -449,10 +422,10 @@ struct CollectiveEpilogueBwdGQA {
         cutlass::arch::fence_view_async_shared();
         cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
         if (thread_idx == 0) {
-            cute::copy(params.tma_add_dV, tdVsdV, tdVgdV);
+            SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdKV_flat.data()), raw_pointer_cast(gdVaccum.data()), dKV_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
             tma_store_arrive();
+            tma_store_wait<0>();
         }
-        tma_store_wait<0>();
         if constexpr (Deterministic) {
             Barrier::arrive_inc(lock_ptr, thread_idx, n_block * num_batch * num_head_kv);
         }
@@ -470,10 +443,10 @@ struct CollectiveEpilogueBwdGQA {
         cutlass::arch::fence_view_async_shared();
         cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
         if (thread_idx == 0) {
-            cute::copy(params.tma_add_dK, tdKsdK, tdKgdK);
+            SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdKV_flat.data()), raw_pointer_cast(gdKaccum.data()), dKV_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
             tma_store_arrive();
+            tma_store_wait<0>();
         }
-        tma_store_wait<0>();
         if constexpr (Deterministic) {
             Barrier::arrive_inc(lock_ptr, thread_idx, n_block * num_batch * num_head_kv);
         }

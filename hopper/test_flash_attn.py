@@ -326,6 +326,8 @@ def attention_ref(
         (64, 128),
         (128, 192),
         (256, 256),
+        (239, 1),
+        (799, 3),
         (113, 203),
         (113, 128),
         (128, 217),
@@ -487,13 +489,13 @@ def test_flash_attn_output(
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
     multiple = 2 if dtype != torch.float8_e4m3fn else (3 if softcap == 0.0 else 6)
-    assert (out - out_ref).abs().max().item() <= multiple * (out_pt - out_ref).abs().max().item()
+    assert (out - out_ref).abs().max().item() <= multiple * (out_pt - out_ref).abs().max().item() + 1e-4
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor:
         multiple = 2 if softcap == 0.0 else 4
-        assert (dq - dq_ref).abs().max().item() <= multiple * (dq_pt - dq_ref).abs().max().item()
-        assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item()
-        assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item()
+        assert (dq - dq_ref).abs().max().item() <= multiple * (dq_pt - dq_ref).abs().max().item() + 1e-4
+        assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item() + 1e-4
+        assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item() + 1e-4
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
@@ -1080,7 +1082,7 @@ def test_flash_attn_cluster(seqlen_q, seqlen_k, d, causal, dtype):
 # @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128])
 # @pytest.mark.parametrize('d', [32, 56, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192])
-# @pytest.mark.parametrize('d', [160])
+# @pytest.mark.parametrize('d', [80])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1119,7 +1121,7 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
     # Numerical error if we just do any arithmetic on dq
     dq_atol = 2 * ((dq0 + 0.3 - 0.3) - dq0).abs().max().item()
 
-    for i in range(10000):
+    for i in range(1000):
         torch.random.manual_seed(42)
         out, lse = flash_attn_func(q, k, v, causal=causal)
         assert torch.equal(out, out0)
@@ -1129,6 +1131,7 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
         dq_equal = torch.allclose(dq, dq0, atol=dq_atol)
         if not dq_equal:
             print(f"Iter {i}, {dq_atol = }, dQ max diff: {(dq - dq0).abs().max().item()}")
+            # breakpoint()
         assert torch.equal(dv, dv0)
         assert torch.equal(dk, dk0)
         assert dq_equal

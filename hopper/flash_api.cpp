@@ -590,7 +590,10 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
-            params.is_bf16 = true;  // Since we want output in BF16. Otherwise fwd_combine will output to FP16
+            if (out_type == at::ScalarType::BFloat16) {
+                // Since we want output in BF16. Otherwise fwd_combine will output to FP16
+                params.is_bf16 = true;
+            }
             run_mha_fwd_combine(params, stream);
         }
     } else if (batch_size > 0) {
@@ -818,7 +821,10 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
-            params.is_bf16 = true;  // Since we want output in BF16. Otherwise fwd_combine will output to FP16
+            if (out_type == at::ScalarType::BFloat16) {
+                // Since we want output in BF16. Otherwise fwd_combine will output to FP16
+                params.is_bf16 = true;
+            }
             // Unless there's seqused_q, for the purpose of attn_combine, we can just treat it as batch=1
             // and seqlen = total_q, and don't need to dispatch to Varlen there.
             if (!seqused_q_.has_value()) {
@@ -943,9 +949,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size_rounded = head_size <= 64 ? 64 : (head_size <= 128 ? round_multiple(head_size, 32) : round_multiple(head_size, 64));
     // This needs to match the kernel configs
-    // const int kBlockM = head_size_rounded <= 64 ? 128 : 64;
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-    const int kBlockM = head_size_rounded <= 64 ? 128 : (head_size_rounded <= 128 ? (is_causal || is_local ? 64 : 80) : 64);
+    const int kBlockM = head_size_rounded <= 64 ? 128 : (head_size_rounded <= 96 ? 64 : (head_size_rounded <= 128 ? (is_causal || is_local ? 64 : 80) : 64));
     const int kBlockN = head_size_rounded <= 128 ? 128 : (head_size_rounded <= 192 ? 96 : 80);
     const int seqlen_q_rounded = round_multiple(seqlen_q, kBlockM);
     const int seqlen_k_rounded = round_multiple(seqlen_k, kBlockN);
@@ -1011,11 +1016,10 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     auto softmax_lse_log2 = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
     at::Tensor dq_accum;
     at::Tensor dk_accum, dv_accum;
-    // dq_accum = torch::empty({batch_size, num_heads, seqlen_q_rounded, head_size_rounded}, opts.dtype(at::kFloat));
-    dq_accum = torch::zeros({batch_size, num_heads, seqlen_q_rounded, head_size_rounded}, opts.dtype(at::kFloat));
+    dq_accum = torch::empty({batch_size, num_heads, seqlen_q_rounded * head_size_rounded}, opts.dtype(at::kFloat));
     if (num_heads_k != num_heads) {  // MQA / GQA
-        dk_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded, head_size_rounded}, opts.dtype(at::kFloat));
-        dv_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded, head_size_rounded}, opts.dtype(at::kFloat));
+        dk_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded * head_size_rounded}, opts.dtype(at::kFloat));
+        dv_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded * head_size_rounded}, opts.dtype(at::kFloat));
     }
 
     Flash_bwd_params params;
@@ -1051,8 +1055,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     // Will be zero'ed out in the backward preprocess kernel
     at::Tensor dq_semaphore = torch::empty({(seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, opts.dtype(torch::kInt32));
     params.dq_semaphore = dq_semaphore.data_ptr<int>();
-    // printf("dq_semaphore: %p, [%d, %d, %d]\n", params.dq_semaphore, (seqlen_q + 64 - 1) / 64, batch_size, num_heads);
-    if (num_heads_k != num_heads) {
+    if (num_heads_k != num_heads && params.deterministic) {
         at::Tensor dk_semaphore = torch::zeros({(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, opts.dtype(torch::kInt32));
         at::Tensor dv_semaphore = torch::zeros({(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, opts.dtype(torch::kInt32));
         params.dk_semaphore = dk_semaphore.data_ptr<int>();
@@ -1161,7 +1164,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
     // This needs to match the kernel configs
     // const int kBlockM = head_size_rounded <= 64 ? 128 : 64;
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-    const int kBlockM = head_size_rounded <= 64 ? 128 : (head_size_rounded <= 128 ? (is_causal || is_local ? 64 : 80) : 64);
+    const int kBlockM = head_size_rounded <= 64 ? 128 : (head_size_rounded <= 96 ? 64 : (head_size_rounded <= 128 ? (is_causal || is_local ? 64 : 80) : 64));
     const int kBlockN = head_size_rounded <= 128 ? 128 : (head_size_rounded <= 192 ? 96 : 80);
     const int seqlen_q_rounded = round_multiple(max_seqlen_q, kBlockM);
     const int seqlen_k_rounded = round_multiple(max_seqlen_k, kBlockN);
@@ -1672,7 +1675,10 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
-            params.is_bf16 = true;  // Since we want output in BF16. Otherwise fwd_combine will output to FP16
+            if (out_type == at::ScalarType::BFloat16) {
+                // Since we want output in BF16. Otherwise fwd_combine will output to FP16
+                params.is_bf16 = true;
+            }
             // Unless there's seqused_q, for the purpose of attn_combine, we can just treat it as batch=1
             // and seqlen = total_q, and don't need to dispatch to Varlen there.
             // if (is_varlen_q && !seqused_q_.has_value()) {

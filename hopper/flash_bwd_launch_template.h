@@ -8,6 +8,8 @@
 
 #include "cutlass/cluster_launch.hpp"
 #include "cutlass/device_kernel.h"  // For device_kernel
+#include "cutlass/kernel_launch.h"  // For kernel_launch
+#include "cutlass/cluster_launch.hpp"  // For ClusterLauncher
 
 #include "static_switch.h"
 #include "flash.h"
@@ -47,8 +49,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         static_cast<float*>(params.softmax_lse_log2_ptr),
         {_1{}, !Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, !Varlen ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
         static_cast<ElementAccum*>(params.dq_accum_ptr),
-        {!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, params.d_rounded, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
-        {params.d_rounded, _1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0},  // stride_dQ
+        {(!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded) * params.d_rounded, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
+        {_1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0},  // stride_dQ
         params.b,
         params.dq_semaphore,
         params.cu_seqlens_q,
@@ -57,7 +59,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
     int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
     dim3 grid_m(num_m_block, params.h, params.b);
-    cutlass::device_kernel<PreprocessKernel><<<grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream>>>(preprocess_params);
+    cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/);
     CHECK_CUDA_KERNEL_LAUNCH();
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
@@ -87,8 +89,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         static_cast<Element const*>(params.do_ptr),
         {params.do_row_stride, _1{}, params.do_head_stride, !Varlen ? params.do_batch_stride : 0},  // stride_dO
         static_cast<ElementAccum*>(params.dq_accum_ptr),
-        {!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, params.d_rounded, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
-        {params.d_rounded, _1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
+        {(!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded) * params.d_rounded, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
+        {_1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
         static_cast<float*>(params.softmax_lse_log2_ptr),
         {!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, params.h, !Varlen ? params.b : 1},  // shape_LSE
         {_1{}, !Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, !Varlen ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
@@ -105,16 +107,28 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     // The case work with GQA is ugly but idk how to fix it.
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<typename CollectiveEpilogue::Element*>(!GQA ? params.dk_ptr : params.dk_accum_ptr),
-        !GQA
-            ? typename CollectiveEpilogue::ShapedKV {!Varlen ? params.seqlen_k : params.total_k, params.d, params.h, !Varlen ? params.b : 1}  // shape_dK
-            : typename CollectiveEpilogue::ShapedKV {!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded, params.d_rounded, params.h_k, !Varlen ? params.b : 1},  // shape_dKaccum
-        !GQA
-            ? typename CollectiveEpilogue::StridedKV {params.dk_row_stride, _1{}, params.dk_head_stride, !Varlen ? params.dk_batch_stride : 0}  // stride_dK
-            : typename CollectiveEpilogue::StridedKV {params.d_rounded, _1{}, params.d_rounded * (!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded), !Varlen ? params.h_k * params.d_rounded * params.seqlen_k_rounded : 0},  // stride_dKaccum
+        [&] {
+            if constexpr (!GQA) {
+                return typename CollectiveEpilogue::ShapedKV {!Varlen ? params.seqlen_k : params.total_k, params.d, params.h, !Varlen ? params.b : 1};  // shape_dK
+            } else {
+                return typename CollectiveEpilogue::ShapedKV {(!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded) * params.d_rounded, params.h_k, !Varlen ? params.b : 1};  // shape_dKaccum
+            }
+        }(),
+        [&] {
+            if constexpr (!GQA) {
+                return typename CollectiveEpilogue::StridedKV {params.dk_row_stride, _1{}, params.dk_head_stride, !Varlen ? params.dk_batch_stride : 0};  // stride_dK
+            } else {
+                return typename CollectiveEpilogue::StridedKV {_1{}, params.d_rounded * (!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded), !Varlen ? params.h_k * params.d_rounded * params.seqlen_k_rounded : 0};  // stride_dKaccum
+            }
+        }(),
         static_cast<typename CollectiveEpilogue::Element*>(!GQA ? params.dv_ptr : params.dv_accum_ptr),
-        !GQA
-            ? typename CollectiveEpilogue::StridedKV {params.dv_row_stride, _1{}, params.dv_head_stride, !Varlen ? params.dv_batch_stride : 0}  // stride_dV
-            : typename CollectiveEpilogue::StridedKV {params.d_rounded, _1{}, params.d_rounded * (!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded), !Varlen ? params.h_k * params.d_rounded * params.seqlen_k_rounded : 0},  // stride_dVaccum
+        [&] {
+            if constexpr (!GQA) {
+                return typename CollectiveEpilogue::StridedKV {params.dv_row_stride, _1{}, params.dv_head_stride, !Varlen ? params.dv_batch_stride : 0};  // stride_dV
+            } else {
+                return typename CollectiveEpilogue::StridedKV {_1{}, params.d_rounded * (!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded), !Varlen ? params.h_k * params.d_rounded * params.seqlen_k_rounded : 0};  // stride_dVaccum
+            }
+        }(),
         params.h,
         params.dk_semaphore,
         params.dv_semaphore,
@@ -155,27 +169,25 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
         dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
-        cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
-        cutlass::launch_kernel_on_cluster(launch_params, kernel, kernel_params);
+        cutlass::ClusterLauncher::launch(
+            grid_dims, cluster_dims, block_dims, smem_size, stream, kernel, kernel_params, false /*launch_with_pdl*/);
     } else {
-        auto kernel = cutlass::device_kernel<AttnKernel>;
         if (smem_size >= 48 * 1024) {
-            CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<AttnKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
-        kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
+        cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, false /*launch_with_pdl*/);
     }
     CHECK_CUDA_KERNEL_LAUNCH();
 
     using PostprocessKernel = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_MK, Element, ElementAccum, cutlass::arch::Sm90,
         AttnKernel::CollectiveMainloop::kNThreadsdQ,
-        typename AttnKernel::CollectiveMainloop::SmemLayoutdQaccumTMA,
         typename AttnKernel::CollectiveMainloop::TiledMmadQ,
         AttnKernel::CollectiveMainloop::dQ_swapAB
         >;
     typename PostprocessKernel::Arguments postprocess_args {
         static_cast<ElementAccum const*>(params.dq_accum_ptr),
-        {(!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), params.d_rounded, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
-        {params.d_rounded, _1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
+        {(!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded) * params.d_rounded, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
+        {_1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
         static_cast<Element*>(params.dq_ptr),
         {!Varlen ? params.seqlen_q : params.total_q, params.d, params.h, !Varlen ? params.b : 1},  // shape_dQ
         {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
@@ -186,27 +198,24 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     typename PostprocessKernel::Params postprocess_params = PostprocessKernel::to_underlying_arguments(postprocess_args);
     int num_m_block_postprocess = cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
     dim3 grid_m_postprocess(num_m_block_postprocess, params.h, params.b);
-    // Get the ptr to kernel function.
-    auto postprocess_kernel = cutlass::device_kernel<PostprocessKernel>;
     int smem_size_postprocess = PostprocessKernel::SharedStorageSize;
     if (smem_size_postprocess >= 48 * 1024) {
-        CHECK_CUDA(cudaFuncSetAttribute(postprocess_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
-    postprocess_kernel<<<grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream>>>(postprocess_params);
+    cutlass::kernel_launch<PostprocessKernel>(grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_params, false /*launch_with_pdl*/);
     CHECK_CUDA_KERNEL_LAUNCH();
 
     if constexpr (GQA) {
         using TileShape_NK = cute::Shape<Int<kBlockN>, Int<kHeadDim>>;
         using PostprocessKerneldKV = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_NK, Element, ElementAccum, cutlass::arch::Sm90,
             AttnKernel::CollectiveEpilogue::NumEpilogueThreads,
-            typename AttnKernel::CollectiveEpilogue::SmemLayoutdKVaccumTMA,
             typename AttnKernel::CollectiveMainloop::TiledMmadKV,
             AttnKernel::CollectiveMainloop::dKV_swapAB
             >;
         typename PostprocessKerneldKV::Arguments postprocess_dK_args {
             static_cast<ElementAccum const*>(params.dk_accum_ptr),
-            {!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded, params.d_rounded, params.h_k, !Varlen ? params.b : 1},  // shape_dKaccum
-            {params.d_rounded, _1{}, params.d_rounded * (!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_k_rounded * params.h_k : 0},  // stride_dKaccum
+            {(!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded) * params.d_rounded, params.h_k, !Varlen ? params.b : 1},  // shape_dKaccum
+            {_1{}, params.d_rounded * (!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_k_rounded * params.h_k : 0},  // stride_dKaccum
             static_cast<Element*>(params.dk_ptr),
             {!Varlen ? params.seqlen_k : params.total_k, params.d, params.h_k, !Varlen ? params.b : 1},  // shape_dK
             {params.dk_row_stride, _1{}, params.dk_head_stride, params.dk_batch_stride},  // stride_dK
@@ -217,8 +226,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         typename PostprocessKerneldKV::Params postprocess_dK_params = PostprocessKerneldKV::to_underlying_arguments(postprocess_dK_args);
         typename PostprocessKerneldKV::Arguments postprocess_dV_args {
             static_cast<ElementAccum const*>(params.dv_accum_ptr),
-            {!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded, params.d_rounded, params.h_k, !Varlen ? params.b : 1},  // shape_dVaccum
-            {params.d_rounded, _1{}, params.d_rounded * (!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_k_rounded * params.h_k : 0},  // stride_dVaccum
+            {(!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded) * params.d_rounded, params.h_k, !Varlen ? params.b : 1},  // shape_dVaccum
+            {_1{}, params.d_rounded * (!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_k_rounded * params.h_k : 0},  // stride_dVaccum
             static_cast<Element*>(params.dv_ptr),
             {!Varlen ? params.seqlen_k : params.total_k, params.d, params.h_k, !Varlen ? params.b : 1},  // shape_dV
             {params.dv_row_stride, _1{}, params.dv_head_stride, params.dv_batch_stride},  // stride_dV
@@ -229,15 +238,13 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         typename PostprocessKerneldKV::Params postprocess_dV_params = PostprocessKerneldKV::to_underlying_arguments(postprocess_dV_args);
         int num_n_block_postprocess = cute::ceil_div(params.seqlen_k, get<0>(TileShape_NK{}));
         dim3 grid_n_postprocess(num_n_block_postprocess, params.h_k, params.b);
-        // Get the ptr to kernel function.
-        auto postprocess_dKV_kernel = cutlass::device_kernel<PostprocessKerneldKV>;
         int smem_size_postprocess = PostprocessKerneldKV::SharedStorageSize;
         if (smem_size_postprocess >= 48 * 1024) {
-            CHECK_CUDA(cudaFuncSetAttribute(postprocess_dKV_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKerneldKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
-        postprocess_dKV_kernel<<<grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream>>>(postprocess_dK_params);
+        cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
-        postprocess_dKV_kernel<<<grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream>>>(postprocess_dV_params);
+        cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dV_params, false /*launch_with_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
 
@@ -289,17 +296,6 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
             }
         });
     });
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, false, 2, 1, 2, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, false, false, false, 1, 2, 1, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 96, 8, false, true, false, 2, 1, 2, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 96, 8, false, true, true, 2, 1, 1, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, true, false, true, 1, 2, 1, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 12, true, false, true, 1, 2, 1, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 12, true, false, false, 1, 2, 1, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 12, false, false, false, 1, 2, 1, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 80, 128, 12, true, false, true, 1, 2, 1, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_seqqpar_kernel_traits<Headdim, 128, 64, 8, false, true, false, 2, 1, 2, 1, T>, false>(params, stream);
-    // run_flash_bwd<Flash_bwd_seqqpar_kernel_traits<Headdim, 96, 128, 8, true, false, true, 1, 2, 1, 1, T>, false>(params, stream);
 }
 
 template<typename T>

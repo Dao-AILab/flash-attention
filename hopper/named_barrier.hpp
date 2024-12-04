@@ -24,21 +24,17 @@ enum class FwdNamedBarriers {
 };
 
 enum class BwdNamedBarriers {
-    Epilogue = 0,
-    KVEmpty = 1,
+    KVEmpty = 0,
+    PdS = 1,
     // This needs to match FwdNamedBarriers::TileCountSmemEmpty since TileScheduler uses it
     TileCountSmemEmpty = 2,
     TileCountSmemFull = 3,
-    PdS = 4,
-    // WarpSchedulerWG1 = 4,
-    // WarpSchedulerWG2 = 5,
-    // dQEmptyWG1 = 4,
-    // dQEmptyWG2 = 5,
-    // dSFull = 6,
-    // dSEmptyWG1 = 7,
-    // dSEmptyWG2 = 8,
-    dQEmpty = 7,
-    dQFull = 8,
+    dQEmptyWG1 = 4,
+    dQEmptyWG2 = 5,
+    dQEmptyWG3 = 6,
+    dQFullWG1 = 7,
+    dQFullWG2 = 8,
+    dQFullWG3 = 9,
 };
 
 } // flash
