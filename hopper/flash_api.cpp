@@ -251,10 +251,11 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.deterministic = deterministic;
 }
 
-void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
+void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // HEADDIM_SWITCH(params.d, [&] {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
+    TORCH_CHECK(params.num_splits >= 1);
     SPLIT_SWITCH(params.num_splits > 1, Split, [&] {
         PAGEDKV_SWITCH(params.page_table, PagedKV, [&] {
             if (!params.is_e4m3) {
@@ -355,27 +356,14 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
     float max_efficiency = 0.f;
     std::vector<float> efficiency;
     efficiency.reserve(max_splits);
-    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
-    // Some splits are not eligible. For example, if we have 64 blocks and choose 11 splits,
-    // we'll have 6 * 10 + 4 blocks. If we choose 12 splits, we'll have 6 * 11 + (-2) blocks
-    // (i.e. it's 11 splits anyway).
-    // So we check if the number of blocks per split is the same as the previous num_splits.
-    auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
-        return num_splits == 1 || ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1);
-    };
     for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        if (!is_split_eligible(num_splits)) {
-            efficiency.push_back(0.f);
-        } else {
-            float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
-            float eff = n_waves / ceil(n_waves);
-            // printf("num_splits = %d, eff = %f\n", num_splits, eff);
-            if (eff > max_efficiency) { max_efficiency = eff; }
-            efficiency.push_back(eff);
-        }
+        float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
+        float eff = n_waves / ceil(n_waves);
+        // printf("num_splits = %d, eff = %f\n", num_splits, eff);
+        if (eff > max_efficiency) { max_efficiency = eff; }
+        efficiency.push_back(eff);
     }
     for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        if (!is_split_eligible(num_splits)) { continue; }
         if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
             // printf("num_splits chosen = %d\n", num_splits);
             return num_splits;
@@ -384,6 +372,33 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
     return 1;
 }
 
+inline bool get_pack_gqa(Flash_fwd_params const& params) {
+    #ifdef FLASHATTENTION_DISABLE_PACKGQA
+    return false;
+    #else
+    // params.page_table must already be set
+    if (params.h == params.h_k) { return false; }
+    // This needs to match the kernel configs
+    auto [kBlockM, kBlockN, IntraWGOverlap] = tile_size_fwd(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
+    return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.is_causal || params.is_local, params.seqlen_q, params.h / params.h_k, kBlockM);
+    #endif
+}
+
+inline int get_num_splits(Flash_fwd_params const& params) {
+    #ifdef FLASHATTENTION_DISABLE_SPLIT
+    return 1;
+    #else
+    // params.pack_gqa must already be set
+    // params.page_table must already be set
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    // This needs to match the kernel configs
+    auto [kBlockM, kBlockN, IntraWGOverlap] = tile_size_fwd(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
+    int seqlen_q_packgqa = params.seqlen_q * (params.pack_gqa ? params.h / params.h_k : 1);
+    const int num_n_blocks = (params.seqlen_k + kBlockN - 1) / kBlockN;
+    const int num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
+    return num_splits_heuristic(params.b * params.h_k * num_m_blocks, dprops->multiProcessorCount, num_n_blocks, 128);
+    #endif
+}
 
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
@@ -507,14 +522,15 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      window_size_right,
                      softcap);
     params.sink_token_length = sink_token_length;
+    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
 
-    params.num_splits = num_splits;
     at::Tensor out_accum, softmax_lse_accum;
     auto outaccum_type = at::ScalarType::Float;
-    if (num_splits > 1) {
+    if (params.num_splits > 1) {
         TORCH_CHECK(params.num_splits <= 256, "num_splits > 256 not supported");
-        out_accum = torch::empty({num_splits, batch_size, num_heads, seqlen_q, head_size}, opts.dtype(outaccum_type));
-        softmax_lse_accum = torch::empty({num_splits, batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+        out_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q, head_size}, opts.dtype(outaccum_type));
+        softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
         params.is_fp32 = false;
         params.oaccum_ptr = out_accum.data_ptr();
         params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
@@ -526,8 +542,6 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         params.lseaccum_head_stride = softmax_lse_accum.stride(2);
         params.lseaccum_batch_stride = softmax_lse_accum.stride(1);
     }
-
-    params.pack_gqa = pack_gqa_.has_value() ? int (pack_gqa_.value()) : -1;
 
     auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
@@ -566,7 +580,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     TORCH_CHECK(params.num_splits == 1, "This flash attention build does not support splits.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
-    TORCH_CHECK(params.pack_gqa == -1 || params.pack_gqa == 0, "This flash attention build does not support pack_gqa.");
+    TORCH_CHECK(!params.pack_gqa, "This flash attention build does not support pack_gqa.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_SOFTCAP
     TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
@@ -575,7 +589,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     if (seqlen_k > 0 && batch_size > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
-        if (num_splits > 1) {
+        if (params.num_splits > 1) {
             params.is_bf16 = true;  // Since we want output in BF16. Otherwise fwd_combine will output to FP16
             run_mha_fwd_combine(params, stream);
         }
@@ -736,14 +750,15 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
                      softcap);
     params.total_q = total_q;
     params.total_k = total_k;
+    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
 
-    params.num_splits = num_splits;
     at::Tensor out_accum, softmax_lse_accum;
     auto outaccum_type = at::ScalarType::Float;
-    if (num_splits > 1) {
+    if (params.num_splits > 1) {
         TORCH_CHECK(params.num_splits <= 256, "num_splits > 256 not supported");
-        out_accum = torch::empty({num_splits, num_heads, total_q, head_size}, opts.dtype(outaccum_type));
-        softmax_lse_accum = torch::empty({num_splits, num_heads, total_q}, opts.dtype(at::kFloat));
+        out_accum = torch::empty({params.num_splits, num_heads, total_q, head_size}, opts.dtype(outaccum_type));
+        softmax_lse_accum = torch::empty({params.num_splits, num_heads, total_q}, opts.dtype(at::kFloat));
         params.is_fp32 = false;
         params.oaccum_ptr = out_accum.data_ptr();
         params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
@@ -755,9 +770,6 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
         params.lseaccum_head_stride = softmax_lse_accum.stride(1);
         params.lseaccum_batch_stride = 0;
     }
-
-    // If negative, we use a heuristic to decide
-    params.pack_gqa = pack_gqa_.has_value() ? int(pack_gqa_.value()) : -1;
 
     auto tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
@@ -796,7 +808,7 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
     TORCH_CHECK(params.num_splits == 1, "This flash attention build does not support splits.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
-    TORCH_CHECK(params.pack_gqa == -1 || params.pack_gqa == 0, "This flash attention build does not support pack_gqa.");
+    TORCH_CHECK(!params.pack_gqa, "This flash attention build does not support pack_gqa.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_SOFTCAP
     TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
@@ -805,7 +817,7 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
     if (max_seqlen_k > 0 && batch_size > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
-        if (num_splits > 1) {
+        if (params.num_splits > 1) {
             params.is_bf16 = true;  // Since we want output in BF16. Otherwise fwd_combine will output to FP16
             // Unless there's seqused_q, for the purpose of attn_combine, we can just treat it as batch=1
             // and seqlen = total_q, and don't need to dispatch to Varlen there.
@@ -1486,47 +1498,15 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
     params.sink_token_length = sink_token_length;
     params.b_k = batch_size_k;
 
-    if (num_splits <= 0) {
-        auto dprops = at::cuda::getCurrentDeviceProperties();
-        // This needs to match the kernel configs
-        // TODO: right now we assume PackGQA
-        bool const is_local = !is_causal && (window_size_left >= 0 || window_size_right >= 0);
-        auto [kBlockM, kBlockN, IntraWGOverlap] = tile_size_fwd(head_size_rounded, is_causal, is_local, torch::elementSize(q_type) /*element_size*/, false /*v_colmajor*/, page_table_.has_value(), softcap > 0.f);
-        int seqlen_q_packgqa = seqlen_q * (num_heads / num_heads_k);
-        const int num_n_blocks = (seqlen_k + kBlockN - 1) / kBlockN;
-        const int num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
-        num_splits = num_splits_heuristic(batch_size * num_heads_k * num_m_blocks, dprops->multiProcessorCount, num_n_blocks, 128);
-    }
-    params.num_splits = num_splits;
-    at::Tensor out_accum, softmax_lse_accum;
-    auto outaccum_type = at::ScalarType::Float;
-    if (num_splits > 1) {
-        TORCH_CHECK(params.num_splits <= 256, "num_splits > 256 not supported");
-        if (!is_varlen_q) {
-            out_accum = torch::empty({num_splits, batch_size, num_heads, seqlen_q, head_size}, opts.dtype(outaccum_type));
-            softmax_lse_accum = torch::empty({num_splits, batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
-            params.oaccum_batch_stride = out_accum.stride(1);
-            params.lseaccum_batch_stride = softmax_lse_accum.stride(1);
-        } else {
-            out_accum = torch::empty({num_splits, num_heads, total_q, head_size}, opts.dtype(outaccum_type));
-            softmax_lse_accum = torch::empty({num_splits, num_heads, total_q}, opts.dtype(at::kFloat));
-        }
-        params.is_fp32 = false;
-        params.oaccum_ptr = out_accum.data_ptr();
-        params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
-        params.oaccum_split_stride = out_accum.stride(0);
-        params.oaccum_row_stride = out_accum.stride(-2);
-        params.oaccum_head_stride = out_accum.stride(-3);
-        params.lseaccum_split_stride = softmax_lse_accum.stride(0);
-        params.lseaccum_head_stride = softmax_lse_accum.stride(-2);
-    }
-
     if (paged_KV) {
         params.page_table = page_table.data_ptr<int>();
         params.page_table_batch_stride = page_table.stride(0);
     }
     params.page_size = page_size;
     params.num_pages = num_pages;
+
+    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
 
     if (k_.has_value()) {
         at::Tensor k, v, k_padded, v_padded;
@@ -1607,7 +1587,28 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         params.kv_batch_idx = reinterpret_cast<int *>(cache_batch_idx.data_ptr());
     }
 
-    params.pack_gqa = pack_gqa_.has_value() ? int (pack_gqa_.value()) : -1;
+    at::Tensor out_accum, softmax_lse_accum;
+    auto outaccum_type = at::ScalarType::Float;
+    if (params.num_splits > 1) {
+        TORCH_CHECK(params.num_splits <= 256, "num_splits > 256 not supported");
+        if (!is_varlen_q) {
+            out_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q, head_size}, opts.dtype(outaccum_type));
+            softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+            params.oaccum_batch_stride = out_accum.stride(1);
+            params.lseaccum_batch_stride = softmax_lse_accum.stride(1);
+        } else {
+            out_accum = torch::empty({params.num_splits, num_heads, total_q, head_size}, opts.dtype(outaccum_type));
+            softmax_lse_accum = torch::empty({params.num_splits, num_heads, total_q}, opts.dtype(at::kFloat));
+        }
+        params.is_fp32 = false;
+        params.oaccum_ptr = out_accum.data_ptr();
+        params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+        params.oaccum_split_stride = out_accum.stride(0);
+        params.oaccum_row_stride = out_accum.stride(-2);
+        params.oaccum_head_stride = out_accum.stride(-3);
+        params.lseaccum_split_stride = softmax_lse_accum.stride(0);
+        params.lseaccum_head_stride = softmax_lse_accum.stride(-2);
+    }
 
     at::Tensor tile_count_semaphore;
     // We don't use the persistent scheduler if Split or PagedKV or AppendKV
@@ -1655,7 +1656,7 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
     TORCH_CHECK(params.num_splits == 1, "This flash attention build does not support splits.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
-    TORCH_CHECK(params.pack_gqa == -1 || params.pack_gqa == 0, "This flash attention build does not support pack_gqa.");
+    TORCH_CHECK(!params.pack_gqa, "This flash attention build does not support pack_gqa.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_PAGEDKV
     TORCH_CHECK(!paged_KV, "This flash attention build does not support paged KV.");
@@ -1670,7 +1671,7 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
     if (seqlen_q > 0 && total_q > 0 && seqlen_k > 0 && batch_size > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
-        if (num_splits > 1) {
+        if (params.num_splits > 1) {
             params.is_bf16 = true;  // Since we want output in BF16. Otherwise fwd_combine will output to FP16
             // Unless there's seqused_q, for the purpose of attn_combine, we can just treat it as batch=1
             // and seqlen = total_q, and don't need to dispatch to Varlen there.

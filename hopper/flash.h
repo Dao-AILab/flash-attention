@@ -135,7 +135,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_rotary_interleaved;
 
     int num_splits;  // For split-KV version
-    int pack_gqa;    // 0: no packing, 1: pack GQA, -1: use heuristic to decide
+    bool pack_gqa;
 
     int * __restrict__ tile_count_semaphore;
 };

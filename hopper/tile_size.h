@@ -43,3 +43,14 @@ constexpr std::tuple<int, int, bool> tile_size_fwd(int headdim, bool is_causal, 
         }
     }
 }
+
+inline bool should_pack_gqa(bool varlen_q, bool is_causal_or_local, int seqlen_q, int qhead_per_khead, int blockM) {
+    // If varlen, we don't actually know seqlen_q but only max_seqlen_q.
+    // If causal, PackGQA always seems faster
+    if (varlen_q || is_causal_or_local) return true;
+    // Heuristic: PackGQA is a bit slower but can help if seqlen_q is small or not near a multiple of kBlockM
+    auto round_up = [](int a, int b) { return (a + b - 1) / b * b; };
+    float nopack_gqa_efficiency = float(seqlen_q) / float(round_up(seqlen_q, blockM));
+    float pack_gqa_efficiency = float(seqlen_q * qhead_per_khead) / float(round_up(seqlen_q * qhead_per_khead, blockM));
+    return nopack_gqa_efficiency < 0.95 * pack_gqa_efficiency;
+};

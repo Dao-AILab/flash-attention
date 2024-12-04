@@ -152,22 +152,11 @@ template<typename T, int kBlockM, int kBlockN, int kHeadDim, int kStages,
          bool Is_causal, bool Is_local, bool Has_softcap, bool PagedKV, bool IntraWGOverlap,
          bool Split, bool V_colmajor, bool Enable_cluster>
 void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
-    auto should_pack_gqa = [](int seqlen_q, int qhead_per_khead, int blockM) {
-        // Heuristic: PackGQA is a bit slower but can help if seqlen_q is small or not near a multiple of kBlockM
-        float nopack_gqa_efficiency = float(seqlen_q) / float(cute::round_up(seqlen_q, blockM));
-        float pack_gqa_efficiency = float(seqlen_q * qhead_per_khead) / float(cute::round_up(seqlen_q * qhead_per_khead, blockM));
-        return nopack_gqa_efficiency < 0.95 * pack_gqa_efficiency;
-    };
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
     using T_out = std::conditional_t<!Split, std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>, float>;
     VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
-        bool pack_gqa = params.pack_gqa >= 0  // if negative, we use a heuristic to decide
-            ? bool(params.pack_gqa)
-            // If varlen, we don't actually know seqlen_q but only max_seqlen_q.
-            // If causal, PackGQA always seems faster
-            : params.h != params.h_k && (Varlen || Is_causal || should_pack_gqa(params.seqlen_q, params.h / params.h_k, kBlockM));
         APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
-            PACKGQA_SWITCH(pack_gqa, PackGQA, [&] {
+            PACKGQA_SWITCH(params.pack_gqa, PackGQA, [&] {
                 // Only use Cluster if number of tiles along seqlen_q is even and not varlen
                 CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
                     static constexpr int ClusterM = !Varlen && Enable_cluster && Use_cluster ? 2 : 1;

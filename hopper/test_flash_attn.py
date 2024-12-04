@@ -303,7 +303,7 @@ def attention_ref(
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
-@pytest.mark.parametrize("softcap", [0.0] + ([30.0]) if not DISABLE_SOFTCAP else [])
+@pytest.mark.parametrize("softcap", [0.0] + ([30.0] if not DISABLE_SOFTCAP else []))
 # @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
