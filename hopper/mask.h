@@ -82,14 +82,14 @@ struct Mask {
                 if constexpr (PackGQA) {
                     mma_m_idx = qhead_per_khead_divmod.divide(m_block * kBlockM + get<Row>(tScS_rowcol(thread_idx % kMmaThreadsPerRow, _0{})));
                 }
-                int causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q - thread_col_offset;
+                int const causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q - thread_col_offset;
                 if constexpr (Causal_mask) {
                     #pragma unroll
                     for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
-                        int row_idx = !PackGQA
+                        int const row_idx = !PackGQA
                             ? get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM
-                            : row_idx = __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
-                        int col_limit_right = !Seqlenk_mask
+                            :  __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
+                        int const col_limit_right = !Seqlenk_mask
                             ? row_idx + causal_row_offset
                             : __viaddmin_s32(row_idx, causal_row_offset, seqlenk_col_limit);
                         #pragma unroll
@@ -98,29 +98,29 @@ struct Mask {
                         }
                     }
                 } else {
-                    int local_row_offset_right = causal_row_offset + window_size_right;
-                    int local_row_offset_left = causal_row_offset - 1 - window_size_left;
-                    int col_limit_sink = sink_token_length - n_block * kBlockN;
+                    int const local_row_offset_right = causal_row_offset + window_size_right;
+                    int const local_row_offset_left = causal_row_offset - 1 - window_size_left;
+                    int const col_limit_sink = sink_token_length - n_block * kBlockN;
                     #pragma unroll
                     for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
-                        int row_idx = !PackGQA
+                        int const row_idx = !PackGQA
                             ? get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM
-                            : row_idx = __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
-                        int col_limit_right = !Seqlenk_mask
+                            :  __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
+                        int const col_limit_right = !Seqlenk_mask
                             ? row_idx + local_row_offset_right
                             : __viaddmin_s32(row_idx, local_row_offset_right, seqlenk_col_limit);
-                        int col_limit_left = row_idx + local_row_offset_left;
+                        int const col_limit_left = row_idx + local_row_offset_left;
                         #pragma unroll
                         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-                            int col_idx = int(get<Col>(t0ScS_rowcol(m, n)));
+                            int const col_idx = int(get<Col>(t0ScS_rowcol(m, n)));
                             if (col_idx >= col_limit_right || (col_idx < col_limit_left && col_idx >= col_limit_sink)) { tSrS_rowcol(m, n) = -INFINITY; }
                         }
                     }
                 }
             } else {
                 int const thread_row_offset = get<Row>(tScS_rowcol(_0{}, _0{}));
+                int const causal_row_offset = seqlenk_col_limit - seqlen_q + m_block * kBlockM + thread_row_offset;
                 if constexpr (Causal_mask) {
-                    int causal_row_offset = seqlenk_col_limit - seqlen_q + m_block * kBlockM + thread_row_offset;
                     #pragma unroll
                     for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                         int const col0 = int(get<Col>(t0ScS_rowcol(_0{}, n)));
@@ -133,18 +133,19 @@ struct Mask {
                         }
                     }
                 } else {
-                    int causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
-                    int local_row_offset_right = causal_row_offset + window_size_right;
-                    int local_row_offset_left = causal_row_offset - 1 - window_size_left;
-                    int col_limit_sink = sink_token_length - n_block * kBlockN;
+                    int const col_limit_sink = sink_token_length - n_block * kBlockN - thread_col_offset;
                     #pragma unroll
-                    for (int i = 0; i < size(tSrS); ++i) {
-                        int col_limit_right = std::min(int(get<Row>(tScS(i))) + local_row_offset_right, seqlen_k - n_block * kBlockN);
-                        // int col_limit_right = __viaddmin_s32(int(get<Row>(tScS(i))), local_row_offset_right, seqlen_k - n_block * kBlockN);
-                        int col_limit_left = int(get<Row>(tScS(i))) + local_row_offset_left;
-                        int col_idx = int(get<Col>(tScS(i)));
-                        if (col_idx >= col_limit_right) { tSrS(i) = -INFINITY; }
-                        if (col_idx < col_limit_left && col_idx >= col_limit_sink) { tSrS(i) = -INFINITY; }
+                    for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                        int const col0 = int(get<Col>(t0ScS_rowcol(_0{}, n)));
+                        // If col0 is beyond the column limit, we want to mask out the entire column, by setting
+                        // row limit to be kBlockM.
+                        int const row_limit_top = col0 >= seqlenk_col_limit ? kBlockM : col0 - causal_row_offset - window_size_right;
+                        int const row_limit_bot = col0 < col_limit_sink ? kBlockM : col0 - causal_row_offset + window_size_left;
+                        #pragma unroll
+                        for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                            int const row_idx = int(get<Row>(t0ScS_rowcol(m, _0{})));
+                            if (row_idx < row_limit_top || row_idx > row_limit_bot) { tSrS_rowcol(m, n) = -INFINITY; }
+                        }
                     }
                 }
             }

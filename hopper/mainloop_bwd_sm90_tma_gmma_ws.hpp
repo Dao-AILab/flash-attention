@@ -259,13 +259,13 @@ struct CollectiveMainloopBwd {
     // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
     // this helps quite a bit to not have to do causal masking for most of the iterations.
     // For hdim 192, separating masking iterations results in register spills.
-    static constexpr bool SeparateMaskingIterations = kHeadDim <= 128;
+    static constexpr bool SeparateMaskingIterations = kHeadDim <= 64;
     // Do we keep the LSE and dPsum in each thread, or split them across 8 threads that share them and then
     // shuffle to get the value whenever we need? This can reduce register pressure when SdP_swapAB, where each
     // thread needs to keep statistics for (kBlockM / 4) rows. If !SdP_swapAB, each thread only needs to keep
     // statistic for 2 rows.
     static constexpr bool ShuffleLSE = SdP_swapAB && kHeadDim <= 64;
-    static constexpr bool ShuffledPSum = SdP_swapAB && (kHeadDim <= 64 || (kHeadDim <= 128 && (Is_causal || Is_local)));
+    static constexpr bool ShuffledPSum = SdP_swapAB && kHeadDim <= 64;
     // If we have extra registers, we can keep V in registers to reduce smem traffic.
     static constexpr bool Mma_dP_is_RS = SdP_swapAB && kHeadDim == 96;
     static constexpr bool dQacc_use_TMA = kHeadDim < 256;
@@ -1039,20 +1039,13 @@ struct CollectiveMainloopBwd {
 
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        // TODO: can calculate the real n_block_masking_max here
-        int const n_local_bottom_steps = (!Is_local || !SeparateMaskingIterations)
-            ? 0
-            : cute::ceil_div(kBlockN, kBlockM) + 1 +
-              (n_block >= cute::ceil_div(params.sink_token_length, kBlockN)
-               ? 0
-               // If this n_block has a sink token, m_block_max is ceil_div(seqlen_q, kBlockM), but
-               // the m_block_max_og without sink token is std::min(blah, blah).
-               // We need to apply local mask starting from m_block_max_og - (cute::ceil_div(kBlockN, kBlockM) + 1)
-               : m_block_max - std::min(cute::ceil_div(seqlen_q, kBlockM), cute::ceil_div((n_block + 1) * kBlockN + seqlen_q - seqlen_k + params.window_size_left, kBlockM)));
+        int const m_block_max_before_local_mask = !Is_local || !SeparateMaskingIterations
+            ? m_block_max
+            : std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
 
         auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
         CUTLASS_PRAGMA_NO_UNROLL
-        for (; m_block < m_block_max - n_local_bottom_steps; ++m_block) {
+        for (; m_block < m_block_max_before_local_mask; ++m_block) {
             bwd_step(m_block, mask_fn);
         }
 
