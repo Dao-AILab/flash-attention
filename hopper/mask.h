@@ -91,9 +91,7 @@ struct Mask {
                             : row_idx = __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
                         int col_limit_right = !Seqlenk_mask
                             ? row_idx + causal_row_offset
-                            // : std::min(row_idx + causal_row_offset, seqlenk_col_limit);
                             : __viaddmin_s32(row_idx, causal_row_offset, seqlenk_col_limit);
-                            // Slightly slower for hdim 64 and slightly faster for hdim128
                         #pragma unroll
                         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                             if (int(get<Col>(t0ScS_rowcol(_0{}, n))) >= col_limit_right) { tSrS_rowcol(m, n) = -INFINITY; }
@@ -110,7 +108,6 @@ struct Mask {
                             : row_idx = __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
                         int col_limit_right = !Seqlenk_mask
                             ? row_idx + local_row_offset_right
-                            // : std::min(row_idx, seqlenk_col_limit);
                             : __viaddmin_s32(row_idx, local_row_offset_right, seqlenk_col_limit);
                         int col_limit_left = row_idx + local_row_offset_left;
                         #pragma unroll

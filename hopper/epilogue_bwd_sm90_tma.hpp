@@ -305,7 +305,7 @@ struct CollectiveEpilogueBwdGQA {
     static_assert(NumEpilogueThreads % cutlass::NumThreadsPerWarp == 0, "NumEpilogueThreads must be a multiple of NumThreadsPerWarp");
     static constexpr int NumWarpGroups = NumEpilogueThreads / cutlass::NumThreadsPerWarpGroup;
     // Thread layout, 256 or 384 threads per row
-    // We split into NumWarpGroups so that we can use the some postprocessing kernel as dQ
+    // We split into NumWarpGroups so that we can use the same postprocessing kernel as dQ
     using R2SLayoutAtomdKVaccum = Layout<Shape<Int<cutlass::NumThreadsPerWarpGroup>, Int<NumWarpGroups>>>;
     using R2STiledCopydKVaccum = decltype(make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{}, R2SLayoutAtomdKVaccum{},
                                                          Layout<Shape < _4>>{}));  // Val layout, 4 vals per store

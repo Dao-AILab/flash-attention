@@ -167,9 +167,9 @@ struct CollectiveMainloopBwd {
         std::conditional_t<PdS_Major == GMMA::Major::K, cute::Step<_1, _2, _3>, cute::Step<_2, _1, _3>>{}));
 
     // Need stride to be multiple of 32, otherwise we get error (misaligned address) when doing TMA if e.g. kBlockM=80
-    // We set stride to be multiple of 32 so that if ShuffleLSE, even if threads read from sLSE but out of bounds,
+    // We set stride to be multiple of 64 so that if ShuffleLSE, even if threads read from sLSE but out of bounds,
     // it's still a valid smem address.
-    using SmemLayoutLSE = cute::Layout<cute::Shape<Int<kBlockM>, Int<kStages>>, cute::Stride<_1, Int<cute::round_up(kBlockM, 32)>>>;
+    using SmemLayoutLSE = cute::Layout<cute::Shape<Int<kBlockM>, Int<kStages>>, cute::Stride<_1, Int<cute::round_up(kBlockM, 64)>>>;
     using SmemLayoutLSEMma = std::conditional_t<
         SdP_swapAB,
         cute::Layout<cute::Shape<Int<kBlockN>, Int<kBlockM>, Int<kStages>>, cute::Stride<_0, _1, Int<cute::round_up(kBlockM, 64)>>>,
@@ -449,6 +449,7 @@ struct CollectiveMainloopBwd {
         int const seqlen_k = get_seqlen_k(params, bidb);
         int m_block_max = cute::ceil_div(seqlen_q, kBlockM);
         if constexpr (Is_local) {
+            static constexpr int kBlockN = get<1>(TileShape_MNK{});
             if (n_block >= cute::ceil_div(params.sink_token_length, kBlockN)) {
                 m_block_max = std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + seqlen_q - seqlen_k + params.window_size_left, kBlockM));
             }
@@ -474,7 +475,7 @@ struct CollectiveMainloopBwd {
 
         auto [n_block, bidh, bidb] = block_coord;
         auto [m_block_min, m_block_max] = get_m_block_min_max(params, n_block, bidb);
-        // It's possible to have n_block_max <= n_block_min. Loading Q, K can cause illegal memory access.
+        // It's possible to have m_block_max <= m_block_min. Loading Q, K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) {
                 scheduler_prefetch();
@@ -637,7 +638,7 @@ struct CollectiveMainloopBwd {
 
         auto [n_block, bidh, bidb] = block_coord;
         auto [m_block_min, m_block_max] = get_m_block_min_max(params, n_block, bidb);
-        // It's possible to have n_block_max <= n_block_min. Exit early
+        // It's possible to have m_block_max <= m_block_min. Exit early
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return; }
         }
@@ -722,7 +723,7 @@ struct CollectiveMainloopBwd {
         int n_block = get<0>(block_coord);
         int bidb = get<2>(block_coord);
         auto [m_block_min, m_block_max] = get_m_block_min_max(params, n_block, bidb);
-        // It's possible to have n_block_max <= n_block_min. Exit early
+        // It's possible to have m_block_max <= m_block_min. Exit early
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return false; }
         }
@@ -1062,7 +1063,6 @@ struct CollectiveMainloopBwd {
                 bwd_step(m_block, mask_fn);
             }
         }
-
 
         // if (blockIdx.x == 0 && threadIdx.x == 128) { print_tensor(tdVrdV); }
         #pragma unroll
