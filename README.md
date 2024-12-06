@@ -56,8 +56,11 @@ To run the test:
 export PYTHONPATH=$PWD
 pytest -q -s test_flash_attn.py
 ```
-
-
+Once the package is installed, you can import it as follows:
+```python
+import flash_attn_interface
+flash_attn_interface.flash_attn_func()
+```
 
 ## Installation and features
 **Requirements:**
