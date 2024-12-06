@@ -2,10 +2,10 @@ import torch
 import math
 from .utils import DEBUG
 
-DEBUG_CORE = DEBUG and False
+DEBUG_CORE = False
 
 def attention_backward_core_ref_impl(
-    do, q, k, v, o, softmax_lse, sm_scale, causal, use_exp2
+    do, q, k, v, o, softmax_lse, sm_scale, causal, dropout_p, philox_seed, philox_offset, use_exp2
 ):
     if DEBUG_CORE:
         print()
@@ -18,6 +18,9 @@ def attention_backward_core_ref_impl(
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
         print("sm_scale:", sm_scale)
         print("causal:", causal)
+        print("dropout_p:", dropout_p)
+        print("philox_seed:", philox_seed)
+        print("philox_offset:", philox_offset)
         print("use_exp2:", use_exp2)
     
     # cast to float32
@@ -30,7 +33,7 @@ def attention_backward_core_ref_impl(
 
 
     # recompute attention_scores. Make sure it matches the forward impl. i.e. It use float32
-    attention_scores = torch.matmul(q.to(torch.float32), k.transpose(-2, -1).to(torch.float32))
+    attention_scores = torch.matmul(q, k.transpose(-2, -1))
     if DEBUG_CORE:
         print("attention_scores:", attention_scores, attention_scores.shape)
 
@@ -65,58 +68,83 @@ def attention_backward_core_ref_impl(
     else:
         softmax_lse_3d =  softmax_lse.unsqueeze(-1)
         p = torch.exp(attention_scaled_scores - softmax_lse_3d)
-
     if DEBUG_CORE:
         print("softmax_lse_3d:", softmax_lse_3d, softmax_lse_3d.shape)
         print("p:", p, p.shape)
-    # compute gradient wrt v
-    dv = torch.matmul(p.transpose(-2, -1), do.to(torch.float32))
-    if DEBUG_CORE:
-        print("dv:", dv, dv.shape)
 
-    # compute dp
-    dp = torch.matmul(do, v.transpose(-2, -1))
-    if DEBUG_CORE:
-        print("dp:", dp, dp.shape)
+    if dropout_p > 0.0:
+        rand_vals = torch.rand(p.shape, generator=torch.Generator(device=p.device).manual_seed(philox_seed), device=p.device, dtype=p.dtype)
+        dropout_mask, dropout_scale = rand_vals > dropout_p,  (1.0 / (1 - dropout_p))
+        if DEBUG:
+            print("dropout_scale:", dropout_scale)
+            print("dropout_mask:", dropout_mask)
+            
+        p_drop = torch.where(dropout_mask, p, torch.zeros_like(p))
+        p_drop_scaled =  p_drop * dropout_scale
+        if DEBUG_CORE:
+            print("dropout_scale:", dropout_scale)
+            print("p_drop:", p_drop, p_drop.shape)
+            print("p_drop_scaled:", p_drop_scaled, p_drop_scaled.shape)
+        
+        # compute dv
+        dv = torch.matmul(p_drop_scaled.transpose(-2, -1), do)
+        if DEBUG_CORE:
+            print("dv:", dv, dv.shape)
 
-    # calculate ds using dp
-    if True:
-        delta = torch.sum(o * do, axis=-1).to(torch.float32)  # what OAI kernel uses
-        delta_3d = delta.unsqueeze(-1)
+        # compute dp
+        dp_dropout = torch.matmul(do, v.transpose(-2, -1))
+        dp = torch.where(dropout_mask, dp_dropout , torch.zeros_like(dp_dropout)) * dropout_scale
+        if DEBUG_CORE:
+            print("dp_dropout:", dp_dropout, dp_dropout.shape)
+            print("dp:", dp, dp.shape)
+
+        # calculate ds
+        if True:
+            delta = torch.sum(o * do, axis=-1).unsqueeze(-1)
+        else:
+            delta = torch.sum(p * dp, axis=-1).unsqueeze(-1)
+        dscores_scaled = p * (dp - delta)
+        ds = dscores_scaled * sm_scale
     else:
-        delta = torch.sum(p * dp, axis=-1) # what the math says you should use
-        delta_3d = delta.unsqueeze(-1)
-    if DEBUG_CORE:
-        print("delta_3d:", delta_3d, delta_3d.shape)
-    ds = (p * (dp - delta_3d)) * sm_scale
-    if DEBUG_CORE:
-        print("ds:", ds, ds.shape)
-   
+        # compute dv
+        dv = torch.matmul(p.transpose(-2, -1), do)
+        if DEBUG_CORE:
+            print("dv:", dv, dv.shape)
 
-    # compute gradient wrt k
-    dk = torch.matmul(ds.transpose(-2, -1), q.to(torch.float32))
+        # compute dp
+        dp = torch.matmul(do, v.transpose(-2, -1))
+        if DEBUG_CORE:
+            print("dp:", dp, dp.shape)
+
+        # calculate ds
+        delta = torch.sum(o * do, axis=-1).unsqueeze(-1)
+        dscores_scaled = p * (dp - delta)
+        ds = dscores_scaled * sm_scale
+    if DEBUG_CORE:
+        print("delta:", delta, delta.shape)
+        print("dscores_scaled:", dscores_scaled, dscores_scaled.shape)
+        print("ds:", ds, ds.shape)
+
+    # compute gradient wrt k & q
+    dk = torch.matmul(ds.transpose(-2, -1), q)
+    dq = torch.matmul(ds, k)
     if DEBUG_CORE:
         print("dk:", dk, dk.shape)
-
-    # compute gradient wrt q
-    dq = torch.matmul(ds, k.to(torch.float32))
-    if DEBUG_CORE:
         print("dq:", dq, dq.shape)
 
     # cast back to original dtype
     dq = dq.to(torch.float16)
     dk = dk.to(torch.float16)
     dv = dv.to(torch.float16)
-
     # remove d dim with size 1
-    delta = delta_3d.squeeze(-1)
+    delta = delta.squeeze(-1)
 
     if DEBUG_CORE:
         print("attention_backward_core_ref_impl output")
-        print("dq:", dq, dq.shape)
-        print("dk:", dk, dk.shape)
-        print("dv:", dv, dv.shape)
         print("delta:", delta, delta.shape)
+        print("dv:", dv, dv.shape)
+        print("dk:", dk, dk.shape)
+        print("dq:", dq, dq.shape)
 
     return dq, dk, dv, delta
 
@@ -134,6 +162,9 @@ def attention_varlen_backward_pytorch_ref_impl(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
+    dropout_p, 
+    philox_seed, 
+    philox_offset,
     use_exp2,
 ):
     # Ensure the layout is 'thd'
@@ -208,6 +239,9 @@ def attention_varlen_backward_pytorch_ref_impl(
             softmax_lse_i,
             sm_scale,
             causal,
+            dropout_p, 
+            philox_seed, 
+            philox_offset,
             use_exp2
         )
 
@@ -251,6 +285,9 @@ def attention_vanilla_backward_pytorch_ref_impl(
     sm_scale,
     causal,
     layout,
+    dropout_p, 
+    philox_seed, 
+    philox_offset,
     use_exp2,
 ):
     if layout == "bshd":
@@ -312,6 +349,9 @@ def attention_vanilla_backward_pytorch_ref_impl(
         softmax_lse,
         sm_scale,
         causal,
+        dropout_p, 
+        philox_seed, 
+        philox_offset,
         use_exp2
     )
 
@@ -364,6 +404,9 @@ def attention_backward_pytorch_ref_impl(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
+    dropout_p, 
+    philox_seed, 
+    philox_offset,
     use_exp2
 ):
 
@@ -383,6 +426,9 @@ def attention_backward_pytorch_ref_impl(
         print("cu_seqlens_k:", cu_seqlens_k)
         print("max_seqlen_q:", max_seqlen_q)
         print("max_seqlen_k:", max_seqlen_k)
+        print("dropout_p:", dropout_p)
+        print("philox_seed:", philox_seed)
+        print("philox_offset:", philox_offset)
         print("use_exp2:", use_exp2)
 
 
@@ -401,6 +447,9 @@ def attention_backward_pytorch_ref_impl(
             cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
+            dropout_p, 
+            philox_seed, 
+            philox_offset,
             use_exp2,
         )
     else:
@@ -414,6 +463,9 @@ def attention_backward_pytorch_ref_impl(
             sm_scale,
             causal,
             layout,
+            dropout_p, 
+            philox_seed, 
+            philox_offset,
             use_exp2,
         )
         
@@ -421,9 +473,9 @@ def attention_backward_pytorch_ref_impl(
     if DEBUG:
         print()
         print("attention_backward_pytorch_ref_impl outputs")
-        print("dq:", dq, dq.shape)
-        print("dk:", dk, dk.shape)
-        print("dv:", dv, dv.shape)
         print("delta:", delta, delta.shape)
+        print("dv:", dv, dv.shape)
+        print("dk:", dk, dk.shape)
+        print("dq:", dq, dq.shape)
 
     return dq, dk, dv, delta

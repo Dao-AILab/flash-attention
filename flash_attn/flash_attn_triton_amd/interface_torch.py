@@ -7,15 +7,7 @@ from .fwd_decode import attention_decode_forward_triton_impl
 class _attention_prefill(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, o, metadata):
-        (output, 
-        softmax_lse, 
-        exp_scores, 
-        grid, 
-        head_size, 
-        philox_seed, 
-        philox_offset, 
-        _, 
-        _) = attention_prefill_forward_triton_impl(
+        output, softmax_lse, sd_mask = attention_prefill_forward_triton_impl(
                                                 q, 
                                                 k, 
                                                 v, 
@@ -23,30 +15,29 @@ class _attention_prefill(torch.autograd.Function):
                                                 metadata.sm_scale, 
                                                 metadata.alibi_slopes, 
                                                 metadata.causal, 
-                                                metadata.bias, 
-                                                metadata.dropout_p, 
+                                                metadata.bias,
                                                 metadata.layout, 
                                                 metadata.cu_seqlens_q, 
                                                 metadata.cu_seqlens_k,
                                                 metadata.max_seqlens_q, 
-                                                metadata.max_seqlens_k, 
-                                                metadata.return_scores, 
+                                                metadata.max_seqlens_k,
+                                                metadata.dropout_p, 
+                                                metadata.philox_seed,
+                                                metadata.philox_offset,
+                                                metadata.return_scores,
                                                 metadata.use_exp2)
 
         ctx.save_for_backward(q, k, v, o, softmax_lse)
-        ctx.grid = grid
         ctx.sm_scale = metadata.sm_scale
-        ctx.head_size = head_size
         ctx.causal = metadata.causal
         ctx.alibi_slopes = metadata.alibi_slopes
         ctx.dropout_p = metadata.dropout_p
-        ctx.philox_seed = philox_seed
-        ctx.philox_offset = philox_offset
-        ctx.exp_scores = exp_scores
+        ctx.philox_seed = metadata.philox_seed
+        ctx.philox_offset = metadata.philox_offset
         ctx.return_scores = metadata.return_scores
         ctx.layout = metadata.layout
         ctx.use_exp2 = metadata.use_exp2
-        return output, softmax_lse, exp_scores
+        return output, softmax_lse, sd_mask
 
     @staticmethod
     def backward(ctx, do, *args):
@@ -69,6 +60,9 @@ class _attention_prefill(torch.autograd.Function):
             None,
             None,
             None,
+            ctx.dropout_p, 
+            ctx.philox_seed, 
+            ctx.philox_offset,
             ctx.use_exp2
         )
 

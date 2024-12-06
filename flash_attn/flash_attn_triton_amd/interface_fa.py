@@ -39,12 +39,8 @@ def fwd(q,
         print("window_size_left:", window_size_left)
         print("window_size_right:", window_size_right)
         print("softcap:", softcap)
-        print("softcap:", softcap)
         print("return_softmax:", return_softmax)
 
-
-    if dropout_p != 0.0:
-        raise ValueError("dropout is not supported on AMD's Triton Backend yet")
 
     if o is None:
         o = torch.empty_like(q)
@@ -66,44 +62,38 @@ def fwd(q,
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
     
     if dropout_p > 0.0:
-        metadata.need_dropout(dropout_p, return_softmax)
+        metadata.need_dropout(dropout_p)
+        rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset]) # as_tensors uses the underlying data and doesnot cast
+    else:
+        rng_state = None
     
-    # Check arguments
+    # check arguments
     metadata.check_args(q, k, v, o)
+
+    # call implementation 
     if USE_REF:
         if DEBUG:
             print("Using reference implementation")
-        (output, 
-        softmax_lse, 
-        exp_scores, 
-        _, 
-        _,
-        _, 
-        _) = attention_forward_pytorch_ref_impl(
+        output, softmax_lse, sd_mask = attention_forward_pytorch_ref_impl(
                                                 q, 
                                                 k, 
                                                 v,
                                                 metadata.sm_scale, 
                                                 metadata.causal,
-                                                metadata.layout, 
+                                                metadata.layout,
                                                 metadata.cu_seqlens_q, 
                                                 metadata.cu_seqlens_k,
                                                 metadata.max_seqlens_q, 
                                                 metadata.max_seqlens_k,
+                                                metadata.dropout_p, 
+                                                metadata.philox_seed,
+                                                metadata.philox_offset,
                                                 metadata.use_exp2)
         o.copy_(output)
     else:
         if DEBUG:
             print("Using Triton implementation")
-        (_, 
-        softmax_lse, 
-        exp_scores, 
-        _, 
-        _, 
-        _, 
-        _, 
-        _, 
-        _) = attention_prefill_forward_triton_impl(
+        output, softmax_lse, sd_mask = attention_prefill_forward_triton_impl(
                                                 q, 
                                                 k, 
                                                 v, 
@@ -111,23 +101,25 @@ def fwd(q,
                                                 metadata.sm_scale, 
                                                 metadata.alibi_slopes, 
                                                 metadata.causal, 
-                                                metadata.bias, 
-                                                metadata.dropout_p, 
+                                                metadata.bias,
                                                 metadata.layout, 
                                                 metadata.cu_seqlens_q, 
                                                 metadata.cu_seqlens_k,
                                                 metadata.max_seqlens_q, 
-                                                metadata.max_seqlens_k, 
-                                                metadata.return_scores, 
+                                                metadata.max_seqlens_k,
+                                                metadata.dropout_p, 
+                                                metadata.philox_seed,
+                                                metadata.philox_offset,
+                                                metadata.return_scores,
                                                 metadata.use_exp2)
 
     if DEBUG:
         print("fwd outputs")
         print("o:", o, o.shape)
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
-        print("exp_scores:", exp_scores, exp_scores.shape if exp_scores is not None else None )
+        print("exp_scores:", sd_mask, sd_mask.shape if sd_mask is not None else None )
 
-    return o, softmax_lse, exp_scores, None
+    return o, softmax_lse, sd_mask, rng_state
 
 def bwd(
     dout,
@@ -150,6 +142,11 @@ def bwd(
     gen_,
     rng_state,
 ):
+    # NOTE: this might have perf costs
+    dq.zero_()
+    dk.zero_()
+    dv.zero_()
+
     if DEBUG:
         print()
         print("flash_attn_triton_amd.py::bwd")
@@ -173,12 +170,16 @@ def bwd(
         print("gen_:", gen_)
         print("rng_state:", rng_state)
 
-    if dropout_p != 0.0:
-        raise ValueError("dropout is not supported on AMD yet")
+    if dropout_p > 0.0:
+        philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
+    else:
+        philox_seed, philox_offset = None, None
 
+    # call implementation
     if USE_REF:
         if DEBUG:
             print("Using reference implementation")
+
         dq_ref, dk_ref, dv_ref, delta_ref = attention_backward_pytorch_ref_impl(
             dout,
             q,
@@ -193,6 +194,9 @@ def bwd(
             None,
             None,
             None,
+            dropout_p, 
+            philox_seed, 
+            philox_offset,
             False,
         )
         dq.copy_(dq_ref)
@@ -220,6 +224,9 @@ def bwd(
             None,
             None,
             None,
+            dropout_p, 
+            philox_seed, 
+            philox_offset,
             False,
         )
         delta = delta_triton
@@ -241,7 +248,7 @@ def varlen_fwd(
         seqused_k,
         leftpad_k,
         block_table_,
-        alibi_slopes,\
+        alibi_slopes,
         max_seqlen_q,
         max_seqlen_k,
         dropout_p,
@@ -272,9 +279,6 @@ def varlen_fwd(
         print("window_size_right:", window_size_right)
         print("gen_:", gen_)
 
-    if dropout_p != 0.0:
-        raise ValueError("dropout is not supported on AMD's Triton Backend yet")
-    
     if o is None:
         o = torch.empty_like(q)
 
@@ -294,23 +298,21 @@ def varlen_fwd(
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
     
     if dropout_p > 0.0:
-        metadata.need_dropout(dropout_p, return_softmax)
+        metadata.need_dropout(dropout_p)
+        rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset]) # as_tensors uses the underlying data and doesnot cast
+    else:
+        rng_state = None
     
     # Check arguments
     metadata.check_args(q, k, v, o)
     if o is None:
         o = torch.empty_like(q, dtype=v.dtype)
 
+    # call implementation
     if USE_REF:
         if DEBUG:
             print("Using reference implementation")
-        (output, 
-        softmax_lse, 
-        exp_scores, 
-        _, 
-        _,
-        _, 
-        _) = attention_forward_pytorch_ref_impl(
+        output, softmax_lse, sd_mask = attention_forward_pytorch_ref_impl(
                                                 q, 
                                                 k, 
                                                 v,
@@ -321,20 +323,15 @@ def varlen_fwd(
                                                 metadata.cu_seqlens_k,
                                                 metadata.max_seqlens_q, 
                                                 metadata.max_seqlens_k,
+                                                metadata.dropout_p, 
+                                                metadata.philox_seed,
+                                                metadata.philox_offset,
                                                 metadata.use_exp2)
         o.copy_(output)
     else:
         if DEBUG:
             print("Using Triton implementation")
-        (_, 
-        softmax_lse, 
-        exp_scores, 
-        _, 
-        _, 
-        _, 
-        _, 
-        _, 
-        _) = attention_prefill_forward_triton_impl(
+        output, softmax_lse, sd_mask = attention_prefill_forward_triton_impl(
                                                             q, 
                                                             k, 
                                                             v, 
@@ -342,23 +339,25 @@ def varlen_fwd(
                                                             metadata.sm_scale, 
                                                             metadata.alibi_slopes, 
                                                             metadata.causal, 
-                                                            metadata.bias, 
-                                                            metadata.dropout_p, 
+                                                            metadata.bias,
                                                             metadata.layout, 
                                                             metadata.cu_seqlens_q, 
                                                             metadata.cu_seqlens_k,
                                                             metadata.max_seqlens_q, 
-                                                            metadata.max_seqlens_k, 
+                                                            metadata.max_seqlens_k,
+                                                            metadata.dropout_p, 
+                                                            metadata.philox_seed,
+                                                            metadata.philox_offset, 
                                                             metadata.return_scores, 
                                                             metadata.use_exp2)
     if DEBUG:
         print("varlen_fwd outputs")
         print("o:", o, o.shape)
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
-        print("exp_scores:", exp_scores, exp_scores.shape if exp_scores is not None else None )
+        print("sd_mask:", sd_mask, sd_mask.shape if sd_mask is not None else None )
 
 
-    return o, softmax_lse, exp_scores, None
+    return o, softmax_lse, sd_mask, rng_state
 
 def varlen_bwd(
     dout,
@@ -412,9 +411,12 @@ def varlen_bwd(
         print("gen_:", gen_)
         print("rng_state:", rng_state)
 
-    if dropout_p != 0.0:
-        raise ValueError("dropout is not supported on AMD yet")
-
+    if dropout_p > 0.0:
+        philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
+    else:
+        philox_seed, philox_offset = None, None
+    
+    # call implementation
     if USE_REF:
         if DEBUG:
             print("Using reference implementation")
@@ -432,6 +434,9 @@ def varlen_bwd(
             cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
+            dropout_p, 
+            philox_seed,
+            philox_offset, 
             False,
         )
         dq.copy_(dq_ref)
@@ -459,6 +464,9 @@ def varlen_bwd(
             cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
+            dropout_p, 
+            philox_seed,
+            philox_offset,
             False,
         )
         delta = delta_triton

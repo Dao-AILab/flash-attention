@@ -1,11 +1,21 @@
 
+import csv
+import json
+import math
 import torch
 import os
+import random
 import triton
+import triton.language as tl
 
 AUTOTUNE = os.environ.get('FLASH_ATTENTION_TRITON_AMD_AUTOTUNE', '0').lower() in ('1', 'true', 'yes')
 DEBUG = os.environ.get('FLASH_ATTENTION_TRITON_AMD_DEBUG', '0').lower() in ('1', 'true', 'yes')
 PERF = os.environ.get('FLASH_ATTENTION_TRITON_AMD_PERF', '0').lower() in ('1', 'true', 'yes')
+USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
+if USE_TRITON_ROCM: # TODO remove this
+    random.seed(42)
+DROPOUT_USE_PYTORCH = False
+DROPOUT_DUMP = False
 
 class MetaData():
     cu_seqlens_q = None
@@ -24,7 +34,9 @@ class MetaData():
     seqlen_new = None
     k_new = None
     v_new = None
-    dropout_p, return_scores= 0.0, False
+    return_scores= False
+    dropout_p= 0.0
+    philox_seed, philox_offset = None, None # if dropout_p > 0.0 seed the RNG so we get reproducible results for testing.
     # NOTE: scale sm_scale by log_2(e) and use 2^x in the loop as we do not have native e^x support in HW.
     use_exp2 = False
     rotary_sin = None
@@ -95,9 +107,10 @@ class MetaData():
         self.rotary_interleaved = rotary_interleaved
         self.rotary_conjunction = rotary_conjunction
 
-    def need_dropout(self, dropout_p, return_scores):
+    def need_dropout(self, dropout_p):
         self.dropout_p = dropout_p
-        self.return_scores = return_scores
+        self.return_scores = True
+        self.philox_seed, self.philox_offset = 0x1BF58, 0x1D4B49
 
     def check_args(self, q, k, v, o):
         assert q.dim() == k.dim() and q.dim() == v.dim()
@@ -110,8 +123,6 @@ class MetaData():
             assert len(self.cu_seqlens_q) == len(self.cu_seqlens_k)
             # TODO: Remove once bias is supported with varlen
             assert self.bias is None
-            # TODO:Remove once dropout is supported with varlen
-            assert self.dropout_p == 0.0
             # assert not self.return_scores
         else:
             assert q.dim() == 4
@@ -256,6 +267,51 @@ def get_padded_headsize(size):
     padded_d_model = max(padded_d_model, 16)
     return padded_d_model
 
+def compute_alibi_tensor_ref(alibi_slopes, seqlen_q, seqlen_k):
+    q_idx = torch.arange(seqlen_q, dtype=torch.int32, device="cuda").unsqueeze(-1)  # (N_CTX_Q, 1)
+    k_idx = torch.arange(seqlen_k, dtype=torch.int32, device="cuda").unsqueeze(0)  # (1, N_CTX_K)
+    relative_pos = torch.abs(q_idx + seqlen_k - seqlen_q - k_idx)  # (N_CTX_Q, N_CTX_K)
+    return -1 * alibi_slopes.unsqueeze(-1).unsqueeze(-1) * relative_pos  # (Z, H, N_CTX_Q, N_CTX_K)
+
+def create_dropout_mask(dropout_p, shape, seed):
+    device = "cuda"
+    rand_vals = torch.rand(shape, generator=torch.Generator(device=device).manual_seed(seed), device=device, dtype=torch.float32)
+    return rand_vals > dropout_p
+
+def write_dropout_mask(x, tensor_name = "tensor"):
+    batch, head, seqlen_m, seqlen_n = x.shape
+    x = x.tolist()
+
+    with open(f'{tensor_name}.csv', 'w') as f:
+        writer = csv.writer(f)
+        for b in range(batch):
+            for h in range(head):
+                dropout_mask = x[b][h]
+                if True:
+                    BLOCK_M = 64
+                    BLOCK_N = 64
+                
+                    # Calculate number of blocks in each dimension
+                    m_blocks = math.ceil(seqlen_m / BLOCK_M)
+                    n_blocks = math.ceil(seqlen_n / BLOCK_N)
+                    
+                    # Process each block
+                    for m_block in range(m_blocks):
+                        # Calculate row range for current block
+                        row_start = m_block * BLOCK_M
+                        row_end = min(row_start + BLOCK_M, seqlen_m)
+                        
+                        for n_block in range(n_blocks):
+                            # Calculate column range for current block
+                            col_start = n_block * BLOCK_N
+                            col_end = min(col_start + BLOCK_N, seqlen_n)
+                            
+                            # Extract and write the current block
+                            for row_idx in range(row_start, row_end):
+                                row_data = dropout_mask[row_idx][col_start:col_end]
+                                writer.writerow(row_data)
+                else:
+                    writer.writerows(dropout_mask)
 
 def _strides(x: torch.Tensor, *stride_names: str):
     if x is None:
@@ -272,13 +328,12 @@ def get_input_shapes():
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
+def get_arch():
+    return triton.runtime.driver.active.get_current_target().arch
 
 def is_cdna():
-    return is_hip() and triton.runtime.driver.active.get_current_target().arch in ('gfx940', 'gfx941', 'gfx942',
-                                                                                   'gfx90a', 'gfx908')
+    return is_hip() and get_arch() in ('gfx940', 'gfx941', 'gfx942', 'gfx90a', 'gfx908')
 
 
 def is_rdna():
-    return is_hip() and triton.runtime.driver.active.get_current_target().arch in ("gfx1030", "gfx1100", "gfx1101",
-                                                                                   "gfx1102", "gfx1200", "gfx1201")
-
+    return is_hip() and get_arch() in ("gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201")
