@@ -4,9 +4,10 @@
 
 #pragma once
 
-#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
 
 #include "static_switch.h"
+#include "hardware_info.h"
 #include "flash.h"
 #include "flash_bwd_preprocess_kernel.h"
 #include "flash_bwd_kernel.h"
@@ -72,8 +73,8 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) 
     const int num_n_block = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
     int gridDimx = num_n_block;
     if (params.deterministic) {
-        auto dprops = at::cuda::getCurrentDeviceProperties();
-        gridDimx = (dprops->multiProcessorCount + params.b * params.h - 1) / (params.b * params.h);
+        int num_sm = get_num_sm(get_current_device());
+        gridDimx = (num_sm + params.b * params.h - 1) / (params.b * params.h);
     }
     dim3 grid_n(gridDimx, params.b, params.h);
 
