@@ -899,7 +899,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         c10::optional<at::Tensor> &dk_,   // batch_size x seqlen_k x num_heads_k x head_size
         c10::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
         const float softmax_scale,
-        const bool is_causal,
+        bool is_causal,
         int window_size_left,
         int window_size_right,
         int sink_token_length,
@@ -946,23 +946,30 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     TORCH_CHECK(head_size <= 256, "FlashAttention backward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
-    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
-    const int head_size_rounded = head_size <= 64 ? 64 : (head_size <= 128 ? round_multiple(head_size, 32) : round_multiple(head_size, 64));
-    // This needs to match the kernel configs
-    bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-    const int kBlockM = head_size_rounded <= 64 ? 128 : (head_size_rounded <= 96 ? 64 : (head_size_rounded <= 128 ? (is_causal || is_local ? 64 : 80) : 64));
-    const int kBlockN = head_size_rounded <= 128 ? 128 : (head_size_rounded <= 192 ? 96 : 80);
-    const int seqlen_q_rounded = round_multiple(seqlen_q, kBlockM);
-    const int seqlen_k_rounded = round_multiple(seqlen_k, kBlockN);
-
-    TORCH_CHECK(head_size == round_multiple(head_size_og, 8), "head_size must be head_size_og rounded to a multiple of 8");
-
+    // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
     if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
     if (window_size_right >= seqlen_q - 1) { window_size_right = -1; }
     if (is_causal) {
         window_size_left = -1;
         window_size_right = 0;
     }
+    // There's a case where is_causal=false, window_size=(-1, 0). Then set_params_bprop will set params.is_causal=true.
+    // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM (and cause IMA).
+    is_causal = window_size_left < 0 && window_size_right == 0;
+
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int head_size_rounded = head_size <= 64 ? 64 : (head_size <= 128 ? round_multiple(head_size, 32) : round_multiple(head_size, 64));
+    // Very important that these match the kernel configs
+    bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    const int kBlockM = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
+        : (head_size_rounded <= 96 ? 64
+           : (head_size_rounded <= 128 ? (is_causal || is_local || softcap > 0.0 ? 64 : 80)
+              : 64));
+    const int kBlockN = head_size_rounded <= 128 ? 128 : (head_size_rounded <= 192 ? 96 : 80);
+    const int seqlen_q_rounded = round_multiple(seqlen_q, kBlockM);
+    const int seqlen_k_rounded = round_multiple(seqlen_k, kBlockN);
+
+    TORCH_CHECK(head_size == round_multiple(head_size_og, 8), "head_size must be head_size_og rounded to a multiple of 8");
 
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
@@ -1104,7 +1111,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                const int max_seqlen_q,
                const int max_seqlen_k,          // max sequence length to choose the kernel
                const float softmax_scale,
-               const bool is_causal,
+               bool is_causal,
                int window_size_left,
                int window_size_right,
                const float softcap,
@@ -1159,12 +1166,26 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
     TORCH_CHECK(head_size <= 256, "FlashAttention backward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
+    // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
+    if (window_size_left >= max_seqlen_k - 1) { window_size_left = -1; }
+    if (window_size_right >= max_seqlen_q - 1) { window_size_right = -1; }
+    if (is_causal) {
+        window_size_left = -1;
+        window_size_right = 0;
+    }
+    // There's a case where is_causal=false, window_size=(-1, 0). Then set_params_bprop will set params.is_causal=true.
+    // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM (and cause IMA).
+    is_causal = window_size_left < 0 && window_size_right == 0;
+
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size_rounded = head_size <= 64 ? 64 : (head_size <= 128 ? round_multiple(head_size, 32) : round_multiple(head_size, 64));
-    // This needs to match the kernel configs
+    // Very important that these match the kernel configs
     // const int kBlockM = head_size_rounded <= 64 ? 128 : 64;
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-    const int kBlockM = head_size_rounded <= 64 ? 128 : (head_size_rounded <= 96 ? 64 : (head_size_rounded <= 128 ? (is_causal || is_local ? 64 : 80) : 64));
+    const int kBlockM = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
+        : (head_size_rounded <= 96 ? 64
+           : (head_size_rounded <= 128 ? (is_causal || is_local || softcap > 0.0 ? 64 : 80)
+              : 64));
     const int kBlockN = head_size_rounded <= 128 ? 128 : (head_size_rounded <= 192 ? 96 : 80);
     const int seqlen_q_rounded = round_multiple(max_seqlen_q, kBlockM);
     const int seqlen_k_rounded = round_multiple(max_seqlen_k, kBlockN);
@@ -1172,13 +1193,6 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
     int const total_k_padded_rounded = round_multiple(total_k + batch_size * kBlockN, kBlockN);
 
     TORCH_CHECK(head_size == round_multiple(head_size_og, 8), "head_size must be head_size_og rounded to a multiple of 8");
-
-    if (window_size_left >= max_seqlen_k - 1) { window_size_left = -1; }
-    if (window_size_right >= max_seqlen_q - 1) { window_size_right = -1; }
-    if (is_causal) {
-        window_size_left = -1;
-        window_size_right = 0;
-    }
 
     CHECK_SHAPE(q, total_q, num_heads, head_size_og);
     CHECK_SHAPE(k, total_k, num_heads_k, head_size_og);
@@ -1289,7 +1303,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
     // Will be zero'ed out in the backward preprocess kernel
     at::Tensor dq_semaphore = torch::empty({(max_seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, opts.dtype(torch::kInt32));
     params.dq_semaphore = dq_semaphore.data_ptr<int>();
-    if (num_heads_k != num_heads) {
+    if (num_heads_k != num_heads && params.deterministic) {
         // TODO: do we need to zero them out?
         at::Tensor dk_semaphore = torch::empty({(max_seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, opts.dtype(torch::kInt32));
         at::Tensor dv_semaphore = torch::empty({(max_seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, opts.dtype(torch::kInt32));

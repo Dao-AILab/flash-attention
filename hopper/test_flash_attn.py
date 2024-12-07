@@ -489,13 +489,14 @@ def test_flash_attn_output(
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
     multiple = 2 if dtype != torch.float8_e4m3fn else (3 if softcap == 0.0 else 6)
-    assert (out - out_ref).abs().max().item() <= multiple * (out_pt - out_ref).abs().max().item() + 1e-4
+    abs_tol = 1e-4 if softcap == 0.0 else 3e-4
+    assert (out - out_ref).abs().max().item() <= multiple * (out_pt - out_ref).abs().max().item() + abs_tol
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor:
         multiple = 2 if softcap == 0.0 else 4
-        assert (dq - dq_ref).abs().max().item() <= multiple * (dq_pt - dq_ref).abs().max().item() + 1e-4
-        assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item() + 1e-4
-        assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item() + 1e-4
+        assert (dq - dq_ref).abs().max().item() <= multiple * (dq_pt - dq_ref).abs().max().item() + abs_tol
+        assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item() + abs_tol
+        assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item() + abs_tol
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])

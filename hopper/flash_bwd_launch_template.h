@@ -270,8 +270,14 @@ template<typename T>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
-            // With ShuffleStats we no longer have register spilling when Has_softcap and using 128 x 128 block.
-            run_mha_bwd_dispatch<T, 128, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 2>(params, stream);
+            // run_mha_bwd_dispatch<T, 128, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 2>(params, stream);
+            if constexpr (Is_causal && Has_softcap) {
+                // register spill with 128 x 128
+                run_mha_bwd_dispatch<T, 96, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 2>(params, stream);
+            } else {
+                // With ShuffleStats we no longer have register spilling when Has_softcap and using 128 x 128 block.
+                run_mha_bwd_dispatch<T, 128, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 2>(params, stream);
+            }
         });
     });
 }
@@ -289,7 +295,7 @@ template<typename T>
 void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
-            if constexpr (Is_causal || Is_local) {
+            if constexpr (Is_causal || Is_local || Has_softcap) {
                 run_mha_bwd_dispatch<T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1>(params, stream);
             } else {
                 run_mha_bwd_dispatch<T, 80, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 1>(params, stream);
