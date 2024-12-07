@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include <ATen/cuda/CUDAGraphsUtils.cuh> // For at::cuda::philox::unpack
+#include "philox_unpack.cuh" // For at::cuda::philox::unpack
 
 #include <cute/tensor.hpp>
 
