@@ -11,6 +11,7 @@
 #include "cutlass/gemm/collective/builders/sm90_common.inl"
 #include "cutlass/epilogue/collective/builders/sm90_common.inl"
 
+#include "seqlen.h"
 #include "named_barrier.hpp"
 #include "pack_gqa.h"
 #include "utils.h"
@@ -210,9 +211,10 @@ struct CollectiveEpilogueFwd {
             }
         }
 
+        flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused};
         bool is_varlen = Varlen && params.cu_seqlens;
-        int offset_o = !is_varlen ? 0 : params.cu_seqlens[bidb];
-        int seqlen_o = !Varlen ? size<0>(params.shape_O) : (params.seqused ? params.seqused[bidb] : (params.cu_seqlens ? params.cu_seqlens[bidb + 1] - offset_o : size<0>(params.shape_O)));
+        int offset_o = seqlen_info.offset;
+        int seqlen_o = seqlen_info.seqlen;
 
         // Step 2: Write LSE from rmem -> gmem
         auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
@@ -336,9 +338,10 @@ struct CollectiveEpilogueFwd {
          ) {
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         auto [m_block, bidh, bidb, split_idx] = block_coord;
+        flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused};
         bool const is_varlen = Varlen && params.cu_seqlens;
-        int offset_o = !is_varlen ? 0 : params.cu_seqlens[bidb];
-        int seqlen_o = !Varlen ? size<0>(params.shape_O) : (params.seqused ? params.seqused[bidb] : (params.cu_seqlens ? params.cu_seqlens[bidb + 1] - offset_o : size<0>(params.shape_O)));
+        int offset_o = seqlen_info.offset;
+        int seqlen_o = seqlen_info.seqlen;
         int qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
         Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset_o * get<0>(params.stride_O)), params.shape_O_packed, params.stride_O_packed)(_, _, bidh, !is_varlen ? bidb : 0, split_idx);
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE + offset_o * get<0>(params.stride_LSE)), params.shape_LSE_packed, params.stride_LSE_packed)(_, bidh, !is_varlen ? bidb : 0, split_idx);

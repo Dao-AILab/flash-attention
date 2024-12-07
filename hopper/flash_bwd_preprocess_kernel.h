@@ -11,6 +11,7 @@
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
 
+#include "seqlen.h"
 #include "utils.h"
 
 namespace flash {
@@ -149,19 +150,19 @@ public:
         int const bidh = blockIdx.y;
         int const bidb = blockIdx.z;
 
-        bool const is_varlen = Varlen && params.cu_seqlens != nullptr;
-        int const offset_o = !is_varlen ? 0 : params.cu_seqlens[bidb];
-        int const seqlen_o = !is_varlen ? get<0>(params.shape_O) : (params.seqused ? params.seqused[bidb] : params.cu_seqlens[bidb + 1] - offset_o);
+        flash::SeqlenInfo<Varlen, kBlockM> seqlen_info(bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused);
+        bool const is_varlen = Varlen && params.cu_seqlens;
+        int const seqlen_o = seqlen_info.seqlen;
         if (is_varlen && m_block * kBlockM >= seqlen_o) { return; }
 
         Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O), params.shape_O, params.stride_O)(_, _, bidh, !is_varlen ? bidb : 0);
-        Tensor gO = local_tile(cute::domain_offset(make_coord(offset_o, _0{}), mO), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
+        Tensor gO = local_tile(cute::domain_offset(make_coord(seqlen_info.offset, _0{}), mO), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
         Tensor mdO = make_tensor(make_gmem_ptr(params.ptr_dO), params.shape_O, params.stride_dO)(_, _, bidh, !is_varlen ? bidb : 0);
-        Tensor gdO = local_tile(cute::domain_offset(make_coord(offset_o, _0{}), mdO), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
+        Tensor gdO = local_tile(cute::domain_offset(make_coord(seqlen_info.offset, _0{}), mdO), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
 
         auto shape_LSE = select<0, 2, 3>(params.shape_O);
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE), shape_LSE, params.stride_LSE)(_, bidh, !is_varlen ? bidb : 0);
-        Tensor gLSE = local_tile(cute::domain_offset(make_coord(offset_o), mLSE), Shape<Int<kBlockM>>{}, make_coord(m_block));
+        Tensor gLSE = local_tile(cute::domain_offset(make_coord(seqlen_info.offset), mLSE), Shape<Int<kBlockM>>{}, make_coord(m_block));
         static_assert(kBlockM <= MaxThreadsPerBlock);
         float lse = thread_idx < seqlen_o - m_block * kBlockM && thread_idx < kBlockM ? gLSE(thread_idx) : INFINITY;
 
@@ -210,13 +211,8 @@ public:
             dP_sum(mi) = flash::Allreduce<kGmemThreadsPerRow>::run(dP_sum_cur, sum_op);
         }
 
-        // If varlen, the layout for dPSum, LSE_log2, and dQaccum is that we pad each sequence in the batch
-        // by an extra kBlockM, so that the write for each sequence doesn't touch the next sequence.
-        // Sequence i starts at params.cu_seqlens[i] + i * kBlockM and ends at params.cu_seqlens[i + 1] + i * kBlockM
-        // However, the start must align to multiples of kBlockM.
-        int const offset_padded = !is_varlen ? 0 : (params.cu_seqlens[bidb] + bidb * kBlockM) / kBlockM * kBlockM;
         Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_dPsum, params.stride_dPsum)(_, bidh, !is_varlen ? bidb : 0);
-        Tensor gdPsum = local_tile(cute::domain_offset(make_coord(offset_padded), mdPsum), Shape<Int<kBlockM>>{}, make_coord(m_block));
+        Tensor gdPsum = local_tile(cute::domain_offset(make_coord(seqlen_info.offset_padded), mdPsum), Shape<Int<kBlockM>>{}, make_coord(m_block));
         if (get<1>(tOcO(_0{}, _0{}, _0{})) == 0) {
             #pragma unroll
             for (int mi = 0; mi < size(dP_sum); ++mi) {
@@ -227,14 +223,14 @@ public:
 
         int const seqlen_rounded = cute::round_up(seqlen_o, kBlockM);
         Tensor mLSElog2 = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_dPsum, params.stride_LSE_log2)(_, bidh, !is_varlen ? bidb : 0);
-        Tensor gLSElog2 = local_tile(cute::domain_offset(make_coord(offset_padded), mLSElog2), Shape<Int<kBlockM>>{}, make_coord(m_block));
+        Tensor gLSElog2 = local_tile(cute::domain_offset(make_coord(seqlen_info.offset_padded), mLSElog2), Shape<Int<kBlockM>>{}, make_coord(m_block));
         if (thread_idx < seqlen_rounded - m_block * kBlockM && thread_idx < kBlockM) {
             gLSElog2(thread_idx) = lse == -INFINITY ? 0.f : lse * float(M_LOG2E);
         }
 
         if constexpr (Clear_dQaccum) {
             Tensor mdQaccum = make_tensor(make_gmem_ptr(params.ptr_dQaccum), params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
-            Tensor gdQaccum = local_tile(cute::domain_offset(make_coord(offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));
+            Tensor gdQaccum = local_tile(cute::domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));
             GmemTiledCopyAccum gmem_tiled_copy_dQaccum;
             auto gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_thread_slice(thread_idx);
             Tensor tdQgdQaccum = gmem_thr_copy_dQaccum.partition_D(gdQaccum);

@@ -12,6 +12,7 @@
 #include <cutlass/numeric_conversion.h>
 #include "cutlass/arch/barrier.h"
 
+#include "seqlen.h"
 #include "utils.h"
 
 namespace flash {
@@ -147,15 +148,14 @@ public:
         int const bidh = blockIdx.y;
         int const bidb = blockIdx.z;
 
-        bool const is_varlen = params.cu_seqlens != nullptr;
-        int const seqlen = !is_varlen ? get<0>(params.shape_dQ) : (params.seqused ? params.seqused[bidb] : params.cu_seqlens[bidb + 1] - params.cu_seqlens[bidb]);
-        if (is_varlen && m_block * kBlockM >= seqlen) { return; }
+        flash::SeqlenInfo<true /*Varlen*/, kBlockM> seqlen_info(bidb, size<0>(params.shape_dQ), params.cu_seqlens, params.seqused);
+        bool const is_varlen = params.cu_seqlens;
+        if (is_varlen && m_block * kBlockM >= seqlen_info.seqlen) { return; }
 
         // Step 1: Bulk copy to load dQaccum from gmem to smem
-        int const offset_padded = !is_varlen ? 0 : (params.cu_seqlens[bidb] + bidb * kBlockM) / kBlockM * kBlockM;
         Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum const*>(params.ptr_dQaccum)),
                                       params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
-        Tensor gdQaccum = local_tile(domain_offset(make_coord(offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));  // (M * K)
+        Tensor gdQaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));  // (M * K)
         static constexpr uint32_t TmaTransactionBytesdQaccum = static_cast<uint32_t>(size(SmemLayoutdQaccumFlat{}) * cute::sizeof_bits_v<ElementAccum> / 8);
         auto bulk_copy = Copy_Traits<SM90_BULK_COPY_AUTO>{};
         // if (thread0()) { print(gdQaccum); printf("\n"); print(sdQaccum_flat); printf("\n"); }
@@ -199,9 +199,8 @@ public:
         __syncthreads();
 
         // Step 4: Copy dQ from smem to register to prepare for coalesced write to gmem
-        int const offset = !is_varlen ? 0 : params.cu_seqlens[bidb];
         Tensor mdQ = make_tensor(make_gmem_ptr(params.ptr_dQ), params.shape_dQ, params.stride_dQ)(_, _, bidh, !is_varlen ? bidb : 0);
-        Tensor gdQ = local_tile(domain_offset(make_coord(offset, _0{}), mdQ), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
+        Tensor gdQ = local_tile(domain_offset(make_coord(seqlen_info.offset, _0{}), mdQ), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
         GmemTiledCopy gmem_tiled_copy_dQ;
         auto gmem_thr_copy_dQ = gmem_tiled_copy_dQ.get_thread_slice(thread_idx);
         Tensor tdQsdQ = gmem_thr_copy_dQ.partition_S(sdQ);    // ((Atom,AtomNum),ATOM_M,ATOM_N)
@@ -217,7 +216,7 @@ public:
         for (int k = 0; k < size(tdQpdQ); ++k) { tdQpdQ(k) = get<1>(tdQcdQ(_0{}, _0{}, k)) < get<1>(params.shape_dQ); }
         // Clear_OOB_K must be false since we don't want to write zeros to gmem
         flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-            gmem_tiled_copy_dQ, tdQrdQ, tdQgdQ, tdQcdQ, tdQpdQ, seqlen - m_block * kBlockM
+            gmem_tiled_copy_dQ, tdQrdQ, tdQgdQ, tdQcdQ, tdQpdQ, seqlen_info.seqlen - m_block * kBlockM
         );
     }
 

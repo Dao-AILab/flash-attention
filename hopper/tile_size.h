@@ -13,7 +13,7 @@ constexpr std::tuple<int, int, bool> tile_size_fwd(int headdim, bool is_causal, 
         if (headdim <= 64) {
             return {192, 128, true};
             // Good for long seqlen (>= 4k) but suffers from tile quantization at short seqlen
-            // return {192, is_causal_or_local ? 192 : 176, false};
+            // return {192, is_causal || is_local ? 192 : 176, false};
         } else if (headdim <= 96) {
             if (is_causal || is_local) {
                 return {128, is_local ? 160 : 192, true};

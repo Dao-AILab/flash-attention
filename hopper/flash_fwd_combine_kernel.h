@@ -12,6 +12,7 @@
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
 
+#include "seqlen.h"
 #include "utils.h"
 
 namespace flash {
@@ -196,8 +197,9 @@ public:
         int const m_block = blockIdx.x;
         int const batch = !Varlen ? 0 : blockIdx.y;
         int const num_splits = get<1>(params.shape_LSE_partial);
-        int const offset = !Varlen || params.cu_seqlens == nullptr ? 0 : params.cu_seqlens[batch];
-        int const seqlen = !Varlen ? get<0>(params.shape_LSE_partial) : (params.seqused ? params.seqused[batch] : (params.cu_seqlens == nullptr ? get<0>(params.shape_LSE_partial) : params.cu_seqlens[batch + 1] - offset));
+        flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
+        int const offset = seqlen_info.offset;
+        int const seqlen = seqlen_info.seqlen;
         int max_idx = seqlen * get<2>(params.shape_LSE_partial) * get<3>(params.shape_LSE_partial);
 
         cutlass::FastDivmod seqlen_divmod_dynamic(seqlen);

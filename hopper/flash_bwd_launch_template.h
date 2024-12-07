@@ -32,25 +32,33 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     using ElementAccum = float;
     int const total_q_padded_rounded = cute::round_up(params.total_q + params.b * kBlockM, kBlockM);
     int const total_k_padded_rounded = cute::round_up(params.total_k + params.b * kBlockN, kBlockN);
+    bool const is_varlen_q = params.cu_seqlens_q;
+    bool const is_varlen_k = params.cu_seqlens_k;
+    int seqlen_q = !is_varlen_q ? params.seqlen_q : params.total_q;
+    int seqlen_k = !is_varlen_k ? params.seqlen_k : params.total_k;
+    int seqlen_q_rounded = !is_varlen_q ? params.seqlen_q_rounded : total_q_padded_rounded;
+    int seqlen_k_rounded = !is_varlen_k ? params.seqlen_k_rounded : total_k_padded_rounded;
+    int batch_q = !is_varlen_q ? params.b : 1;
+    int batch_k = !is_varlen_k ? params.b : 1;
 
     using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
     using PreprocessKernel = flash::FlashAttnBwdPreprocess<TileShape_MK, Element, ElementAccum, cutlass::arch::Sm90, /*Clear_dQaccum=*/true, Varlen>;
     typename PreprocessKernel::Arguments preprocess_args {
         static_cast<Element const*>(params.o_ptr),
-        {!Varlen ? params.seqlen_q : params.total_q, params.d, params.h, !Varlen ? params.b : 1},  // shape_O
-        {params.o_row_stride, _1{}, params.o_head_stride, !Varlen ? params.o_batch_stride : 0},  // stride_O
+        {seqlen_q, params.d, params.h, batch_q},  // shape_O
+        {params.o_row_stride, _1{}, params.o_head_stride, !is_varlen_q ? params.o_batch_stride : 0},  // stride_O
         static_cast<Element const*>(params.do_ptr),
-        {params.do_row_stride, _1{}, params.do_head_stride, !Varlen ? params.do_batch_stride : 0},  // stride_dO
+        {params.do_row_stride, _1{}, params.do_head_stride, !is_varlen_q ? params.do_batch_stride : 0},  // stride_dO
         static_cast<float*>(params.dsoftmax_sum),
-        {!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, params.h, !Varlen ? params.b : 1},  // shape_dPsum
-        {_1{}, !Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, !Varlen ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
+        {seqlen_q_rounded, params.h, batch_q},  // shape_dPsum
+        {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
         static_cast<float*>(params.softmax_lse_ptr),
-        {_1{}, !Varlen ? params.seqlen_q : params.total_q, !Varlen ? params.h * params.seqlen_q : 0},  // stride_LSE
+        {_1{}, seqlen_q, !is_varlen_q ? params.h * params.seqlen_q : 0},  // stride_LSE
         static_cast<float*>(params.softmax_lse_log2_ptr),
-        {_1{}, !Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, !Varlen ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
+        {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
         static_cast<ElementAccum*>(params.dq_accum_ptr),
-        {(!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded) * params.d_rounded, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
-        {_1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0},  // stride_dQ
+        {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
+        {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * seqlen_q_rounded * params.h : 0},  // stride_dQaccum
         params.b,
         params.dq_semaphore,
         params.cu_seqlens_q,
@@ -79,23 +87,23 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 
     typename CollectiveMainloop::Arguments mainloop_args {
         static_cast<Element const*>(params.q_ptr),
-        {!Varlen ? params.seqlen_q : params.total_q, params.d, params.h, !Varlen ? params.b : 1},  // shape_Q
-        {params.q_row_stride, _1{}, params.q_head_stride, !Varlen ? params.q_batch_stride : 0},  // stride_Q
+        {seqlen_q, params.d, params.h, batch_q},  // shape_Q
+        {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},  // stride_Q
         static_cast<Element const*>(params.k_ptr),
-        {!Varlen ? params.seqlen_k : params.total_k, params.d, params.h_k, !Varlen ? params.b : 1},  // shape_K
-        {params.k_row_stride, _1{}, params.k_head_stride, !Varlen ? params.k_batch_stride : 0},  // stride_K
+        {seqlen_k, params.d, params.h_k, batch_k},  // shape_K
+        {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0},  // stride_K
         static_cast<Element const*>(params.v_ptr),
-        {params.v_row_stride, _1{}, params.v_head_stride, !Varlen ? params.v_batch_stride : 0},  // stride_V
+        {params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0},  // stride_V
         static_cast<Element const*>(params.do_ptr),
-        {params.do_row_stride, _1{}, params.do_head_stride, !Varlen ? params.do_batch_stride : 0},  // stride_dO
+        {params.do_row_stride, _1{}, params.do_head_stride, !is_varlen_q ? params.do_batch_stride : 0},  // stride_dO
         static_cast<ElementAccum*>(params.dq_accum_ptr),
-        {(!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded) * params.d_rounded, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
-        {_1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
+        {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
+        {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
         static_cast<float*>(params.softmax_lse_log2_ptr),
-        {!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, params.h, !Varlen ? params.b : 1},  // shape_LSE
-        {_1{}, !Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, !Varlen ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
+        {seqlen_q_rounded, params.h, batch_q},  // shape_LSE
+        {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
         static_cast<float*>(params.dsoftmax_sum),
-        {_1{}, !Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, !Varlen ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
+        {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
         params.scale_softmax,
         params.window_size_left, params.window_size_right, params.sink_token_length,
         params.softcap,
@@ -109,24 +117,24 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         static_cast<typename CollectiveEpilogue::Element*>(!GQA ? params.dk_ptr : params.dk_accum_ptr),
         [&] {
             if constexpr (!GQA) {
-                return typename CollectiveEpilogue::ShapedKV {!Varlen ? params.seqlen_k : params.total_k, params.d, params.h, !Varlen ? params.b : 1};  // shape_dK
+                return typename CollectiveEpilogue::ShapedKV {seqlen_k, params.d, params.h, batch_k};  // shape_dK
             } else {
-                return typename CollectiveEpilogue::ShapedKV {(!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded) * params.d_rounded, params.h_k, !Varlen ? params.b : 1};  // shape_dKaccum
+                return typename CollectiveEpilogue::ShapedKV {seqlen_k_rounded * params.d_rounded, params.h_k, batch_k};  // shape_dKaccum
             }
         }(),
         [&] {
             if constexpr (!GQA) {
-                return typename CollectiveEpilogue::StridedKV {params.dk_row_stride, _1{}, params.dk_head_stride, !Varlen ? params.dk_batch_stride : 0};  // stride_dK
+                return typename CollectiveEpilogue::StridedKV {params.dk_row_stride, _1{}, params.dk_head_stride, !is_varlen_k ? params.dk_batch_stride : 0};  // stride_dK
             } else {
-                return typename CollectiveEpilogue::StridedKV {_1{}, params.d_rounded * (!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded), !Varlen ? params.h_k * params.d_rounded * params.seqlen_k_rounded : 0};  // stride_dKaccum
+                return typename CollectiveEpilogue::StridedKV {_1{}, params.d_rounded * seqlen_k_rounded, !is_varlen_k ? params.h_k * params.d_rounded * params.seqlen_k_rounded : 0};  // stride_dKaccum
             }
         }(),
         static_cast<typename CollectiveEpilogue::Element*>(!GQA ? params.dv_ptr : params.dv_accum_ptr),
         [&] {
             if constexpr (!GQA) {
-                return typename CollectiveEpilogue::StridedKV {params.dv_row_stride, _1{}, params.dv_head_stride, !Varlen ? params.dv_batch_stride : 0};  // stride_dV
+                return typename CollectiveEpilogue::StridedKV {params.dv_row_stride, _1{}, params.dv_head_stride, !is_varlen_k ? params.dv_batch_stride : 0};  // stride_dV
             } else {
-                return typename CollectiveEpilogue::StridedKV {_1{}, params.d_rounded * (!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded), !Varlen ? params.h_k * params.d_rounded * params.seqlen_k_rounded : 0};  // stride_dVaccum
+                return typename CollectiveEpilogue::StridedKV {_1{}, params.d_rounded * seqlen_k_rounded, !is_varlen_k ? params.h_k * params.d_rounded * params.seqlen_k_rounded : 0};  // stride_dVaccum
             }
         }(),
         params.h,
@@ -186,10 +194,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         >;
     typename PostprocessKernel::Arguments postprocess_args {
         static_cast<ElementAccum const*>(params.dq_accum_ptr),
-        {(!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded) * params.d_rounded, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
-        {_1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
+        {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
+        {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
         static_cast<Element*>(params.dq_ptr),
-        {!Varlen ? params.seqlen_q : params.total_q, params.d, params.h, !Varlen ? params.b : 1},  // shape_dQ
+        {seqlen_q, params.d, params.h, batch_q},  // shape_dQ
         {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
         params.scale_softmax,
         params.cu_seqlens_q,
@@ -214,10 +222,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             >;
         typename PostprocessKerneldKV::Arguments postprocess_dK_args {
             static_cast<ElementAccum const*>(params.dk_accum_ptr),
-            {(!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded) * params.d_rounded, params.h_k, !Varlen ? params.b : 1},  // shape_dKaccum
-            {_1{}, params.d_rounded * (!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_k_rounded * params.h_k : 0},  // stride_dKaccum
+            {seqlen_k_rounded * params.d_rounded, params.h_k, batch_k},  // shape_dKaccum
+            {_1{}, seqlen_k_rounded * params.d_rounded, !is_varlen_k ? params.d_rounded * params.seqlen_k_rounded * params.h_k : 0},  // stride_dKaccum
             static_cast<Element*>(params.dk_ptr),
-            {!Varlen ? params.seqlen_k : params.total_k, params.d, params.h_k, !Varlen ? params.b : 1},  // shape_dK
+            {seqlen_k, params.d, params.h_k, batch_k},  // shape_dK
             {params.dk_row_stride, _1{}, params.dk_head_stride, params.dk_batch_stride},  // stride_dK
             1.f,
             params.cu_seqlens_k,
@@ -226,10 +234,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         typename PostprocessKerneldKV::Params postprocess_dK_params = PostprocessKerneldKV::to_underlying_arguments(postprocess_dK_args);
         typename PostprocessKerneldKV::Arguments postprocess_dV_args {
             static_cast<ElementAccum const*>(params.dv_accum_ptr),
-            {(!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded) * params.d_rounded, params.h_k, !Varlen ? params.b : 1},  // shape_dVaccum
-            {_1{}, params.d_rounded * (!Varlen ? params.seqlen_k_rounded : total_k_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_k_rounded * params.h_k : 0},  // stride_dVaccum
+            {seqlen_k_rounded * params.d_rounded, params.h_k, batch_k},  // shape_dVaccum
+            {_1{}, seqlen_k_rounded * params.d_rounded, !is_varlen_k ? params.d_rounded * params.seqlen_k_rounded * params.h_k : 0},  // stride_dVaccum
             static_cast<Element*>(params.dv_ptr),
-            {!Varlen ? params.seqlen_k : params.total_k, params.d, params.h_k, !Varlen ? params.b : 1},  // shape_dV
+            {seqlen_k, params.d, params.h_k, batch_k},  // shape_dV
             {params.dv_row_stride, _1{}, params.dv_head_stride, params.dv_batch_stride},  // stride_dV
             1.f,
             params.cu_seqlens_k,

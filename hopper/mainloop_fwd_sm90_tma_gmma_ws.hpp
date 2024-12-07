@@ -50,9 +50,9 @@ struct CollectiveMainloopFwd {
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
     static constexpr bool Use_TMA_Q = !PackGQA;
     static constexpr bool Use_TMA_KV = !PagedKV;
-    static_assert(Use_TMA_KV || size(ClusterShape{}) == 1, "If not using TMA for KV, ClusterShape must be 1");
+    static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
-    using SeqlenInfo_t = flash::SeqlenInfo<Varlen, AppendKV>;
+    using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
 
     static_assert(ArchTag::kMinComputeCapability >= 90);
 
@@ -869,7 +869,7 @@ struct CollectiveMainloopFwd {
             // So any thread gets there, all threads must have finished the previous MMA and at least started
             // writing to smem_o.
             int const bidh = get<1>(block_coord);
-            bool const is_varlen_q = Varlen && params.cu_seqlens_q != nullptr;
+            bool const is_varlen_q = Varlen && params.cu_seqlens_q;
             Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
             Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
             using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element>;

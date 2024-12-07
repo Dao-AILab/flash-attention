@@ -16,6 +16,7 @@
 #include "cutlass/gemm/collective/builders/sm90_common.inl"
 
 #include "named_barrier.hpp"
+#include "seqlen.h"
 #include "mask.h"
 #include "softmax.h"
 #include "utils.h"
@@ -55,6 +56,8 @@ struct CollectiveMainloopBwd {
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
     static constexpr bool Varlen = Varlen_;
+    using SeqlenInfo_t = flash::SeqlenInfoQK<Varlen, CUTE_STATIC_V(get<0>(TileShape_MNK{}))>;
+
     static constexpr bool SdP_swapAB = SdP_swapAB_;
     static constexpr bool dKV_swapAB = dKV_swapAB_;
     static constexpr bool dQ_swapAB = dQ_swapAB_;
@@ -214,7 +217,6 @@ struct CollectiveMainloopBwd {
 
     using GmemTiledCopyQdO = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<1>(ClusterShape{})));
     using GmemTiledCopyKV = cute::SM90_TMA_LOAD;
-    using GmemTiledCopyLSE = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<1>(ClusterShape{})));
 
     using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
     using StrideQKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
@@ -385,10 +387,6 @@ struct CollectiveMainloopBwd {
             TileShape_MNK{},
             ClusterShape{}); // no mcast for KV
         if constexpr (Deterministic) { assert(args.dq_semaphore != nullptr); }
-        if constexpr (Varlen) {
-            assert(args.cu_seqlens_q != nullptr);
-            assert(args.cu_seqlens_k != nullptr);
-        }
         // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         // Right after this, we multiply by log2(e) before applying exp2.
         // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
@@ -421,32 +419,11 @@ struct CollectiveMainloopBwd {
     }
 
     CUTLASS_DEVICE
-    int get_seqlen_q(Params const& params, int bidb) {
-        if constexpr (!Varlen) {
-            return get<0>(params.shape_Q);
-        } else {
-            return params.cu_seqlens_q == nullptr
-                ? get<0>(params.shape_Q)
-                : (params.seqused_q ? params.seqused_q[bidb] : params.cu_seqlens_q[bidb + 1] - params.cu_seqlens_q[bidb]);
-        }
-    }
-
-    CUTLASS_DEVICE
-    int get_seqlen_k(Params const& params, int bidb) {
-        if constexpr (!Varlen) {
-            return get<0>(params.shape_K);
-        } else {
-            return params.cu_seqlens_k == nullptr
-                ? get<0>(params.shape_K)
-                : (params.seqused_k ? params.seqused_k[bidb] : params.cu_seqlens_k[bidb + 1] - params.cu_seqlens_k[bidb]);
-        }
-    }
-
-    CUTLASS_DEVICE
-    cute::tuple<int, int> get_m_block_min_max(Params const& params, int n_block, int bidb) {
+    cute::tuple<int, int> get_m_block_min_max(Params const& params, SeqlenInfo_t const& seqlen_info,
+                                              int n_block, int bidb) {
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
-        int const seqlen_q = get_seqlen_q(params, bidb);
-        int const seqlen_k = get_seqlen_k(params, bidb);
+        int const seqlen_q = seqlen_info.seqlen_q;
+        int const seqlen_k = seqlen_info.seqlen_k;
         int m_block_max = cute::ceil_div(seqlen_q, kBlockM);
         if constexpr (Is_local) {
             static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -474,7 +451,11 @@ struct CollectiveMainloopBwd {
          ) {
 
         auto [n_block, bidh, bidb] = block_coord;
-        auto [m_block_min, m_block_max] = get_m_block_min_max(params, n_block, bidb);
+        SeqlenInfo_t seqlen_info{
+            bidb, get<0>(params.shape_Q), size<0>(params.shape_K),
+            params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k
+        };
+        auto [m_block_min, m_block_max] = get_m_block_min_max(params, seqlen_info, n_block, bidb);
         // It's possible to have m_block_max <= m_block_min. Loading Q, K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) {
@@ -496,22 +477,21 @@ struct CollectiveMainloopBwd {
         uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
         constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
-        Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !Varlen ? bidb : 0);
-        Tensor mdO = params.tma_load_dO.get_tma_tensor(params.shape_Q)(_, _, bidh, !Varlen ? bidb : 0);
-        Tensor mK = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !Varlen ? bidb : 0);
-        Tensor mV = params.tma_load_V.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !Varlen ? bidb : 0);
-        Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, !Varlen ? bidb : 0);
-        Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_LSE, params.stride_dPsum)(_, bidh, !Varlen ? bidb : 0);
+        bool const is_varlen_q = Varlen && params.cu_seqlens_q;
+        bool const is_varlen_k = Varlen && params.cu_seqlens_k;
+        Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mdO = params.tma_load_dO.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mK = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
+        Tensor mV = params.tma_load_V.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
+        Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_LSE, params.stride_dPsum)(_, bidh, !is_varlen_q ? bidb : 0);
 
-        int const offset_q = !Varlen ? 0 : params.cu_seqlens_q[bidb];
-        int const offset_k = !Varlen ? 0 : params.cu_seqlens_k[bidb];
-        int const offset_padded = !Varlen ? 0 : (params.cu_seqlens_q[bidb] + bidb * kBlockM) / kBlockM * kBlockM;
-        Tensor gQ = local_tile(domain_offset(make_coord(offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)
-        Tensor gdO = local_tile(domain_offset(make_coord(offset_q, _0{}), mdO), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)
-        Tensor gK = local_tile(domain_offset(make_coord(offset_k, _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
-        Tensor gV = local_tile(domain_offset(make_coord(offset_k, _0{}), mV), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
-        Tensor gLSE = local_tile(domain_offset(make_coord(offset_padded), mLSE), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
-        Tensor gdPsum = local_tile(domain_offset(make_coord(offset_padded), mdPsum), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
+        Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)
+        Tensor gdO = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mdO), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)
+        Tensor gK = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
+        Tensor gV = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mV), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
+        Tensor gLSE = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mLSE), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
+        Tensor gdPsum = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mdPsum), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
 
         Tensor sK_x = make_tensor(sK.data(), make_layout(sK.layout(), Layout<_1>{}));
         Tensor gK_x = make_tensor(gK.data(), make_layout(gK.layout(), Layout<_1>{}));
@@ -637,7 +617,11 @@ struct CollectiveMainloopBwd {
         if constexpr (!dQacc_use_TMA) { return; }
 
         auto [n_block, bidh, bidb] = block_coord;
-        auto [m_block_min, m_block_max] = get_m_block_min_max(params, n_block, bidb);
+        SeqlenInfo_t seqlen_info{
+            bidb, get<0>(params.shape_Q), size<0>(params.shape_K),
+            params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k
+        };
+        auto [m_block_min, m_block_max] = get_m_block_min_max(params, seqlen_info, n_block, bidb);
         // It's possible to have m_block_max <= m_block_min. Exit early
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return; }
@@ -646,10 +630,10 @@ struct CollectiveMainloopBwd {
         Tensor sdQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_dqacc.data()), SmemLayoutdQaccum{});
         static constexpr int dQ_TMA_num_bytes = CUTE_STATIC_V(size<0>(sdQ)) * sizeof(ElementAccum);
 
-        int const offset_padded = !Varlen ? 0 : (params.cu_seqlens_q[bidb] + bidb * kBlockM) / kBlockM * kBlockM;
+        bool const is_varlen = Varlen && params.cu_seqlens_q;
         Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.ptr_dQaccum)),
-                                      params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !Varlen ? bidb : 0);
-        Tensor gdQaccum_ = local_tile(domain_offset(make_coord(offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(_));  // (M * K, _)
+                                      params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
+        Tensor gdQaccum_ = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(_));  // (M * K, _)
         Tensor gdQaccum = cute::flat_divide(gdQaccum_, Int<kBlockM * kHeadDim / NumdQWarpGroups>{});  // (M * K / WG, WG, _)
 
         int const num_batch = params.num_batch;
@@ -682,8 +666,7 @@ struct CollectiveMainloopBwd {
         }
         if constexpr (Is_local && Deterministic) {
             constexpr int kBlockM = get<0>(TileShape_MNK{});
-            int const seqlen_q = get_seqlen_q(params, bidb);
-            int const m_block_global_max = cute::ceil_div(seqlen_q, kBlockM);
+            int const m_block_global_max = cute::ceil_div(seqlen_info.seqlen_q, kBlockM);
             #pragma unroll 2
             for (; m_block < m_block_global_max; ++m_block) {
                 Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
@@ -722,7 +705,11 @@ struct CollectiveMainloopBwd {
 
         int n_block = get<0>(block_coord);
         int bidb = get<2>(block_coord);
-        auto [m_block_min, m_block_max] = get_m_block_min_max(params, n_block, bidb);
+        SeqlenInfo_t seqlen_info{
+            bidb, get<0>(params.shape_Q), size<0>(params.shape_K),
+            params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k
+        };
+        auto [m_block_min, m_block_max] = get_m_block_min_max(params, seqlen_info, n_block, bidb);
         // It's possible to have m_block_max <= m_block_min. Exit early
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return false; }
@@ -769,9 +756,7 @@ struct CollectiveMainloopBwd {
         auto wg_mma_dP = tiled_mma_dP.get_slice(warp_group_thread_layout(warp_group_idx));
         auto thread_mma_SdP = tiled_mma_SdP.get_thread_slice(thread_idx);
         auto wg_mma_dKV = tiled_mma_dKV.get_slice(warp_group_thread_layout(warp_group_idx));
-        // If Varlen && Is_causal and we use warp_group_thread_layout_dq, there's a lot of register spills.
-        auto wg_mma_dQ = tiled_mma_dQ.get_slice(!(Varlen && (Is_causal || Is_local)) ? warp_group_thread_layout_dq(NumdQWarpGroups == NumMmaWarpGroups ? warp_group_idx : 0) : thread_idx);
-        // auto wg_mma_dQ = tiled_mma_dQ.get_slice(warp_group_thread_layout_dq(NumdQWarpGroups == NumMmaWarpGroups ? warp_group_idx : 0));
+        auto wg_mma_dQ = tiled_mma_dQ.get_slice(warp_group_thread_layout_dq(NumdQWarpGroups == NumMmaWarpGroups ? warp_group_idx : 0));
         // auto wg_mma_dQ = tiled_mma_dQ.get_slice(warp_group_thread_layout_dq(warp_group_idx));
         // auto wg_mma_dQ = tiled_mma_dQ.get_thread_slice(thread_idx);
         auto thread0_mma_SdP = tiled_mma_SdP.get_thread_slice(_0{});
@@ -820,14 +805,14 @@ struct CollectiveMainloopBwd {
         };
 
         int bidh = get<1>(block_coord);
-        int const seqlen_q = get_seqlen_q(params, bidb);
-        int const seqlen_k = get_seqlen_k(params, bidb);
+        int const seqlen_q = seqlen_info.seqlen_q;
+        int const seqlen_k = seqlen_info.seqlen_k;
 
         // For the case where we do atomicAdd directly to gdQaccum instead of using TMA
+        bool const is_varlen = Varlen && params.cu_seqlens_q;
         Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.ptr_dQaccum)),
-                                      params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !Varlen ? bidb : 0);
-        int const offset_padded = !Varlen ? 0 : (params.cu_seqlens_q[bidb] + bidb * kBlockM) / kBlockM * kBlockM;
-        Tensor gdQaccum_ = local_tile(domain_offset(make_coord(offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(_));  // (M * K, _)
+                                      params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
+        Tensor gdQaccum_ = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(_));  // (M * K, _)
         Tensor gdQaccum = cute::flat_divide(gdQaccum_, Int<kBlockM * kHeadDim / NumdQWarpGroups>{});  // (M * K / WG, WG, _)
         // We can reuse r2s_thr_copy_dQaccum for this partitioning
         Tensor tdQgdQaccum = r2s_thr_copy_dQaccum.partition_D(gdQaccum);
