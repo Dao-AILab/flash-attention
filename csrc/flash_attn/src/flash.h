@@ -7,7 +7,7 @@
 #include <cuda.h>
 #include <vector>
 
-#include <ATen/cuda/PhiloxUtils.cuh> // For at::cuda::philox::unpack
+#include <ATen/cuda/CUDAGeneratorImpl.h> // For at::Generator and at::PhiloxCudaState
 
 constexpr int TOTAL_DIM = 0;
 constexpr int H_DIM = 1;
