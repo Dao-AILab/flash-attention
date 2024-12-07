@@ -366,10 +366,11 @@ def test_flash_attn_output(
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     num_splits = 1
-    q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref).requires_grad_()
+    q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
     if softcap > 0.0:
         # Ensure the values of qk are at least within softcap range.
-        q_ref = (q_ref * softcap / 4).detach().requires_grad_()
+        q_ref = (q_ref * softcap / 4)
+    q_ref = q_ref.to(dtype).to(dtype_ref).requires_grad_()
     k_ref = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref).requires_grad_()
     v_ref = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref).requires_grad_()
     # Put window_size after QKV randn so that window_size changes from test to test
@@ -488,12 +489,12 @@ def test_flash_attn_output(
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
-    multiple = 2 if dtype != torch.float8_e4m3fn else (3 if softcap == 0.0 else 6)
+    multiple = 2 if dtype != torch.float8_e4m3fn else 3
     abs_tol = 1e-4 if softcap == 0.0 else 3e-4
     assert (out - out_ref).abs().max().item() <= multiple * (out_pt - out_ref).abs().max().item() + abs_tol
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor:
-        multiple = 2 if softcap == 0.0 else 4
+        multiple = 2
         assert (dq - dq_ref).abs().max().item() <= multiple * (dq_pt - dq_ref).abs().max().item() + abs_tol
         assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item() + abs_tol
         assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item() + abs_tol
@@ -557,10 +558,11 @@ def test_flash_attn_varlen_output(
     # nheads = 2
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref).requires_grad_()
+    q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
     if softcap > 0.0:
         # Ensure the values of qk are at least within softcap range.
-        q_ref = (q_ref * softcap / 2).detach().requires_grad_()
+        q_ref = (q_ref * softcap / 4).detach().requires_grad_()
+    q_ref = q_ref.to(dtype).to(dtype_ref).requires_grad_()
     k_ref = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref).requires_grad_()
     v_ref = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref).requires_grad_()
     # Put window_size after QKV randn so that window_size changes from test to test
@@ -702,7 +704,7 @@ def test_flash_attn_varlen_output(
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn:
-        multiple = 2 if softcap == 0.0 else 4
+        multiple = 2
         assert (dq - dq_ref).abs().max().item() <= multiple * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item()
