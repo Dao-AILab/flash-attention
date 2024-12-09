@@ -1,35 +1,59 @@
 # Copyright (c) 2023, Tri Dao.
-
-from typing import Optional, Union
-
-# isort: off
-# We need to import the CUDA kernels after importing torch
-import flashattn_hopper_cuda
-
+from typing import Optional, Union, Tuple, List, Any
 import torch
 import torch.nn as nn
 
-# isort: on
+# We need to import the CUDA kernels after importing torch
+import flashattn_hopper_cuda
+
+# torch.compile() support is only enabled for pytorch >= 2.4
+# The reason for this is that we are using the new custom_op and register_fake
+# APIs, which support inplace modification of inputs in the function itself
+if torch.__version__ >= "2.4.0":
+    _torch_custom_op_wrapper = torch.library.custom_op
+    _torch_register_fake_wrapper = torch.library.register_fake
+else:
+    def noop_custom_op_wrapper(name, fn=None, /, *, mutates_args, device_types=None, schema=None):
+        def wrap(func):
+            return func
+        if fn is None:
+            return wrap
+        return fn
+    def noop_register_fake_wrapper(op, fn=None, /, *, lib=None, _stacklevel=1):
+        def wrap(func):
+            return func
+        if fn is None:
+            return wrap
+        return fn
+    _torch_custom_op_wrapper = noop_custom_op_wrapper
+    _torch_register_fake_wrapper = noop_register_fake_wrapper
 
 
-def maybe_contiguous(x):
+def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def round_multiple(x, m):
+    return (x + m - 1) // m * m
+
+
+@_torch_custom_op_wrapper("flash_attn_hopper::_flash_attn_forward", mutates_args=(), device_types="cuda")
 def _flash_attn_forward(
-    q,
-    k,
-    v,
-    softmax_scale,
-    causal,
-    window_size,
-    descale_q=None,
-    descale_k=None,
-    descale_v=None,
-    gqa_parallel=False,
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+    descale_v: Optional[torch.Tensor] = None,
+    gqa_parallel: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # breakpoint()
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse, S_dmask = flashattn_hopper_cuda.fwd(
+    out, softmax_lse, S_dmask = flashattn_hopper_cuda.fwd(
         q,
         k,
         v,
@@ -39,28 +63,65 @@ def _flash_attn_forward(
         descale_k,
         descale_v,
         causal,
-        window_size[0],
-        window_size[1],
+        window_size_left,
+        window_size_right,
         gqa_parallel,
     )
-    return out, q, k, v, out_padded, softmax_lse, S_dmask
+    return out, softmax_lse, S_dmask
 
 
+@_torch_register_fake_wrapper("flash_attn_hopper::_flash_attn_forward")
+def _flash_attn_forward_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+    descale_v: Optional[torch.Tensor] = None,
+    gqa_parallel: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    batch_size, seqlen_q, num_heads, head_size = q.shape
+    seqlen_k = k.shape[1]
+    
+    out = torch.empty_like(q)
+    softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device, layout=q.layout)
+    S_dmask = torch.empty((batch_size, num_heads, seqlen_q, seqlen_k), dtype=q.dtype, device=q.device, layout=q.layout)
+    
+    return out, softmax_lse, S_dmask
+
+
+if torch.__version__ >= "2.4.0":
+    _wrapped_flash_attn_forward = torch.ops.flash_attn_hopper._flash_attn_forward
+else:
+    _wrapped_flash_attn_forward = _flash_attn_forward
+
+
+@_torch_custom_op_wrapper(
+    "flash_attn_hopper::_flash_attn_backward",
+    mutates_args=("dq", "dk", "dv"),
+    device_types="cuda",
+)
 def _flash_attn_backward(
-    dout,
-    q,
-    k,
-    v,
-    out,
-    softmax_lse,
-    dq,
-    dk,
-    dv,
-    softmax_scale,
-    causal,
-    window_size,
-    deterministic=False,
-):
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool = False,
+) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     dq, dk, dv, softmax_d, *rest = flashattn_hopper_cuda.bwd(
@@ -75,34 +136,73 @@ def _flash_attn_backward(
         dv,
         softmax_scale,
         causal,
-        window_size[0],
-        window_size[1],
+        window_size_left,
+        window_size_right,
         deterministic,
     )
-    return dq, dk, dv, softmax_d
+    return softmax_d
 
 
+@_torch_register_fake_wrapper("flash_attn_hopper::_flash_attn_backward")
+def _flash_attn_backward_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool = False,
+) -> torch.Tensor:
+    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    if dq is None:
+        dq = torch.empty_like(q)
+    if dk is None:
+        dk = torch.empty_like(k)
+    if dv is None:
+        dv = torch.empty_like(v)
+    batch_size, seqlen_q, num_heads, _ = q.shape
+    softmax_d = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128)), device=q.device, dtype=torch.float32)
+    return softmax_d
+
+
+if torch.__version__ >= "2.4.0":
+    _wrapped_flash_attn_backward = torch.ops.flash_attn_hopper._flash_attn_backward
+else:
+    _wrapped_flash_attn_backward = _flash_attn_backward
+
+
+@_torch_custom_op_wrapper(
+    "flash_attn_hopper::_flash_attn_varlen_forward", mutates_args=(), device_types="cuda"
+)
 def _flash_attn_varlen_forward(
-    q,
-    k,
-    v,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
-    softmax_scale,
-    causal,
-    block_table=None,
-    window_size=(-1, -1),
-    seqused_q=None,
-    seqused_k=None,
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    block_table: Optional[torch.Tensor] = None,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     assert (
         block_table is None or k.dtype != torch.float8_e4m3fn
     ), "Paged Attention / block_table is not supported for fp8 just yet"
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse = flashattn_hopper_cuda.varlen_fwd(
+    out, softmax_lse = flashattn_hopper_cuda.varlen_fwd(
         q,
         k,
         v,
@@ -116,45 +216,84 @@ def _flash_attn_varlen_forward(
         max_seqlen_k,
         softmax_scale,
         causal,
-        window_size[0],
-        window_size[1],
+        window_size_left,
+        window_size_right,
     )
-    # if out.isnan().any() or softmax_lse.isnan().any():
-    #     breakpoint()
-    return out, q, k, v, out_padded, softmax_lse
+    return out, softmax_lse
 
 
+
+@_torch_register_fake_wrapper("flash_attn_hopper::_flash_attn_varlen_forward")
+def _flash_attn_varlen_forward_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    block_table: Optional[torch.Tensor] = None,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Make tensors contiguous if needed
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    
+    # Create empty output tensor with same shape/properties as q
+    out = torch.empty_like(q)
+    
+    # Create empty softmax_lse tensor
+    total_q = q.shape[0]
+    num_heads = q.shape[1]
+    softmax_lse = torch.empty(
+        (num_heads, total_q),
+        dtype=torch.float32,
+        device=q.device,
+        layout=q.layout
+    )
+
+    return out, softmax_lse
+
+
+if torch.__version__ >= "2.4.0":
+    _wrapped_flash_attn_varlen_forward = torch.ops.flash_attn_hopper._flash_attn_varlen_forward
+else:
+    _wrapped_flash_attn_varlen_forward = _flash_attn_varlen_forward
+
+
+@_torch_custom_op_wrapper(
+    "flash_attn_hopper::_flash_attn_varlen_backward",
+    mutates_args=("dq", "dk", "dv"),
+    device_types="cuda",
+)
 def _flash_attn_varlen_backward(
-    dout,
-    q,
-    k,
-    v,
-    out,
-    softmax_lse,
-    dq,
-    dk,
-    dv,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
-    softmax_scale,
-    causal,
-    window_size,
-    deterministic=False,
-    seqused_q=None,
-    seqused_k=None,
-):
-    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
-    # dq, dk, dv are allocated by us so they should already be contiguous
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool = False,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    (
-        dq,
-        dk,
-        dv,
-        softmax_d,
-        *rest,
-    ) = flashattn_hopper_cuda.varlen_bwd(
+    dq, dk, dv, softmax_d, *rest = flashattn_hopper_cuda.varlen_bwd(
         dout,
         q,
         k,
@@ -172,13 +311,53 @@ def _flash_attn_varlen_backward(
         max_seqlen_k,
         softmax_scale,
         causal,
-        window_size[0],
-        window_size[1],
+        window_size_left,
+        window_size_right,
         deterministic,
     )
-    # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
-    #     breakpoint()
-    return dq, dk, dv, softmax_d
+    return softmax_d
+
+@_torch_register_fake_wrapper("flash_attn_hopper::_flash_attn_varlen_backward")
+def _flash_attn_varlen_backward_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool = False,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    batch_size = cu_seqlens_q.numel() - 1
+    total_q, num_heads, _ = q.shape
+    if dq is None:
+        dq = torch.empty_like(q)
+    if dk is None:
+        dk = torch.empty_like(k)
+    if dv is None:
+        dv = torch.empty_like(v)
+    softmax_d = torch.empty((num_heads, total_q + 128 * batch_size), device=q.device, dtype=torch.float32)
+
+    return softmax_d
+
+
+if torch.__version__ >= "2.4.0":
+    _wrapped_flash_attn_varlen_backward = torch.ops.flash_attn_hopper._flash_attn_varlen_backward
+else:
+    _wrapped_flash_attn_varlen_backward = _flash_attn_varlen_backward
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -197,15 +376,22 @@ class FlashAttnFunc(torch.autograd.Function):
         descale_v=None,
         gqa_parallel=False,
     ):
+        # breakpoint()
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse, S_dmask = _flash_attn_forward(
+        head_size_og = q.size(3)
+        if head_size_og % 8 != 0:
+            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
+            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
+            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        out_padded, softmax_lse, S_dmask = _wrapped_flash_attn_forward(
             q,
             k,
             v,
             softmax_scale,
-            causal,
-            window_size,
+            causal=causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
             descale_q=descale_q,
             descale_k=descale_k,
             descale_v=descale_v,
@@ -217,13 +403,20 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.deterministic = deterministic
         ctx.gqa_parallel = gqa_parallel
+        out = out_padded[..., :head_size_og]
         return out, softmax_lse
 
     @staticmethod
-    def backward(ctx, dout, *args):
+    def backward(
+        ctx: Any, dout: torch.Tensor, *args: Any
+    ) -> Tuple[Optional[torch.Tensor], ...]:
         q, k, v, out, softmax_lse = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        _flash_attn_backward(
+        head_size_og = dout.size(3)
+        dout_padded = dout
+        if head_size_og % 8 != 0:
+            dout_padded = torch.nn.functional.pad(dout, [0, 0, 0, 8 - head_size_og % 8])
+        _wrapped_flash_attn_backward(
             dout,
             q,
             k,
@@ -235,7 +428,8 @@ class FlashAttnFunc(torch.autograd.Function):
             dv,
             ctx.softmax_scale,
             ctx.causal,
-            ctx.window_size,
+            ctx.window_size[0],
+            ctx.window_size[1],
             ctx.deterministic,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
@@ -247,25 +441,30 @@ class FlashAttnFunc(torch.autograd.Function):
 class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx,
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        softmax_scale,
-        causal,
-        window_size,
-        deterministic=False,
-        seqused_q=None,
-        seqused_k=None,
-        block_table=None,
-    ):
+        ctx: Any,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        softmax_scale: Optional[float],
+        causal: bool,
+        window_size: Tuple[int, int],
+        deterministic: bool = False,
+        seqused_q: Optional[torch.Tensor] = None,
+        seqused_k: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse = _flash_attn_varlen_forward(
+        head_size_og = q.size(2)
+        if head_size_og % 8 != 0:
+            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
+            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
+            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        out_padded, softmax_lse = _wrapped_flash_attn_varlen_forward(
             q,
             k,
             v,
@@ -275,7 +474,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_k,
             softmax_scale,
             causal=causal,
-            window_size=window_size,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
             seqused_q=seqused_q,
             seqused_k=seqused_k,
             block_table=block_table,
@@ -297,16 +497,23 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.deterministic = deterministic
+        out = out_padded[..., :head_size_og]
         return out, softmax_lse
 
     @staticmethod
-    def backward(ctx, dout, *args):
+    def backward(
+        ctx: Any, dout: torch.Tensor, *args: Any
+    ) -> Tuple[Optional[torch.Tensor], ...]:
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = (
             ctx.saved_tensors
         )
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        _flash_attn_varlen_backward(
-            dout,
+        head_size_og = dout.size(2)
+        dout_padded = dout
+        if head_size_og % 8 != 0:
+            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
+        _wrapped_flash_attn_varlen_backward(
+            dout_padded,
             q,
             k,
             v,
@@ -321,12 +528,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.max_seqlen_k,
             ctx.softmax_scale,
             ctx.causal,
-            ctx.window_size,
+            ctx.window_size[0],
+            ctx.window_size[1],
             ctx.deterministic,
             seqused_q,
             seqused_k,
         )
-        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
+        dq = dq[..., : dout.shape[-1]]
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
         return (
@@ -499,6 +707,7 @@ def flash_attn_varlen_func(
         seqused_k,
         block_table,
     )
+
 
 
 def flash_attn_with_kvcache(
