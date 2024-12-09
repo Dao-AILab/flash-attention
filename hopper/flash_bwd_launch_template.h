@@ -188,7 +188,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     CHECK_CUDA_KERNEL_LAUNCH();
 
     using PostprocessKernel = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_MK, Element, ElementAccum, cutlass::arch::Sm90,
-        AttnKernel::CollectiveMainloop::kNThreadsdQ,
+        AttnKernel::CollectiveMainloop::NumMmaThreads,
         typename AttnKernel::CollectiveMainloop::TiledMmadQ,
         AttnKernel::CollectiveMainloop::dQ_swapAB
         >;
