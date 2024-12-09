@@ -24,7 +24,7 @@ using namespace cute;
 
 template <int kHeadDim, int kBlockM, int kBlockN, int kStages, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKV, bool AppendKV,
-          bool IntraWGOverlap, bool PackGQA, bool Split, bool V_colmajor>
+          bool Mma1_is_RS, bool IntraWGOverlap, bool PackGQA, bool Split, bool V_colmajor>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
@@ -33,7 +33,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr bool FP8_TransposeV = Is_FP8 && !V_colmajor;
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
-    using CollectiveMainloop = flash::CollectiveMainloopFwd<kStages, ClusterShape, TileShape_MNK, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV, IntraWGOverlap, PackGQA, Split, V_colmajor>;
+    using CollectiveMainloop = flash::CollectiveMainloopFwd<kStages, ClusterShape, TileShape_MNK, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV, Mma1_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK, ClusterShape, ElementOut, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, FP8_TransposeV>;
 
     using SchedulerPersistent = std::conditional_t<Varlen,
@@ -149,7 +149,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, int kBlockM, int kBlockN, int kHeadDim, int kStages,
-         bool Is_causal, bool Is_local, bool Has_softcap, bool PagedKV, bool IntraWGOverlap,
+         bool Is_causal, bool Is_local, bool Has_softcap, bool PagedKV, bool Mma1_is_RS, bool IntraWGOverlap,
          bool Split, bool V_colmajor, bool Enable_cluster>
 void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
@@ -160,7 +160,7 @@ void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
                 // Only use Cluster if number of tiles along seqlen_q is even and not varlen
                 CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
                     static constexpr int ClusterM = !Varlen && Enable_cluster && Use_cluster ? 2 : 1;
-                    run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV && Varlen, IntraWGOverlap, PackGQA, Split, V_colmajor>(params, stream);
+                    run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV && Varlen, Mma1_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>(params, stream);
                 });
             });
         });
@@ -172,10 +172,10 @@ void run_mha_fwd_16b(Flash_fwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
             // Can't use structured binding since it's not compatible with constexpr
-            static constexpr std::tuple<int, int, bool> kBlockMN_IntraWGOverlap = tile_size_fwd(kHeadDim, Is_causal, Is_local, sizeof(T) /*element_size*/, false /*V_colmajor*/, PagedKV, Has_softcap);
+            static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd(kHeadDim, Is_causal, Is_local, sizeof(T) /*element_size*/, false /*V_colmajor*/, PagedKV, Has_softcap);
             static constexpr bool Enable_cluster = kHeadDim >= 128 && !Is_causal && !Is_local && !Split && !PagedKV;
-            run_mha_fwd_dispatch<T, std::get<0>(kBlockMN_IntraWGOverlap), std::get<1>(kBlockMN_IntraWGOverlap), kHeadDim, 2,
-                Is_causal, Is_local, Has_softcap, PagedKV, std::get<2>(kBlockMN_IntraWGOverlap), Split, false /*V_colmajor*/, Enable_cluster>(params, stream);
+            run_mha_fwd_dispatch<T, std::get<0>(kBlockMN_RS_IntraWGOverlap), std::get<1>(kBlockMN_RS_IntraWGOverlap), kHeadDim, 2,
+                Is_causal, Is_local, Has_softcap, PagedKV, std::get<2>(kBlockMN_RS_IntraWGOverlap), std::get<3>(kBlockMN_RS_IntraWGOverlap), Split, false /*V_colmajor*/, Enable_cluster>(params, stream);
         });
     });
 }
@@ -186,9 +186,10 @@ void run_mha_fwd_8b(Flash_fwd_params &params, cudaStream_t stream) {
         VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor, [&] {
             SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
                 // Can't use structured binding since it's not compatible with constexpr
-                static constexpr std::tuple<int, int, bool> kBlockMN_IntraWGOverlap = tile_size_fwd(kHeadDim, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor /*V_colmajor*/, PagedKV, Has_softcap);
+                static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd(kHeadDim, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor /*V_colmajor*/, PagedKV, Has_softcap);
                 static constexpr bool Enable_cluster = kHeadDim == 192 && !Is_causal && !Is_local && !Split && !PagedKV;
-                run_mha_fwd_dispatch<T, std::get<0>(kBlockMN_IntraWGOverlap), std::get<1>(kBlockMN_IntraWGOverlap), kHeadDim, 2, Is_causal, Is_local, Has_softcap, PagedKV, std::get<2>(kBlockMN_IntraWGOverlap), Split, V_colmajor, Enable_cluster>(params, stream);
+                run_mha_fwd_dispatch<T, std::get<0>(kBlockMN_RS_IntraWGOverlap), std::get<1>(kBlockMN_RS_IntraWGOverlap), kHeadDim, 2,
+                    Is_causal, Is_local, Has_softcap, PagedKV, std::get<2>(kBlockMN_RS_IntraWGOverlap), std::get<3>(kBlockMN_RS_IntraWGOverlap), Split, V_colmajor, Enable_cluster>(params, stream);
             });
         });
     });

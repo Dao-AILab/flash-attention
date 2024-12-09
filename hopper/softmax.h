@@ -24,14 +24,10 @@ __device__ __forceinline__ void thread_reduce_(Tensor<Engine0, Layout0> const &t
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
     CUTE_STATIC_ASSERT_V(size<0>(summary) == size<0>(tensor));
     #pragma unroll
-    for (int mi = 0; mi < size<0>(tensor); mi++) {
-        summary(mi) = zero_init ? tensor(mi, _0{}) : op(summary(mi), tensor(mi, _0{}));
-    }
-    #pragma unroll
-    for (int ni = 1; ni < size<1>(tensor); ni++) {
+    for (int ni = 0; ni < size<1>(tensor); ni++) {
         #pragma unroll
         for (int mi = 0; mi < size<0>(tensor); mi++) {
-            summary(mi) = op(summary(mi), tensor(mi, ni));
+            summary(mi) = zero_init && ni == 0 ? tensor(mi, ni) : op(summary(mi), tensor(mi, ni));
         }
     }
 }

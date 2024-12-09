@@ -379,7 +379,7 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     // params.page_table must already be set
     if (params.h == params.h_k) { return false; }
     // This needs to match the kernel configs
-    auto [kBlockM, kBlockN, IntraWGOverlap] = tile_size_fwd(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
+    auto [kBlockM, kBlockN, Mma1_is_RS, IntraWGOverlap] = tile_size_fwd(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
     return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.is_causal || params.is_local, params.seqlen_q, params.h / params.h_k, kBlockM);
     #endif
 }
@@ -392,7 +392,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // params.page_table must already be set
     auto dprops = at::cuda::getCurrentDeviceProperties();
     // This needs to match the kernel configs
-    auto [kBlockM, kBlockN, IntraWGOverlap] = tile_size_fwd(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
+    auto [kBlockM, kBlockN, Mma1_is_RS, IntraWGOverlap] = tile_size_fwd(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
     int seqlen_q_packgqa = params.seqlen_q * (params.pack_gqa ? params.h / params.h_k : 1);
     const int num_n_blocks = (params.seqlen_k + kBlockN - 1) / kBlockN;
     const int num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
