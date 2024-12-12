@@ -85,7 +85,7 @@ else:
 dtypes = os.getenv('DTYPE')
 if dtypes:
     dtypes = [dtypes]
-    DTYPE_FLAG="-DDTYPE_" + str(dtypes[0])
+    DTYPE_FLAG="-DDTYPE_" + str(dtypes[0]).upper()
 else:
     dtypes = DTYPE
 
