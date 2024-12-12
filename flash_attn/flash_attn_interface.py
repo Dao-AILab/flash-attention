@@ -452,6 +452,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
     ):
+        is_grad = torch.is_grad_enabled() and qkv.requires_grad
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
         q, k, v = qkv[:, :, 0].detach(), qkv[:, :, 1].detach(), qkv[:, :, 2].detach()
@@ -473,14 +474,15 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
-        ctx.dropout_p = dropout_p
-        ctx.softmax_scale = softmax_scale
-        ctx.causal = causal
-        ctx.window_size = window_size
-        ctx.softcap = softcap
-        ctx.alibi_slopes = alibi_slopes
-        ctx.deterministic = deterministic
+        if is_grad:
+            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+            ctx.dropout_p = dropout_p
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.softcap = softcap
+            ctx.alibi_slopes = alibi_slopes
+            ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
@@ -533,6 +535,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
     ):
+        is_grad = torch.is_grad_enabled() and qkv.requires_grad
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
         q, k, v = qkv[:, 0].detach(), qkv[:, 1].detach(), qkv[:, 2].detach()
@@ -559,15 +562,16 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             return_softmax=return_softmax and dropout_p > 0,
             block_table=None,
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens, rng_state)
-        ctx.dropout_p = dropout_p
-        ctx.max_seqlen = max_seqlen
-        ctx.softmax_scale = softmax_scale
-        ctx.causal = causal
-        ctx.window_size = window_size
-        ctx.softcap = softcap
-        ctx.alibi_slopes = alibi_slopes
-        ctx.deterministic = deterministic
+        if is_grad:
+            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens, rng_state)
+            ctx.dropout_p = dropout_p
+            ctx.max_seqlen = max_seqlen
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.softcap = softcap
+            ctx.alibi_slopes = alibi_slopes
+            ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
@@ -623,6 +627,9 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
     ):
+        is_grad = torch.is_grad_enabled() and any(
+            x.requires_grad for x in [q, kv]
+        )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         k, v = kv[:, :, 0].detach(), kv[:, :, 1].detach()
@@ -644,14 +651,15 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
-        ctx.dropout_p = dropout_p
-        ctx.softmax_scale = softmax_scale
-        ctx.causal = causal
-        ctx.window_size = window_size
-        ctx.softcap = softcap
-        ctx.alibi_slopes = alibi_slopes
-        ctx.deterministic = deterministic
+        if is_grad:
+            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+            ctx.dropout_p = dropout_p
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.softcap = softcap
+            ctx.alibi_slopes = alibi_slopes
+            ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
@@ -709,6 +717,9 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
     ):
+        is_grad = torch.is_grad_enabled() and any(
+            x.requires_grad for x in [q, kv]
+        )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         k, v = kv[:, 0].detach(), kv[:, 1].detach()
@@ -735,18 +746,19 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             return_softmax=return_softmax and dropout_p > 0,
             block_table=None,
         )
-        ctx.save_for_backward(
-            q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
-        )
-        ctx.dropout_p = dropout_p
-        ctx.max_seqlen_q = max_seqlen_q
-        ctx.max_seqlen_k = max_seqlen_k
-        ctx.softmax_scale = softmax_scale
-        ctx.causal = causal
-        ctx.window_size = window_size
-        ctx.softcap = softcap
-        ctx.alibi_slopes = alibi_slopes
-        ctx.deterministic = deterministic
+        if is_grad:
+            ctx.save_for_backward(
+                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
+            )
+            ctx.dropout_p = dropout_p
+            ctx.max_seqlen_q = max_seqlen_q
+            ctx.max_seqlen_k = max_seqlen_k
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.softcap = softcap
+            ctx.alibi_slopes = alibi_slopes
+            ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
@@ -805,6 +817,9 @@ class FlashAttnFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
     ):
+        is_grad = torch.is_grad_enabled() and any(
+            x.requires_grad for x in [q, k, v]
+        )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_og = q.size(3)
@@ -825,15 +840,16 @@ class FlashAttnFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
-        ctx.dropout_p = dropout_p
-        ctx.softmax_scale = softmax_scale
-        ctx.causal = causal
-        ctx.window_size = window_size
-        ctx.softcap = softcap
-        ctx.alibi_slopes = alibi_slopes
-        ctx.deterministic = deterministic
-        out = out_padded[..., :head_size_og]
+        if is_grad:
+            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+            ctx.dropout_p = dropout_p
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.softcap = softcap
+            ctx.alibi_slopes = alibi_slopes
+            ctx.deterministic = deterministic
+            out = out_padded[..., :head_size_og]
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -891,6 +907,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_softmax,
         block_table,
     ):
+        is_grad = torch.is_grad_enabled() and any(
+            x.requires_grad for x in [q, k, v]
+        )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_og = q.size(2)
@@ -916,18 +935,20 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             return_softmax=return_softmax and dropout_p > 0,
             block_table=block_table,
         )
-        ctx.save_for_backward(
-            q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
-        )
-        ctx.dropout_p = dropout_p
-        ctx.max_seqlen_q = max_seqlen_q
-        ctx.max_seqlen_k = max_seqlen_k
-        ctx.softmax_scale = softmax_scale
-        ctx.causal = causal
-        ctx.window_size = window_size
-        ctx.softcap = softcap
-        ctx.alibi_slopes = alibi_slopes
-        ctx.deterministic = deterministic
+        if is_grad:
+            ctx.save_for_backward(
+                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
+            )
+            ctx.dropout_p = dropout_p
+            ctx.max_seqlen_q = max_seqlen_q
+            ctx.max_seqlen_k = max_seqlen_k
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.softcap = softcap
+            ctx.alibi_slopes = alibi_slopes
+            ctx.deterministic = deterministic
+
         out = out_padded[..., :head_size_og]
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
