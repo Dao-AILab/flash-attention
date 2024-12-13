@@ -54,6 +54,12 @@ struct Flash_fwd_params : public Qkv_params {
     float * __restrict__ q_descale_ptr;
     float * __restrict__ k_descale_ptr;
     float * __restrict__ v_descale_ptr;
+    index_t q_descale_batch_stride;
+    index_t q_descale_head_stride;
+    index_t k_descale_batch_stride;
+    index_t k_descale_head_stride;
+    index_t v_descale_batch_stride;
+    index_t v_descale_head_stride;
 
     // The dimensions.
     int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;

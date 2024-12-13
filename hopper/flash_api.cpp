@@ -408,9 +408,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
         const float softmax_scale,
         bool is_causal,
-        c10::optional<at::Tensor> &q_descale_,  // 1
-        c10::optional<at::Tensor> &k_descale_,  // 1
-        c10::optional<at::Tensor> &v_descale_,  // 1
+        c10::optional<at::Tensor> &q_descale_,  // batch_size x *num_heads_k* (not num_heads_q)
+        c10::optional<at::Tensor> &k_descale_,  // batch_size x num_heads_k
+        c10::optional<at::Tensor> &v_descale_,  // batch_size x num_heads_k
         int window_size_left,
         int window_size_right,
         int sink_token_length,
@@ -550,24 +550,30 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         if (q_descale_.has_value()) {
             auto q_descale = q_descale_.value();
             CHECK_DEVICE(q_descale);
-            CHECK_SHAPE(q_descale, 1);
+            CHECK_SHAPE(q_descale, batch_size, num_heads_k);
             params.q_descale_ptr = q_descale.data_ptr<float>();
+            params.q_descale_batch_stride = q_descale.stride(0);
+            params.q_descale_head_stride = q_descale.stride(1);
         } else {
             params.q_descale_ptr = nullptr;
         }
         if (k_descale_.has_value()) {
             auto k_descale = k_descale_.value();
             CHECK_DEVICE(k_descale);
-            CHECK_SHAPE(k_descale, 1);
+            CHECK_SHAPE(k_descale, batch_size, num_heads_k);
             params.k_descale_ptr = k_descale.data_ptr<float>();
+            params.k_descale_batch_stride = k_descale.stride(0);
+            params.k_descale_head_stride = k_descale.stride(1);
         } else {
             params.k_descale_ptr = nullptr;
         }
         if (v_descale_.has_value()) {
             auto v_descale = v_descale_.value();
             CHECK_DEVICE(v_descale);
-            CHECK_SHAPE(v_descale, 1);
+            CHECK_SHAPE(v_descale, batch_size, num_heads_k);
             params.v_descale_ptr = v_descale.data_ptr<float>();
+            params.v_descale_batch_stride = v_descale.stride(0);
+            params.v_descale_head_stride = v_descale.stride(1);
         } else {
             params.v_descale_ptr = nullptr;
         }
@@ -625,9 +631,9 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
                int const max_seqlen_k,
                const float softmax_scale,
                bool is_causal,
-               c10::optional<at::Tensor> &q_descale_,  // 1
-               c10::optional<at::Tensor> &k_descale_,  // 1
-               c10::optional<at::Tensor> &v_descale_,  // 1
+               c10::optional<at::Tensor> &q_descale_,  // batch_size x *num_heads_k* (not num_heads_q)
+               c10::optional<at::Tensor> &k_descale_,  // batch_size x num_heads_k
+               c10::optional<at::Tensor> &v_descale_,  // batch_size x num_heads_k
                int window_size_left,
                int window_size_right,
                const float softcap,
@@ -781,24 +787,30 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
         if (q_descale_.has_value()) {
             auto q_descale = q_descale_.value();
             CHECK_DEVICE(q_descale);
-            CHECK_SHAPE(q_descale, 1);
+            CHECK_SHAPE(q_descale, batch_size, num_heads_k);
             params.q_descale_ptr = q_descale.data_ptr<float>();
+            params.q_descale_batch_stride = q_descale.stride(0);
+            params.q_descale_head_stride = q_descale.stride(1);
         } else {
             params.q_descale_ptr = nullptr;
         }
         if (k_descale_.has_value()) {
             auto k_descale = k_descale_.value();
             CHECK_DEVICE(k_descale);
-            CHECK_SHAPE(k_descale, 1);
+            CHECK_SHAPE(k_descale, batch_size, num_heads_k);
             params.k_descale_ptr = k_descale.data_ptr<float>();
+            params.k_descale_batch_stride = k_descale.stride(0);
+            params.k_descale_head_stride = k_descale.stride(1);
         } else {
             params.k_descale_ptr = nullptr;
         }
         if (v_descale_.has_value()) {
             auto v_descale = v_descale_.value();
             CHECK_DEVICE(v_descale);
-            CHECK_SHAPE(v_descale, 1);
+            CHECK_SHAPE(v_descale, batch_size, num_heads_k);
             params.v_descale_ptr = v_descale.data_ptr<float>();
+            params.v_descale_batch_stride = v_descale.stride(0);
+            params.v_descale_head_stride = v_descale.stride(1);
         } else {
             params.v_descale_ptr = nullptr;
         }
@@ -1355,9 +1367,9 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
                 c10::optional<int> max_seqlen_q_,
                 float const softmax_scale,
                 bool is_causal,
-                c10::optional<at::Tensor> &q_descale_,  // 1
-                c10::optional<at::Tensor> &k_descale_,  // 1
-                c10::optional<at::Tensor> &v_descale_,  // 1
+                c10::optional<at::Tensor> &q_descale_,  // batch_size x *num_heads_k* (not num_heads_q)
+                c10::optional<at::Tensor> &k_descale_,  // batch_size x num_heads_k
+                c10::optional<at::Tensor> &v_descale_,  // batch_size x num_heads_k
                 int window_size_left,
                 int window_size_right,
                 int sink_token_length,
@@ -1640,24 +1652,30 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         if (q_descale_.has_value()) {
             auto q_descale = q_descale_.value();
             CHECK_DEVICE(q_descale);
-            CHECK_SHAPE(q_descale, 1);
+            CHECK_SHAPE(q_descale, batch_size, num_heads_k);
             params.q_descale_ptr = q_descale.data_ptr<float>();
+            params.q_descale_batch_stride = q_descale.stride(0);
+            params.q_descale_head_stride = q_descale.stride(1);
         } else {
             params.q_descale_ptr = nullptr;
         }
         if (k_descale_.has_value()) {
             auto k_descale = k_descale_.value();
             CHECK_DEVICE(k_descale);
-            CHECK_SHAPE(k_descale, 1);
+            CHECK_SHAPE(k_descale, batch_size, num_heads_k);
             params.k_descale_ptr = k_descale.data_ptr<float>();
+            params.k_descale_batch_stride = k_descale.stride(0);
+            params.k_descale_head_stride = k_descale.stride(1);
         } else {
             params.k_descale_ptr = nullptr;
         }
         if (v_descale_.has_value()) {
             auto v_descale = v_descale_.value();
             CHECK_DEVICE(v_descale);
-            CHECK_SHAPE(v_descale, 1);
+            CHECK_SHAPE(v_descale, batch_size, num_heads_k);
             params.v_descale_ptr = v_descale.data_ptr<float>();
+            params.v_descale_batch_stride = v_descale.stride(0);
+            params.v_descale_head_stride = v_descale.stride(1);
         } else {
             params.v_descale_ptr = nullptr;
         }

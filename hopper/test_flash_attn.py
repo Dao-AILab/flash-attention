@@ -240,11 +240,12 @@ def attention_ref(
     if upcast:
         q, k, v = q.float(), k.float(), v.float()
     if q_descale is not None:
-        q = (q.float() * q_descale).to(dtype=q.dtype)
+        q_descale = repeat(q_descale, "b h -> b (h g)", g = q.shape[2] // k.shape[2])
+        q = (q.float() * rearrange(q_descale, "b h -> b 1 h 1")).to(dtype=q.dtype)
     if k_descale is not None:
-        k = (k.float() * k_descale).to(dtype=k.dtype)
+        k = (k.float() * rearrange(k_descale, "b h -> b 1 h 1")).to(dtype=k.dtype)
     if v_descale is not None:
-        v = (v.float() * v_descale).to(dtype=v.dtype)
+        v = (v.float() * rearrange(v_descale, "b h -> b 1 h 1")).to(dtype=v.dtype)
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
     k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
@@ -376,7 +377,7 @@ def test_flash_attn_output(
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     # window_size = (-1, -1) if not local else (16, 0)
     if dtype == torch.float8_e4m3fn:
-        q_descale, k_descale, v_descale = [torch.rand(1, device=device, dtype=torch.float32) * 2 for _ in range(3)]
+        q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
     else:
         q_descale, k_descale, v_descale = None, None, None
     q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]

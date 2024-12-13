@@ -43,6 +43,7 @@ public:
     static constexpr bool Use_TMA_Q = CollectiveMainloop::Use_TMA_Q;
     static constexpr bool Use_TMA_KV = CollectiveMainloop::Use_TMA_KV;
     static constexpr bool Use_TMA_O = CollectiveEpilogue::Use_TMA_O;
+    static constexpr bool PackGQA = CollectiveMainloop::PackGQA;
     static constexpr int NumProducerThreads = CollectiveMainloop::NumProducerThreads;
     using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
 
@@ -356,16 +357,19 @@ public:
                 Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 2>(TileShape_MNK{}));
                 float softmax_scale_log2 = params.mainloop.softmax_scale_log2;
                 // If there's tanh softcap, the scaling will be done before tanh.
+                auto block_coord = work_tile_info.get_block_coord(params.scheduler);
+                int const bidb = get<2>(block_coord);
                 if constexpr (Is_FP8 && !Has_softcap) {
-                    float const q_descale = params.mainloop.ptr_q_descale == nullptr ? 1.0f : *params.mainloop.ptr_q_descale;
-                    float const k_descale = params.mainloop.ptr_k_descale == nullptr ? 1.0f : *params.mainloop.ptr_k_descale;
+                    int const bidh = get<1>(block_coord);
+                    int const bidh_kv = !PackGQA ? params.mainloop.qhead_per_khead_divmod.divide(bidh) : bidh;
+                    float const q_descale = params.mainloop.ptr_q_descale == nullptr ? 1.0f : params.mainloop.ptr_q_descale[bidb * get<0>(params.mainloop.stride_q_descale) + bidh_kv * get<1>(params.mainloop.stride_q_descale)];
+                    float const k_descale = params.mainloop.ptr_k_descale == nullptr ? 1.0f : params.mainloop.ptr_k_descale[bidb * get<0>(params.mainloop.stride_k_descale) + bidh_kv * get<1>(params.mainloop.stride_k_descale)];
                     softmax_scale_log2 *= q_descale * k_descale;
                 }
                 flash::Softmax<2 * (2 * kBlockM / NumMmaThreads), /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
 
-                auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 SeqlenInfo_t seqlen_info{
-                    get<2>(block_coord) /*bidb*/,
+                    bidb,
                     get<0>(params.mainloop.shape_Q),
                     !PagedKV ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
                     get<0>(params.mainloop.shape_K_new),

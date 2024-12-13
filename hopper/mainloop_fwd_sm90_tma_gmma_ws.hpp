@@ -200,6 +200,7 @@ struct CollectiveMainloopFwd {
     using StridePageTable = cute::Stride<int64_t, _1>;
     using ShapeRotary = cute::Shape<int32_t, int32_t>;  // (seqlen_ro, rotary_dim // 2)
     using StrideRotary = cute::Stride<int64_t, _1>;
+    using StrideDescale = cute::Stride<int64_t, int64_t>;
 
     using TMA_Q = decltype(make_tma_copy_A_sm90(
         GmemTiledCopyQ{},
@@ -307,7 +308,8 @@ struct CollectiveMainloopFwd {
         ShapePageTable const shape_pagetable;
         StridePageTable const stride_pagetable;
         float const softmax_scale;
-        float const* ptr_q_descale = nullptr, *ptr_k_descale = nullptr, *ptr_v_descale = nullptr;
+        float const* ptr_q_descale, *ptr_k_descale, *ptr_v_descale;
+        StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
         int const window_size_left = -1, window_size_right = -1, sink_token_length = 0;
         float const softcap_val;
         int const num_splits;
@@ -354,7 +356,8 @@ struct CollectiveMainloopFwd {
         TMA_K tma_load_K_new;
         TMA_V tma_load_V_new;
         float const softmax_scale_log2;
-        float const* ptr_q_descale = nullptr, *ptr_k_descale = nullptr, *ptr_v_descale = nullptr;
+        float const* ptr_q_descale, *ptr_k_descale, *ptr_v_descale;
+        StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
         float const softcap_val;
         int const window_size_left, window_size_right, sink_token_length;
         int const num_splits;
@@ -434,6 +437,7 @@ struct CollectiveMainloopFwd {
                 tma_load_Q, tma_load_K, tma_load_V, tma_load_K_new, tma_load_V_new,
                 !Has_softcap ? float(args.softmax_scale * M_LOG2E) : float(args.softcap_val * M_LOG2E),
                 args.ptr_q_descale, args.ptr_k_descale, args.ptr_v_descale,
+                args.stride_q_descale, args.stride_k_descale, args.stride_v_descale,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.window_size_left, args.window_size_right, args.sink_token_length,
                 !Split ? 1 : args.num_splits,
@@ -838,9 +842,11 @@ struct CollectiveMainloopFwd {
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
         // can't use auto [m_block, ...] = block_coord since structured binding cannot be captured in lambda
-        int m_block = get<0>(block_coord);
-        int bidb = get<2>(block_coord);
-        int split_idx = get<3>(block_coord);
+        int const m_block = get<0>(block_coord);
+        int const bidh = get<1>(block_coord);
+        int const bidb = get<2>(block_coord);
+        int const split_idx = get<3>(block_coord);
+        int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
         auto [n_block_min, n_block_max] = get_n_block_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
@@ -906,8 +912,8 @@ struct CollectiveMainloopFwd {
 
         float softcap_val = params.softcap_val;
         if constexpr (Has_softcap && Is_FP8) {
-            float const q_descale = params.ptr_q_descale == nullptr ? 1.0f : *params.ptr_q_descale;
-            float const k_descale = params.ptr_k_descale == nullptr ? 1.0f : *params.ptr_k_descale;
+            float const q_descale = params.ptr_q_descale == nullptr ? 1.0f : params.ptr_q_descale[bidb * get<0>(params.stride_q_descale) + bidh_kv * get<1>(params.stride_q_descale)];
+            float const k_descale = params.ptr_k_descale == nullptr ? 1.0f : params.ptr_k_descale[bidb * get<0>(params.stride_k_descale) + bidh_kv * get<1>(params.stride_k_descale)];
             softcap_val *= q_descale * k_descale;
         }
         // Softcapping needs to happen before masking since if we apply after masking, softcapping can turn
@@ -922,7 +928,6 @@ struct CollectiveMainloopFwd {
             // since we assume that all MMA threads sync in the epilogue before writing to smem_o.
             // So any thread gets there, all threads must have finished the previous MMA and at least started
             // writing to smem_o.
-            int const bidh = get<1>(block_coord);
             bool const is_varlen_q = Varlen && params.cu_seqlens_q;
             Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
             Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
@@ -1072,7 +1077,8 @@ struct CollectiveMainloopFwd {
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
             consumer_wait(pipeline_v, smem_pipe_read);
             flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, cute::conditional_return<Mma1_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-            cute::copy(softmax.finalize(!Is_FP8 || params.ptr_v_descale == nullptr ? 1.f : *params.ptr_v_descale), scores_scale);
+            float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
+            cute::copy(softmax.finalize(v_descale), scores_scale);
             warpgroup_wait<0>();
             pipeline_v.consumer_release(smem_pipe_read);  // release V, otherwise producers will hang
             softmax.rescale_o(tOrO, scores_scale);
@@ -1150,7 +1156,8 @@ struct CollectiveMainloopFwd {
             if constexpr (Use_TMA_Q) {  // If !Use_TMA_Q, we don't use the producer WG to load Q
                 cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
             }
-            Tensor scores_scale = softmax.finalize(!Is_FP8 || params.ptr_v_descale == nullptr ? 1.f : *params.ptr_v_descale);
+            float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
+            Tensor scores_scale = softmax.finalize(v_descale);
             softmax.rescale_o(tOrO, scores_scale);
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
         }
