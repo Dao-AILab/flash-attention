@@ -19,6 +19,7 @@ struct TileSchedulerArguments {
     int const num_blocks, num_head, num_batch, num_splits;
     int const qhead_per_khead;
     int const seqlen;  // Only used if Varlen and cu_seqlens == nullptr and seqused == nullptr
+    int const seqlen_k, headdim, element_size;  // Used to calculate L2 swizzling
     int* const tile_count_semaphore = nullptr;
     int* const cu_seqlens = nullptr;
     int* const seqused = nullptr;
@@ -196,8 +197,17 @@ public:
 };
 
 template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
-        bool Split=false>
+        bool Split=false, bool PackGQA=false>
 class DynamicPersistentTileScheduler {
+
+    // This scheduler targets the causal (or local) case where each tile takes different
+    // amount of time. We using longest-processing-time-first scheduling:
+    // the longest remaining tile is assigned to the first SM that's free.
+    // SM indicates they are free by incrementing a semaphore.
+    // However, we have to make sure K & V still fit into L2 cache, so we perform scheduling
+    // on "sections" of the head & batch dimension, each section consisting of e.g. 8 heads.
+    // This is the L2 swizzling part. The size of each section is precomputed based on the
+    // size of K & V and the L2 cache size.
 
 public:
     using SharedStorage = int;
@@ -211,15 +221,30 @@ public:
     struct Params {
         int const total_blocks;
         cutlass::FastDivmod const m_block_divmod, head_divmod;
-        cutlass::FastDivmod nsplits_divmod;
+        cutlass::FastDivmod const l2_minor_divmod, l2_major_divmod;
+        cutlass::FastDivmod const l2_minor_residual_divmod;
+        int const num_hb_quotient;
         int* const tile_count_semaphore;
     };
 
     static Params
     to_underlying_arguments(TileSchedulerArguments const& args) {
-        return {args.num_blocks * args.num_head * args.num_batch * (!Split ? 1 : args.num_splits),
-                cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head * (!Split ? 1 : args.num_splits)),
-                cutlass::FastDivmod(!Split ? 1 : args.num_splits),
+        int const size_one_kv_head = args.seqlen_k * args.headdim * args.element_size * 2;
+        int const size_l2 = 32 * 1024 * 1024;  // 32 MB for K & V
+        // Swizzle is the size of each "section". Round swizzle to a power of 2
+        // If not PackGQA already, the size of each section can increase by qhead_per_khead
+        int const swizzle = (1 << cutlass::find_log2(size_l2 / size_one_kv_head)) * (PackGQA ? 1 : args.qhead_per_khead);
+        // If we're in the last section (called residual), we don't want to divide by
+        // swizzle. Instead we want to divide by the remainder.
+        int const num_hb_remainder = (args.num_head * args.num_batch) % swizzle;
+        int const num_split_blocks = args.num_blocks * (!Split ? 1 : args.num_splits);
+        // printf("num_split_blocks = %d, num_head = %d, num_batch = %d, swizzle = %d, PackGQA = %d, qhead_per_khead = %d, num_hb_remainder = %d\n", num_split_blocks, args.num_head, args.num_batch, swizzle, int(PackGQA), args.qhead_per_khead, num_hb_remainder);
+        return {num_split_blocks * args.num_head * args.num_batch,
+                cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head),
+                cutlass::FastDivmod(swizzle), cutlass::FastDivmod(swizzle * num_split_blocks),
+                // don't divide by 0
+                cutlass::FastDivmod(num_hb_remainder > 0 ? num_hb_remainder : 1),
+                (args.num_head * args.num_batch) / swizzle,
                 args.tile_count_semaphore};
     }
 
@@ -241,11 +266,22 @@ public:
         cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
             int block, bidh, bidb;
-            bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(block, tile_idx));
+            int l2_mod, bidhb, bidhb_residual;
+            bidhb = params.l2_major_divmod.divmod(l2_mod, tile_idx);
+            // If we're in the last section (called residual), we don't want to divide by
+            // swizzle. Instead we want to divide by the remainder.
+            if (bidhb < params.num_hb_quotient) {
+                block = params.l2_minor_divmod.divmod(bidhb_residual, l2_mod);
+            } else {
+                block = params.l2_minor_residual_divmod.divmod(bidhb_residual, l2_mod);
+            }
+            bidb = params.head_divmod.divmod(bidh, bidhb * params.l2_minor_divmod.divisor + bidhb_residual);
             int split_idx = 0;
             if constexpr (Split) {
-                bidh = params.nsplits_divmod.divmod(split_idx, bidh);
+                split_idx = params.m_block_divmod.divmod(block, block);
             }
+            // Longest-processing-time-first
+            block = params.m_block_divmod.divisor - 1 - block;
             return {block, bidh, bidb, split_idx};
         }
 

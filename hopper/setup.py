@@ -3,6 +3,7 @@
 import sys
 import warnings
 import os
+import stat
 import re
 import shutil
 import ast
@@ -210,6 +211,8 @@ if not SKIP_CUDA_BUILD:
         # Need to append to path otherwise nvcc can't find cicc in nvvm/bin/cicc
         os.environ["PATH"] = ctk_path_new + os.pathsep + os.environ["PATH"]
         os.environ["PYTORCH_NVCC"] = nvcc_path_new
+        # Make nvcc executable, sometimes after the copy it loses its permissions
+        os.chmod(nvcc_path_new, os.stat(nvcc_path_new).st_mode | stat.S_IEXEC)
 
     cc_flag = []
     cc_flag.append("-gencode")
@@ -259,9 +262,10 @@ if not SKIP_CUDA_BUILD:
         "--ftemplate-backtrace-limit=0",  # To debug template code
         "--expt-extended-lambda",
         "--use_fast_math",
-        # "--ptxas-options=--verbose,--warn-on-local-memory-usage",  # printing out number of registers
-        "--ptxas-options=--verbose",  # printing out number of registers
+        # "--keep",
+        # "--ptxas-options=--verbose,--register-usage-level=5,--warn-on-local-memory-usage",  # printing out number of registers
         # f"--split-compile={os.getenv('NVCC_THREADS', '4')}",  # split-compile is faster
+        "--resource-usage",  # printing out number of registers
         "-lineinfo",
         "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",  # Necessary for the WGMMA shapes that we use
         # "-DCUTLASS_ENABLE_GDC_FOR_SM90",  # For PDL

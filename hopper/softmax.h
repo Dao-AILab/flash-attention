@@ -139,7 +139,7 @@ struct Softmax {
         quad_allreduce_(row_sum, row_sum, sum_op);
         TensorT scores_scale;
         #pragma unroll
-        for (int mi = 0; mi < size(row_max); ++mi) {
+        for (int mi = 0; mi < size(row_sum); ++mi) {
             float sum = row_sum(mi);
             float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
             scores_scale(mi) = inv_sum * final_scale;
@@ -159,7 +159,7 @@ struct Softmax {
         Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
         static_assert(CUTE_STATIC_V(size<0>(acc_o_rowcol)) == kNRows);
         #pragma unroll
-        for (int mi = 0; mi < size(row_max); ++mi) {
+        for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
             #pragma unroll
             for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale(mi); }
         }

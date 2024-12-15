@@ -40,7 +40,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         flash::VarlenDynamicPersistentTileScheduler<kBlockM, CollectiveMainloop::NumMmaThreads, CollectiveMainloop::NumProducerThreads, Split, PackGQA>,
         std::conditional_t<!Is_causal && !Is_local,
             flash::StaticPersistentTileScheduler<Split>,
-            flash::DynamicPersistentTileScheduler<CollectiveMainloop::NumMmaThreads, CollectiveMainloop::NumProducerThreads, Split>>
+            flash::DynamicPersistentTileScheduler<CollectiveMainloop::NumMmaThreads, CollectiveMainloop::NumProducerThreads, Split, PackGQA>
+        >
     >;
     using SchedulerSingleTile = flash::SingleTileScheduler<Varlen, Split, PackGQA, kBlockM>;
     // If Split, PagedKV, or AppendKV then we probably don't have enough work for PersistentScheduler to be useful.
@@ -116,6 +117,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         num_blocks_m, !PackGQA ? params.h : params.h_k, params.b, params.num_splits,
         params.h / params.h_k,
         params.seqlen_q,
+        params.seqlen_k, params.d, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q
     };
 

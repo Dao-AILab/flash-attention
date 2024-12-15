@@ -14,6 +14,7 @@
 #include "flash.h"
 #include "static_switch.h"
 #include "tile_size.h"
+#include "heuristics.h"
 
 // Copied from https://github.com/pytorch/pytorch/commit/7931eee5c5ebcdf468bff4d308510b03355cd909
 // This is so that we can pass in torch.dtype as a parameter to the function.
@@ -343,35 +344,6 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
     #endif
 }
 
-// Find the number of splits that maximizes the occupancy. For example, if we have
-// batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
-// better than having 3 splits (efficiency = 0.67). However, we also don't want too many
-// splits as that would incur more HBM reads/writes.
-// So we find the best efficiency, then find the smallest number of splits that gets 85%
-// of the best efficiency.
-inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
-    // If we have enough to almost fill the SMs, then just use 1 split
-    if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
-    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
-    float max_efficiency = 0.f;
-    std::vector<float> efficiency;
-    efficiency.reserve(max_splits);
-    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
-        float eff = n_waves / ceil(n_waves);
-        // printf("num_splits = %d, eff = %f\n", num_splits, eff);
-        if (eff > max_efficiency) { max_efficiency = eff; }
-        efficiency.push_back(eff);
-    }
-    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
-            // printf("num_splits chosen = %d\n", num_splits);
-            return num_splits;
-        }
-    }
-    return 1;
-}
-
 inline bool get_pack_gqa(Flash_fwd_params const& params) {
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
     return false;
@@ -380,7 +352,7 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     if (params.h == params.h_k) { return false; }
     // This needs to match the kernel configs
     auto [kBlockM, kBlockN, Mma1_is_RS, IntraWGOverlap] = tile_size_fwd(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
-    return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.is_causal || params.is_local, params.seqlen_q, params.h / params.h_k, kBlockM);
+    return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.seqlen_q, params.h / params.h_k, kBlockM);
     #endif
 }
 

@@ -1,5 +1,6 @@
 import os
 import math
+import itertools
 
 import pytest
 import torch
@@ -365,7 +366,6 @@ def test_flash_attn_output(
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    num_splits = 1
     q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
     if softcap > 0.0:
         # Ensure the values of qk are at least within softcap range.
@@ -383,17 +383,6 @@ def test_flash_attn_output(
     q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
     if V_colmajor:
         v = rearrange(rearrange(v.detach(), "b s h d -> b h d s").contiguous(), "b h d s -> b s h d").requires_grad_()
-    out, lse = flash_attn_func(
-        q,
-        k,
-        v,
-        causal=causal,
-        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
-        window_size=window_size,
-        sink_token_length=sink_token_length,
-        softcap=softcap,
-        num_splits=num_splits
-    )
     out_ref, attn_ref = attention_ref(
         q_ref,
         k_ref,
@@ -429,13 +418,35 @@ def test_flash_attn_output(
     # qk = torch.einsum('bthd,bshd->bhts', q_ref.float() / math.sqrt(d), k_ref.float())
     # lse_ref = torch.logsumexp(qk, dim=-1)
 
-    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-    # if not causal:
-    #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
-    # breakpoint()
+    pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
+    num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
+    for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
+        out, lse = flash_attn_func(
+            q,
+            k,
+            v,
+            causal=causal,
+            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+            window_size=window_size,
+            sink_token_length=sink_token_length,
+            softcap=softcap,
+            pack_gqa=pack_gqa,
+            num_splits=num_splits
+        )
+        print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+        print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+        # if not causal:
+        #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+        # breakpoint()
+
+        # Check that FlashAttention's numerical error is at most twice the numerical error
+        # of a Pytorch implementation.
+        multiple = 2 if dtype != torch.float8_e4m3fn else 3
+        abs_tol = 1e-4 if softcap == 0.0 else 3e-4
+        assert (out - out_ref).abs().max().item() <= multiple * (out_pt - out_ref).abs().max().item() + abs_tol
+
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor:
         g = torch.randn_like(out)
@@ -486,12 +497,6 @@ def test_flash_attn_output(
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
         # breakpoint()
 
-
-    # Check that FlashAttention's numerical error is at most twice the numerical error
-    # of a Pytorch implementation.
-    multiple = 2 if dtype != torch.float8_e4m3fn else 3
-    abs_tol = 1e-4 if softcap == 0.0 else 3e-4
-    assert (out - out_ref).abs().max().item() <= multiple * (out_pt - out_ref).abs().max().item() + abs_tol
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor:
         multiple = 2
@@ -568,7 +573,7 @@ def test_flash_attn_varlen_output(
     # Put window_size after QKV randn so that window_size changes from test to test
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     if dtype == torch.float8_e4m3fn:
-        q_descale, k_descale, v_descale = [torch.rand(1, device=device, dtype=torch.float32) * 2 for _ in range(3)]
+        q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
     else:
         q_descale, k_descale, v_descale = None, None, None
     q, k, v = [x.detach().requires_grad_() for x in (q_ref, k_ref, v_ref)]
