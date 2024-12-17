@@ -1164,7 +1164,6 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size_rounded = head_size <= 64 ? 64 : (head_size <= 128 ? round_multiple(head_size, 32) : round_multiple(head_size, 64));
     // Very important that these match the kernel configs
-    // const int kBlockM = head_size_rounded <= 64 ? 128 : 64;
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
     const int kBlockM = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
         : (head_size_rounded <= 96 ? 64
@@ -1325,8 +1324,9 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
                 // batch_size_k x seqlen_k x num_heads_k x head_size or num_pages x page_size x num_heads_k x head_size if there's a page_table.
                 const at::Tensor &kcache,
                 const at::Tensor &vcache,
-                c10::optional<const at::Tensor> &k_, // batch_size x seqlen_knew x num_heads_k x head_size
-                c10::optional<const at::Tensor> &v_, // batch_size x seqlen_knew x num_heads_k x head_size
+                // batch_size x seqlen_k_new x num_heads_k x head_size or total_k_new x num_heads_k x head_size
+                c10::optional<const at::Tensor> &k_,
+                c10::optional<const at::Tensor> &v_,
                 // batch_size x seqlen_q x num_heads x head_size or total_q x num_heads x head_size
                 c10::optional<at::Tensor> &out_,
                 c10::optional<const at::Tensor> &seqused_k_, // batch_size
@@ -1336,6 +1336,7 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
                 c10::optional<const at::Tensor> &leftpad_k_, // batch_size
                 c10::optional<const at::Tensor> &page_table_, // batch_size_k x max_num_pages_per_seq
                 c10::optional<const at::Tensor> &cu_seqlens_q_,  // b+1
+                c10::optional<const at::Tensor> &cu_seqlens_k_new_,  // b+1
                 c10::optional<int> max_seqlen_q_,
                 float const softmax_scale,
                 bool is_causal,
@@ -1514,6 +1515,14 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         TORCH_CHECK(v_.has_value(), "If key is supplied, value must also be passed in");
         TORCH_CHECK(seqused_k_.has_value(), "If key is supplied, seqlens_k must also be passed in");
         TORCH_CHECK(seqlen_q <= seqlen_k, "If key is supplied, it must have seqlen <= the seqlen of the KV cache");
+        at::Tensor cu_seqlens_k_new;
+        bool const is_varlen_k_new = cu_seqlens_k_new_.has_value();
+        if (is_varlen_k_new) {
+            cu_seqlens_k_new = cu_seqlens_k_new_.value();
+            CHECK_DEVICE(cu_seqlens_k_new);
+            TORCH_CHECK(cu_seqlens_k_new.dtype() == torch::kInt32, "cu_seqlens_k_new must have dtype torch.int32");
+            TORCH_CHECK(cu_seqlens_k_new.stride(-1) == 1, "cu_seqlens_k_new must have contiguous last dimension");
+        }
         k = k_.value();
         v = v_.value();
         TORCH_CHECK(k.dtype() == q_type, "Key must have the same dtype as query");
@@ -1521,9 +1530,17 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         CHECK_DEVICE(k); CHECK_DEVICE(v);
         TORCH_CHECK(k.stride(-1) == 1, "Key tensor must have contiguous last dimension");
         TORCH_CHECK(v.stride(-1) == 1, "Value tensor must have contiguous last dimension");
-        int seqlen_knew = k.size(1);
-        CHECK_SHAPE(k, batch_size, seqlen_knew, num_heads_k, head_size_og);
-        CHECK_SHAPE(v, batch_size, seqlen_knew, num_heads_k, head_size_og);
+        // We don't need max_seqlen_k_new, so seqlen_k_new can be whatever when is_varlen_k_new
+        int seqlen_k_new = !is_varlen_k_new ? k.size(1) : 0;
+        int total_k_new = !is_varlen_k_new ? batch_size * k.size(1): k.size(0);
+        if (!is_varlen_k_new) {
+            CHECK_SHAPE(k, batch_size, seqlen_k_new, num_heads_k, head_size_og);
+            CHECK_SHAPE(v, batch_size, seqlen_k_new, num_heads_k, head_size_og);
+        } else {
+            CHECK_SHAPE(k, total_k_new, num_heads_k, head_size_og);
+            CHECK_SHAPE(v, total_k_new, num_heads_k, head_size_og);
+            CHECK_SHAPE(cu_seqlens_k_new, batch_size + 1);
+        }
         if (head_size_og % 8 != 0) {
             k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
             v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
@@ -1531,16 +1548,22 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
             k_padded = k;
             v_padded = v;
         }
-        params.seqlen_knew = seqlen_knew;
+        params.seqlen_knew = seqlen_k_new;
+        params.total_knew = total_k_new;
         params.knew_ptr = k_padded.data_ptr();
         params.vnew_ptr = v_padded.data_ptr();
         // All stride are in elements, not bytes.
-        params.knew_batch_stride = k_padded.stride(0);
-        params.vnew_batch_stride = v_padded.stride(0);
         params.knew_row_stride = k_padded.stride(-3);
         params.vnew_row_stride = v_padded.stride(-3);
         params.knew_head_stride = k_padded.stride(-2);
         params.vnew_head_stride = v_padded.stride(-2);
+        if (!is_varlen_k_new) {
+            params.knew_batch_stride = k_padded.stride(0);
+            params.vnew_batch_stride = v_padded.stride(0);
+        }
+        if (is_varlen_k_new) {
+            params.cu_seqlens_knew = static_cast<int*>(cu_seqlens_k_new.data_ptr());
+        }
     }
 
     if (leftpad_k_.has_value()) {

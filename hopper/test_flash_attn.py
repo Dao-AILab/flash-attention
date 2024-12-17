@@ -742,7 +742,7 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("has_batch_idx", [False, True])
 # @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [False, True])
-# @pytest.mark.parametrize("varlen_q", [False])
+# @pytest.mark.parametrize("varlen_q", [True])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
@@ -819,9 +819,15 @@ def test_flash_attn_kvcache(
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
     seqlen_new = seqlen_q if seqlen_new_eq_seqlen_q else torch.randint(1, seqlen_q + 1, (1,)).item()
+    cu_seqlens_k_new = None
+    key_new_padding_mask = None
     if new_kv:
         k = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
         v = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
+        if varlen_q:  # k & v are also varlen
+            key_new_padding_mask = generate_random_padding_mask(seqlen_new, batch_size, device, mode="random")
+            k_unpad, indices_k, cu_seqlens_k_new, *rest = unpad_input(k, key_new_padding_mask)
+            v_unpad, *rest = unpad_input(v, key_new_padding_mask)
     else:
         k, v = None, None
     if page_size is None:
@@ -865,7 +871,11 @@ def test_flash_attn_kvcache(
         cache_batch_idx = None
     arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
     cache_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")
-    key_padding_mask = arange < cache_seqlens_expanded + (seqlen_new if new_kv else 0)
+    if not new_kv:
+        key_padding_mask = arange < cache_seqlens_expanded
+    else:
+        k_new_seqlens = key_new_padding_mask.sum(-1, keepdims=True) if varlen_q else seqlen_new
+        key_padding_mask = arange < cache_seqlens_expanded + k_new_seqlens
     if has_leftpad:
         key_padding_mask = torch.logical_and(
             key_padding_mask, arange >= cache_leftpad.unsqueeze(-1).expand(-1, seqlen_k)
@@ -911,10 +921,15 @@ def test_flash_attn_kvcache(
     v_cache_ref = (v_cache if not has_batch_idx else v_cache[cache_batch_idx]).clone()
     if new_kv:
         update_mask = torch.logical_and(
-            cache_seqlens_expanded <= arange, arange < cache_seqlens_expanded + seqlen_new
+            cache_seqlens_expanded <= arange, arange < cache_seqlens_expanded + k_new_seqlens
         )
-        k_cache_ref[update_mask] = rearrange(k_ro, "b s ... -> (b s) ...")
-        v_cache_ref[update_mask] = rearrange(v, "b s ... -> (b s) ...")
+        k_to_update = rearrange(k_ro, "b s ... -> (b s) ...")
+        v_to_update = rearrange(v, "b s ... -> (b s) ...")
+        if varlen_q:
+            k_to_update = k_to_update[indices_k]
+            v_to_update = v_to_update[indices_k]
+        k_cache_ref[update_mask] = k_to_update
+        v_cache_ref[update_mask] = v_to_update
     k_cache_rep = repeat(k_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
     v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
     out_ref, _ = attention_ref(
@@ -954,8 +969,8 @@ def test_flash_attn_kvcache(
         q if not varlen_q else q_unpad,
         k_cache if page_size is None else k_cache_paged,
         v_cache if page_size is None else v_cache_paged,
-        k,
-        v,
+        k if not varlen_q else k_unpad,
+        v if not varlen_q else v_unpad,
         rotary_cos=cos,
         rotary_sin=sin,
         cache_seqlens=cache_seqlens,
@@ -963,6 +978,7 @@ def test_flash_attn_kvcache(
         cache_leftpad=cache_leftpad,
         page_table=page_table,
         cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k_new=cu_seqlens_k_new,
         max_seqlen_q=max_seqlen_q,
         causal=causal,
         window_size=window_size,

@@ -568,6 +568,7 @@ def flash_attn_with_kvcache(
     cache_leftpad: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     softmax_scale=None,
     causal=False,
@@ -677,6 +678,7 @@ def flash_attn_with_kvcache(
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     page_table = maybe_contiguous(page_table)
     cu_seqlens_q = maybe_contiguous(cu_seqlens_q)
+    cu_seqlens_k_new = maybe_contiguous(cu_seqlens_k_new)
     out, softmax_lse, *rest = flashattn_hopper_cuda.fwd_kvcache(
         q,
         k_cache,
@@ -691,6 +693,7 @@ def flash_attn_with_kvcache(
         cache_leftpad,
         page_table,
         cu_seqlens_q,
+        cu_seqlens_k_new,
         max_seqlen_q,
         softmax_scale,
         causal,

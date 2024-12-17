@@ -201,7 +201,7 @@ template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerT
 class DynamicPersistentTileScheduler {
 
     // This scheduler targets the causal (or local) case where each tile takes different
-    // amount of time. We using longest-processing-time-first scheduling:
+    // amount of time. We use longest-processing-time-first scheduling:
     // the longest remaining tile is assigned to the first SM that's free.
     // SM indicates they are free by incrementing a semaphore.
     // However, we have to make sure K & V still fit into L2 cache, so we perform scheduling
