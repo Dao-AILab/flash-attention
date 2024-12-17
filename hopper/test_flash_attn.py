@@ -828,8 +828,10 @@ def test_flash_attn_kvcache(
             key_new_padding_mask = generate_random_padding_mask(seqlen_new, batch_size, device, mode="random")
             k_unpad, indices_k, cu_seqlens_k_new, *rest = unpad_input(k, key_new_padding_mask)
             v_unpad, *rest = unpad_input(v, key_new_padding_mask)
+        else:
+            k_unpad, v_unpad = k, v
     else:
-        k, v = None, None
+        k, v, k_unpad, v_unpad = None, None, None, None
     if page_size is None:
         k_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
         v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
@@ -963,14 +965,16 @@ def test_flash_attn_kvcache(
     v_cache_paged = v_cache_paged.to(dtype) if page_size is not None else None
     k = k.to(dtype) if k is not None else None
     v = v.to(dtype) if v is not None else None
+    k_unpad = k_unpad.to(dtype) if k_unpad is not None else None
+    v_unpad = v_unpad.to(dtype) if v_unpad is not None else None
     cos = cos.to(dtype) if cos is not None else None
     sin = sin.to(dtype) if sin is not None else None
     out, lse, *rest = flash_attn_with_kvcache(
         q if not varlen_q else q_unpad,
         k_cache if page_size is None else k_cache_paged,
         v_cache if page_size is None else v_cache_paged,
-        k if not varlen_q else k_unpad,
-        v if not varlen_q else v_unpad,
+        k if not new_kv or not varlen_q else k_unpad,
+        v if not new_kv or not varlen_q else v_unpad,
         rotary_cos=cos,
         rotary_sin=sin,
         cache_seqlens=cache_seqlens,
