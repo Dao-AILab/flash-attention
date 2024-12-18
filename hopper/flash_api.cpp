@@ -259,53 +259,57 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     TORCH_CHECK(params.num_splits >= 1);
     SPLIT_SWITCH(params.num_splits > 1, Split, [&] {
         PAGEDKV_SWITCH(params.page_table, PagedKV, [&] {
-            if (!params.is_e4m3) {
-                if (params.is_bf16) {
-                    if (params.d <= 64) {
-                        run_mha_fwd_<cutlass::bfloat16_t, 64, Split, PagedKV>(params, stream);
-                    } else if (params.d <= 96) {
-                        run_mha_fwd_<cutlass::bfloat16_t, 96, Split, PagedKV>(params, stream);
-                    } else if (params.d <= 128) {
-                        run_mha_fwd_<cutlass::bfloat16_t, 128, Split, PagedKV>(params, stream);
-                    } else if (params.d <= 192) {
-                        run_mha_fwd_<cutlass::bfloat16_t, 192, Split, PagedKV>(params, stream);
+            PACKGQA_SWITCH(params.pack_gqa, PackGQA, [&] {
+                SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
+                    if (!params.is_e4m3) {
+                        if (params.is_bf16) {
+                            if (params.d <= 64) {
+                                run_mha_fwd_<cutlass::bfloat16_t, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                            } else if (params.d <= 96) {
+                                run_mha_fwd_<cutlass::bfloat16_t, 96, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                            } else if (params.d <= 128) {
+                                run_mha_fwd_<cutlass::bfloat16_t, 128, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                            } else if (params.d <= 192) {
+                                run_mha_fwd_<cutlass::bfloat16_t, 192, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                            } else {
+                                run_mha_fwd_<cutlass::bfloat16_t, 256, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                            }
+                        } else {
+                            #ifndef FLASHATTENTION_DISABLE_FP16
+                            if (params.d <= 64) {
+                                run_mha_fwd_<cutlass::half_t, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                            } else if (params.d <= 96) {
+                                run_mha_fwd_<cutlass::half_t, 96, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                            } else if (params.d <= 128) {
+                                run_mha_fwd_<cutlass::half_t, 128, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                            } else if (params.d <= 192) {
+                                run_mha_fwd_<cutlass::half_t, 192, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                            } else {
+                                run_mha_fwd_<cutlass::half_t, 256, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                            }
+                            #else
+                            TORCH_CHECK(false, "This flash attention build does not support FP16.");
+                            #endif
+                        }
                     } else {
-                        run_mha_fwd_<cutlass::bfloat16_t, 256, Split, PagedKV>(params, stream);
+                        #ifndef FLASHATTENTION_DISABLE_FP8
+                        if (params.d <= 64) {
+                            run_mha_fwd_<cutlass::float_e4m3_t, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                        } else if (params.d <= 96) {
+                            run_mha_fwd_<cutlass::float_e4m3_t, 96, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                        } else if (params.d <= 128) {
+                            run_mha_fwd_<cutlass::float_e4m3_t, 128, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                        } else if (params.d <= 192) {
+                            run_mha_fwd_<cutlass::float_e4m3_t, 192, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                        } else {
+                            run_mha_fwd_<cutlass::float_e4m3_t, 256, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                        }
+                        #else
+                        TORCH_CHECK(false, "This flash attention build does not support FP8.");
+                        #endif
                     }
-                } else {
-                    #ifndef FLASHATTENTION_DISABLE_FP16
-                    if (params.d <= 64) {
-                        run_mha_fwd_<cutlass::half_t, 64, Split, PagedKV>(params, stream);
-                    } else if (params.d <= 96) {
-                        run_mha_fwd_<cutlass::half_t, 96, Split, PagedKV>(params, stream);
-                    } else if (params.d <= 128) {
-                        run_mha_fwd_<cutlass::half_t, 128, Split, PagedKV>(params, stream);
-                    } else if (params.d <= 192) {
-                        run_mha_fwd_<cutlass::half_t, 192, Split, PagedKV>(params, stream);
-                    } else {
-                        run_mha_fwd_<cutlass::half_t, 256, Split, PagedKV>(params, stream);
-                    }
-                    #else
-                    TORCH_CHECK(false, "This flash attention build does not support FP16.");
-                    #endif
-                }
-            } else {
-                #ifndef FLASHATTENTION_DISABLE_FP8
-                if (params.d <= 64) {
-                    run_mha_fwd_<cutlass::float_e4m3_t, 64, Split, PagedKV>(params, stream);
-                } else if (params.d <= 96) {
-                    run_mha_fwd_<cutlass::float_e4m3_t, 96, Split, PagedKV>(params, stream);
-                } else if (params.d <= 128) {
-                    run_mha_fwd_<cutlass::float_e4m3_t, 128, Split, PagedKV>(params, stream);
-                } else if (params.d <= 192) {
-                    run_mha_fwd_<cutlass::float_e4m3_t, 192, Split, PagedKV>(params, stream);
-                } else {
-                    run_mha_fwd_<cutlass::float_e4m3_t, 256, Split, PagedKV>(params, stream);
-                }
-                #else
-                TORCH_CHECK(false, "This flash attention build does not support FP8.");
-                #endif
-            }
+                });
+            });
         });
     });
 }

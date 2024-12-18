@@ -31,9 +31,9 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd(int headdim, bool is_ca
         } else if (headdim <= 96) {
             return {192, 128, true, true};
         } else if (headdim <= 128) {
-            return {128, v_colmajor || (paged_kv && is_local) ? 192 : 224, true, true};
+            return {128, v_colmajor || ((paged_kv || softcap) && is_local) ? 192 : 224, true, true};
         } else if (headdim <= 192) {
-            return {128, paged_kv && is_local ? 128 : 160, true, true};
+            return {128, (paged_kv || softcap) && is_local ? 128 : 160, true, true};
         } else {
             return {128, is_local ? 64 : 128, true, !paged_kv};  // PagedKV uses more registers so we disabled IntraWGOverlap
         }

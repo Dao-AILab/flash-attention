@@ -244,13 +244,17 @@ if not SKIP_CUDA_BUILD:
 
     DTYPE_FWD = ["bf16"] + (["fp16"] if not DISABLE_FP16 else []) + (["e4m3"] if not DISABLE_FP8 else [])
     DTYPE_BWD = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
-    HEAD_DIMENSIONS = [64, 96, 128, 192, 256]
+    HEAD_DIMENSIONS_BWD = [64, 96, 128, 192, 256]
+    HEAD_DIMENSIONS_FWD = ["all"]
+    # HEAD_DIMENSIONS_FWD = [128]
     SPLIT = [""] + (["_split"] if not DISABLE_SPLIT else [])
     PAGEDKV = [""] + (["_paged"] if not DISABLE_PAGEDKV else [])
-    sources_fwd = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}_sm90.cu"
-                   for hdim, dtype, split, paged in itertools.product(HEAD_DIMENSIONS, DTYPE_FWD, SPLIT, PAGEDKV)]
+    SOFTCAP = [""] + (["_softcap"] if not DISABLE_SOFTCAP else [])
+    PACKGQA = [""] + (["_packgqa"] if not DISABLE_PACKGQA else [])
+    sources_fwd = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
+                   for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)]
     sources_bwd = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}_sm90.cu"
-                   for hdim, dtype in itertools.product(HEAD_DIMENSIONS, DTYPE_BWD)]
+                   for hdim, dtype in itertools.product(HEAD_DIMENSIONS_BWD, DTYPE_BWD)]
     if DISABLE_BACKWARD:
         sources_bwd = []
     sources = ["flash_api.cpp"] + sources_fwd + sources_bwd
@@ -260,7 +264,6 @@ if not SKIP_CUDA_BUILD:
         "-O3",
         "-std=c++17",
         "--ftemplate-backtrace-limit=0",  # To debug template code
-        "--expt-extended-lambda",
         "--use_fast_math",
         # "--keep",
         # "--ptxas-options=--verbose,--register-usage-level=5,--warn-on-local-memory-usage",  # printing out number of registers

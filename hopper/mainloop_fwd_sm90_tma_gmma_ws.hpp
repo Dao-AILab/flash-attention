@@ -732,7 +732,9 @@ struct CollectiveMainloopFwd {
             n_block_prev = n_block;
             if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
         }
-        if constexpr (Is_local) {
+        // if constexpr (Is_local) {
+        // Disable sink token code for now
+        if constexpr (false && Is_local) {
             static constexpr int kBlockN = get<1>(TileShape_MNK{});
             int n_block_sink_max = cute::ceil_div(params.sink_token_length, kBlockN);
             #pragma unroll 1
@@ -1064,11 +1066,12 @@ struct CollectiveMainloopFwd {
                 for (; n_block >= n_block_min; --n_block) {
                     fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
                 }
-                int n_block_sink_max = cute::ceil_div(params.sink_token_length, kBlockN);
-                #pragma unroll 1
-                for (n_block = std::min(n_block, n_block_sink_max - 1); n_block >= 0; --n_block) {
-                    fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
-                }
+                // Disable sink token code for now
+                // int n_block_sink_max = cute::ceil_div(params.sink_token_length, kBlockN);
+                // #pragma unroll 1
+                // for (n_block = std::min(n_block, n_block_sink_max - 1); n_block >= 0; --n_block) {
+                //     fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
+                // }
             }
             // Tell warp 0 that smem_q is ready
             if constexpr (Use_TMA_Q) {  // If !Use_TMA_Q, we don't use the producer WG to load Q
@@ -1145,11 +1148,12 @@ struct CollectiveMainloopFwd {
                 for (; n_block >= n_block_min; --n_block) {
                     fwd_step(n_block, local_mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
                 }
-                int n_block_sink_max = cute::ceil_div(params.sink_token_length, kBlockN);
-                #pragma unroll 1
-                for (n_block = std::min(n_block, n_block_sink_max - 1); n_block >= 0; --n_block) {
-                    fwd_step(n_block, local_mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
-                }
+                // Disable sink token code for now
+                // int n_block_sink_max = cute::ceil_div(params.sink_token_length, kBlockN);
+                // #pragma unroll 1
+                // for (n_block = std::min(n_block, n_block_sink_max - 1); n_block >= 0; --n_block) {
+                //     fwd_step(n_block, local_mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
+                // }
             }
             warp_scheduler_barrier_arrive();
             // Tell warp 0 that smem_q is ready

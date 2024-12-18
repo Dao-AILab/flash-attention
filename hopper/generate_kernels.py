@@ -5,9 +5,12 @@
 
 import argparse
 import itertools
+from collections import namedtuple
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+
+KERNEL_BATCH = namedtuple("Kernel", ["template", "filename"])
 
 DTYPE_MAP = {
     "fp16": "cutlass::half_t",
@@ -20,24 +23,15 @@ DTYPE_MAP_BWD = {
     "bf16": "cutlass::bfloat16_t",
 }
 
-SM = [90]  # Sm80 kernels support up to
+SM = [90]  # Sm kernels support up to
 HEAD_DIMENSIONS = [64, 96, 128, 192, 256]
-PAGEDKV = ["false", "true"]
-SPLIT = ["false", "true"]
+PAGEDKV = [False, True]
+SPLIT = [False, True]
+SOFTCAP = [False, True]
+PACKGQA = [False, True]
 KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_launch_template.h"
 
-template<>
-void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}>(Flash_fwd_params &params, cudaStream_t stream) {{
-    run_mha_fwd_16b<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}>(params, stream);
-}}
-"""
-
-KERNEL_IMPL_TEMPLATE_FWD_FP8 = """#include "flash_fwd_launch_template.h"
-
-template<>
-void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}>(Flash_fwd_params &params, cudaStream_t stream) {{
-    run_mha_fwd_8b<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}>(params, stream);
-}}
+template void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
 """
 
 KERNEL_IMPL_TEMPLATE_BWD = """#include "flash_bwd_launch_template.h"
@@ -54,19 +48,19 @@ class Kernel:
     sm: int
     dtype: str
     head_dim: int
-    split: str
-    paged_kv: str
+    split: bool
+    paged_kv: bool
+    softcap: bool
+    packgqa: bool
     direction: str
 
     @property
     def template(self) -> str:
-        if self.direction == "fwd" and self.dtype != "e4m3":
-            return KERNEL_IMPL_TEMPLATE_FWD.format(
-                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim, SPLIT=self.split, PAGEDKV=self.paged_kv
-            )
         if self.direction == "fwd":
-            return KERNEL_IMPL_TEMPLATE_FWD_FP8.format(
-                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim, SPLIT=self.split, PAGEDKV=self.paged_kv
+            return KERNEL_IMPL_TEMPLATE_FWD.format(
+                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim,
+                SPLIT=str(self.split).lower(), PAGEDKV=str(self.paged_kv).lower(),
+                SOFTCAP=str(self.softcap).lower(), PACKGQA=str(self.packgqa).lower()
             )
         elif self.direction == "bwd":
             return KERNEL_IMPL_TEMPLATE_BWD.format(
@@ -75,19 +69,28 @@ class Kernel:
 
     @property
     def filename(self) -> str:
-        return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}_{'paged_' if self.paged_kv == 'true' else ''}{'split_' if self.split == 'true' else ''}sm{self.sm}.cu"
+        return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}{'_paged' if self.paged_kv else ''}{'_split' if self.split else ''}{'_softcap' if self.softcap else ''}{'_packgqa' if self.packgqa else ''}_sm{self.sm}.cu"
 
 
 def get_all_kernels() -> List[Kernel]:
-    for dtype, head_dim, split, paged_kv, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SPLIT, PAGEDKV, SM):
-        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=split, paged_kv=paged_kv, direction="fwd")
+    for dtype, head_dim, split, paged_kv, softcap, packgqa, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SPLIT, PAGEDKV, SOFTCAP, PACKGQA, SM):
+        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
     for dtype, head_dim, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SM):
-        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split='false', paged_kv='false', direction="bwd")
+        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=False, paged_kv=False, softcap=False, packgqa=False, direction="bwd")
+
+
+def batch_hdim(kernels_all) -> List[KERNEL_BATCH]:
+    for dtype, split, paged_kv, softcap, packgqa, sm in itertools.product(DTYPE_MAP.keys(), SPLIT, PAGEDKV, SOFTCAP, PACKGQA, SM):
+        kernels = [k for k in kernels_all if k.direction == "fwd" and k.dtype == dtype and k.split == split and k.paged_kv == paged_kv and k.softcap == softcap and k.packgqa == packgqa]
+        assert len(kernels) > 0
+        filename = f"flash_fwd_hdimall_{dtype}{'_paged' if paged_kv else ''}{'_split' if split else ''}{'_softcap' if softcap else ''}{'_packgqa' if packgqa else ''}_sm{sm}.cu"
+        template = "\n".join([f"#include \"{k.filename}\"" for k in kernels])
+        yield KERNEL_BATCH(template, filename)
 
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:
     prelude = """// Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-// Splitting the different head dimensions to different files to speed up compilation.
+// Splitting the different template instantiations to different files to speed up compilation.
 // This file is auto-generated. See "generate_kernels.py"\n
 """
     (autogen_dir / kernel.filename).write_text(prelude + kernel.template)
@@ -96,7 +99,10 @@ def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:
 def main(output_dir: Optional[str]) -> None:
     output_dir = Path(output_dir) if output_dir is not None else Path(__file__).parent
     output_dir.mkdir(parents=True, exist_ok=True)
-    for kernel in get_all_kernels():
+    kernels_all = list(get_all_kernels())
+    for kernel in kernels_all:
+        write_kernel(kernel, output_dir)
+    for kernel in batch_hdim(kernels_all):
         write_kernel(kernel, output_dir)
 
 
