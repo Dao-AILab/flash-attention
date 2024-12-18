@@ -72,6 +72,7 @@ struct CollectiveMainloopBwd {
     static_assert(get<0>(ClusterShape{}) == 1 && get<2>(ClusterShape{}) == 1);
 
     static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
+    static constexpr int NumProducerThreads = cutlass::NumThreadsPerWarp * 2;
 
     static_assert(NumMmaWarpGroups % AtomLayoutMSdP == 0);
     static_assert(NumMmaWarpGroups % AtomLayoutNdKV == 0);
@@ -673,8 +674,8 @@ struct CollectiveMainloopBwd {
 
     CUTLASS_DEVICE void
     mma_init() {
-        // Tell producer (warp 0) that smem_k and smem_v are ready
         // We're not currently using this bc we're not using persistent scheduler
+        // // Tell producer (warp 0) that smem_k and smem_v are ready
         // cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::KVEmpty) /*id*/);
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         if constexpr (dQacc_use_TMA) {

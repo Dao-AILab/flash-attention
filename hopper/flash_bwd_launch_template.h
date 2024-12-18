@@ -82,7 +82,6 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         flash::CollectiveEpilogueBwdGQA<TileShape_MNK, ElementAccum, CollectiveMainloop::NumMmaThreads, Varlen, Deterministic>
     >;
     using Scheduler = flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>;
-    // using Scheduler = flash::StaticPersistentTileScheduler;
     using AttnKernel = flash::FlashAttnBwd<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
 
     typename CollectiveMainloop::Arguments mainloop_args {

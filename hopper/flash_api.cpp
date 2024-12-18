@@ -1086,6 +1086,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
     params.sink_token_length = sink_token_length;
 
+    // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
+    // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
     // Will be zero'ed out in the backward preprocess kernel
     at::Tensor dq_semaphore = torch::empty({(seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, opts.dtype(torch::kInt32));
     params.dq_semaphore = dq_semaphore.data_ptr<int>();
@@ -1326,6 +1328,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
     params.total_k = total_k;
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
 
+    // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
+    // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
     // Will be zero'ed out in the backward preprocess kernel
     at::Tensor dq_semaphore = torch::empty({(max_seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, opts.dtype(torch::kInt32));
     params.dq_semaphore = dq_semaphore.data_ptr<int>();

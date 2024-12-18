@@ -226,6 +226,9 @@ struct CollectiveEpilogueBwd {
             Tensor tdKVrdK = make_fragment_like(tdKVgdK);
             cute::copy(gmem_tiled_copy_dKV, tdKVsdV, tdKVrdV);
             cute::copy(gmem_tiled_copy_dKV, tdKVsdK, tdKVrdK);
+            // // Tell warp 0 that smem_k and smem_v are ready
+            // cutlass::arch::fence_view_async_shared(); // ensure smem reads are done before next TMA to smem_k/v
+            // cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::KVEmpty) /*id*/);
             // Construct identity layout for gdKV
             Tensor cdKV = cute::make_identity_tensor(select<1, 2>(TileShape_MNK{}));  // (BLK_M,BLK_K) -> (blk_m,blk_k)
             // Repeat the partitioning with identity layouts
@@ -441,6 +444,8 @@ struct CollectiveEpilogueBwdGQA {
         if constexpr (Deterministic) {
             Barrier::arrive_inc(lock_ptr, thread_idx, n_block * num_batch * num_head_kv);
         }
+        // // Tell warp 0 that smem_k and smem_v are ready
+        // cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::KVEmpty) /*id*/);
     }
 
     CUTLASS_DEVICE void
