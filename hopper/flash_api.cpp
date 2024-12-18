@@ -264,43 +264,35 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                         if (params.is_bf16) {
                             #ifndef FLASHATTENTION_DISABLE_HDIM64
                             if (params.d <= 64) { return run_mha_fwd_<cutlass::bfloat16_t, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                            #else
+                            #endif
                             #ifndef FLASHATTENTION_DISABLE_HDIM96
                             if (params.d <= 96) { return run_mha_fwd_<cutlass::bfloat16_t, 96, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                            #else
+                            #endif
                             #ifndef FLASHATTENTION_DISABLE_HDIM128
                             if (params.d <= 128) { return run_mha_fwd_<cutlass::bfloat16_t, 128, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                            #else
+                            #endif
                             #ifndef FLASHATTENTION_DISABLE_HDIM192
                             if (params.d <= 192) { return run_mha_fwd_<cutlass::bfloat16_t, 192, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                            #else
+                            #endif
                             #ifndef FLASHATTENTION_DISABLE_HDIM256
                             if (params.d <= 256) { return run_mha_fwd_<cutlass::bfloat16_t, 256, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                            #endif
-                            #endif
-                            #endif
-                            #endif
                             #endif
                         } else {
                             #ifndef FLASHATTENTION_DISABLE_FP16
                             #ifndef FLASHATTENTION_DISABLE_HDIM64
                             if (params.d <= 64) { return run_mha_fwd_<cutlass::half_t, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                            #else
+                            #endif
                             #ifndef FLASHATTENTION_DISABLE_HDIM96
                             if (params.d <= 96) { return run_mha_fwd_<cutlass::half_t, 96, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                            #else
+                            #endif
                             #ifndef FLASHATTENTION_DISABLE_HDIM128
                             if (params.d <= 128) { return run_mha_fwd_<cutlass::half_t, 128, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                            #else
+                            #endif
                             #ifndef FLASHATTENTION_DISABLE_HDIM192
                             if (params.d <= 192) { return run_mha_fwd_<cutlass::half_t, 192, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                            #else
+                            #endif
                             #ifndef FLASHATTENTION_DISABLE_HDIM256
                             if (params.d <= 256) { return run_mha_fwd_<cutlass::half_t, 256, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                            #endif
-                            #endif
-                            #endif
-                            #endif
                             #endif
                             #else
                             TORCH_CHECK(false, "This flash attention build does not support FP16.");
@@ -310,22 +302,18 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                         #ifndef FLASHATTENTION_DISABLE_FP8
                         #ifndef FLASHATTENTION_DISABLE_HDIM64
                         if (params.d <= 64) { return run_mha_fwd_<cutlass::float_e4m3_t, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                        #else
+                        #endif
                         #ifndef FLASHATTENTION_DISABLE_HDIM96
                         if (params.d <= 96) { return run_mha_fwd_<cutlass::float_e4m3_t, 96, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                        #else
+                        #endif
                         #ifndef FLASHATTENTION_DISABLE_HDIM128
                         if (params.d <= 128) { return run_mha_fwd_<cutlass::float_e4m3_t, 128, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                        #else
+                        #endif
                         #ifndef FLASHATTENTION_DISABLE_HDIM192
                         if (params.d <= 192) { return run_mha_fwd_<cutlass::float_e4m3_t, 192, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                        #else
+                        #endif
                         #ifndef FLASHATTENTION_DISABLE_HDIM256
                         if (params.d <= 256) { return run_mha_fwd_<cutlass::float_e4m3_t, 256, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
-                        #endif
-                        #endif
-                        #endif
-                        #endif
                         #endif
                         #else
                         TORCH_CHECK(false, "This flash attention build does not support FP8.");
@@ -402,22 +390,18 @@ inline int get_num_splits(Flash_fwd_params const& params) {
 inline int round_up_headdim(int head_size) {
     #ifndef FLASHATTENTION_DISABLE_HDIM64
     if (head_size <= 64) { return 64; }
-    #else
+    #endif
     #ifndef FLASHATTENTION_DISABLE_HDIM96
     if (head_size <= 96) { return 96; }
-    #else
+    #endif
     #ifndef FLASHATTENTION_DISABLE_HDIM128
     if (head_size <= 128) { return 128; }
-    #else
+    #endif
     #ifndef FLASHATTENTION_DISABLE_HDIM192
     if (head_size <= 192) { return 192; }
-    #else
+    #endif
     #ifndef FLASHATTENTION_DISABLE_HDIM256
     if (head_size <= 256) { return 256; }
-    #endif
-    #endif
-    #endif
-    #endif
     #endif
     return 256;
 }
@@ -895,22 +879,18 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             #ifndef FLASHATTENTION_DISABLE_FP16
             #ifndef FLASHATTENTION_DISABLE_HDIM64
             if (params.d <= 64) { return run_mha_bwd_<cutlass::half_t, 64>(params, stream); } 
-            #else
+            #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM96
             if (params.d <= 96) { return run_mha_bwd_<cutlass::half_t, 96>(params, stream); } 
-            #else
+            #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM128
             if (params.d <= 128) { return run_mha_bwd_<cutlass::half_t, 128>(params, stream); } 
-            #else
+            #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM192
             if (params.d <= 192) { return run_mha_bwd_<cutlass::half_t, 192>(params, stream); } 
-            #else
+            #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM256
             if (params.d <= 256) { return run_mha_bwd_<cutlass::half_t, 256>(params, stream); } 
-            #endif
-            #endif
-            #endif
-            #endif
             #endif
             #else
             TORCH_CHECK(false, "This flash attention build does not support FP16.");
@@ -918,22 +898,18 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         } else {
             #ifndef FLASHATTENTION_DISABLE_HDIM64
             if (params.d <= 64) { return run_mha_bwd_<cutlass::bfloat16_t, 64>(params, stream); }
-            #else
+            #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM96
             if (params.d <= 96) { return run_mha_bwd_<cutlass::bfloat16_t, 96>(params, stream); }
-            #else
+            #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM128
             if (params.d <= 128) { return run_mha_bwd_<cutlass::bfloat16_t, 128>(params, stream); }
-            #else
+            #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM192
             if (params.d <= 192) { return run_mha_bwd_<cutlass::bfloat16_t, 192>(params, stream); }
-            #else
+            #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM256
             if (params.d <= 256) { return run_mha_bwd_<cutlass::bfloat16_t, 256>(params, stream); }
-            #endif
-            #endif
-            #endif
-            #endif
             #endif
         }
     #endif
