@@ -4,7 +4,9 @@
 
 #include "flash_bwd_launch_template.h"
 
+#ifndef FLASHATTENTION_DISABLE_HDIM64
 template<>
 void run_mha_bwd_<cutlass::bfloat16_t, 64>(Flash_bwd_params &params, cudaStream_t stream) {
     run_mha_bwd_hdim64<cutlass::bfloat16_t>(params, stream);
 }
+#endif

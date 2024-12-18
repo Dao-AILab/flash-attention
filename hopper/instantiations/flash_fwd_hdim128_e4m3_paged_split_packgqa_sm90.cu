@@ -4,4 +4,6 @@
 
 #include "flash_fwd_launch_template.h"
 
+#ifndef FLASHATTENTION_DISABLE_HDIM128
 template void run_mha_fwd_<cutlass::float_e4m3_t, 128, true, true, false, true>(Flash_fwd_params &params, cudaStream_t stream);
+#endif

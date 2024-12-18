@@ -55,7 +55,6 @@ namespace pybind11::detail {
 
 #endif
 
-
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -263,47 +262,71 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
                     if (!params.is_e4m3) {
                         if (params.is_bf16) {
-                            if (params.d <= 64) {
-                                run_mha_fwd_<cutlass::bfloat16_t, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                            } else if (params.d <= 96) {
-                                run_mha_fwd_<cutlass::bfloat16_t, 96, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                            } else if (params.d <= 128) {
-                                run_mha_fwd_<cutlass::bfloat16_t, 128, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                            } else if (params.d <= 192) {
-                                run_mha_fwd_<cutlass::bfloat16_t, 192, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                            } else {
-                                run_mha_fwd_<cutlass::bfloat16_t, 256, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                            }
+                            #ifndef FLASHATTENTION_DISABLE_HDIM64
+                            if (params.d <= 64) { return run_mha_fwd_<cutlass::bfloat16_t, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                            #else
+                            #ifndef FLASHATTENTION_DISABLE_HDIM96
+                            if (params.d <= 96) { return run_mha_fwd_<cutlass::bfloat16_t, 96, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                            #else
+                            #ifndef FLASHATTENTION_DISABLE_HDIM128
+                            if (params.d <= 128) { return run_mha_fwd_<cutlass::bfloat16_t, 128, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                            #else
+                            #ifndef FLASHATTENTION_DISABLE_HDIM192
+                            if (params.d <= 192) { return run_mha_fwd_<cutlass::bfloat16_t, 192, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                            #else
+                            #ifndef FLASHATTENTION_DISABLE_HDIM256
+                            if (params.d <= 256) { return run_mha_fwd_<cutlass::bfloat16_t, 256, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                            #endif
+                            #endif
+                            #endif
+                            #endif
+                            #endif
                         } else {
                             #ifndef FLASHATTENTION_DISABLE_FP16
-                            if (params.d <= 64) {
-                                run_mha_fwd_<cutlass::half_t, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                            } else if (params.d <= 96) {
-                                run_mha_fwd_<cutlass::half_t, 96, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                            } else if (params.d <= 128) {
-                                run_mha_fwd_<cutlass::half_t, 128, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                            } else if (params.d <= 192) {
-                                run_mha_fwd_<cutlass::half_t, 192, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                            } else {
-                                run_mha_fwd_<cutlass::half_t, 256, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                            }
+                            #ifndef FLASHATTENTION_DISABLE_HDIM64
+                            if (params.d <= 64) { return run_mha_fwd_<cutlass::half_t, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                            #else
+                            #ifndef FLASHATTENTION_DISABLE_HDIM96
+                            if (params.d <= 96) { return run_mha_fwd_<cutlass::half_t, 96, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                            #else
+                            #ifndef FLASHATTENTION_DISABLE_HDIM128
+                            if (params.d <= 128) { return run_mha_fwd_<cutlass::half_t, 128, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                            #else
+                            #ifndef FLASHATTENTION_DISABLE_HDIM192
+                            if (params.d <= 192) { return run_mha_fwd_<cutlass::half_t, 192, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                            #else
+                            #ifndef FLASHATTENTION_DISABLE_HDIM256
+                            if (params.d <= 256) { return run_mha_fwd_<cutlass::half_t, 256, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                            #endif
+                            #endif
+                            #endif
+                            #endif
+                            #endif
                             #else
                             TORCH_CHECK(false, "This flash attention build does not support FP16.");
                             #endif
                         }
                     } else {
                         #ifndef FLASHATTENTION_DISABLE_FP8
-                        if (params.d <= 64) {
-                            run_mha_fwd_<cutlass::float_e4m3_t, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                        } else if (params.d <= 96) {
-                            run_mha_fwd_<cutlass::float_e4m3_t, 96, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                        } else if (params.d <= 128) {
-                            run_mha_fwd_<cutlass::float_e4m3_t, 128, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                        } else if (params.d <= 192) {
-                            run_mha_fwd_<cutlass::float_e4m3_t, 192, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                        } else {
-                            run_mha_fwd_<cutlass::float_e4m3_t, 256, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
-                        }
+                        #ifndef FLASHATTENTION_DISABLE_HDIM64
+                        if (params.d <= 64) { return run_mha_fwd_<cutlass::float_e4m3_t, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                        #else
+                        #ifndef FLASHATTENTION_DISABLE_HDIM96
+                        if (params.d <= 96) { return run_mha_fwd_<cutlass::float_e4m3_t, 96, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                        #else
+                        #ifndef FLASHATTENTION_DISABLE_HDIM128
+                        if (params.d <= 128) { return run_mha_fwd_<cutlass::float_e4m3_t, 128, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                        #else
+                        #ifndef FLASHATTENTION_DISABLE_HDIM192
+                        if (params.d <= 192) { return run_mha_fwd_<cutlass::float_e4m3_t, 192, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                        #else
+                        #ifndef FLASHATTENTION_DISABLE_HDIM256
+                        if (params.d <= 256) { return run_mha_fwd_<cutlass::float_e4m3_t, 256, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                        #endif
+                        #endif
+                        #endif
+                        #endif
+                        #endif
                         #else
                         TORCH_CHECK(false, "This flash attention build does not support FP8.");
                         #endif
@@ -375,6 +398,30 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     return num_splits_heuristic(params.b * params.h_k * num_m_blocks, dprops->multiProcessorCount, num_n_blocks, 128);
     #endif
 }
+
+inline int round_up_headdim(int head_size) {
+    #ifndef FLASHATTENTION_DISABLE_HDIM64
+    if (head_size <= 64) { return 64; }
+    #else
+    #ifndef FLASHATTENTION_DISABLE_HDIM96
+    if (head_size <= 96) { return 96; }
+    #else
+    #ifndef FLASHATTENTION_DISABLE_HDIM128
+    if (head_size <= 128) { return 128; }
+    #else
+    #ifndef FLASHATTENTION_DISABLE_HDIM192
+    if (head_size <= 192) { return 192; }
+    #else
+    #ifndef FLASHATTENTION_DISABLE_HDIM256
+    if (head_size <= 256) { return 256; }
+    #endif
+    #endif
+    #endif
+    #endif
+    #endif
+    return 256;
+}
+
 
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
@@ -469,7 +516,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size = round_multiple(head_size_og, alignment);
-    const int head_size_rounded = head_size <= 64 ? 64 : (head_size <= 128 ? round_multiple(head_size, 32) : round_multiple(head_size, 64));
+    const int head_size_rounded = round_up_headdim(head_size);
     const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
@@ -705,7 +752,7 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size = round_multiple(head_size_og, alignment);
-    const int head_size_rounded = head_size <= 64 ? 64 : (head_size <= 128 ? round_multiple(head_size, 32) : round_multiple(head_size, 64));
+    const int head_size_rounded = round_up_headdim(head_size);
     const int seqlen_q_rounded = round_multiple(max_seqlen_q, 128);
     const int seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
 
@@ -846,32 +893,48 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         // });
         if (!params.is_bf16) {
             #ifndef FLASHATTENTION_DISABLE_FP16
-            if (params.d <= 64) {
-                run_mha_bwd_<cutlass::half_t, 64>(params, stream);
-            } else if (params.d <= 96) {
-                run_mha_bwd_<cutlass::half_t, 96>(params, stream);
-            } else if (params.d <= 128) {
-                run_mha_bwd_<cutlass::half_t, 128>(params, stream);
-            } else if (params.d <= 192) {
-                run_mha_bwd_<cutlass::half_t, 192>(params, stream);
-            } else {
-                run_mha_bwd_<cutlass::half_t, 256>(params, stream);
-            }
+            #ifndef FLASHATTENTION_DISABLE_HDIM64
+            if (params.d <= 64) { return run_mha_bwd_<cutlass::half_t, 64>(params, stream); } 
+            #else
+            #ifndef FLASHATTENTION_DISABLE_HDIM96
+            if (params.d <= 96) { return run_mha_bwd_<cutlass::half_t, 96>(params, stream); } 
+            #else
+            #ifndef FLASHATTENTION_DISABLE_HDIM128
+            if (params.d <= 128) { return run_mha_bwd_<cutlass::half_t, 128>(params, stream); } 
+            #else
+            #ifndef FLASHATTENTION_DISABLE_HDIM192
+            if (params.d <= 192) { return run_mha_bwd_<cutlass::half_t, 192>(params, stream); } 
+            #else
+            #ifndef FLASHATTENTION_DISABLE_HDIM256
+            if (params.d <= 256) { return run_mha_bwd_<cutlass::half_t, 256>(params, stream); } 
+            #endif
+            #endif
+            #endif
+            #endif
+            #endif
             #else
             TORCH_CHECK(false, "This flash attention build does not support FP16.");
             #endif
         } else {
-            if (params.d <= 64) {
-                run_mha_bwd_<cutlass::bfloat16_t, 64>(params, stream);
-            } else if (params.d <= 96) {
-                run_mha_bwd_<cutlass::bfloat16_t, 96>(params, stream);
-            } else if (params.d <= 128) {
-                run_mha_bwd_<cutlass::bfloat16_t, 128>(params, stream);
-            } else if (params.d <= 192) {
-                run_mha_bwd_<cutlass::bfloat16_t, 192>(params, stream);
-            } else {
-                run_mha_bwd_<cutlass::bfloat16_t, 256>(params, stream);
-            }
+            #ifndef FLASHATTENTION_DISABLE_HDIM64
+            if (params.d <= 64) { return run_mha_bwd_<cutlass::bfloat16_t, 64>(params, stream); }
+            #else
+            #ifndef FLASHATTENTION_DISABLE_HDIM96
+            if (params.d <= 96) { return run_mha_bwd_<cutlass::bfloat16_t, 96>(params, stream); }
+            #else
+            #ifndef FLASHATTENTION_DISABLE_HDIM128
+            if (params.d <= 128) { return run_mha_bwd_<cutlass::bfloat16_t, 128>(params, stream); }
+            #else
+            #ifndef FLASHATTENTION_DISABLE_HDIM192
+            if (params.d <= 192) { return run_mha_bwd_<cutlass::bfloat16_t, 192>(params, stream); }
+            #else
+            #ifndef FLASHATTENTION_DISABLE_HDIM256
+            if (params.d <= 256) { return run_mha_bwd_<cutlass::bfloat16_t, 256>(params, stream); }
+            #endif
+            #endif
+            #endif
+            #endif
+            #endif
         }
     #endif
 }
@@ -946,7 +1009,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     is_causal = window_size_left < 0 && window_size_right == 0;
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
-    const int head_size_rounded = head_size <= 64 ? 64 : (head_size <= 128 ? round_multiple(head_size, 32) : round_multiple(head_size, 64));
+    const int head_size_rounded = round_up_headdim(head_size);
     // Very important that these match the kernel configs
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
     const int kBlockM = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
@@ -1166,7 +1229,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
     is_causal = window_size_left < 0 && window_size_right == 0;
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
-    const int head_size_rounded = head_size <= 64 ? 64 : (head_size <= 128 ? round_multiple(head_size, 32) : round_multiple(head_size, 64));
+    const int head_size_rounded = round_up_headdim(head_size);
     // Very important that these match the kernel configs
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
     const int kBlockM = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
@@ -1472,7 +1535,7 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size = round_multiple(head_size_og, alignment);
-    const int head_size_rounded = head_size <= 64 ? 64 : (head_size <= 128 ? round_multiple(head_size, 32) : round_multiple(head_size, 64));
+    const int head_size_rounded = round_up_headdim(head_size);
     const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 

@@ -31,15 +31,19 @@ SOFTCAP = [False, True]
 PACKGQA = [False, True]
 KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_launch_template.h"
 
+#ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
 template void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
+#endif
 """
 
 KERNEL_IMPL_TEMPLATE_BWD = """#include "flash_bwd_launch_template.h"
 
+#ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
 template<>
 void run_mha_bwd_<{DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream) {{
     run_mha_bwd_hdim{HEAD_DIM}<{DTYPE}>(params, stream);
 }}
+#endif
 """
 
 
