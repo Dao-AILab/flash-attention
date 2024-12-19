@@ -452,7 +452,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
     ):
-        is_grad = torch.is_grad_enabled() and qkv.requires_grad
+        is_grad = qkv.requires_grad
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
         q, k, v = qkv[:, :, 0].detach(), qkv[:, :, 1].detach(), qkv[:, :, 2].detach()
@@ -535,7 +535,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
     ):
-        is_grad = torch.is_grad_enabled() and qkv.requires_grad
+        is_grad = qkv.requires_grad
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
         q, k, v = qkv[:, 0].detach(), qkv[:, 1].detach(), qkv[:, 2].detach()
@@ -627,9 +627,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
     ):
-        is_grad = torch.is_grad_enabled() and any(
-            x.requires_grad for x in [q, kv]
-        )
+        is_grad = any(x.requires_grad for x in [q, kv])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         k, v = kv[:, :, 0].detach(), kv[:, :, 1].detach()
@@ -717,9 +715,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
     ):
-        is_grad = torch.is_grad_enabled() and any(
-            x.requires_grad for x in [q, kv]
-        )
+        is_grad = any(x.requires_grad for x in [q, kv])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         k, v = kv[:, 0].detach(), kv[:, 1].detach()
@@ -817,9 +813,7 @@ class FlashAttnFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
     ):
-        is_grad = torch.is_grad_enabled() and any(
-            x.requires_grad for x in [q, k, v]
-        )
+        is_grad = any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_og = q.size(3)
@@ -907,9 +901,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_softmax,
         block_table,
     ):
-        is_grad = torch.is_grad_enabled() and any(
-            x.requires_grad for x in [q, k, v]
-        )
+        is_grad = any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_og = q.size(2)
