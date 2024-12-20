@@ -1688,9 +1688,9 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
     }
 
     at::Tensor tile_count_semaphore;
-    // We don't use the persistent scheduler if (Split or PagedKV) and (not Varlen)
+    // We don't use the persistent scheduler if Split and not Varlen
     bool const is_varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
-    if (((params.is_causal || params.is_local) && (params.num_splits == 1 && !paged_KV)) || is_varlen) {
+    if (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen) {
         tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32));
         params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
     } else {

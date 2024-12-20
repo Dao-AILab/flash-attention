@@ -17,7 +17,7 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd(int headdim, bool is_ca
         } else if (headdim <= 96) {
             return {192, is_local ? 128 : 144, false, true};
         } else if (headdim <= 128) {
-            return {128, is_causal || is_local ? 128 : 176, true, true};
+            return {128, is_causal || is_local || paged_kv ? 128 : 176, true, true};
             // {128, 192, false, false} and {192, 128, false, true} are quite good too
             // 128 x 192 hits the limit of smem if Mma1_is_RS, 128 x 144 hits the limit if !Mma1_is_RS
         } else if (headdim <= 192) {
@@ -31,7 +31,7 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd(int headdim, bool is_ca
         } else if (headdim <= 96) {
             return {192, 128, true, true};
         } else if (headdim <= 128) {
-            return {128, v_colmajor || ((paged_kv || softcap) && is_local) ? 192 : 224, true, true};
+            return {128, paged_kv ? 160 : (v_colmajor || (softcap && is_local) ? 192 : 224), true, true};
         } else if (headdim <= 192) {
             return {128, (paged_kv || softcap) && is_local ? 128 : 160, true, true};
         } else {
