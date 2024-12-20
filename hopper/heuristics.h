@@ -25,6 +25,8 @@ inline bool should_pack_gqa(bool varlen_q, int seqlen_q, int qhead_per_khead, in
 inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
     // If we have enough to almost fill the SMs, then just use 1 split
     if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
+    // If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
+    if (num_n_blocks <= 4) { return 1; }
     max_splits = std::min({max_splits, num_SMs, num_n_blocks});
     float max_efficiency = 0.f;
     std::vector<float> efficiency;

@@ -381,9 +381,15 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // This needs to match the kernel configs
     auto [kBlockM, kBlockN, Mma1_is_RS, IntraWGOverlap] = tile_size_fwd(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
     int seqlen_q_packgqa = params.seqlen_q * (params.pack_gqa ? params.h / params.h_k : 1);
-    const int num_n_blocks = (params.seqlen_k + kBlockN - 1) / kBlockN;
-    const int num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
-    return num_splits_heuristic(params.b * params.h_k * num_m_blocks, dprops->multiProcessorCount, num_n_blocks, 128);
+    // If is_local, we're not going to load all of seqlen_k
+    int const seqlen_k_loaded = !params.is_local
+        ? params.seqlen_k
+        : std::max(0, std::min(params.seqlen_k, params.window_size_right + params.window_size_left + 1 + kBlockM));
+    int const num_n_blocks = (seqlen_k_loaded + kBlockN - 1) / kBlockN;
+    int const num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
+    return num_splits_heuristic(params.b * (!params.pack_gqa ? params.h : params.h_k) * num_m_blocks, dprops->multiProcessorCount, num_n_blocks, 128);
+    // return num_splits_heuristic(params.b * params.h_k * num_m_blocks, params.b * params.h_k,
+    //                             dprops->multiProcessorCount, num_n_blocks, 128, params.d_rounded);
     #endif
 }
 
@@ -1682,8 +1688,9 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
     }
 
     at::Tensor tile_count_semaphore;
-    // We don't use the persistent scheduler if Split or PagedKV or AppendKV
-    if ((params.is_causal || params.is_local || seqused_k_.has_value() || leftpad_k_.has_value()) && params.num_splits == 1 && !paged_KV && !k_.has_value()) {
+    // We don't use the persistent scheduler if (Split or PagedKV) and (not Varlen)
+    bool const is_varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
+    if (((params.is_causal || params.is_local) && (params.num_splits == 1 && !paged_KV)) || is_varlen) {
         tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32));
         params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
     } else {
