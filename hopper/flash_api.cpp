@@ -84,7 +84,8 @@ void set_params_fprop(Flash_fwd_params &params,
                       float softmax_scale,
                       int window_size_left,
                       int window_size_right,
-                      const float softcap=0.f) {
+                      const float softcap=0.f,
+                      const int sm_margin=0) {
 
     // Reset the parameters
     params = {};
@@ -164,6 +165,9 @@ void set_params_fprop(Flash_fwd_params &params,
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
 
+    params.compute_capability = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
+    params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
+
     #ifdef FLASHATTENTION_DISABLE_LOCAL
         TORCH_CHECK(params.is_causal || (window_size_left < 0 && window_size_right < 0),
             "This flash attention build does not support local attention.");
@@ -204,7 +208,8 @@ void set_params_dgrad(Flash_bwd_params &params,
                       int window_size_left,
                       int window_size_right,
                       const float softcap=0.f,
-                      bool deterministic=false) {
+                      bool deterministic=false,
+                      int const sm_margin=0) {
 
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
@@ -218,7 +223,8 @@ void set_params_dgrad(Flash_bwd_params &params,
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     softcap);
+                     softcap,
+                     sm_margin);
 
     // Set the pointers and strides.
     params.do_ptr = dout.data_ptr();
@@ -377,7 +383,6 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     #else
     // params.pack_gqa must already be set
     // params.page_table must already be set
-    auto dprops = at::cuda::getCurrentDeviceProperties();
     // This needs to match the kernel configs
     auto [kBlockM, kBlockN, Mma1_is_RS, IntraWGOverlap] = tile_size_fwd(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
     int seqlen_q_packgqa = params.seqlen_q * (params.pack_gqa ? params.h / params.h_k : 1);
@@ -387,9 +392,9 @@ inline int get_num_splits(Flash_fwd_params const& params) {
         : std::max(0, std::min(params.seqlen_k, params.window_size_right + params.window_size_left + 1 + kBlockM));
     int const num_n_blocks = (seqlen_k_loaded + kBlockN - 1) / kBlockN;
     int const num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
-    return num_splits_heuristic(params.b * (!params.pack_gqa ? params.h : params.h_k) * num_m_blocks, dprops->multiProcessorCount, num_n_blocks, 128);
+    return num_splits_heuristic(params.b * (!params.pack_gqa ? params.h : params.h_k) * num_m_blocks, params.num_sm, num_n_blocks, 128);
     // return num_splits_heuristic(params.b * params.h_k * num_m_blocks, params.b * params.h_k,
-    //                             dprops->multiProcessorCount, num_n_blocks, 128, params.d_rounded);
+    //                             params.num_sm, num_n_blocks, 128, params.d_rounded);
     #endif
 }
 
@@ -429,7 +434,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         int sink_token_length,
         const float softcap,
         int num_splits,
-        c10::optional<bool> pack_gqa_
+        c10::optional<bool> pack_gqa_,
+        int const sm_margin
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -533,7 +539,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     softcap);
+                     softcap,
+                     sm_margin);
     params.sink_token_length = sink_token_length;
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
@@ -651,7 +658,8 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
                int window_size_right,
                const float softcap,
                int num_splits,
-               c10::optional<bool> pack_gqa_
+               c10::optional<bool> pack_gqa_,
+               int const sm_margin
                ) {
 
     #ifdef FLASHATTENTION_DISABLE_VARLEN
@@ -769,7 +777,8 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     softcap);
+                     softcap,
+                     sm_margin);
     params.total_q = total_q;
     params.total_k = total_k;
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
@@ -937,7 +946,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         int window_size_right,
         int sink_token_length,
         const float softcap,
-        const bool deterministic) {
+        const bool deterministic,
+        int const sm_margin) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -1088,7 +1098,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      window_size_left,
                      window_size_right,
                      softcap,
-                     deterministic);
+                     deterministic,
+                     sm_margin);
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
     params.sink_token_length = sink_token_length;
 
@@ -1150,7 +1161,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                int window_size_left,
                int window_size_right,
                const float softcap,
-               const bool deterministic) {
+               const bool deterministic,
+               int const sm_margin) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -1329,7 +1341,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                      window_size_left,
                      window_size_right,
                      softcap,
-                     deterministic);
+                     deterministic,
+                     sm_margin);
     params.total_q = total_q;
     params.total_k = total_k;
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
@@ -1402,7 +1415,8 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
                 float const softcap,
                 bool const is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
                 int num_splits,
-                c10::optional<bool> pack_gqa_
+                c10::optional<bool> pack_gqa_,
+                int const sm_margin
                 ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1548,7 +1562,8 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     softcap);
+                     softcap,
+                     sm_margin);
     params.total_q = total_q;
     params.sink_token_length = sink_token_length;
     params.b_k = batch_size_k;

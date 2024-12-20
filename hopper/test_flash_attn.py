@@ -481,6 +481,7 @@ def test_flash_attn_output(
             sink_token_length,
             softcap,
             deterministic,
+            0,  # sm_margin
         )
         # print(f"dO_O max diff: {(softmax_d - do_o).abs().max().item()}")
         # assert (softmax_d - do_o).abs().max().item() <= 1e-5
@@ -681,6 +682,7 @@ def test_flash_attn_varlen_output(
             window_size[0], window_size[1],
             softcap,
             deterministic,
+            0,  # sm_margin
         )
         dq = dq_pad_fn(dq_unpad)
         dk = dk_pad_fn(dk_unpad)

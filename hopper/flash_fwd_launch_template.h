@@ -44,10 +44,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         >
     >;
     using SchedulerSingleTile = flash::SingleTileScheduler<Varlen, Split, PackGQA, kBlockM>;
-    // If Split or PagedKV then we probably don't have enough work for PersistentScheduler to be useful.
+    // If Split then we probably don't have enough work for PersistentScheduler to be useful.
     // However, if Varlen (e.g., during decode where we have max_seqlens), using PersistentScheduler is better
     // since we'll avoid launching a bunch of thread blocks that immediate exit.
-    using Scheduler = std::conditional_t<(Split || PagedKV) && !Varlen, SchedulerSingleTile, SchedulerPersistent>;
+    using Scheduler = std::conditional_t<Split && !Varlen, SchedulerSingleTile, SchedulerPersistent>;
     using AttnKernel = flash::FlashAttnFwd<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
 
     bool const is_varlen_q = params.cu_seqlens_q;
@@ -126,7 +126,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     int device;
     CHECK_CUDA(cudaGetDevice(&device));
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
-        mainloop_args, epilogue_args, {device}, scheduler_args
+        mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
     });
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);

@@ -156,7 +156,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     int device;
     cudaGetDevice(&device);
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
-        mainloop_args, epilogue_args, {device}, scheduler_args
+        mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
     });
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);

@@ -144,6 +144,9 @@ struct Flash_fwd_params : public Qkv_params {
     bool pack_gqa;
 
     int * __restrict__ tile_count_semaphore;
+
+    int compute_capability;
+    int num_sm;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
