@@ -464,25 +464,26 @@ def test_flash_attn_output(
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor:
         g = torch.randn_like(out)
         do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
-        import flashattn_hopper_cuda
-        dq, dk, dv, softmax_d, dq_accum, dk_accum, dv_accum = flashattn_hopper_cuda.bwd(
-            g,
-            q,
-            k,
-            v,
-            out,
-            lse,
-            None,
-            None,
-            None,
-            d ** (-0.5),
-            causal,
-            window_size[0], window_size[1],
-            sink_token_length,
-            softcap,
-            deterministic,
-            0,  # sm_margin
-        )
+        # import flashattn_hopper_cuda
+        # dq, dk, dv, softmax_d, dq_accum, dk_accum, dv_accum = flashattn_hopper_cuda.bwd(
+        #     g,
+        #     q,
+        #     k,
+        #     v,
+        #     out,
+        #     lse,
+        #     None,
+        #     None,
+        #     None,
+        #     d ** (-0.5),
+        #     causal,
+        #     window_size[0], window_size[1],
+        #     sink_token_length,
+        #     softcap,
+        #     deterministic,
+        #     0,  # sm_margin
+        # )
+        dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
         # print(f"dO_O max diff: {(softmax_d - do_o).abs().max().item()}")
         # assert (softmax_d - do_o).abs().max().item() <= 1e-5
         # assert dq_accum.abs().max().item() == 0.0
@@ -609,21 +610,6 @@ def test_flash_attn_varlen_output(
         dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
     q_unpad, k_unpad, v_unpad = [x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)]
-    out_unpad, lse = flash_attn_varlen_func(
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        causal=causal,
-        q_descale=q_descale,
-        k_descale=k_descale, v_descale=v_descale,
-        window_size=window_size,
-        softcap=softcap,
-    )
-    out = output_pad_fn(out_unpad)
     out_ref, attn_ref = attention_ref(
         q_ref,
         k_ref,
@@ -650,40 +636,65 @@ def test_flash_attn_varlen_output(
         intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
     )
 
-    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-    # if not causal:
-    #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
-    # breakpoint()
-
-    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn:
-        g_unpad = torch.randn_like(out_unpad)
-        do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
-        import flashattn_hopper_cuda
-        dq_unpad, dk_unpad, dv_unpad, softmax_d, dq_accum, lse_log2 = flashattn_hopper_cuda.bwd_varlen(
-            g_unpad,
+    pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
+    num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
+    for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
+        out_unpad, lse = flash_attn_varlen_func(
             q_unpad,
             k_unpad,
             v_unpad,
-            out_unpad,
-            lse,
-            None,
-            None,
-            None,
             cu_seqlens_q,
             cu_seqlens_k,
             None, None,
             max_seqlen_q,
             max_seqlen_k,
-            d ** (-0.5),
-            causal,
-            window_size[0], window_size[1],
-            softcap,
-            deterministic,
-            0,  # sm_margin
+            causal=causal,
+            q_descale=q_descale,
+            k_descale=k_descale, v_descale=v_descale,
+            window_size=window_size,
+            softcap=softcap,
         )
+        out = output_pad_fn(out_unpad)
+        print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+        print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+        # if not causal:
+        #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+        # breakpoint()
+
+        # Check that FlashAttention's numerical error is at most twice the numerical error
+        # of a Pytorch implementation.
+        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+
+
+    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn:
+        g_unpad = torch.randn_like(out_unpad)
+        do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
+        # import flashattn_hopper_cuda
+        # dq_unpad, dk_unpad, dv_unpad, softmax_d, dq_accum, lse_log2 = flashattn_hopper_cuda.bwd_varlen(
+        #     g_unpad,
+        #     q_unpad,
+        #     k_unpad,
+        #     v_unpad,
+        #     out_unpad,
+        #     lse,
+        #     None,
+        #     None,
+        #     None,
+        #     cu_seqlens_q,
+        #     cu_seqlens_k,
+        #     None, None,
+        #     max_seqlen_q,
+        #     max_seqlen_k,
+        #     d ** (-0.5),
+        #     causal,
+        #     window_size[0], window_size[1],
+        #     softcap,
+        #     deterministic,
+        #     0,  # sm_margin
+        # )
+        dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(out_unpad, (q_unpad, k_unpad, v_unpad), g_unpad)
         dq = dq_pad_fn(dq_unpad)
         dk = dk_pad_fn(dk_unpad)
         dv = dk_pad_fn(dv_unpad)
@@ -718,10 +729,6 @@ def test_flash_attn_varlen_output(
         print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
         # breakpoint()
-
-    # Check that FlashAttention's numerical error is at most twice the numerical error
-    # of a Pytorch implementation.
-    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn:
         multiple = 2

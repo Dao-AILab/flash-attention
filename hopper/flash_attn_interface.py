@@ -72,23 +72,30 @@ def _flash_attn_varlen_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q
 
 
 def _flash_attn_backward(
-    dout,
-    q,
-    k,
-    v,
-    out,
-    softmax_lse,
-    dq,
-    dk,
-    dv,
-    softmax_scale,
-    causal,
-    window_size=(-1, -1),
-    sink_token_length=0,
-    softcap=0.0,
-    deterministic=False,
-    sm_margin=0,
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        sequed_q,
+        sequed_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dq,
+        dk,
+        dv,
+        softmax_scale,
+        causal,
+        window_size=(-1, -1),
+        sink_token_length=0,
+        softcap=0.0,
+        deterministic=False,
+        sm_margin=0,
 ):
+    assert sink_token_length == 0, "sink_token_length not supported yet"
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -102,61 +109,17 @@ def _flash_attn_backward(
         dq,
         dk,
         dv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        sequed_q,
+        sequed_k,
+        max_seqlen_q,
+        max_seqlen_k,
         softmax_scale,
         causal,
         window_size[0],
         window_size[1],
         sink_token_length,
-        softcap,
-        deterministic,
-        sm_margin,
-    )
-    return dq, dk, dv, softmax_d
-
-
-def _flash_attn_varlen_backward(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dq,
-        dk,
-        dv,
-        softmax_scale,
-        causal,
-        window_size=(-1, -1),
-        softcap=0.0,
-        deterministic=False,
-        sm_margin=0,
-):
-    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
-    # dq, dk, dv are allocated by us so they should already be contiguous
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    dq, dk, dv, softmax_d, *rest = flashattn_hopper_cuda.bwd_varlen(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
-        dq,
-        dk,
-        dv,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        None, None,
-        max_seqlen_q,
-        max_seqlen_k,
-        softmax_scale,
-        causal,
-        window_size[0],
-        window_size[1],
         softcap,
         deterministic,
         sm_margin,
@@ -245,6 +208,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
 
 
 class FlashAttnFunc(torch.autograd.Function):
+
     @staticmethod
     def forward(
         ctx,
@@ -299,6 +263,9 @@ class FlashAttnFunc(torch.autograd.Function):
             v,
             out,
             softmax_lse,
+            None, None, # cu_seqlens_q, cu_seqlens_k,
+            None, None, # sequed_q, sequed_k,
+            None, None, # max_seqlen_q, max_seqlen_k,
             dq,
             dk,
             dv,
@@ -313,10 +280,11 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
+
     @staticmethod
     def forward(
         ctx,
@@ -325,18 +293,23 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         v,
         cu_seqlens_q,
         cu_seqlens_k,
+        seqused_q,
+        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
         softmax_scale,
         causal,
         q_descale=None, k_descale=None, v_descale=None,
         window_size=(-1, -1),
+        sink_token_length=0,
         softcap=0.0,
         num_splits=1,
         pack_gqa=None,
         deterministic=False,
         sm_margin=0,
     ):
+        assert seqused_q is None, "seqused_q not supported yet"
+        assert seqused_k is None, "seqused_k not supported yet"
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         out, q, k, v, out_padded, softmax_lse = _flash_attn_varlen_forward(
@@ -356,12 +329,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k)
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.sink_token_length = sink_token_length
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
@@ -369,9 +343,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        _flash_attn_varlen_backward(
+        _flash_attn_backward(
             dout,
             q,
             k,
@@ -380,6 +354,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             softmax_lse,
             cu_seqlens_q,
             cu_seqlens_k,
+            seqused_q,
+            seqused_k,
             ctx.max_seqlen_q,
             ctx.max_seqlen_k,
             dq,
@@ -388,6 +364,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softmax_scale,
             ctx.causal,
             ctx.window_size,
+            ctx.sink_token_length,
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
@@ -395,7 +372,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -539,12 +516,15 @@ def flash_attn_varlen_func(
     v,
     cu_seqlens_q,
     cu_seqlens_k,
+    seqused_q,
+    seqused_k,
     max_seqlen_q,
     max_seqlen_k,
     softmax_scale=None,
     causal=False,
     q_descale=None, k_descale=None, v_descale=None,
     window_size=(-1, -1),
+    sink_token_length=0,
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
@@ -557,12 +537,15 @@ def flash_attn_varlen_func(
         v,
         cu_seqlens_q,
         cu_seqlens_k,
+        seqused_q,
+        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
         softmax_scale,
         causal,
         q_descale, k_descale, v_descale,
         window_size,
+        sink_token_length,
         softcap,
         num_splits,
         pack_gqa,
