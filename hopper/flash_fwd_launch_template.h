@@ -34,7 +34,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
     using CollectiveMainloop = flash::CollectiveMainloopFwd<kStages, ClusterShape, TileShape_MNK, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV, Mma1_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>;
-    using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK, ClusterShape, ElementOut, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, FP8_TransposeV>;
+    using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK, ClusterShape, ElementOut, cutlass::arch::Sm90, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, FP8_TransposeV>;
 
     using SchedulerPersistent = std::conditional_t<Varlen,
         flash::VarlenDynamicPersistentTileScheduler<kBlockM, CollectiveMainloop::NumMmaThreads, CollectiveMainloop::NumProducerThreads, Split, PackGQA>,

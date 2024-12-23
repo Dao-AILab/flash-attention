@@ -833,7 +833,7 @@ struct CollectiveMainloopFwd {
         PipelineState& smem_pipe_read,
         FrgTensorO& tOrO,
         Softmax& softmax,
-        int thread_idx,
+        int const thread_idx,
         int &work_idx,
         SeqlenInfo_t const& seqlen_info,
         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,

@@ -20,17 +20,22 @@ namespace flash {
 
 using namespace cute;
 
-template <class TileShape_MNK_, class ClusterShape_, class Element_, int NumEpilogueThreads_, bool Varlen_, bool PackGQA_, bool FP8PermuteCol=false>
+template <class TileShape_MNK_, class ClusterShape_, class Element_, class ArchTag_,
+          int NumEpilogueThreads_, bool Varlen_, bool PackGQA_, bool FP8PermuteCol=false>
 struct CollectiveEpilogueFwd {
 
     using TileShape_MNK = TileShape_MNK_;
     using ClusterShape = ClusterShape_;
     using Element = Element_;
+    using ArchTag = ArchTag_;
     static constexpr int NumEpilogueThreads = NumEpilogueThreads_;
     static constexpr bool Varlen = Varlen_;
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Use_smem = sizeof(Element) <= 2;
-    static constexpr bool Use_TMA_O = !Varlen && Use_smem && !PackGQA;
+    static constexpr bool Use_TMA_O = ArchTag::kMinComputeCapability >= 90 && !Varlen && Use_smem && !PackGQA;
+
+    static_assert(ArchTag::kMinComputeCapability >= 80);
+    static_assert(ArchTag::kMinComputeCapability >= 90 || CUTE_STATIC_V(size(ClusterShape{})) == 1);
 
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
@@ -59,9 +64,17 @@ struct CollectiveEpilogueFwd {
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerStore>>>{}));  // Val layout, 8 or 16 vals per store
 
-    using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
+    using SmemLayoutAtomOTMA = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
-    using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 2>(TileShape_MNK{})));
+    using SmemLayoutOTMA = decltype(tile_to_shape(SmemLayoutAtomOTMA{}, select<0, 2>(TileShape_MNK{})));
+    static constexpr int kSwizzle = kBlockKGmem == 128 ? 4 : (kBlockKGmem == 64 ? 3 : (kBlockKGmem == 32 ? 2 : 1));
+    static constexpr int kSwizzleBase = sizeof(Element) == 4 ? 2 : (sizeof(Element) == 2 ? 3 : 4);
+    using SmemLayoutAtomO = decltype(
+        composition(Swizzle<kSwizzle, kSwizzleBase, kSwizzleBase>{},
+                    Layout<Shape<_8, Int<kBlockKGmem>>,
+                           Stride<Int<kBlockKGmem>, _1>>{}));
+    using SmemLayoutOSTS = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 2>(TileShape_MNK{})));
+    using SmemLayoutO = std::conditional_t<ArchTag::kMinComputeCapability >= 90, SmemLayoutOTMA, SmemLayoutOSTS>;
 
     using ShapeO = cute::Shape<int32_t, int32_t, int32_t, int32_t, int32_t>;  // (seqlen_q, d, head, batch, num_splits)
     using StrideO = cute::Stride<int64_t, _1, int64_t, int64_t, int64_t>;
@@ -73,8 +86,12 @@ struct CollectiveEpilogueFwd {
     using ShapeLSEPacked = std::conditional_t<!PackGQA, cute::Shape<int32_t, int32_t, int32_t, int32_t>, cute::Shape<cute::Shape<int32_t, int32_t>, int32_t, int32_t, int32_t>>;
     using StrideLSEPacked = std::conditional_t<!PackGQA, StrideLSE, cute::Stride<cute::Stride<int64_t, _1>, int64_t, int64_t, int64_t>>;
 
-    // cute::SM90_U32x4_STSM_N if Element size is 2 bytes (fp16, bf16)
-    using CopyOpR2S = decltype(cutlass::epilogue::collective::detail::sm90_get_smem_store_op_for_accumulator<StrideO, Element>());
+    using CopyOpR2S = std::conditional_t<
+        ArchTag::kMinComputeCapability >= 90,
+        // cute::SM90_U32x4_STSM_N if Element size is 2 bytes (fp16, bf16)
+        decltype(cutlass::epilogue::collective::detail::sm90_get_smem_store_op_for_accumulator<StrideO, Element>()),
+        AutoVectorizingCopyWithAssumedAlignment<128>
+    >;
     using SmemCopyAtomO = Copy_Atom<CopyOpR2S, Element>;
 
     // static constexpr size_t SmemAlignmentO = cutlass::detail::alignment_for_swizzle(SmemLayoutO{});
@@ -86,12 +103,16 @@ struct CollectiveEpilogueFwd {
         cute::array_aligned<Element, Use_smem ? cute::cosize_v<SmemLayoutO> : 0> smem_o;
     };
 
-    using TMA_O = decltype(make_tma_copy(
-        GmemTiledCopyOTMA{},
-        make_tensor(make_gmem_ptr(static_cast<Element*>(nullptr)), ShapeO{}, StrideO{}),
-        SmemLayoutO{},
-        select<0, 2>(TileShape_MNK{}),
-        _1{}));  // no mcast for O
+    using TMA_O = std::conditional_t<
+        Use_TMA_O,
+        decltype(make_tma_copy(
+            GmemTiledCopyOTMA{},
+            make_tensor(make_gmem_ptr(static_cast<Element*>(nullptr)), ShapeO{}, StrideO{}),
+            SmemLayoutOTMA{},
+            select<0, 2>(TileShape_MNK{}),
+            _1{})),  // no mcast for O
+        std::nullptr_t
+    >;
 
     // Host side kernel arguments
     struct Arguments {
@@ -125,12 +146,13 @@ struct CollectiveEpilogueFwd {
     static Params
     to_underlying_arguments(Arguments const& args) {
         Tensor mO = make_tensor(make_gmem_ptr(args.ptr_O), args.shape_O, args.stride_O);
-        TMA_O tma_store_O = make_tma_copy(
-            GmemTiledCopyOTMA{},
-            mO,
-            SmemLayoutO{},
-            select<0, 2>(TileShape_MNK{}),
-            _1{}); // no mcast for O
+        TMA_O tma_store_O = [&]{
+            if constexpr (Use_TMA_O) {
+                return make_tma_copy(GmemTiledCopyOTMA{}, mO, SmemLayoutO{}, select<0, 2>(TileShape_MNK{}), _1{}); // no mcast
+            } else {
+                return nullptr;
+            }
+        }();
         // If PackGQA, reshape O to be ((qhead_per_khead, seqlen_q), head_size, nhead_k, batch_size, num_splits)
         int const qhead_per_khead = !PackGQA ? 1 : cute::ceil_div(get<2>(args.shape_O), args.nheads_kv);
         auto const shape_O_packed = cute::conditional_return<!PackGQA>(
@@ -197,7 +219,7 @@ struct CollectiveEpilogueFwd {
             Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
             // Tensor taccOsO = smem_thr_copy_O.partition_D(sO_pi);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
             cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
-            if constexpr (!Varlen && !PackGQA) {
+            if constexpr (Use_TMA_O) {
                 cutlass::arch::fence_view_async_shared(); // ensure smem writes are visible to TMA
                 cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
                                                     cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
@@ -205,9 +227,11 @@ struct CollectiveEpilogueFwd {
                 cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
             }
         } else {
-            #pragma unroll
-            for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
-                shared_storage.pipelines.barrier_O.arrive(cta_id);
+            if constexpr (ArchTag::kMinComputeCapability >= 90) {
+                #pragma unroll
+                for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
+                    shared_storage.pipelines.barrier_O.arrive(cta_id);
+                }
             }
         }
 
@@ -222,8 +246,8 @@ struct CollectiveEpilogueFwd {
         Tensor taccOcO = thread_mma.partition_C(cute::make_identity_tensor(select<0, 2>(TileShape_MNK{})));
         static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
         static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
-        // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the row indices.
-        Tensor taccOcO_row = taccOcO(make_coord(_0{}, _, _0{}), _, _0{});
+        Tensor taccOcO_rowcol = make_tensor(taccOcO.data(), flash::convert_layout_acc_rowcol(taccOcO.layout()));
+        Tensor taccOcO_row = taccOcO_rowcol(_, _0{});
         CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
 
         using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumEpilogueThreads, Element>;
@@ -261,7 +285,7 @@ struct CollectiveEpilogueFwd {
                     }
                 }
             }
-        } else {  // Don't use TMA since we don't want to overwrite the output of another sequence
+        } else {  // Don't use TMA in Varlen case since we don't want to overwrite the output of another sequence
             Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset_o * get<0>(params.stride_O)), params.shape_O_packed, params.stride_O_packed)(_, _, bidh, !is_varlen ? bidb : 0, split_idx);
             Tensor gO = local_tile(mO, select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
             // if (thread_idx == 0) { printf("Before O write, m_block: %d, bidh: %d, bidb: %d, split_idx: %d, offset_o: %d, seqlen_o: %d, mO_addr = %p, addr diff = %d\n", m_block, bidh, bidb, split_idx, offset_o, seqlen_o, mO.data(), reinterpret_cast<int>(&mO(0)) - reinterpret_cast<int>(params.ptr_O)); }
@@ -272,10 +296,12 @@ struct CollectiveEpilogueFwd {
                 // Tensor tOsO = gmem_thr_copy_O.partition_S(sO_pi);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
                 Tensor tOrO = make_fragment_like(tOsO);
                 cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
-                cutlass::arch::fence_view_async_shared(); // ensure smem reads are done before next TMA to smem_v
-                #pragma unroll
-                for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
-                    shared_storage.pipelines.barrier_O.arrive(cta_id);
+                if constexpr (ArchTag::kMinComputeCapability >= 90) {
+                    cutlass::arch::fence_view_async_shared(); // ensure smem reads are done before next TMA to smem_v
+                    #pragma unroll
+                    for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
+                        shared_storage.pipelines.barrier_O.arrive(cta_id);
+                    }
                 }
                 if constexpr (!PackGQA) {
                     // (BLK_M,BLK_K) -> (blk_m,blk_k)
@@ -303,8 +329,7 @@ struct CollectiveEpilogueFwd {
                     Tensor tOgO = thread_mma.partition_C(gO);
                     Tensor tOgO_rowcol = make_tensor(tOgO.data(), flash::convert_layout_acc_rowcol(tOgO.layout()));
                     Tensor tOgO_copy = cute::tiled_divide(tOgO_rowcol, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});
-                    // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the col indices.
-                    Tensor taccOcO_col = taccOcO(make_coord(_, _0{}, _), _0{}, _);
+                    Tensor taccOcO_col = taccOcO_rowcol(_0{}, _);
                     #pragma unroll
                     for (int m = 0; m < size(taccOcO_row); ++m) {
                         if (get<0>(taccOcO_row(m)) < seqlen_o - m_block * kBlockM) {

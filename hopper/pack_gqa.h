@@ -134,8 +134,8 @@ struct PackGQAManager {
         Tensor caccO = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
         auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
         Tensor taccOcO = thread_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
-        // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the row indices.
-        Tensor taccOcO_row = taccOcO(make_coord(_0{}, _, _0{}), _, _0{});
+        Tensor taccOcO_rowcol = make_tensor(taccOcO.data(), flash::convert_layout_acc_rowcol(taccOcO.layout()));
+        Tensor taccOcO_row = taccOcO_rowcol(_, _0{});
         CUTE_STATIC_ASSERT_V(size(tLSErLSE) == size(taccOcO_row));                     // MMA_M
 
         // If PackGQA, we split the work of compute divmod among threads in the same row
@@ -217,9 +217,9 @@ struct PackGQAManager {
         Tensor caccO = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
         auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
         Tensor taccOcO = thread_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
-        // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the row indices.
-        Tensor taccOcO_row = taccOcO(make_coord(_0{}, _, _0{}), _, _0{});
-        Tensor taccOcO_col = taccOcO(make_coord(_, _0{}, _), _0{}, _);
+        Tensor taccOcO_rowcol = make_tensor(taccOcO.data(), flash::convert_layout_acc_rowcol(taccOcO.layout()));
+        Tensor taccOcO_row = taccOcO_rowcol(_, _0{});
+        Tensor taccOcO_col = taccOcO_rowcol(_0{}, _);
 
         // If PackGQA, we split the work of compute divmod among threads in the same row
         static constexpr int kMmaThreadsPerRow = size<0, 0>(typename TiledMma::AtomLayoutC_TV{});
