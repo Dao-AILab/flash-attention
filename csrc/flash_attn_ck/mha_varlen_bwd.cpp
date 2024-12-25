@@ -201,7 +201,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          static_cast<ck_tile::index_t>(mask.type),
                          p_dropout,
                          p_undrop,
-                         {drop_seed, drop_offset}};
+                         std::make_pair(drop_seed, drop_offset)};
 }
 
 std::vector<at::Tensor>

@@ -140,7 +140,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          static_cast<ck_tile::index_t>(mask.type),
                          p_dropout,
                          has_dropout_randval,
-                         {drop_seed, drop_offset}};
+                         std::make_pair(drop_seed, drop_offset)};
 }
 
 std::vector<at::Tensor>
