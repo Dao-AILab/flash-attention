@@ -15,9 +15,9 @@
 #include "flash.h"
 #include "tile_size.h"
 #include "tile_scheduler.hpp"
-#include "flash_fwd_kernel.h"
+#include "flash_fwd_kernel_sm90.h"
 #include "mainloop_fwd_sm90_tma_gmma_ws.hpp"
-#include "epilogue_fwd_sm90_tma.hpp"
+#include "epilogue_fwd.hpp"
 
 
 using namespace cute;
@@ -33,7 +33,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr bool FP8_TransposeV = Is_FP8 && !V_colmajor;
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
-    using CollectiveMainloop = flash::CollectiveMainloopFwd<kStages, ClusterShape, TileShape_MNK, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV, Mma1_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>;
+    using CollectiveMainloop = flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV, Mma1_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK, ClusterShape, ElementOut, cutlass::arch::Sm90, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, FP8_TransposeV>;
 
     using SchedulerPersistent = std::conditional_t<Varlen,
@@ -48,7 +48,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // However, if Varlen (e.g., during decode where we have max_seqlens), using PersistentScheduler is better
     // since we'll avoid launching a bunch of thread blocks that immediately exit.
     using Scheduler = std::conditional_t<Split && !Varlen, SchedulerSingleTile, SchedulerPersistent>;
-    using AttnKernel = flash::FlashAttnFwd<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
+    using AttnKernel = flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
 
     bool const is_varlen_q = params.cu_seqlens_q;
     bool const is_varlen_k = params.cu_seqlens_k;
@@ -132,9 +132,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();
     int smem_size = AttnKernel::SharedStorageSize;
-    // int smem_size_q = sizeof(decltype((typename Kernel_traits::SharedStorage{}).smem_q));
-    // int smem_size_k = sizeof(decltype((typename Kernel_traits::SharedStorage{}).smem_k));
-    // int smem_size_v = sizeof(decltype((typename Kernel_traits::SharedStorage{}).smem_v));
+    // int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
+    // int smem_size_k = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k));
+    // int smem_size_v = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v));
     // printf("smem_size = %d, q = %d, k = %d, v = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v);
     // Get the ptr to kernel function.
     if constexpr (size(ClusterShape{}) > 1) {

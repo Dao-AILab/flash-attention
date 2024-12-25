@@ -23,7 +23,7 @@ namespace flash {
 using namespace cute;
 
 template <class CollectiveMainloop_, class CollectiveEpilogue_, class TileScheduler_>
-class FlashAttnFwd {
+class FlashAttnFwdSm90 {
 
 public:
 
