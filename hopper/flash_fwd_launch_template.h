@@ -16,25 +16,44 @@
 #include "tile_size.h"
 #include "tile_scheduler.hpp"
 #include "flash_fwd_kernel_sm90.h"
+#include "flash_fwd_kernel_sm80.h"
 #include "mainloop_fwd_sm90_tma_gmma_ws.hpp"
+#include "mainloop_fwd_sm80.hpp"
 #include "epilogue_fwd.hpp"
 
 
 using namespace cute;
 
-template <int kHeadDim, int kBlockM, int kBlockN, int kStages, int ClusterM, typename Element, typename ElementOut,
+template <int kHeadDim, int Arch, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKV, bool AppendKV,
-          bool Mma1_is_RS, bool IntraWGOverlap, bool PackGQA, bool Split, bool V_colmajor>
+          bool PackGQA, bool Split, bool V_colmajor>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
     static_assert(!(AppendKV && !Varlen), "AppendKV requires Varlen");
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;
     static constexpr bool FP8_TransposeV = Is_FP8 && !V_colmajor;
+    using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
+
+    // Can't use structured binding since it's not compatible with constexpr
+    static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKV, Has_softcap);
+    static constexpr std::tuple<int, int, int, int, bool> kBlockMN_kNWarps_Stages_RS = tile_size_fwd_sm80(kHeadDim, Is_causal, Is_local, sizeof(Element) /*element_size*/, PagedKV, Has_softcap);
+    static constexpr int kBlockM = Arch >= 90 ? std::get<0>(kBlockMN_RS_IntraWGOverlap) : std::get<0>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr int kBlockN = Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr bool Mma1_is_RS = std::get<2>(kBlockMN_RS_IntraWGOverlap);
+    static constexpr bool IntraWGOverlap = std::get<3>(kBlockMN_RS_IntraWGOverlap);
+    static constexpr int kNWarps = std::get<2>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr int kStages = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
+
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
-    using CollectiveMainloop = flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV, Mma1_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>;
-    using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK, ClusterShape, ElementOut, cutlass::arch::Sm90, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, FP8_TransposeV>;
+    using CollectiveMainloop = std::conditional_t<
+        Arch >= 90,
+        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV, Mma1_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>,
+        flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV, PackGQA, Split>
+    >;
+    using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, FP8_TransposeV>;
 
     using SchedulerPersistent = std::conditional_t<Varlen,
         flash::VarlenDynamicPersistentTileScheduler<kBlockM, CollectiveMainloop::NumMmaThreads, CollectiveMainloop::NumProducerThreads, Split, PackGQA>,
@@ -47,8 +66,12 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // If Split then we probably don't have enough work for PersistentScheduler to be useful.
     // However, if Varlen (e.g., during decode where we have max_seqlens), using PersistentScheduler is better
     // since we'll avoid launching a bunch of thread blocks that immediately exit.
-    using Scheduler = std::conditional_t<Split && !Varlen, SchedulerSingleTile, SchedulerPersistent>;
-    using AttnKernel = flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
+    using Scheduler = std::conditional_t<(Split && !Varlen) || Arch < 90, SchedulerSingleTile, SchedulerPersistent>;
+    using AttnKernel = std::conditional_t<
+        Arch >= 90,
+        flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>,
+        flash::FlashAttnFwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>
+    >;
 
     bool const is_varlen_q = params.cu_seqlens_q;
     bool const is_varlen_k = params.cu_seqlens_k;
@@ -155,34 +178,32 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-template<typename T, int kBlockM, int kBlockN, int kHeadDim, int kStages,
-         bool Is_causal, bool Is_local, bool Has_softcap, bool PagedKV,
-         bool Mma1_is_RS, bool IntraWGOverlap, bool PackGQA, bool Split, bool V_colmajor, bool Enable_cluster>
-void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
-    static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
-    using T_out = std::conditional_t<!Split, std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>, float>;
-    VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
-        APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
-            // Only use Cluster if number of tiles along seqlen_q is even and not varlen
-            CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
-                static constexpr int ClusterM = !Varlen && Enable_cluster && Use_cluster ? 2 : 1;
-                run_flash_fwd<kHeadDim, kBlockM, kBlockN, kStages, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV && Varlen, Mma1_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>(params, stream);
-            });
-        });
-    });
-}
-
 template<typename T, int kHeadDim, bool Split, bool PagedKV, bool Has_softcap, bool PackGQA>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
+    static constexpr int Arch = 90;
     static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
+    static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
+    using T_out = std::conditional_t<!Split, std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>, float>;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
             static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
-            // Can't use structured binding since it's not compatible with constexpr
-            static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd(kHeadDim, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKV, Has_softcap);
-            static constexpr bool Enable_cluster = (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKV;
-            run_mha_fwd_dispatch<T, std::get<0>(kBlockMN_RS_IntraWGOverlap), std::get<1>(kBlockMN_RS_IntraWGOverlap), kHeadDim, 2,
-                Is_causal, Is_local, Has_softcap, PagedKV, std::get<2>(kBlockMN_RS_IntraWGOverlap), std::get<3>(kBlockMN_RS_IntraWGOverlap), PackGQA, Split, V_colmajor, Enable_cluster>(params, stream);
+            static constexpr int kBlockM = [&] {
+                if constexpr (Arch >= 90) {
+                    return std::get<0>(tile_size_fwd_sm90(kHeadDim, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKV, Has_softcap));
+                } else {
+                    return std::get<0>(tile_size_fwd_sm80(kHeadDim, Is_causal, Is_local, sizeof(T) /*element_size*/, PagedKV, Has_softcap));
+                }
+            }();
+            static constexpr bool Enable_cluster = Arch >= 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKV;
+            VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
+                APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
+                    // Only use Cluster if number of tiles along seqlen_q is even and not varlen
+                    CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
+                        static constexpr int ClusterM = !Varlen && Enable_cluster && Use_cluster ? 2 : 1;
+                        run_flash_fwd<kHeadDim, Arch, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV && Varlen, PackGQA, Split, V_colmajor>(params, stream);
+                    });
+                });
+            });
         });
     });
 }
