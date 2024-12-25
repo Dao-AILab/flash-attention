@@ -1394,7 +1394,6 @@ struct CollectiveMainloopFwd {
 
         auto store_V = [&] (int const n_block, auto const& smem_pipe_read) {
             pipeline_v_new.consumer_wait(smem_pipe_read);
-            // Tensor tVrV = make_fragment_like(tVsV(_, _, _, _0{}));
             int const n_limit = std::min(seqlen_k_new - n_block * kBlockN, kBlockN);
             Tensor tVsV_cur = tVsV(_, _, _, smem_pipe_read.index());
             if constexpr (!PagedKV) {

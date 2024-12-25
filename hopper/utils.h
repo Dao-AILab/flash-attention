@@ -215,7 +215,7 @@ void cp_async_wait() {
 
 template <bool zero_init=false, int wg_wait=0, bool SwapAB=false, int M_slice=-1,
         typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
-__forceinline__ __device__ void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const& tCrB, Tensor2& tCrC) {
+CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const& tCrB, Tensor2& tCrC) {
     if constexpr (M_slice >= 0) {
         static constexpr int MMA_M = decltype(size<1>(tCrC))::value;
         static_assert(M_slice < MMA_M);
@@ -268,12 +268,65 @@ __forceinline__ __device__ void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, T
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template<bool A_in_regs=false, bool B_in_regs=false, typename Tensor0, typename Tensor1,
+         typename Tensor2, typename Tensor3, typename Tensor4,
+         typename TiledMma, typename TiledCopyA, typename TiledCopyB,
+         typename ThrCopyA, typename ThrCopyB, typename Hook>
+CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
+                              Tensor4 const& tCsB, TiledMma tiled_mma,
+                              TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
+                              ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, Hook fn) {
+    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
+    Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
+    if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{})); }
+    #pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        if (i < size<2>(tCrA) - 1) {
+            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1)); }
+            if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1)); }
+        }
+        if (i == 0) { fn(); }
+        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+         typename TiledMma, typename TiledCopy, typename ThrCopy>
+CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
+                                 TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
+                                 ThrCopy smem_thr_copy_B) {
+    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
+    #pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        if (i < size<2>(tCrA) - 1) {
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+        }
+        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    }
+}
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
           typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
           typename Engine2, typename Layout2, typename Engine3, typename Layout3>
-__forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const &S,
-                            Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
-                            Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
+CUTLASS_DEVICE void copy(TiledCopy const &tiled_copy, Tensor<Engine0, Layout0> const &S,
+                         Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
+                         Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
     CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
     CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
@@ -281,19 +334,50 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
     CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K
     // There's no case where !Clear_OOB_K && Clear_OOB_MN
     static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
+    static constexpr bool has_with_bool = cute::detail::has_with_bool<TiledCopy>;
     #pragma unroll
     for (int m = 0; m < size<1>(S); ++m) {
-        if (Is_even_MN || get<0>(identity_MN(_0{}, m, _0{})) < max_MN) {
-            #pragma unroll
-            for (int k = 0; k < size<2>(S); ++k) {
-                if (Is_even_K || predicate_K(k)) {
-                    cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
-                } else if (Clear_OOB_K) {
-                    cute::clear(D(_, m, k));
+        bool predicate_mn = Is_even_MN || get<0>(identity_MN(_0{}, m, _0{})) < max_MN;
+        if constexpr (Is_even_MN || !Clear_OOB_MN) {
+            if (Is_even_MN || predicate_mn) {
+                #pragma unroll
+                for (int k = 0; k < size<2>(S); ++k) {
+                    if constexpr (Is_even_K || !Clear_OOB_K) {
+                        if (Is_even_K || predicate_K(k)) { cute::copy(tiled_copy, S(_, m, k), D(_, m, k)); }
+                    } else {  // Clear_OOB_K == true && Is_even_K == false
+                        // If copy traits can be transformed with a predicate value, do it, otherwise branch here
+                        if constexpr (has_with_bool) {
+                            cute::copy(tiled_copy.with(predicate_K(k)), S(_, m, k), D(_, m, k));
+                        } else {
+                            if (predicate_K(k)) {
+                                cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
+                            } else {
+                                cute::clear(D(_, m, k));
+                            }
+                        }
+                    }
                 }
             }
-        } else if (Clear_OOB_MN) {
-            cute::clear(D(_, m, _));
+        } else {  // Clear_OOB_MN == true && Is_even_MN == false, also implies Clear_OOB_K == true
+            if constexpr (!has_with_bool) {
+                if (predicate_mn) {
+                    #pragma unroll
+                    for (int k = 0; k < size<2>(S); ++k) {
+                        if (Is_even_K || predicate_K(k)) {
+                            cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
+                        } else if (Clear_OOB_K) {
+                            cute::clear(D(_, m, k));
+                        }
+                    }
+                } else {
+                    cute::clear(D(_, m, _));
+                }
+            } else {  // combine the mn predicate with the k predicate
+                #pragma unroll
+                for (int k = 0; k < size<2>(S); ++k) {
+                    cute::copy(tiled_copy.with(predicate_mn && (Is_even_K || predicate_K(k))), S(_, m, k), D(_, m, k));
+                }
+            }
         }
     }
 }
