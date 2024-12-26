@@ -1127,7 +1127,7 @@ struct CollectiveMainloopFwdSm90 {
                 int const n_block_min_causal_local_mask =
                     std::max(n_block_min, (m_idx_min + seqlen_k - seqlen_q + params.window_size_right) / kBlockN);
                 #pragma unroll 1
-                for (; n_block >= n_block_min; --n_block) {
+                for (; n_block >= n_block_min_causal_local_mask; --n_block) {
                     fwd_step(n_block, mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<true>{} /*check_inf*/);
                 }
             }
