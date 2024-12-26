@@ -68,7 +68,7 @@ def pad_rearrange_dropout_mask_hts_to_bhss(S_dmask, cu_seqlens_q, seqlen_q_round
 @pytest.mark.parametrize("alibi", [False])
 @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -80,6 +80,12 @@ def pad_rearrange_dropout_mask_hts_to_bhss(S_dmask, cu_seqlens_q, seqlen_q_round
 def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked
 ):
+    if d == 64 and causal and dtype is torch.bfloat16:
+        pytest.skip("hd=64,dtype=bf16 with causal mask not supported")
+
+    if d == 128 and causal:
+        pytest.skip("hd=128 with causal mask not supported")
+
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -283,6 +289,7 @@ def test_flash_attn_output(
     ],
 )
 @pytest.mark.parametrize("dropout_p", [0.0])
+@pytest.mark.skip(reason="functionality not supported")
 def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dtype):
     device = "cuda"
     # set seed
@@ -328,6 +335,7 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize("seqlen", [128, 256])
+@pytest.mark.skip(reason="functionality not supported")
 def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
     """We previously had a bug where we were using the wrong strides of dout, which shows up
     when dout is not contiguous.

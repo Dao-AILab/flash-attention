@@ -25,7 +25,7 @@ fmha_bwd_traits get_ck_fmha_bwd_traits(const mask_info &mask,
                            false, // s_randval
                            deterministic,
                            true, // uses_ext_asm
-                           true, // is_v3_atomic_fp32
+                           head_size != 64, // is_v3_atomic_fp32
                            false, // is_v3_spec
                            1}; // how_v3_bf16_cvt 0:RTNE; 1:RTNA; 2:RTZ
 }
