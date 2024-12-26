@@ -772,20 +772,26 @@ struct CollectiveMainloopFwdSm80 {
 
         auto load_K_new = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
             static constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
+            static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0;
             Tensor tKsK_cur = tKsKg2s(_, _, _, smem_pipe_write);
+            int const seqlenk_row_limit = -int(get<0>(tKcKg2s(_0{}, _0{}, _0{}))) + (EvenN
+                ? seqlen_k_new - n_block * kBlockN
+                : (!Seqlenk_mask ? kBlockN : std::min(seqlen_k_new - n_block * kBlockN, kBlockN)));
             // We don't need to clear the sK smem tiles since we won't write them out
-            flash::copy</*Is_even_MN=*/!Seqlenk_mask, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
-                gmem_tiled_copy_kv_g2s, tKgKnew(_, _, _, n_block), tKsK_cur, t0KcKg2s, tKpKg2s, seqlen_k_new - n_block * kBlockN - get<0>(tKcKg2s(_0{}, _0{}, _0{}))
-            );
+            flash::copy</*Is_even_MN=*/!Seqlenk_mask && EvenN, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
+                gmem_tiled_copy_kv_g2s, tKgKnew(_, _, _, n_block), tKsK_cur, t0KcKg2s, tKpKg2s, seqlenk_row_limit);
         };
 
         auto load_V_new = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
             static constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
+            static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0;
             Tensor tVsV_cur = tVsVg2s(_, _, _, smem_pipe_write);
+            int const seqlenk_row_limit = -int(get<0>(tKcKg2s(_0{}, _0{}, _0{}))) + (EvenN
+                ? seqlen_k_new - n_block * kBlockN
+                : (!Seqlenk_mask ? kBlockN : std::min(seqlen_k_new - n_block * kBlockN, kBlockN)));
             // We don't need to clear the sV smem tiles since we won't write them out
-            flash::copy</*Is_even_MN=*/!Seqlenk_mask, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
-                gmem_tiled_copy_kv_g2s, tVgVnew(_, _, _, n_block), tVsV_cur, t0KcKg2s, tKpKg2s, seqlen_k_new - n_block * kBlockN - get<0>(tKcKg2s(_0{}, _0{}, _0{}))
-            );
+            flash::copy</*Is_even_MN=*/!Seqlenk_mask && EvenN, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
+                gmem_tiled_copy_kv_g2s, tVgVnew(_, _, _, n_block), tVsV_cur, t0KcKg2s, tKpKg2s, seqlenk_row_limit);
         };
 
         auto store_K = [&] (int const n_block, int const smem_pipe_read) {
@@ -832,14 +838,14 @@ struct CollectiveMainloopFwdSm80 {
         for_each(make_int_sequence<kStages>{}, [&] (auto stage) {
             static constexpr bool Is_first_stage = CUTE_STATIC_V(stage) == 0;
             static constexpr bool Is_last_stage = CUTE_STATIC_V(stage) == kStages - 1;
-            if (n_block - stage >= n_block_new_min) {
+            if (Is_first_stage || n_block - stage >= n_block_new_min) {
                 load_K_new(n_block - stage, stage, cute::bool_constant<Is_first_stage>{} /*Seqlenk_mask*/);
             }
             cute::cp_async_fence();
             // If persistent, need to sync to make sure all threads have finished with smem_o before writing to smem_v
             if constexpr (Is_first_stage) { __syncthreads(); }
             if constexpr (!Is_last_stage) {
-                if (n_block - stage >= n_block_new_min) {
+                if (Is_first_stage || n_block - stage >= n_block_new_min) {
                     load_V_new(n_block - stage, stage, cute::bool_constant<Is_first_stage>{} /*Seqlenk_mask*/);
                 }
                 cute::cp_async_fence();
