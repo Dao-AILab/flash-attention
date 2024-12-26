@@ -80,8 +80,8 @@ def pad_rearrange_dropout_mask_hts_to_bhss(S_dmask, cu_seqlens_q, seqlen_q_round
 def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked
 ):
-    if not (d == 64 and dtype is torch.bfloat16):
-        pytest.skip("hd=64 only support dtype=bf16")
+    if d == 64 and causal and dtype is torch.bfloat16:
+        pytest.skip("hd=64,dtype=bf16 with causal mask not supported")
 
     if d == 128 and causal:
         pytest.skip("hd=128 with causal mask not supported")
