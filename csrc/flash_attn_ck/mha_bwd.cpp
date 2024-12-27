@@ -338,6 +338,10 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         dv_expanded = dv;
     }
 
+    if(head_size == 64) {
+        dq.zero_();
+    }
+
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
