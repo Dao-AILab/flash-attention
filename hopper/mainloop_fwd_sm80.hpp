@@ -103,18 +103,18 @@ struct CollectiveMainloopFwdSm80 {
 
     // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
     // from the same address by the same threadblock. This is slightly faster.
-    using Gmem_copy_struct = std::conditional_t<
+    using GmemCopyAtom = Copy_Atom<std::conditional_t<
         Has_cp_async,
-        SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>,
+        SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>,
         AutoVectorizingCopyWithAssumedAlignment<128>
-    >;
+    >, Element>;
 
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerLoad;
     static_assert(NumMmaThreads % kGmemThreadsPerRow == 0, "NumMmaThreads must be a multiple of kGmemThreadsPerRow");
     using GmemLayoutAtom = Layout<Shape <Int<NumMmaThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
     using GmemTiledCopyQKV = decltype(
-        make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
+        make_tiled_copy(GmemCopyAtom{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per read
     // So that we don't have to check if we overshot kBlockM when we load Q

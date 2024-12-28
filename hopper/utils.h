@@ -322,11 +322,13 @@ CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
-          typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
+          class CopyAtom, class TV, class Tiler, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
           typename Engine2, typename Layout2, typename Engine3, typename Layout3>
-CUTLASS_DEVICE void copy(TiledCopy const &tiled_copy, Tensor<Engine0, Layout0> const &S,
+CUTLASS_DEVICE void copy(TiledCopy<CopyAtom, TV, Tiler> const &tiled_copy, Tensor<Engine0, Layout0> const &S,
                          Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
                          Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
+    // Decay TiledCopy to CopyAtom
+    auto copy_atom = static_cast<CopyAtom const&>(tiled_copy);
     CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
     CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
@@ -334,7 +336,7 @@ CUTLASS_DEVICE void copy(TiledCopy const &tiled_copy, Tensor<Engine0, Layout0> c
     CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K
     // There's no case where !Clear_OOB_K && Clear_OOB_MN
     static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
-    static constexpr bool has_with_bool = cute::detail::has_with_bool<TiledCopy>;
+    auto has_with_bool = cute::is_valid([](auto t)->void_t<decltype(declval<typename decltype(t)::Traits>().with(true))>{}, copy_atom);
     #pragma unroll
     for (int m = 0; m < size<1>(S); ++m) {
         bool predicate_mn = Is_even_MN || get<0>(identity_MN(_0{}, m, _0{})) < max_MN;
@@ -343,14 +345,14 @@ CUTLASS_DEVICE void copy(TiledCopy const &tiled_copy, Tensor<Engine0, Layout0> c
                 #pragma unroll
                 for (int k = 0; k < size<2>(S); ++k) {
                     if constexpr (Is_even_K || !Clear_OOB_K) {
-                        if (Is_even_K || predicate_K(k)) { cute::copy(tiled_copy, S(_, m, k), D(_, m, k)); }
+                        if (Is_even_K || predicate_K(k)) { cute::copy(copy_atom, S(_, m, k), D(_, m, k)); }
                     } else {  // Clear_OOB_K == true && Is_even_K == false
                         // If copy traits can be transformed with a predicate value, do it, otherwise branch here
                         if constexpr (has_with_bool) {
-                            cute::copy(tiled_copy.with(predicate_K(k)), S(_, m, k), D(_, m, k));
+                            cute::copy(copy_atom.with(predicate_K(k)), S(_, m, k), D(_, m, k));
                         } else {
                             if (predicate_K(k)) {
-                                cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
+                                cute::copy(copy_atom, S(_, m, k), D(_, m, k));
                             } else {
                                 cute::clear(D(_, m, k));
                             }
@@ -364,7 +366,7 @@ CUTLASS_DEVICE void copy(TiledCopy const &tiled_copy, Tensor<Engine0, Layout0> c
                     #pragma unroll
                     for (int k = 0; k < size<2>(S); ++k) {
                         if (Is_even_K || predicate_K(k)) {
-                            cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
+                            cute::copy(copy_atom, S(_, m, k), D(_, m, k));
                         } else if (Clear_OOB_K) {
                             cute::clear(D(_, m, k));
                         }
@@ -375,7 +377,7 @@ CUTLASS_DEVICE void copy(TiledCopy const &tiled_copy, Tensor<Engine0, Layout0> c
             } else {  // combine the mn predicate with the k predicate
                 #pragma unroll
                 for (int k = 0; k < size<2>(S); ++k) {
-                    cute::copy(tiled_copy.with(predicate_mn && (Is_even_K || predicate_K(k))), S(_, m, k), D(_, m, k));
+                    cute::copy(copy_atom.with(predicate_mn && (Is_even_K || predicate_K(k))), S(_, m, k), D(_, m, k));
                 }
             }
         }
