@@ -682,7 +682,7 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/); }
             // if (thread_idx == 0) { printf("Producer: main load, before load_K, index = %d\n", smem_pipe_write.index());}
             load_K(n_block, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/);
-            // if (thread_idx == 0) { printf("Producer: main load, after loaf K, index = %d\n", smem_pipe_write.index());}
+            // if (thread_idx == 0) { printf("Producer: main load, after load K, index = %d\n", smem_pipe_write.index());}
         }
 
         // If !Use_TMA_Q, we use the MMA WGs to load Q with cp.async
@@ -702,7 +702,7 @@ struct CollectiveMainloopFwdSm90 {
         // Wait for the MMA WGs to signal that smem_v are ready and V can be copied from gmem
         // Need ClusterBarrier, not just NamedBarrier. Otherwise we might have CTA 0 finishing the
         // TMA store on O first, call TMA multicast load on V, before CTA 1 can finishing TMA store on O.
-        // if (thread_idx == 0) { printf("Producer: main load, before barrier_O\n");}
+        // if (thread_idx == 0) { printf("Producer: main load, before barrier_O, work_idx = %d\n", work_idx);}
         shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
         // if (thread_idx == 0) { printf("Producer: main load, after barrier_O\n");}
 
@@ -1255,10 +1255,12 @@ struct CollectiveMainloopFwdSm90 {
         bool should_load_KV = (SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync();
 
         int n_block = n_block_new_max - 1;
+        // Need to wait for barrier_O even before load_K_new since the pipelines for AppendKV
+        // and the main attention are not the same. We want to make sure the consumers
+        // have finished reading all smem_k and smem_v for the previous iteration.
+        shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
         if (should_load_KV) { load_K_new(n_block, smem_pipe_write); }
         // if (thread_idx == 0) { printf("Producer: Done loading K, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
-        // Wait for warp 1 to signal that smem_v are ready and V can be copied from gmem
-        if constexpr (!Transpose_V) { shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2); }
         if (should_load_KV) { load_V_new(n_block, smem_pipe_write); }
         // if (thread_idx == 0) { printf("Producer: Done loading V, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
         ++smem_pipe_write;

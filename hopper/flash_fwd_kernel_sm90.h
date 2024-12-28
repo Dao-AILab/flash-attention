@@ -289,7 +289,12 @@ public:
         if (warp_group_idx == 0) {  // Producer
             cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
 
+            // The pipelines for AppendKV and main attention are different, since e.g. main attention
+            // might use cp.async to load KV (if PagedKV) while AppendKV always uses TMA to load
+            // KV_new. Since the pipeline states are different, we have to manually sync to make
+            // sure the two pipelines don't race when accessing smem_k and smem_v.
             PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
+            PipelineState smem_pipe_write_new = cutlass::make_producer_start_state<MainloopPipelineKVNew>();
             int work_idx = 0;
 
             TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
@@ -317,13 +322,11 @@ public:
                 if constexpr (AppendKV) {
                     bool tile_new_valid = collective_mainloop.load_kv_new(
                         params.mainloop, pipeline_k_new, pipeline_v_new,
-                        smem_pipe_write, shared_storage, seqlen_info, block_coord, work_idx);
+                        smem_pipe_write_new, shared_storage, seqlen_info, block_coord, work_idx);
                     if (tile_new_valid) {
                         // if (threadIdx.x == 0) { printf("Producer: Before sync\n"); }
                         cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
                         // if (threadIdx.x == 0) { printf("Producer: After sync\n"); }
-                        // If we don't reset the state, the loads for the main attention might have the wrong phase.
-                        smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
                     }
                 }
                 auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
@@ -342,6 +345,7 @@ public:
             TiledMma1 tiled_mma1;
 
             PipelineState smem_pipe_read;
+            PipelineState smem_pipe_read_new;
             // We don't need separate variables smem_pipe_release_k and smem_pipe_release_v
             // (like in Cutlass's gemm) because the read and release pipeline states are always the same.
 
@@ -378,7 +382,7 @@ public:
                 };
                 if constexpr (AppendKV) {
                     bool tile_new_valid = collective_mainloop.store_kv_new(
-                        params.mainloop, pipeline_k_new, pipeline_v_new, smem_pipe_read,
+                        params.mainloop, pipeline_k_new, pipeline_v_new, smem_pipe_read_new,
                         threadIdx.x - MmaThreadOffset, shared_storage, seqlen_info, block_coord);
                     if (tile_new_valid) {
                         // if (threadIdx.x == 128) { printf("Consumer: Before sync\n"); }
@@ -386,8 +390,10 @@ public:
                         // that might do TMA read after that.
                         asm volatile ("fence.proxy.async.global;");
                         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
+                        // arrive is enough, we don't need sync. The producer will sync, which means
+                        // after that sync we're guaranteed that the AppendKV pipeline have finished
+                        // loading and consumer smem_k and smem_v.
                         // if (threadIdx.x == 128) { printf("Consumer: After sync\n"); }
-                        smem_pipe_read = PipelineState{};
                     }
                 }
                 bool tile_valid = collective_mainloop.mma(
