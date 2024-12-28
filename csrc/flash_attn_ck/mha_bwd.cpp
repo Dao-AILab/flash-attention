@@ -25,7 +25,7 @@ fmha_bwd_traits get_ck_fmha_bwd_traits(const mask_info &mask,
                            false, // s_randval
                            deterministic,
                            true, // uses_ext_asm
-                           head_size != 64, // is_v3_atomic_fp32
+                           true, // is_v3_atomic_fp32
                            false, // is_v3_spec
                            1}; // how_v3_bf16_cvt 0:RTNE; 1:RTNA; 2:RTZ
 }
@@ -336,10 +336,6 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
     } else {
         dk_expanded = dk;
         dv_expanded = dv;
-    }
-
-    if (head_size == 64) {
-        dq.zero_();
     }
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
