@@ -254,7 +254,13 @@ if not SKIP_CUDA_BUILD:
 
     DTYPE_FWD = ["bf16"] + (["fp16"] if not DISABLE_FP16 else []) + (["e4m3"] if not DISABLE_FP8 else [])
     DTYPE_BWD = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
-    HEAD_DIMENSIONS_BWD = [64, 96, 128, 192, 256]
+    HEAD_DIMENSIONS_BWD = (
+        [64] if not DISABLE_HDIM64 else []
+        + [96] if not DISABLE_HDIM96 else []
+        + [128] if not DISABLE_HDIM128 else []
+        + [192] if not DISABLE_HDIM192 else []
+        + [256] if not DISABLE_HDIM256 else []
+    )
     HEAD_DIMENSIONS_FWD = ["all"]
     # HEAD_DIMENSIONS_FWD = [128]
     SPLIT = [""] + (["_split"] if not DISABLE_SPLIT else [])
