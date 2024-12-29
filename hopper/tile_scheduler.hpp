@@ -197,7 +197,7 @@ public:
 };
 
 template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
-        bool Split=false, bool PackGQA=false>
+        bool Split=false, bool PackGQA=false, bool WarpSpecialized=true>
 class DynamicPersistentTileScheduler {
 
     // This scheduler targets the causal (or local) case where each tile takes different
@@ -208,6 +208,9 @@ class DynamicPersistentTileScheduler {
     // on "sections" of the head & batch dimension, each section consisting of e.g. 8 heads.
     // This is the L2 swizzling part. The size of each section is precomputed based on the
     // size of K & V and the L2 cache size.
+
+    static_assert(WarpSpecialized || NumProducerThreads == NumMmaThreads);
+    static constexpr int NumThreads = WarpSpecialized ? NumMmaThreads + NumProducerThreads : NumMmaThreads;
 
 public:
     using SharedStorage = int;
@@ -239,6 +242,7 @@ public:
         int const num_hb_remainder = (args.num_head * args.num_batch) % swizzle;
         int const num_split_blocks = args.num_blocks * (!Split ? 1 : args.num_splits);
         // printf("num_split_blocks = %d, num_head = %d, num_batch = %d, swizzle = %d, PackGQA = %d, qhead_per_khead = %d, num_hb_remainder = %d\n", num_split_blocks, args.num_head, args.num_batch, swizzle, int(PackGQA), args.qhead_per_khead, num_hb_remainder);
+        assert(args.tile_count_semaphore != nullptr);
         return {num_split_blocks * args.num_head * args.num_batch,
                 cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head),
                 cutlass::FastDivmod(swizzle), cutlass::FastDivmod(swizzle * num_split_blocks),
@@ -300,7 +304,9 @@ public:
     CUTLASS_DEVICE
     void
     init_consumer() const {
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+        if (WarpSpecialized || cutlass::canonical_warp_idx_sync() > 0) {
+            cutlass::arch::NamedBarrier::arrive(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+        }
     }
 
     CUTLASS_DEVICE
@@ -318,16 +324,16 @@ public:
         if constexpr (IsProducerWarp) {
             // thread 0 already has the right tile_idx, just need to broadcast to the rest of warp 0
             int new_tile_idx = __shfl_sync(0xffffffff, current_work.tile_idx, 0 /*lane*/);
-            cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            cutlass::arch::NamedBarrier::sync(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
             if (threadIdx.x % NumProducerThreads == 0) {
                 *tile_count_smem = current_work.tile_idx;
             }
-            cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            cutlass::arch::NamedBarrier::arrive(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
             return {new_tile_idx};
         } else {
-            cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            cutlass::arch::NamedBarrier::sync(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
             int tile_idx = *tile_count_smem;
-            cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            cutlass::arch::NamedBarrier::arrive(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
             return {tile_idx};
         }
     }
@@ -335,8 +341,11 @@ public:
 };
 
 
-template<int kBlock, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp, bool Split=false, bool PackGQA=false>
+template<int kBlock, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp, bool Split=false, bool PackGQA=false, bool WarpSpecialized=true>
 class VarlenDynamicPersistentTileScheduler {
+
+    static_assert(WarpSpecialized || NumProducerThreads == NumMmaThreads);
+    static constexpr int NumThreads = WarpSpecialized ? NumMmaThreads + NumProducerThreads : NumMmaThreads;
 
 public:
     using SharedStorage = int4;
@@ -361,6 +370,7 @@ public:
     to_underlying_arguments(TileSchedulerArguments const& args) {
         // If Split, for the purpose of scheduling, we pretend that instead there are
         // (args.num_splits * args.num_head) number of heads.
+        assert(args.tile_count_semaphore != nullptr);
         return {args.num_head * (!Split ? 1 : args.num_splits), args.num_batch,
                 args.qhead_per_khead, args.seqlen,
                 cutlass::FastDivmod(!Split ? 1 : args.num_splits),
@@ -478,7 +488,7 @@ public:
             if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                 *work_info_smem = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
             }
-            cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            cutlass::arch::NamedBarrier::arrive(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
             return work_info;
         } else {
             return get_next_work<false>(params, {0, 0, 0, 0});
@@ -508,16 +518,16 @@ public:
             int new_tile_idx = __shfl_sync(0xffffffff, current_work.tile_idx, 0 /*lane*/);
             WorkTileInfo work_info = {__shfl_sync(0xffffffff, current_work.tile_idx, 1 /*lane*/), current_work.block, current_work.bidh, current_work.bidb};
             work_info = tile_idx_to_work_tile(params, new_tile_idx, work_info);
-            cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            cutlass::arch::NamedBarrier::sync(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
             if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                 *work_info_smem = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
             }
-            cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            cutlass::arch::NamedBarrier::arrive(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
             return work_info;
         } else {
-            cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            cutlass::arch::NamedBarrier::sync(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
             int4 work_info = *work_info_smem;
-            cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            cutlass::arch::NamedBarrier::arrive(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
             return WorkTileInfo{work_info.x, work_info.y, work_info.z, work_info.w};
         }
     }

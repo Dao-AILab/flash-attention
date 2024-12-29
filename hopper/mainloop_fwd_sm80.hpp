@@ -348,7 +348,10 @@ struct CollectiveMainloopFwdSm80 {
         int const n_block_max = get<1>(n_block_min_max);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
-            if (n_block_max <= n_block_min) { return false; }
+            if (n_block_max <= n_block_min) {
+                scheduler_prefetch();
+                return false;
+            }
         }
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});

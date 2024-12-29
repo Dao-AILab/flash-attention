@@ -160,14 +160,13 @@ public:
         // Initialize matmul objects.
         TiledMma tiled_mma;
 
-        // TODO
         scheduler.init_consumer();
 
+        int warp_idx = cutlass::canonical_warp_idx_sync();
         CUTLASS_PRAGMA_NO_UNROLL
-        // TODO: set IsProducerWarp
-        for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
+        for (auto work_tile_info = warp_idx == 0 ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler) : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
              work_tile_info.is_valid(params.scheduler);
-             work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
+             work_tile_info = warp_idx == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
             // Attention output (GEMM-II) accumulator.
             Tensor tOrO = partition_fragment_C(tiled_mma, select<0, 2>(TileShape_MNK{}));
             float softmax_scale_log2 = params.mainloop.softmax_scale_log2;

@@ -55,18 +55,20 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     >;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, FP8_TransposeV>;
 
+    static constexpr int NumProducerThreads = Arch >= 90 ? CollectiveMainloop::NumProducerThreads : CollectiveMainloop::NumMmaThreads;
     using SchedulerPersistent = std::conditional_t<Varlen,
-        flash::VarlenDynamicPersistentTileScheduler<kBlockM, CollectiveMainloop::NumMmaThreads, CollectiveMainloop::NumProducerThreads, Split, PackGQA>,
+        flash::VarlenDynamicPersistentTileScheduler<kBlockM, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/>,
         std::conditional_t<!Is_causal && !Is_local,
             flash::StaticPersistentTileScheduler<Split>,
-            flash::DynamicPersistentTileScheduler<CollectiveMainloop::NumMmaThreads, CollectiveMainloop::NumProducerThreads, Split, PackGQA>
+            flash::DynamicPersistentTileScheduler<CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/>
         >
     >;
     using SchedulerSingleTile = flash::SingleTileScheduler<Varlen, Split, PackGQA, kBlockM>;
     // If Split then we probably don't have enough work for PersistentScheduler to be useful.
     // However, if Varlen (e.g., during decode where we have max_seqlens), using PersistentScheduler is better
     // since we'll avoid launching a bunch of thread blocks that immediately exit.
-    using Scheduler = std::conditional_t<(Split && !Varlen) || Arch < 90, SchedulerSingleTile, SchedulerPersistent>;
+    // On Sm80, noncausal persistent seems a bit slower.
+    using Scheduler = std::conditional_t<Arch >= 90 ? (Split && !Varlen) : ((!Is_causal && !Is_local) || (Split && !Varlen)), SchedulerSingleTile, SchedulerPersistent>;
     using AttnKernel = std::conditional_t<
         Arch >= 90,
         flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>,
