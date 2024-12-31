@@ -18,11 +18,11 @@
 #include "tile_scheduler.hpp"
 #include "mainloop_bwd_sm90_tma_gmma_ws.hpp"
 #include "epilogue_bwd_sm90_tma.hpp"
-#include "flash_bwd_kernel.h"
+#include "flash_bwd_kernel_sm90.h"
 
 using namespace cute;
 
-template <int kHeadDim, int kBlockM, int kBlockN, typename Element,
+template <int Arch, int kHeadDim, int kBlockM, int kBlockN, typename Element,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool Deterministic, bool GQA,
           int Stages_dO=2, int Stages_dS=2,
           bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
@@ -30,6 +30,8 @@ template <int kHeadDim, int kBlockM, int kBlockN, typename Element,
 void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Is_causal and Is_local cannot be true at the same time.");
     using ElementAccum = float;
+    using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
+
     int const total_q_padded_rounded = cute::round_up(params.total_q + params.b * kBlockM, kBlockM);
     int const total_k_padded_rounded = cute::round_up(params.total_k + params.b * kBlockN, kBlockN);
     bool const is_varlen_q = params.cu_seqlens_q;
@@ -42,7 +44,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     int batch_k = !is_varlen_k ? params.b : 1;
 
     using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
-    using PreprocessKernel = flash::FlashAttnBwdPreprocess<TileShape_MK, Element, ElementAccum, cutlass::arch::Sm90, /*Clear_dQaccum=*/true, Varlen>;
+    using PreprocessKernel = flash::FlashAttnBwdPreprocess<TileShape_MK, Element, ElementAccum, ArchTag, /*Clear_dQaccum=*/true, Varlen>;
     typename PreprocessKernel::Arguments preprocess_args {
         static_cast<Element const*>(params.o_ptr),
         {seqlen_q, params.d, params.h, batch_q},  // shape_O
@@ -73,7 +75,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<_1, Int<1>, _1>;  // Currently doesn't not support cluster
     static constexpr int Stages = 2;
-    using CollectiveMainloop = flash::CollectiveMainloopBwd<Stages, Stages_dO, Stages_dS, ClusterShape, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm90,
+    using CollectiveMainloop = flash::CollectiveMainloopBwdSm90<Stages, Stages_dO, Stages_dS, ClusterShape, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm90,
             Is_causal, Is_local, Has_softcap, Varlen, Deterministic,
             SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>;
     using CollectiveEpilogue = std::conditional_t<
@@ -82,7 +84,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         flash::CollectiveEpilogueBwdGQA<TileShape_MNK, ElementAccum, CollectiveMainloop::NumMmaThreads, Varlen, Deterministic>
     >;
     using Scheduler = flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>;
-    using AttnKernel = flash::FlashAttnBwd<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
+    using AttnKernel = flash::FlashAttnBwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
 
     typename CollectiveMainloop::Arguments mainloop_args {
         static_cast<Element const*>(params.q_ptr),
@@ -187,7 +189,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     }
     CHECK_CUDA_KERNEL_LAUNCH();
 
-    using PostprocessKernel = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_MK, Element, ElementAccum, cutlass::arch::Sm90,
+    using PostprocessKernel = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_MK, Element, ElementAccum, ArchTag,
         AttnKernel::CollectiveMainloop::NumMmaThreads,
         typename AttnKernel::CollectiveMainloop::TiledMmadQ,
         AttnKernel::CollectiveMainloop::dQ_swapAB
@@ -215,7 +217,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 
     if constexpr (GQA) {
         using TileShape_NK = cute::Shape<Int<kBlockN>, Int<kHeadDim>>;
-        using PostprocessKerneldKV = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_NK, Element, ElementAccum, cutlass::arch::Sm90,
+        using PostprocessKerneldKV = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_NK, Element, ElementAccum, ArchTag,
             AttnKernel::CollectiveEpilogue::NumEpilogueThreads,
             typename AttnKernel::CollectiveMainloop::TiledMmadKV,
             AttnKernel::CollectiveMainloop::dKV_swapAB
@@ -263,11 +265,12 @@ template<typename T, int kBlockM, int kBlockN, int kHeadDim, bool Is_causal, boo
          bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
          int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1>
 void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
+    static constexpr int Arch = 90;
     VARLEN_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
         BOOL_SWITCH(params.h != params.h_k, GQA, [&] {
 //             BOOL_SWITCH(params.deterministic, Deterministic, [&] {
             // run_flash_bwd<kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen, false, GQA, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);
-            run_flash_bwd<kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen /*Varlen*/, false /*Deterministic*/, GQA, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);
+            run_flash_bwd<Arch, kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen /*Varlen*/, false /*Deterministic*/, GQA, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);
 //             });
         });
     });

@@ -7,12 +7,9 @@
 #include "cute/tensor.hpp"
 
 #include <cutlass/cutlass.h>
-#include <cutlass/arch/reg_reconfig.h>
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
-#include <cutlass/numeric_conversion.h>
 #include <cutlass/kernel_hardware_info.h>
-#include "cutlass/pipeline/pipeline.hpp"
 
 #include "seqlen.h"
 #include "utils.h"
@@ -143,7 +140,6 @@ public:
     get_block_shape() {
         return dim3(MaxThreadsPerBlock, 1, 1);
     }
-
 
     CUTLASS_DEVICE
     void

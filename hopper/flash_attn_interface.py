@@ -58,7 +58,7 @@ def _flash_attn_forward(
         maybe_contiguous(x) for x in (page_table, kv_batch_idx, leftpad_k)
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
-    out, softmax_lse, *rest = flashattn_hopper_cuda.fwd_kvcache(
+    out, softmax_lse, *rest = flashattn_hopper_cuda.fwd(
         q,
         k,
         v,

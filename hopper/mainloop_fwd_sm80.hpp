@@ -11,7 +11,6 @@
 
 #include "cute/tensor.hpp"
 
-#include "named_barrier.hpp"
 #include "seqlen.h"
 #include "mask.h"
 #include "pack_gqa.h"

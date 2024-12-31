@@ -40,7 +40,7 @@ template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class T
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Deterministic,
         bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
         int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1>
-struct CollectiveMainloopBwd {
+struct CollectiveMainloopBwdSm90 {
 
     static constexpr int kStages = Stages;
     static constexpr int kStages_dO = Stages_dO;
@@ -265,7 +265,7 @@ struct CollectiveMainloopBwd {
     // thread needs to keep statistics for (kBlockM / 4) rows. If !SdP_swapAB, each thread only needs to keep
     // statistic for 2 rows.
     static constexpr bool ShuffleLSE = SdP_swapAB && kHeadDim <= 64;
-    static constexpr bool ShuffledPSum = SdP_swapAB && kHeadDim <= 64;
+    static constexpr bool ShuffledPsum = SdP_swapAB && kHeadDim <= 64;
     // If we have extra registers, we can keep V in registers to reduce smem traffic.
     static constexpr bool Mma_dP_is_RS = SdP_swapAB && kHeadDim == 96;
     static constexpr bool dQacc_use_TMA = kHeadDim < 256;
@@ -298,15 +298,15 @@ struct CollectiveMainloopBwd {
 
     // Host side kernel arguments
     struct Arguments {
-        Element const* ptr_Q;
+        Element const* const ptr_Q;
         ShapeQKV const shape_Q;
         StrideQKV const stride_Q;
-        Element const* ptr_K;
+        Element const* const ptr_K;
         ShapeQKV const shape_K;
         StrideQKV const stride_K;
-        Element const* ptr_V;
+        Element const* const ptr_V;
         StrideQKV const stride_V;
-        Element const* ptr_dO;
+        Element const* const ptr_dO;
         StrideQKV const stride_dO;
         ElementAccum* ptr_dQaccum;
         ShapedQaccum const shape_dQaccum;
@@ -331,8 +331,8 @@ struct CollectiveMainloopBwd {
     struct Params {
         ShapeQKV const shape_Q;
         ShapeQKV const shape_K;
-        ShapedQaccum const shape_dQaccum;
         ElementAccum* ptr_dQaccum;
+        ShapedQaccum const shape_dQaccum;
         StridedQaccum stride_dQaccum;
         cutlass::FastDivmod qhead_per_khead_divmod;
         TMA_QdO tma_load_Q, tma_load_dO;
@@ -394,8 +394,8 @@ struct CollectiveMainloopBwd {
         // (1 - tanh^2) * softmax_scale / softcap_val * softcap_val = (1 - tanh^2) * softmax_scale.
         // Instead we multiply by (1 - tanh^2) and multiply dK and dV by params.softmax_scale
         // (the original softmax_scale) at the end.
-        return {args.shape_Q, args.shape_K, args.shape_dQaccum,
-                args.ptr_dQaccum, args.stride_dQaccum,
+        return {args.shape_Q, args.shape_K,
+                args.ptr_dQaccum, args.shape_dQaccum, args.stride_dQaccum,
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
                 tma_load_Q, tma_load_dO, tma_load_K, tma_load_V,
                 args.ptr_LSE_log2, args.shape_LSE, args.stride_LSE_log2, args.ptr_dPsum, args.stride_dPsum,
@@ -755,7 +755,6 @@ struct CollectiveMainloopBwd {
         auto thread_mma_SdP = tiled_mma_SdP.get_thread_slice(thread_idx);
         auto wg_mma_dKV = tiled_mma_dKV.get_slice(warp_group_thread_layout(warp_group_idx));
         auto wg_mma_dQ = tiled_mma_dQ.get_slice(warp_group_thread_layout_dq(warp_group_idx));
-        auto thread0_mma_SdP = tiled_mma_SdP.get_thread_slice(_0{});
 
         auto smem_tiled_copy_PdS = make_tiled_copy_C(SmemCopyAtomPdS{}, tiled_mma_SdP);
         auto smem_thr_copy_PdS = smem_tiled_copy_PdS.get_thread_slice(thread_idx);
@@ -874,8 +873,8 @@ struct CollectiveMainloopBwd {
                 }
             }
 
-            Tensor tLSErdPsum = cute::conditional_return<!ShuffledPSum>(make_fragment_like(tLSEsdPsum(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
-            if constexpr (!ShuffledPSum) {
+            Tensor tLSErdPsum = cute::conditional_return<!ShuffledPsum>(make_fragment_like(tLSEsdPsum(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
+            if constexpr (!ShuffledPsum) {
                 cute::copy(tLSEsdPsum(_, smem_pipe_read_do_cur.index()), tLSErdPsum);
             } else {
                 #pragma unroll
@@ -890,7 +889,7 @@ struct CollectiveMainloopBwd {
             #pragma unroll
             for (int mi = 0; mi < size<0>(dS); ++mi) {
                 float const dP_sum_cur = [&] {
-                    if constexpr (!ShuffledPSum) return tLSErdPsum(mi);
+                    if constexpr (!ShuffledPsum) return tLSErdPsum(mi);
                     else return __shfl_sync(0xffffffff, tLSErdPsum(mi / 8), (mi % 8) * 4 + (thread_idx % 4));
                 }();
                 #pragma unroll

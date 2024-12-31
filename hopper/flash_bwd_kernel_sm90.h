@@ -22,7 +22,7 @@ namespace flash {
 using namespace cute;
 
 template <class CollectiveMainloop_, class CollectiveEpilogue_, class TileScheduler_>
-class FlashAttnBwd {
+class FlashAttnBwdSm90 {
 
 public:
 
@@ -143,7 +143,6 @@ public:
     get_block_shape() {
         return dim3(MaxThreadsPerBlock, 1, 1);
     }
-
 
     CUTLASS_DEVICE
     void

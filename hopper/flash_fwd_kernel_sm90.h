@@ -170,7 +170,6 @@ public:
         return dim3(MaxThreadsPerBlock, 1, 1);
     }
 
-
     CUTLASS_DEVICE
     void
     operator()(Params const& params, char* smem_buf) {
