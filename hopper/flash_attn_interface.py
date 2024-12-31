@@ -16,59 +16,82 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
-def _flash_attn_forward(q, k, v, softmax_scale, causal,
-                        q_descale=None, k_descale=None, v_descale=None,
-                        window_size=(-1, -1),
-                        sink_token_length=0,
-                        softcap=0.0,
-                        num_splits=1,
-                        pack_gqa=None,
-                        sm_margin=0):
-    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
-    q, k = [maybe_contiguous(x) for x in (q, k)]
+def _flash_attn_forward(
+        q,
+        k,
+        v,
+        k_new,
+        v_new,
+        out,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_k_new,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        page_table,
+        kv_batch_idx,
+        leftpad_k,
+        rotary_cos,
+        rotary_sin,
+        q_descale,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        causal,
+        window_size=(-1, -1),
+        sink_token_length=0,
+        softcap=0.0,
+        rotary_interleaved=True,
+        num_splits=1,
+        pack_gqa=None,
+        sm_margin=0):
+    assert sink_token_length == 0, "sink_token_length not supported yet"
+    q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
-    out, q, k, v, out_padded, softmax_lse = flashattn_hopper_cuda.fwd(
+    cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
+        maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new)
+    ]
+    seqused_q, seqused_k = [maybe_contiguous(x) for x in (seqused_q, seqused_k)]
+    page_table, kv_batch_idx, leftpad_k = [
+        maybe_contiguous(x) for x in (page_table, kv_batch_idx, leftpad_k)
+    ]
+    rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
+    out, softmax_lse, *rest = flashattn_hopper_cuda.fwd_kvcache(
         q,
         k,
         v,
-        None,
+        k_new,
+        v_new,
+        out,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_k_new,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        page_table,
+        kv_batch_idx,
+        leftpad_k,
+        rotary_cos,
+        rotary_sin,
+        q_descale,
+        k_descale,
+        v_descale,
         softmax_scale,
         causal,
-        q_descale, k_descale, v_descale,
-        window_size[0], window_size[1], sink_token_length,
+        window_size[0],
+        window_size[1],
+        sink_token_length,
         softcap,
+        rotary_interleaved,
         num_splits,
         pack_gqa,
-        sm_margin
+        sm_margin,
     )
-    return out, q, k, v, out_padded, softmax_lse
-
-
-def _flash_attn_varlen_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, causal,
-                               q_descale=None, k_descale=None, v_descale=None,
-                               window_size=(-1, -1), softcap=0.0,
-                               num_splits=1,
-                               pack_gqa=None,
-                               sm_margin=0):
-    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse = flashattn_hopper_cuda.fwd_varlen(
-        q,
-        k,
-        v,
-        None,
-        cu_seqlens_q, cu_seqlens_k, None, None, max_seqlen_q, max_seqlen_k,
-        softmax_scale,
-        causal,
-        q_descale, k_descale, v_descale,
-        window_size[0], window_size[1],
-        softcap,
-        num_splits,
-        pack_gqa,
-        sm_margin
-    )
-    # breakpoint()
-    return out, q, k, v, out_padded, softmax_lse
+    return (out, softmax_lse, *rest)
 
 
 def _flash_attn_backward(
@@ -96,7 +119,6 @@ def _flash_attn_backward(
         sm_margin=0,
 ):
     assert sink_token_length == 0, "sink_token_length not supported yet"
-    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     dq, dk, dv, softmax_d, *rest = flashattn_hopper_cuda.bwd(
@@ -228,13 +250,21 @@ class FlashAttnFunc(torch.autograd.Function):
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse = _flash_attn_forward(
+        # out, q, k, v, out_padded, softmax_lse = _flash_attn_forward(
+        out, softmax_lse, *rest = _flash_attn_forward(
             q,
             k,
             v,
+            None, None,  # k_new, v_new
+            None,  # out
+            None, None, None,   # cu_seqlens_q/k/k_new
+            None, None,   # seqused_q/k
+            None, None,   # max_seqlen_q/k
+            None, None, None,   # page_table, kv_batch_idx, leftpad_k,
+            None, None,  # rotary_cos/sin
+            q_descale, k_descale, v_descale,
             softmax_scale,
             causal=causal,
-            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
             sink_token_length=sink_token_length,
             softcap=softcap,
@@ -242,7 +272,8 @@ class FlashAttnFunc(torch.autograd.Function):
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
+        # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
+        ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -308,28 +339,36 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic=False,
         sm_margin=0,
     ):
-        assert seqused_q is None, "seqused_q not supported yet"
-        assert seqused_k is None, "seqused_k not supported yet"
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse = _flash_attn_varlen_forward(
+        # out, q, k, v, out_padded, softmax_lse = _flash_attn_varlen_forward(
+        out, softmax_lse, *rest = _flash_attn_forward(
             q,
             k,
             v,
+            None, None,  # k_new, v_new
+            None,  # out
             cu_seqlens_q,
             cu_seqlens_k,
+            None,   # cu_seqlens_k_new
+            seqused_q,
+            seqused_k,
             max_seqlen_q,
             max_seqlen_k,
+            None, None, None,   # page_table, kv_batch_idx, leftpad_k,
+            None, None,  # rotary_cos/sin
+            q_descale, k_descale, v_descale,
             softmax_scale,
             causal=causal,
-            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
+            sink_token_length=sink_token_length,
             softcap=softcap,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.softmax_scale = softmax_scale
@@ -573,6 +612,9 @@ def flash_attn_with_kvcache(
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
@@ -671,7 +713,6 @@ def flash_attn_with_kvcache(
     assert sink_token_length == 0
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
@@ -679,37 +720,35 @@ def flash_attn_with_kvcache(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
-    cache_batch_idx = maybe_contiguous(cache_batch_idx)
-    page_table = maybe_contiguous(page_table)
-    cu_seqlens_q = maybe_contiguous(cu_seqlens_q)
-    cu_seqlens_k_new = maybe_contiguous(cu_seqlens_k_new)
-    out, softmax_lse, *rest = flashattn_hopper_cuda.fwd_kvcache(
+    out, softmax_lse, *rest = _flash_attn_forward(
         q,
         k_cache,
         v_cache,
         k,
         v,
         None,  # out
+        cu_seqlens_q,
+        None,  # cu_seqlens_k
+        cu_seqlens_k_new,
+        None,  # seqused_q
         cache_seqlens,
-        rotary_cos,
-        rotary_sin,
+        max_seqlen_q,
+        None,  # max_seqlen_k
+        page_table,
         cache_batch_idx,
         cache_leftpad,
-        page_table,
-        cu_seqlens_q,
-        cu_seqlens_k_new,
-        max_seqlen_q,
+        rotary_cos,
+        rotary_sin,
+        q_descale, k_descale, v_descale,
         softmax_scale,
-        causal,
-        None, None, None,  # qkv_descale
-        window_size[0],
-        window_size[1],
-        sink_token_length,
-        softcap,
-        rotary_interleaved,
-        num_splits,
-        pack_gqa,
-        sm_margin,
+        causal=causal,
+        window_size=window_size,
+        sink_token_length=sink_token_length,
+        softcap=softcap,
+        rotary_interleaved=rotary_interleaved,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        sm_margin=sm_margin,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
