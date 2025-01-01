@@ -28,21 +28,36 @@ public:
     using TileShape_MK = TileShape_MK_;
     using ArchTag = ArchTag_;
 
-    static_assert(ArchTag::kMinComputeCapability >= 90);
+    static_assert(ArchTag::kMinComputeCapability >= 75);
+    static constexpr bool IsSm90 = ArchTag::kMinComputeCapability >= 90;
 
     static constexpr uint32_t MaxThreadsPerBlock = kNThreads;
     static constexpr uint32_t MinBlocksPerMultiprocessor = 2;
 
     static constexpr int kBlockM = get<0>(TileShape_MK{});
     static constexpr int kHeadDim = get<1>(TileShape_MK{});
-    static_assert(kNThreads % cutlass::NumThreadsPerWarpGroup == 0, "kNThreads must be a multiple of NumThreadsPerWarpGroup");
+    static_assert(!IsSm90 || kNThreads % cutlass::NumThreadsPerWarpGroup == 0, "kNThreads must be a multiple of NumThreadsPerWarpGroup");
     static constexpr int NumdQWarpGgroups = kNThreads / cutlass::NumThreadsPerWarpGroup;
-    using R2SLayoutAtomdQaccum = Layout<Shape<Int<cutlass::NumThreadsPerWarpGroup>, Int<NumdQWarpGgroups>>>;
+    using R2SLayoutAtomdQaccum = std::conditional_t<
+        IsSm90,
+        Layout<Shape<Int<cutlass::NumThreadsPerWarpGroup>, Int<NumdQWarpGgroups>>>,
+        Layout<Shape<Int<kNThreads>>>
+    >;
     using R2STiledCopydQaccum = decltype(make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{}, R2SLayoutAtomdQaccum{},
-                                                         Layout<Shape < _4>>{}));  // Val layout, 4 vals per read
+                                                         Layout<Shape<Int<IsSm90 ? 4 : 1>>>{}));  // Val layout, 1 or 4 vals per read
+    using G2SLayoutAtomdQaccum = Layout<Shape<Int<kNThreads>>>;
+    // UniversalCopy instead of AutoVectorizingCopyWithAssumedAlignment as the latter generates cp.async instructions
+    using G2STiledCopydQaccum = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, ElementAccum>{}, G2SLayoutAtomdQaccum{},
+                                                         Layout<Shape<_4>>{}));  // Val layout, 4 vals per read
+    // We don't do bound checking for the gmem -> smem load so we just assert here.
+    static_assert(IsSm90 || (kBlockM * kHeadDim) % (kNThreads * 4) == 0);
     static constexpr int SmemdQaccumSize = size(TileShape_MK{});
     using SmemLayoutdQaccumFlat = Layout<Shape<Int<SmemdQaccumSize>>>;
-    using SmemLayoutdQaccum = Layout<Shape<Int<kBlockM * kHeadDim / NumdQWarpGgroups>, Int<NumdQWarpGgroups>>>;
+    using SmemLayoutdQaccum = std::conditional_t<
+        IsSm90,
+        Layout<Shape<Int<kBlockM * kHeadDim / NumdQWarpGgroups>, Int<NumdQWarpGgroups>>>,
+        Layout<Shape<Int<kBlockM * kHeadDim>>>
+    >;
 
     // We can't just use kHeadDim here. E.g. if MMA shape is 64 x 96 but split across 2 WGs,
     // then setting kBlockKSmem to 32 will cause "Static shape_div failure".
@@ -61,7 +76,11 @@ public:
                                                make_stride(Int<get<0>(TileShape_MK{})>{}, _1{}))));
 
     using SmemCopyAtomdQ = Copy_Atom<
-        std::conditional_t<!dQ_swapAB, cute::SM90_U32x4_STSM_N, cute::SM90_U16x8_STSM_T>,
+        std::conditional_t<
+            IsSm90,
+            std::conditional_t<!dQ_swapAB, cute::SM90_U32x4_STSM_N, cute::SM90_U16x8_STSM_T>,
+            AutoVectorizingCopyWithAssumedAlignment<128>
+        >,
         Element>;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
@@ -152,20 +171,29 @@ public:
         bool const is_varlen = params.cu_seqlens;
         if (is_varlen && m_block * kBlockM >= seqlen_info.seqlen) { return; }
 
-        // Step 1: Bulk copy to load dQaccum from gmem to smem
+        // Step 1: load dQaccum from gmem to smem
         Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum const*>(params.ptr_dQaccum)),
                                       params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
         Tensor gdQaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));  // (M * K)
-        static constexpr uint32_t TmaTransactionBytesdQaccum = static_cast<uint32_t>(size(SmemLayoutdQaccumFlat{}) * cute::sizeof_bits_v<ElementAccum> / 8);
-        auto bulk_copy = Copy_Traits<SM90_BULK_COPY_AUTO>{};
-        // if (thread0()) { print(gdQaccum); printf("\n"); print(sdQaccum_flat); printf("\n"); }
-        if (thread_idx == 0) {
-            shared_storage.barrier_dQaccum.init(1 /*numThreads*/);
-            shared_storage.barrier_dQaccum.arrive_and_expect_tx(TmaTransactionBytesdQaccum);
-            copy(bulk_copy.with(*reinterpret_cast<uint64_t*>(&shared_storage.barrier_dQaccum)), gdQaccum, sdQaccum_flat);
+        if constexpr (IsSm90) {  // Use BulkCopy
+            static constexpr uint32_t TmaTransactionBytesdQaccum = static_cast<uint32_t>(size(SmemLayoutdQaccumFlat{}) * cute::sizeof_bits_v<ElementAccum> / 8);
+            auto bulk_copy = Copy_Traits<SM90_BULK_COPY_AUTO>{};
+            // if (thread0()) { print(gdQaccum); printf("\n"); print(sdQaccum_flat); printf("\n"); }
+            if (thread_idx == 0) {
+                shared_storage.barrier_dQaccum.init(1 /*numThreads*/);
+                shared_storage.barrier_dQaccum.arrive_and_expect_tx(TmaTransactionBytesdQaccum);
+                copy(bulk_copy.with(*reinterpret_cast<uint64_t*>(&shared_storage.barrier_dQaccum)), gdQaccum, sdQaccum_flat);
+            }
+            __syncthreads();
+            shared_storage.barrier_dQaccum.wait(0);
+        } else {
+            G2STiledCopydQaccum g2s_tiled_copy_dQaccum;
+            auto g2s_thr_copy_dQaccum = g2s_tiled_copy_dQaccum.get_thread_slice(thread_idx);
+            Tensor tdQgdQaccumg2s = g2s_thr_copy_dQaccum.partition_S(gdQaccum);
+            Tensor tdQsdQaccumg2s = g2s_thr_copy_dQaccum.partition_D(sdQaccum);
+            cute::copy(g2s_tiled_copy_dQaccum, tdQgdQaccumg2s, tdQsdQaccumg2s);
+            __syncthreads();
         }
-        __syncthreads();
-        shared_storage.barrier_dQaccum.wait(0);
 
         // __syncthreads(); if (cute::thread0()) { print_tensor(sdQaccum); }
 

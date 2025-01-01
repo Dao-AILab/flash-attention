@@ -24,16 +24,6 @@
 
 namespace flash {
 
-template <bool A, class Mma, class Tensor0>
-CUTLASS_DEVICE
-auto mma_partition_fragment_AB(Mma const& mma, Tensor0 const& tensor0) {
-    if constexpr (A) {
-        return mma.partition_fragment_A(tensor0);
-    } else {
-        return mma.partition_fragment_B(tensor0);
-    }
-}
-
 using namespace cute;
 
 template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class TileShape_MNK_, class Element_, class ElementAccum_, class ArchTag_,
@@ -308,13 +298,13 @@ struct CollectiveMainloopBwdSm90 {
         StrideQKV const stride_V;
         Element const* const ptr_dO;
         StrideQKV const stride_dO;
-        ElementAccum* ptr_dQaccum;
+        ElementAccum* const ptr_dQaccum;
         ShapedQaccum const shape_dQaccum;
         StridedQaccum const stride_dQaccum;
-        float const* ptr_LSE_log2;
+        float const* const ptr_LSE_log2;
         ShapeLSE const shape_LSE;
         StrideLSE const stride_LSE_log2;
-        float const* ptr_dPsum;
+        float const* const ptr_dPsum;
         StrideLSE const stride_dPsum;
         float const softmax_scale;
         int const window_size_left, window_size_right, sink_token_length;
@@ -331,17 +321,17 @@ struct CollectiveMainloopBwdSm90 {
     struct Params {
         ShapeQKV const shape_Q;
         ShapeQKV const shape_K;
-        ElementAccum* ptr_dQaccum;
+        ElementAccum* const ptr_dQaccum;
         ShapedQaccum const shape_dQaccum;
         StridedQaccum stride_dQaccum;
         cutlass::FastDivmod qhead_per_khead_divmod;
         TMA_QdO tma_load_Q, tma_load_dO;
         TMA_K tma_load_K;
         TMA_V tma_load_V;
-        float const* ptr_LSE_log2;
+        float const* const ptr_LSE_log2;
         ShapeLSE const shape_LSE;
         StrideLSE const stride_LSE_log2;
-        float const* ptr_dPsum;
+        float const* const ptr_dPsum;
         StrideLSE const stride_dPsum;
         float const softmax_scale, softmax_scale_log2;
         int const window_size_left, window_size_right, sink_token_length;

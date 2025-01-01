@@ -86,7 +86,7 @@ static __device__ __forceinline__ T run(T x, Operator &op) {
 // For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
 // For SM90, convert acc_layout from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
 template<bool Transposed=false, typename Layout0>
-__forceinline__ __device__ auto convert_layout_acc_rowcol(Layout0 acc_layout) {
+CUTLASS_DEVICE auto convert_layout_acc_rowcol(Layout0 acc_layout) {
     if constexpr (decltype(rank<0>(acc_layout))::value == 3) {  // SM90
         static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
         static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
@@ -99,24 +99,15 @@ __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout0 acc_layout) {
         }
 
     } else {  // SM80
-        static_assert(!Transposed);
         static_assert(decltype(size<0>(acc_layout))::value == 4);
         static_assert(decltype(rank(acc_layout))::value == 3);
         auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
-        return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
+        if constexpr (!Transposed) {
+            return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
+        } else {
+            return make_layout(make_layout(get<0, 0>(l), get<2>(l)), make_layout(get<0, 1>(l), get<1>(l)));
+        }
     }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// For SM90, convert acc_layout from ((2, 2, V), MMA_N, MMA_M) to (nrow=(2, V, MMA_M), ncol=(2, MMA_N))
-template<typename Layout0>
-__forceinline__ __device__ auto convert_layout_acc_transposed_rowcol(Layout0 acc_layout) {
-    static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
-    static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
-    static_assert(decltype(rank(acc_layout))::value == 3);
-    auto l = acc_layout;
-    return make_layout(make_layout(get<0, 0>(l), get<0, 2>(l), get<2>(l)), make_layout(get<0, 1>(l), get<1>(l)));
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -126,7 +117,7 @@ __forceinline__ __device__ auto convert_layout_acc_transposed_rowcol(Layout0 acc
 // For SM90, FP16/BF16, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((2, 2, 2), MMA_M, (N / 16, MMA_N))
 // For SM90, FP8, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((4, 2, 2), MMA_M, (N / 32, MMA_N))
 template<typename MMA_Traits, typename Layout0>
-__forceinline__ __device__ auto convert_layout_acc_Aregs(Layout0 acc_layout) {
+CUTLASS_DEVICE auto convert_layout_acc_Aregs(Layout0 acc_layout) {
     using X = Underscore;
     if constexpr (decltype(rank<0>(acc_layout))::value == 3) {  // SM90
         static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
@@ -209,6 +200,18 @@ void cp_async_wait() {
 #if defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
     asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
 #endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <bool A, class Mma, class Tensor0>
+CUTLASS_DEVICE
+auto mma_partition_fragment_AB(Mma const& mma, Tensor0 const& tensor0) {
+    if constexpr (A) {
+        return mma.partition_fragment_A(tensor0);
+    } else {
+        return mma.partition_fragment_B(tensor0);
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
