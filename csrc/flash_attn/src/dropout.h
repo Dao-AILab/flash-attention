@@ -4,10 +4,11 @@
 
 #pragma once
 
+#include "namespace_config.h"
 #include "philox.cuh"
 #include "utils.h"
 
-namespace flash {
+namespace FLASH_NAMESPACE {
 
 struct Dropout {
 
@@ -26,7 +27,7 @@ struct Dropout {
     __forceinline__ __device__ void apply_dropout(Tensor<Engine, Layout> &tensor_,
                                          int block_row_start, int block_col_start, int block_row_stride) {
         // convert shape from (4, MMA_M, MMA_N) to (8, MMA_M, MMA_N / 2)
-        Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_dropout(tensor_.layout()));
+        Tensor tensor = make_tensor(tensor_.data(), FLASH_NAMESPACE::convert_layout_acc_dropout(tensor_.layout()));
         using T = typename Engine::value_type;
         auto encode_dropout = [](bool keep, T val) {
             return keep ? val : (encode_dropout_in_sign_bit ? -val : T(0));
@@ -41,7 +42,7 @@ struct Dropout {
             #pragma unroll
             for (int n = 0; n < size<2>(tensor) / 2; ++n, ++rowcol.y) {
                 // if (cute::thread(32, 0)) { printf("m = %d, n = %d, row = %d, col = %d\n", m, n, int(rowcol.x), int(rowcol.y));}
-                uint4 random_uint4 = flash::philox(seed, reinterpret_cast<unsigned long long&>(rowcol), offset);
+                uint4 random_uint4 = FLASH_NAMESPACE::philox(seed, reinterpret_cast<unsigned long long&>(rowcol), offset);
                 // if (cute::thread0()) { printf("philox = %u, %d, %d, %d\n", random_uint4.x, random_uint4.y, random_uint4.z, random_uint4.w);}
                 uint8_t (&rnd_8)[16] = reinterpret_cast<uint8_t (&)[16]>(random_uint4);
                 // Special implementation for 16-bit types: we duplicate the threshold to the
@@ -91,4 +92,4 @@ struct Dropout {
 
 };
 
-} // namespace flash
+} // namespace FLASH_NAMESPACE

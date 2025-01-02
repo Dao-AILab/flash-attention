@@ -2,7 +2,9 @@
 #pragma once
 // Philox CUDA.
 
-namespace flash {
+#include "namespace_config.h"
+
+namespace FLASH_NAMESPACE {
 
 struct ull2 {
     unsigned long long x;
@@ -48,4 +50,4 @@ __forceinline__ __device__ uint4 philox(unsigned long long seed,
     return output;
 }
 
-} // namespace flash
+} // namespace FLASH_NAMESPACE

@@ -6,11 +6,12 @@
 
 #include <cute/tensor.hpp>
 
+#include "namespace_config.h"
 #include "utils.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace flash {
+namespace FLASH_NAMESPACE {
 
 using namespace cute;
 
@@ -149,4 +150,4 @@ __forceinline__ __device__ void copy_rotary_contiguous(Tensor<Engine0, Layout0> 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace flash
+}  // namespace FLASH_NAMESPACE
