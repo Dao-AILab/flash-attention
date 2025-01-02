@@ -1,5 +1,6 @@
 #include <cmath>
 
+#include "namespace_config.h"
 #include <cute/tensor.hpp>
 
 #include <cutlass/cutlass.h>
@@ -7,7 +8,7 @@
 
 #include "utils.h"
 
-namespace flash {
+namespace FLASH_NAMESPACE {
 
 using namespace cute;
 
@@ -71,4 +72,4 @@ struct Alibi {
 
 };
 
-}  // namespace flash
+}  // namespace FLASH_NAMESPACE
