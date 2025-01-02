@@ -17,7 +17,7 @@
 #include "flash_bwd_postprocess_kernel.h"
 #include "tile_scheduler.hpp"
 #include "mainloop_bwd_sm90_tma_gmma_ws.hpp"
-#include "epilogue_bwd_sm90_tma.hpp"
+#include "epilogue_bwd.hpp"
 #include "flash_bwd_kernel_sm90.h"
 
 using namespace cute;
