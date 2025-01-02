@@ -271,7 +271,8 @@ CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<bool A_in_regs=false, bool B_in_regs=false, typename Tensor0, typename Tensor1,
+template<bool A_in_regs=false, bool B_in_regs=false, bool SwapAB=false,
+         typename Tensor0, typename Tensor1,
          typename Tensor2, typename Tensor3, typename Tensor4,
          typename TiledMma, typename TiledCopyA, typename TiledCopyB,
          typename ThrCopyA, typename ThrCopyB, typename Hook>
@@ -279,23 +280,29 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
                               Tensor4 const& tCsB, TiledMma tiled_mma,
                               TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
                               ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, Hook fn) {
-    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
-    CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
-    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
-    Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
-    CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
-    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
-    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
-    if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
-    if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{})); }
-    #pragma unroll
-    for (int i = 0; i < size<2>(tCrA); ++i) {
-        if (i < size<2>(tCrA) - 1) {
-            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1)); }
-            if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1)); }
+    if constexpr (SwapAB) {
+        gemm_sm80<B_in_regs, A_in_regs>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn);
+    } else {
+        CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
+        CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
+        CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
+        Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+        CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
+        Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+        CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+        if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
+        if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{})); }
+        #pragma unroll
+        for (int i = 0; i < size<2>(tCrA); ++i) {
+            if (i < size<2>(tCrA) - 1) {
+                if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1)); }
+                if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1)); }
+            }
+            if constexpr (!std::is_same_v<Hook, std::nullptr_t>) {
+                if (i == 0) { fn(); }
+            }
+            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
         }
-        if (i == 0) { fn(); }
-        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
 }
 
@@ -510,7 +517,7 @@ CUTLASS_DEVICE void permute_output_fp8_Vcolmajor(Fragment &frag) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename Engine, typename Layout>
-__forceinline__ __device__ void apply_softcap(Tensor<Engine, Layout> &tensor, float const softcap){
+CUTLASS_DEVICE void apply_softcap(Tensor<Engine, Layout> &tensor, float const softcap){
     #pragma unroll
     for (int i = 0; i < size(tensor); ++i) {
         tensor(i) = cutlass::fast_tanh(tensor(i) * softcap);
@@ -518,7 +525,7 @@ __forceinline__ __device__ void apply_softcap(Tensor<Engine, Layout> &tensor, fl
 }
 
 template <typename Engine, typename Layout>
-__forceinline__ __device__ auto calculate_dtanh(Tensor<Engine, Layout> &tensor){
+CUTLASS_DEVICE auto calculate_dtanh(Tensor<Engine, Layout> &tensor){
     Tensor out = make_fragment_like<float>(tensor);
     #pragma unroll
     for (int i = 0; i < size(tensor); ++i) {

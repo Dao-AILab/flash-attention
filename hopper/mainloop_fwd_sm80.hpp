@@ -321,7 +321,7 @@ struct CollectiveMainloopFwdSm80 {
         return {n_block_min, n_block_max};
     }
 
-    template <typename SharedStorage, typename FrgTensorO, typename Softmax, typename SchedulerPrefetch>
+    template <typename SharedStorage, typename FrgTensorO, typename Softmax>
     CUTLASS_DEVICE bool
     mma(Params const& params,
         FrgTensorO& tOrO,
@@ -329,8 +329,7 @@ struct CollectiveMainloopFwdSm80 {
         int const thread_idx,
         SeqlenInfo_t const& seqlen_info,
         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
-        SharedStorage& shared_storage,
-        SchedulerPrefetch const& scheduler_prefetch
+        SharedStorage& shared_storage
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -347,10 +346,7 @@ struct CollectiveMainloopFwdSm80 {
         int const n_block_max = get<1>(n_block_min_max);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
-            if (n_block_max <= n_block_min) {
-                scheduler_prefetch();
-                return false;
-            }
+            if (n_block_max <= n_block_min) { return false; }
         }
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
@@ -552,8 +548,8 @@ struct CollectiveMainloopFwdSm80 {
                 // so that we can wait with the correct number of outstanding commits.
                 cute::cp_async_fence();
             }
-            // If persistent and Share_QV_Smem, need to sync to make sure all threads have finished with smem_o before writing to smem_v.
-            // If !Share_QV_Smem, sync to make sure all threads have finished reading from smem_q.
+            // If persistent and !Share_QV_Smem, need to sync to make sure all threads have finished with smem_o before writing to smem_v.
+            // If Share_QV_Smem, sync to make sure all threads have finished reading from smem_q.
             if constexpr (Is_first_stage) { __syncthreads(); }
             if constexpr (!Is_last_stage) {
                 if (Is_first_stage || n_block - stage >= n_block_min) {
@@ -672,7 +668,6 @@ struct CollectiveMainloopFwdSm80 {
             //     fwd_step(n_block, local_mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
             // }
         }
-        scheduler_prefetch();
         float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
         Tensor scores_scale = softmax.finalize(v_descale);
         softmax.rescale_o(tOrO, scores_scale);

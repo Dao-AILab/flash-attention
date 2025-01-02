@@ -191,12 +191,10 @@ public:
                     params.mainloop, threadIdx.x, shared_storage, seqlen_info, block_coord);
                 if (tile_new_valid) { __syncthreads(); }
             }
-            auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
-                scheduler.prefetch_next_work(params.scheduler, work_tile_info);
-            };
             bool tile_valid = collective_mainloop.mma(
                 params.mainloop, tOrO, softmax, threadIdx.x, seqlen_info, block_coord,
-                shared_storage, scheduler_prefetch);
+                shared_storage);
+            scheduler.prefetch_next_work(params.scheduler, work_tile_info);
             if (tile_valid) {
                 // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
                 collective_epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma,

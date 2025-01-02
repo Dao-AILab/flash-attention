@@ -80,8 +80,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>;
     using CollectiveEpilogue = std::conditional_t<
         !GQA,
-        flash::CollectiveEpilogueBwd<TileShape_MNK, Element, CollectiveMainloop::NumMmaThreads, Varlen, dKV_swapAB, NumMmaWarpGroups / AtomLayoutNdKV>,
-        flash::CollectiveEpilogueBwdGQA<TileShape_MNK, ElementAccum, CollectiveMainloop::NumMmaThreads, Varlen, Deterministic>
+        flash::CollectiveEpilogueBwd<TileShape_MNK, Element, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, dKV_swapAB, NumMmaWarpGroups * (Arch >= 90 ? 1 : cutlass::NumWarpsPerWarpGroup) / AtomLayoutNdKV>,
+        flash::CollectiveEpilogueBwdGQA<TileShape_MNK, ElementAccum, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, Deterministic>
     >;
     using Scheduler = flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>;
     using AttnKernel = flash::FlashAttnBwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
@@ -167,7 +167,13 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     // int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
     // int smem_size_do = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_do));
     // int smem_size_ds = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_ds));
-    // int smem_size_dqacc = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_dqacc));
+    // int smem_size_dqacc = [&] {
+    //     if constexpr (Arch >= 90) {
+    //         return sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_dqacc));
+    //     } else {
+    //         return 0;
+    //     }
+    // }();
     // int smem_size_k = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k));
     // int smem_size_v = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v));
     // int smem_size_lse = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_lse));
@@ -260,12 +266,11 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 
 }
 
-template<typename T, int kBlockM, int kBlockN, int kHeadDim, bool Is_causal, bool Is_local, bool Has_softcap,
+template<int Arch, typename T, int kBlockM, int kBlockN, int kHeadDim, bool Is_causal, bool Is_local, bool Has_softcap,
          int Stages_dO=2, int Stages_dS=2,
          bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
          int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1>
 void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
-    static constexpr int Arch = 90;
     VARLEN_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
         BOOL_SWITCH(params.h != params.h_k, GQA, [&] {
 //             BOOL_SWITCH(params.deterministic, Deterministic, [&] {
@@ -279,15 +284,16 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
 
 template<typename T>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
+    static constexpr int Arch = 90;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
             // run_mha_bwd_dispatch<T, 128, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 2>(params, stream);
             if constexpr (Is_causal && Has_softcap) {
                 // register spill with 128 x 128
-                run_mha_bwd_dispatch<T, 96, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 2>(params, stream);
+                run_mha_bwd_dispatch<Arch, T, 96, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 2>(params, stream);
             } else {
                 // With ShuffleStats we no longer have register spilling when Has_softcap and using 128 x 128 block.
-                run_mha_bwd_dispatch<T, 128, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 2>(params, stream);
+                run_mha_bwd_dispatch<Arch, T, 128, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 2>(params, stream);
             }
         });
     });
@@ -295,21 +301,23 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
 
 template<typename T>
 void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
+    static constexpr int Arch = 90;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
-            run_mha_bwd_dispatch<T, 64, 128, 96, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1>(params, stream);
+            run_mha_bwd_dispatch<Arch, T, 64, 128, 96, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1>(params, stream);
         });
     });
 }
 
 template<typename T>
 void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
+    static constexpr int Arch = 90;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
             if constexpr (Is_causal || Is_local || Has_softcap) {
-                run_mha_bwd_dispatch<T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1>(params, stream);
+                run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1>(params, stream);
             } else {
-                run_mha_bwd_dispatch<T, 80, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 1>(params, stream);
+                run_mha_bwd_dispatch<Arch, T, 80, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 1>(params, stream);
             }
         });
     });
@@ -317,18 +325,20 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
 
 template<typename T>
 void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
+    static constexpr int Arch = 90;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
-            run_mha_bwd_dispatch<T, 64, 96, 192, Is_causal, Is_local, Has_softcap, 1, 1, false, true, false, 3, 1, 1, 1>(params, stream);
+            run_mha_bwd_dispatch<Arch, T, 64, 96, 192, Is_causal, Is_local, Has_softcap, 1, 1, false, true, false, 3, 1, 1, 1>(params, stream);
         });
     });
 }
 
 template<typename T>
 void run_mha_bwd_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
+    static constexpr int Arch = 90;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
-            run_mha_bwd_dispatch<T, 64, 80, 256, Is_causal, Is_local, Has_softcap, 1, 1, false, true, true, 2, 1, 1, 1>(params, stream);
+            run_mha_bwd_dispatch<Arch, T, 64, 80, 256, Is_causal, Is_local, Has_softcap, 1, 1, false, true, true, 2, 1, 1, 1>(params, stream);
         });
     });
 }

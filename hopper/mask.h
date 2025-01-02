@@ -76,7 +76,7 @@ struct Mask {
                 // If PackGQA, we split the work of compute divmod among threads in the same row
                 static constexpr int kMmaThreadsPerRow = size<0, 0>(typename TiledMma::AtomLayoutC_TV{});
                 static_assert(cutlass::NumThreadsPerWarp % kMmaThreadsPerRow == 0);
-                static_assert(CUTE_STATIC_V(size<0>(tSrS_rowcol)) <= kMmaThreadsPerRow);
+                static_assert(!PackGQA || CUTE_STATIC_V(size<0>(tSrS_rowcol)) <= kMmaThreadsPerRow);
                 int mma_m_idx;
                 // Might get OOB but it's ok since we'll check it later
                 if constexpr (PackGQA) {
