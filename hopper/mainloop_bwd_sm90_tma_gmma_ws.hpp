@@ -29,7 +29,8 @@ using namespace cute;
 template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class TileShape_MNK_, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Deterministic,
         bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
-        int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1>
+        int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
+        bool Mma_dP_is_RS=false>
 struct CollectiveMainloopBwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -37,6 +38,7 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr int kStages_dS = Stages_dS;
     static_assert(kStages >= kStages_dO);
     static_assert(Stages_dS == 1 || Stages_dS == kStages);
+    static_assert(!Mma_dP_is_RS || SdP_swapAB_);  // If Mma_dP_is_RS, we need SdP_SwapAB
     using ClusterShape = ClusterShape_;
     using TileShape_MNK = TileShape_MNK_;
     using Element = Element_;
@@ -256,8 +258,6 @@ struct CollectiveMainloopBwdSm90 {
     // statistic for 2 rows.
     static constexpr bool ShuffleLSE = SdP_swapAB && kHeadDim <= 64;
     static constexpr bool ShuffledPsum = SdP_swapAB && kHeadDim <= 64;
-    // If we have extra registers, we can keep V in registers to reduce smem traffic.
-    static constexpr bool Mma_dP_is_RS = SdP_swapAB && kHeadDim == 96;
     static constexpr bool dQacc_use_TMA = kHeadDim < 256;
     // For hdim256, we want to slice the dQ MMA (64 x 256 on 2 WGs) into two (64 x 128 on 2 WGs) so that we can
     // do atomic add on one half before doing the other half of the MMA, to reduce register pressure.

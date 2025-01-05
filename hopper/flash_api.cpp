@@ -1022,14 +1022,27 @@ std::vector<at::Tensor> mha_bwd(
     // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM (and cause IMA).
     is_causal = window_size_left < 0 && window_size_right == 0;
 
+    int const arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
     int const head_size_rounded = round_up_headdim(head_size);
     // Very important that these match the kernel configs
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-    int const kBlockM = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
+    int const kBlockM_sm90 = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
         : (head_size_rounded <= 96 ? 64
            : (head_size_rounded <= 128 ? (is_causal || is_local || softcap > 0.0 ? 64 : 80)
               : 64));
-    int const kBlockN = head_size_rounded <= 128 ? 128 : (head_size_rounded <= 192 ? 96 : 80);
+    int const kBlockM_sm80 = head_size_rounded <= 64 ? 128 : 64;
+    int const kBlockM_sm86 = head_size_rounded <= 192 ? 64 : 32;
+    int const kBlockM = arch >= 90 ? kBlockM_sm90 : (arch == 86 || arch == 89 ? kBlockM_sm86 : kBlockM_sm80);
+    int const kBlockN_sm90_sm80 = head_size_rounded <= 128
+        ? 128
+        : (arch >= 90
+           ? (head_size_rounded <= 192 ? 96 : 80)
+           : (head_size_rounded <= 192 ? 80 : 64));
+    int const kBlockN_sm86 = head_size_rounded <= 64 ? 128
+        : (head_size_rounded <= 96 ? 128
+           : (head_size_rounded <= 128 ? 96
+              : (head_size_rounded <= 192 ? 64 : 64)));
+    int const kBlockN = arch >= 90 ? kBlockN_sm90_sm80 : (arch == 86 || arch == 89 ? kBlockN_sm86 : kBlockN_sm90_sm80);
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     int const seqlen_q_rounded = round_multiple(seqlen_q, kBlockM);
     int const seqlen_k_rounded = round_multiple(seqlen_k, kBlockN);
@@ -1202,7 +1215,7 @@ std::vector<at::Tensor> mha_bwd(
         }
     }
 
-    return { dq, dk, dv, softmax_d, dq_accum, softmax_lse_log2 };
+    return { dq, dk, dv, softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum };
 }
 
 std::vector<at::Tensor>

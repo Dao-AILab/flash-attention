@@ -238,24 +238,28 @@ struct CollectiveEpilogueBwd {
             Tensor tdKVsdK = gmem_thr_copy_dKV.partition_S(sdK); // (TMA, TMA_M, TMA_K)
             Tensor tdKVrdV = make_fragment_like(tdKVgdV);
             Tensor tdKVrdK = make_fragment_like(tdKVgdK);
-            cute::copy(gmem_tiled_copy_dKV, tdKVsdV, tdKVrdV);
-            cute::copy(gmem_tiled_copy_dKV, tdKVsdK, tdKVrdK);
-            // // Tell warp 0 that smem_k and smem_v are ready
-            // cutlass::arch::fence_view_async_shared(); // ensure smem reads are done before next TMA to smem_k/v
-            // cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::KVEmpty) /*id*/);
-            // Construct identity layout for gdKV
             Tensor cdKV = cute::make_identity_tensor(select<1, 2>(TileShape_MNK{}));  // (BLK_M,BLK_K) -> (blk_m,blk_k)
             // Repeat the partitioning with identity layouts
             Tensor tdKVcdKV = gmem_thr_copy_dKV.partition_D(cdKV);
             Tensor tdKVpdKV = make_tensor<bool>(make_shape(size<2>(tdKVgdV)));
             #pragma unroll
             for (int k = 0; k < size(tdKVpdKV); ++k) { tdKVpdKV(k) = get<1>(tdKVcdKV(_0{}, _0{}, k)) < get<1>(params.shape_dK); }
+            // Need to check OOB when reading from smem if kBlockN isn't evenly tiled
+            static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(size<0>(GmemLayoutAtom{})) == 0;
+            flash::copy</*Is_even_MN=*/EvenN, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
+                gmem_tiled_copy_dKV, tdKVsdV, tdKVrdV, tdKVcdKV, tdKVpdKV, kBlockN);
+            flash::copy</*Is_even_MN=*/EvenN, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
+                gmem_tiled_copy_dKV, tdKVsdK, tdKVrdK, tdKVcdKV, tdKVpdKV, kBlockN);
+            // // Tell warp 0 that smem_k and smem_v are ready
+            // cutlass::arch::fence_view_async_shared(); // ensure smem reads are done before next TMA to smem_k/v
+            // cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::KVEmpty) /*id*/);
+            // Construct identity layout for gdKV
             // Clear_OOB_K must be false since we don't want to write zeros to gmem
             flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-                gmem_tiled_copy_dKV, tdKVrdV, tdKVgdV, tdKVcdKV, tdKVpdKV, seqlen_info.seqlen - n_block * kBlockN
+                gmem_tiled_copy_dKV, tdKVrdV, tdKVgdV, tdKVcdKV, tdKVpdKV, std::min(seqlen_info.seqlen - n_block * kBlockN, kBlockN)
             );
             flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-                gmem_tiled_copy_dKV, tdKVrdK, tdKVgdK, tdKVcdKV, tdKVpdKV, seqlen_info.seqlen - n_block * kBlockN
+                gmem_tiled_copy_dKV, tdKVrdK, tdKVgdK, tdKVcdKV, tdKVpdKV, std::min(seqlen_info.seqlen - n_block * kBlockN, kBlockN)
             );
         }
     }

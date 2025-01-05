@@ -235,16 +235,19 @@ public:
         Tensor tdQgdQ = gmem_thr_copy_dQ.partition_D(gdQ);
 
         Tensor tdQrdQ = make_fragment_like(tdQsdQ);
-        cute::copy(gmem_tiled_copy_dQ, tdQsdQ, tdQrdQ);
-
-        // Step 5: Copy dQ from register to gmem
         Tensor tdQcdQ = gmem_thr_copy_dQ.partition_D(cute::make_identity_tensor(TileShape_MK{}));
         Tensor tdQpdQ = make_tensor<bool>(make_shape(size<2>(tdQgdQ)));
         #pragma unroll
         for (int k = 0; k < size(tdQpdQ); ++k) { tdQpdQ(k) = get<1>(tdQcdQ(_0{}, _0{}, k)) < get<1>(params.shape_dQ); }
+        // Need to check OOB when reading from smem if kBlockM isn't evenly tiled
+        static constexpr bool EvenM = kBlockM % CUTE_STATIC_V(size<0>(GmemLayoutAtom{})) == 0;
+        flash::copy</*Is_even_MN=*/EvenM, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
+            gmem_tiled_copy_dQ, tdQsdQ, tdQrdQ, tdQcdQ, tdQpdQ, kBlockM);
+
+        // Step 5: Copy dQ from register to gmem
         // Clear_OOB_K must be false since we don't want to write zeros to gmem
         flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-            gmem_tiled_copy_dQ, tdQrdQ, tdQgdQ, tdQcdQ, tdQpdQ, seqlen_info.seqlen - m_block * kBlockM
+            gmem_tiled_copy_dQ, tdQrdQ, tdQgdQ, tdQcdQ, tdQpdQ, std::min(seqlen_info.seqlen - m_block * kBlockM, kBlockM)
         );
     }
 
