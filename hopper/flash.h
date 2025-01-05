@@ -145,7 +145,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     int * __restrict__ tile_count_semaphore;
 
-    int compute_capability;
+    int arch;
     int num_sm;
 };
 

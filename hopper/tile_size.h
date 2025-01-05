@@ -43,20 +43,20 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
 
 // Return {kBlockM, kBlockN, kNWarps, kStages, Q_in_regs}
 constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm80(
-        int headdim, bool is_causal, bool is_local, int element_size=2,
+        bool sm86_or_89, int headdim, bool is_causal, bool is_local, int element_size=2,
         bool paged_kv=false, bool softcap=false) {
     if (element_size == 2) {
         if (headdim <= 64) {
-            return {128, 128, 4, 2, true};
+            return {128, 112, 4, sm86_or_89 ? 1 : 2, false};
         } else if (headdim <= 96) {
-            return {128, 64, 4, 2, true};
+            return {128, 64, 4, sm86_or_89 ? 1 : 2, false};
         } else if (headdim <= 128) {
-            return {128, 128, 8, 2, true};
+            return {128, 128, 8, sm86_or_89 ? 1 : 2, true};
             // return {128, 64, 4, 1, false};  // a bit of spill but very good perf
         } else if (headdim <= 192) {
-            return {128, 96, 8, 2, true};
+            return {128, 96, 8, sm86_or_89 ? 1 : 2, true};
         } else {
-            return {128, 96, 8, 1, false};
+            return {128, sm86_or_89 ? 64 : 96, 8, 1, sm86_or_89};
         }
     } else {
         // Placeholder for now

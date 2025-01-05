@@ -165,7 +165,7 @@ void set_params_fprop(Flash_fwd_params &params,
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
 
-    params.compute_capability = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
+    params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
     params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
@@ -372,8 +372,8 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     if (params.h == params.h_k) { return false; }
     // This needs to match the kernel configs
     auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
-    auto kBlockMN_kernel_args_sm80 = tile_size_fwd_sm80(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, params.softcap > 0.f);
-    int const kBlockM = params.compute_capability >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm80);
+    auto kBlockMN_kernel_args_sm80 = tile_size_fwd_sm80(params.sm86_or_89, params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, params.softcap > 0.f);
+    int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm80);
     return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.seqlen_q, params.h / params.h_k, kBlockM);
     #endif
 }
@@ -386,9 +386,9 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // params.page_table must already be set
     // This needs to match the kernel configs
     auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
-    auto kBlockMN_kernel_args_sm80 = tile_size_fwd_sm80(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, params.softcap > 0.f);
-    int const kBlockM = params.compute_capability >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm80);
-    int const kBlockN = params.compute_capability >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm80);
+    auto kBlockMN_kernel_args_sm80 = tile_size_fwd_sm80(params.sm86_or_89, params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, params.softcap > 0.f);
+    int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm80);
+    int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm80);
     int seqlen_q_packgqa = params.seqlen_q * (params.pack_gqa ? params.h / params.h_k : 1);
     // If is_local, we're not going to load all of seqlen_k
     int const seqlen_k_loaded = !params.is_local

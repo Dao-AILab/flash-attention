@@ -21,7 +21,6 @@
 #include "mainloop_fwd_sm80.hpp"
 #include "epilogue_fwd.hpp"
 
-
 using namespace cute;
 
 template <int Arch, int kHeadDim, int ClusterM, typename Element, typename ElementOut,
@@ -37,7 +36,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
     // Can't use structured binding since it's not compatible with constexpr
     static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKV, Has_softcap);
-    static constexpr std::tuple<int, int, int, int, bool> kBlockMN_kNWarps_Stages_RS = tile_size_fwd_sm80(kHeadDim, Is_causal, Is_local, sizeof(Element) /*element_size*/, PagedKV, Has_softcap);
+    static constexpr std::tuple<int, int, int, int, bool> kBlockMN_kNWarps_Stages_RS = tile_size_fwd_sm80(Arch == 86 || Arch == 89, kHeadDim, Is_causal, Is_local, sizeof(Element) /*element_size*/, PagedKV, Has_softcap);
     static constexpr int kBlockM = Arch >= 90 ? std::get<0>(kBlockMN_RS_IntraWGOverlap) : std::get<0>(kBlockMN_kNWarps_Stages_RS);
     static constexpr int kBlockN = Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool Mma1_is_RS = std::get<2>(kBlockMN_RS_IntraWGOverlap);
@@ -68,7 +67,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // However, if Varlen (e.g., during decode where we have max_seqlens), using PersistentScheduler is better
     // since we'll avoid launching a bunch of thread blocks that immediately exit.
     // On Sm80, noncausal persistent seems a bit slower.
-    using Scheduler = std::conditional_t<Arch >= 90 ? (Split && !Varlen) : ((!Is_causal && !Is_local) || (Split && !Varlen)), SchedulerSingleTile, SchedulerPersistent>;
+    using Scheduler = std::conditional_t<Arch >= 90 ? (Split && !Varlen) : (((!Is_causal && !Is_local) || Split) && !Varlen), SchedulerSingleTile, SchedulerPersistent>;
     using AttnKernel = std::conditional_t<
         Arch >= 90,
         flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>,

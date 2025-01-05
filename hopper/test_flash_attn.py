@@ -31,11 +31,12 @@ DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
 
 COMPILED_HDIMS = (
-    [64] if not DISABLE_HDIM64 else []
-    + [96] if not DISABLE_HDIM96 else []
-    + [128] if not DISABLE_HDIM128 else []
-    + [192] if not DISABLE_HDIM192 else []
-    + [256] if not DISABLE_HDIM256 else []
+    []
+    + ([64] if not DISABLE_HDIM64 else [])
+    + ([96] if not DISABLE_HDIM96 else [])
+    + ([128] if not DISABLE_HDIM128 else [])
+    + ([192] if not DISABLE_HDIM192 else [])
+    + ([256] if not DISABLE_HDIM256 else [])
 )
 
 
@@ -332,7 +333,7 @@ def attention_ref(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
 @pytest.mark.parametrize("d", COMPILED_HDIMS)
-# @pytest.mark.parametrize("d", [128])
+# @pytest.mark.parametrize("d", [256])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [

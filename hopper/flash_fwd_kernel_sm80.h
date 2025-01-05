@@ -63,9 +63,11 @@ public:
     static constexpr uint32_t MinBlocksPerMultiprocessor = NumThreads == 128 ? 2 : 1;
 
     // Kernel level shared memory storage
-    // We overlap the shared memory for the mainloop and epilogue. However, we only want smem_o to overlap with smem_v
-    // and nothing else, so we'll pad in case sizeof(smem_o) > sizeof(smem_v).
-    static constexpr int mainloop_smem_padding_ = int(sizeof(typename CollectiveEpilogue::TensorStorage)) - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)));
+    // We overlap the shared memory for the mainloop and epilogue. However, we only want smem_o to overlap with smem_v + smem_k and not smem_q
+    // and nothing else, so we'll pad in case sizeof(smem_o) > sizeof(smem_v) + sizeof(smem_k).
+    static constexpr int mainloop_smem_padding_ = int(sizeof(typename CollectiveEpilogue::TensorStorage))
+        - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)))
+        - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k)));
     static constexpr int mainloop_smem_padding = mainloop_smem_padding_ < 0 ? 0 : mainloop_smem_padding_;
     struct SharedStorage {
         struct TensorStorage : cute::aligned_struct<128> {
@@ -133,7 +135,7 @@ public:
     // Computes the kernel launch grid shape based on runtime parameters
     static dim3
     get_grid_shape(Params const& params) {
-        return TileScheduler::get_grid_shape(params.scheduler, params.hw_info.sm_count);
+        return TileScheduler::get_grid_shape(params.scheduler, params.hw_info.sm_count * MinBlocksPerMultiprocessor);
     }
 
     static dim3

@@ -163,8 +163,8 @@ struct CollectiveMainloopFwdSm80 {
 
     struct TensorStorageSeparateQV : cute::aligned_struct<128> {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
-        cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
     };
 
     using TensorStorage = std::conditional_t<Share_QV_Smem, TensorStorageSharedQV, TensorStorageSeparateQV>;
@@ -471,7 +471,7 @@ struct CollectiveMainloopFwdSm80 {
                 int const seqlenk_row_limit = seqlen_info.seqlen_k - n_block * kBlockN - get<0>(tKVcKV(_0{}, _0{}, _0{}));
                 #pragma unroll
                 for (int m = 0; m < size<1>(tVsV); ++m) {
-                    // If kBlockN doesn't evenly divide the tiled copy, only the last `m` needs to checked
+                    // If kBlockN doesn't evenly divide the tiled copy, only the last `m` needs to be checked
                     if (EvenN || m < size<1>(tVsV) - 1 || get<0>(tKVcKV(_0{}, m, _0{})) < kBlockN) {
                         bool const predicate_n = !Seqlenk_mask || get<0>(t0KVcKV(_0{}, m, _0{})) < seqlenk_row_limit;
                         #pragma unroll
@@ -534,8 +534,11 @@ struct CollectiveMainloopFwdSm80 {
             load_K(n_block, 0, cute::bool_constant<true>{} /*Seqlenk_mask*/);
             cute::cp_async_fence();
             preprocess_Q();
+            __syncthreads();  // Make sure all threads have read smem_q before loading V
         }
 
+        // For persistent, make sure all threads have finished reading smem_o
+        if constexpr (!Share_QV_Smem) { __syncthreads(); }
         // Note, using the for_each() function here to ensure `stage` is of type Int<x>.
         for_each(make_int_sequence<kStages>{}, [&] (auto stage) {
             static constexpr bool Is_first_stage = CUTE_STATIC_V(stage) == 0;
@@ -548,9 +551,6 @@ struct CollectiveMainloopFwdSm80 {
                 // so that we can wait with the correct number of outstanding commits.
                 cute::cp_async_fence();
             }
-            // If persistent and !Share_QV_Smem, need to sync to make sure all threads have finished with smem_o before writing to smem_v.
-            // If Share_QV_Smem, sync to make sure all threads have finished reading from smem_q.
-            if constexpr (Is_first_stage) { __syncthreads(); }
             if constexpr (!Is_last_stage) {
                 if (Is_first_stage || n_block - stage >= n_block_min) {
                     load_V(n_block - stage, stage, cute::bool_constant<Is_first_stage>{} /*Seqlenk_mask*/);
