@@ -44,19 +44,18 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
 // Return {kBlockM, kBlockN, kNWarps, kStages, Q_in_regs}
 constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm80(
         bool sm86_or_89, int headdim, bool is_causal, bool is_local, int element_size=2,
-        bool paged_kv=false, bool softcap=false) {
+        bool varlen_and_split=false, bool softcap=false) {
     if (element_size == 2) {
         if (headdim <= 64) {
-            return {128, 112, 4, sm86_or_89 ? 1 : 2, false};
+            return {128, varlen_and_split ? 80 : (is_local ? 96 : 112), 4, 1, false};
         } else if (headdim <= 96) {
-            return {128, 64, 4, sm86_or_89 ? 1 : 2, false};
+            return {128, varlen_and_split || is_local ? 48 : 64, 4, sm86_or_89 ? 1 : 2, false};
         } else if (headdim <= 128) {
-            return {128, 128, 8, sm86_or_89 ? 1 : 2, true};
-            // return {128, 64, 4, 1, false};  // a bit of spill but very good perf
+            return {128, sm86_or_89 ? (varlen_and_split ? 112 : 128) : (is_local ? 48 : 64), sm86_or_89 ? 8 : 4, 1, sm86_or_89};
         } else if (headdim <= 192) {
-            return {128, 96, 8, sm86_or_89 ? 1 : 2, true};
+            return {128, varlen_and_split || is_local ? 80 : 96, 8, sm86_or_89 ? 1 : 2, true};
         } else {
-            return {128, sm86_or_89 ? 64 : 96, 8, 1, sm86_or_89};
+            return {128, sm86_or_89 ? (varlen_and_split || is_local ? 48 : 64) : (varlen_and_split || is_local ? 64 : 96), 8, 1, sm86_or_89};
         }
     } else {
         // Placeholder for now
