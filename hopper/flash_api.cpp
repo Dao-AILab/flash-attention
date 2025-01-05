@@ -562,10 +562,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     // TODO: check this
     if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
     if (window_size_right >= seqlen_q - 1) { window_size_right = -1; }
-    if (is_causal) {
-        window_size_left = -1;
-        window_size_right = 0;
-    }
+    if (is_causal) { window_size_right = 0; }
     // There's a case where is_causal=false, window_size=(-1, 0). Then set_params_fprop will set params.is_causal=true.
     // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM.
     is_causal = window_size_left < 0 && window_size_right == 0;
