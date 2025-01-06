@@ -33,7 +33,7 @@ with open("../README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-PACKAGE_NAME = "flashattn-hopper"
+PACKAGE_NAME = "flash_attn"
 
 BASE_WHEEL_URL = "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
 
@@ -192,10 +192,10 @@ if not SKIP_CUDA_BUILD:
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
-    check_if_cuda_home_none("--fahopper")
+    check_if_cuda_home_none("flash_attn")
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
     if bare_metal_version < Version("12.3"):
-        raise RuntimeError("FA Hopper is only supported on CUDA 12.3 and above")
+        raise RuntimeError("FlashAttention-3 is only supported on CUDA 12.3 and above")
 
     if bare_metal_version != Version("12.3"):  # nvcc 12.3 gives the best perf currently
         download_and_copy(
@@ -306,7 +306,7 @@ if not SKIP_CUDA_BUILD:
 
     ext_modules.append(
         CUDAExtension(
-            name="flashattn_hopper_cuda",
+            name="flash_attn_3_cuda",
             sources=sources,
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"] + feature_args,
@@ -321,7 +321,7 @@ def get_package_version():
     with open(Path(this_dir) / "__init__.py", "r") as f:
         version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
-    local_version = os.environ.get("FLASHATTN_HOPPER_LOCAL_VERSION")
+    local_version = os.environ.get("FLASH_ATTN_LOCAL_VERSION")
     if local_version:
         return f"{public_version}+{local_version}"
     else:

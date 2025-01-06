@@ -464,8 +464,8 @@ def test_flash_attn_output(
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor:
         g = torch.randn_like(out)
         do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
-        # import flashattn_hopper_cuda
-        # dq, dk, dv, softmax_d, dq_accum, dk_accum, dv_accum = flashattn_hopper_cuda.bwd(
+        # import flash_attn_3_cuda
+        # dq, dk, dv, softmax_d, dq_accum, dk_accum, dv_accum = flash_attn_3_cuda.bwd(
         #     g,
         #     q,
         #     k,
@@ -671,8 +671,8 @@ def test_flash_attn_varlen_output(
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn:
         g_unpad = torch.randn_like(out_unpad)
         do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
-        # import flashattn_hopper_cuda
-        # dq_unpad, dk_unpad, dv_unpad, softmax_d, dq_accum, lse_log2 = flashattn_hopper_cuda.bwd_varlen(
+        # import flash_attn_3_cuda
+        # dq_unpad, dk_unpad, dv_unpad, softmax_d, dq_accum, lse_log2 = flash_attn_3_cuda.bwd_varlen(
         #     g_unpad,
         #     q_unpad,
         #     k_unpad,

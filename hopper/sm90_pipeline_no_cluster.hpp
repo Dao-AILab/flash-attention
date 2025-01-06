@@ -12,10 +12,10 @@ using namespace cute;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// As of Cutlass v3.6.0, if size(ClusterShape) == 1, PipelineTmaAsync have all threads
+// As of Cutlass v3.6.0, if size(ClusterShape) == 1, PipelineTmaAsync has all threads
 // signaling the barrier during consumer_release. This causes a perf regression in FA3
 // forward pass (especially hdim 128 causal). We instead reimplement the version of
-// PipelineTmaAsync before v3.6.0 where only 1 out of 128 threads signal the barrier.
+// PipelineTmaAsync before v3.6.0 where only 1 out of 128 threads signals the barrier.
 //
 // Assumption: params.num_consumers % NumThreadsPerWarpGroup == 0
 template <int Stages_, class Base=cutlass::PipelineTmaAsync<Stages_>>

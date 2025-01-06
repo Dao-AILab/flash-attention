@@ -7,7 +7,7 @@ import torch.nn as nn
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
-import flashattn_hopper_cuda
+import flash_attn_3_cuda
 
 # isort: on
 
@@ -58,7 +58,7 @@ def _flash_attn_forward(
         maybe_contiguous(x) for x in (page_table, kv_batch_idx, leftpad_k)
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
-    out, softmax_lse, *rest = flashattn_hopper_cuda.fwd(
+    out, softmax_lse, *rest = flash_attn_3_cuda.fwd(
         q,
         k,
         v,
@@ -121,7 +121,7 @@ def _flash_attn_backward(
     assert sink_token_length == 0, "sink_token_length not supported yet"
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    dq, dk, dv, softmax_d, *rest = flashattn_hopper_cuda.bwd(
+    dq, dk, dv, softmax_d, *rest = flash_attn_3_cuda.bwd(
         dout,
         q,
         k,
@@ -594,7 +594,7 @@ def flash_attn_varlen_func(
 
 
 def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
-    return flashattn_hopper_cuda.fwd_combine(out_partial, lse_partial, out, out_dtype)
+    return flash_attn_3_cuda.fwd_combine(out_partial, lse_partial, out, out_dtype)
 
 
 def flash_attn_with_kvcache(
