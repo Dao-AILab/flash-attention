@@ -21,6 +21,7 @@
 #include "paged_kv.h"
 #include "rotary.h"
 #include "utils.h"
+#include "sm90_pipeline_no_cluster.hpp"
 
 namespace flash {
 
@@ -229,11 +230,12 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutVt{})) * cutlass::sizeof_bits_v<Element> / 8);
     static_assert(TmaTransactionBytesK == TmaTransactionBytesV);
 
-    using MainloopPipelineK = std::conditional_t<Use_TMA_KV, typename cutlass::PipelineTmaAsync<kStages>, typename cutlass::PipelineAsync<kStages>>;
-    using MainloopPipelineV = std::conditional_t<!Transpose_V && Use_TMA_KV, typename cutlass::PipelineTmaAsync<kStages>, typename cutlass::PipelineAsync<kStages>>;
-    using MainloopPipelineVt = std::conditional_t<Use_TMA_KV, typename cutlass::PipelineTmaAsync<kStages>, typename cutlass::PipelineAsync<kStages>>;
+    using PipelineTmaAsync = std::conditional_t<CUTE_STATIC_V(size(ClusterShape{})) == 1, typename cutlass::PipelineTmaAsyncNoCluster<kStages>, typename cutlass::PipelineTmaAsync<kStages>>;
+    using MainloopPipelineK = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
+    using MainloopPipelineV = std::conditional_t<!Transpose_V && Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
+    using MainloopPipelineVt = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
     // We always use TMA for K_new and V_new
-    using MainloopPipelineKVNew = typename cutlass::PipelineTmaAsync<kStages>;
+    using MainloopPipelineKVNew = PipelineTmaAsync;
     using PipelineState = cutlass::PipelineState<kStages>;
 
     // If PackGQA, we use cp.async (instead of TMA) to load Q, so we want smem_q to be aligned

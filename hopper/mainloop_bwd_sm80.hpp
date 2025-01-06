@@ -201,8 +201,7 @@ struct CollectiveMainloopBwdSm80 {
     // from the same address by the same threadblock. This is slightly faster.
     using GmemCopyStruct = std::conditional_t<
         Has_cp_async,
-        // SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>,
-        SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>,
+        SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>,
         AutoVectorizingCopyWithAssumedAlignment<128>
     >;
     using GmemCopyAtom = Copy_Atom<GmemCopyStruct, Element>;
