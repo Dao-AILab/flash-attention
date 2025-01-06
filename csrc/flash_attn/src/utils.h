@@ -293,6 +293,53 @@ void cp_async_wait() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// resolves offset of a slice of a paged kv copy from gmem.
+// assumes that the tensor has already been positioned at the correct head.
+template <typename Kernel_traits>
+__forceinline__ __device__
+int64_t resolve_thread_kv_page_slice_offset(const int tidx, const int n_block_max, const int page_block_size, 
+                            const int* block_table, const int page_stride, const int row_stride) {
+    constexpr int kGmemThreadsPerRow = Kernel_traits::kGmemThreadsPerRow;
+    constexpr int kGmemRowsPerThread = Kernel_traits::kGmemRowsPerThread;
+    constexpr int kGmemElemsPerLoad = Kernel_traits::kGmemElemsPerLoad;
+    constexpr int kBlockN = Kernel_traits::kBlockN;
+    
+    const int64_t col_offset = tidx % kGmemThreadsPerRow * kGmemElemsPerLoad;
+    const int64_t block_row_offset = tidx / kGmemThreadsPerRow * kGmemRowsPerThread;
+    const int64_t global_row_offset = block_row_offset + (n_block_max - 1) * kBlockN;
+    const int64_t page_offset = global_row_offset % page_block_size;
+    const int64_t virtual_page_idx = global_row_offset / page_block_size;
+
+    return ((int64_t) block_table[virtual_page_idx]) * ((int64_t) page_stride)
+        + page_offset * ((int64_t) row_stride)
+        + col_offset;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Layout reshape function. Given a layout with modes ((v1, v2), m, k), returns (v1, v2, k),         
+// where v2 may be a tuple itself, in the case of swizzled smem-backed thread tiles. This ensures
+// that paged and non-paged copies result in equivalently shaped, if not necessarily strided, tensors.
+template <class Shape, class Stride>
+__forceinline__ __device__
+auto reshape_thread_tile(Layout<Shape, Stride> l) {
+    return make_layout(append(get<0>(l.shape()), get<2>(l.shape())),
+                        append(get<0>(l.stride()), get<2>(l.stride())));
+}
+
+// reshapes and flattens the thread tile layout. A separate function is needed for the case where
+// one of the modes of l is a layout itself and must be flattened, as opposed to keeping it intact
+// for the case of swizzled layouts
+template <class Shape, class Stride>
+__forceinline__ __device__
+auto reshape_flatten_thread_tile(Layout<Shape, Stride> l) {
+    auto mode_0 = filter(flatten(get<0>(l)));
+    return make_layout(append(mode_0.shape(), get<2>(l.shape())),
+                        append(mode_0.stride(), get<2>(l.stride())));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
           typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
           typename Engine2, typename Layout2, typename Engine3, typename Layout3>

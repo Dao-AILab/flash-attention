@@ -3,7 +3,6 @@
  ******************************************************************************/
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
-#include <torch/python.h>
 #include <torch/nn/functional.h>
 #include <torch/version.h>  // For TORCH_VERSION* macros
 #include <ATen/cuda/CUDAContext.h>
@@ -1334,9 +1333,15 @@ mha_combine(const at::Tensor &out_partial,         // num_splits x batch_size x 
     return {out, softmax_lse};
 }
 
+#ifndef FLASHATTENTION_DISABLE_PYBIND
+
+#include <torch/python.h>
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");
     m.def("bwd", &mha_bwd, "Backward pass");
     m.def("fwd_combine", &mha_combine, "Combine partial attention outputs");
 }
+
+#endif

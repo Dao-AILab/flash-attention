@@ -1588,7 +1588,7 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     ],
 )
 # TODO: add smaller page sizes when https://github.com/Dao-AILab/flash-attention/pull/824 is merged
-@pytest.mark.parametrize("paged_kv_block_size", [None, 256, 512])
+@pytest.mark.parametrize("paged_kv_block_size", [None, 16, 256, 512])
 # @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 128)])
 def test_flash_attn_varlen_causal(
     seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, dtype
@@ -1875,7 +1875,7 @@ def test_flash_attn_splitkv(
 # @pytest.mark.parametrize("rotary_interleaved", [False])
 @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
-@pytest.mark.parametrize("paged_kv_block_size", [None, 256])
+@pytest.mark.parametrize("paged_kv_block_size", [None, 16, 256, 512])
 # @pytest.mark.parametrize("paged_kv_block_size", [256, 512])
 # @pytest.mark.parametrize("paged_kv_block_size", [None])
 @pytest.mark.parametrize("has_leftpad", [False, True])
@@ -2523,3 +2523,47 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dv, dv0)
         assert torch.equal(dk, dk0)
         assert torch.equal(dq, dq0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("paged_kv_block_size", [16])
+# @pytest.mark.parametrize("has_batch_idx", [False])
+@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("nheads", [32])
+@pytest.mark.parametrize("b", [4])
+@pytest.mark.parametrize("n", [10])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(170, 170)])
+def test_flash_attn_paged_kvcache_overflow(
+    seqlen_q,
+    seqlen_k,
+    d,
+    nheads,
+    b,
+    n,
+    paged_kv_block_size,
+    causal,
+    dtype,
+):  
+    device = "cuda"
+    num_blocks = 1000*16//paged_kv_block_size
+    key_cache = torch.rand([num_blocks, paged_kv_block_size, nheads, d], dtype=dtype, device=device)
+    value_cache = torch.rand([num_blocks, paged_kv_block_size, nheads, d], dtype=dtype, device=device)
+    cache_seqlens = torch.zeros(b, dtype=torch.int32, device=device)
+
+    for _ in range(n):
+        query = torch.rand([b, seqlen_q, nheads, d], dtype=dtype, device=device)
+        key = torch.rand([b, seqlen_k, nheads, d], dtype=dtype, device=device)
+        value = torch.rand([b, seqlen_k, nheads, d], dtype=dtype, device=device)
+        block_tables = torch.randint(0, num_blocks, size=(b, (seqlen_k + paged_kv_block_size - 1) // paged_kv_block_size), dtype=torch.int32, device=device)
+        output = flash_attn_with_kvcache(
+            query,
+            key_cache,
+            value_cache,
+            k=key,
+            v=value,
+            cache_seqlens=cache_seqlens,
+            block_table=block_tables,
+            causal=causal,
+        )

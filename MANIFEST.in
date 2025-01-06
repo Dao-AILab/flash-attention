@@ -4,8 +4,8 @@ recursive-include csrc *.cuh
 recursive-include csrc *.cpp
 recursive-include csrc *.hpp
 
-recursive-include flash_attn *.cu
-recursive-include flash_attn *.h
-recursive-include flash_attn *.cuh
-recursive-include flash_attn *.cpp
-recursive-include flash_attn *.hpp
+recursive-include vllm_flash_attn *.cu
+recursive-include vllm_flash_attn *.h
+recursive-include vllm_flash_attn *.cuh
+recursive-include vllm_flash_attn *.cpp
+recursive-include vllm_flash_attn *.hpp
