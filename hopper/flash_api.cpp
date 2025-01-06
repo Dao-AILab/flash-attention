@@ -1014,10 +1014,7 @@ std::vector<at::Tensor> mha_bwd(
     // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
     if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
     if (window_size_right >= seqlen_q - 1) { window_size_right = -1; }
-    if (is_causal) {
-        window_size_left = -1;
-        window_size_right = 0;
-    }
+    if (is_causal) { window_size_left = -1; }
     // There's a case where is_causal=false, window_size=(-1, 0). Then set_params_bprop will set params.is_causal=true.
     // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM (and cause IMA).
     is_causal = window_size_left < 0 && window_size_right == 0;
