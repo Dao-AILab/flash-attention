@@ -3,12 +3,16 @@
 import sys
 import warnings
 import os
+import stat
 import re
 import shutil
 import ast
 from pathlib import Path
 from packaging.version import parse, Version
 import platform
+import sysconfig
+import tarfile
+import itertools
 
 from setuptools import setup, find_packages
 import subprocess
@@ -29,17 +33,35 @@ with open("../README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-PACKAGE_NAME = "flashattn-hopper"
+PACKAGE_NAME = "flash_attn"
 
 BASE_WHEEL_URL = "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
 
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
-FORCE_BUILD = os.getenv("FAHOPPER_FORCE_BUILD", "FALSE") == "TRUE"
-SKIP_CUDA_BUILD = os.getenv("FAHOPPER_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
+FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
+SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
-FORCE_CXX11_ABI = os.getenv("FAHOPPER_FORCE_CXX11_ABI", "FALSE") == "TRUE"
+FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 
+DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
+DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
+DISABLE_PAGEDKV = os.getenv("FLASH_ATTENTION_DISABLE_PAGEDKV", "FALSE") == "TRUE"
+DISABLE_APPENDKV = os.getenv("FLASH_ATTENTION_DISABLE_APPENDKV", "FALSE") == "TRUE"
+DISABLE_LOCAL = os.getenv("FLASH_ATTENTION_DISABLE_LOCAL", "FALSE") == "TRUE"
+DISABLE_SOFTCAP = os.getenv("FLASH_ATTENTION_DISABLE_SOFTCAP", "FALSE") == "TRUE"
+DISABLE_PACKGQA = os.getenv("FLASH_ATTENTION_DISABLE_PACKGQA", "FALSE") == "TRUE"
+DISABLE_FP16 = os.getenv("FLASH_ATTENTION_DISABLE_FP16", "FALSE") == "TRUE"
+DISABLE_FP8 = os.getenv("FLASH_ATTENTION_DISABLE_FP8", "FALSE") == "TRUE"
+DISABLE_VARLEN = os.getenv("FLASH_ATTENTION_DISABLE_VARLEN", "FALSE") == "TRUE"
+DISABLE_CLUSTER = os.getenv("FLASH_ATTENTION_DISABLE_CLUSTER", "FALSE") == "TRUE"
+DISABLE_HDIM64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM64", "FALSE") == "TRUE"
+DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
+DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
+DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
+DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
+
+ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
 
 def get_platform():
     """
@@ -77,8 +99,85 @@ def check_if_cuda_home_none(global_option: str) -> None:
     )
 
 
-def append_nvcc_threads(nvcc_extra_args):
-    return nvcc_extra_args + ["--threads", "4"]
+# Taken from https://github.com/pytorch/pytorch/blob/master/tools/setup_helpers/env.py
+def check_env_flag(name: str, default: str = "") -> bool:
+    return os.getenv(name, default).upper() in ["ON", "1", "YES", "TRUE", "Y"]
+
+
+# Copied from https://github.com/triton-lang/triton/blob/main/python/setup.py
+def is_offline_build() -> bool:
+    """
+    Downstream projects and distributions which bootstrap their own dependencies from scratch
+    and run builds in offline sandboxes
+    may set `FLASH_ATTENTION_OFFLINE_BUILD` in the build environment to prevent any attempts at downloading
+    pinned dependencies from the internet or at using dependencies vendored in-tree.
+
+    Dependencies must be defined using respective search paths (cf. `syspath_var_name` in `Package`).
+    Missing dependencies lead to an early abortion.
+    Dependencies' compatibility is not verified.
+
+    Note that this flag isn't tested by the CI and does not provide any guarantees.
+    """
+    return check_env_flag("FLASH_ATTENTION_OFFLINE_BUILD", "")
+
+
+# Copied from https://github.com/triton-lang/triton/blob/main/python/setup.py
+def get_flashattn_cache_path():
+    user_home = os.getenv("FLASH_ATTENTION_HOME")
+    if not user_home:
+        user_home = os.getenv("HOME") or os.getenv("USERPROFILE") or os.getenv("HOMEPATH") or None
+    if not user_home:
+        raise RuntimeError("Could not find user home directory")
+    return os.path.join(user_home, ".flashattn")
+
+
+def open_url(url):
+    user_agent = 'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0'
+    headers = {
+        'User-Agent': user_agent,
+    }
+    request = urllib.request.Request(url, None, headers)
+    # Set timeout to 300 seconds to prevent the request from hanging forever.
+    return urllib.request.urlopen(request, timeout=300)
+
+
+def download_and_copy(name, src_path, dst_path, version, url_func):
+    if is_offline_build():
+        return
+    flashattn_cache_path = get_flashattn_cache_path()
+    base_dir = os.path.dirname(__file__)
+    system = platform.system()
+    try:
+        arch = {"x86_64": "64", "arm64": "aarch64", "aarch64": "aarch64"}[platform.machine()]
+    except KeyError:
+        arch = platform.machine()
+    supported = {"Linux": "linux", "Darwin": "linux"}
+    url = url_func(supported[system], arch, version)
+    tmp_path = os.path.join(flashattn_cache_path, "nvidia", name)  # path to cache the download
+    dst_path = os.path.join(base_dir, os.pardir, "third_party", "nvidia", "backend", dst_path)  # final binary path
+    platform_name = "sbsa-linux" if arch == "aarch64" else "x86_64-linux"
+    src_path = src_path(platform_name, version) if callable(src_path) else src_path
+    src_path = os.path.join(tmp_path, src_path)
+    download = not os.path.exists(src_path)
+    if download:
+        print(f'downloading and extracting {url} ...')
+        file = tarfile.open(fileobj=open_url(url), mode="r|*")
+        file.extractall(path=tmp_path)
+    os.makedirs(os.path.split(dst_path)[0], exist_ok=True)
+    print(f'copy {src_path} to {dst_path} ...')
+    if os.path.isdir(src_path):
+        shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+    else:
+        shutil.copy(src_path, dst_path)
+
+
+def nvcc_threads_args():
+    nvcc_threads = os.getenv("NVCC_THREADS") or "4"
+    return ["--threads", nvcc_threads]
+
+
+NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.3.107"}
+exe_extension = sysconfig.get_config_var("EXE")
 
 
 cmdclass = {}
@@ -93,11 +192,34 @@ if not SKIP_CUDA_BUILD:
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
-    check_if_cuda_home_none("--fahopper")
-    cc_flag = []
+    check_if_cuda_home_none("flash_attn")
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
     if bare_metal_version < Version("12.3"):
-        raise RuntimeError("FA Hopper is only supported on CUDA 12.3 and above")
+        raise RuntimeError("FlashAttention-3 is only supported on CUDA 12.3 and above")
+
+    if bare_metal_version != Version("12.3"):  # nvcc 12.3 gives the best perf currently
+        download_and_copy(
+            name="nvcc", src_path=f"bin", dst_path="bin",
+            version=NVIDIA_TOOLCHAIN_VERSION["nvcc"], url_func=lambda system, arch, version:
+            ((lambda version_major, version_minor1, version_minor2:
+            f"https://anaconda.org/nvidia/cuda-nvcc/{version}/download/{system}-{arch}/cuda-nvcc-{version}-0.tar.bz2")
+            (*version.split('.'))))
+        download_and_copy(
+            name="nvcc", src_path=f"nvvm/bin", dst_path="bin",
+            version=NVIDIA_TOOLCHAIN_VERSION["nvcc"], url_func=lambda system, arch, version:
+            ((lambda version_major, version_minor1, version_minor2:
+            f"https://anaconda.org/nvidia/cuda-nvcc/{version}/download/{system}-{arch}/cuda-nvcc-{version}-0.tar.bz2")
+            (*version.split('.'))))
+        base_dir = os.path.dirname(__file__)
+        ctk_path_new = os.path.join(base_dir, os.pardir, "third_party", "nvidia", "backend", "bin")
+        nvcc_path_new = os.path.join(ctk_path_new, f"nvcc{exe_extension}")
+        # Need to append to path otherwise nvcc can't find cicc in nvvm/bin/cicc
+        os.environ["PATH"] = ctk_path_new + os.pathsep + os.environ["PATH"]
+        os.environ["PYTORCH_NVCC"] = nvcc_path_new
+        # Make nvcc executable, sometimes after the copy it loses its permissions
+        os.chmod(nvcc_path_new, os.stat(nvcc_path_new).st_mode | stat.S_IEXEC)
+
+    cc_flag = []
     cc_flag.append("-gencode")
     cc_flag.append("arch=compute_90a,code=sm_90a")
 
@@ -108,86 +230,65 @@ if not SKIP_CUDA_BUILD:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
     repo_dir = Path(this_dir).parent
     cutlass_dir = repo_dir / "csrc" / "cutlass"
-    sources = [
-        "flash_api.cpp",
-        "flash_fwd_hdim64_fp16_sm90.cu",
-        "flash_fwd_hdim64_bf16_sm90.cu",
-        "flash_fwd_hdim128_fp16_sm90.cu",
-        "flash_fwd_hdim128_bf16_sm90.cu",
-        "flash_fwd_hdim256_fp16_sm90.cu",
-        "flash_fwd_hdim256_bf16_sm90.cu",
-        "flash_bwd_hdim64_fp16_sm90.cu",
-        "flash_bwd_hdim96_fp16_sm90.cu",
-        "flash_bwd_hdim128_fp16_sm90.cu",
-        # "flash_bwd_hdim256_fp16_sm90.cu",
-        "flash_bwd_hdim64_bf16_sm90.cu",
-        "flash_bwd_hdim96_bf16_sm90.cu",
-        "flash_bwd_hdim128_bf16_sm90.cu",
-        "flash_fwd_hdim64_e4m3_sm90.cu",
-        "flash_fwd_hdim128_e4m3_sm90.cu",
-        "flash_fwd_hdim256_e4m3_sm90.cu",
-        "flash_fwd_hdim64_fp16_gqa2_sm90.cu",
-        "flash_fwd_hdim64_fp16_gqa4_sm90.cu",
-        "flash_fwd_hdim64_fp16_gqa8_sm90.cu",
-        "flash_fwd_hdim64_fp16_gqa16_sm90.cu",
-        "flash_fwd_hdim64_fp16_gqa32_sm90.cu",
-        "flash_fwd_hdim128_fp16_gqa2_sm90.cu",
-        "flash_fwd_hdim128_fp16_gqa4_sm90.cu",
-        "flash_fwd_hdim128_fp16_gqa8_sm90.cu",
-        "flash_fwd_hdim128_fp16_gqa16_sm90.cu",
-        "flash_fwd_hdim128_fp16_gqa32_sm90.cu",
-        "flash_fwd_hdim256_fp16_gqa2_sm90.cu",
-        "flash_fwd_hdim256_fp16_gqa4_sm90.cu",
-        "flash_fwd_hdim256_fp16_gqa8_sm90.cu",
-        "flash_fwd_hdim256_fp16_gqa16_sm90.cu",
-        "flash_fwd_hdim256_fp16_gqa32_sm90.cu",
-        "flash_fwd_hdim64_bf16_gqa2_sm90.cu",
-        "flash_fwd_hdim64_bf16_gqa4_sm90.cu",
-        "flash_fwd_hdim64_bf16_gqa8_sm90.cu",
-        "flash_fwd_hdim64_bf16_gqa16_sm90.cu",
-        "flash_fwd_hdim64_bf16_gqa32_sm90.cu",
-        "flash_fwd_hdim128_bf16_gqa2_sm90.cu",
-        "flash_fwd_hdim128_bf16_gqa4_sm90.cu",
-        "flash_fwd_hdim128_bf16_gqa8_sm90.cu",
-        "flash_fwd_hdim128_bf16_gqa16_sm90.cu",
-        "flash_fwd_hdim128_bf16_gqa32_sm90.cu",
-        "flash_fwd_hdim256_bf16_gqa2_sm90.cu",
-        "flash_fwd_hdim256_bf16_gqa4_sm90.cu",
-        "flash_fwd_hdim256_bf16_gqa8_sm90.cu",
-        "flash_fwd_hdim256_bf16_gqa16_sm90.cu",
-        "flash_fwd_hdim256_bf16_gqa32_sm90.cu",
-        "flash_fwd_hdim64_e4m3_gqa2_sm90.cu",
-        "flash_fwd_hdim64_e4m3_gqa4_sm90.cu",
-        "flash_fwd_hdim64_e4m3_gqa8_sm90.cu",
-        "flash_fwd_hdim64_e4m3_gqa16_sm90.cu",
-        "flash_fwd_hdim64_e4m3_gqa32_sm90.cu",
-        "flash_fwd_hdim128_e4m3_gqa2_sm90.cu",
-        "flash_fwd_hdim128_e4m3_gqa4_sm90.cu",
-        "flash_fwd_hdim128_e4m3_gqa8_sm90.cu",
-        "flash_fwd_hdim128_e4m3_gqa16_sm90.cu",
-        "flash_fwd_hdim128_e4m3_gqa32_sm90.cu",
-        "flash_fwd_hdim256_e4m3_gqa2_sm90.cu",
-        "flash_fwd_hdim256_e4m3_gqa4_sm90.cu",
-        "flash_fwd_hdim256_e4m3_gqa8_sm90.cu",
-        "flash_fwd_hdim256_e4m3_gqa16_sm90.cu",
-        "flash_fwd_hdim256_e4m3_gqa32_sm90.cu",
-    ]
+
+    feature_args = (
+        []
+        + (["-DFLASHATTENTION_DISABLE_BACKWARD"] if DISABLE_BACKWARD else [])
+        + (["-DFLASHATTENTION_DISABLE_PAGEDKV"] if DISABLE_PAGEDKV else [])
+        + (["-DFLASHATTENTION_DISABLE_SPLIT"] if DISABLE_SPLIT else [])
+        + (["-DFLASHATTENTION_DISABLE_APPENDKV"] if DISABLE_APPENDKV else [])
+        + (["-DFLASHATTENTION_DISABLE_LOCAL"] if DISABLE_LOCAL else [])
+        + (["-DFLASHATTENTION_DISABLE_SOFTCAP"] if DISABLE_SOFTCAP else [])
+        + (["-DFLASHATTENTION_DISABLE_PACKGQA"] if DISABLE_PACKGQA else [])
+        + (["-DFLASHATTENTION_DISABLE_FP16"] if DISABLE_FP16 else [])
+        + (["-DFLASHATTENTION_DISABLE_FP8"] if DISABLE_FP8 else [])
+        + (["-DFLASHATTENTION_DISABLE_VARLEN"] if DISABLE_VARLEN else [])
+        + (["-DFLASHATTENTION_DISABLE_CLUSTER"] if DISABLE_CLUSTER else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIM64"] if DISABLE_HDIM64 else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIM96"] if DISABLE_HDIM96 else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIM128"] if DISABLE_HDIM128 else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIM192"] if DISABLE_HDIM192 else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIM256"] if DISABLE_HDIM256 else [])
+        + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
+    )
+
+    DTYPE_FWD = ["bf16"] + (["fp16"] if not DISABLE_FP16 else []) + (["e4m3"] if not DISABLE_FP8 else [])
+    DTYPE_BWD = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
+    HEAD_DIMENSIONS_BWD = (
+        []
+        + ([64] if not DISABLE_HDIM64 else [])
+        + ([96] if not DISABLE_HDIM96 else [])
+        + ([128] if not DISABLE_HDIM128 else [])
+        + ([192] if not DISABLE_HDIM192 else [])
+        + ([256] if not DISABLE_HDIM256 else [])
+    )
+    # HEAD_DIMENSIONS_FWD = HEAD_DIMENSIONS_BWD
+    HEAD_DIMENSIONS_FWD = ["all"]
+    SPLIT = [""] + (["_split"] if not DISABLE_SPLIT else [])
+    PAGEDKV = [""] + (["_paged"] if not DISABLE_PAGEDKV else [])
+    SOFTCAP = [""] + (["_softcap"] if not DISABLE_SOFTCAP else [])
+    PACKGQA = [""] + (["_packgqa"] if not DISABLE_PACKGQA else [])
+    sources_fwd = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
+                   for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)]
+    sources_bwd = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}_sm90.cu"
+                   for hdim, dtype in itertools.product(HEAD_DIMENSIONS_BWD, DTYPE_BWD)]
+    if DISABLE_BACKWARD:
+        sources_bwd = []
+    sources = ["flash_api.cpp"] + sources_fwd + sources_bwd
+    if not DISABLE_SPLIT:
+        sources += ["flash_fwd_combine_sm80.cu"]
     nvcc_flags = [
         "-O3",
-        # "-O0",
         "-std=c++17",
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "-U__CUDA_NO_BFLOAT16_OPERATORS__",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "-U__CUDA_NO_BFLOAT162_OPERATORS__",
-        "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
+        "--ftemplate-backtrace-limit=0",  # To debug template code
         "--use_fast_math",
-        "--ptxas-options=-v",  # printing out number of registers
-        "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",  # printing out number of registers
+        # "--keep",
+        # "--ptxas-options=--verbose,--register-usage-level=5,--warn-on-local-memory-usage",  # printing out number of registers
+        # f"--split-compile={os.getenv('NVCC_THREADS', '4')}",  # split-compile is faster
+        "--resource-usage",  # printing out number of registers
         "-lineinfo",
+        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",  # Necessary for the WGMMA shapes that we use
+        # "-DCUTLASS_ENABLE_GDC_FOR_SM90",  # For PDL
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
         "-DNDEBUG",  # Important, otherwise performance is severely impacted
     ]
@@ -199,52 +300,28 @@ if not SKIP_CUDA_BUILD:
             ]
         )
     include_dirs = [
-        # Path(this_dir) / "fmha-pipeline",
-        # repo_dir / "lib",
-        # repo_dir / "include",
+        Path(this_dir),
         cutlass_dir / "include",
-        # cutlass_dir / "examples" / "common",
-        # cutlass_dir / "tools" / "util" / "include",
     ]
 
     ext_modules.append(
         CUDAExtension(
-            name="flashattn_hopper_cuda",
+            name="flash_attn_3_cuda",
             sources=sources,
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
-                # "cxx": ["-O0", "-std=c++17"],
-                "nvcc": append_nvcc_threads(
-                    nvcc_flags + cc_flag
-                ),
+                "cxx": ["-O3", "-std=c++17"] + feature_args,
+                "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
             },
             include_dirs=include_dirs,
-            # Without this we get and error about cuTensorMapEncodeTiled not defined
-            libraries=["cuda"]
         )
     )
-    # ext_modules.append(
-    #     CUDAExtension(
-    #         name="flashattn_hopper_cuda_ws",
-    #         sources=sources,
-    #         extra_compile_args={
-    #             "cxx": ["-O3", "-std=c++17"],
-    #             "nvcc": append_nvcc_threads(
-    #                 nvcc_flags + ["-DEXECMODE=1"] + cc_flag
-    #             ),
-    #         },
-    #         include_dirs=include_dirs,
-    #         # Without this we get and error about cuTensorMapEncodeTiled not defined
-    #         libraries=["cuda"]
-    #     )
-    # )
 
 
 def get_package_version():
     with open(Path(this_dir) / "__init__.py", "r") as f:
         version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
-    local_version = os.environ.get("FLASHATTN_HOPPER_LOCAL_VERSION")
+    local_version = os.environ.get("FLASH_ATTN_LOCAL_VERSION")
     if local_version:
         return f"{public_version}+{local_version}"
     else:

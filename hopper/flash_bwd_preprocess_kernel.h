@@ -11,6 +11,7 @@
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
 
+#include "seqlen.h"
 #include "utils.h"
 
 namespace flash {
@@ -36,6 +37,7 @@ public:
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(get<1>(TileShape_MK{}) % kGmemElemsPerLoad == 0, "Headdim must be a multiple of kGmemElemsPerLoad");
+    static constexpr int kBlockM = get<0>(TileShape_MK{});
     static constexpr int kHeadDim = get<1>(TileShape_MK{});
     // We want kBlockKGmem to be a power of 2 so that when we do the summing,
     // it's just between threads in the same warp
@@ -45,25 +47,24 @@ public:
     using GmemLayoutAtom = Layout<Shape <Int<MaxThreadsPerBlock / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
     using GmemTiledCopy = decltype(
-        make_tiled_copy(Copy_Atom<DefaultCopy, Element>{},
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per load
 
     static constexpr int kGmemElemsPerLoadAccum = sizeof(cute::uint128_t) / sizeof(ElementAccum);
-    static_assert(get<1>(TileShape_MK{}) % kGmemElemsPerLoadAccum == 0, "Headdim must be a multiple of kGmemElemsPerLoadAccum");
-    static constexpr int kGmemThreadsPerRowAccum = kBlockKGmem / kGmemElemsPerLoadAccum;
-    static_assert(MaxThreadsPerBlock % kGmemThreadsPerRowAccum == 0, "MaxThreadsPerBlock must be a multiple of kGmemThreadsPerRowAccum");
-    using GmemLayoutAtomAccum = Layout<Shape <Int<MaxThreadsPerBlock / kGmemThreadsPerRowAccum>, Int<kGmemThreadsPerRowAccum>>,
-                                       Stride<Int<kGmemThreadsPerRowAccum>, _1>>;
+    static_assert((kBlockM * kHeadDim / kGmemElemsPerLoadAccum) % MaxThreadsPerBlock == 0, "MaxThreadsPerBlock must divide kBlockM * kHeadDim / kGmemElemsPerLoadAccum");
+    using GmemLayoutAtomAccum = Layout<Shape<Int<MaxThreadsPerBlock>>>;
     using GmemTiledCopyAccum = decltype(
-        make_tiled_copy(Copy_Atom<DefaultCopy, ElementAccum>{},
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
                         GmemLayoutAtomAccum{},
-                        Layout<Shape<_1, Int<kGmemElemsPerLoadAccum>>>{}));  // Val layout, 4 vals per store
+                        Layout<Shape<Int<kGmemElemsPerLoadAccum>>>{}));  // Val layout, 4 vals per store
 
     using ShapeO = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen_q, d, head, batch)
     using StrideO = cute::Stride<int64_t, _1, int64_t, int64_t>;
     using ShapedPsum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q, head, batch)
     using StridedPsum = cute::Stride<_1, int64_t, int64_t>;
+    using ShapedQaccum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
+    using StridedQaccum = cute::Stride<_1, int64_t, int64_t>;
 
     // Device side arguments
     struct Arguments {
@@ -80,8 +81,8 @@ public:
         float *ptr_LSE_log2;
         StridedPsum const stride_LSE_log2;
         ElementAccum* ptr_dQaccum;
-        ShapeO const shape_dQaccum;
-        StrideO const stride_dQaccum;
+        ShapedQaccum const shape_dQaccum;
+        StridedQaccum const stride_dQaccum;
         int num_batch;  // We need this to know the size of dq_semaphore in case of varlen
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
@@ -103,8 +104,8 @@ public:
         float* ptr_LSE_log2;
         StridedPsum const stride_LSE_log2;
         ElementAccum* ptr_dQaccum;
-        ShapeO const shape_dQaccum;
-        StrideO const stride_dQaccum;
+        ShapedQaccum const shape_dQaccum;
+        StridedQaccum const stride_dQaccum;
         int num_batch;
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
@@ -149,19 +150,19 @@ public:
         int const bidh = blockIdx.y;
         int const bidb = blockIdx.z;
 
-        bool const is_varlen = Varlen && params.cu_seqlens != nullptr;
-        int const offset_o = !is_varlen ? 0 : params.cu_seqlens[bidb];
-        int const seqlen_o = !is_varlen ? get<0>(params.shape_O) : (params.seqused ? params.seqused[bidb] : params.cu_seqlens[bidb + 1] - offset_o);
+        flash::SeqlenInfo<Varlen, kBlockM> seqlen_info(bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused);
+        bool const is_varlen = Varlen && params.cu_seqlens;
+        int const seqlen_o = seqlen_info.seqlen;
         if (is_varlen && m_block * kBlockM >= seqlen_o) { return; }
 
         Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O), params.shape_O, params.stride_O)(_, _, bidh, !is_varlen ? bidb : 0);
-        Tensor gO = local_tile(cute::domain_offset(make_coord(offset_o, _0{}), mO), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
+        Tensor gO = local_tile(cute::domain_offset(make_coord(seqlen_info.offset, _0{}), mO), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
         Tensor mdO = make_tensor(make_gmem_ptr(params.ptr_dO), params.shape_O, params.stride_dO)(_, _, bidh, !is_varlen ? bidb : 0);
-        Tensor gdO = local_tile(cute::domain_offset(make_coord(offset_o, _0{}), mdO), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
+        Tensor gdO = local_tile(cute::domain_offset(make_coord(seqlen_info.offset, _0{}), mdO), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
 
         auto shape_LSE = select<0, 2, 3>(params.shape_O);
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE), shape_LSE, params.stride_LSE)(_, bidh, !is_varlen ? bidb : 0);
-        Tensor gLSE = local_tile(cute::domain_offset(make_coord(offset_o), mLSE), Shape<Int<kBlockM>>{}, make_coord(m_block));
+        Tensor gLSE = local_tile(cute::domain_offset(make_coord(seqlen_info.offset), mLSE), Shape<Int<kBlockM>>{}, make_coord(m_block));
         static_assert(kBlockM <= MaxThreadsPerBlock);
         float lse = thread_idx < seqlen_o - m_block * kBlockM && thread_idx < kBlockM ? gLSE(thread_idx) : INFINITY;
 
@@ -181,17 +182,22 @@ public:
         // (8, kBlockM / 32, kHeadDim / 64) or (8, kBlockM / 16, kHeadDim / 128)
         Tensor tOrO = make_fragment_like(tOgO);
         Tensor tOrdO = make_fragment_like(tOgdO);
-        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true>(
+        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true, /*Clearn_OOB_K=*/true>(
             gmem_tiled_copy_O, tOgO, tOrO, tOcO, tOpO, seqlen_o - m_block * kBlockM
         );
-        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true>(
+        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true, /*Clearn_OOB_K=*/true>(
             gmem_tiled_copy_O, tOgdO, tOrdO, tOcO, tOpO, seqlen_o - m_block * kBlockM
         );
+        // if (threadIdx.x == 222) { printf("bidx = %d, bidy = %d, bidz = %d, seqlen_o = %d, m_block = %d, seqlen_o - m_block * kBlockM = %d, tOgO addr = %p\n", blockIdx.x, blockIdx.y, blockIdx.z, seqlen_o, m_block, seqlen_o - m_block * kBlockM, &tOgO(0));}
 
         // Reshape from e.g. (8, kBlockM / 32, kHeadDim / 64) to (kBlockM / 32, (8, kHeadDim / 64))
         Layout l = make_layout(get<1>(tOrO.layout()), make_layout(get<0>(tOrO.layout()), get<2>(tOrO.layout())));
-        Tensor o_fp32 = flash::convert_type<float>(make_tensor(tOrO.data(), l));
-        Tensor do_fp32 = flash::convert_type<float>(make_tensor(tOrdO.data(), l));
+        Tensor tOrO_l = make_tensor(tOrO.data(), l);
+        Tensor o_fp32 = make_tensor_like<float>(tOrO_l);
+        flash::convert_type_out(tOrO_l, o_fp32);
+        Tensor tOrdO_l = make_tensor(tOrdO.data(), l);
+        Tensor do_fp32 = make_tensor_like<float>(tOrdO_l);
+        flash::convert_type_out(tOrdO_l, do_fp32);
         // Sum across the last dimension
         Tensor dP_sum = make_tensor<float>(make_shape(size<0>(o_fp32)));
         #pragma unroll
@@ -205,45 +211,37 @@ public:
             dP_sum(mi) = flash::Allreduce<kGmemThreadsPerRow>::run(dP_sum_cur, sum_op);
         }
 
-        // If varlen, the layout for dPSum, LSE_log2, and dQaccum is that we pad each sequence in the batch
-        // by an extra 128, so that the write for each sequence doesn't touch the next sequence.
-        // Sequence i starts at params.cu_seqlens[i] + i * 128 and ends at params.cu_seqlens[i + 1] + i * 128
-        int const offset_padded = !is_varlen ? 0 : (params.cu_seqlens[bidb] + bidb * 128) / 128 * 128;
         Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_dPsum, params.stride_dPsum)(_, bidh, !is_varlen ? bidb : 0);
-        Tensor gdPsum = local_tile(cute::domain_offset(make_coord(offset_padded), mdPsum), Shape<Int<kBlockM>>{}, make_coord(m_block));
-        if (thread_idx % kGmemThreadsPerRow == 0) {
+        Tensor gdPsum = local_tile(cute::domain_offset(make_coord(seqlen_info.offset_padded), mdPsum), Shape<Int<kBlockM>>{}, make_coord(m_block));
+        if (get<1>(tOcO(_0{}, _0{}, _0{})) == 0) {
             #pragma unroll
             for (int mi = 0; mi < size(dP_sum); ++mi) {
-                int row = thread_idx / kGmemThreadsPerRow + mi * MaxThreadsPerBlock / kGmemThreadsPerRow;
+                int const row = get<0>(tOcO(_0{}, mi, _0{}));
                 gdPsum(row) = row < seqlen_o - m_block * kBlockM ? dP_sum(mi) : 0;
             }
         }
 
         int const seqlen_rounded = cute::round_up(seqlen_o, kBlockM);
         Tensor mLSElog2 = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_dPsum, params.stride_LSE_log2)(_, bidh, !is_varlen ? bidb : 0);
-        Tensor gLSElog2 = local_tile(cute::domain_offset(make_coord(offset_padded), mLSElog2), Shape<Int<kBlockM>>{}, make_coord(m_block));
+        Tensor gLSElog2 = local_tile(cute::domain_offset(make_coord(seqlen_info.offset_padded), mLSElog2), Shape<Int<kBlockM>>{}, make_coord(m_block));
         if (thread_idx < seqlen_rounded - m_block * kBlockM && thread_idx < kBlockM) {
             gLSElog2(thread_idx) = lse == -INFINITY ? 0.f : lse * float(M_LOG2E);
         }
 
         if constexpr (Clear_dQaccum) {
-            Tensor mdQaccum = make_tensor(make_gmem_ptr(params.ptr_dQaccum), params.shape_dQaccum, params.stride_dQaccum)(_, _, bidh, !is_varlen ? bidb : 0);
-            Tensor gdQaccum = local_tile(cute::domain_offset(make_coord(offset_padded, _0{}), mdQaccum), TileShape_MK{}, make_coord(m_block, _0{}));
+            Tensor mdQaccum = make_tensor(make_gmem_ptr(params.ptr_dQaccum), params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
+            Tensor gdQaccum = local_tile(cute::domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));
             GmemTiledCopyAccum gmem_tiled_copy_dQaccum;
             auto gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_thread_slice(thread_idx);
             Tensor tdQgdQaccum = gmem_thr_copy_dQaccum.partition_D(gdQaccum);
             Tensor zero = make_fragment_like(tdQgdQaccum);
             clear(zero);
-            // cute::copy(zero, tdQgdQaccum);  // Somehow this doesn't vectorize the write
-            #pragma unroll
-            for (int m = 0; m < size<1>(zero); ++m) {
-                cute::copy(zero(_, m, _), tdQgdQaccum(_, m, _));
-            }
+            cute::copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{}, zero, tdQgdQaccum);
         }
 
         if (params.dq_semaphore != nullptr && thread_idx == 0) {
             int const num_batch = params.num_batch;
-            int const num_head = get<2>(params.shape_dQaccum);
+            int const num_head = get<2>(params.shape_O);
             params.dq_semaphore[bidh + bidb * num_head + m_block * num_head * num_batch] = 0;
         }
 
