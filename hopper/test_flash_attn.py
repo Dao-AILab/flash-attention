@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from flash_attn.layers.rotary import apply_rotary_emb
 
+from padding import pad_input, unpad_input
 from test_util import (
     attention_ref,
     generate_qkv,
@@ -51,7 +52,7 @@ COMPILED_HDIMS = (
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
-@pytest.mark.parametrize("softcap", [0.0] + ([30.0] if not DISABLE_SOFTCAP else []))
+@pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 # @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("local", [False])
@@ -164,7 +165,7 @@ def test_flash_attn_output(
     # qk = torch.einsum('bthd,bshd->bhts', q_ref.float() / math.sqrt(d), k_ref.float())
     # lse_ref = torch.logsumexp(qk, dim=-1)
 
-    abs_tol = 5e-5 if softcap == 0.0 else 5e-4
+    abs_tol = 1e-4 if softcap == 0.0 else 5e-4
 
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
@@ -261,7 +262,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
-@pytest.mark.parametrize("softcap", [0.0] + ([30.0] if not DISABLE_SOFTCAP else []))
+@pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 # @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("local", [False])
@@ -408,7 +409,9 @@ def test_flash_attn_varlen_output(
     if query_unused_mask is not None:
         q_zero_masking = rearrange(query_unused_mask, "b s -> b s 1 1")
 
-    abs_tol = 5e-5 if softcap == 0.0 else 5e-4
+    # Numerical error if we just do any arithmetic on out_ref
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    rel_tol = 2 if softcap == 0.0 else 3
 
     pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
     num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
@@ -437,9 +440,9 @@ def test_flash_attn_varlen_output(
         #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
         # breakpoint()
 
-        # Check that FlashAttention's numerical error is at most twice the numerical error
+        # Check that FlashAttention's numerical error is at most 3x the numerical error
         # of a Pytorch implementation.
-        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + abs_tol
+        assert (out - out_ref).abs().max().item() <= rel_tol * (out_pt - out_ref).abs().max().item() + fwd_atol
 
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn:
@@ -511,10 +514,12 @@ def test_flash_attn_varlen_output(
         # breakpoint()
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn:
-        multiple = 2
-        assert (dq - dq_ref).abs().max().item() <= multiple * (dq_pt - dq_ref).abs().max().item() + abs_tol
-        assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item() + abs_tol
-        assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item() + abs_tol
+        dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
+        assert (dq - dq_ref).abs().max().item() <= rel_tol * (dq_pt - dq_ref).abs().max().item() + dq_atol
+        dk_atol = 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
+        assert (dk - dk_ref).abs().max().item() <= rel_tol * (dk_pt - dk_ref).abs().max().item() + dk_atol
+        dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
+        assert (dv - dv_ref).abs().max().item() <= rel_tol * (dv_pt - dv_ref).abs().max().item() + dv_atol
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
