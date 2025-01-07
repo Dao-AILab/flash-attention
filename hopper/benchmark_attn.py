@@ -1,5 +1,7 @@
+from collections import namedtuple
 from functools import partial
 import math
+from typing import NamedTuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +12,9 @@ try:
     import cudnn
 except ImportError:
     cudnn = None
+# cudnn = None
+
+Timing = NamedTuple('timing', [('mean', float)])
 
 
 from einops import rearrange, repeat
@@ -17,9 +22,11 @@ from einops import rearrange, repeat
 # from flash_attn.utils.benchmark import benchmark_forward, benchmark_backward, benchmark_combined, benchmark_all, benchmark_fwd_bwd, pytorch_profiler
 from flash_attn.utils.benchmark import benchmark_forward, benchmark_backward, benchmark_combined, benchmark_all, benchmark_fwd_bwd, pytorch_profiler
 from flash_attn.flash_attn_interface import flash_attn_func, flash_attn_varlen_func
-# from flash_attn_interface import flash_attn_func as flash_attn_func_v3
-from flash_attn_interface import flash_attn_with_kvcache as flash_attn_func_v3
+from flash_attn_interface import flash_attn_func as flash_attn_func_v3
+# from flash_attn_interface import flash_attn_with_kvcache as flash_attn_func_v3
 from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_v3
+
+from triton.testing import do_bench
 
 try:
     from triton_fused_attention import attention as triton_attention
@@ -29,19 +36,24 @@ triton_attention = None
 
 
 def time_fwd(func, *args, repeats=30, verbose=True, desc="", **kwargs):
+    # # Warmup
+    # for _ in range(5):
+    #     func(*args, **kwargs)
+    # time.sleep(1)
     # return benchmark_forward(func, *args, **kwargs, repeats=repeats, verbose=verbose, desc=desc)[1]
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        for _ in range(2):
-            out = func(*args, **kwargs)
-    torch.cuda.current_stream().wait_stream(s)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out = func(*args, **kwargs)
-    time_f = benchmark_forward(lambda: graph.replay(), repeats=repeats, verbose=verbose, desc=desc)
-    # return time_f[1].mean
-    return time_f[1]
+    # s = torch.cuda.Stream()
+    # s.wait_stream(torch.cuda.current_stream())
+    # with torch.cuda.stream(s):
+    #     for _ in range(2):
+    #         out = func(*args, **kwargs)
+    # torch.cuda.current_stream().wait_stream(s)
+    # graph = torch.cuda.CUDAGraph()
+    # with torch.cuda.graph(graph):
+    #     out = func(*args, **kwargs)
+    # time_f = benchmark_forward(lambda: graph.replay(), repeats=repeats, verbose=verbose, desc=desc)
+    # # return time_f[1].mean
+    # return time_f[1]
+    return Timing(do_bench(lambda: func(*args, **kwargs), warmup=5, rep=repeats) * 1e-3)
 
 
 def flops(batch, nheads, seqlen_q, seqlen_k, headdim, causal=False, window_size=(-1, -1)):
@@ -222,9 +234,9 @@ dim = 2048
 headdim = 256
 # for headdim in [64, 128, 256]:
 # bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
+# bs_seqlen_vals = [(16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
 # bs_seqlen_vals = [(32, 512), (16, 1024)]
 # bs_seqlen_vals = [(2, 64 * 132)]
-# bs_seqlen_vals = [(2 * 8, 8192)]
 bs_seqlen_vals = [(2, 8192)]
 # bs_seqlen_vals = [(1, 16 * 1024)]
 time_f = {}
@@ -243,7 +255,6 @@ time_b = {}
 # # # with open(f'flash3_attn_time_h100_hdim{headdim}_causal.plk', 'wb') as fp:
 # # with open(f'flash3_matmul_tflops_h100.plk', 'wb') as fp:
 # #     pickle.dump(tflops_matmul, fp, protocol=pickle.HIGHEST_PROTOCOL)
-
 # exit(0)
 
 # for headdim in [64, 128, 256]:
@@ -251,6 +262,7 @@ time_b = {}
 # for headdim in [64, 96, 128, 192, 256]:
 # for headdim in [64, 96, 128]:
 # for headdim in [64, 128, 256]:
+# for headdim in [64, 96, 128, 192, 256]:
 for headdim in [128]:
     nheads = dim // headdim
     # headdim = 64
@@ -258,8 +270,8 @@ for headdim in [128]:
     # seqlen = 512
     # nheads = 8
     # headdim = 128
-    # nheads_kv = nheads
-    nheads_kv = nheads // 4
+    nheads_kv = nheads
+    # nheads_kv = nheads // 4
 
     for batch_size, seqlen in bs_seqlen_vals:
         num_splits = 1
@@ -315,72 +327,77 @@ for headdim in [128]:
                     cudnn_spda = cudnn_spda_setup(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=causal, window_size_left=window_size[0])
                     cudnn_spda_bwd = cudnn_spda_bwd_setup(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), o.transpose(1, 2), g.transpose(1, 2), stats.transpose(1, 2), causal=causal, window_size_left=window_size[0])
             # _, m0 = benchmark_forward(flash_attn_func, q, k, v, dropout_p, causal=causal, repeats=repeats, verbose=verbose, desc='Fav2')
-            # if dtype != torch.float8_e4m3fn:
-            if False:
+            if dtype != torch.float8_e4m3fn:
+            # if False:
                 if not varlen:
-                    m0 = time_fwd(flash_attn_func, q, k, v, dropout_p, causal=causal, window_size=window_size, repeats=repeats, verbose=verbose, desc='Fav2')
+                    m0 = time_fwd(flash_attn_func, q, k, v, dropout_p, causal=causal, window_size=window_size, softcap=softcap, repeats=repeats, verbose=verbose, desc='Fav2')
                 else:
-                    m0 = time_fwd(flash_attn_varlen_func, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, dropout_p, causal=causal, window_size=window_size, repeats=repeats, verbose=verbose, desc='Fav2')
+                    m0 = time_fwd(flash_attn_varlen_func, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, dropout_p, causal=causal, window_size=window_size, softcap=softcap, repeats=repeats, verbose=verbose, desc='Fav2')
                 time_f[(causal, headdim, batch_size, seqlen), "Flash2"] = m0.mean
                 time.sleep(1)
-                _, m0b = benchmark_backward(flash_attn_func, q, k, v, dropout_p, causal=causal, deterministic=deterministic,
-                                            repeats=repeats, verbose=verbose, desc='Fav2')
+                if not varlen:
+                    _, m0b = benchmark_backward(flash_attn_func, q, k, v, dropout_p, causal=causal, window_size=window_size, softcap=softcap, deterministic=deterministic,
+                                                repeats=repeats, verbose=verbose, desc='Fav2')
+                else:
+                    _, m0b = benchmark_backward(flash_attn_varlen_func, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, dropout_p, causal=causal, window_size=window_size, softcap=softcap, deterministic=deterministic,
+                                                repeats=repeats, verbose=verbose, desc='Fav2')
                 time_b[(causal, headdim, batch_size, seqlen), "Flash2"] = m0b.mean
             # pytorch_profiler(flash_attn_func, q, k, v, dropout_p, causal=causal, backward=True)
             if headdim <= 256 and dtype != torch.float8_e4m3fn:
                 if triton_attention is not None:
                     qt, kt, vt = [x.detach().transpose(1, 2).contiguous().requires_grad_() for x in [q, k, v]]
                     time.sleep(1) # Sleep to avoid residual power throttling from the previous benchmark
-                    _, m3 = benchmark_forward(triton_attention, qt, kt, vt, causal, 1 / math.sqrt(headdim), repeats=repeats, verbose=verbose, desc='Triton')
+                    m3 = time_fwd(triton_attention, qt, kt, vt, causal, 1 / math.sqrt(headdim), repeats=repeats, verbose=verbose, desc='Triton')
                     time_f[(causal, headdim, batch_size, seqlen), "Triton"] = m3.mean
                     # if causal: # triton bwd only works w causal for now
                     #     time.sleep(1)
                     #     _, m3b = benchmark_backward(triton_attention, qt, kt, vt, causal, 1 / math.sqrt(headdim), repeats=repeats, verbose=verbose, desc='Triton')
                     #     time_b[(causal, headdim, batch_size, seqlen), "Triton"] = m3b.mean
-                    # pytorch_profiler(triton_attention, q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous(), causal, 1 / math.sqrt(headdim), backward=True)
+                    # # pytorch_profiler(triton_attention, q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous(), causal, 1 / math.sqrt(headdim), backward=True)
             if cudnn is not None:
             # if False:
                 if headdim <= 256 and dtype != torch.float8_e4m3fn:
                     time.sleep(1) # Sleep to avoid residual power throttling from the previous benchmark
-                    _, m2 = benchmark_forward(cudnn_spda, repeats=repeats, verbose=verbose, desc='CuDNN')
-                    # m2 = time_fwd(cudnn_spda, repeats=repeats, verbose=verbose, desc='CuDNN')
+                    m2 = time_fwd(cudnn_spda, repeats=repeats, verbose=verbose, desc='CuDNN')
                     time_f[(causal, headdim, batch_size, seqlen), "cuDNN"] = m2.mean
                     time.sleep(1)
-                    _, m2b = benchmark_forward(cudnn_spda_bwd, repeats=repeats, verbose=verbose, desc='CuDNN')
+                    m2b = time_fwd(cudnn_spda_bwd, repeats=repeats, verbose=verbose, desc='CuDNN')
                     time_b[(causal, headdim, batch_size, seqlen), "cuDNN"] = m2b.mean
                 # pytorch_profiler(cudnn_spda, backward=False)
                 # pytorch_profiler(cudnn_spda_bwd, backward=False)
+
             time.sleep(1)
             if not varlen:
-                m1 = time_fwd(flash_attn_func_v3, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, cache_leftpad = leftpad_k, page_table=page_table, causal=causal, window_size=window_size, sink_token_length=sink_token_length, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3')
+                # m1 = time_fwd(flash_attn_func_v3, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, cache_leftpad = leftpad_k, page_table=page_table, causal=causal, window_size=window_size, sink_token_length=sink_token_length, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3')
+                m1 = time_fwd(flash_attn_func_v3, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, causal=causal, window_size=window_size, sink_token_length=sink_token_length, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3')
                 # pytorch_profiler(flash_attn_func_v3, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, page_table=page_table, causal=causal, window_size=window_size, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa)
             else:
-                m1 = time_fwd(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, window_size=window_size, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3')
+                m1 = time_fwd(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, None, None, seqlen_q, seqlen, causal=causal, window_size=window_size, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3')
                 # pytorch_profiler(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, window_size=window_size, softcap=softcap, num_splits=num_splits)
             time_f[(causal, headdim, batch_size, seqlen), "Flash3"] = m1.mean
-            # # time.sleep(1)
-            # # m5 = time_fwd(torch.bmm, a, b, desc='cuBLAS', repeats=repeats, verbose=False)
+            # time.sleep(1)
+            # m5 = time_fwd(torch.bmm, a, b, desc='cuBLAS', repeats=repeats, verbose=False)
             # nFLOPS_matmul = nFLOPS
-            # # nFLOPS_matmul = 2 * x.shape[0] * x.shape[1] * w.shape[1]
-            # # m5 = time_fwd(torch.matmul, x, w, desc='cuBLAS')
-            # if dtype != torch.float8_e4m3fn:
-            #     time.sleep(1)
-            #     if not varlen:
-            #         _, m1b = benchmark_backward(flash_attn_func_v3, q, k, v, causal=causal, window_size=window_size, sink_token_length=sink_token_length, softcap=softcap, deterministic=deterministic,
-            #                                     repeats=repeats, verbose=verbose, desc='Fav3')
-            #     else:
-            #         _, m1b = benchmark_backward(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, window_size=window_size, softcap=softcap, deterministic=deterministic,
-            #                                     repeats=repeats, verbose=verbose, desc='Fav3')
-            #     time_b[(causal, headdim, batch_size, seqlen), "Flash3"] = m1b.mean
-            #     # time.sleep(1)
-            #     # if not varlen:
-            #     #     pytorch_profiler(flash_attn_func_v3, q, k, v, causal=causal, deterministic=deterministic, backward=True)
-            #     # else:
-            #     #     pytorch_profiler(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, deterministic=deterministic, backward=True)
+            # nFLOPS_matmul = 2 * x.shape[0] * x.shape[1] * w.shape[1]
+            # m5 = time_fwd(torch.matmul, x, w, desc='cuBLAS')
+            if dtype != torch.float8_e4m3fn:
+                time.sleep(1)
+                if not varlen:
+                    _, m1b = benchmark_backward(flash_attn_func_v3, q, k, v, causal=causal, window_size=window_size, sink_token_length=sink_token_length, softcap=softcap, deterministic=deterministic,
+                                                repeats=repeats, verbose=verbose, desc='Fav3')
+                else:
+                    _, m1b = benchmark_backward(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, None, None, seqlen_q, seqlen, causal=causal, window_size=window_size, softcap=softcap, deterministic=deterministic,
+                                                repeats=repeats, verbose=verbose, desc='Fav3')
+                time_b[(causal, headdim, batch_size, seqlen), "Flash3"] = m1b.mean
+                # time.sleep(1)
+                # if not varlen:
+                #     pytorch_profiler(flash_attn_func_v3, q, k, v, causal=causal, deterministic=deterministic, backward=True)
+                # else:
+                #     pytorch_profiler(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, deterministic=deterministic, backward=True)
             # benchmark_forward(torch.clone, k, repeats=repeats, verbose=verbose, desc='Memcpy')
 
-            # if dtype != torch.float8_e4m3fn:
-            if False:
+            if dtype != torch.float8_e4m3fn:
+            # if False:
                 print(f'Fav2 fwd: {m0.mean * 1e3:.3f}ms, {(nFLOPS / m0.mean * 1e-12):.1f} TFLOPS')
                 print(f'Fav2 bwd: {m0b.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m0b.mean * 1e-12):.1f} TFLOPS')
             if headdim <= 256 and dtype != torch.float8_e4m3fn:
@@ -392,8 +409,8 @@ for headdim in [128]:
                     print(f'CuDNN fwd: {m2.mean * 1e3:.3f}ms, {(nFLOPS / m2.mean * 1e-12):.1f} TFLOPS')
                     print(f'CuDNN bwd: {m2b.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m2b.mean * 1e-12):.1f} TFLOPS')
             print(f'Fav3 fwd: {m1.mean * 1e3:.3f}ms, {(nFLOPS / m1.mean * 1e-12):.1f} TFLOPS')
-            # if dtype != torch.float8_e4m3fn:
-            #     print(f'Fav3 bwd: {m1b.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m1b.mean * 1e-12):.1f} TFLOPS')
+            if dtype != torch.float8_e4m3fn:
+                print(f'Fav3 bwd: {m1b.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m1b.mean * 1e-12):.1f} TFLOPS')
             # benchmark_forward(torch.square, k)
             # print(f'cuBLAS: {m5.mean * 1e3:.3f}ms, {(nFLOPS_matmul / m5.mean * 1e-12):.1f} TFLOPS')
     # print(time_f)
@@ -401,7 +418,8 @@ for headdim in [128]:
 
     # import pickle
     # # with open(f'flash3_attn_time_h100_hdim{headdim}_causal.plk', 'wb') as fp:
-    # # with open(f'flash3_attn_time_h100_hdim{headdim}.plk', 'wb') as fp:
-    # with open(f'flash3_attn_time_h100_fp8_hdim{headdim}.plk', 'wb') as fp:
+    # # with open(f'flash3_attn_time_h100_cudnn_triton_20241208.plk', 'wb') as fp:
+    # with open(f'flash3_attn_time_h100_fa3_20241208.plk', 'wb') as fp:
+    # # with open(f'flash3_attn_time_h100_fp8_hdim{headdim}.plk', 'wb') as fp:
     # # with open(f'flash3_attn_time_h100_hdim{headdim}_1031.plk', 'wb') as fp:
     #     pickle.dump((time_f, time_b), fp, protocol=pickle.HIGHEST_PROTOCOL)
