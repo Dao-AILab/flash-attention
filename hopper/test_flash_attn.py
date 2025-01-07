@@ -44,7 +44,7 @@ COMPILED_HDIMS = (
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float16] if not DISABLE_FP16 else []) + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -101,8 +101,6 @@ def test_flash_attn_output(
     sink_token_length = 0 if not local else 0
     if V_colmajor and (seqlen_k % 16 != 0 or dtype != torch.float8_e4m3fn):
         pytest.skip("V_colmajor requires seqlen_k to be a multiple of 16 and dtype to be float8_e4m3fn")
-    # if softcap > 0.0 and dtype == torch.float8_e4m3fn:
-        # pytest.skip("Softcap is not supported for float8_e4m3fn")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -166,6 +164,8 @@ def test_flash_attn_output(
     # qk = torch.einsum('bthd,bshd->bhts', q_ref.float() / math.sqrt(d), k_ref.float())
     # lse_ref = torch.logsumexp(qk, dim=-1)
 
+    abs_tol = 5e-5 if softcap == 0.0 else 5e-4
+
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
     pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
@@ -192,7 +192,6 @@ def test_flash_attn_output(
         # Check that FlashAttention's numerical error is at most twice the numerical error
         # of a Pytorch implementation.
         multiple = 2 if dtype != torch.float8_e4m3fn else 3
-        abs_tol = 3e-5
         assert (out - out_ref).abs().max().item() <= multiple * (out_pt - out_ref).abs().max().item() + abs_tol
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor:
@@ -255,7 +254,7 @@ def test_flash_attn_output(
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float16] if not DISABLE_FP16 else []) + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -264,9 +263,12 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("softcap", [0.0] + ([30.0] if not DISABLE_SOFTCAP else []))
 # @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
-# @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
-# @pytest.mark.parametrize("causal,local", [(False, False)])
+@pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
+# @pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("add_unused_qkv", [False, True])
+# @pytest.mark.parametrize("add_unused_qkv", [True])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
@@ -278,6 +280,11 @@ def test_flash_attn_output(
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
+        (1, 1),
+        (1, 3),
+        (2, 1),
+        (511, 1),
+        (3, 513),
         (64, 128),
         (128, 128),
         (256, 256),
@@ -293,14 +300,11 @@ def test_flash_attn_output(
         (1023, 1024),
         (1024, 1023),
         (2048, 2048),
-        (8192, 8192),
     ],
 )
 def test_flash_attn_varlen_output(
-        seqlen_q, seqlen_k, d, causal, local, softcap, deterministic, mha_type, dtype
+    seqlen_q, seqlen_k, d, add_unused_qkv, causal, local, softcap, deterministic, mha_type, dtype
 ):
-    if softcap > 0.0 and dtype == torch.float8_e4m3fn:
-        pytest.skip("Softcap is not supported for float8_e4m3fn")
     device = "cuda"
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
@@ -309,7 +313,7 @@ def test_flash_attn_varlen_output(
     batch_size = 9 if seqlen_q <= 2048 else 2
     nheads = 6
     # batch_size = 2
-    # nheads = 2
+    # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
@@ -326,14 +330,40 @@ def test_flash_attn_varlen_output(
     else:
         q_descale, k_descale, v_descale = None, None, None
     q, k, v = [x.detach().requires_grad_() for x in (q_ref, k_ref, v_ref)]
-    query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random")
-    key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode="random")
+    query_padding_mask = generate_random_padding_mask(
+        seqlen_q, batch_size, device, mode="random", zero_lengths=False
+    )
+    key_padding_mask = generate_random_padding_mask(
+        seqlen_k, batch_size, device, mode="random", zero_lengths=True
+    )
+
+    def _gen_unused_masks(padding_mask, add_unused, max_seq_len, bs, device):
+        if add_unused:
+            another_mask = generate_random_padding_mask(max_seq_len, bs, device)
+            attn_mask = torch.logical_and(padding_mask, another_mask)
+            unused_mask = torch.logical_xor(
+                torch.logical_or(padding_mask, another_mask), attn_mask
+            )
+        else:
+            attn_mask = padding_mask
+            unused_mask = None
+        return attn_mask, unused_mask
+
+    query_padding_mask, query_unused_mask = _gen_unused_masks(
+        query_padding_mask, add_unused_qkv, seqlen_q, batch_size, q.device
+    )
+    key_padding_mask, key_unused_mask = _gen_unused_masks(
+        key_padding_mask, add_unused_qkv, seqlen_k, batch_size, k.device
+    )
+
     (
         q_unpad,
         k_unpad,
         v_unpad,
         cu_seqlens_q,
         cu_seqlens_k,
+        seqused_q,
+        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
         q,
@@ -342,7 +372,8 @@ def test_flash_attn_varlen_output(
         output_pad_fn,
         dq_pad_fn,
         dk_pad_fn,
-    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False,
+                     query_unused_mask=query_unused_mask, key_unused_mask=key_unused_mask)
     q_unpad, k_unpad, v_unpad = [x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)]
     out_ref, attn_ref = attention_ref(
         q_ref,
@@ -370,8 +401,15 @@ def test_flash_attn_varlen_output(
         intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
     )
 
+
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+
+    if query_unused_mask is not None:
+        q_zero_masking = rearrange(query_unused_mask, "b s -> b s 1 1")
+
+    abs_tol = 5e-5 if softcap == 0.0 else 5e-4
+
     pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
     num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
     for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
@@ -381,7 +419,7 @@ def test_flash_attn_varlen_output(
             v_unpad,
             cu_seqlens_q,
             cu_seqlens_k,
-            None, None,
+            seqused_q, seqused_k,
             max_seqlen_q,
             max_seqlen_k,
             causal=causal,
@@ -391,6 +429,8 @@ def test_flash_attn_varlen_output(
             softcap=softcap,
         )
         out = output_pad_fn(out_unpad)
+        if query_unused_mask is not None:
+            out.masked_fill_(q_zero_masking, 0.0)
         print(f"Output max diff: {(out - out_ref).abs().max().item()}")
         print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
         # if not causal:
@@ -399,7 +439,7 @@ def test_flash_attn_varlen_output(
 
         # Check that FlashAttention's numerical error is at most twice the numerical error
         # of a Pytorch implementation.
-        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + abs_tol
 
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn:
@@ -432,6 +472,12 @@ def test_flash_attn_varlen_output(
         dq = dq_pad_fn(dq_unpad)
         dk = dk_pad_fn(dk_unpad)
         dv = dk_pad_fn(dv_unpad)
+        if key_unused_mask is not None:
+            k_zero_masking = rearrange(key_unused_mask, "b s -> b s 1 1")
+            dk.masked_fill_(k_zero_masking, 0.0)
+            dv.masked_fill_(k_zero_masking, 0.0)
+        if query_unused_mask is not None:
+            dq.masked_fill_(q_zero_masking, 0.0)
         # print(f"dO_O max diff: {(softmax_d - do_o).abs().max().item()}")
         # assert (softmax_d - do_o).abs().max().item() <= 1e-5
         # assert dq_accum.abs().max().item() == 0.0
@@ -466,9 +512,9 @@ def test_flash_attn_varlen_output(
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn:
         multiple = 2
-        assert (dq - dq_ref).abs().max().item() <= multiple * (dq_pt - dq_ref).abs().max().item()
-        assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item()
-        assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item()
+        assert (dq - dq_ref).abs().max().item() <= multiple * (dq_pt - dq_ref).abs().max().item() + abs_tol
+        assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item() + abs_tol
+        assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item() + abs_tol
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])

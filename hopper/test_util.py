@@ -19,7 +19,9 @@ def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random", 
 
     if zero_lengths:
         # Generate zero-lengths every 5 batches and the last batch.
-        lengths = [l if i % 5 != 0 else 0 for i, l in enumerate(lengths)]
+        for i in range(batch_size):
+            if i % 5 == 0:
+                lengths[i] = 0
         lengths[-1] = 0
     padding_mask = (
         repeat(torch.arange(max_seqlen, device=device), "s -> b s", b=batch_size) < lengths
@@ -146,6 +148,7 @@ def generate_qkv(
             dk_pad_fn,
         )
 
+
 def construct_local_mask(
     seqlen_q,
     seqlen_k,
@@ -264,6 +267,9 @@ def attention_ref(
     # Otherwise we'll get NaN in dV
     if query_padding_mask is not None:
         attention = attention.masked_fill(rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0)
+    # Without this we might get NaN in dv
+    if key_padding_mask is not None:
+        attention = attention.masked_fill(rearrange(~key_padding_mask, "b s -> b 1 1 s"), 0.0)
     # Some rows might be completely masked out so we fill them with zero instead of NaN
     if window_size[0] >= 0 or window_size[1] >= 0:
         attention = attention.masked_fill(torch.all(local_mask, dim=-1, keepdim=True), 0.0)
@@ -279,7 +285,4 @@ def attention_ref(
     output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
-    if key_padding_mask is not None:
-        output.masked_fill_(rearrange(torch.logical_not(torch.any(key_padding_mask, 1)), "b -> b 1 1 1"), 0.0)
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
-

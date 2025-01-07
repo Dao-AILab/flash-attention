@@ -844,7 +844,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     TORCH_CHECK(!k_new_.has_value(), "This flash attention build does not support appending KV.");
     #endif
 
-    if (seqlen_q > 0 && total_q > 0 && seqlen_k > 0 && batch_size > 0) {
+    if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
@@ -861,7 +861,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
             }
             run_mha_fwd_combine(params, stream);
         }
-    } else if (seqlen_q > 0 && total_q > 0 && batch_size > 0) {
+    } else if (total_q > 0 && num_heads_k > 0) {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
         out.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
@@ -1200,16 +1200,17 @@ std::vector<at::Tensor> mha_bwd(
     TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
     #endif
 
-    if (seqlen_q > 0 && batch_size > 0) {
+    if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_bwd(params, stream);
-    } else {
+    } else if (total_k > 0 && num_heads_k > 0) {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
-        if (batch_size > 0) {
-            dk.zero_();
-            dv.zero_();
-            softmax_d.zero_();
-        }
+        dk.zero_();
+        dv.zero_();
+        softmax_d.zero_();
+    } else if (total_q > 0 && num_heads_k > 0) {
+        dq.zero_();
+        softmax_d.zero_();
     }
 
     return { dq, dk, dv, softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum };
