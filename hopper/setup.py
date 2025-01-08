@@ -60,7 +60,7 @@ DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
-DISABLE_SM80 = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
+DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
 
@@ -221,7 +221,7 @@ if not SKIP_CUDA_BUILD:
         os.chmod(nvcc_path_new, os.stat(nvcc_path_new).st_mode | stat.S_IEXEC)
 
     cc_flag = []
-    if not DISABLE_SM80:
+    if not DISABLE_SM8x:
         cc_flag.append("-gencode")
         cc_flag.append("arch=compute_80,code=sm_80")
     cc_flag.append("-gencode")
@@ -253,7 +253,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_HDIM128"] if DISABLE_HDIM128 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM192"] if DISABLE_HDIM192 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM256"] if DISABLE_HDIM256 else [])
-        + (["-DFLASHATTENTION_DISABLE_SM80"] if DISABLE_SM80 else [])
+        + (["-DFLASHATTENTION_DISABLE_SM8x"] if DISABLE_SM8x else [])
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
     )
 
@@ -286,8 +286,8 @@ if not SKIP_CUDA_BUILD:
         sources_bwd_sm90 = []
     sources = (
         ["flash_api.cpp"]
-        + (sources_fwd_sm80 if not DISABLE_SM80 else []) + sources_fwd_sm90
-        + (sources_bwd_sm80 if not DISABLE_SM80 else []) + sources_bwd_sm90
+        + (sources_fwd_sm80 if not DISABLE_SM8x else []) + sources_fwd_sm90
+        + (sources_bwd_sm80 if not DISABLE_SM8x else []) + sources_bwd_sm90
     )
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine_sm80.cu"]

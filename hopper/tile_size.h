@@ -49,7 +49,7 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm80(
         if (headdim <= 64) {
             return {128, varlen_and_split ? 80 : (is_local ? 96 : 112), 4, 1, false};
         } else if (headdim <= 96) {
-            return {128, varlen_and_split || is_local ? 48 : 64, 4, sm86_or_89 ? 1 : 2, false};
+            return {128, varlen_and_split || is_local ? 48 : 64, 4, 1, false};
         } else if (headdim <= 128) {
             return {128, sm86_or_89 ? (varlen_and_split ? 112 : 128) : (is_local ? 48 : 64), sm86_or_89 ? 8 : 4, 1, sm86_or_89};
         } else if (headdim <= 192) {

@@ -34,14 +34,25 @@ PAGEDKV = [False, True]
 SPLIT = [False, True]
 SOFTCAP = [False, True]
 PACKGQA = [False, True]
-KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_launch_template.h"
+
+KERNEL_IMPL_TEMPLATE_FWD_SM90 = """#include "flash_fwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
 template void run_mha_fwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
 #endif
 """
 
-KERNEL_IMPL_TEMPLATE_BWD = """#include "flash_bwd_launch_template.h"
+KERNEL_IMPL_TEMPLATE_FWD_SM80 = """#include "flash_fwd_launch_template.h"
+
+#ifndef FLASHATTENTION_DISABLE_SM8x
+#ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
+template void run_mha_fwd_<80, {DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_<86, {DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
+#endif
+#endif
+"""
+
+KERNEL_IMPL_TEMPLATE_BWD_SM90 = """#include "flash_bwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
 template<>
@@ -50,6 +61,23 @@ void run_mha_bwd_<{ARCH}, {DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStr
 }}
 #endif
 """
+
+KERNEL_IMPL_TEMPLATE_BWD_SM80 = """#include "flash_bwd_launch_template.h"
+
+#ifndef FLASHATTENTION_DISABLE_SM8x
+#ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
+template<>
+void run_mha_bwd_<80, {DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream) {{
+    run_mha_bwd_hdim{HEAD_DIM}<80, {DTYPE}>(params, stream);
+}}
+template<>
+void run_mha_bwd_<86, {DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream) {{
+    run_mha_bwd_hdim{HEAD_DIM}<86, {DTYPE}>(params, stream);
+}}
+#endif
+#endif
+"""
+
 
 
 @dataclass
@@ -66,15 +94,27 @@ class Kernel:
     @property
     def template(self) -> str:
         if self.direction == "fwd":
-            return KERNEL_IMPL_TEMPLATE_FWD.format(
-                ARCH=str(self.sm), DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim,
-                SPLIT=str(self.split).lower(), PAGEDKV=str(self.paged_kv).lower(),
-                SOFTCAP=str(self.softcap).lower(), PACKGQA=str(self.packgqa).lower()
-            )
+            if self.sm == 90:
+                return KERNEL_IMPL_TEMPLATE_FWD_SM90.format(
+                    ARCH=str(self.sm), DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim,
+                    SPLIT=str(self.split).lower(), PAGEDKV=str(self.paged_kv).lower(),
+                    SOFTCAP=str(self.softcap).lower(), PACKGQA=str(self.packgqa).lower()
+                )
+            else:
+                return KERNEL_IMPL_TEMPLATE_FWD_SM80.format(
+                    DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim,
+                    SPLIT=str(self.split).lower(), PAGEDKV=str(self.paged_kv).lower(),
+                    SOFTCAP=str(self.softcap).lower(), PACKGQA=str(self.packgqa).lower()
+                )
         elif self.direction == "bwd":
-            return KERNEL_IMPL_TEMPLATE_BWD.format(
-                ARCH=str(self.sm), DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
-            )
+            if self.sm == 90:
+                return KERNEL_IMPL_TEMPLATE_BWD_SM90.format(
+                    ARCH=str(self.sm), DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
+                )
+            else:
+                return KERNEL_IMPL_TEMPLATE_BWD_SM80.format(
+                    DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
+                )
 
     @property
     def filename(self) -> str:

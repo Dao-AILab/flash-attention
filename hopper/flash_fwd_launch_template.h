@@ -188,13 +188,9 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
         VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
             static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
             VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
-                static constexpr int kBlockM = [&] {
-                    if constexpr (Arch >= 90) {
-                        return std::get<0>(tile_size_fwd_sm90(kHeadDim, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKV, Has_softcap));
-                    } else {
-                        return std::get<0>(tile_size_fwd_sm80(kHeadDim, Is_causal, Is_local, sizeof(T) /*element_size*/, Varlen && Split, Has_softcap));
-                    }
-                }();
+                // Only needed here to decide if we should use cluster
+                static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKV, Has_softcap)) : 128;
+
                 static constexpr bool Enable_cluster = Arch >= 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKV && !Varlen;
                 APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
                     // Only use Cluster if number of tiles along seqlen_q is even and not varlen
