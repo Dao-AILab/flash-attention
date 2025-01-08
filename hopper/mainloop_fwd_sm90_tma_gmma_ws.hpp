@@ -666,7 +666,7 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_v.producer_commit(smem_pipe_write);
             // Very important: PipelineTmaAsync::consumer_release assumes that the warpgroup is synchronized
             // before calling. Without this we get race conditions.
-            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::ProducerWG) /*id*/);
+            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<uint32_t>(FwdNamedBarriers::ProducerWG) /*id*/);
             pipeline_vt.consumer_release(smem_pipe_read);
         };
 
@@ -691,7 +691,7 @@ struct CollectiveMainloopFwdSm90 {
         if constexpr (Use_TMA_Q) {
             // Wait for the MMA warpgroups to signal that smem_q is ready
             if (SingleProducerWarp || warp_idx_in_warpgroup == 0) {
-                cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
+                cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             }
 
             if ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync()) {
@@ -795,7 +795,7 @@ struct CollectiveMainloopFwdSm90 {
     CUTLASS_DEVICE void
     warp_scheduler_barrier_sync() {
         if constexpr (UseSchedulerBarrier) {
-            cutlass::arch::NamedBarrier::sync(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + flash::canonical_warp_group_idx_nosync() /*id*/);
+            cutlass::arch::NamedBarrier::sync(2 * cutlass::NumThreadsPerWarpGroup, static_cast<uint32_t>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + flash::canonical_warp_group_idx_nosync() /*id*/);
         }
     }
 
@@ -807,7 +807,7 @@ struct CollectiveMainloopFwdSm90 {
             int const next_WG = NumMmaWarpGroups == 2
                 ? 1 - cur_WG
                 : (cur_WG < NumMmaWarpGroups - 1 ? cur_WG + 1 : 0);
-            cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) + next_WG /*id*/);
+            cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, static_cast<uint32_t>(FwdNamedBarriers::WarpSchedulerWG1) + next_WG /*id*/);
         }
     }
 
@@ -815,14 +815,14 @@ struct CollectiveMainloopFwdSm90 {
     mma_init() {
         // Tell producer (warp 0) that smem_q is ready
         if constexpr (Use_TMA_Q) {
-            cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
+            cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
         }
         if constexpr (UseSchedulerBarrier) {
             // We have NamedBarrier for up to 3 WGs
             static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
             // WG1 needs the very first signal to start
             if (flash::canonical_warp_group_idx_nosync() == 1) {
-                cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
+                cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, static_cast<uint32_t>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
             }
         }
     }
@@ -969,7 +969,7 @@ struct CollectiveMainloopFwdSm90 {
                 }
                 // SMEM fence to make sure the rotated Q is visible to GMMA
                 cutlass::arch::fence_view_async_shared();
-                cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<int>(FwdNamedBarriers::QueryRotated) /*id*/);
+                cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::QueryRotated) /*id*/);
             } else {
                 barrier_Q.wait(work_idx % 2);
             }
@@ -1077,7 +1077,7 @@ struct CollectiveMainloopFwdSm90 {
             }
             // Tell warp 0 that smem_q is ready
             if constexpr (Use_TMA_Q) {  // If !Use_TMA_Q, we don't use the producer WG to load Q
-                cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
+                cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             }
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
             consumer_wait(pipeline_v, smem_pipe_read);
@@ -1160,7 +1160,7 @@ struct CollectiveMainloopFwdSm90 {
             warp_scheduler_barrier_arrive();
             // Tell warp 0 that smem_q is ready
             if constexpr (Use_TMA_Q) {  // If !Use_TMA_Q, we don't use the producer WG to load Q
-                cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
+                cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             }
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             Tensor scores_scale = softmax.finalize(v_descale);
@@ -1342,7 +1342,7 @@ struct CollectiveMainloopFwdSm90 {
             // WG1 already got the very first signal from mma_init(), but we'll be using the same NamedBarrier.
             // So we'll need to "cancel it out" here and then re-signal it at the end.
             if (flash::canonical_warp_group_idx_nosync() == 1) {
-                cutlass::arch::NamedBarrier::sync(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
+                cutlass::arch::NamedBarrier::sync(2 * cutlass::NumThreadsPerWarpGroup, static_cast<uint32_t>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
             }
         }
 
@@ -1391,7 +1391,7 @@ struct CollectiveMainloopFwdSm90 {
             cutlass::arch::fence_view_async_shared();
             // Very important: PipelineTmaAsync::consumer_release assumes that the warpgroup is synchronized
             // before calling.
-            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + flash::canonical_warp_group_idx_nosync() /*id*/);
+            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<uint32_t>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + flash::canonical_warp_group_idx_nosync() /*id*/);
             pipeline_k_new.consumer_release(smem_pipe_read);
             // if (thread_idx == 0) { print_tensor(tKpK); printf("\n"); printf("seqlen_limit = %d\n", seqlen_k_new - n_block * kBlockN);}
         };
@@ -1409,7 +1409,7 @@ struct CollectiveMainloopFwdSm90 {
                 paged_kv_manager.store_V(n_block, tVsV_cur);
             }
             cutlass::arch::fence_view_async_shared();
-            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + flash::canonical_warp_group_idx_nosync() /*id*/);
+            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<uint32_t>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + flash::canonical_warp_group_idx_nosync() /*id*/);
             pipeline_v_new.consumer_release(smem_pipe_read);
         };
 
@@ -1427,7 +1427,7 @@ struct CollectiveMainloopFwdSm90 {
         // Re-signaling the NamedBarrier that we "canceled out"
         if constexpr (UseSchedulerBarrier) {
             if (flash::canonical_warp_group_idx_nosync() == 1) {
-                cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
+                cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, static_cast<uint32_t>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
             }
         }
 

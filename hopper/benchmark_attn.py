@@ -337,10 +337,10 @@ for headdim in [128]:
                 time.sleep(1)
                 if not varlen:
                     _, m0b = benchmark_backward(flash_attn_func, q, k, v, dropout_p, causal=causal, window_size=window_size, softcap=softcap, deterministic=deterministic,
-                                                repeats=repeats, verbose=verbose, desc='Fav2')
+                                                repeats=repeats, verbose=False, desc='Fav2')
                 else:
                     _, m0b = benchmark_backward(flash_attn_varlen_func, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, dropout_p, causal=causal, window_size=window_size, softcap=softcap, deterministic=deterministic,
-                                                repeats=repeats, verbose=verbose, desc='Fav2')
+                                                repeats=repeats, verbose=False, desc='Fav2')
                 time_b[(causal, headdim, batch_size, seqlen), "Flash2"] = m0b.mean
             # pytorch_profiler(flash_attn_func, q, k, v, dropout_p, causal=causal, backward=True)
             if headdim <= 256 and dtype != torch.float8_e4m3fn:
@@ -384,10 +384,10 @@ for headdim in [128]:
                 time.sleep(1)
                 if not varlen:
                     _, m1b = benchmark_backward(flash_attn_func_v3, q, k, v, causal=causal, window_size=window_size, sink_token_length=sink_token_length, softcap=softcap, deterministic=deterministic,
-                                                repeats=repeats, verbose=verbose, desc='Fav3')
+                                                repeats=repeats, verbose=False, desc='Fav3')
                 else:
                     _, m1b = benchmark_backward(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, None, None, seqlen_q, seqlen, causal=causal, window_size=window_size, softcap=softcap, deterministic=deterministic,
-                                                repeats=repeats, verbose=verbose, desc='Fav3')
+                                                repeats=repeats, verbose=False, desc='Fav3')
                 time_b[(causal, headdim, batch_size, seqlen), "Flash3"] = m1b.mean
                 # time.sleep(1)
                 # if not varlen:

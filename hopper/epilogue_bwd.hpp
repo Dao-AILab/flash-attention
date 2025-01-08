@@ -188,7 +188,7 @@ struct CollectiveEpilogueBwd {
         Tensor taccdVsdV = smem_thr_copy_dKV.partition_D(cute::conditional_return<!dKV_swapAB>(sdV, sdVt));     // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
         // Make sure all WGs have finished reading K and V
-        cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+        flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
         cute::copy(smem_tiled_copy_dKV, taccdVrdV, taccdVsdV);
         cute::copy(smem_tiled_copy_dKV, taccdKrdK, taccdKsdK);
         if constexpr (Use_TMA) {
@@ -218,10 +218,10 @@ struct CollectiveEpilogueBwd {
             }
             tma_store_wait<0>();
             // // Tell warp 0 that smem_k and smem_v are ready
-            // cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::KVEmpty) /*id*/);
+            // cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
 
         } else {
-            cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+            flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
             static constexpr int kBlockN = get<1>(TileShape_MNK{});
             flash::SeqlenInfo<Varlen, kBlockN> seqlen_info{bidb, size<0>(params.shape_dK), params.cu_seqlens, params.seqused};
             bool const is_varlen = Varlen && params.cu_seqlens;
@@ -252,7 +252,7 @@ struct CollectiveEpilogueBwd {
                 gmem_tiled_copy_dKV, tdKVsdK, tdKVrdK, tdKVcdKV, tdKVpdKV, kBlockN);
             // // Tell warp 0 that smem_k and smem_v are ready
             // cutlass::arch::fence_view_async_shared(); // ensure smem reads are done before next TMA to smem_k/v
-            // cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::KVEmpty) /*id*/);
+            // flash::named_barrier_arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
             // Construct identity layout for gdKV
             // Clear_OOB_K must be false since we don't want to write zeros to gmem
             flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
@@ -433,7 +433,7 @@ struct CollectiveEpilogueBwdGQA {
 
         // Make sure all WGs have finished reading K and V, otherwise we get racy dQ
         // because smem_q could be changed.
-        cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+        flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
         if constexpr (Use_TMA) {
             Tensor taccdKVrdV = r2s_thr_copy_dKVaccum.retile_S(tdVrdV); // ((Atom,AtomNum), MMA_M, MMA_N)
             cute::copy(r2s_tiled_copy_dKVaccum, taccdKVrdV, tdKVsdKVaccum);
@@ -501,7 +501,7 @@ struct CollectiveEpilogueBwdGQA {
             Barrier::arrive_inc(lock_ptr, thread_idx, n_block * num_batch * num_head_kv);
         }
         // // Tell warp 0 that smem_k and smem_v are ready
-        // cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<int>(BwdNamedBarriers::KVEmpty) /*id*/);
+        // flash::named_barrier_arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
     }
 
     CUTLASS_DEVICE void

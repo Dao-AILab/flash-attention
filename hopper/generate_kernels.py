@@ -18,33 +18,66 @@ DTYPE_MAP = {
     "e4m3": "cutlass::float_e4m3_t",
 }
 
+DTYPE_MAP_FWD_SM80 = {
+    "fp16": "cutlass::half_t",
+    "bf16": "cutlass::bfloat16_t",
+}
+
 DTYPE_MAP_BWD = {
     "fp16": "cutlass::half_t",
     "bf16": "cutlass::bfloat16_t",
 }
 
-SM = [90]  # Sm kernels support up to
+SM = [80, 90]  # Sm kernels support up to
 HEAD_DIMENSIONS = [64, 96, 128, 192, 256]
 PAGEDKV = [False, True]
 SPLIT = [False, True]
 SOFTCAP = [False, True]
 PACKGQA = [False, True]
-KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_launch_template.h"
+
+KERNEL_IMPL_TEMPLATE_FWD_SM90 = """#include "flash_fwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
-template void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
 #endif
 """
 
-KERNEL_IMPL_TEMPLATE_BWD = """#include "flash_bwd_launch_template.h"
+KERNEL_IMPL_TEMPLATE_FWD_SM80 = """#include "flash_fwd_launch_template.h"
+
+#ifndef FLASHATTENTION_DISABLE_SM8x
+#ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
+template void run_mha_fwd_<80, {DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_<86, {DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
+#endif
+#endif
+"""
+
+KERNEL_IMPL_TEMPLATE_BWD_SM90 = """#include "flash_bwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
 template<>
-void run_mha_bwd_<{DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream) {{
-    run_mha_bwd_hdim{HEAD_DIM}<{DTYPE}>(params, stream);
+void run_mha_bwd_<{ARCH}, {DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream) {{
+    run_mha_bwd_hdim{HEAD_DIM}<{ARCH}, {DTYPE}>(params, stream);
 }}
 #endif
 """
+
+KERNEL_IMPL_TEMPLATE_BWD_SM80 = """#include "flash_bwd_launch_template.h"
+
+#ifndef FLASHATTENTION_DISABLE_SM8x
+#ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
+template<>
+void run_mha_bwd_<80, {DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream) {{
+    run_mha_bwd_hdim{HEAD_DIM}<80, {DTYPE}>(params, stream);
+}}
+template<>
+void run_mha_bwd_<86, {DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream) {{
+    run_mha_bwd_hdim{HEAD_DIM}<86, {DTYPE}>(params, stream);
+}}
+#endif
+#endif
+"""
+
 
 
 @dataclass
@@ -61,15 +94,27 @@ class Kernel:
     @property
     def template(self) -> str:
         if self.direction == "fwd":
-            return KERNEL_IMPL_TEMPLATE_FWD.format(
-                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim,
-                SPLIT=str(self.split).lower(), PAGEDKV=str(self.paged_kv).lower(),
-                SOFTCAP=str(self.softcap).lower(), PACKGQA=str(self.packgqa).lower()
-            )
+            if self.sm == 90:
+                return KERNEL_IMPL_TEMPLATE_FWD_SM90.format(
+                    ARCH=str(self.sm), DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim,
+                    SPLIT=str(self.split).lower(), PAGEDKV=str(self.paged_kv).lower(),
+                    SOFTCAP=str(self.softcap).lower(), PACKGQA=str(self.packgqa).lower()
+                )
+            else:
+                return KERNEL_IMPL_TEMPLATE_FWD_SM80.format(
+                    DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim,
+                    SPLIT=str(self.split).lower(), PAGEDKV=str(self.paged_kv).lower(),
+                    SOFTCAP=str(self.softcap).lower(), PACKGQA=str(self.packgqa).lower()
+                )
         elif self.direction == "bwd":
-            return KERNEL_IMPL_TEMPLATE_BWD.format(
-                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
-            )
+            if self.sm == 90:
+                return KERNEL_IMPL_TEMPLATE_BWD_SM90.format(
+                    ARCH=str(self.sm), DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
+                )
+            else:
+                return KERNEL_IMPL_TEMPLATE_BWD_SM80.format(
+                    DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
+                )
 
     @property
     def filename(self) -> str:
@@ -78,18 +123,19 @@ class Kernel:
 
 def get_all_kernels() -> List[Kernel]:
     for dtype, head_dim, split, paged_kv, softcap, packgqa, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SPLIT, PAGEDKV, SOFTCAP, PACKGQA, SM):
-        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
+        if sm >= 90 or dtype in DTYPE_MAP_FWD_SM80:
+            yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
     for dtype, head_dim, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SM):
         yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=False, paged_kv=False, softcap=False, packgqa=False, direction="bwd")
 
 
 def batch_hdim(kernels_all) -> List[KERNEL_BATCH]:
     for dtype, split, paged_kv, softcap, packgqa, sm in itertools.product(DTYPE_MAP.keys(), SPLIT, PAGEDKV, SOFTCAP, PACKGQA, SM):
-        kernels = [k for k in kernels_all if k.direction == "fwd" and k.dtype == dtype and k.split == split and k.paged_kv == paged_kv and k.softcap == softcap and k.packgqa == packgqa]
-        assert len(kernels) > 0
-        filename = f"flash_fwd_hdimall_{dtype}{'_paged' if paged_kv else ''}{'_split' if split else ''}{'_softcap' if softcap else ''}{'_packgqa' if packgqa else ''}_sm{sm}.cu"
-        template = "\n".join([f"#include \"{k.filename}\"" for k in kernels])
-        yield KERNEL_BATCH(template, filename)
+        kernels = [k for k in kernels_all if k.direction == "fwd" and k.dtype == dtype and k.split == split and k.paged_kv == paged_kv and k.softcap == softcap and k.packgqa == packgqa and k.sm == sm]
+        if len(kernels) > 0:
+            filename = f"flash_fwd_hdimall_{dtype}{'_paged' if paged_kv else ''}{'_split' if split else ''}{'_softcap' if softcap else ''}{'_packgqa' if packgqa else ''}_sm{sm}.cu"
+            template = "\n".join([f"#include \"{k.filename}\"" for k in kernels])
+            yield KERNEL_BATCH(template, filename)
 
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:
