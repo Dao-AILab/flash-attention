@@ -129,12 +129,12 @@ def _write_ninja_file(path,
     config.append(f'cxx = {compiler}')
     if with_cuda or cuda_dlink_post_cflags:
         if "PYTORCH_NVCC" in os.environ:
-            nvcc = os.getenv("PYTORCH_NVCC")    # user can set nvcc compiler with ccache using the environment variable here
+            nvcc_from_env = os.getenv("PYTORCH_NVCC")    # user can set nvcc compiler with ccache using the environment variable here
+        if IS_HIP_EXTENSION:
+            nvcc = _join_rocm_home('bin', 'hipcc')
         else:
-            if IS_HIP_EXTENSION:
-                nvcc = _join_rocm_home('bin', 'hipcc')
-            else:
-                nvcc = _join_cuda_home('bin', 'nvcc')
+            nvcc = _join_cuda_home('bin', 'nvcc')
+        config.append(f'nvcc_from_env = {nvcc_from_env}')
         config.append(f'nvcc = {nvcc}')
 
     if IS_HIP_EXTENSION:
@@ -183,10 +183,10 @@ def _write_ninja_file(path,
             f'  command = $nvcc {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm80'
         ]
         cuda_compile_rule_sm80_sm90 = ['rule cuda_compile_sm80_sm90'] + cuda_compile_rule[1:] + [
-            f'  command = $nvcc {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm80_sm90'
+            f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm80_sm90'
         ]
         cuda_compile_rule.append(
-            f'  command = $nvcc {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags')
+            f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags')
 
     # Emit one build rule per source to enable incremental build.
     build = []
