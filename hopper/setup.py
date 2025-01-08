@@ -60,6 +60,7 @@ DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
+DISABLE_SM80 = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
 
@@ -220,6 +221,9 @@ if not SKIP_CUDA_BUILD:
         os.chmod(nvcc_path_new, os.stat(nvcc_path_new).st_mode | stat.S_IEXEC)
 
     cc_flag = []
+    if not DISABLE_SM80:
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_80,code=sm_80")
     cc_flag.append("-gencode")
     cc_flag.append("arch=compute_90a,code=sm_90a")
 
@@ -249,10 +253,12 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_HDIM128"] if DISABLE_HDIM128 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM192"] if DISABLE_HDIM192 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM256"] if DISABLE_HDIM256 else [])
+        + (["-DFLASHATTENTION_DISABLE_SM80"] if DISABLE_SM80 else [])
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
     )
 
-    DTYPE_FWD = ["bf16"] + (["fp16"] if not DISABLE_FP16 else []) + (["e4m3"] if not DISABLE_FP8 else [])
+    DTYPE_FWD_SM80 = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
+    DTYPE_FWD_SM90 = ["bf16"] + (["fp16"] if not DISABLE_FP16 else []) + (["e4m3"] if not DISABLE_FP8 else [])
     DTYPE_BWD = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
     HEAD_DIMENSIONS_BWD = (
         []
@@ -268,13 +274,21 @@ if not SKIP_CUDA_BUILD:
     PAGEDKV = [""] + (["_paged"] if not DISABLE_PAGEDKV else [])
     SOFTCAP = [""] + (["_softcap"] if not DISABLE_SOFTCAP else [])
     PACKGQA = [""] + (["_packgqa"] if not DISABLE_PACKGQA else [])
-    sources_fwd = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
-                   for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)]
-    sources_bwd = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}_sm90.cu"
-                   for hdim, dtype in itertools.product(HEAD_DIMENSIONS_BWD, DTYPE_BWD)]
+    sources_fwd_sm80 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm80.cu"
+                        for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM80, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)]
+    sources_fwd_sm90 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
+                        for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)]
+    sources_bwd_sm80 = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}_sm80.cu"
+                        for hdim, dtype in itertools.product(HEAD_DIMENSIONS_BWD, DTYPE_BWD)]
+    sources_bwd_sm90 = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}_sm90.cu"
+                        for hdim, dtype in itertools.product(HEAD_DIMENSIONS_BWD, DTYPE_BWD)]
     if DISABLE_BACKWARD:
-        sources_bwd = []
-    sources = ["flash_api.cpp"] + sources_fwd + sources_bwd
+        sources_bwd_sm90 = []
+    sources = (
+        ["flash_api.cpp"]
+        + (sources_fwd_sm80 if not DISABLE_SM80 else []) + sources_fwd_sm90
+        + (sources_bwd_sm80 if not DISABLE_SM80 else []) + sources_bwd_sm90
+    )
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine_sm80.cu"]
     nvcc_flags = [

@@ -305,7 +305,7 @@ public:
     void
     init_consumer() const {
         if (WarpSpecialized || cutlass::canonical_warp_idx_sync() > 0) {
-            cutlass::arch::NamedBarrier::arrive(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
         }
     }
 
@@ -324,16 +324,16 @@ public:
         if constexpr (IsProducerWarp) {
             // thread 0 already has the right tile_idx, just need to broadcast to the rest of warp 0
             int new_tile_idx = __shfl_sync(0xffffffff, current_work.tile_idx, 0 /*lane*/);
-            cutlass::arch::NamedBarrier::sync(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
             if (threadIdx.x % NumProducerThreads == 0) {
                 *tile_count_smem = current_work.tile_idx;
             }
-            cutlass::arch::NamedBarrier::arrive(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
             return {new_tile_idx};
         } else {
-            cutlass::arch::NamedBarrier::sync(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
             int tile_idx = *tile_count_smem;
-            cutlass::arch::NamedBarrier::arrive(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
             return {tile_idx};
         }
     }
@@ -488,7 +488,7 @@ public:
             if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                 *work_info_smem = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
             }
-            cutlass::arch::NamedBarrier::arrive(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
             return work_info;
         } else {
             return get_next_work<false>(params, {0, 0, 0, 0});
@@ -518,16 +518,16 @@ public:
             int new_tile_idx = __shfl_sync(0xffffffff, current_work.tile_idx, 0 /*lane*/);
             WorkTileInfo work_info = {__shfl_sync(0xffffffff, current_work.tile_idx, 1 /*lane*/), current_work.block, current_work.bidh, current_work.bidb};
             work_info = tile_idx_to_work_tile(params, new_tile_idx, work_info);
-            cutlass::arch::NamedBarrier::sync(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
             if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                 *work_info_smem = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
             }
-            cutlass::arch::NamedBarrier::arrive(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
             return work_info;
         } else {
-            cutlass::arch::NamedBarrier::sync(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
             int4 work_info = *work_info_smem;
-            cutlass::arch::NamedBarrier::arrive(NumThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
             return WorkTileInfo{work_info.x, work_info.y, work_info.z, work_info.w};
         }
     }

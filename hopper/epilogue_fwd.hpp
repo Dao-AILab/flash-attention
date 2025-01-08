@@ -209,7 +209,7 @@ struct CollectiveEpilogueFwd {
         // Technically we don't need this if we're not using smem, but the mainloop makes the assumption that
         // all epilogue threads sync at least once during the epilogue (so that we can start loading Q with
         // cp.async if we need).
-        cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+        flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
         // Step 1: Write O from rmem -> smem
         if constexpr (Use_smem) {
@@ -224,7 +224,7 @@ struct CollectiveEpilogueFwd {
                 cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
                                                     cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
             } else {
-                cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
             }
         } else {
             if constexpr (ArchTag::kMinComputeCapability >= 90) {

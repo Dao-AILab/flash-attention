@@ -70,8 +70,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using Scheduler = std::conditional_t<Arch >= 90 ? (Split && !Varlen) : !((Is_causal && !Varlen) || (Varlen && Split)), SchedulerSingleTile, SchedulerPersistent>;
     using AttnKernel = std::conditional_t<
         Arch >= 90,
-        flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>,
-        flash::FlashAttnFwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>
+        flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>,
+        flash::enable_sm80_to_sm89<flash::FlashAttnFwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
 
     bool const is_varlen_q = params.cu_seqlens_q;
@@ -179,9 +179,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-template<typename T, int kHeadDim, bool Split, bool PagedKV, bool Has_softcap, bool PackGQA>
+template<int Arch, typename T, int kHeadDim, bool Split, bool PagedKV, bool Has_softcap, bool PackGQA>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
-    static constexpr int Arch = 90;
     static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
     using T_out = std::conditional_t<!Split, std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>, float>;

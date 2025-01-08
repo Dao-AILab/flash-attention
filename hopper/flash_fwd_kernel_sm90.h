@@ -324,7 +324,7 @@ public:
                         smem_pipe_write_new, shared_storage, seqlen_info, block_coord, work_idx);
                     if (tile_new_valid) {
                         // if (threadIdx.x == 0) { printf("Producer: Before sync\n"); }
-                        cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
+                        cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::AppendKV) /*id*/);
                         // if (threadIdx.x == 0) { printf("Producer: After sync\n"); }
                     }
                 }
@@ -388,7 +388,7 @@ public:
                         // We need this sync so that the gmem write from the consumers is visible to the producer
                         // that might do TMA read after that.
                         asm volatile ("fence.proxy.async.global;");
-                        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::AppendKV) /*id*/);
+                        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::AppendKV) /*id*/);
                         // arrive is enough, we don't need sync. The producer will sync, which means
                         // after that sync we're guaranteed that the AppendKV pipeline have finished
                         // loading and consumer smem_k and smem_v.

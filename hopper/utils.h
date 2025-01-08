@@ -16,8 +16,8 @@
 
 #include <cute/tensor.hpp>
 
-#include <cutlass/array.h>
 #include <cutlass/cutlass.h>
+#include <cutlass/array.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
@@ -36,6 +36,32 @@
 namespace flash {
 
 using namespace cute;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// A wrapper for the kernel that is used to guard against compilation on
+// architectures that will never use the kernel. The purpose of this is to
+// reduce the size of the compiled binary.
+// Adapted from https://github.com/vllm-project/vllm/blob/4d29e91be84d27ca313d657eee92c067439a4c23/csrc/quantization/cutlass_w8a8/scaled_mm_c2x.cuh#L55
+template <typename Kernel>
+struct enable_sm90_or_later : Kernel {
+    template <typename... Args>
+    CUTLASS_DEVICE void operator()(Args&&... args) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+        Kernel::operator()(std::forward<Args>(args)...);
+#endif
+    }
+};
+
+template <typename Kernel>
+struct enable_sm80_to_sm89 : Kernel {
+    template <typename... Args>
+    CUTLASS_DEVICE void operator()(Args&&... args) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ <= 890)
+        Kernel::operator()(std::forward<Args>(args)...);
+#endif
+    }
+};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

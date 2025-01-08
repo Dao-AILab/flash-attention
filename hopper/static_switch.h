@@ -128,6 +128,25 @@
   #define CLUSTER_SWITCH BOOL_SWITCH
 #endif
 
+#ifdef FLASHATTENTION_DISABLE_SM80
+  #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
+  [&] {                                                                                          \
+    constexpr static int ARCH_NAME = 90;                                                         \
+    return __VA_ARGS__();                                                                        \
+  }()
+#else
+  #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
+  [&] {                                                                                          \
+    if (ARCH < 90) {                                                                             \
+      constexpr static int ARCH_NAME = 80;                                                       \
+      return __VA_ARGS__();                                                                      \
+    } else {                                                                                     \
+      constexpr static int ARCH_NAME = 90;                                                       \
+      return __VA_ARGS__();                                                                      \
+    }                                                                                            \
+  }()
+#endif
+
 #ifndef FLASHATTENTION_ENABLE_VCOLMAJOR
   #define VCOLMAJOR_SWITCH(COND, CONST_NAME, ...)                                                \
   [&] {                                                                                          \

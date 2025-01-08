@@ -96,8 +96,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     using Scheduler = flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>;
     using AttnKernel = std::conditional_t<
         Arch >= 90,
-        flash::FlashAttnBwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>,
-        flash::FlashAttnBwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>
+        flash::enable_sm90_or_later<flash::FlashAttnBwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>,
+        flash::enable_sm80_to_sm89<flash::FlashAttnBwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
 
     typename CollectiveMainloop::Arguments mainloop_args {
@@ -297,9 +297,8 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 
-template<typename T>
+template<int Arch, typename T>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
-    static constexpr int Arch = 90;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
             if constexpr (Arch >= 90) {
@@ -322,9 +321,8 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
     });
 }
 
-template<typename T>
+template<int Arch, typename T>
 void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
-    static constexpr int Arch = 90;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
             if constexpr (Arch >= 90) {
@@ -338,9 +336,8 @@ void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
     });
 }
 
-template<typename T>
+template<int Arch, typename T>
 void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
-    static constexpr int Arch = 90;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
             if constexpr (Arch >= 90) {
@@ -358,9 +355,8 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
     });
 }
 
-template<typename T>
+template<int Arch, typename T>
 void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
-    static constexpr int Arch = 90;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
             if constexpr (Arch >= 90) {
@@ -374,9 +370,8 @@ void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
     });
 }
 
-template<typename T>
+template<int Arch, typename T>
 void run_mha_bwd_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
-    static constexpr int Arch = 90;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
             if constexpr (Arch >= 90) {

@@ -197,6 +197,9 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename T, int Headdim, bool Split, bool PagedKV, bool Has_softcap, bool PackGQA> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
-template<typename T, int Headdim> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
-template<typename T, typename Tpartial, int Headdim> void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream);
+template <int Arch, typename T, int Headdim, bool Split, bool PagedKV, bool Has_softcap, bool PackGQA>
+void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
+template <int Arch, typename T, int Headdim>
+void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+template <typename T, typename Tpartial, int Headdim>
+void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream);
