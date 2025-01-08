@@ -45,6 +45,7 @@ public:
       cutlass::arch::detail::initialize_barrier_array_pair_aligned<decltype(storage.full_barrier_), decltype(storage.empty_barrier_), Stages>(
           storage.full_barrier_, storage.empty_barrier_, producer_arv_cnt, multicast_consumer_arrival_count);
     }
+    cutlass::arch::fence_barrier_init();
   }
 
   template<class ClusterShape, class InitBarriers, class InitMasks>
