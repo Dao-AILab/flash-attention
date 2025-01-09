@@ -854,7 +854,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.softcap = softcap
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
-            out = out_padded[..., :head_size_og]
+        out = out_padded[..., :head_size_og]
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
