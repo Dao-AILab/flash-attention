@@ -136,11 +136,22 @@ def get_all_kernels() -> List[Kernel]:
 
 def batch_hdim(kernels_all) -> List[KERNEL_BATCH]:
     for dtype, split, paged_kv, softcap, packgqa, sm in itertools.product(DTYPE_MAP.keys(), SPLIT, PAGEDKV, SOFTCAP, PACKGQA, SM):
-        if sm < 90 and packgqa:
+        if sm < 90:
             continue
         kernels = [k for k in kernels_all if k.direction == "fwd" and k.dtype == dtype and k.split == split and k.paged_kv == paged_kv and k.softcap == softcap and k.packgqa == packgqa and k.sm == sm]
         if len(kernels) > 0:
             filename = f"flash_fwd_hdimall_{dtype}{'_paged' if paged_kv else ''}{'_split' if split else ''}{'_softcap' if softcap else ''}{'_packgqa' if packgqa else ''}_sm{sm}.cu"
+            template = "\n".join([f"#include \"{k.filename}\"" for k in kernels])
+            yield KERNEL_BATCH(template, filename)
+
+
+def batch_softcap(kernels_all) -> List[KERNEL_BATCH]:
+    for dtype, head_dim, split, paged_kv, packgqa, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SPLIT, PAGEDKV, PACKGQA, SM):
+        if sm >= 90:
+            continue
+        kernels = [k for k in kernels_all if k.direction == "fwd" and k.dtype == dtype and k.head_dim == head_dim and k.split == split and k.paged_kv == paged_kv and k.packgqa == packgqa and k.sm == sm]
+        if len(kernels) > 0:
+            filename = f"flash_fwd_hdim{head_dim}_{dtype}{'_paged' if paged_kv else ''}{'_split' if split else ''}_softcapall{'_packgqa' if packgqa else ''}_sm{sm}.cu"
             template = "\n".join([f"#include \"{k.filename}\"" for k in kernels])
             yield KERNEL_BATCH(template, filename)
 
@@ -160,6 +171,8 @@ def main(output_dir: Optional[str]) -> None:
     for kernel in kernels_all:
         write_kernel(kernel, output_dir)
     for kernel in batch_hdim(kernels_all):
+        write_kernel(kernel, output_dir)
+    for kernel in batch_softcap(kernels_all):
         write_kernel(kernel, output_dir)
 
 
