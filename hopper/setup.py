@@ -460,8 +460,9 @@ if not SKIP_CUDA_BUILD:
     PAGEDKV = [""] + (["_paged"] if not DISABLE_PAGEDKV else [])
     SOFTCAP = [""] + (["_softcap"] if not DISABLE_SOFTCAP else [])
     PACKGQA = [""] + (["_packgqa"] if not DISABLE_PACKGQA else [])
-    sources_fwd_sm80 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm80.cu"
-                        for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM80, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)]
+    # We already always hard-code PackGQA=true for Sm8x
+    sources_fwd_sm80 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}_sm80.cu"
+                        for hdim, dtype, split, paged, softcap in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM80, SPLIT, PAGEDKV, SOFTCAP)]
     sources_fwd_sm90 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                         for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)]
     sources_bwd_sm80 = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}_sm80.cu"

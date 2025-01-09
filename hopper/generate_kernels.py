@@ -101,10 +101,11 @@ class Kernel:
                     SOFTCAP=str(self.softcap).lower(), PACKGQA=str(self.packgqa).lower()
                 )
             else:
+                # Always enable PackGQA for Sm8x to reduce compilation
                 return KERNEL_IMPL_TEMPLATE_FWD_SM80.format(
                     DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim,
                     SPLIT=str(self.split).lower(), PAGEDKV=str(self.paged_kv).lower(),
-                    SOFTCAP=str(self.softcap).lower(), PACKGQA=str(self.packgqa).lower()
+                    SOFTCAP=str(self.softcap).lower(), PACKGQA=str(True).lower()
                 )
         elif self.direction == "bwd":
             if self.sm == 90:
@@ -123,6 +124,10 @@ class Kernel:
 
 def get_all_kernels() -> List[Kernel]:
     for dtype, head_dim, split, paged_kv, softcap, packgqa, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SPLIT, PAGEDKV, SOFTCAP, PACKGQA, SM):
+        # We always enable PackGQA for Sm8x so we should just pass in packgqa=False
+        # to avoid the `_packgqa` in the filename.
+        if sm < 90 and packgqa:
+            continue
         if sm >= 90 or dtype in DTYPE_MAP_FWD_SM80:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
     for dtype, head_dim, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SM):
@@ -131,6 +136,8 @@ def get_all_kernels() -> List[Kernel]:
 
 def batch_hdim(kernels_all) -> List[KERNEL_BATCH]:
     for dtype, split, paged_kv, softcap, packgqa, sm in itertools.product(DTYPE_MAP.keys(), SPLIT, PAGEDKV, SOFTCAP, PACKGQA, SM):
+        if sm < 90 and packgqa:
+            continue
         kernels = [k for k in kernels_all if k.direction == "fwd" and k.dtype == dtype and k.split == split and k.paged_kv == paged_kv and k.softcap == softcap and k.packgqa == packgqa and k.sm == sm]
         if len(kernels) > 0:
             filename = f"flash_fwd_hdimall_{dtype}{'_paged' if paged_kv else ''}{'_split' if split else ''}{'_softcap' if softcap else ''}{'_packgqa' if packgqa else ''}_sm{sm}.cu"

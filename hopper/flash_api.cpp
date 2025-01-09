@@ -264,7 +264,9 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     ARCH_SWITCH(params.arch, Arch, [&] {
         SPLIT_SWITCH(params.num_splits > 1, Split, [&] {
             PAGEDKV_SWITCH(params.page_table, PagedKV, [&] {
-                PACKGQA_SWITCH(params.pack_gqa, PackGQA, [&] {
+                PACKGQA_SWITCH(params.pack_gqa, PackGQA_, [&] {
+                    // Always enable PackGQA for Sm8x to reduce compilation
+                    static constexpr bool PackGQA = PackGQA_ || Arch < 90;
                     SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
                         if (!params.is_e4m3) {
                             if (params.is_bf16) {
@@ -367,18 +369,17 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 inline bool get_pack_gqa(Flash_fwd_params const& params) {
+    // Always enable PackGQA for Sm8x to reduce compilation and binary size.
+    // Has almost no effect on speed.
+    if (params.arch < 90) { return true; }
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
     return false;
     #else
     // params.page_table must already be set
     if (params.h == params.h_k) { return false; }
     // This needs to match the kernel configs
-    bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
     auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
-    // Strictly speaking we need to pass in (varlen && params.num_splits > 1) but num_splits
-    // has not been set here. It's OK though because for Sm80 kBlockM = 128 always.
-    auto kBlockMN_kernel_args_sm80 = tile_size_fwd_sm80(params.arch == 86 || params.arch == 89, params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, varlen, params.softcap > 0.f);
-    int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm80);
+    int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
     return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.seqlen_q, params.h / params.h_k, kBlockM);
     #endif
 }
