@@ -838,7 +838,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     TORCH_CHECK(params.num_splits == 1, "This flash attention build does not support splits.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
-    TORCH_CHECK(!params.pack_gqa, "This flash attention build does not support pack_gqa.");
+    TORCH_CHECK(params.arch < 90 || !params.pack_gqa, "This flash attention build does not support pack_gqa.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_PAGEDKV
     TORCH_CHECK(!paged_KV, "This flash attention build does not support paged KV.");
@@ -882,43 +882,45 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         //     });
         // });
     ARCH_SWITCH(params.arch, Arch, [&] {
-        if (!params.is_bf16) {
-            #ifndef FLASHATTENTION_DISABLE_FP16
-            #ifndef FLASHATTENTION_DISABLE_HDIM64
-            if (params.d <= 64) { return run_mha_bwd_<Arch, cutlass::half_t, 64>(params, stream); }
-            #endif
-            #ifndef FLASHATTENTION_DISABLE_HDIM96
-            if (params.d <= 96) { return run_mha_bwd_<Arch, cutlass::half_t, 96>(params, stream); }
-            #endif
-            #ifndef FLASHATTENTION_DISABLE_HDIM128
-            if (params.d <= 128) { return run_mha_bwd_<Arch, cutlass::half_t, 128>(params, stream); }
-            #endif
-            #ifndef FLASHATTENTION_DISABLE_HDIM192
-            if (params.d <= 192) { return run_mha_bwd_<Arch, cutlass::half_t, 192>(params, stream); }
-            #endif
-            #ifndef FLASHATTENTION_DISABLE_HDIM256
-            if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::half_t, 256>(params, stream); }
-            #endif
-            #else
-            TORCH_CHECK(false, "This flash attention build does not support FP16.");
-            #endif
-        } else {
-            #ifndef FLASHATTENTION_DISABLE_HDIM64
-            if (params.d <= 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64>(params, stream); }
-            #endif
-            #ifndef FLASHATTENTION_DISABLE_HDIM96
-            if (params.d <= 96) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 96>(params, stream); }
-            #endif
-            #ifndef FLASHATTENTION_DISABLE_HDIM128
-            if (params.d <= 128) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 128>(params, stream); }
-            #endif
-            #ifndef FLASHATTENTION_DISABLE_HDIM192
-            if (params.d <= 192) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 192>(params, stream); }
-            #endif
-            #ifndef FLASHATTENTION_DISABLE_HDIM256
-            if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256>(params, stream); }
-            #endif
-        }
+        SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
+            if (!params.is_bf16) {
+                #ifndef FLASHATTENTION_DISABLE_FP16
+                #ifndef FLASHATTENTION_DISABLE_HDIM64
+                if (params.d <= 64) { return run_mha_bwd_<Arch, cutlass::half_t, 64, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM96
+                if (params.d <= 96) { return run_mha_bwd_<Arch, cutlass::half_t, 96, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM128
+                if (params.d <= 128) { return run_mha_bwd_<Arch, cutlass::half_t, 128, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM192
+                if (params.d <= 192) { return run_mha_bwd_<Arch, cutlass::half_t, 192, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM256
+                if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::half_t, 256, Has_softcap>(params, stream); }
+                #endif
+                #else
+                TORCH_CHECK(false, "This flash attention build does not support FP16.");
+                #endif
+            } else {
+                #ifndef FLASHATTENTION_DISABLE_HDIM64
+                if (params.d <= 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM96
+                if (params.d <= 96) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 96, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM128
+                if (params.d <= 128) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 128, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM192
+                if (params.d <= 192) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 192, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM256
+                if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap>(params, stream); }
+                #endif
+            }
+        });
     });
     #endif
 }
@@ -1035,16 +1037,17 @@ std::vector<at::Tensor> mha_bwd(
     int const kBlockM_sm80 = head_size_rounded <= 64 ? 128 : 64;
     int const kBlockM_sm86 = head_size_rounded <= 192 ? 64 : 32;
     int const kBlockM = arch >= 90 ? kBlockM_sm90 : (arch == 86 || arch == 89 ? kBlockM_sm86 : kBlockM_sm80);
-    int const kBlockN_sm90_sm80 = head_size_rounded <= 128
+    int const kBlockN_sm90 = head_size_rounded <= 128
         ? 128
-        : (arch >= 90
-           ? (head_size_rounded <= 192 ? 96 : 80)
-           : (head_size_rounded <= 192 ? 80 : 64));
+        : (head_size_rounded <= 192 ? 96 : 80);
+    int const kBlockN_sm80 = head_size_rounded <= 128
+        ? 128
+        : (head_size_rounded <= 192 ? 80 : 64);
     int const kBlockN_sm86 = head_size_rounded <= 64 ? 128
         : (head_size_rounded <= 96 ? 128
            : (head_size_rounded <= 128 ? 96
               : (head_size_rounded <= 192 ? 64 : 64)));
-    int const kBlockN = arch >= 90 ? kBlockN_sm90_sm80 : (arch == 86 || arch == 89 ? kBlockN_sm86 : kBlockN_sm90_sm80);
+    int const kBlockN = arch >= 90 ? kBlockN_sm90 : (arch == 86 || arch == 89 ? kBlockN_sm86 : kBlockN_sm80);
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     int const seqlen_q_rounded = round_multiple(seqlen_q, kBlockM);
     int const seqlen_k_rounded = round_multiple(seqlen_k, kBlockN);

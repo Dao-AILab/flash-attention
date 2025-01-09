@@ -7,12 +7,12 @@
 #ifndef FLASHATTENTION_DISABLE_SM8x
 #ifndef FLASHATTENTION_DISABLE_HDIM256
 template<>
-void run_mha_bwd_<80, cutlass::half_t, 256, false>(Flash_bwd_params &params, cudaStream_t stream) {
-    run_mha_bwd_hdim256<80, cutlass::half_t, false>(params, stream);
+void run_mha_bwd_<80, cutlass::bfloat16_t, 256, true>(Flash_bwd_params &params, cudaStream_t stream) {
+    run_mha_bwd_hdim256<80, cutlass::bfloat16_t, true>(params, stream);
 }
 template<>
-void run_mha_bwd_<86, cutlass::half_t, 256, false>(Flash_bwd_params &params, cudaStream_t stream) {
-    run_mha_bwd_hdim256<86, cutlass::half_t, false>(params, stream);
+void run_mha_bwd_<86, cutlass::bfloat16_t, 256, true>(Flash_bwd_params &params, cudaStream_t stream) {
+    run_mha_bwd_hdim256<86, cutlass::bfloat16_t, true>(params, stream);
 }
 #endif
 #endif
