@@ -631,8 +631,7 @@ std::vector<Tensor> host_softmax_xentropy(
   AT_ASSERTM(labels_.scalar_type() == ScalarType::Long,"Label type should be CUDA Long");
 
   // Otherwise the kernel will be launched from cuda:0 device
-  // Cast to char to avoid compiler warning about narrowing
-  at::cuda::CUDAGuard device_guard{(char)input_.get_device()};
+  at::cuda::CUDAGuard device_guard{input_.device()};
 
   auto input = input_.contiguous();
   Tensor max_log_sum_exp = at::empty_like(labels_, input.options().dtype(ScalarType::Float));
@@ -690,8 +689,7 @@ Tensor host_softmax_xentropy_backward(
     bool inplace,
     const int total_classes) {
   // Otherwise the kernel will be launched from cuda:0 device
-  // Cast to char to avoid compiler warning about narrowing
-  at::cuda::CUDAGuard device_guard{(char)grad_loss.get_device()};
+  at::cuda::CUDAGuard device_guard{grad_loss.device()};
 
   const int64_t dim = 1;
   Tensor gI = inplace ? logits_ : at::empty_like(logits_);

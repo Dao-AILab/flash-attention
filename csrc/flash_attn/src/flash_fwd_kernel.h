@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "philox_unpack.cuh" // For at::cuda::philox::unpack
+
 #include <cute/tensor.hpp>
 
 #include <cutlass/cutlass.h>
@@ -1219,7 +1221,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     constexpr int kBlockN = kNThreads / kBlockM;
     using GmemLayoutAtomOaccum = Layout<Shape<Int<kBlockM>, Int<kBlockN>>, Stride<Int<kBlockN>, _1>>;
     using GmemTiledCopyOaccum = decltype(
-        make_tiled_copy(Copy_Atom<DefaultCopy, ElementAccum>{},
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
                         GmemLayoutAtomOaccum{},
                         Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
     GmemTiledCopyOaccum gmem_tiled_copy_Oaccum;

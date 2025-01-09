@@ -194,8 +194,7 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
     TORCH_CHECK(epsilon >= 0.f);
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)x0.get_device()};
+    at::cuda::CUDAGuard device_guard{x0.device()};
 
     auto opts = x0.options();
 
@@ -398,8 +397,7 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
     TORCH_CHECK(gamma.numel() == cols);
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)dz.get_device()};
+    at::cuda::CUDAGuard device_guard{dz.device()};
 
     auto opts = x.options();
 
@@ -558,8 +556,7 @@ std::vector<at::Tensor> dropout_add_ln_parallel_residual_fwd(
     TORCH_CHECK(epsilon >= 0.f);
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)x0.get_device()};
+    at::cuda::CUDAGuard device_guard{x0.device()};
 
     auto opts = x0.options();
 
@@ -744,8 +741,7 @@ std::vector<at::Tensor> dropout_add_ln_parallel_residual_bwd(
     TORCH_CHECK(mu.sizes() == rsigma.sizes());
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)dz0.get_device()};
+    at::cuda::CUDAGuard device_guard{dz0.device()};
 
     auto opts = x.options();
 

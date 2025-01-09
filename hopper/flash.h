@@ -7,8 +7,6 @@
 #include <cuda.h>
 #include <vector>
 
-#include "cutlass/fast_math.h"  // For cutlass::FastDivmod
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Qkv_params {
@@ -28,17 +26,16 @@ struct Qkv_params {
     index_t q_head_stride;
     index_t k_head_stride;
     index_t v_head_stride;
+    index_t v_dim_stride;
 
     // The number of heads.
     int h, h_k;
-    // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
-    // different from nheads (query).
-    int h_h_k_ratio; // precompute h / h_k,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Flash_fwd_params : public Qkv_params {
+    using index_t = int64_t;
 
     // The O matrix (output).
     void * __restrict__ o_ptr;
@@ -49,38 +46,50 @@ struct Flash_fwd_params : public Qkv_params {
     index_t o_row_stride;
     index_t o_head_stride;
 
-    // The stride between rows of Oaccum.
-    index_t oaccum_batch_stride;
-    index_t oaccum_row_stride;
-    index_t oaccum_head_stride;
-    index_t oaccum_split_stride;
-
-    // The pointer to the P matrix.
-    void * __restrict__ p_ptr;
-
     // The pointer to the softmax sum.
     void * __restrict__ softmax_lse_ptr;
     void * __restrict__ softmax_lseaccum_ptr;
 
+    // For FP8 scaling
+    float * __restrict__ q_descale_ptr;
+    float * __restrict__ k_descale_ptr;
+    float * __restrict__ v_descale_ptr;
+    index_t q_descale_batch_stride;
+    index_t q_descale_head_stride;
+    index_t k_descale_batch_stride;
+    index_t k_descale_head_stride;
+    index_t v_descale_batch_stride;
+    index_t v_descale_head_stride;
+
     // The dimensions.
-    int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim, total_q, total_k;
-    int b_k;
+    int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;
+    int total_q, total_k, total_knew;
+    int b_k;  // When having KV cache and with cache_batch_idx, K & V might have larger batch size than Q
 
     // The scaling factors for the kernel.
     float scale_softmax;
-    float scale_softmax_log2;
-    uint32_t scale_softmax_log2_half2;
+    float softcap;
 
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
+    int * __restrict__ cu_seqlens_knew;
+    int * __restrict__ leftpad_k;
 
-    // If provided, the actual length of each q / o sequence.
-    int * __restrict__ seqused_q;
-    // If provided, the actual length of each k / v sequence.
-    int * __restrict__ seqused_k;
+    // If provided, the actual length of each q/k sequence.
+    int *__restrict__ seqused_q;
+    int *__restrict__ seqused_k;
 
-    int *__restrict__ blockmask;
+    // The stride between rows of Oaccum.
+    index_t oaccum_split_stride;
+    index_t oaccum_batch_stride;
+    index_t oaccum_row_stride;
+    index_t oaccum_head_stride;
+
+    // The stride between rows of LSEaccum.
+    index_t lseaccum_split_stride;
+    index_t lseaccum_batch_stride;
+    index_t lseaccum_head_stride;
 
     // The K_new and V_new matrices.
     void * __restrict__ knew_ptr;
@@ -99,13 +108,13 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ rotary_sin_ptr;
 
     // The indices to index into the KV cache.
-    int * __restrict__ cache_batch_idx;
+    int * __restrict__ kv_batch_idx;
 
     // Paged KV cache
-    int * __restrict__ block_table;
-    index_t block_table_batch_stride;
-    int page_block_size;
-    int page_num_blocks;
+    int * __restrict__ page_table;
+    index_t page_table_batch_stride;
+    int page_size;
+    int num_pages;
 
     // The dropout probability (probability of keeping an activation).
     float p_dropout;
@@ -115,40 +124,35 @@ struct Flash_fwd_params : public Qkv_params {
 
     // Scale factor of 1 / (1 - p_dropout).
     float rp_dropout;
-    float scale_softmax_rp_dropout;
 
     // Local window size
     int window_size_left, window_size_right;
+    int sink_token_length;
 
     // Pointer to the RNG seed (idx 0) and offset (idx 1).
     uint64_t * rng_state;
 
     bool is_bf16;
+    bool is_fp32;
     bool is_e4m3;
     bool is_causal;
     bool is_local;
-    bool is_kv_cache;
-    bool use_gqa_packing;
 
     bool is_rotary_interleaved;
 
     int num_splits;  // For split-KV version
-
-    void * __restrict__ alibi_slopes_ptr;
-    index_t alibi_slopes_batch_stride;
-
-    bool unpadded_lse; // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
-    bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+    bool pack_gqa;
 
     int * __restrict__ tile_count_semaphore;
-    float * __restrict__ descale_q_ptr;
-    float * __restrict__ descale_k_ptr;
-    float * __restrict__ descale_v_ptr;
+
+    int arch;
+    int num_sm;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Flash_bwd_params : public Flash_fwd_params {
+    using index_t = int64_t;
 
     // The dO and dQKV matrices.
     void *__restrict__ do_ptr;
@@ -166,8 +170,6 @@ struct Flash_bwd_params : public Flash_fwd_params {
     // dv_accum_ptr;
 
     // The stride between rows of the dO, dQ, dK and dV matrices.
-    // TD [2022-04-16]: We're using 32-bit indexing to save registers.
-    // The code probably won't work for arrays larger than 2GB.
     index_t do_batch_stride;
     index_t do_row_stride;
     index_t do_head_stride;
@@ -186,6 +188,8 @@ struct Flash_bwd_params : public Flash_fwd_params {
     void *__restrict__ softmax_lse_log2_ptr;
 
     int *__restrict__ dq_semaphore;
+    int *__restrict__ dk_semaphore;
+    int *__restrict__ dv_semaphore;
 
     bool deterministic;
     index_t dq_accum_split_stride;
@@ -193,6 +197,9 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename T, int Headdim> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
-template<typename T, int Headdim, int kBlockH> void run_mha_fwd_gqa_(Flash_fwd_params &params, cudaStream_t stream);
-template<typename T, int Headdim> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+template <int Arch, typename T, int Headdim, bool Split, bool PagedKV, bool Has_softcap, bool PackGQA>
+void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
+template <int Arch, typename T, int Headdim>
+void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+template <typename T, typename Tpartial, int Headdim>
+void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream);

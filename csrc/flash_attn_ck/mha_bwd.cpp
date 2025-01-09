@@ -309,8 +309,7 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         dv = torch::empty_like(v);
     }
 
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
