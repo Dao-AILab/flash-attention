@@ -913,7 +913,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_table,
         is_grad_enabled,
     ):
-        is_grad = torch.is_grad_enabled() and any(
+        is_grad = is_grad_enabled and any(
             x.requires_grad for x in [q, k, v]
         )
         if softmax_scale is None:
