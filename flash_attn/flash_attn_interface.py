@@ -164,6 +164,7 @@ def _flash_attn_varlen_forward(
     block_table: Optional[torch.Tensor] = None,
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    zero_tensors=False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
@@ -181,7 +182,7 @@ def _flash_attn_varlen_forward(
         max_seqlen_k,
         dropout_p,
         softmax_scale,
-        False,
+        zero_tensors,
         causal,
         window_size_left,
         window_size_right,
@@ -353,6 +354,7 @@ def _flash_attn_varlen_backward(
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
+    zero_tensors=False,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -378,7 +380,7 @@ def _flash_attn_varlen_backward(
         max_seqlen_k,
         dropout_p,
         softmax_scale,
-        False,
+        zero_tensors,
         causal,
         window_size_left,
         window_size_right,
