@@ -42,9 +42,9 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
 }
 
 // Return {kBlockM, kBlockN, kNWarps, kStages, Q_in_regs}
-constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm80(
+constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm8x(
         bool sm86_or_89, int headdim, bool is_causal, bool is_local, int element_size=2,
-        bool varlen_and_split=false, bool softcap=false) {
+        bool varlen_and_split=false, bool softcap=false, bool append_kv=false) {
     if (element_size == 2) {
         if (headdim <= 64) {
             return {128, varlen_and_split ? 80 : (is_local ? 96 : 112), 4, 1, false};
@@ -54,9 +54,9 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm80(
             bool const use_8_warps = sm86_or_89 | varlen_and_split;
             return {128, use_8_warps ? (varlen_and_split ? 112 : 128) : (is_local ? 48 : 64), use_8_warps ? 8 : 4, 1, use_8_warps};
         } else if (headdim <= 192) {
-            return {128, varlen_and_split || is_local ? 80 : 96, 8, sm86_or_89 ? 1 : 2, true};
+            return {128, append_kv ? 64 : (varlen_and_split || is_local ? 80 : 96), 8, sm86_or_89 ? 1 : 2, true};
         } else {
-            return {128, sm86_or_89 ? (varlen_and_split || is_local ? 48 : 64) : (varlen_and_split || is_local ? 64 : 96), 8, 1, sm86_or_89};
+            return {128, sm86_or_89 ? (varlen_and_split || is_local || append_kv ? 48 : 64) : (varlen_and_split || is_local || append_kv ? 64 : 96), 8, 1, sm86_or_89};
         }
     } else {
         // Placeholder for now
