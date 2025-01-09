@@ -396,8 +396,8 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // Strictly speaking we need to pass in (varlen && params.num_splits > 1) but num_splits
     // has not been set here. It's OK though because we might just underestimate kBlockN a bit
     auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, varlen, params.softcap > 0.f, params.knew_ptr);
-    int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm80);
-    int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm80);
+    int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
+    int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
     int seqlen_q_packgqa = params.seqlen_q * (params.pack_gqa ? params.h / params.h_k : 1);
     // If is_local, we're not going to load all of seqlen_k
     int const seqlen_k_loaded = !params.is_local
@@ -1229,8 +1229,8 @@ mha_combine(const at::Tensor &out_partial,         // num_splits x batch_size x 
             ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_sm80 = dprops->major >= 8;
-    TORCH_CHECK(is_sm80, "Attention combine function only supports Ampere GPUs or newer.");
+    bool is_sm8x = dprops->major >= 8;
+    TORCH_CHECK(is_sm8x, "Attention combine function only supports Ampere GPUs or newer.");
 
     auto out_partial_type = out_partial.scalar_type();
     TORCH_CHECK(out_partial_type == at::ScalarType::Float, "Attention combine function only support fp32 data type");

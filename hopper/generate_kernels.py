@@ -18,7 +18,7 @@ DTYPE_MAP = {
     "e4m3": "cutlass::float_e4m3_t",
 }
 
-DTYPE_MAP_FWD_SM80 = {
+DTYPE_MAP_FWD_SM8x = {
     "fp16": "cutlass::half_t",
     "bf16": "cutlass::bfloat16_t",
 }
@@ -42,7 +42,7 @@ template void run_mha_fwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {SPLIT}, {PAGEDKV}, {SOF
 #endif
 """
 
-KERNEL_IMPL_TEMPLATE_FWD_SM80 = """#include "flash_fwd_launch_template.h"
+KERNEL_IMPL_TEMPLATE_FWD_SM8x = """#include "flash_fwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_SM8x
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
@@ -62,7 +62,7 @@ void run_mha_bwd_<{ARCH}, {DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStr
 #endif
 """
 
-KERNEL_IMPL_TEMPLATE_BWD_SM80 = """#include "flash_bwd_launch_template.h"
+KERNEL_IMPL_TEMPLATE_BWD_SM8x = """#include "flash_bwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_SM8x
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
@@ -102,7 +102,7 @@ class Kernel:
                 )
             else:
                 # Always enable PackGQA for Sm8x to reduce compilation
-                return KERNEL_IMPL_TEMPLATE_FWD_SM80.format(
+                return KERNEL_IMPL_TEMPLATE_FWD_SM8x.format(
                     DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim,
                     SPLIT=str(self.split).lower(), PAGEDKV=str(self.paged_kv).lower(),
                     SOFTCAP=str(self.softcap).lower(), PACKGQA=str(True).lower()
@@ -113,7 +113,7 @@ class Kernel:
                     ARCH=str(self.sm), DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
                 )
             else:
-                return KERNEL_IMPL_TEMPLATE_BWD_SM80.format(
+                return KERNEL_IMPL_TEMPLATE_BWD_SM8x.format(
                     DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
                 )
 
@@ -128,7 +128,7 @@ def get_all_kernels() -> List[Kernel]:
         # to avoid the `_packgqa` in the filename.
         if sm < 90 and packgqa:
             continue
-        if sm >= 90 or dtype in DTYPE_MAP_FWD_SM80:
+        if sm >= 90 or dtype in DTYPE_MAP_FWD_SM8x:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
     for dtype, head_dim, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SM):
         yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=False, paged_kv=False, softcap=False, packgqa=False, direction="bwd")

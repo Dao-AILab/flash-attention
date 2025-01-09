@@ -681,9 +681,9 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (PagedKV) {
                 paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
             }
-            if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/); }
+            if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
             // if (thread_idx == 0) { printf("Producer: main load, before load_K, index = %d\n", smem_pipe_write.index());}
-            load_K(n_block, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/);
+            load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
             // if (thread_idx == 0) { printf("Producer: main load, after load K, index = %d\n", smem_pipe_write.index());}
         }
 
@@ -709,7 +709,7 @@ struct CollectiveMainloopFwdSm90 {
         // if (thread_idx == 0) { printf("Producer: main load, after barrier_O\n");}
 
         if constexpr (!Transpose_V && !IntraWGOverlap) {
-            if (should_load_KV) { load_V(n_block, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/); }
+            if (should_load_KV) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
         }
         int n_block_prev = n_block;
         --n_block;
@@ -721,13 +721,13 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (PagedKV) {
                     paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
                 }
-                if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/); }
-                load_K(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/);
+                if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
+                load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
                 if constexpr (!Transpose_V) {
                     if constexpr (IntraWGOverlap) {
-                        load_V(n_block_prev, smem_pipe_write_v, cute::bool_constant<true>{} /*Seqlenk_mask*/);
+                        load_V(n_block_prev, smem_pipe_write_v, cute::true_type{} /*Seqlenk_mask*/);
                     } else {
-                        load_V(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/);
+                        load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
                     }
                 }
             }
@@ -747,13 +747,13 @@ struct CollectiveMainloopFwdSm90 {
                     if constexpr (PagedKV) {
                         paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
                     }
-                    if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/); }
-                    load_K(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/);
+                    if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
+                    load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
                     if constexpr (!Transpose_V) {
                         if constexpr (IntraWGOverlap) {
-                            load_V(n_block_prev, smem_pipe_write_v, cute::bool_constant<true>{} /*Seqlenk_mask*/);
+                            load_V(n_block_prev, smem_pipe_write_v, cute::true_type{} /*Seqlenk_mask*/);
                         } else {
-                            load_V(n_block, smem_pipe_write, cute::bool_constant<false>{} /*Seqlenk_mask*/);
+                            load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
                         }
                     }
                 }
@@ -763,7 +763,7 @@ struct CollectiveMainloopFwdSm90 {
         }
         scheduler_prefetch();
         if constexpr (!Transpose_V && IntraWGOverlap) {
-            if (should_load_KV) { load_V(n_block_prev, smem_pipe_write, cute::bool_constant<true>{} /*Seqlenk_mask*/); }
+            if (should_load_KV) { load_V(n_block_prev, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
         }
         if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }
         ++smem_pipe_write;
@@ -1047,7 +1047,7 @@ struct CollectiveMainloopFwdSm90 {
                     std::max(n_block_min, (m_idx_min + seqlen_k - seqlen_q + params.window_size_right) / kBlockN);
                 #pragma unroll 1
                 for (; n_block >= n_block_min_causal_local_mask; --n_block) {
-                    fwd_step(n_block, mask_fn, cute::bool_constant<true>{} /*check_inf*/);
+                    fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);
                 }
             }
 
@@ -1059,7 +1059,7 @@ struct CollectiveMainloopFwdSm90 {
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; --n_block) {
-                fwd_step(n_block, no_mask_fn, cute::bool_constant<false>{} /*check_inf*/);
+                fwd_step(n_block, no_mask_fn, cute::false_type{} /*check_inf*/);
             }
             // Separate masking iterations on the left for local attention
             if constexpr (Is_local) {
@@ -1121,7 +1121,7 @@ struct CollectiveMainloopFwdSm90 {
             };
 
             auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-            fwd_step(n_block, first_iter_mask_fn, cute::bool_constant<true>{} /*is_first_iter*/, cute::bool_constant<true>{} /*check_inf*/);
+            fwd_step(n_block, first_iter_mask_fn, cute::true_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
             --n_block;
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
                 auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
@@ -1130,7 +1130,7 @@ struct CollectiveMainloopFwdSm90 {
                     std::max(n_block_min, (m_idx_min + seqlen_k - seqlen_q + params.window_size_right) / kBlockN);
                 #pragma unroll 1
                 for (; n_block >= n_block_min_causal_local_mask; --n_block) {
-                    fwd_step(n_block, mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<true>{} /*check_inf*/);
+                    fwd_step(n_block, mask_fn, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
                 }
             }
             int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : params.qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
@@ -1141,20 +1141,20 @@ struct CollectiveMainloopFwdSm90 {
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; --n_block) {
-                fwd_step(n_block, no_mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<false>{} /*check_inf*/);
+                fwd_step(n_block, no_mask_fn, cute::false_type{} /*is_first_iter*/, cute::false_type{} /*check_inf*/);
             }
             // Separate masking iterations on the left for local attention
             if constexpr (Is_local) {
                 auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
                 #pragma unroll 1
                 for (; n_block >= n_block_min; --n_block) {
-                    fwd_step(n_block, local_mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
+                    fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
                 }
                 // Disable sink token code for now
                 // int n_block_sink_max = cute::ceil_div(params.sink_token_length, kBlockN);
                 // #pragma unroll 1
                 // for (n_block = std::min(n_block, n_block_sink_max - 1); n_block >= 0; --n_block) {
-                //     fwd_step(n_block, local_mask_fn, cute::bool_constant<false>{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
+                //     fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
                 // }
             }
             warp_scheduler_barrier_arrive();
