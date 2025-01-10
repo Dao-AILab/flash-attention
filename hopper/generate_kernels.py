@@ -95,8 +95,8 @@ class Kernel:
     def template(self) -> str:
         if self.direction == "fwd":
             if self.sm == 90:
-                # Always enable PackGQA for PagedKV to reduce compilation
-                packgqa = self.packgqa or self.paged_kv
+                # Always enable PackGQA for PagedKV or Split to reduce compilation
+                packgqa = self.packgqa or self.paged_kv or self.split
                 return KERNEL_IMPL_TEMPLATE_FWD_SM90.format(
                     ARCH=str(self.sm), DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim,
                     SPLIT=str(self.split).lower(), PAGEDKV=str(self.paged_kv).lower(),
@@ -128,9 +128,9 @@ class Kernel:
 
 def get_all_kernels() -> List[Kernel]:
     for dtype, head_dim, split, paged_kv, softcap, packgqa, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SPLIT, PAGEDKV, SOFTCAP, PACKGQA, SM):
-        # We always enable PackGQA for Sm8x and PagedKV so we should just pass in packgqa=False
-        # to avoid the `_packgqa` in the filename.
-        if packgqa and (sm < 90 or (sm >= 90 and paged_kv)):
+        # We always enable PackGQA for Sm8x or PagedKV or Split
+         # so we should just pass in packgqa=False to avoid the `_packgqa` in the filename.
+        if packgqa and (sm < 90 or (sm >= 90 and (paged_kv or split))):
             continue
         if sm >= 90 or dtype in DTYPE_MAP_FWD_SM8x:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")

@@ -265,8 +265,8 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         SPLIT_SWITCH(params.num_splits > 1, Split, [&] {
             PAGEDKV_SWITCH(params.page_table, PagedKV, [&] {
                 PACKGQA_SWITCH(params.pack_gqa, PackGQA_, [&] {
-                    // Always enable PackGQA for Sm8x or PagedKV to reduce compilation
-                    static constexpr bool PackGQA = PackGQA_ || Arch < 90 || PagedKV;
+                    // Always enable PackGQA for Sm8x or PagedKV or Split to reduce compilation
+                    static constexpr bool PackGQA = PackGQA_ || Arch < 90 || PagedKV || Split;
                     SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
                         if (!params.is_e4m3) {
                             if (params.is_bf16) {
@@ -369,9 +369,9 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 inline bool get_pack_gqa(Flash_fwd_params const& params) {
-    // Always enable PackGQA for Sm8x or PagedKV to reduce compilation and binary size.
+    // Always enable PackGQA for Sm8x or PagedKV or Split to reduce compilation and binary size.
     // Has little effect on speed.
-    if (params.arch < 90 || params.page_table) { return true; }
+    if (params.arch < 90 || params.page_table || params.num_splits > 1) { return true; }
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
     return false;
     #else
@@ -388,7 +388,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     #ifdef FLASHATTENTION_DISABLE_SPLIT
     return 1;
     #else
-    // params.pack_gqa must already be set
+    // Always enable PackGQA for Split
     // params.page_table must already be set
     // This needs to match the kernel configs
     bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
@@ -398,7 +398,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);
     int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
     int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
-    int seqlen_q_packgqa = params.seqlen_q * (params.pack_gqa ? params.h / params.h_k : 1);
+    int seqlen_q_packgqa = params.seqlen_q * (params.h / params.h_k);
     // If is_local, we're not going to load all of seqlen_k
     int const seqlen_k_loaded = !params.is_local
         ? params.seqlen_k
@@ -671,8 +671,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     params.page_size = page_size;
     params.num_pages = num_pages;
 
-    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
 
     if (k_new_.has_value()) {
         at::Tensor k_new, v_new;
@@ -838,7 +838,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     TORCH_CHECK(params.num_splits == 1, "This flash attention build does not support splits.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
-    TORCH_CHECK(!params.pack_gqa || params.arch < 90 || params.page_table, "This flash attention build does not support pack_gqa.");
+    TORCH_CHECK(!params.pack_gqa || params.arch < 90 || params.page_table || params.num_splits > 1, "This flash attention build does not support pack_gqa.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_PAGEDKV
     TORCH_CHECK(!paged_KV, "This flash attention build does not support paged KV.");
