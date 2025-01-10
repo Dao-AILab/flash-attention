@@ -498,7 +498,11 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
 
     auto q_type = q.scalar_type();
     TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16 || q_type == at::ScalarType::Float8_e4m3fn,
-                "FlashAttention only support fp16, bf16, and fp8_e4m3 data type");
+                "FlashAttention only supports fp16, bf16, and fp8_e4m3 data type");
+    if (dprops->major < 9) {
+        TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
+                    "FlashAttention on Ampere/Ada cards only supports fp16 and bf16 data type");
+    }
     TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
     TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
 
@@ -788,7 +792,10 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
 
     at::Tensor tile_count_semaphore;
     // We don't use the persistent scheduler if Split and not Varlen
-    if (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen) {
+    bool const persistent_scheduler = params.arch >= 90
+        ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
+        : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
+    if (persistent_scheduler) {
         tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32));
         params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
     } else {
