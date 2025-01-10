@@ -4,11 +4,14 @@
 
 #pragma once
 
+#include "namespace_config.h"
+
 #include <cuda.h>
 #include <vector>
 
 #include <ATen/cuda/CUDAGeneratorImpl.h> // For at::Generator and at::PhiloxCudaState
 
+namespace FLASH_NAMESPACE {
 constexpr int TOTAL_DIM = 0;
 constexpr int H_DIM = 1;
 constexpr int D_DIM = 2;
@@ -187,3 +190,5 @@ template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_(Flash_fwd_pa
 template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
 
 template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+
+}  // namespace FLASH_NAMESPACE
