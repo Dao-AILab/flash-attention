@@ -265,8 +265,8 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         SPLIT_SWITCH(params.num_splits > 1, Split, [&] {
             PAGEDKV_SWITCH(params.page_table, PagedKV, [&] {
                 PACKGQA_SWITCH(params.pack_gqa, PackGQA_, [&] {
-                    // Always enable PackGQA for Sm8x to reduce compilation
-                    static constexpr bool PackGQA = PackGQA_ || Arch < 90;
+                    // Always enable PackGQA for Sm8x or PagedKV to reduce compilation
+                    static constexpr bool PackGQA = PackGQA_ || Arch < 90 || PagedKV;
                     SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
                         if (!params.is_e4m3) {
                             if (params.is_bf16) {
@@ -369,9 +369,9 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 inline bool get_pack_gqa(Flash_fwd_params const& params) {
-    // Always enable PackGQA for Sm8x to reduce compilation and binary size.
-    // Has almost no effect on speed.
-    if (params.arch < 90) { return true; }
+    // Always enable PackGQA for Sm8x or PagedKV to reduce compilation and binary size.
+    // Has little effect on speed.
+    if (params.arch < 90 || params.page_table) { return true; }
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
     return false;
     #else
@@ -838,7 +838,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     TORCH_CHECK(params.num_splits == 1, "This flash attention build does not support splits.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
-    TORCH_CHECK(params.arch < 90 || !params.pack_gqa, "This flash attention build does not support pack_gqa.");
+    TORCH_CHECK(!params.pack_gqa || params.arch < 90 || params.page_table, "This flash attention build does not support pack_gqa.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_PAGEDKV
     TORCH_CHECK(!paged_KV, "This flash attention build does not support paged KV.");
