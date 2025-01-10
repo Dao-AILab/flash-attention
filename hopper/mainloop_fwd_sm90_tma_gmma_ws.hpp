@@ -91,7 +91,7 @@ struct CollectiveMainloopFwdSm90 {
         AtomLayoutMNK{}));
 
     static constexpr int NumMmaThreads = size(TiledMma0{});
-    static constexpr int NumProducerThreads = !Transpose_V && Use_TMA_KV ? cutlass::NumThreadsPerWarp : cutlass::NumThreadsPerWarpGroup;
+    static constexpr int NumProducerThreads = !Transpose_V && Use_TMA_KV && Use_TMA_Q ? cutlass::NumThreadsPerWarp : cutlass::NumThreadsPerWarpGroup;
     static_assert(NumMmaThreads % cutlass::NumThreadsPerWarpGroup == 0);
     static constexpr int NumMmaWarpGroups = NumMmaThreads / cutlass::NumThreadsPerWarpGroup;
     static_assert(NumMmaWarpGroups == 1 || NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
@@ -687,7 +687,6 @@ struct CollectiveMainloopFwdSm90 {
             // if (thread_idx == 0) { printf("Producer: main load, after load K, index = %d\n", smem_pipe_write.index());}
         }
 
-        // If !Use_TMA_Q, we use the MMA WGs to load Q with cp.async
         if constexpr (Use_TMA_Q) {
             // Wait for the MMA warpgroups to signal that smem_q is ready
             if (SingleProducerWarp || warp_idx_in_warpgroup == 0) {
@@ -699,6 +698,15 @@ struct CollectiveMainloopFwdSm90 {
                 copy(params.tma_load_Q.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Q), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
                     tQgQ, tQsQ);
             }
+        } else {  // Load Q with cp.async
+            cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
+            Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
+            Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
+            using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumProducerThreads, Element>;
+            PackGQAt::load_Q(mQ, sQ_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_info.seqlen_q, m_block);
+            auto &barrier_Q = shared_storage.pipelines.barrier_Q;
+            cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Q));
+            barrier_Q.arrive();
         }
 
         // Wait for the MMA WGs to signal that smem_v are ready and V can be copied from gmem
@@ -813,10 +821,8 @@ struct CollectiveMainloopFwdSm90 {
 
     CUTLASS_DEVICE void
     mma_init() {
-        // Tell producer (warp 0) that smem_q is ready
-        if constexpr (Use_TMA_Q) {
-            cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
-        }
+        // Tell producers that smem_q is ready
+        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
         if constexpr (UseSchedulerBarrier) {
             // We have NamedBarrier for up to 3 WGs
             static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
@@ -927,20 +933,6 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         auto &barrier_Q = shared_storage.pipelines.barrier_Q;
-        if constexpr (!Use_TMA_Q) {  // Use Mma threads to load Q with cp.async
-            // If persistent, we don't need to wait for the previous work_idx to finish and signal QueryEmpty
-            // since we assume that all MMA threads sync in the epilogue before writing to smem_o.
-            // So any thread gets there, all threads must have finished the previous MMA and at least started
-            // writing to smem_o.
-            bool const is_varlen_q = Varlen && params.cu_seqlens_q;
-            Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
-            Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
-            using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element>;
-            PackGQAt::load_Q(mQ, sQ_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_q, m_block);
-            cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Q));
-            barrier_Q.arrive();
-        }
-
         if constexpr (!AppendKV) {
             barrier_Q.wait(work_idx % 2);
         } else {
@@ -1075,10 +1067,8 @@ struct CollectiveMainloopFwdSm90 {
                 //     fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
                 // }
             }
-            // Tell warp 0 that smem_q is ready
-            if constexpr (Use_TMA_Q) {  // If !Use_TMA_Q, we don't use the producer WG to load Q
-                cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
-            }
+            // Tell producers that smem_q is ready
+            cutlass::arch::NamedBarrier::arrive(NumMmaThreads + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
             consumer_wait(pipeline_v, smem_pipe_read);
             flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, cute::conditional_return<Mma1_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
@@ -1158,10 +1148,8 @@ struct CollectiveMainloopFwdSm90 {
                 // }
             }
             warp_scheduler_barrier_arrive();
-            // Tell warp 0 that smem_q is ready
-            if constexpr (Use_TMA_Q) {  // If !Use_TMA_Q, we don't use the producer WG to load Q
-                cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
-            }
+            // Tell producers that smem_q is ready
+            cutlass::arch::NamedBarrier::arrive(NumMmaThreads + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             Tensor scores_scale = softmax.finalize(v_descale);
             softmax.rescale_o(tOrO, scores_scale);
