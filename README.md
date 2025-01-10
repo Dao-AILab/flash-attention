@@ -94,6 +94,11 @@ variable `MAX_JOBS`:
 MAX_JOBS=4 pip install flash-attn --no-build-isolation
 ```
 
+**Dedicated build(only for research):**
+```sh
+MAX_JOBS=8 HEADDIM=64 DTYPE=fp16 ENABLE_SM90=FALSE pip install -e . -v
+```
+
 **Interface:** `src/flash_attention_interface.py`
 
 ### NVIDIA CUDA Support
