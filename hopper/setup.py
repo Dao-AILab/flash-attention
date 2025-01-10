@@ -459,17 +459,19 @@ if not SKIP_CUDA_BUILD:
     SPLIT = [""] + (["_split"] if not DISABLE_SPLIT else [])
     PAGEDKV = [""] + (["_paged"] if not DISABLE_PAGEDKV else [])
     SOFTCAP = [""] + (["_softcap"] if not DISABLE_SOFTCAP else [])
-    SOFTCAP_SM80 = [""] if not DISABLE_SOFTCAP else ["_softcapall"]
+    SOFTCAP_ALL = [""] if DISABLE_SOFTCAP else ["_softcapall"]
     PACKGQA = [""] + (["_packgqa"] if not DISABLE_PACKGQA else [])
     # We already always hard-code PackGQA=true for Sm8x
     sources_fwd_sm80 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}_sm80.cu"
-                        for hdim, dtype, split, paged, softcap in itertools.product(HEAD_DIMENSIONS_FWD_SM80, DTYPE_FWD_SM80, SPLIT, PAGEDKV, SOFTCAP_SM80)]
+                        for hdim, dtype, split, paged, softcap in itertools.product(HEAD_DIMENSIONS_FWD_SM80, DTYPE_FWD_SM80, SPLIT, PAGEDKV, SOFTCAP_ALL)]
+    # We already always hard-code PackGQA=true for Sm9x if PagedKV or Split
     sources_fwd_sm90 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
-                        for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)]
-    sources_bwd_sm80 = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}_sm80.cu"
-                        for hdim, dtype in itertools.product(HEAD_DIMENSIONS_BWD, DTYPE_BWD)]
-    sources_bwd_sm90 = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}_sm90.cu"
-                        for hdim, dtype in itertools.product(HEAD_DIMENSIONS_BWD, DTYPE_BWD)]
+                        for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
+                        if not (packgqa and (paged or split))]
+    sources_bwd_sm80 = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}{softcap}_sm80.cu"
+                        for hdim, dtype, softcap in itertools.product(HEAD_DIMENSIONS_BWD, DTYPE_BWD, SOFTCAP)]
+    sources_bwd_sm90 = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}{softcap}_sm90.cu"
+                        for hdim, dtype, softcap in itertools.product(HEAD_DIMENSIONS_BWD, DTYPE_BWD, SOFTCAP_ALL)]
     if DISABLE_BACKWARD:
         sources_bwd_sm90 = []
         sources_bwd_sm80 = []
@@ -487,8 +489,7 @@ if not SKIP_CUDA_BUILD:
         "--use_fast_math",
         # "--keep",
         # "--ptxas-options=--verbose,--register-usage-level=5,--warn-on-local-memory-usage",  # printing out number of registers
-        "--ptxas-options=--verbose",  # printing out number of registers
-        # "--resource-usage",  # printing out number of registers
+        "--resource-usage",  # printing out number of registers
         # f"--split-compile={os.getenv('NVCC_THREADS', '4')}",  # split-compile is faster
         "-lineinfo",
         "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",  # Necessary for the WGMMA shapes that we use

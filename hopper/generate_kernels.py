@@ -56,8 +56,8 @@ KERNEL_IMPL_TEMPLATE_BWD_SM90 = """#include "flash_bwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
 template<>
-void run_mha_bwd_<{ARCH}, {DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream) {{
-    run_mha_bwd_hdim{HEAD_DIM}<{ARCH}, {DTYPE}>(params, stream);
+void run_mha_bwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {SOFTCAP}>(Flash_bwd_params &params, cudaStream_t stream) {{
+    run_mha_bwd_hdim{HEAD_DIM}<{ARCH}, {DTYPE}, {SOFTCAP}>(params, stream);
 }}
 #endif
 """
@@ -67,12 +67,12 @@ KERNEL_IMPL_TEMPLATE_BWD_SM8x = """#include "flash_bwd_launch_template.h"
 #ifndef FLASHATTENTION_DISABLE_SM8x
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
 template<>
-void run_mha_bwd_<80, {DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream) {{
-    run_mha_bwd_hdim{HEAD_DIM}<80, {DTYPE}>(params, stream);
+void run_mha_bwd_<80, {DTYPE}, {HEAD_DIM}, {SOFTCAP}>(Flash_bwd_params &params, cudaStream_t stream) {{
+    run_mha_bwd_hdim{HEAD_DIM}<80, {DTYPE}, {SOFTCAP}>(params, stream);
 }}
 template<>
-void run_mha_bwd_<86, {DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream) {{
-    run_mha_bwd_hdim{HEAD_DIM}<86, {DTYPE}>(params, stream);
+void run_mha_bwd_<86, {DTYPE}, {HEAD_DIM}, {SOFTCAP}>(Flash_bwd_params &params, cudaStream_t stream) {{
+    run_mha_bwd_hdim{HEAD_DIM}<86, {DTYPE}, {SOFTCAP}>(params, stream);
 }}
 #endif
 #endif
@@ -95,10 +95,12 @@ class Kernel:
     def template(self) -> str:
         if self.direction == "fwd":
             if self.sm == 90:
+                # Always enable PackGQA for PagedKV or Split to reduce compilation
+                packgqa = self.packgqa or self.paged_kv or self.split
                 return KERNEL_IMPL_TEMPLATE_FWD_SM90.format(
                     ARCH=str(self.sm), DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim,
                     SPLIT=str(self.split).lower(), PAGEDKV=str(self.paged_kv).lower(),
-                    SOFTCAP=str(self.softcap).lower(), PACKGQA=str(self.packgqa).lower()
+                    SOFTCAP=str(self.softcap).lower(), PACKGQA=str(packgqa).lower()
                 )
             else:
                 # Always enable PackGQA for Sm8x to reduce compilation
@@ -110,11 +112,13 @@ class Kernel:
         elif self.direction == "bwd":
             if self.sm == 90:
                 return KERNEL_IMPL_TEMPLATE_BWD_SM90.format(
-                    ARCH=str(self.sm), DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
+                    ARCH=str(self.sm), DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim,
+                    SOFTCAP=str(self.softcap).lower()
                 )
             else:
                 return KERNEL_IMPL_TEMPLATE_BWD_SM8x.format(
-                    DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
+                    DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim, 
+                    SOFTCAP=str(self.softcap).lower()
                 )
 
     @property
@@ -124,14 +128,14 @@ class Kernel:
 
 def get_all_kernels() -> List[Kernel]:
     for dtype, head_dim, split, paged_kv, softcap, packgqa, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SPLIT, PAGEDKV, SOFTCAP, PACKGQA, SM):
-        # We always enable PackGQA for Sm8x so we should just pass in packgqa=False
-        # to avoid the `_packgqa` in the filename.
-        if sm < 90 and packgqa:
+        # We always enable PackGQA for Sm8x or PagedKV or Split
+         # so we should just pass in packgqa=False to avoid the `_packgqa` in the filename.
+        if packgqa and (sm < 90 or (sm >= 90 and (paged_kv or split))):
             continue
         if sm >= 90 or dtype in DTYPE_MAP_FWD_SM8x:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
-    for dtype, head_dim, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SM):
-        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=False, paged_kv=False, softcap=False, packgqa=False, direction="bwd")
+    for dtype, head_dim, softcap, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SOFTCAP, SM):
+        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, split=False, paged_kv=False, softcap=softcap, packgqa=False, direction="bwd")
 
 
 def batch_hdim(kernels_all) -> List[KERNEL_BATCH]:
@@ -152,6 +156,16 @@ def batch_softcap(kernels_all) -> List[KERNEL_BATCH]:
         kernels = [k for k in kernels_all if k.direction == "fwd" and k.dtype == dtype and k.head_dim == head_dim and k.split == split and k.paged_kv == paged_kv and k.packgqa == packgqa and k.sm == sm]
         if len(kernels) > 0:
             filename = f"flash_fwd_hdim{head_dim}_{dtype}{'_paged' if paged_kv else ''}{'_split' if split else ''}_softcapall{'_packgqa' if packgqa else ''}_sm{sm}.cu"
+            template = "\n".join([f"#include \"{k.filename}\"" for k in kernels])
+            yield KERNEL_BATCH(template, filename)
+
+    # Bwd
+    for dtype, head_dim, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SM):
+        if sm < 90:
+            continue
+        kernels = [k for k in kernels_all if k.direction == "bwd" and k.dtype == dtype and k.head_dim == head_dim and k.sm == sm]
+        if len(kernels) > 0:
+            filename = f"flash_bwd_hdim{head_dim}_{dtype}_softcapall_sm{sm}.cu"
             template = "\n".join([f"#include \"{k.filename}\"" for k in kernels])
             yield KERNEL_BATCH(template, filename)
 
