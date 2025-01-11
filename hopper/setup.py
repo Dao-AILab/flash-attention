@@ -128,12 +128,14 @@ def _write_ninja_file(path,
     config = ['ninja_required_version = 1.3']
     config.append(f'cxx = {compiler}')
     if with_cuda or cuda_dlink_post_cflags:
-        if "PYTORCH_NVCC" in os.environ:
-            nvcc_from_env = os.getenv("PYTORCH_NVCC")    # user can set nvcc compiler with ccache using the environment variable here
         if IS_HIP_EXTENSION:
             nvcc = _join_rocm_home('bin', 'hipcc')
         else:
             nvcc = _join_cuda_home('bin', 'nvcc')
+        if "PYTORCH_NVCC" in os.environ:
+            nvcc_from_env = os.getenv("PYTORCH_NVCC")    # user can set nvcc compiler with ccache using the environment variable here
+        else:
+            nvcc_from_env = nvcc
         config.append(f'nvcc_from_env = {nvcc_from_env}')
         config.append(f'nvcc = {nvcc}')
 
