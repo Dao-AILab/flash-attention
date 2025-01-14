@@ -58,7 +58,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           const at::Tensor v,
                                           const at::Tensor seqlens_q,
                                           const at::Tensor seqlens_k,
-                                          c10::optional<at::Tensor> &alibi_slopes_,
+                                          std::optional<at::Tensor> &alibi_slopes_,
                                           at::Tensor out,
                                           at::Tensor softmax_lse,
                                           at::Tensor dropout_randval,
@@ -175,8 +175,8 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
                                                           const at::Tensor v,
                                                           const at::Tensor seqlens_q,
                                                           const at::Tensor seqlens_k,
-                                                          c10::optional<at::Tensor> &block_table_,
-                                                          c10::optional<at::Tensor> &alibi_slopes_,
+                                                          std::optional<at::Tensor> &block_table_,
+                                                          std::optional<at::Tensor> &alibi_slopes_,
                                                           at::Tensor out,
                                                           at::Tensor lse,
                                                           at::Tensor lse_acc,
@@ -294,13 +294,13 @@ std::vector<at::Tensor>
 mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                const at::Tensor &k,             // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                const at::Tensor &v,             // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-               c10::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
-               c10::optional<at::Tensor> & /*seqused_k*/,
-               c10::optional<const at::Tensor> &/*leftpad_k_*/, // batch_size
-               c10::optional<at::Tensor> &block_table_,  // batch_size x max_num_blocks_per_seq
-               c10::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
+               std::optional<at::Tensor> & /*seqused_k*/,
+               std::optional<const at::Tensor> &/*leftpad_k_*/, // batch_size
+               std::optional<at::Tensor> &block_table_,  // batch_size x max_num_blocks_per_seq
+               std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
                int max_seqlen_q,
                const int max_seqlen_k,
                const float p_dropout,
@@ -311,7 +311,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
                int window_size_right,
                const float /*softcap*/,
                const bool return_dropout_randval,
-               c10::optional<at::Generator> gen_)
+               std::optional<at::Generator> gen_)
 {
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,

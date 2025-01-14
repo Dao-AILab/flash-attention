@@ -90,7 +90,7 @@ std::vector<at::Tensor> linear_bias_wgrad(at::Tensor input, at::Tensor d_output,
 }
 
 std::vector<at::Tensor> linear_act_forward(at::Tensor input, at::Tensor weight,
-                                           c10::optional<at::Tensor> bias_,
+                                           std::optional<at::Tensor> bias_,
                                            bool is_gelu, bool save_pre_act, int heuristic) {
 
   int64_t batch_size = input.size(0);
