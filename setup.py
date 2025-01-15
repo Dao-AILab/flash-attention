@@ -145,11 +145,8 @@ ext_modules = []
 
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
-if IS_ROCM:
-    if not USE_TRITON_ROCM:
-        subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"])
-else:
-    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
+subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"])
+subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 if not SKIP_CUDA_BUILD and not IS_ROCM:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
