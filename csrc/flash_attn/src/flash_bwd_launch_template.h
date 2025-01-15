@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "namespace_config.h"
 #include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
 
 #include "static_switch.h"
@@ -11,6 +12,8 @@
 #include "flash.h"
 #include "flash_bwd_preprocess_kernel.h"
 #include "flash_bwd_kernel.h"
+
+namespace FLASH_NAMESPACE {
 
 // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -30,7 +33,7 @@ __global__ void kernelName(KERNEL_PARAM_MODIFIER const Flash_bwd_params params)
 
 DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_loop_kernel, bool Is_dropout, bool Is_causal, bool Has_alibi, bool Is_even_M, bool Is_even_K) {
     #if defined(ARCH_SUPPORTS_FLASH)
-       flash::compute_dq_dk_dv<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K>(params);
+       FLASH_NAMESPACE::compute_dq_dk_dv<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K>(params);
     #else
         FLASH_UNSUPPORTED_ARCH
     #endif
@@ -39,7 +42,7 @@ DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_loop_kernel, bool Is_dropout, bo
 DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap) {
     #if defined(ARCH_SUPPORTS_FLASH)
         static_assert(!(Is_causal && Is_local));  // If Is_local is true, Is_causal should be false
-        flash::compute_dq_dk_dv_seqk_parallel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap>(params);
+        FLASH_NAMESPACE::compute_dq_dk_dv_seqk_parallel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap>(params);
     #else
         FLASH_UNSUPPORTED_ARCH
     #endif
@@ -48,22 +51,22 @@ DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel, bool 
 
 template<bool Clear_dQaccum=true, typename Kernel_traits>
 __global__ void flash_bwd_dot_do_o_kernel(const Flash_bwd_params params) {
-    flash::compute_dot_do_o<Clear_dQaccum, Kernel_traits>(params);
+    FLASH_NAMESPACE::compute_dot_do_o<Clear_dQaccum, Kernel_traits>(params);
 }
 
 template<typename Kernel_traits>
 __global__ void flash_bwd_clear_dkvaccum_kernel(const Flash_bwd_params params) {
-    flash::clear_dKVaccum<Kernel_traits>(params);
+    FLASH_NAMESPACE::clear_dKVaccum<Kernel_traits>(params);
 }
 
 template<typename Kernel_traits>
 __global__ void flash_bwd_convert_dq_kernel(const Flash_bwd_params params, const int nsplits) {
-    flash::convert_dQ<Kernel_traits>(params, nsplits);
+    FLASH_NAMESPACE::convert_dQ<Kernel_traits>(params, nsplits);
 }
 
 template<typename Kernel_traits>
 __global__ void flash_bwd_convert_dkv_kernel(const Flash_bwd_params params) {
-    flash::convert_dKV<Kernel_traits>(params);
+    FLASH_NAMESPACE::convert_dKV<Kernel_traits>(params);
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
@@ -321,3 +324,5 @@ void run_mha_bwd_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
         }
     });
 }
+
+} // namespace FLASH_NAMESPACE {
