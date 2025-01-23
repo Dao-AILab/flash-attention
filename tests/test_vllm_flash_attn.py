@@ -25,8 +25,8 @@ DTYPES = [torch.float16, torch.bfloat16]
 # one value small enough to test the schema op check
 NUM_BLOCKS = [32768, 2048]
 VERSIONS = \
-    [2] if is_fa2_supported() else [] + \
-    [3] if is_fa3_supported() else []
+    ([2] if is_fa2_supported() else []) + \
+    ([3] if is_fa3_supported() else [])
 
 
 def ref_attn(
