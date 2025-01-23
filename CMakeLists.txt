@@ -171,7 +171,8 @@ if (FA2_ENABLED)
     )
 endif ()
 
-if (FA3_ENABLED)
+# FA3 requires CUDA 12.0 or later
+if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
     # BF16 source files (we only use paged, split, packgqa and sm80)
     #   we only use paged, split and packgqa since for paged_kv or varlen_q 
     #   PackedGQA is the only one that is used
@@ -249,4 +250,6 @@ if (FA3_ENABLED)
         FLASHATTENTION_PACKGQA_ONLY # Custom flag to save on binary size
         FLASHATTENTION_VARLEN_ONLY  # Custom flag to save on binary size
     )
+elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS 12.0)
+    message(STATUS "FA3 is disabled because CUDA version is not 12.0 or later.")
 endif ()

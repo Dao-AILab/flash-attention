@@ -6,7 +6,6 @@ from .flash_attn_interface import (
     flash_attn_with_kvcache,
     sparse_attn_func,
     sparse_attn_varlen_func,
-    is_fa2_supported,
-    is_fa3_supported,
     is_fa_version_supported,
+    fa_version_unsupported_reason
 )

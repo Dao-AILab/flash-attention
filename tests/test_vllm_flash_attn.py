@@ -13,8 +13,7 @@ from einops import rearrange, repeat
 from vllm_flash_attn.flash_attn_interface import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
-    is_fa2_supported,
-    is_fa3_supported
+    is_fa_version_supported
 )
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
@@ -25,8 +24,8 @@ DTYPES = [torch.float16, torch.bfloat16]
 # one value small enough to test the schema op check
 NUM_BLOCKS = [32768, 2048]
 VERSIONS = \
-    ([2] if is_fa2_supported() else []) + \
-    ([3] if is_fa3_supported() else [])
+    ([2] if is_fa_version_supported(2) else []) + \
+    ([3] if is_fa_version_supported(3) else [])
 
 
 def ref_attn(

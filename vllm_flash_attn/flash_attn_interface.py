@@ -11,39 +11,57 @@ import torch.nn as nn
 
 try:
     from . import _vllm_fa2_C  # noqa: F401
+    FA2_UNAVAILABLE_REASON = None
     FA2_AVAILABLE = True
 except ImportError as e:
-    print(f"[WARNING] FA2 is not available because {e}")
+    FA2_UNAVAILABLE_REASON = str(e)
     FA2_AVAILABLE = False
 
 try:
     from . import _vllm_fa3_C  # noqa: F401
+    FA3_UNAVAILABLE_REASON = None
     FA3_AVAILABLE = True
 except ImportError as e:
-    print(f"[WARNING] FA3 is not available because {e}")
+    FA3_UNAVAILABLE_REASON = str(e)
     FA3_AVAILABLE = False
 
 # isort: on
 
 DEFAULT_FA_VERSION = 2
 
-def is_fa2_supported(device = None) -> bool:
-    return FA2_AVAILABLE and torch.cuda.get_device_capability(device)[0] >= 8
-
-def is_fa3_supported(device = None) -> bool:
-    # FA3 can fail without a enough shared memory for a some shapes, currently
-    #  only 8.0 and 8.7 have enough shared memory for all shapes
-    #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
-    return FA3_AVAILABLE and (torch.cuda.get_device_capability(device)[0] >= 9 \
-        or torch.cuda.get_device_capability(device) == (8, 0) \
-        or torch.cuda.get_device_capability(device) == (8, 7))
+def _is_fa2_supported(device = None) -> Tuple[bool, Optional[str]]:
+    if not FA2_AVAILABLE:
+        return False, f"FA2 is unavaible due to: {FA2_UNAVAILABLE_REASON}"
+    if torch.cuda.get_device_capability(device)[0] < 8:
+        return False, \
+            "FA2 is only supported on devices with compute capability < 8"
+    return True, None
+    
+def _is_fa3_supported(device = None) -> Tuple[bool, Optional[str]]:
+    if not FA3_AVAILABLE:
+        return False, f"FA3 is unavaible due to: {FA3_UNAVAILABLE_REASON}"
+    if torch.cuda.get_device_capability(device)[0] < 8 \
+        or torch.cuda.get_device_capability(device) == (8, 6) \
+        or torch.cuda.get_device_capability(device) == (8, 9):
+        return False, \
+            "FA3 is only supported on devices with compute capability >= 8" \
+            " excluding 8.6 and 8.9"
+    return True, None
 
 def is_fa_version_supported(fa_version: int, device = None) -> bool:
     assert fa_version in [2, 3], f"Unsupported FA version: {fa_version}"
     if fa_version == 2:
-        return is_fa2_supported(device)
+        return _is_fa2_supported(device)[0]
     elif fa_version == 3:
-        return is_fa3_supported(device)
+        return _is_fa3_supported(device)[0]
+
+def fa_version_unsupported_reason(fa_version: int, device = None) \
+    -> Optional[str]:
+    assert fa_version in [2, 3], f"Unsupported FA version: {fa_version}"
+    if fa_version == 2:
+        return _is_fa3_supported(device)[1]
+    elif fa_version == 3:
+        return _is_fa3_supported(device)[1]
 
 #
 #  For vLLM we only care about `flash_attn_varlen_func` and 
