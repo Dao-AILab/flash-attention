@@ -179,16 +179,16 @@ These features are supported in Fwd and Bwd
 2) Variable sequence lengths
 3) Arbitrary Q and KV sequence lengths
 4) Arbitrary head sizes
+5) Multi and grouped query attention
+6) Dropout
+7) Rotary embeddings
 
 These features are supported in Fwd for now. We will add them to backward soon.
-1) Multi and grouped query attention
 2) ALiBi and matrix bias
 
 These features are in development
 1) Paged Attention 
 2) Sliding Window
-3) Rotary embeddings
-4) Dropout
 5) Performance Improvements
 
 #### Getting Started
