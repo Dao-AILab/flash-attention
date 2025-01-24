@@ -1,10 +1,10 @@
 
 import csv
-import json
 import math
 import torch
 import os
 import random
+import functools
 import triton
 import triton.language as tl
 
@@ -176,38 +176,73 @@ def input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout, device="cud
     return q, k, v, input_metadata
 
 
+def random_seqlens_composition(N, Z):
+    # generate a random composition of N into Z positive parts.
+    idx = torch.randperm(N - 1)[: Z - 1] + 1
+    idx, _ = torch.sort(idx)
+    breakpoints = torch.cat([
+        torch.tensor([0], dtype=torch.long),
+        idx,
+        torch.tensor([N], dtype=torch.long),
+    ])
+    seqlens = (breakpoints[1:] - breakpoints[:-1]).to(torch.int32)
+    return seqlens
+
 def varlen_input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device="cuda", equal_seqlens=False, DEBUG_INPUT=False):
     torch.manual_seed(20)
 
     # Random or equal sequence lengths based on 'equal_seqlens' flag
     if not equal_seqlens:
-        max_seqlens_q = N_CTX_Q // Z
-        max_seqlens_k = N_CTX_K // Z
-        seqlens_q = torch.randint(1, max_seqlens_q + 1, (Z,), dtype=torch.int32)
-        seqlens_k = torch.randint(1, max_seqlens_k + 1, (Z,), dtype=torch.int32)
+        seqlens_q = random_seqlens_composition(N_CTX_Q, Z)
+        seqlens_k = random_seqlens_composition(N_CTX_K, Z)
     else:
         seqlens_q = torch.full((Z,), N_CTX_Q // Z, dtype=torch.int32)
         seqlens_k = torch.full((Z,), N_CTX_K // Z, dtype=torch.int32)
 
-    # Calculate cumulative sequence lengths
+    # calculate cumulative sequence lengths
     cu_seqlens_q = torch.cat([torch.tensor([0], dtype=torch.int32), seqlens_q.cumsum(dim=0)])
     cu_seqlens_k = torch.cat([torch.tensor([0], dtype=torch.int32), seqlens_k.cumsum(dim=0)])
     cu_seqlens_q = cu_seqlens_q.to(device=device).to(torch.int32)
     cu_seqlens_k = cu_seqlens_k.to(device=device).to(torch.int32)
 
-    # Total lengths
+    # total lengths
     total_q = cu_seqlens_q[-1].item()
     total_k = cu_seqlens_k[-1].item()
 
     if DEBUG_INPUT:
-        # Initialize q, k, v with deterministic values
-        q = torch.arange(total_q, dtype=dtype, device=device).view(total_q, 1, 1)
-        q = q.expand(total_q, HQ, D_HEAD).contiguous().requires_grad_()
-        k = torch.arange(total_k, dtype=dtype, device=device).view(total_k, 1, 1)
-        k = k.expand(total_k, HK, D_HEAD).contiguous().requires_grad_()
-        v = torch.arange(total_k, dtype=dtype, device=device).view(total_k, 1, 1)
-        v = v.expand(total_k, HK, D_HEAD).contiguous().requires_grad_()
-        sm_scale = 1
+        sm_scale = 1.0
+        
+        q = torch.empty(total_q, HQ, D_HEAD, dtype=dtype, device=device)
+        k = torch.empty(total_k, HK, D_HEAD, dtype=dtype, device=device)
+        v = torch.empty(total_k, HK, D_HEAD, dtype=dtype, device=device)
+        for i in range(Z):
+            q_start = cu_seqlens_q[i].item()
+            q_end   = cu_seqlens_q[i+1].item()
+            q_length  = q_end - q_start
+            k_start = cu_seqlens_k[i].item()
+            k_end   = cu_seqlens_k[i+1].item()
+            k_length  = k_end - k_start
+            
+          
+            q[q_start:q_end, :, :] = (
+                torch.arange(q_length, dtype=dtype, device=device)
+                .view(q_length, 1, 1)
+                .expand(q_length, HQ, D_HEAD)
+            )
+            k[k_start:k_end, :, :] = (
+                torch.arange(k_length, dtype=dtype, device=device)
+                .view(k_length, 1, 1)
+                .expand(k_length, HK, D_HEAD)
+            )
+            v[k_start:k_end, :, :] = (
+                torch.arange(k_length, dtype=dtype, device=device)
+                .view(k_length, 1, 1)
+                .expand(k_length, HK, D_HEAD)
+            )
+        q.requires_grad_()
+        k.requires_grad_()
+        v.requires_grad_()
+      
     else:
         # Initialize q, k, v with random values
         q = torch.randn((total_q, HQ, D_HEAD), dtype=dtype, device=device).requires_grad_()
@@ -217,6 +252,7 @@ def varlen_input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device="cuda
 
     input_metadata = MetaData(sm_scale=sm_scale)
     input_metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k)
+
     return q, k, v, input_metadata
 
 
@@ -325,15 +361,22 @@ def get_input_shapes():
              for i in range(8, 18)] + [(max(1, 2**(16 - i)), 1, 2**i, 16, 2, 128) for i in range(8, 18)]
     return cases
 
+@functools.cache
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
+@functools.cache
 def get_arch():
     return triton.runtime.driver.active.get_current_target().arch
 
+@functools.cache
 def is_cdna():
-    return is_hip() and get_arch() in ('gfx940', 'gfx941', 'gfx942', 'gfx90a', 'gfx908')
+    return is_hip() and get_arch() in ('gfx908', 'gfx90a', 'gfx940', 'gfx941', 'gfx942')
 
-
+@functools.cache
 def is_rdna():
     return is_hip() and get_arch() in ("gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201")
+
+@functools.cache
+def arch_supports_fp8():
+    return is_hip() and get_arch() in ('gfx942')

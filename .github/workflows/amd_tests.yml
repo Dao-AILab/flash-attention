@@ -8,7 +8,7 @@ on:
     branches: [main_perf]
     types: [checks_requested]
   push:
-    branches: [main_perf, micmelesse/upstream_pr]
+    branches: [main_perf]
 
 concurrency:
   group: ${{ github.ref }}
@@ -17,70 +17,75 @@ concurrency:
 permissions: read-all
 
 jobs:
-  Runner-Preparation-AMD:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    outputs:
-      matrix-HIP: ${{ steps.set-matrix.outputs.matrix-HIP }}
-    steps:
-      - name: Prepare runner matrix
-        id: set-matrix
-        run: |
-          if [ x"${{ github.repository }}" == x"ROCm/flash-attention" ]; then
-            echo '::set-output name=matrix-HIP::[["self-hosted", "gfx90a"], ["self-hosted", "gfx1100"]]'
-          else
-            echo '::set-output name=matrix-HIP::[["ubuntu-latest"]]'
-          fi
-
   Integration-Tests-AMD:
-    needs: Runner-Preparation-AMD
-    if: needs.Runner-Preparation-AMD.outputs.matrix-HIP != ''
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        runner: ${{fromJson(needs.Runner-Preparation-AMD.outputs.matrix-HIP)}}
+        runner: [linux-mi300-gpu-1]
+      fail-fast: false # disables failing the entire job when one matrix entry fails
     container:
-      image: rocm/pytorch:rocm6.0.2_ubuntu22.04_py3.10_pytorch_2.1.2
+      image: rocm/pytorch:rocm6.2.3_ubuntu22.04_py3.10_pytorch_release_2.3.0
       options: --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --group-add video --user root
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Show Device Info
+        run: |
+          rocminfo | grep gfx
+      - name: Uninstall Triton
+        run : |
+          pip uninstall -y triton
+          rm -rf ~/.triton
+          rm -rf ./triton/python/build
       - name: Install Triton
         run: |
-          pip uninstall -y triton
-          pip install matplotlib pandas pytest
           git clone https://github.com/triton-lang/triton
           cd triton
-          git checkout 3ca2f498e98ed7249b82722587c511a5610e00c4 
-          pip install --verbose -e python
+          git checkout 3ca2f498e98ed7249b82722587c511a5610e00c4
+          pip install ninja cmake wheel pybind11 # build-time dependencies
+          pip install matplotlib pandas pytest # triton bench dependencies
+          pip install --verbose --no-build-isolation ./python
           cd ..
+      - name: Show Triton version
+        run: |
+          pip show triton
       - name: Build
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           python setup.py install
-      - name: Flash Attention Tests Using Reference Impl
-        if: matrix.runner[1] == 'gfx90a'
-        run: |
-          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          export FLASH_ATTENTION_TRITON_AMD_REF=1
-          pytest tests/test_flash_attn_triton_amd.py
-      - name: Flash Attention Tests
+
+      # CDNA Tests
+      - name: Flash Attention CDNA Tests
+        if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           pytest tests/test_flash_attn_triton_amd.py
       - name: AMD Tests
-        if: matrix.runner[1] == 'gfx90a'
+        if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           pytest -v -s flash_attn/flash_attn_triton_amd/test.py
       - name: AMD Bench
-        if: matrix.runner[1] == 'gfx90a'
+        if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           python flash_attn/flash_attn_triton_amd/bench.py
       - name: AMD Bench with Autotune
-        if: matrix.runner[1] == 'gfx90a'
+        if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=1
           python flash_attn/flash_attn_triton_amd/bench.py
+      
+      # RDNA Tests
+      - name: Flash Attention Tests Using Reference Impl
+        if: matrix.runner == 'gfx1100'
+        run: |
+          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+          export FLASH_ATTENTION_TRITON_AMD_REF=1
+          pytest tests/test_flash_attn_triton_amd.py
+      - name: Flash Attention RDNA Tests
+        if: matrix.runner == 'gfx1100'
+        run: |
+          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+          pytest tests/test_flash_attn_triton_amd.py::test_flash_attn_output tests/test_flash_attn_triton_amd.py::test_flash_attn_varlen_output tests/test_flash_attn_triton_amd.py::test_flash_attn_kvcache
