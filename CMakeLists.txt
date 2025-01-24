@@ -247,8 +247,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         # FLASHATTENTION_DISABLE_LOCAL
         FLASHATTENTION_DISABLE_PYBIND
         FLASHATTENTION_DISABLE_FP8 # TODO Enable FP8
-        FLASHATTENTION_PACKGQA_ONLY # Custom flag to save on binary size
-        FLASHATTENTION_VARLEN_ONLY  # Custom flag to save on binary size
+        FLASHATTENTION_VARLEN_ONLY # Custom flag to save on binary size
     )
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS 12.0)
     message(STATUS "FA3 is disabled because CUDA version is not 12.0 or later.")
