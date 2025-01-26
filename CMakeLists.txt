@@ -173,31 +173,15 @@ endif ()
 
 # FA3 requires CUDA 12.0 or later
 if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
-    # BF16 source files (we only use paged, split, packgqa and sm80)
-    #   we only use paged, split and packgqa since for paged_kv or varlen_q 
-    #   PackedGQA is the only one that is used
+    # BF16 source files
     file(GLOB FA3_BF16_GEN_SRCS 
-        "hopper/instantiations/flash_fwd_hdimall_bf16_*paged*_sm90.cu")
-    file(GLOB FA3_BF16_GEN_SRCS_ 
-        "hopper/instantiations/flash_fwd_hdimall_bf16_*packgqa*_sm90.cu")
-    list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
-    file(GLOB FA3_BF16_GEN_SRCS_ 
-        "hopper/instantiations/flash_fwd_hdimall_bf16_*split*_sm90.cu")
-    list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
+        "hopper/instantiations/flash_fwd_hdimall_bf16*_sm90.cu")
     file(GLOB FA3_BF16_GEN_SRCS_ 
         "hopper/instantiations/flash_fwd_*_bf16_*_sm80.cu")
     list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
-    # FP16 source files (we only use paged, split and packgqa and sm80)
-    #   we only use paged, split and packgqa since for paged_kv or varlen_q 
-    #   PackedGQA is the only one that is used
+    # FP16 source files
     file(GLOB FA3_FP16_GEN_SRCS 
-        "hopper/instantiations/flash_fwd_hdimall_fp16_*paged*_sm90.cu")
-    file(GLOB FA3_FP16_GEN_SRCS_ 
-        "hopper/instantiations/flash_fwd_hdimall_fp16_*packgqa*_sm90.cu")
-    list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
-    file(GLOB FA3_FP16_GEN_SRCS_ 
-        "hopper/instantiations/flash_fwd_hdimall_fp16_*split*_sm90.cu")
-    list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
+        "hopper/instantiations/flash_fwd_hdimall_fp16*_sm90.cu")
     file(GLOB FA3_FP16_GEN_SRCS_ 
         "hopper/instantiations/flash_fwd_*_fp16_*_sm80.cu")
     list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
