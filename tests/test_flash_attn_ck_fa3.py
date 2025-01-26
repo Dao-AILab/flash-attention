@@ -68,10 +68,11 @@ def pad_rearrange_dropout_mask_hts_to_bhss(S_dmask, cu_seqlens_q, seqlen_q_round
 @pytest.mark.parametrize("alibi", [False])
 @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 72, 80, 88, 96, 104, 112, 120, 128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
+        (256, 512),
         (1024, 1024),
         (2048, 2048),
     ],
