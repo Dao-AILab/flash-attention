@@ -23,7 +23,7 @@ These features are in development
 2) Sliding Window
 5) Performance Improvements
 
-#### Getting Started
+##### Getting Started
 To get started with the triton backend for AMD, follow the steps below.
 
 First install the recommended Triton [commit](https://github.com/triton-lang/triton/commit/3ca2f498e98ed7249b82722587c511a5610e00c4).
@@ -43,7 +43,7 @@ python setup.py install
 pytest tests/test_flash_attn_triton_amd.py
 ```
 
-#### Credits
+##### Credits
 AMD Triton kernels team
 
 OpenAI kernel team

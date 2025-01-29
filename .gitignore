@@ -35,6 +35,7 @@ csrc/flash_attn_ck
 .eggs
 *.log
 core.*
+gpucore.*
 *.csv
 *.png
 *.html

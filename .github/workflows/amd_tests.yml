@@ -4,11 +4,6 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [main_perf]
-  merge_group:
-    branches: [main_perf]
-    types: [checks_requested]
-  push:
-    branches: [main_perf]
 
 concurrency:
   group: ${{ github.ref }}
@@ -55,6 +50,12 @@ jobs:
           python setup.py install
 
       # CDNA Tests
+      - name: Flash Attention Tests Using Reference Impl
+        if: matrix.runner == 'linux-mi300-gpu-1'
+        run: |
+          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+          export FLASH_ATTENTION_TRITON_AMD_REF=1
+          pytest tests/test_flash_attn_triton_amd.py
       - name: Flash Attention CDNA Tests
         if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
@@ -78,12 +79,6 @@ jobs:
           python flash_attn/flash_attn_triton_amd/bench.py
       
       # RDNA Tests
-      - name: Flash Attention Tests Using Reference Impl
-        if: matrix.runner == 'gfx1100'
-        run: |
-          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          export FLASH_ATTENTION_TRITON_AMD_REF=1
-          pytest tests/test_flash_attn_triton_amd.py
       - name: Flash Attention RDNA Tests
         if: matrix.runner == 'gfx1100'
         run: |
