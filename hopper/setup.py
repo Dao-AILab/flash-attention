@@ -333,22 +333,19 @@ def open_url(url):
     return urllib.request.urlopen(request, timeout=300)
 
 
-def download_and_copy(name, src_path, dst_path, version, url_func):
+def download_and_copy(name, src_func, dst_path, version, url_func):
     if is_offline_build():
         return
     flashattn_cache_path = get_flashattn_cache_path()
     base_dir = os.path.dirname(__file__)
     system = platform.system()
-    try:
-        arch = {"x86_64": "64", "arm64": "aarch64", "aarch64": "aarch64"}[platform.machine()]
-    except KeyError:
-        arch = platform.machine()
+    arch = platform.machine()
+    arch = {"arm64": "aarch64"}.get(arch, arch)
     supported = {"Linux": "linux", "Darwin": "linux"}
     url = url_func(supported[system], arch, version)
+    src_path = src_func(supported[system], arch, version)
     tmp_path = os.path.join(flashattn_cache_path, "nvidia", name)  # path to cache the download
     dst_path = os.path.join(base_dir, os.pardir, "third_party", "nvidia", "backend", dst_path)  # final binary path
-    platform_name = "sbsa-linux" if arch == "aarch64" else "x86_64-linux"
-    src_path = src_path(platform_name, version) if callable(src_path) else src_path
     src_path = os.path.join(tmp_path, src_path)
     download = not os.path.exists(src_path)
     if download:
@@ -364,11 +361,12 @@ def download_and_copy(name, src_path, dst_path, version, url_func):
 
 
 def nvcc_threads_args():
-    nvcc_threads = os.getenv("NVCC_THREADS") or "4"
+    nvcc_threads = os.getenv("NVCC_THREADS") or "2"
     return ["--threads", nvcc_threads]
 
 
-NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.3.107"}
+# NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.3.107"}
+NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.8.61"}
 exe_extension = sysconfig.get_config_var("EXE")
 
 
@@ -389,24 +387,31 @@ if not SKIP_CUDA_BUILD:
     if bare_metal_version < Version("12.3"):
         raise RuntimeError("FlashAttention-3 is only supported on CUDA 12.3 and above")
 
-    if bare_metal_version != Version("12.3"):  # nvcc 12.3 gives the best perf currently
+    if bare_metal_version != Version("12.8"):  # nvcc 12.8 gives the best perf currently
         download_and_copy(
-            name="nvcc", src_path=f"bin", dst_path="bin",
-            version=NVIDIA_TOOLCHAIN_VERSION["nvcc"], url_func=lambda system, arch, version:
-            ((lambda version_major, version_minor1, version_minor2:
-            f"https://anaconda.org/nvidia/cuda-nvcc/{version}/download/{system}-{arch}/cuda-nvcc-{version}-0.tar.bz2")
-            (*version.split('.'))))
+            name="nvcc",
+            # src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas{exe_extension}",
+            src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin",
+            dst_path="bin",
+            version=NVIDIA_TOOLCHAIN_VERSION["nvcc"],
+            url_func=lambda system, arch, version:
+            f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
+        )
         download_and_copy(
-            name="nvcc", src_path=f"nvvm/bin", dst_path="bin",
-            version=NVIDIA_TOOLCHAIN_VERSION["nvcc"], url_func=lambda system, arch, version:
-            ((lambda version_major, version_minor1, version_minor2:
-            f"https://anaconda.org/nvidia/cuda-nvcc/{version}/download/{system}-{arch}/cuda-nvcc-{version}-0.tar.bz2")
-            (*version.split('.'))))
+            name="nvcc",
+            # src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas{exe_extension}",
+            src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/nvvm/bin",
+            dst_path="nvvm/bin",
+            version=NVIDIA_TOOLCHAIN_VERSION["nvcc"],
+            url_func=lambda system, arch, version:
+            f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
+        )
         base_dir = os.path.dirname(__file__)
         ctk_path_new = os.path.join(base_dir, os.pardir, "third_party", "nvidia", "backend", "bin")
         nvcc_path_new = os.path.join(ctk_path_new, f"nvcc{exe_extension}")
         # Need to append to path otherwise nvcc can't find cicc in nvvm/bin/cicc
-        os.environ["PATH"] = ctk_path_new + os.pathsep + os.environ["PATH"]
+        # nvcc 12.8 seems to hard-code looking for cicc in ../nvvm/bin/cicc
+        # os.environ["PATH"] = ctk_path_new + os.pathsep + os.environ["PATH"]
         os.environ["PYTORCH_NVCC"] = nvcc_path_new
         # Make nvcc executable, sometimes after the copy it loses its permissions
         os.chmod(nvcc_path_new, os.stat(nvcc_path_new).st_mode | stat.S_IEXEC)

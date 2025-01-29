@@ -44,7 +44,7 @@ Currently released:
 
 Requirements: H100 / H800 GPU, CUDA >= 12.3.
 
-For now, we highly recommend CUDA 12.3 for best performance.
+We highly recommend CUDA 12.8 for best performance.
 
 To install:
 ```sh
