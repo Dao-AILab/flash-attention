@@ -68,7 +68,7 @@ struct CollectiveMainloopFwdSm90 {
     // Leaving this option here for reference.
     static constexpr bool Mma0_is_RS = false;
     // We can have Mma1 (P @ V) with P in smem in rmem to reduce register pressure at the cost of more smem.
-    static_assert(!(!Mma1_is_RS && !IntraWGOverlap), "Mma1 must be RS if IntraWGOverlap is enabled");
+    static_assert(!(!Mma1_is_RS && !IntraWGOverlap), "Mma1 must be RS if IntraWGOverlap is disabled");
     static_assert(!(!Mma1_is_RS && Is_FP8), "Mma1 must be RS if FP8");
     static_assert(!(!Mma1_is_RS && Transpose_V), "Mma1 must be RS if Transpose_V");
 
