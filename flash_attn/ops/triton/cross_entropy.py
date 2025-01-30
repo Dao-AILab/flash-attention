@@ -166,6 +166,7 @@ class CrossEntropyLoss(torch.autograd.Function):
         if labels.dtype == torch.long and labels.data_ptr() % 16 != 0:
             labels = F.pad(labels, (0, 1))[..., :-1]
             assert labels.data_ptr() % 16 == 0
+        assert logit_scale > 0.0
         n_rows, n_cols = logits.shape
         assert labels.shape == (n_rows,)
         world_size = 1 if process_group is None else torch.distributed.get_world_size(process_group)
