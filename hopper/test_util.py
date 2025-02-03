@@ -37,15 +37,16 @@ def generate_qkv(
     Arguments:
         q: (batch_size, seqlen_q, nheads, d)
         k: (batch_size, seqlen_k, nheads_k, d)
-        v: (batch_size, seqlen_k, nheads_k, d)
+        v: (batch_size, seqlen_k, nheads_k, d_v)
         query_padding_mask: (batch_size, seqlen), bool
         key_padding_mask: (batch_size, seqlen), bool
     """
     assert not (kvpacked and qkvpacked)
     batch_size, seqlen_q, nheads, d = q.shape
+    d_v = v.shape[-1]
     _, seqlen_k, nheads_k, _ = k.shape
     assert k.shape == (batch_size, seqlen_k, nheads_k, d)
-    assert v.shape == (batch_size, seqlen_k, nheads_k, d)
+    assert v.shape == (batch_size, seqlen_k, nheads_k, d_v)
     if query_unused_mask is not None or key_unused_mask is not None:
         assert not kvpacked
         assert not qkvpacked
@@ -208,7 +209,7 @@ def attention_ref(
     Arguments:
         q: (batch_size, seqlen_q, nheads, head_dim)
         k: (batch_size, seqlen_k, nheads, head_dim)
-        v: (batch_size, seqlen_k, nheads, head_dim)
+        v: (batch_size, seqlen_k, nheads, head_dim_v)
         query_padding_mask: (batch_size, seqlen_q)
         key_padding_mask: (batch_size, seqlen_k)
         attn_bias: broadcastable to (batch_size, nheads, seqlen_q, seqlen_k)
@@ -221,7 +222,7 @@ def attention_ref(
             without changing the math. This is to estimate the numerical error from operation
             reordering.
     Output:
-        output: (batch_size, seqlen_q, nheads, head_dim)
+        output: (batch_size, seqlen_q, nheads, head_dim_v)
         attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
     """
     if causal:

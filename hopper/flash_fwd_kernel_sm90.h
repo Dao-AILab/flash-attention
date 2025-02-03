@@ -45,10 +45,11 @@ public:
     static constexpr bool Use_TMA_O = CollectiveEpilogue::Use_TMA_O;
     static constexpr bool PackGQA = CollectiveMainloop::PackGQA;
     static constexpr int NumProducerThreads = CollectiveMainloop::NumProducerThreads;
+    static constexpr bool SameHeadDim = CollectiveMainloop::SameHeadDim;
     using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
 
     // Mainloop derived types
-    using TileShape_MNK = typename CollectiveMainloop::TileShape_MNK;
+    using TileShape_MNK_PV = typename CollectiveMainloop::TileShape_MNK_PV;
     using TiledMma0 = typename CollectiveMainloop::TiledMma0;
     using TiledMma1 = typename CollectiveMainloop::TiledMma1;
     using ArchTag = typename CollectiveMainloop::ArchTag;
@@ -176,7 +177,7 @@ public:
 
         static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int MmaThreadOffset = NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
 
         using MainloopPipelineK = typename CollectiveMainloop::MainloopPipelineK;
         using MainloopPipelineV = typename CollectiveMainloop::MainloopPipelineV;
@@ -222,6 +223,11 @@ public:
             pipeline_params_k.producer_arv_count = NumProducerThreads;
         }
 
+        PipelineParamsV pipeline_params_v = pipeline_params_k;
+        if constexpr (Use_TMA_KV && !SameHeadDim) {
+            pipeline_params_v.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
+        }
+
         MainloopPipelineK pipeline_k = [&] {
             if constexpr (Use_TMA_KV) {
                 return MainloopPipelineK(shared_storage.pipelines.pipeline_k, pipeline_params_k, ClusterShape{});
@@ -234,9 +240,9 @@ public:
             if constexpr (!Transpose_V) {
                 static_assert(is_same_v<PipelineParamsK, PipelineParamsV>);
                 if constexpr (Use_TMA_KV) {
-                    return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_k, ClusterShape{});
+                    return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_v, ClusterShape{});
                 } else {
-                    return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_k);
+                    return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_v);
                 }
             } else {
                 PipelineParamsV pipeline_params_v;
@@ -256,11 +262,11 @@ public:
         // However, the thread role isn't used in the pipeline implementation.
         MainloopPipelineVt pipeline_vt = [&] {
             if constexpr (Use_TMA_KV) {
-                pipeline_params_k.num_consumers = NumProducerThreads; // TMA_V is only consumed by the producer WG
-                return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_k, ClusterShape{});
+                pipeline_params_v.num_consumers = NumProducerThreads; // TMA_V is only consumed by the producer WG
+                return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_v, ClusterShape{});
             } else {
-                pipeline_params_k.consumer_arv_count = NumProducerThreads; // TMA_V is only consumed by the producer WG
-                return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_k);
+                pipeline_params_v.consumer_arv_count = NumProducerThreads; // TMA_V is only consumed by the producer WG
+                return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_v);
             }
         }();
 
@@ -272,6 +278,9 @@ public:
         pipeline_params_kv_new.is_leader = warp_group_thread_idx == 0;
         pipeline_params_kv_new.num_consumers = NumMmaThreads;
         auto pipeline_k_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_k_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
+        if constexpr (!SameHeadDim) {
+            pipeline_params_kv_new.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
+        }
         auto pipeline_v_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_v_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
 
         CollectiveMainloop collective_mainloop;
@@ -357,7 +366,7 @@ public:
                  work_tile_info.is_valid(params.scheduler);
                  work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
                 // Attention output (GEMM-II) accumulator.
-                Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 2>(TileShape_MNK{}));
+                Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 1>(TileShape_MNK_PV{}));
                 float softmax_scale_log2 = params.mainloop.softmax_scale_log2;
                 // If there's tanh softcap, the scaling will be done before tanh.
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);

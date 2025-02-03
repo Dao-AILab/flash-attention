@@ -8,7 +8,7 @@
 
 // Return {kBlockM, kBlockN, Mma1_is_RS, IntraWGOverlap}
 constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
-        int headdim, bool is_causal, bool is_local, int element_size=2,
+        int headdim, int headdim_v, bool is_causal, bool is_local, int element_size=2,
         bool v_colmajor=false, bool paged_kv=false, bool softcap=false) {
     if (element_size == 2) {
         if (headdim <= 64) {
@@ -22,7 +22,7 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             // {128, 192, false, false} and {192, 128, false, true} are quite good too
             // 128 x 192 hits the limit of smem if Mma1_is_RS, 128 x 144 hits the limit if !Mma1_is_RS
         } else if (headdim <= 192) {
-            return {128, paged_kv || is_local ? 96 : 112, true, true};  // 128 x 112 hits the limit of smem
+            return {128, paged_kv || is_local ? 96 : (headdim_v <= 128 ? 128 : 112), true, true};  // 128 x 112 hits the limit of smem
         } else {
             return {128, is_local ? 64 : 80, true, true};  // 128 x 80 hits the limit of smem
         }
@@ -43,7 +43,7 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
 
 // Return {kBlockM, kBlockN, kNWarps, kStages, Q_in_regs}
 constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm8x(
-        bool sm86_or_89, int headdim, bool is_causal, bool is_local, int element_size=2,
+        bool sm86_or_89, int headdim, int headdim_v, bool is_causal, bool is_local, int element_size=2,
         bool paged_kv=false, bool varlen_and_split=false,
         bool softcap=false, bool append_kv=false) {
     if (element_size == 2) {
