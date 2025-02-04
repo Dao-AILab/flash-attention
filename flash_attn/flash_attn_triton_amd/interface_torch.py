@@ -1,7 +1,10 @@
+import os
 import torch
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .bwd_prefill import attention_prefill_backward_triton_impl
+from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
 from .fwd_decode import attention_decode_forward_triton_impl
+from .utils import USE_SINGLE_BWD_KERNEL
 
 
 class _attention_prefill(torch.autograd.Function):
@@ -42,7 +45,11 @@ class _attention_prefill(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do, *args):
         q, k, v, o, softmax_lse = ctx.saved_tensors
-        return attention_prefill_backward_triton_impl(
+        if USE_SINGLE_BWD_KERNEL:
+            bwd = attention_prefill_backward_triton_impl
+        else:
+            bwd = attention_prefill_backward_triton_split_impl
+        return bwd(
             do,
             q,
             k,

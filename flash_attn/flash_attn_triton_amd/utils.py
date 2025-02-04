@@ -11,7 +11,10 @@ import triton.language as tl
 AUTOTUNE = os.environ.get('FLASH_ATTENTION_TRITON_AMD_AUTOTUNE', '0').lower() in ('1', 'true', 'yes')
 DEBUG = os.environ.get('FLASH_ATTENTION_TRITON_AMD_DEBUG', '0').lower() in ('1', 'true', 'yes')
 PERF = os.environ.get('FLASH_ATTENTION_TRITON_AMD_PERF', '0').lower() in ('1', 'true', 'yes')
+USE_SINGLE_BWD_KERNEL = os.environ.get('USE_SINGLE_BWD_KERNEL', '0').lower() in ('1', 'true', 'yes')
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
+DEBUG_TRITON = os.environ.get('DEBUG_TRITON', '0').lower() in ('1', 'true', 'yes') and os.environ.get('TRITON_INTERPRET', '0').lower() in ('1', 'true', 'yes')
+DEBUG_TRITON_DETAIL = os.environ.get('DEBUG_TRITON_DETAIL', '0').lower() in ('1', 'true', 'yes')
 if USE_TRITON_ROCM: # TODO remove this
     random.seed(42)
 DROPOUT_USE_PYTORCH = False
@@ -313,6 +316,22 @@ def create_dropout_mask(dropout_p, shape, seed):
     device = "cuda"
     rand_vals = torch.rand(shape, generator=torch.Generator(device=device).manual_seed(seed), device=device, dtype=torch.float32)
     return rand_vals > dropout_p
+
+def create_dropout_mask_varlen(dropout_p, batch, nheads_q, cu_seqlens_q, cu_seqlens_k, philox_seed):
+    device = "cuda"
+    qlens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1])
+    klens = (cu_seqlens_k[1:] - cu_seqlens_k[:-1])
+    max_qlen = qlens.max()
+    max_klen = klens.max()
+    dropout_mask = torch.zeros((batch, nheads_q, max_qlen, max_klen), device=device)
+    for b in range(batch):
+        qlen = qlens[b]
+        klen = klens[b]
+        rand_vals = torch.rand((nheads_q, qlen, klen), generator=torch.Generator(device=device).manual_seed(philox_seed), device=device, dtype=torch.float32)
+        submask = rand_vals > dropout_p
+        dropout_mask[b, :, :qlen, :klen] = submask
+
+    return dropout_mask
 
 def write_dropout_mask(x, tensor_name = "tensor"):
     batch, head, seqlen_m, seqlen_n = x.shape

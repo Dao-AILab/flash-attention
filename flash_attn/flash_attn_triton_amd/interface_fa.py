@@ -2,10 +2,11 @@ import torch
 import os
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .bwd_prefill import attention_prefill_backward_triton_impl
+from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
 from .fwd_decode import attention_decode_forward_triton_impl
 from .fwd_ref import attention_forward_pytorch_ref_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
-from .utils import MetaData, get_shape_from_layout, DEBUG
+from .utils import MetaData, get_shape_from_layout, DEBUG, USE_SINGLE_BWD_KERNEL
 from einops import rearrange, repeat
 from flash_attn.layers.rotary import apply_rotary_emb
 
@@ -28,7 +29,7 @@ def fwd(q,
         descale_k,
         descale_v,
         descale_p):
-    
+
     if DEBUG:
         print()
         print("flash_attn_triton_amd.py::fwd")
@@ -58,38 +59,38 @@ def fwd(q,
         metadata.return_scores = True
 
     batch, nheads_q, nheads_k, head_size, _, _ = get_shape_from_layout(q, k, metadata.layout)
-    
+
     if causal:
         metadata.need_causal()
-    
+
     if alibi_slopes is not None:
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
-    
+
     if dropout_p > 0.0:
         metadata.need_dropout(dropout_p)
         rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset]) # as_tensors uses the underlying data and doesnot cast
     else:
         rng_state = None
-    
+
     # check arguments
     metadata.check_args(q, k, v, o)
 
-    # call implementation 
+    # call implementation
     if USE_REF:
         if DEBUG:
             print("Using reference implementation")
         output, softmax_lse, sd_mask = attention_forward_pytorch_ref_impl(
-                                                q, 
-                                                k, 
+                                                q,
+                                                k,
                                                 v,
-                                                metadata.sm_scale, 
+                                                metadata.sm_scale,
                                                 metadata.causal,
                                                 metadata.layout,
-                                                metadata.cu_seqlens_q, 
+                                                metadata.cu_seqlens_q,
                                                 metadata.cu_seqlens_k,
-                                                metadata.max_seqlens_q, 
+                                                metadata.max_seqlens_q,
                                                 metadata.max_seqlens_k,
-                                                metadata.dropout_p, 
+                                                metadata.dropout_p,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
                                                 metadata.use_exp2)
@@ -98,20 +99,20 @@ def fwd(q,
         if DEBUG:
             print("Using Triton implementation")
         output, softmax_lse, sd_mask = attention_prefill_forward_triton_impl(
-                                                q, 
-                                                k, 
-                                                v, 
-                                                o, 
-                                                metadata.sm_scale, 
-                                                metadata.alibi_slopes, 
-                                                metadata.causal, 
+                                                q,
+                                                k,
+                                                v,
+                                                o,
+                                                metadata.sm_scale,
+                                                metadata.alibi_slopes,
+                                                metadata.causal,
                                                 metadata.bias,
-                                                metadata.layout, 
-                                                metadata.cu_seqlens_q, 
+                                                metadata.layout,
+                                                metadata.cu_seqlens_q,
                                                 metadata.cu_seqlens_k,
-                                                metadata.max_seqlens_q, 
+                                                metadata.max_seqlens_q,
                                                 metadata.max_seqlens_k,
-                                                metadata.dropout_p, 
+                                                metadata.dropout_p,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
                                                 metadata.return_scores,
@@ -202,8 +203,8 @@ def bwd(
             None,
             None,
             None,
-            dropout_p, 
-            philox_seed, 
+            dropout_p,
+            philox_seed,
             philox_offset,
             False,
         )
@@ -214,7 +215,11 @@ def bwd(
     else:
         if DEBUG:
             print("Using Triton implementation")
-        dq_triton, dk_triton, dv_triton, delta_triton, _, _ = attention_prefill_backward_triton_impl(
+        if USE_SINGLE_BWD_KERNEL:
+            bwd = attention_prefill_backward_triton_impl
+        else:
+            bwd = attention_prefill_backward_triton_split_impl
+        _, _, _, delta_triton, _, _ = bwd(
             dout,
             q,
             k,
@@ -232,8 +237,8 @@ def bwd(
             None,
             None,
             None,
-            dropout_p, 
-            philox_seed, 
+            dropout_p,
+            philox_seed,
             philox_offset,
             False,
         )
@@ -247,9 +252,9 @@ def bwd(
     return dq, dk, dv, delta
 
 def varlen_fwd(
-        q, 
-        k, 
-        v, 
+        q,
+        k,
+        v,
         o,
         cu_seqlens_q,
         cu_seqlens_k,
@@ -308,13 +313,13 @@ def varlen_fwd(
 
     if alibi_slopes is not None:
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
-    
+
     if dropout_p > 0.0:
         metadata.need_dropout(dropout_p)
         rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset]) # as_tensors uses the underlying data and doesnot cast
     else:
         rng_state = None
-    
+
     # Check arguments
     metadata.check_args(q, k, v, o)
     if o is None:
@@ -325,17 +330,17 @@ def varlen_fwd(
         if DEBUG:
             print("Using reference implementation")
         output, softmax_lse, sd_mask = attention_forward_pytorch_ref_impl(
-                                                q, 
-                                                k, 
+                                                q,
+                                                k,
                                                 v,
-                                                metadata.sm_scale, 
+                                                metadata.sm_scale,
                                                 metadata.causal,
-                                                metadata.layout, 
-                                                metadata.cu_seqlens_q, 
+                                                metadata.layout,
+                                                metadata.cu_seqlens_q,
                                                 metadata.cu_seqlens_k,
-                                                metadata.max_seqlens_q, 
+                                                metadata.max_seqlens_q,
                                                 metadata.max_seqlens_k,
-                                                metadata.dropout_p, 
+                                                metadata.dropout_p,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
                                                 metadata.use_exp2)
@@ -344,23 +349,23 @@ def varlen_fwd(
         if DEBUG:
             print("Using Triton implementation")
         output, softmax_lse, sd_mask = attention_prefill_forward_triton_impl(
-                                                            q, 
-                                                            k, 
-                                                            v, 
-                                                            o, 
-                                                            metadata.sm_scale, 
-                                                            metadata.alibi_slopes, 
-                                                            metadata.causal, 
+                                                            q,
+                                                            k,
+                                                            v,
+                                                            o,
+                                                            metadata.sm_scale,
+                                                            metadata.alibi_slopes,
+                                                            metadata.causal,
                                                             metadata.bias,
-                                                            metadata.layout, 
-                                                            metadata.cu_seqlens_q, 
+                                                            metadata.layout,
+                                                            metadata.cu_seqlens_q,
                                                             metadata.cu_seqlens_k,
-                                                            metadata.max_seqlens_q, 
+                                                            metadata.max_seqlens_q,
                                                             metadata.max_seqlens_k,
-                                                            metadata.dropout_p, 
+                                                            metadata.dropout_p,
                                                             metadata.philox_seed,
-                                                            metadata.philox_offset, 
-                                                            metadata.return_scores, 
+                                                            metadata.philox_offset,
+                                                            metadata.return_scores,
                                                             metadata.use_exp2,
                                                             descale_q,
                                                             descale_k,
@@ -431,7 +436,7 @@ def varlen_bwd(
         philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
     else:
         philox_seed, philox_offset = None, None
-    
+
     # call implementation
     if USE_REF:
         if DEBUG:
@@ -450,9 +455,9 @@ def varlen_bwd(
             cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
-            dropout_p, 
+            dropout_p,
             philox_seed,
-            philox_offset, 
+            philox_offset,
             False,
         )
         dq.copy_(dq_ref)
@@ -462,7 +467,11 @@ def varlen_bwd(
     else:
         if DEBUG:
             print("Using Triton implementation")
-        dq_triton, dk_triton, dv_triton, delta_triton, _, _ = attention_prefill_backward_triton_impl(
+        if USE_SINGLE_BWD_KERNEL:
+            bwd = attention_prefill_backward_triton_impl
+        else:
+            bwd = attention_prefill_backward_triton_split_impl
+        dq_triton, dk_triton, dv_triton, delta_triton, _, _ = bwd(
             dout,
             q,
             k,
@@ -480,7 +489,7 @@ def varlen_bwd(
             cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
-            dropout_p, 
+            dropout_p,
             philox_seed,
             philox_offset,
             False,

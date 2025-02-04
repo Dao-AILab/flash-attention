@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, get_shape_from_layout, get_strides_from_layout, write_dropout_mask, create_dropout_mask
 
+# TODO: move this into utils.py so it's shared among kernels
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = DROPOUT_USE_PYTORCH
 tl_DROPOUT_DUMP: tl.constexpr = DROPOUT_DUMP
@@ -595,8 +596,6 @@ def attention_prefill_backward_triton_impl(
     ACTUAL_BLOCK_DMODEL = head_size
 
     do = do.contiguous()
-    # NOTE: we might need to copy the output tensor if they are not continuous or have other issues
-    copy_back = {"dq": False, "dk": False, "dv": False}
 
     # deal with dq
     if dq is None:
@@ -604,40 +603,13 @@ def attention_prefill_backward_triton_impl(
             dq = torch.zeros((num_blocks_n,) + q.shape, device=q.device, dtype=q.dtype)
         else:
             dq = torch.zeros(q.shape, device=q.device, dtype=q.dtype)
-    else:
-        dq_og = dq
-        if (not dq.is_contiguous()):
-            dq = dq.contiguous()
-            copy_back["dq"] = True
-
-        if sequence_parallel:
-            dq = torch.zeros((num_blocks_n,) + q.shape, device=q.device, dtype=q.dtype)
-            copy_back["dq"] = True
-        else:
-            # NOTE: the kernel does inplace accumlation so dq has to be zeros. This avoids the case where we are passed empty dq and it is not all zeros
-            dq.zero_()
     stride_dq_all = dq.stride()[0]
 
     # deal with dk, dv
     if (dk is None) or (dv is None):
         dk = torch.zeros_like(k)
         dv = torch.zeros_like(v)
-    else:
-        # store og
-        dk_og = dk
-        dv_og = dv
 
-
-        if (not dk.is_contiguous()):
-            dk = dk.contiguous()
-            copy_back["dk"] = True
-
-        if (not dv.is_contiguous()):
-            dv = dv.contiguous()
-            copy_back["dv"] = True
-
-    if DEBUG:
-        print("copy_back:", copy_back)
 
     # zero out
     dq.zero_()
@@ -786,15 +758,5 @@ def attention_prefill_backward_triton_impl(
             print("dropout_mask:", dropout_mask, dropout_mask.shape if dropout_mask is not None else None)
             print("dropout_fraction bwd:", 1.0 - (dropout_mask.sum()/ dropout_mask.numel()).item())
             write_dropout_mask(dropout_mask, "dropout_mask_bwd")
-
-    if copy_back["dq"]:
-        dq_og.copy_(dq)
-        dq = dq_og
-    if copy_back["dk"]:
-        dk_og.copy_(dk)
-        dk = dk_og
-    if copy_back["dv"]:
-        dv_og.copy_(dv)
-        dv = dv_og
 
     return dq, dk, dv, delta, None, None
