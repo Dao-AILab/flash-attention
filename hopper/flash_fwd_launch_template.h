@@ -126,7 +126,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<ElementOut*>(!Split ? params.o_ptr : params.oaccum_ptr),
-        {seqlen_q, params.d, params.h, batch_q, params.num_splits},  // shape_O
+        {seqlen_q, params.dv, params.h, batch_q, params.num_splits},  // shape_O
         {!Split ? params.o_row_stride : params.oaccum_row_stride,
          _1{},
          !Split ? params.o_head_stride : params.oaccum_head_stride,
