@@ -40,6 +40,8 @@ struct CollectiveEpilogueFwd {
     static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
     static constexpr int kHeadDimV = get<1>(TileShape_MNK_PV{});
 
+    static constexpr bool LargeHeadDimV = kHeadDimV > 256;
+
     using GmemTiledCopyOTMA = cute::SM90_TMA_STORE;
 
     // These are for storing the output tensor without TMA (e.g., for setting output to zero)
@@ -239,6 +241,7 @@ struct CollectiveEpilogueFwd {
         bool is_varlen = Varlen && params.cu_seqlens;
         int offset_o = seqlen_info.offset;
         int seqlen_o = seqlen_info.seqlen;
+        int warp_group_idx = __shfl_sync(0xFFFFFFFF, thread_idx / cutlass::NumThreadsPerWarpGroup, 0);
 
         // Step 2: Write LSE from rmem -> gmem
         auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
@@ -254,14 +257,16 @@ struct CollectiveEpilogueFwd {
 
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE + offset_o * get<0>(params.stride_LSE)), params.shape_LSE_packed, params.stride_LSE_packed)(_, bidh, !is_varlen ? bidb : 0, split_idx);
         // if (thread_idx == 0) { printf("Before LSE write, m_block: %d, bidh: %d, bidb: %d, split_idx: %d, offset_o: %d, seqlen_o: %d\n", m_block, bidh, bidb, split_idx, offset_o, seqlen_o); print(mLSE); printf("\n"); }
-        if constexpr (!PackGQA) {
-            #pragma unroll
-            for (int mi = 0; mi < size(lse); ++mi) {
-                int const row = m_block * kBlockM + get<0>(taccOcO_row(mi));
-                if (get<1>(taccOcO_row(_0{})) == 0 && row < seqlen_o) { mLSE(row) = lse(mi); }
+        if (!LargeHeadDimV || warp_group_idx == 0) {
+            if constexpr (!PackGQA) {
+                #pragma unroll
+                for (int mi = 0; mi < size(lse); ++mi) {
+                    int const row = m_block * kBlockM + get<0>(taccOcO_row(mi));
+                    if (get<1>(taccOcO_row(_0{})) == 0 && row < seqlen_o) { mLSE(row) = lse(mi); }
+                }
+            } else {
+                PackGQAt::store_LSE(mLSE, lse, tiled_mma, params.qhead_per_khead_divmod, thread_idx, seqlen_o, m_block);
             }
-        } else {
-            PackGQAt::store_LSE(mLSE, lse, tiled_mma, params.qhead_per_khead_divmod, thread_idx, seqlen_o, m_block);
         }
 
         // Step 3: Write O from smem -> gmem
