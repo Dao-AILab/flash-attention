@@ -117,7 +117,7 @@ struct PagedKVManager {
         Tensor cV = cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDimV>>{});  // (BLK_N,BLK_K) -> (blk_n,blk_k)
         Tensor tVcV = gmem_thr_copy_kv.partition_S(cV);
         #pragma unroll
-        for (int k = 0; k < size<1>(tVpV_); ++k) { tVpV_(_0{}, k) = get<1>(tVcV(_0{}, _0{}, k)) < get<1>(shape_K); }
+        for (int k = 0; k < size<1>(tVpV_); ++k) { tVpV_(_0{}, k) = get<1>(tVcV(_0{}, _0{}, k)) < get<1>(shape_V); }
         tVpV = cute::conditional_return<SameHeadDim>(tKpK, tVpV_);
     };
 
