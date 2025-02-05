@@ -45,11 +45,13 @@ public:
     static constexpr bool Use_TMA_O = CollectiveEpilogue::Use_TMA_O;
     static constexpr bool PackGQA = CollectiveMainloop::PackGQA;
     static constexpr int NumProducerThreads = CollectiveMainloop::NumProducerThreads;
+    static constexpr bool SameHeadDim = CollectiveMainloop::SameHeadDim;
+    static constexpr bool LargeHeadDimV = CollectiveMainloop::LargeHeadDimV;
+    static_assert(CollectiveMainloop::LargeHeadDimV == CollectiveEpilogue::LargeHeadDimV);
     using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
 
     // Mainloop derived types
-    using TileShape_MNK = typename CollectiveMainloop::TileShape_MNK;
-    using TiledMma0 = typename CollectiveMainloop::TiledMma0;
+    using TileShape_MNK_PV = typename CollectiveMainloop::TileShape_MNK_PV;
     using TiledMma1 = typename CollectiveMainloop::TiledMma1;
     using ArchTag = typename CollectiveMainloop::ArchTag;
     using ClusterShape = typename CollectiveMainloop::ClusterShape;
@@ -68,8 +70,8 @@ public:
     using TileSchedulerParams = typename TileScheduler::Params;
 
     static constexpr uint32_t NumLoadWarpGroups = 1;
-    static constexpr uint32_t NumMmaWarpGroups = CUTE_STATIC_V(size(TiledMma0{})) / cutlass::NumThreadsPerWarpGroup;
-    static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma0{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup);
+    static constexpr uint32_t NumMmaWarpGroups = CUTE_STATIC_V(size(TiledMma1{})) / cutlass::NumThreadsPerWarpGroup;
+    static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma1{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup);
     static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
     static_assert(NumMmaWarpGroups == 1 || NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
 
@@ -176,7 +178,7 @@ public:
 
         static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int MmaThreadOffset = NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
 
         using MainloopPipelineK = typename CollectiveMainloop::MainloopPipelineK;
         using MainloopPipelineV = typename CollectiveMainloop::MainloopPipelineV;
@@ -216,10 +218,18 @@ public:
         if constexpr (Use_TMA_KV) {
             pipeline_params_k.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
             pipeline_params_k.is_leader = warp_group_thread_idx == 0;
-            pipeline_params_k.num_consumers = NumMmaThreads;
+            pipeline_params_k.num_consumers = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup;
         } else {
-            pipeline_params_k.consumer_arv_count = NumMmaThreads;
+            pipeline_params_k.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup;
             pipeline_params_k.producer_arv_count = NumProducerThreads;
+        }
+
+        PipelineParamsV pipeline_params_v = pipeline_params_k;
+        if constexpr (Use_TMA_KV && !SameHeadDim) {
+            pipeline_params_v.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
+            if constexpr (LargeHeadDimV) { pipeline_params_v.num_consumers = NumMmaThreads; }
+        } else {
+            if constexpr (LargeHeadDimV) { pipeline_params_v.consumer_arv_count = NumMmaThreads; }
         }
 
         MainloopPipelineK pipeline_k = [&] {
@@ -234,9 +244,9 @@ public:
             if constexpr (!Transpose_V) {
                 static_assert(is_same_v<PipelineParamsK, PipelineParamsV>);
                 if constexpr (Use_TMA_KV) {
-                    return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_k, ClusterShape{});
+                    return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_v, ClusterShape{});
                 } else {
-                    return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_k);
+                    return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_v);
                 }
             } else {
                 PipelineParamsV pipeline_params_v;
@@ -256,11 +266,11 @@ public:
         // However, the thread role isn't used in the pipeline implementation.
         MainloopPipelineVt pipeline_vt = [&] {
             if constexpr (Use_TMA_KV) {
-                pipeline_params_k.num_consumers = NumProducerThreads; // TMA_V is only consumed by the producer WG
-                return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_k, ClusterShape{});
+                pipeline_params_v.num_consumers = NumProducerThreads; // TMA_V is only consumed by the producer WG
+                return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_v, ClusterShape{});
             } else {
-                pipeline_params_k.consumer_arv_count = NumProducerThreads; // TMA_V is only consumed by the producer WG
-                return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_k);
+                pipeline_params_v.consumer_arv_count = NumProducerThreads; // TMA_V is only consumed by the producer WG
+                return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_v);
             }
         }();
 
@@ -272,6 +282,9 @@ public:
         pipeline_params_kv_new.is_leader = warp_group_thread_idx == 0;
         pipeline_params_kv_new.num_consumers = NumMmaThreads;
         auto pipeline_k_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_k_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
+        if constexpr (!SameHeadDim) {
+            pipeline_params_kv_new.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
+        }
         auto pipeline_v_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_v_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
 
         CollectiveMainloop collective_mainloop;
@@ -357,7 +370,7 @@ public:
                  work_tile_info.is_valid(params.scheduler);
                  work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
                 // Attention output (GEMM-II) accumulator.
-                Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 2>(TileShape_MNK{}));
+                Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 1>(TileShape_MNK_PV{}));
                 float softmax_scale_log2 = params.mainloop.softmax_scale_log2;
                 // If there's tanh softcap, the scaling will be done before tanh.
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
@@ -369,7 +382,7 @@ public:
                     float const k_descale = params.mainloop.ptr_k_descale == nullptr ? 1.0f : params.mainloop.ptr_k_descale[bidb * get<0>(params.mainloop.stride_k_descale) + bidh_kv * get<1>(params.mainloop.stride_k_descale)];
                     softmax_scale_log2 *= q_descale * k_descale;
                 }
-                flash::Softmax<2 * (2 * kBlockM / NumMmaThreads), /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
+                flash::Softmax<!LargeHeadDimV ? 2 * (2 * kBlockM / NumMmaThreads) : 2, /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
 
                 SeqlenInfo_t seqlen_info{
                     bidb,
@@ -395,9 +408,22 @@ public:
                         // if (threadIdx.x == 128) { printf("Consumer: After sync\n"); }
                     }
                 }
-                bool tile_valid = collective_mainloop.mma(
-                    params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
-                    tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
+                bool tile_valid;
+                if constexpr (!LargeHeadDimV) {
+                    tile_valid = collective_mainloop.mma(
+                        params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
+                        tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
+                } else {  // mma1_only might not compile if !LargeHeadDimV
+                    if (warp_group_idx == 1) {
+                        tile_valid = collective_mainloop.mma(
+                            params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
+                            tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
+                    } else {
+                        tile_valid = collective_mainloop.mma1_only(
+                            params.mainloop, pipeline_v, smem_pipe_read,
+                            tOrO, softmax, threadIdx.x - MmaThreadOffset, seqlen_info, block_coord, shared_storage);
+                    }
+                }
                 if (tile_valid) {
                     // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
                     collective_epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma1,

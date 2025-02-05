@@ -24,7 +24,7 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
 
     typename CombineKernel::Arguments args {
         static_cast<ElementPartial const*>(params.oaccum_ptr),
-        {!Varlen ? params.seqlen_q : params.total_q, params.d, params.num_splits, params.h, !Varlen ? params.b : 1},  // shape_O_partial
+        {!Varlen ? params.seqlen_q : params.total_q, params.dv, params.num_splits, params.h, !Varlen ? params.b : 1},  // shape_O_partial
         {params.oaccum_row_stride, _1{}, params.oaccum_split_stride, params.oaccum_head_stride, !Varlen ? params.oaccum_batch_stride : 0},  // stride_O_partial
         static_cast<float*>(params.softmax_lseaccum_ptr),
         {!Varlen ? params.seqlen_q : params.total_q, params.num_splits, params.h, !Varlen ? params.b : 1},  // shape_LSE_partial
