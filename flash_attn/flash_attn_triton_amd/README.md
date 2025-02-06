@@ -43,6 +43,24 @@ python setup.py install
 pytest tests/test_flash_attn_triton_amd.py
 ```
 
+###### Docker
+We have also created a Dockerfile.
+
+To build the docker file
+```
+cd flash_attn/flash_attn_triton_amd
+docker build -t fa_triton .
+```
+
+To run the docker image
+```
+docker run -it --network=host --user root --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ipc=host --shm-size 16G --device=/dev/kfd --device=/dev/dri fa_triton
+```
+Inside the docker, it should open to the flash attention repo with everything installed. You can run the following command to test things.
+```
+pytest tests/test_flash_attn_triton_amd.py
+``` 
+
 ##### Credits
 AMD Triton kernels team
 

@@ -1,5 +1,7 @@
 import torch
 import pytest
+import numpy as np
+from flash_attn import flash_attn_func, flash_attn_varlen_func
 
 from .utils import DEBUG, DEBUG_TRITON, DEBUG_TRITON_DETAIL, MetaData, get_input_shapes, input_helper, varlen_input_helper, compute_alibi_tensor_ref, get_arch, arch_supports_fp8
 from .interface_torch import attention_prefill, attention_decode
@@ -9,9 +11,11 @@ from .bwd_prefill import attention_prefill_backward_triton_impl
 from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
 from .fwd_decode import dequantize_kv_fp16, quantize_kv_int4
+
+# set print options
 torch.set_printoptions(linewidth=5e5, edgeitems=10, sci_mode=False)
-import numpy as np
 np.set_printoptions(linewidth=5000, threshold=1e4, suppress=True, precision=4)
+
 # defailt fp16 tolerance is ATOL, RTOL = 1e-5, 1e-3. See table https://pytorch.org/docs/stable/testing.html
 ATOL, RTOL = 1e-2, 1e-2 # old standard. maybe to lose. 
 # ATOL, RTOL = 1e-3, 1e-3  # catchs fa mismatch issues
@@ -780,7 +784,7 @@ def test_op_fwd_decode_int4_kv(B, Mq, Mkv, Hq, Hkv, K, dtype=torch.float16):
 def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, DEBUG_INPUT):
     device = "cuda"
     window_size =  (-1, -1)
-    softcap = None
+    softcap = 0.0
     alibi_slopes = None
     deterministic = False
     layout = "bshd"
@@ -901,7 +905,7 @@ def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, 
 def test_op_prefill_varlen_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, DEBUG_INPUT):
     device = "cuda"
     window_size =  (-1, -1)
-    softcap = None
+    softcap = 0.0
     alibi_slopes = None
     deterministic = False
     layout = "thd"
