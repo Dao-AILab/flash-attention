@@ -52,7 +52,7 @@ public:
 
     // Mainloop derived types
     using TileShape_MNK_PV = typename CollectiveMainloop::TileShape_MNK_PV;
-    using TiledMma1 = typename CollectiveMainloop::TiledMma1;
+    using TiledMmaPV = typename CollectiveMainloop::TiledMmaPV;
     using ArchTag = typename CollectiveMainloop::ArchTag;
     using ClusterShape = typename CollectiveMainloop::ClusterShape;
     using MainloopArguments = typename CollectiveMainloop::Arguments;
@@ -70,8 +70,8 @@ public:
     using TileSchedulerParams = typename TileScheduler::Params;
 
     static constexpr uint32_t NumLoadWarpGroups = 1;
-    static constexpr uint32_t NumMmaWarpGroups = CUTE_STATIC_V(size(TiledMma1{})) / cutlass::NumThreadsPerWarpGroup;
-    static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma1{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup);
+    static constexpr uint32_t NumMmaWarpGroups = CUTE_STATIC_V(size(TiledMmaPV{})) / cutlass::NumThreadsPerWarpGroup;
+    static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMmaPV{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup);
     static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
     static_assert(NumMmaWarpGroups == 1 || NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
 
@@ -354,7 +354,7 @@ public:
 
             TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
             // Initialize matmul objects.
-            TiledMma1 tiled_mma1;
+            TiledMmaPV tiled_mma_pv;
 
             PipelineState smem_pipe_read;
             PipelineState smem_pipe_read_new;
@@ -370,7 +370,7 @@ public:
                  work_tile_info.is_valid(params.scheduler);
                  work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
                 // Attention output (GEMM-II) accumulator.
-                Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 1>(TileShape_MNK_PV{}));
+                Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
                 float softmax_scale_log2 = params.mainloop.softmax_scale_log2;
                 // If there's tanh softcap, the scaling will be done before tanh.
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
@@ -413,20 +413,20 @@ public:
                     tile_valid = collective_mainloop.mma(
                         params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
-                } else {  // mma1_only might not compile if !LargeHeadDimV
+                } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = collective_mainloop.mma(
                             params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
                     } else {
-                        tile_valid = collective_mainloop.mma1_only(
+                        tile_valid = collective_mainloop.mma_pv(
                             params.mainloop, pipeline_v, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, seqlen_info, block_coord, shared_storage);
                     }
                 }
                 if (tile_valid) {
                     // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
-                    collective_epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
+                    collective_epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma_pv,
                                             threadIdx.x - MmaThreadOffset, block_coord);
                 } else {
                     // Write 0 to gO and -inf to gLSE.
