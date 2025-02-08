@@ -90,7 +90,7 @@ public:
     static constexpr int mainloop_smem_padding_ = int(sizeof(typename CollectiveEpilogue::TensorStorage)) - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)));
     static constexpr int mainloop_smem_padding = mainloop_smem_padding_ < 0 ? 0 : mainloop_smem_padding_;
     struct SharedStorage {
-        struct TensorStorage : cute::aligned_struct<128> {
+        struct TensorStorage : cute::aligned_struct<128, _1> {
             union {
                 struct {
                     cute::array<uint32_t, mainloop_smem_padding / sizeof(uint32_t)> padding_;
@@ -100,8 +100,7 @@ public:
                 typename CollectiveEpilogue::TensorStorage epilogue;
             };
         } tensors;
-
-        struct PipelineStorage : cute::aligned_struct<16> {
+        struct PipelineStorage : cute::aligned_struct<16, _1> {
             alignas(16) BarrierQ barrier_Q;
             alignas(16) cutlass::arch::ClusterBarrier barrier_O;
             alignas(16) typename CollectiveMainloop::MainloopPipelineK::SharedStorage pipeline_k;
