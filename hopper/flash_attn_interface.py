@@ -22,6 +22,7 @@ def _flash_attn_forward(
         v,
         k_new,
         v_new,
+        qv,
         out,
         cu_seqlens_q,
         cu_seqlens_k,
@@ -64,6 +65,7 @@ def _flash_attn_forward(
         v,
         k_new,
         v_new,
+        qv,
         out,
         cu_seqlens_q,
         cu_seqlens_k,
@@ -239,6 +241,7 @@ class FlashAttnFunc(torch.autograd.Function):
         v,
         softmax_scale,
         causal,
+        qv=None,
         q_descale=None, k_descale=None, v_descale=None,
         window_size=(-1, -1),
         sink_token_length=0,
@@ -249,13 +252,14 @@ class FlashAttnFunc(torch.autograd.Function):
         sm_margin=0,
     ):
         if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
+            softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         # out, q, k, v, out_padded, softmax_lse = _flash_attn_forward(
         out, softmax_lse, *rest = _flash_attn_forward(
             q,
             k,
             v,
             None, None,  # k_new, v_new
+            qv,  # qv
             None,  # out
             None, None, None,   # cu_seqlens_q/k/k_new
             None, None,   # seqused_q/k
@@ -311,7 +315,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -330,6 +334,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         max_seqlen_k,
         softmax_scale,
         causal,
+        qv=None,
         q_descale=None, k_descale=None, v_descale=None,
         window_size=(-1, -1),
         sink_token_length=0,
@@ -340,13 +345,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         sm_margin=0,
     ):
         if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
+            softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         # out, q, k, v, out_padded, softmax_lse = _flash_attn_varlen_forward(
         out, softmax_lse, *rest = _flash_attn_forward(
             q,
             k,
             v,
             None, None,  # k_new, v_new
+            qv,  # qv
             None,  # out
             cu_seqlens_q,
             cu_seqlens_k,
@@ -411,7 +417,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -478,6 +484,7 @@ def flash_attn_func(
     v,
     softmax_scale=None,
     causal=False,
+    qv=None,
     q_descale=None, k_descale=None, v_descale=None,
     window_size=(-1, -1),
     sink_token_length=0,
@@ -538,6 +545,7 @@ def flash_attn_func(
         v,
         softmax_scale,
         causal,
+        qv,
         q_descale, k_descale, v_descale,
         window_size,
         sink_token_length,
@@ -561,6 +569,7 @@ def flash_attn_varlen_func(
     max_seqlen_k,
     softmax_scale=None,
     causal=False,
+    qv=None,
     q_descale=None, k_descale=None, v_descale=None,
     window_size=(-1, -1),
     sink_token_length=0,
@@ -582,6 +591,7 @@ def flash_attn_varlen_func(
         max_seqlen_k,
         softmax_scale,
         causal,
+        qv,
         q_descale, k_descale, v_descale,
         window_size,
         sink_token_length,
@@ -603,6 +613,7 @@ def flash_attn_with_kvcache(
     v_cache,
     k=None,
     v=None,
+    qv=None,
     rotary_cos=None,
     rotary_sin=None,
     cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
@@ -673,11 +684,12 @@ def flash_attn_with_kvcache(
         k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no page_table,
             or (num_blocks, page_block_size, nheads_k, headdim) if there's a page_table (i.e. paged KV cache)
             page_block_size must be a multiple of 256.
-        v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no _table,
-            or (num_blocks, page_block_size, nheads_k, headdim) if there's a page_table (i.e. paged KV cache)
+        v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim_v) if there's no page_table,
+            or (num_blocks, page_block_size, nheads_k, headdim_v) if there's a page_table (i.e. paged KV cache)
         k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
             k with k_cache, starting at the indices specified by cache_seqlens.
-        v [optional]: (batch_size, seqlen_new, nheads_k, headdim). Similar to k.
+        v [optional]: (batch_size, seqlen_new, nheads_k, headdim_v). Similar to k.
+        qv [optional]: (batch_size, seqlen, nheads, headdim_v)
         rotary_cos [optional]: (seqlen_ro, rotary_dim / 2). If not None, we apply rotary embedding
             to k and q. Only applicable if k and v are passed in. rotary_dim must be divisible by 16.
         rotary_sin [optional]: (seqlen_ro, rotary_dim / 2). Similar to rotary_cos.
@@ -714,7 +726,7 @@ def flash_attn_with_kvcache(
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
     if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
+        softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
@@ -726,6 +738,7 @@ def flash_attn_with_kvcache(
         v_cache,
         k,
         v,
+        qv,
         None,  # out
         cu_seqlens_q,
         None,  # cu_seqlens_k

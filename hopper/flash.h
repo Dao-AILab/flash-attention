@@ -104,6 +104,11 @@ struct Flash_fwd_params : public Qkv_params {
     index_t knew_head_stride;
     index_t vnew_head_stride;
 
+    void *__restrict__ qv_ptr;
+    index_t qv_batch_stride;
+    index_t qv_row_stride;
+    index_t qv_head_stride;
+
     // The cos and sin matrices for rotary embedding.
     void * __restrict__ rotary_cos_ptr;
     void * __restrict__ rotary_sin_ptr;

@@ -487,6 +487,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         const at::Tensor &v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table.
         std::optional<const at::Tensor> &k_new_,  // (b, s_k_new, h_k, d) or (total_k_new, h_k, d) if there is cu_seqlens_k_new
         std::optional<const at::Tensor> &v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
+        std::optional<const at::Tensor> &q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
         std::optional<at::Tensor> &out_,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
         std::optional<const at::Tensor> &cu_seqlens_q_,  // b+1
         std::optional<const at::Tensor> &cu_seqlens_k_,  // b+1
@@ -762,6 +763,30 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         }
         if (is_varlen_k_new) {
             params.cu_seqlens_knew = static_cast<int*>(cu_seqlens_k_new.data_ptr());
+        }
+    }
+
+    if (q_v_.has_value()) {
+        TORCH_CHECK(false, "q_v should be None for now");
+        TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
+        TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
+                    "q_v is only supported for fp16 and bf16 data type");
+        TORCH_CHECK(params.arch == 90, "q_v is only supported for Hopper GPUs");
+        at::Tensor q_v = q_v_.value();
+        TORCH_CHECK(q_v.dtype() == q_type, "q_v must have the same dtype as query");
+        CHECK_DEVICE(q_v);
+        TORCH_CHECK(q_v.stride(-1) == 1, "q_v tensor must have contiguous last dimension");
+        if (!is_varlen_q) {
+            CHECK_SHAPE(q_v, batch_size, seqlen_q, num_heads, head_size_v);
+        } else {
+            CHECK_SHAPE(q_v, total_q, num_heads, head_size_v);
+        }
+        params.qv_ptr = q_v.data_ptr();
+        // All stride are in elements, not bytes.
+        params.qv_row_stride = q_v.stride(-3);
+        params.qv_head_stride = q_v.stride(-2);
+        if (!is_varlen_q) {
+            params.qv_batch_stride = q_v.stride(0);
         }
     }
 

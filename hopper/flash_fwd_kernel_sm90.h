@@ -40,6 +40,7 @@ public:
     static constexpr bool Is_FP8 = CollectiveMainloop::Is_FP8;
     static constexpr bool Transpose_V = CollectiveMainloop::Transpose_V;
     static constexpr bool AppendKV = CollectiveMainloop::AppendKV;
+    static constexpr bool HasQv = CollectiveMainloop::HasQv;
     static constexpr bool Use_TMA_Q = CollectiveMainloop::Use_TMA_Q;
     static constexpr bool Use_TMA_KV = CollectiveMainloop::Use_TMA_KV;
     static constexpr bool Use_TMA_O = CollectiveEpilogue::Use_TMA_O;
@@ -102,6 +103,7 @@ public:
         } tensors;
         struct PipelineStorage : cute::aligned_struct<16, _1> {
             alignas(16) BarrierQ barrier_Q;
+            alignas(16) BarrierQ barrier_Qv;
             alignas(16) cutlass::arch::ClusterBarrier barrier_O;
             alignas(16) typename CollectiveMainloop::MainloopPipelineK::SharedStorage pipeline_k;
             alignas(16) typename CollectiveMainloop::MainloopPipelineV::SharedStorage pipeline_v;
@@ -206,6 +208,9 @@ public:
 
         if (warp_idx == 0 && lane_predicate) {
             shared_storage.pipelines.barrier_Q.init(Use_TMA_Q ? 1 : NumProducerThreads /*numThreads*/);
+            if constexpr (HasQv) {
+                shared_storage.pipelines.barrier_Qv.init(Use_TMA_Q ? 1 : NumProducerThreads /*numThreads*/);
+            }
             shared_storage.pipelines.barrier_O.init(size(ClusterShape{}) * (Use_TMA_O ? 1 : NumMmaThreads) /*numThreads*/);
         }
 

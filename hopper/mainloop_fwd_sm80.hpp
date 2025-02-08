@@ -185,6 +185,8 @@ struct CollectiveMainloopFwdSm80 {
         StrideQK const stride_K_new;
         Element const* const ptr_V_new;
         StrideV const stride_V_new;
+        Element const* const ptr_Qv;
+        StrideQK const stride_Qv;
         Element const* const ptr_rotary_cos;
         ShapeRotary const shape_rotary;
         StrideRotary const stride_rotary_cos;
