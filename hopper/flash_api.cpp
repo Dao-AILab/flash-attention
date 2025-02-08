@@ -429,7 +429,8 @@ inline int get_num_splits(Flash_fwd_params const& params) {
         : std::max(0, std::min(params.seqlen_k, params.window_size_right + params.window_size_left + 1 + kBlockM));
     int const num_n_blocks = (seqlen_k_loaded + kBlockN - 1) / kBlockN;
     int const num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
-    return num_splits_heuristic(params.b * (!params.pack_gqa ? params.h : params.h_k) * num_m_blocks, params.num_sm, num_n_blocks, 128);
+    // Always enable PackGQA for Split
+    return num_splits_heuristic(params.b * params.h_k * num_m_blocks, params.num_sm, num_n_blocks, 128);
     // return num_splits_heuristic(params.b * params.h_k * num_m_blocks, params.b * params.h_k,
     //                             params.num_sm, num_n_blocks, 128, params.d_rounded);
     #endif
@@ -715,9 +716,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     params.page_size = page_size;
     params.num_pages = num_pages;
 
-    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
-    // get_num_splits need params.pack_gqa to decide
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
+    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
 
     if (k_new_.has_value()) {
         at::Tensor k_new, v_new;
