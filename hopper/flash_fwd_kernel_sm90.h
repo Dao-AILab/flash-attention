@@ -223,12 +223,13 @@ public:
             pipeline_params_k.producer_arv_count = NumProducerThreads;
         }
 
-        PipelineParamsV pipeline_params_v = pipeline_params_k;
+        static_assert(is_same_v<PipelineParamsK, PipelineParamsVt>);
+        PipelineParamsVt pipeline_params_vt = pipeline_params_k;
         if constexpr (Use_TMA_KV && !SameHeadDim) {
-            pipeline_params_v.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
-            if constexpr (LargeHeadDimV) { pipeline_params_v.num_consumers = NumMmaThreads; }
+            pipeline_params_vt.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
+            if constexpr (LargeHeadDimV) { pipeline_params_vt.num_consumers = NumMmaThreads; }
         } else {
-            if constexpr (LargeHeadDimV) { pipeline_params_v.consumer_arv_count = NumMmaThreads; }
+            if constexpr (LargeHeadDimV) { pipeline_params_vt.consumer_arv_count = NumMmaThreads; }
         }
 
         MainloopPipelineK pipeline_k = [&] {
@@ -243,9 +244,9 @@ public:
             if constexpr (!Transpose_V) {
                 static_assert(is_same_v<PipelineParamsK, PipelineParamsV>);
                 if constexpr (Use_TMA_KV) {
-                    return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_v, ClusterShape{});
+                    return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_vt, ClusterShape{});
                 } else {
-                    return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_v);
+                    return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_vt);
                 }
             } else {
                 PipelineParamsV pipeline_params_v;
@@ -257,7 +258,6 @@ public:
                 return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_v);
             }
         }();
-        static_assert(is_same_v<PipelineParamsK, PipelineParamsVt>);
         // If we need to transpose V (e.g. FP8 and V is row-major), we use pipeline_vt for the TMA, then
         // the producer WG will read from pipeline_vt and write to pipeline_v.
         // If we don't need to transpose V, we use pipeline_v for the TMA, and pipeline_vt won't be used.
@@ -265,11 +265,11 @@ public:
         // However, the thread role isn't used in the pipeline implementation.
         MainloopPipelineVt pipeline_vt = [&] {
             if constexpr (Use_TMA_KV) {
-                pipeline_params_v.num_consumers = NumProducerThreads; // TMA_V is only consumed by the producer WG
-                return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_v, ClusterShape{});
+                pipeline_params_vt.num_consumers = NumProducerThreads; // TMA_V is only consumed by the producer WG
+                return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_vt, ClusterShape{});
             } else {
-                pipeline_params_v.consumer_arv_count = NumProducerThreads; // TMA_V is only consumed by the producer WG
-                return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_v);
+                pipeline_params_vt.consumer_arv_count = NumProducerThreads; // TMA_V is only consumed by the producer WG
+                return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_vt);
             }
         }();
 
