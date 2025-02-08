@@ -16,9 +16,9 @@
 
 using namespace cute;
 
-template <int kHeadDim, int kBlockM, int kLogMaxSplits, bool IsEvenK, bool Varlen, typename Element, typename ElementPartial>
+template <int kBlockM, int kBlockK, int kLogMaxSplits, bool IsEvenK, bool Varlen, typename Element, typename ElementPartial>
 void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
-    using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
+    using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kBlockK>>;
     using CombineKernel = flash::FlashAttnFwdCombine<TileShape_MK, kLogMaxSplits, 256 /*kNThreads*/, 1 /*AlignmentLSE*/,
                                                      IsEvenK, Varlen, Element, ElementPartial, cutlass::arch::Sm80>;
 
@@ -37,8 +37,9 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
     };
 
     typename CombineKernel::Params kernel_params = CombineKernel::to_underlying_arguments(args);
+    int num_blocks_k = cute::ceil_div(params.dv, kBlockK);
     int num_blocks_m = cute::ceil_div(params.seqlen_q * params.h * (!Varlen ? params.b : 1), kBlockM);
-    dim3 grid_m(num_blocks_m, !Varlen ? 1 : params.b);
+    dim3 grid_m(num_blocks_k, num_blocks_m, !Varlen ? 1 : params.b);
     auto kernel = cutlass::device_kernel<CombineKernel>;
     int smem_size = CombineKernel::SharedStorageSize;
     if (smem_size >= 48 * 1024) {
@@ -48,27 +49,27 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-template<typename T, typename Tpartial, int kHeadDim>
+template<typename T, typename Tpartial, int kBlockK>
 void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream) {
     // We want kBlockM to be as small as possible to maximize parallelism.
     // E.g., if hdim is 64, we want kBlockM to be 16 so that we can use 256 threads, each reading 4 elements (floats).
-    static_assert(kHeadDim % 32 == 0, "kHeadDim must be a multiple of 32");
-    static constexpr int kBlockM = kHeadDim % 128 == 0 ? 8 : (kHeadDim % 64 == 0 ? 16 : 32);
+    static_assert(kBlockK % 32 == 0, "kBlockK must be a multiple of 32");
+    static constexpr int kBlockM = kBlockK % 128 == 0 ? 8 : (kBlockK % 64 == 0 ? 16 : 32);
     BOOL_SWITCH(params.seqused_q != nullptr, Varlen, [&] {
         if constexpr (kBlockM >= 16) {  // If kBlockM == 8 then the minimum number of splits is 32.
             if (params.num_splits <= 16) {
-                run_flash_fwd_combine<kHeadDim, kBlockM, 4, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream);
+                run_flash_fwd_combine<kBlockM, kBlockK, 4, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream);
                 return;
             }
         }
         if (params.num_splits <= 32) {
-            run_flash_fwd_combine<kHeadDim, kBlockM, 5, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream);
+            run_flash_fwd_combine<kBlockM, kBlockK, 5, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream);
         } else if (params.num_splits <= 64) {
-            run_flash_fwd_combine<kHeadDim, kBlockM, 6, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream);
+            run_flash_fwd_combine<kBlockM, kBlockK, 6, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream);
         } else if (params.num_splits <= 128) {
-            run_flash_fwd_combine<kHeadDim, kBlockM, 7, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream);
+            run_flash_fwd_combine<kBlockM, kBlockK, 7, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream);
         } else {
-            run_flash_fwd_combine<kHeadDim, kBlockM, 8, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream);
+            run_flash_fwd_combine<kBlockM, kBlockK, 8, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream);
         }
     });
 }

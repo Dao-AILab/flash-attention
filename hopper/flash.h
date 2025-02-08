@@ -207,5 +207,5 @@ template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool Pa
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
 template <int Arch, typename T, int kHeadDim, bool Has_softcap>
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
-template <typename T, typename Tpartial, int kHeadDim>
+template <typename T, typename Tpartial, int kBlockK>
 void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream);
