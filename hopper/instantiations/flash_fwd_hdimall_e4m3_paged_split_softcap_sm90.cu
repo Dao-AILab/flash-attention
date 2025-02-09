@@ -6,5 +6,4 @@
 #include "flash_fwd_hdim96_e4m3_paged_split_softcap_sm90.cu"
 #include "flash_fwd_hdim128_e4m3_paged_split_softcap_sm90.cu"
 #include "flash_fwd_hdim192_e4m3_paged_split_softcap_sm90.cu"
-#include "flash_fwd_hdim192_128_e4m3_paged_split_softcap_sm90.cu"
 #include "flash_fwd_hdim256_e4m3_paged_split_softcap_sm90.cu"
