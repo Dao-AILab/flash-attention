@@ -366,7 +366,7 @@ def nvcc_threads_args():
 
 
 # NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.3.107"}
-NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.6.85", "ptxas": "12.8.61", "cicc": "12.8.61"}
+NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.6.85", "ptxas": "12.8.61"}
 exe_extension = sysconfig.get_config_var("EXE")
 
 
@@ -408,10 +408,10 @@ if not SKIP_CUDA_BUILD:
             f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
         )
         download_and_copy(
-            name="cicc",
+            name="ptxas",
             src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/nvvm/bin",
             dst_path="nvvm/bin",
-            version=NVIDIA_TOOLCHAIN_VERSION["cicc"],
+            version=NVIDIA_TOOLCHAIN_VERSION["ptxas"],
             url_func=lambda system, arch, version:
             f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
         )
