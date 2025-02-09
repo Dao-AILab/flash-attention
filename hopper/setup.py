@@ -366,7 +366,7 @@ def nvcc_threads_args():
 
 
 # NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.3.107"}
-NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.8.61"}
+NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.6.85", "ptxas": "12.8.61", "cicc": "12.8.61"}
 exe_extension = sysconfig.get_config_var("EXE")
 
 
@@ -387,10 +387,12 @@ if not SKIP_CUDA_BUILD:
     if bare_metal_version < Version("12.3"):
         raise RuntimeError("FlashAttention-3 is only supported on CUDA 12.3 and above")
 
-    if bare_metal_version != Version("12.8"):  # nvcc 12.8 gives the best perf currently
+    # ptxas 12.8 gives the best perf currently
+    # We want to use the nvcc front end from 12.6 however, since if we use nvcc 12.8
+    # Cutlass 3.8 will expect the new data types in cuda.h from CTK 12.8, which we don't have.
+    if bare_metal_version != Version("12.8"):
         download_and_copy(
             name="nvcc",
-            # src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas{exe_extension}",
             src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin",
             dst_path="bin",
             version=NVIDIA_TOOLCHAIN_VERSION["nvcc"],
@@ -398,11 +400,18 @@ if not SKIP_CUDA_BUILD:
             f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
         )
         download_and_copy(
-            name="nvcc",
-            # src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas{exe_extension}",
+            name="ptxas",
+            src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas",
+            dst_path="bin",
+            version=NVIDIA_TOOLCHAIN_VERSION["ptxas"],
+            url_func=lambda system, arch, version:
+            f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
+        )
+        download_and_copy(
+            name="cicc",
             src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/nvvm/bin",
             dst_path="nvvm/bin",
-            version=NVIDIA_TOOLCHAIN_VERSION["nvcc"],
+            version=NVIDIA_TOOLCHAIN_VERSION["cicc"],
             url_func=lambda system, arch, version:
             f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
         )
@@ -411,7 +420,7 @@ if not SKIP_CUDA_BUILD:
         nvcc_path_new = os.path.join(ctk_path_new, f"nvcc{exe_extension}")
         # Need to append to path otherwise nvcc can't find cicc in nvvm/bin/cicc
         # nvcc 12.8 seems to hard-code looking for cicc in ../nvvm/bin/cicc
-        # os.environ["PATH"] = ctk_path_new + os.pathsep + os.environ["PATH"]
+        os.environ["PATH"] = ctk_path_new + os.pathsep + os.environ["PATH"]
         os.environ["PYTORCH_NVCC"] = nvcc_path_new
         # Make nvcc executable, sometimes after the copy it loses its permissions
         os.chmod(nvcc_path_new, os.stat(nvcc_path_new).st_mode | stat.S_IEXEC)

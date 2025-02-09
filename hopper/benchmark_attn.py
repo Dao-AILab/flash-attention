@@ -261,9 +261,9 @@ time_b = {}
 # for headdim in [64, 96, 128, 192]:
 # for headdim in [64, 96, 128, 192, 256]:
 # for headdim in [64, 96, 128]:
-# for headdim in [64, 128, 256]:
+for headdim in [64, 128, 256]:
 # for headdim in [64, 96, 128, 192, 256]:
-for headdim in [192]:
+# for headdim in [128]:
     nheads = dim // headdim
     # headdim = 64
     # batch_size = 64
@@ -276,7 +276,7 @@ for headdim in [192]:
     # headdim_v = 128
 
     for batch_size, seqlen in bs_seqlen_vals:
-        num_splits = 1
+        num_splits = 0
         window_size = (-1, -1)
         # window_size = (seqlen // 2 - 1, 0)
         sink_token_length = 0
@@ -320,7 +320,7 @@ for headdim in [192]:
             page_table = None
 
         for causal in [False, True]:
-        # for causal in [False]:
+        # for causal in [True]:
             print(f"\n### {headdim = }, {causal = }, {seqlen = } ###")
             nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen, headdim, headdim_v, causal=causal, window_size=window_size)
             if cudnn is not None:
