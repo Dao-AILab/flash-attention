@@ -150,6 +150,8 @@ def _write_ninja_file(path,
         flags.append(f'cuda_post_cflags_sm80 = {" ".join(cuda_post_cflags_sm80)}')
         cuda_post_cflags_sm80_sm90 = cuda_post_cflags + ['-gencode', 'arch=compute_80,code=sm_80']
         flags.append(f'cuda_post_cflags_sm80_sm90 = {" ".join(cuda_post_cflags_sm80_sm90)}')
+        cuda_post_cflags_sm100 = [s if s != 'arch=compute_90a,code=sm_90a' else 'arch=compute_100a,code=sm_100a' for s in cuda_post_cflags]
+        flags.append(f'cuda_post_cflags_sm100 = {" ".join(cuda_post_cflags_sm100)}')
     flags.append(f'cuda_dlink_post_cflags = {" ".join(cuda_dlink_post_cflags)}')
     flags.append(f'ldflags = {" ".join(ldflags)}')
 
@@ -187,6 +189,9 @@ def _write_ninja_file(path,
         cuda_compile_rule_sm80_sm90 = ['rule cuda_compile_sm80_sm90'] + cuda_compile_rule[1:] + [
             f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm80_sm90'
         ]
+        cuda_compile_rule_sm100 = ['rule cuda_compile_sm100'] + cuda_compile_rule[1:] + [
+            f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm100'
+        ]
         cuda_compile_rule.append(
             f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags')
 
@@ -199,6 +204,8 @@ def _write_ninja_file(path,
                 rule = 'cuda_compile'
             elif source_file.endswith('_sm80.cu'):
                 rule = 'cuda_compile_sm80'
+            elif source_file.endswith('_sm100.cu'):
+                rule = 'cuda_compile_sm100'
             else:
                 rule = 'cuda_compile_sm80_sm90'
         else:
@@ -244,6 +251,7 @@ def _write_ninja_file(path,
         blocks.append(cuda_compile_rule)  # type: ignore[possibly-undefined]
         blocks.append(cuda_compile_rule_sm80)  # type: ignore[possibly-undefined]
         blocks.append(cuda_compile_rule_sm80_sm90)  # type: ignore[possibly-undefined]
+        blocks.append(cuda_compile_rule_sm100)  # type: ignore[possibly-undefined]
     blocks += [devlink_rule, link_rule, build, devlink, link, default]
     content = "\n\n".join("\n".join(b) for b in blocks)
     # Ninja requires a new lines at the end of the .ninja file
