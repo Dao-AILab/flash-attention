@@ -354,6 +354,69 @@ CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <bool zero_init=false, typename Atom, typename TA, typename TB, typename TC>
+CUTLASS_DEVICE void gemm_sm100(Atom& atom, TA const& tA, TB const& tB, TC&& tC) {
+    static constexpr int rA = decltype(rank(tA))::value;
+    static constexpr int rB = decltype(rank(tB))::value;
+    static constexpr int rC = decltype(rank(tC))::value;
+    static_assert(rA == 3 && rB == 3 && rC == 3);
+
+    if constexpr (zero_init) { atom.accumulate_ = decltype(atom.accumulate_)::Zero; }
+    CUTLASS_PRAGMA_UNROLL
+    for (int k_block = 0; k_block < size<2>(tA); k_block++) {
+        cute::gemm(atom, tA(_,_,k_block), tB(_,_,k_block), tC);
+        atom.accumulate_ = decltype(atom.accumulate_)::One;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <class a_type, class b_type, class c_type,
+          int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg, class... TAs, class... TMs>
+CUTE_HOST_DEVICE constexpr
+auto
+to_tiled_mma_sm100_ts(
+    TiledMMA<MMA_Atom<
+      MMA_Traits<SM100_MMA_F8F6F4_SS, a_type, b_type, c_type,
+                    cute::C<M>, cute::C<N>,
+                    cute::integral_constant<UMMA::Major, a_major>,
+                    cute::integral_constant<UMMA::Major, b_major>,
+                    cute::integral_constant<UMMA::ScaleIn, a_neg>,
+                    cute::integral_constant<UMMA::ScaleIn, b_neg>>,
+      TAs...>, TMs...>) {
+
+  return TiledMMA<MMA_Atom<
+    MMA_Traits<SM100_MMA_F8F6F4_TS<a_type, b_type, c_type,
+                                M, N,
+                                a_major, b_major,
+                                a_neg, b_neg, UMMA::Saturate::False>>,
+    TAs...>, TMs...>{};
+}
+
+template <class a_type, class b_type, class c_type,
+          int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg, class... TAs, class... TMs>
+CUTE_HOST_DEVICE constexpr
+auto
+to_tiled_mma_sm100_ts(
+    TiledMMA<MMA_Atom<
+      SM100_MMA_F16BF16_SS<a_type, b_type, c_type,
+                    M, N,
+                    a_major,
+                    b_major,
+                    a_neg,
+                    b_neg>,
+      TAs...>, TMs...>) {
+  return TiledMMA<MMA_Atom<
+    SM100_MMA_F16BF16_TS<a_type, b_type, c_type,
+                                M, N,
+                                a_major, b_major,
+                                a_neg, b_neg, UMMA::Saturate::False>,
+    TAs...>, TMs...>{};
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -558,6 +621,13 @@ CUTLASS_DEVICE auto calculate_dtanh(Tensor<Engine, Layout> &tensor){
         out(i) = 1.f - (tensor(i) * tensor(i));
     }
     return out;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<class T>
+CUTE_DEVICE T warp_uniform(T a) {
+    return __shfl_sync(0xffffffff, a, 0);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
