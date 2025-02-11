@@ -46,6 +46,8 @@ Requirements: H100 / H800 GPU, CUDA >= 12.3.
 
 We highly recommend CUDA 12.8 for best performance.
 
+> Notice: `setup.py` will try to download and use the recommended CUDA version. Please check whether your CUDA driver is new enough or modify the script.
+
 To install:
 ```sh
 cd hopper
