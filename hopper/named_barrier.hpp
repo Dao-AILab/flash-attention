@@ -57,6 +57,8 @@ enum class FwdNamedBarriers {
     WarpSchedulerWG3 = 6,
     AppendKV = 7,
     QueryRotated = 8,
+    PFull = 9,
+    PEmpty = 6,  // HACK: PEmpty is only used when we don't have 3 WGs
 };
 
 enum class BwdNamedBarriers {

@@ -22,7 +22,7 @@ namespace flash {
 
 using namespace cute;
 
-template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, class Element_, class ElementAccum_, class ArchTag_,
+template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
         bool PackGQA_, bool Split_>
 struct CollectiveMainloopFwdSm80 {
@@ -30,6 +30,7 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kStages = Stages;
     static_assert(kStages > 0, "kStages must be greater than 0");
     using TileShape_MNK = TileShape_MNK_;
+    using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
     using Element = Element_;
     using ElementAccum = ElementAccum_;
     using ArchTag = ArchTag_;
@@ -177,12 +178,15 @@ struct CollectiveMainloopFwdSm80 {
         ShapeQKV const shape_K;
         StrideQK const stride_K;
         Element* const ptr_V;
+        int32_t const headdim_v;
         StrideV const stride_V;
         Element const* const ptr_K_new;
         ShapeQKV const shape_K_new;
         StrideQK const stride_K_new;
         Element const* const ptr_V_new;
         StrideV const stride_V_new;
+        Element const* const ptr_Qv;
+        StrideQK const stride_Qv;
         Element const* const ptr_rotary_cos;
         ShapeRotary const shape_rotary;
         StrideRotary const stride_rotary_cos;
@@ -218,6 +222,7 @@ struct CollectiveMainloopFwdSm80 {
         ShapeQKV const shape_K;
         StrideQK const stride_K;
         Element* const ptr_V;
+        int32_t const headdim_v;
         StrideV const stride_V;
         Element const* const ptr_K_new;
         ShapeQKV const shape_K_new;
@@ -272,7 +277,7 @@ struct CollectiveMainloopFwdSm80 {
         // (assigning it to params.softcap_val) and pre-multiply softcap_val * log2(e)
         // (assigning it to params.softmax_scale_log2).
         return {args.ptr_Q, args.shape_Q, args.stride_Q, shape_Q_packed, stride_Q_packed,
-                args.ptr_K, args.shape_K, args.stride_K, args.ptr_V, args.stride_V,
+                args.ptr_K, args.shape_K, args.stride_K, args.ptr_V, args.headdim_v, args.stride_V,
                 args.ptr_K_new, args.shape_K_new, args.stride_K_new, args.ptr_V_new, args.stride_V_new,
                 args.ptr_rotary_cos, args.shape_rotary, args.stride_rotary_cos,
                 args.ptr_rotary_sin, args.stride_rotary_sin, args.is_rotary_interleaved,
@@ -430,11 +435,11 @@ struct CollectiveMainloopFwdSm80 {
         }
         cute::cp_async_fence();
 
-        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element, true /*KV_Same_Iter*/>;
+        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/>;
         PagedKVManager_t paged_kv_manager(
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
-            params.ptr_V, params.stride_V,
+            params.ptr_V, params.headdim_v, params.stride_V,
             params.page_size_divmod, bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k
         );
 
@@ -730,11 +735,11 @@ struct CollectiveMainloopFwdSm80 {
                         params.ptr_rotary_sin, params.stride_rotary_sin,
                         params.is_rotary_interleaved, thread_idx, seqlen_k_new, offset_rotary);
 
-        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 2 /*LoadsPerRow_LB*/>;
+        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 2 /*LoadsPerRow_LB*/>;
         PagedKVManager_t paged_kv_manager(
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
-            params.ptr_V, params.stride_V,
+            params.ptr_V, params.headdim_v, params.stride_V,
             params.page_size_divmod, bidb_kv, bidh_kv, thread_idx, seqlen_k_new, offset_k
             // passing offset_k instead of leftpad_k will move the PageTable pointer to the right position
         );

@@ -26,7 +26,7 @@ def benchmark_forward(fn, *inputs, repeats=10, desc='', verbose=True, **kwinputs
 
 torch.manual_seed(0)
 repeats = 30
-dtype = torch.float16
+dtype = torch.bfloat16
 device = 'cuda'
 verbose = False
 m, n = 8192, 8192

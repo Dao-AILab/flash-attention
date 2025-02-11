@@ -82,6 +82,7 @@ def flash_attn_varlen_func(
     max_seqlen_k,
     cu_seqlens_k=None, # only used for non-paged prefill
     seqused_k=None,
+    q_v=None,
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
@@ -91,7 +92,6 @@ def flash_attn_varlen_func(
     deterministic=False,
     return_attn_probs=False,
     block_table=None,
-    *,
     return_softmax_lse=False,
     out=None,
     fa_version: int = DEFAULT_FA_VERSION,
@@ -196,6 +196,7 @@ def flash_attn_varlen_func(
         out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
             q, k, v,
             None, None,       # k_new, v_new
+            q_v,              #
             out,
             cu_seqlens_q,
             cu_seqlens_k,     # cu_seqlens_k
@@ -369,6 +370,7 @@ def flash_attn_with_kvcache(
         out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
             q, k_cache, v_cache, # q, k, v
             k, v,             # k_new, v_new
+            None,             # q_v
             out,
             None, None,       # cu_seqlens_q, cu_seqlens_k
             None,             # cu_seqlens_k_new

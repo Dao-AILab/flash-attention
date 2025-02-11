@@ -14,7 +14,7 @@ namespace flash {
 
 using namespace cute;
 
-template <int kBlockN, int kHeadDim, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1>
+template <int kBlockN, int kHeadDim, int kHeadDimV, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1>
 struct PagedKVManager {
     // If KV_Same_Iter=false, then we do load_page_table(0), load_K(0), load_page_table(1), load_K(1), load_V(0),
     // load_page_table(2), load_K(2), load_V(1), etc.
@@ -23,14 +23,17 @@ struct PagedKVManager {
     // LoadsPerRow_LB is the lower bound on number of loads per row in the K direction. This is useful for
     // rotary where we want each thread to have at least 2 loads per row.
 
+    static constexpr bool SameHeadDim = (kHeadDim == kHeadDimV);
+    static constexpr int kHeadDimGCD = cute::gcd(kHeadDim, kHeadDimV);
+
     // We use CpAsync for K and V if PagedKV, since TMA doesn't work there
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
-    static_assert(kHeadDim % kGmemElemsPerLoad == 0, "Headdim must be a multiple of kGmemElemsPerLoad");
+    static_assert(kHeadDimGCD % kGmemElemsPerLoad == 0, "Headdim and HeaddimV must be a multiple of kGmemElemsPerLoad");
     // We want each "row" to have 64 elements (128 bytes, i.e. 1 cache line). E.g. if hdim=128, we want each
     // thread to have 4 loads in the M direction and 2 vectorized load in the K direction.
     // In the case of PackGQA, this reduces the number of times we need to call divmod.
-    static_assert(kHeadDim % LoadsPerRow_LB == 0, "Headdim must be a multiple of LoadsPerRow_LB");
-    static constexpr int kBytePerRow = kHeadDim / LoadsPerRow_LB * sizeof(Element);
+    static_assert(kHeadDimGCD % LoadsPerRow_LB == 0, "Headdim and HeaddimV must be a multiple of LoadsPerRow_LB");
+    static constexpr int kBytePerRow = kHeadDimGCD / LoadsPerRow_LB * sizeof(Element);
     static constexpr int kBlockKGmem = (kBytePerRow % 128 == 0 ? 128 : (kBytePerRow % 64 == 0 ? 64 : 32)) / sizeof(Element);
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerLoad;
     static_assert(NumThreads % kGmemThreadsPerRow == 0, "NumThreads must be a multiple of kGmemThreadsPerRow");
@@ -59,6 +62,8 @@ struct PagedKVManager {
     using GmemThrCopyKVCpAsync = decltype(GmemTiledCopyKVCpAsync{}.get_thread_slice(int(0)));
     using TensortKcK = decltype(GmemTiledCopyKVCpAsync{}.get_thread_slice(int(0)).partition_D(cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{})));
     using TensortKpK = decltype(make_tensor<bool>(make_shape(size<1>(TensortKcK{}), size<2>(TensortKcK{})), Stride<_0, _1>{}));
+    using TensortVcV = decltype(GmemTiledCopyKVCpAsync{}.get_thread_slice(int(0)).partition_D(cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDimV>>{})));
+    using TensortVpV = decltype(make_tensor<bool>(make_shape(size<1>(TensortVcV{}), size<2>(TensortVcV{})), Stride<_0, _1>{}));
 
     // For PagedKV, it's expensive the calculate the pointers to K and V for each page table entry,
     // since those require int64_t arithmetic. We optimize by having threads split this work.
@@ -66,6 +71,7 @@ struct PagedKVManager {
     // that each thread needs to load for the case of hdim 128 and kBlockN = 176.
     // So each of those 8 threads will calculate the K_ptr and V_ptr for 11 / 8 = 2 rows.
     // We then use __shfl_sync to broadcast the pointers to the other threads in the warp.
+    static_assert(CUTE_STATIC_V(size<1>(TensortKcK{})) == CUTE_STATIC_V(size<1>(TensortVcV{})));
     static constexpr int kPageEntryPerThread = cute::ceil_div(size<1>(TensortKcK{}), kGmemThreadsPerRow);
     using TensorPageOffset = decltype(make_tensor<cute::tuple<int, int>>(Shape<Int<kPageEntryPerThread>>{}));
     using TensorKVPtr = decltype(make_tensor<Element*>(Shape<Int<kPageEntryPerThread>>{}));
@@ -79,15 +85,15 @@ struct PagedKVManager {
     TensorPageTable mPageTable;
     TensorKV mK_paged, mV_paged;
     TensortKpK tKpK;
+    TensortVpV tVpV;
     TensorPageOffset tPrPageOffset;
     TensorKVPtr tPrVPtr;
-
 
     CUTLASS_DEVICE
     PagedKVManager(int const* const ptr_page_table,
                    ShapePageTable const &shape_pagetable, StridePageTable const &stride_pagetable,
                    Element* const ptr_K, ShapeKV const &shape_K, StrideKV const &stride_K,
-                   Element* const ptr_V, StrideKV const &stride_V,
+                   Element* const ptr_V, int const headdim_v, StrideKV const &stride_V,
                    cutlass::FastDivmod const &page_size_divmod,
                    int const bidb, int const bidh, int const thread_idx, int const seqlen_k, int const leftpad_k
                    )
@@ -100,13 +106,19 @@ struct PagedKVManager {
     {
         mPageTable = make_tensor(make_gmem_ptr(ptr_page_table), shape_pagetable, stride_pagetable)(bidb, _);
         mK_paged = make_tensor(make_gmem_ptr(ptr_K), shape_K, stride_K)(_, _, bidh, _);
-        mV_paged = make_tensor(make_gmem_ptr(ptr_V), shape_K, stride_V)(_, _, bidh, _);
+        auto shape_V = make_shape(get<0>(shape_K), headdim_v, get<2>(shape_K), get<3>(shape_K));
+        mV_paged = make_tensor(make_gmem_ptr(ptr_V), shape_V, stride_V)(_, _, bidh, _);
         tKpK = make_tensor<bool>(make_shape(size<1>(TensortKcK{}), size<2>(TensortKcK{})), Stride<_0, _1>{});
-
         Tensor cK = cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{});  // (BLK_N,BLK_K) -> (blk_n,blk_k)
         Tensor tKcK = gmem_thr_copy_kv.partition_S(cK);
         #pragma unroll
         for (int k = 0; k < size<1>(tKpK); ++k) { tKpK(_0{}, k) = get<1>(tKcK(_0{}, _0{}, k)) < get<1>(shape_K); }
+        Tensor tVpV_ = make_tensor<bool>(make_shape(size<1>(TensortVcV{}), size<2>(TensortVcV{})), Stride<_0, _1>{});
+        Tensor cV = cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDimV>>{});  // (BLK_N,BLK_K) -> (blk_n,blk_k)
+        Tensor tVcV = gmem_thr_copy_kv.partition_S(cV);
+        #pragma unroll
+        for (int k = 0; k < size<1>(tVpV_); ++k) { tVpV_(_0{}, k) = get<1>(tVcV(_0{}, _0{}, k)) < get<1>(shape_V); }
+        tVpV = cute::conditional_return<SameHeadDim>(tKpK, tVpV_);
     };
 
     template <bool Seqlenk_mask=false, bool First_iter=false>
@@ -200,27 +212,27 @@ struct PagedKVManager {
         // Only for index calculation, since all the indices of thread 0 are known at compile time
         auto gmem_thr0_copy_kv = gmem_tiled_copy_kv.get_thread_slice(_0{});
         Tensor tVsV = gmem_thr_copy_kv.partition_D(sV);
-        Tensor cK = cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{});  // (BLK_N,BLK_K) -> (blk_n,blk_k)
+        Tensor cV = cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDimV>>{});  // (BLK_N,BLK_K) -> (blk_n,blk_k)
         // Repeat the partitioning with identity layouts
-        Tensor tKcK = gmem_thr_copy_kv.partition_S(cK);
-        Tensor t0KcK = gmem_thr0_copy_kv.partition_S(cK);
+        Tensor tVcV = gmem_thr_copy_kv.partition_S(cV);
+        Tensor t0VcV = gmem_thr0_copy_kv.partition_S(cV);
 
-        int const seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tKcK(_0{}, _0{}, _0{}));
+        int const seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tVcV(_0{}, _0{}, _0{}));
         #pragma unroll
         for (int m = 0; m < size<1>(tVsV); ++m) {
             // Faster to rely on the cp.async to clear smem that are out of bound,
             // rather than calling cute::clear directly.
             // We have to be careful not to write to smem past `kBlockN` if !EvenN.
             // If kBlockN doesn't evenly divide the tiled copy, only the last `m` needs to checked
-            if (EvenN || m < size<1>(tVsV) - 1 || get<0>(tKcK(_0{}, m, _0{})) < kBlockN) {
-                bool const should_load = !Seqlenk_mask || get<0>(t0KcK(_0{}, m, _0{})) < seqlenk_row_limit;
+            if (EvenN || m < size<1>(tVsV) - 1 || get<0>(tVcV(_0{}, m, _0{})) < kBlockN) {
+                bool const should_load = !Seqlenk_mask || get<0>(t0VcV(_0{}, m, _0{})) < seqlenk_row_limit;
                 Element const* v_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrVPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
-                Tensor mV_paged_cur = make_tensor(make_gmem_ptr(v_ptr), Shape<Int<kHeadDim>>{});
+                Tensor mV_paged_cur = make_tensor(make_gmem_ptr(v_ptr), Shape<Int<kHeadDimV>>{});
                 Tensor mV_paged_cur_copy = cute::tiled_divide(mV_paged_cur, Shape<Int<kGmemElemsPerLoad>>{});
                 #pragma unroll
                 for (int k = 0; k < size<2>(tVsV); ++k) {
-                    int const ki = get<1>(tKcK(_0{}, _0{}, k)) / kGmemElemsPerLoad;
-                    cute::copy(gmem_tiled_copy_kv.with(tKpK(_0{}, k) && should_load), mV_paged_cur_copy(_, ki), tVsV(_, m, k));
+                    int const ki = get<1>(tVcV(_0{}, _0{}, k)) / kGmemElemsPerLoad;
+                    cute::copy(gmem_tiled_copy_kv.with(tVpV(_0{}, k) && should_load), mV_paged_cur_copy(_, ki), tVsV(_, m, k));
                 }
             }
         }
@@ -269,24 +281,24 @@ struct PagedKVManager {
         if constexpr (KV_Same_Iter) { compute_V_ptr(); }
         // Only for index calculation, since all the indices of thread 0 are known at compile time
         auto gmem_thr0_copy_kv = gmem_tiled_copy_kv.get_thread_slice(_0{});
-        Tensor cK = cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{});  // (BLK_N,BLK_K) -> (blk_n,blk_k)
+        Tensor cV = cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDimV>>{});  // (BLK_N,BLK_K) -> (blk_n,blk_k)
         // Repeat the partitioning with identity layouts
-        Tensor tKcK = gmem_thr_copy_kv.partition_S(cK);
-        Tensor t0KcK = gmem_thr0_copy_kv.partition_S(cK);
+        Tensor tVcV = gmem_thr_copy_kv.partition_S(cV);
+        Tensor t0VcV = gmem_thr0_copy_kv.partition_S(cV);
 
         GmemTiledCopyKVStore gmem_tiled_copy_kv_store;
-        int const seqlenk_row_limit = std::min(seqlen_k - n_block * kBlockN, kBlockN) - get<0>(tKcK(_0{}, _0{}, _0{}));
+        int const seqlenk_row_limit = std::min(seqlen_k - n_block * kBlockN, kBlockN) - get<0>(tVcV(_0{}, _0{}, _0{}));
         #pragma unroll
         for (int m = 0; m < size<1>(tVrV); ++m) {
-            bool const should_load = get<0>(t0KcK(_0{}, m, _0{})) < seqlenk_row_limit;
+            bool const should_load = get<0>(t0VcV(_0{}, m, _0{})) < seqlenk_row_limit;
             Element* v_ptr = reinterpret_cast<Element*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrVPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
-            Tensor mV_paged_cur = make_tensor(make_gmem_ptr(v_ptr), Shape<Int<kHeadDim>>{});
+            Tensor mV_paged_cur = make_tensor(make_gmem_ptr(v_ptr), Shape<Int<kHeadDimV>>{});
             Tensor mV_paged_cur_copy = cute::tiled_divide(mV_paged_cur, Shape<Int<kGmemElemsPerLoad>>{});
             if (should_load) {
                 #pragma unroll
                 for (int k = 0; k < size<2>(tVrV); ++k) {
-                    int const ki = get<1>(tKcK(_0{}, _0{}, k)) / kGmemElemsPerLoad;
-                    if (tKpK(_0{}, k)) {
+                    int const ki = get<1>(tVcV(_0{}, _0{}, k)) / kGmemElemsPerLoad;
+                    if (tVpV(_0{}, k)) {
                         cute::copy(gmem_tiled_copy_kv_store, tVrV(_, m, k), mV_paged_cur_copy(_, ki));
                     }
                 }
