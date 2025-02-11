@@ -49,7 +49,7 @@ We highly recommend CUDA 12.8 for best performance.
 To install:
 ```sh
 cd hopper
-python setup.py install
+pip install .
 ```
 To run the test:
 ```sh
@@ -83,7 +83,7 @@ pip install flash-attn --no-build-isolation
 ```
 Alternatively you can compile from source:
 ```sh
-python setup.py install
+pip install .
 ```
 
 If your machine has less than 96GB of RAM and lots of CPU cores, `ninja` might
@@ -165,7 +165,7 @@ Then install and test Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_
 ```
 export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
 cd flash-attention
-python setup.py install
+pip install .
 pytest tests/test_flash_attn.py
 ```
 
