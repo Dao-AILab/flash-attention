@@ -238,9 +238,9 @@ def attention_ref(
         q, k, v = q.float(), k.float(), v.float()
         qv = qv.float() if qv is not None else None
     if q_descale is not None:
-        q_descale = repeat(q_descale, "b h -> b 1 (h g) 1", g = q.shape[2] // k.shape[2]).to(dtype=q.dtype)
-        q = q.float() * q_descale
-        qv = qv.float() * q_descale if qv is not None else None
+        q_descale = repeat(q_descale, "b h -> b 1 (h g) 1", g=q.shape[2] // k.shape[2])
+        q = (q.float() * q_descale).to(q.dtype)
+        qv = (qv.float() * q_descale).to(qv.dtype) if qv is not None else None
     if k_descale is not None:
         k = (k.float() * rearrange(k_descale, "b h -> b 1 h 1")).to(dtype=k.dtype)
     if v_descale is not None:
