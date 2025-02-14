@@ -26,12 +26,12 @@ These features are in development
 ##### Getting Started
 To get started with the triton backend for AMD, follow the steps below.
 
-First install the recommended Triton [commit](https://github.com/triton-lang/triton/commit/3ca2f498e98ed7249b82722587c511a5610e00c4).
+First install the recommended Triton [commit](https://github.com/triton-lang/triton/commit/f906b9b2f9a5efa0040f52f88ca1491526b6dc56).
 
 ```
 git clone https://github.com/triton-lang/triton
 cd triton
-git checkout 3ca2f498e98ed7249b82722587c511a5610e00c4 
+git checkout f906b9b2f9a5efa0040f52f88ca1491526b6dc56 
 pip install --verbose -e python
 ```
 Then install and test Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.

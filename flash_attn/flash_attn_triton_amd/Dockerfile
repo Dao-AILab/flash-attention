@@ -5,7 +5,7 @@ WORKDIR /workspace
 # install triton
 RUN git clone https://github.com/triton-lang/triton &&\ 
     cd triton &&\
-    git checkout 3ca2f498e98ed7249b82722587c511a5610e00c4 &&\
+    git checkout f906b9b2f9a5efa0040f52f88ca1491526b6dc56 &&\
     pip uninstall -y triton &&\ 
     cd python &&\
     pip install matplotlib pandas pytest einops &&\
