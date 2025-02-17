@@ -34,7 +34,7 @@ def _is_fa2_supported(device = None) -> Tuple[bool, Optional[str]]:
         return False, f"FA2 is unavaible due to: {FA2_UNAVAILABLE_REASON}"
     if torch.cuda.get_device_capability(device)[0] < 8:
         return False, \
-            "FA2 is only supported on devices with compute capability < 8"
+            "FA2 is only supported on devices with compute capability >= 8"
     return True, None
     
 def _is_fa3_supported(device = None) -> Tuple[bool, Optional[str]]:
@@ -59,7 +59,7 @@ def fa_version_unsupported_reason(fa_version: int, device = None) \
     -> Optional[str]:
     assert fa_version in [2, 3], f"Unsupported FA version: {fa_version}"
     if fa_version == 2:
-        return _is_fa3_supported(device)[1]
+        return _is_fa2_supported(device)[1]
     elif fa_version == 3:
         return _is_fa3_supported(device)[1]
 
