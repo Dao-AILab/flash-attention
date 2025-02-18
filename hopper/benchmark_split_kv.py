@@ -38,7 +38,7 @@ def main():
     ).multi_processor_count
 
     max_splits = 129
-    check_all_splits = False
+    check_all_splits = True
 
     causal = True
     # causal = False
@@ -139,7 +139,7 @@ def main():
                 cache_seqlens=cache_seqlens,
                 cache_batch_idx=cache_idxs,
                 causal=causal,
-                gqa_parallel=False,
+                pack_gqa=False,
                 num_splits=1,
             ) * 1000. * 1000.
 
@@ -151,9 +151,9 @@ def main():
                 cache_seqlens=cache_seqlens,
                 cache_batch_idx=cache_idxs,
                 causal=causal,
-                gqa_parallel=True,
+                pack_gqa=True,
                 num_splits=0,
-                max_seqlen_k_hint=context_seqlen
+                # max_seqlen_k_hint=context_seqlen
             ) * 1000. * 1000.
 
             if check_all_splits:
@@ -170,7 +170,7 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=False,
+                        pack_gqa=False,
                         num_splits=num_splits
                     ) * 1000. * 1000.
 
@@ -181,7 +181,7 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=False,
+                        pack_gqa=False,
                         num_splits=num_splits
                     )
 
@@ -192,7 +192,7 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=False,
+                        pack_gqa=False,
                         num_splits=1
                     )
 
@@ -220,7 +220,7 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=True,
+                        pack_gqa=True,
                         num_splits=num_splits
                     ) * 1000. * 1000.
 
@@ -231,7 +231,7 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=True,
+                        pack_gqa=True,
                         num_splits=num_splits
                     )
 
@@ -242,7 +242,7 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=True,
+                        pack_gqa=True,
                         num_splits=1
                     )
 
@@ -271,11 +271,11 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=True,
+                        pack_gqa=True,
                         # num_splits=num_splits_select,
                         # num_splits=1,
                         num_splits=0,
-                        max_seqlen_k_hint=context_seqlen
+                        # max_seqlen_k_hint=context_seqlen
                     ) * 1000. * 1000.
 
                     fa3_fastest_splitk_time_gqa = timeit(
@@ -286,7 +286,7 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=True,
+                        pack_gqa=True,
                         num_splits=fa3_fastest_num_splits_gqa
                     ) * 1000. * 1000. 
 
