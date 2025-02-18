@@ -33,7 +33,7 @@ with open("../README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-PACKAGE_NAME = "flash_attn"
+PACKAGE_NAME = "flash_attn_3"
 
 BASE_WHEEL_URL = "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
 
@@ -390,7 +390,7 @@ if not SKIP_CUDA_BUILD:
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
-    check_if_cuda_home_none("flash_attn")
+    check_if_cuda_home_none(PACKAGE_NAME)
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
     if bare_metal_version < Version("12.3"):
         raise RuntimeError("FlashAttention-3 is only supported on CUDA 12.3 and above")
