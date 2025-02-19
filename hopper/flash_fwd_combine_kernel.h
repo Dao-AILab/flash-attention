@@ -194,8 +194,8 @@ public:
         Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o_partial.data()), SmemLayoutO{});
 
         int const thread_idx = threadIdx.x;
-        int const k_block = blockIdx.x;
-        int const m_block = blockIdx.y;
+        int const m_block = blockIdx.x;
+        int const k_block = blockIdx.y;
         int const batch = !Varlen ? 0 : blockIdx.y;
         int const num_splits = get<1>(params.shape_LSE_partial);
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
