@@ -172,6 +172,7 @@ def _flash_attn_varlen_forward(
     block_table: Optional[torch.Tensor] = None,
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    zero_tensors: bool = False,
     descale_q: Optional[torch.Tensor] = None,
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
@@ -839,6 +840,7 @@ class FlashAttnFunc(torch.autograd.Function):
         alibi_slopes,
         deterministic,
         return_softmax,
+        is_grad_enabled,
         descale_q,
         descale_k,
         descale_v,
@@ -914,7 +916,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -937,6 +939,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
         block_table,
+        is_grad_enabled,
         descale_q,
         descale_k,
         descale_v,
@@ -1026,7 +1029,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -1243,6 +1246,7 @@ def flash_attn_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
+        torch.is_grad_enabled(),
         descale_q, 
         descale_k, 
         descale_v,
@@ -1502,6 +1506,7 @@ def flash_attn_varlen_func(
         deterministic,
         return_attn_probs,
         block_table,
+        torch.is_grad_enabled(),
         descale_q,
         descale_k,
         descale_v,

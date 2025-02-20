@@ -1,11 +1,8 @@
-name: AMD Perf Kernel Tests
+name: AMD Nightly Kernel Tests
 
 on:
-  workflow_dispatch:
-  pull_request:
-    branches: [main_perf]
-  push:
-    branches: [main_perf, rebase/main_perf]
+  schedule:
+    - cron: '0 0 * * *'  # runs nightly at midnight UTC
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -16,7 +13,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        runner: [linux-mi300-gpu-1]
+        runner: [linux-mi300-gpu-1, gfx1100]
       fail-fast: false # disables failing the entire job when one matrix entry fails
     container:
       image: rocm/pytorch:rocm6.3.2_ubuntu22.04_py3.10_pytorch_release_2.4.0
@@ -24,6 +21,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main_perf # nightly should run on main_perf only
       
       - name: Show Device Info
         run: |
@@ -35,9 +34,16 @@ jobs:
           rm -rf ~/.triton
           rm -rf ./triton/python/build
 
-      - name: Install Triton
+      - name: Install dependencies for building triton
         run: |
-          pip install triton==3.2.0
+          pip install ninja cmake wheel pybind11
+      
+      - name: Install Triton Nightly
+        run: |
+          git clone https://github.com/triton-lang/triton
+          cd triton
+          pip install --verbose --no-build-isolation ./python
+          cd ..
       
       - name: Show Triton version
         run: |
@@ -49,11 +55,14 @@ jobs:
           python setup.py install
 
       - name: Flash Attention Tests using Pytorch reference implementation
+        if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           FLASH_ATTENTION_TRITON_AMD_REF=1 pytest tests/test_flash_attn_triton_amd.py
       
-      - name: Flash Attention Tests
+      # CDNA Tests
+      - name: Flash Attention CDNA Tests
+        if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           pytest tests/test_flash_attn_triton_amd.py
@@ -64,11 +73,22 @@ jobs:
 
       # FIXME: run the full suite
       - name: AMD Internal Tests
+        if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           pytest -v -s flash_attn/flash_attn_triton_amd/test.py::test_op_prefill_fp8 flash_attn/flash_attn_triton_amd/test.py::test_op_prefill_varlen_fp8
 
       - name: AMD Bench
+        if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=1 python flash_attn/flash_attn_triton_amd/bench.py
+      
+      # RDNA Tests
+      - name: Flash Attention RDNA Tests
+        if: matrix.runner == 'gfx1100'
+        run: |
+          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+          
+          # NOTE: this exceeds 6 hrs on "gfx1100" so we are testing a subset of the tests. The full suite is run on a CDNA machine.
+          pytest tests/test_flash_attn_triton_amd.py::test_flash_attn_output
