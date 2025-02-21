@@ -59,7 +59,7 @@ docker run -it --network=host --user root --group-add video --cap-add=SYS_PTRACE
 Inside the docker, it should open to the flash attention repo with everything installed. You can run the following command to test things.
 ```
 pytest tests/test_flash_attn_triton_amd.py
-``` 
+```
 
 ##### Credits
 AMD Triton kernels team
