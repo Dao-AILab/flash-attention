@@ -271,7 +271,14 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                         if (!params.is_e4m3) {
                             if (params.is_bf16) {
                                 #ifndef FLASHATTENTION_DISABLE_HDIM64
-                                if (params.d <= 64) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                                if (params.d <= 64) {
+                                    if (params.dv > 64 && Arch == 90) {
+                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                                    }
+                                    else {
+                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream); 
+                                    }
+                                }
                                 #endif
                                 #ifndef FLASHATTENTION_DISABLE_HDIM96
                                 if (params.d <= 96) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 96, 96, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
@@ -294,7 +301,14 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             } else {
                                 #ifndef FLASHATTENTION_DISABLE_FP16
                                 #ifndef FLASHATTENTION_DISABLE_HDIM64
-                                if (params.d <= 64) { return run_mha_fwd_<Arch, cutlass::half_t, 64, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
+                                if (params.d <= 64) { 
+                                    if (params.dv > 64 && Arch == 90) {  
+                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKV, Has_softcap, PackGQA>(params, stream);
+                                    }
+                                    else {
+                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 64, Split, PagedKV, Has_softcap, PackGQA>(params, stream); 
+                                    }
+                                }
                                 #endif
                                 #ifndef FLASHATTENTION_DISABLE_HDIM96
                                 if (params.d <= 96) { return run_mha_fwd_<Arch, cutlass::half_t, 96, 96, Split, PagedKV, Has_softcap, PackGQA>(params, stream); }
@@ -581,7 +595,10 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
     if (head_size_v != head_size) {
-        TORCH_CHECK(head_size > 128 && head_size <= 192 && head_size_v > 96 && head_size_v <= 128, "If V headdim is different from Q/K dim, we only support Q/K headdim in (128, 192] and V headdim in (96, 128]");
+        TORCH_CHECK((head_size > 128 && head_size <= 192 && head_size_v > 96 && head_size_v <= 128) || 
+                   (head_size <= 64 && head_size_v <= 512),
+                   "If V headdim is different from Q/K dim, we only support Q/K headdim in (128, 192] and V headdim in (96, 128], "
+                   "or (Q/K <= 64 and V <= 512).");        
         TORCH_CHECK(dprops->major == 9, "Only Hopper supports different V headdim");
         if (head_size_v > 256) {
             TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -758,7 +775,6 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     }
 
     if (q_v_.has_value()) {
-        TORCH_CHECK(false, "q_v should be None for now");
         TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
         TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
                     "q_v is only supported for fp16 and bf16 data type");
