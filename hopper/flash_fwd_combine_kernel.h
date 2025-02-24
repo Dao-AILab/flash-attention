@@ -128,7 +128,6 @@ public:
 
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
-
     // Device side arguments
     struct Arguments {
         ElementPartial const* ptr_O_partial;
@@ -143,6 +142,7 @@ public:
         StrideLSE const stride_LSE;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        int const* num_splits_dynamic_ptr = nullptr;
     };
 
     // Kernel entry point API
@@ -160,6 +160,7 @@ public:
         cutlass::FastDivmod seqlen_divmod, head_divmod;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        int const* num_splits_dynamic_ptr = nullptr;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -180,7 +181,8 @@ public:
             args.stride_LSE,
             cutlass::FastDivmod(get<0>(args.shape_LSE_partial)), cutlass::FastDivmod(get<2>(args.shape_LSE_partial)),
             args.cu_seqlens,
-            args.seqused
+            args.seqused,
+            args.num_splits_dynamic_ptr
         };
     }
 
@@ -196,7 +198,7 @@ public:
         int const thread_idx = threadIdx.x;
         int const m_block = blockIdx.x;
         int const k_block = blockIdx.y;
-        int const batch = !Varlen ? 0 : blockIdx.y;
+        int const batch = !Varlen ? 0 : blockIdx.z;
         int const num_splits = get<1>(params.shape_LSE_partial);
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
         int const offset = seqlen_info.offset;
@@ -229,12 +231,13 @@ public:
                     bidh = seqlen_divmod_dynamic.divmod(m_idx, idx);
                     bidb = 0;
                 }
+                int num_splits_actual = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[!Varlen ? bidb : batch] : num_splits;
                 Tensor mLSEpartial_cur_copy = mLSEpartial_copy(_, _, m_idx, bidh, bidb);
                 #pragma unroll
                 for (int s = 0; s < size<1>(tLSEcLSE); ++s) {
                     int si = get<0>(tLSEcLSE(_0{}, s, _0{}));
                     // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && thread_idx < 32) { printf("thread_idx = %d, m = %d, s = %d, addr = %p, bank = %d\n", thread_idx, m, s, reinterpret_cast<float *>(&(tLSEsLSE(_0{}, s, m))), reinterpret_cast<int>(&(tLSEsLSE(_0{}, s, m))) / 4 % 32);}
-                    if (si < num_splits) {
+                    if (si < num_splits_actual) {
                         cute::copy(gmem_tiled_copy_LSE, mLSEpartial_cur_copy(_, si), tLSEsLSE(_, s, m));
                     } else {
                         cute::fill(tLSEsLSE(_, s, m), -INFINITY);

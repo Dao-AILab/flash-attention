@@ -506,6 +506,7 @@ if not SKIP_CUDA_BUILD:
     )
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine.cu"]
+    sources += ["flash_prepare_scheduler.cu"]
     nvcc_flags = [
         "-O3",
         "-std=c++17",

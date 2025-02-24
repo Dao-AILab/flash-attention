@@ -68,7 +68,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // However, if Varlen (e.g., during decode where we have max_seqlens), using PersistentScheduler is better
     // since we'll avoid launching a bunch of thread blocks that immediately exit.
     // On Sm80, noncausal persistent seems a bit slower.
-    using Scheduler = std::conditional_t<Arch >= 90 ? (Split && !Varlen) : !((Is_causal && !Varlen) || (Varlen && Split)), SchedulerSingleTile, SchedulerPersistent>;
+    static constexpr bool UsePersistentScheduler = Arch >= 90 ? !(Split && !Varlen) : ((Is_causal && !Varlen) || (Varlen && Split));
+    using Scheduler = std::conditional_t<!UsePersistentScheduler, SchedulerSingleTile, SchedulerPersistent>;
     using AttnKernel = std::conditional_t<
         Arch >= 90,
         flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>,
@@ -148,8 +149,15 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.h / params.h_k,
         params.seqlen_q,
         params.seqlen_k, params.d, sizeof(Element),
-        params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q
+        params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q,
+        // params.num_m_blocks_ptr, params.num_splits_dynamic_ptr,
+        params.num_splits_dynamic_ptr,
     };
+
+    if constexpr (Varlen && UsePersistentScheduler) {
+        prepare_varlen_num_blocks(params, stream, PackGQA, kBlockM, kBlockN);
+        CHECK_CUDA_KERNEL_LAUNCH();
+    }
 
     int device;
     CHECK_CUDA(cudaGetDevice(&device));

@@ -200,6 +200,7 @@ struct CollectiveEpilogueFwd {
           ) {
 
         auto [m_block, bidh, bidb, split_idx] = block_coord;
+        split_idx &= 0x0000FFFF;  // Only use the lower 16 bits of split_idx
         Tensor sO = make_tensor(make_smem_ptr(shared_storage.tensors.epilogue.smem_o.data()), SmemLayoutO{});
         // Tensor sO_pi = cute::as_position_independent_swizzle_tensor(sO);
 
@@ -368,6 +369,7 @@ struct CollectiveEpilogueFwd {
          ) {
         static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
         auto [m_block, bidh, bidb, split_idx] = block_coord;
+        split_idx &= 0x0000FFFF; // Only use the lower 16 bits of split_idx
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused};
         bool const is_varlen = Varlen && params.cu_seqlens;
         int offset_o = seqlen_info.offset;

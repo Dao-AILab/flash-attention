@@ -33,7 +33,7 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
         {params.o_row_stride, _1{}, params.o_head_stride, !Varlen ? params.o_batch_stride : 0},  // stride_O
         static_cast<float*>(params.softmax_lse_ptr),
         {_1{}, !Varlen ? params.seqlen_q : params.total_q, !Varlen ? params.h * params.seqlen_q : 0},  // stride_LSE
-        params.cu_seqlens_q, params.seqused_q
+        params.cu_seqlens_q, params.seqused_q, params.num_splits_dynamic_ptr
     };
 
     typename CombineKernel::Params kernel_params = CombineKernel::to_underlying_arguments(args);
@@ -55,7 +55,7 @@ void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream) {
     // E.g., if hdim is 64, we want kBlockM to be 16 so that we can use 256 threads, each reading 4 elements (floats).
     static_assert(kBlockK % 32 == 0, "kBlockK must be a multiple of 32");
     static constexpr int kBlockM = kBlockK % 128 == 0 ? 8 : (kBlockK % 64 == 0 ? 16 : 32);
-    BOOL_SWITCH(params.seqused_q != nullptr, Varlen, [&] {
+    BOOL_SWITCH(params.cu_seqlens_q || params.seqused_q, Varlen, [&] {
         if constexpr (kBlockM >= 16) {  // If kBlockM == 8 then the minimum number of splits is 32.
             if (params.num_splits <= 16) {
                 run_flash_fwd_combine<kBlockM, kBlockK, 4, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream);

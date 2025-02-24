@@ -433,9 +433,11 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     int const num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
     int const size_one_kv_head = params.seqlen_k * (params.d + params.dv) * (params.is_e4m3 ? 1 : 2);
     // Always enable PackGQA for Split
-    return num_splits_heuristic(params.b * params.h_k * num_m_blocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);
-    // return num_splits_heuristic(params.b * params.h_k * num_m_blocks, params.b * params.h_k,
-    //                             params.num_sm, num_n_blocks, 128, params.d_rounded);
+    // If varlen, we use dynamic split, so this heuristic just needs to get an upper bound on num_splits.
+    // We assume the case where there's 1 long sequence and the rest are short, i.e. pretending
+    // that batch = 1.
+    int total_mblocks = (!varlen ? params.b : 1) * params.h_k * num_m_blocks;
+    return num_splits_heuristic(total_mblocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);
     #endif
 }
 
@@ -861,14 +863,21 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         params.lseaccum_head_stride = softmax_lse_accum.stride(-2);
     }
 
-    at::Tensor tile_count_semaphore;
+    at::Tensor tile_count_semaphore, num_m_n_blocks_splits;
     // We don't use the persistent scheduler if Split and not Varlen
     bool const persistent_scheduler = params.arch >= 90
         ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
         : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
     if (persistent_scheduler) {
-        tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32));
+        tile_count_semaphore = torch::empty({1}, opts.dtype(torch::kInt32));
+        if (!is_varlen) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
         params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+        if (is_varlen) {
+            num_m_n_blocks_splits = torch::empty({batch_size * 3}, opts.dtype(torch::kInt32));
+            params.num_m_blocks_ptr = num_m_n_blocks_splits.data_ptr<int>();
+            params.num_n_blocks_ptr = num_m_n_blocks_splits.data_ptr<int>() + batch_size;
+            params.num_splits_dynamic_ptr = num_m_n_blocks_splits.data_ptr<int>() + batch_size * 2;
+        }
     } else {
         params.tile_count_semaphore = nullptr;
     }
@@ -935,11 +944,13 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
             }
             // Unless there's seqused_q, for the purpose of attn_combine, we can just treat it as batch=1
             // and seqlen = total_q, and don't need to dispatch to Varlen there.
+            // However, with dynamic split, each row needs to know which batch it belongs to
+            // to read the number of splits, so we just use the varlen version of combine kernel.
             // if (is_varlen_q && !seqused_q_.has_value()) {
-            if (is_varlen_q) {
-                params.b = 1;
-                params.seqlen_q = total_q;
-            }
+            // if (is_varlen_q) {
+            //     params.b = 1;
+            //     params.seqlen_q = total_q;
+            // }
             run_mha_fwd_combine(params, stream);
         }
     } else if (total_q > 0 && num_heads_k > 0) {

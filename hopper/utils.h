@@ -626,6 +626,19 @@ CUTLASS_DEVICE auto calculate_dtanh(Tensor<Engine, Layout> &tensor){
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<class T>
+CUTE_DEVICE T warp_prefix_sum(T val) {
+    int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 1; i < cutlass::NumThreadsPerWarp; i <<= 1) {
+        T partial_sum = __shfl_up_sync(0xffffffff, val, i);
+        if (lane >= i) { val += partial_sum; }
+    }
+    return val;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<class T>
 CUTE_DEVICE T warp_uniform(T a) {
     return __shfl_sync(0xffffffff, a, 0);
 }
