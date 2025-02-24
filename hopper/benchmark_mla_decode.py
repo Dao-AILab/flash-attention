@@ -19,7 +19,7 @@ nheads_kv = 1
 headdim = 64
 headdim_v = 512
 has_qv = True
-seqlen_q = 1
+seqlen_q = 4
 # page_size = None
 page_size = 1
 
@@ -43,7 +43,7 @@ if page_size is not None:
                            "(b s) -> b s", s=seqlen // page_size)
 else:
     page_table = None
-qv = torch.randn(batch_size, 1, nheads, headdim_v, dtype=dtype, device=device) if has_qv else None
+qv = torch.randn(batch_size, seqlen_q, nheads, headdim_v, dtype=dtype, device=device) if has_qv else None
 
 # Time in ms
 fn = lambda: flash_attn_with_kvcache(q, k_cache, v_cache, cache_seqlens=cache_seqlens, num_splits=num_splits, qv=qv, page_table=page_table, causal=True)
