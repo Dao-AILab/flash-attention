@@ -76,7 +76,8 @@ __global__ void prepare_varlen_num_blocks_kernel(
 
     int total_blocks = 0;
     int warp_idx = threadIdx.x / cutlass::NumThreadsPerWarp;
-    for (int bidb_start = kNumBatchPerWarp * warp_idx; bidb_start < num_batch; bidb_start += kNumBatchPerWarp) {
+    int num_warps = blockDim.x / cutlass::NumThreadsPerWarp;
+    for (int bidb_start = kNumBatchPerWarp * warp_idx; bidb_start < num_batch; bidb_start += kNumBatchPerWarp * num_warps) {
         int num_m_blocks = get_num_m_blocks(bidb_start);
         int num_n_blocks = get_num_n_blocks(bidb_start);
         if (bidb_start + lane < num_batch && lane < kNumBatchPerWarp) {
@@ -98,7 +99,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
     // 20% margin
     int blocks_per_sm = static_cast<int>(ceilf(float(total_blocks) * 1.2f * float(num_head) / float(num_sm)));
     // blocks_per_sm = std::max(1, blocks_per_sm);  // 1 is the minimum number of blocks per SM
-    for (int bidb_start = kNumBatchPerWarp * warp_idx; bidb_start < num_batch; bidb_start += kNumBatchPerWarp) {
+    for (int bidb_start = kNumBatchPerWarp * warp_idx; bidb_start < num_batch; bidb_start += kNumBatchPerWarp * num_warps) {
         bool is_valid = bidb_start + lane < num_batch && lane < kNumBatchPerWarp;
         int num_n_blocks = is_valid ? num_n_blocks_ptr[bidb_start + lane] : 0;
         int num_split_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
