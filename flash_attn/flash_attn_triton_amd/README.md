@@ -16,12 +16,13 @@ These features are supported in Fwd and Bwd
 7) Rotary embeddings
 
 These features are supported in Fwd for now. We will add them to backward soon.
-2) ALiBi and matrix bias
+1) ALiBi
 
 These features are in development
-1) Paged Attention 
-2) Sliding Window
-5) Performance Improvements
+1) FP8
+2) Paged Attention 
+3) Sliding Window
+4) Performance Improvements
 
 ##### Getting Started
 To get started with the triton backend for AMD, follow the steps below.
@@ -31,21 +32,43 @@ First install the recommended Triton version
 ```
 pip install triton==3.2.0
 ```
-Then install and test Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.
+Then install Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.
 
 ```
-export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
 cd flash-attention
-python setup.py install
-pytest tests/test_flash_attn_triton_amd.py
+git checkout main_perf
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
+```
+
+To test that things are working, you can run our tests. These tests take hours so you don't need to run the full thing.
+```
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd.py
 ```
 
 ###### Docker
-We have also created a Dockerfile.
+You can also use the Dockerfile below which does the above steps on top of the latest rocm/pytorch image.
+```
+FROM rocm/pytorch:rocm6.3.2_ubuntu22.04_py3.10_pytorch_release_2.4.0
+
+WORKDIR /workspace
+
+# install triton
+RUN pip install triton=3.2.0
+
+# install flash attention
+ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+
+RUN git clone https://github.com/ROCm/flash-attention.git &&\ 
+    cd flash-attention &&\
+    git checkout main_perf &&\
+    python setup.py install
+
+# set working dir
+WORKDIR /workspace/flash-attention
+```
 
 To build the docker file
 ```
-cd flash_attn/flash_attn_triton_amd
 docker build -t fa_triton .
 ```
 
@@ -53,11 +76,6 @@ To run the docker image
 ```
 docker run -it --network=host --user root --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ipc=host --shm-size 16G --device=/dev/kfd --device=/dev/dri fa_triton
 ```
-Inside the docker, it should open to the flash attention repo with everything installed. You can run the following command to test things.
-```
-pytest tests/test_flash_attn_triton_amd.py
-```
-
 ##### Credits
 AMD Triton kernels team
 
