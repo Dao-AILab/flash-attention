@@ -133,7 +133,7 @@ jobs:
             # Hard-coding this version of pytorch-triton for torch 2.7.0.dev20250205
             pip install jinja2
             pip install https://download.pytorch.org/whl/nightly/pytorch_triton-3.2.0-cp${{ matrix.python-version|replace('.', '') }}-cp${{ matrix.python-version|replace('.', '') }}-manylinux_2_28_${{ matrix.arch }}.whl
-            pip install https://download.pytorch.org/whl/nightly/cu118/torch-${{ matrix.torch-version }}%2Bcu118-cp${{ matrix.python-version|replace('.', '') }}-cp${{ matrix.python-version|replace('.', '') }}-manylinux_2_28_${{ matrix.arch }}.whl
+            pip install --no-cache-dir --pre https://download.pytorch.org/whl/nightly/cu${TORCH_CUDA_VERSION}/torch-${{ matrix.torch-version }}%2Bcu${TORCH_CUDA_VERSION}-cp${MATRIX_PYTHON_VERSION}-cp${MATRIX_PYTHON_VERSION}-manylinux_2_28_${{ matrix.arch }}.whl
           else
             pip install --no-cache-dir torch==${{ matrix.torch-version }} --index-url https://download.pytorch.org/whl/cu${TORCH_CUDA_VERSION}
           fi
