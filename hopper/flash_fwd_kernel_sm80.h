@@ -151,8 +151,8 @@ public:
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
-        CollectiveMainloop collective_mainloop;
-        CollectiveEpilogue collective_epilogue;
+        CollectiveMainloop mainloop;
+        CollectiveEpilogue epilogue;
 
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.smem_scheduler));
         // Initialize matmul objects.
@@ -189,23 +189,23 @@ public:
                 params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
             };
             if constexpr (AppendKV) {
-                bool tile_new_valid = collective_mainloop.store_kv_new(
+                bool tile_new_valid = mainloop.store_kv_new(
                     params.mainloop, threadIdx.x, shared_storage, seqlen_info, block_coord);
                 if (tile_new_valid) { __syncthreads(); }
             }
-            bool tile_valid = collective_mainloop.mma(
+            bool tile_valid = mainloop.mma(
                 params.mainloop, tOrO, softmax, threadIdx.x, seqlen_info, block_coord,
                 shared_storage);
             scheduler.prefetch_next_work(params.scheduler, work_tile_info);
             if (tile_valid) {
                 // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
-                collective_epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma,
-                                          threadIdx.x, block_coord);
+                epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma,
+                               threadIdx.x, block_coord);
             } else {
                 // Write 0 to gO and -inf to gLSE.
                 // If Split, we don't have to write 0 to O if the mha_combine kernel is used, since it will
                 // not use the value of O if LSE is -inf.
-                collective_epilogue.template store_zero<!Split /*Clear_O*/>(params.epilogue, threadIdx.x, block_coord);
+                epilogue.template store_zero<!Split /*Clear_O*/>(params.epilogue, threadIdx.x, block_coord);
             }
         }
 

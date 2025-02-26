@@ -7,7 +7,10 @@ import torch
 import torch.nn.functional as F
 
 from einops import rearrange, repeat
-from flash_attn.layers.rotary import apply_rotary_emb
+try:
+    from flash_attn.layers.rotary import apply_rotary_emb
+except ImportError:
+    apply_rotary_emb = None
 
 from padding import pad_input, unpad_input
 from test_util import (
@@ -450,9 +453,10 @@ def test_flash_attn_varlen_output(
                 v_unpad,
                 cu_seqlens_q,
                 cu_seqlens_k,
-                seqused_q, seqused_k,
                 max_seqlen_q,
                 max_seqlen_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
                 causal=causal,
                 qv=qv_unpad,
                 q_descale=q_descale,
@@ -569,7 +573,7 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("rotary_interleaved", [False, True] if not DISABLE_APPENDKV else [False])
 # @pytest.mark.parametrize("rotary_interleaved", [True])
-@pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0] if not DISABLE_APPENDKV else [0.0])
+@pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0] if (not DISABLE_APPENDKV) and (apply_rotary_emb is not None) else [0.0])
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize("page_size", [None] + ([1, 4, 128] if not DISABLE_PAGEDKV else []))
 # @pytest.mark.parametrize("page_size", [None])

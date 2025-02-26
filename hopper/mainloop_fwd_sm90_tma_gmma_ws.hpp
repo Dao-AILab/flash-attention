@@ -16,6 +16,7 @@
 
 #include "named_barrier.hpp"
 #include "seqlen.h"
+#include "block.h"
 #include "mask.h"
 #include "pack_gqa.h"
 #include "paged_kv.h"
@@ -58,7 +59,6 @@ struct CollectiveMainloopFwdSm90 {
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
     static constexpr bool LargeHeadDimV = kHeadDimV > 256;
-    using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
 
     static_assert(ArchTag::kMinComputeCapability >= 90);
 
@@ -68,6 +68,9 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+
+    using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
+    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
 
     static_assert(!LargeHeadDimV || kHeadDimV % 256 == 0);
     static_assert(!LargeHeadDimV || kBlockM <= 64, "kBlockM must be 64 or less for large Headdim_V");
@@ -565,37 +568,6 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
-    CUTLASS_DEVICE
-    cute::tuple<int, int> get_n_block_min_max(Params const& params, SeqlenInfo_t const& seqlen_info,
-                                              int m_block, int bidb, int split_idx=0, int num_splits=1) {
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
-        static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        int const seqlen_k = seqlen_info.seqlen_k;
-        int const seqlen_q = seqlen_info.seqlen_q;
-        int n_block_max = cute::ceil_div(seqlen_k, kBlockN);
-        if constexpr (Is_causal || Is_local) {
-            int m_idx_max = (m_block + 1) * kBlockM;
-            // TODO: check off-by-1 error
-            if (PackGQA) { m_idx_max = params.qhead_per_khead_divmod.divide(m_idx_max - 1) + 1 ; }
-            n_block_max = std::min(n_block_max,
-                                   cute::ceil_div(m_idx_max + seqlen_k - seqlen_q + params.window_size_right, kBlockN));
-        }
-        int n_block_min = 0;
-        if constexpr (Is_local) {
-            int m_idx_min = m_block * kBlockM;
-            if (PackGQA) { m_idx_min = params.qhead_per_khead_divmod.divide(m_idx_min); }
-            n_block_min = std::max(int(0), (m_idx_min + seqlen_k - seqlen_q - params.window_size_left) / kBlockN);
-        }
-        // if (threadIdx.x == 128) { printf("Inside, bid.x = %d, bid.y = %d, bid.z = %d, split_idx = %d, n_block_min: %d, n_block_max: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, split_idx, n_block_min, n_block_max); }
-        if constexpr (Split) {
-            int num_n_blocks_per_split = n_block_max <= n_block_min ? 0 : cute::ceil_div(n_block_max - n_block_min, num_splits);
-            n_block_min = n_block_min + split_idx * num_n_blocks_per_split;
-            n_block_max = std::min(n_block_min + num_n_blocks_per_split, n_block_max);
-        }
-        // if (threadIdx.x == 128) { printf("After split, inside, bid.y = %d, bid.z = %d, split_idx = %d, n_block_min: %d, n_block_max: %d\n", blockIdx.y, blockIdx.z, split_idx, n_block_min, n_block_max); }
-        return {n_block_min, n_block_max};
-    }
-
     template <typename SchedulerPrefetch, typename SharedStorage>
     CUTLASS_DEVICE void
     load(Params const& params,
@@ -615,7 +587,9 @@ struct CollectiveMainloopFwdSm90 {
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
-        auto [n_block_min, n_block_max] = get_n_block_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
+        auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
+            seqlen_info, m_block, bidb, split_idx, params.num_splits,
+            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) {
@@ -997,7 +971,9 @@ struct CollectiveMainloopFwdSm90 {
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
-        auto [n_block_min, n_block_max] = get_n_block_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
+        auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
+            seqlen_info, m_block, bidb, split_idx, params.num_splits,
+            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -1379,7 +1355,9 @@ struct CollectiveMainloopFwdSm90 {
         int const m_block = get<0>(block_coord);
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
-        auto [n_block_min, n_block_max] = get_n_block_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
+        auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
+            seqlen_info, m_block, bidb, split_idx, params.num_splits,
+            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -1446,19 +1424,6 @@ struct CollectiveMainloopFwdSm90 {
         return true;
     }
 
-    CUTLASS_DEVICE
-    cute::tuple<int, int> get_n_block_k_new_min_max(Params const& params, SeqlenInfo_t const& seqlen_info,
-                                                    int m_block, int bidb, int split_idx=0, int num_splits=1) {
-        static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        auto [n_block_min, n_block_max] = get_n_block_min_max(params, seqlen_info, m_block, bidb, split_idx, num_splits);
-        int const idx_k_new_min = std::max(n_block_min * kBlockN - seqlen_info.seqlen_k_og, 0);
-        int const idx_k_new_max = std::min(n_block_max * kBlockN - seqlen_info.seqlen_k_og, seqlen_info.seqlen_k_new);
-        int const n_block_new_min = idx_k_new_min / kBlockN;
-        int const n_block_new_max = idx_k_new_max > idx_k_new_min ? cute::ceil_div(idx_k_new_max, kBlockN) : n_block_new_min;
-        // if (threadIdx.x == 128 && m_block == 0) { printf("bidb = %d, seqlen_k_new = %d, seqlen_k_og = %d, n_block_min = %d, n_block_max = %d, idx_k_new_min = %d, idx_k_new_max = %d, n_block_new_min = %d, n_block_new_max = %d\n", bidb, seqlen_k_new, seqlen_k_og, n_block_min, n_block_max, idx_k_new_min, idx_k_new_max, n_block_new_min, n_block_new_max);}
-        return {n_block_new_min, n_block_new_max};
-    }
-
     template <typename SharedStorage>
     CUTLASS_DEVICE bool
     load_kv_new(Params const& params,
@@ -1472,7 +1437,10 @@ struct CollectiveMainloopFwdSm90 {
          ) {
 
         auto [m_block, bidh, bidb, split_idx] = block_coord;
-        auto [n_block_new_min, n_block_new_max] = get_n_block_k_new_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
+        auto [n_block_new_min, n_block_new_max] = BlockMN_t::get_n_block_k_new_min_max(
+            seqlen_info, m_block, bidb, split_idx, params.num_splits,
+            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+
         if (n_block_new_max <= n_block_new_min) { return false; }
 
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
@@ -1571,7 +1539,9 @@ struct CollectiveMainloopFwdSm90 {
                  cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord
     ) {
         auto [m_block, bidh, bidb, split_idx] = block_coord;
-        auto [n_block_new_min, n_block_new_max] = get_n_block_k_new_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
+        auto [n_block_new_min, n_block_new_max] = BlockMN_t::get_n_block_k_new_min_max(
+            seqlen_info, m_block, bidb, split_idx, params.num_splits,
+            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
         if (n_block_new_max <= n_block_new_min) { return false; }
 
         // as_position_independent_swizzle_tensor makes address calculation easier
