@@ -96,8 +96,8 @@ __global__ void prepare_varlen_num_blocks_kernel(
     if (lane == 0) { atomicAdd(smem, total_blocks); }
     __syncthreads();
     total_blocks = smem[0];
-    // 20% margin
-    int blocks_per_sm = static_cast<int>(ceilf(float(total_blocks) * 1.2f * float(num_head) / float(num_sm)));
+    // 10% margin
+    int blocks_per_sm = static_cast<int>(ceilf(float(total_blocks) * 1.1f * float(num_head) / float(num_sm)));
     // blocks_per_sm = std::max(1, blocks_per_sm);  // 1 is the minimum number of blocks per SM
     for (int bidb_start = kNumBatchPerWarp * warp_idx; bidb_start < num_batch; bidb_start += kNumBatchPerWarp * num_warps) {
         bool is_valid = bidb_start + lane < num_batch && lane < kNumBatchPerWarp;
