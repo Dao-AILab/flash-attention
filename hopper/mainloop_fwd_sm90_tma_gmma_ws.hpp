@@ -994,7 +994,7 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (LargeHeadDimV) {
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_scale.data()), SmemLayoutScale{});
             } else { // won't be used, just a placeholder
-                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutScale{});
+                return make_tensor(make_smem_ptr(static_cast<float*>(nullptr)), SmemLayoutScale{});
             }
         }();
         Tensor sQv = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_qv.data()), SmemLayoutQv{});
