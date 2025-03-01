@@ -285,11 +285,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
-<<<<<<< HEAD
-    flash::Mask<Is_causal, Is_local, Has_alibi, Is_tree_attention> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope, binfo.sum_s_k, binfo.sum_s_q);
-=======
-    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
->>>>>>> main
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi, Is_tree_attention> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope, binfo.sum_s_k, binfo.sum_s_q);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
