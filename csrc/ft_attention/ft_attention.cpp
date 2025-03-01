@@ -121,10 +121,10 @@ torch::Tensor single_query_attention(const torch::Tensor q,
                                      const torch::Tensor v,
                                      torch::Tensor k_cache,
                                      torch::Tensor v_cache,
-                                     c10::optional<const torch::Tensor> length_per_sample_,
-                                     c10::optional<const torch::Tensor> rotary_cos_,
-                                     c10::optional<const torch::Tensor> rotary_sin_,
-                                     c10::optional<const torch::Tensor> nnz_head_idx_,
+                                     std::optional<const torch::Tensor> length_per_sample_,
+                                     std::optional<const torch::Tensor> rotary_cos_,
+                                     std::optional<const torch::Tensor> rotary_sin_,
+                                     std::optional<const torch::Tensor> nnz_head_idx_,
                                      const int timestep,
                                      int rotary_embedding_dim = 0,
                                      const float rotary_base = 10000.0f,
@@ -190,8 +190,7 @@ torch::Tensor single_query_attention(const torch::Tensor q,
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{q.device()};
 
     torch::Tensor out = torch::empty_like(q);
 

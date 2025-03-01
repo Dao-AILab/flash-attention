@@ -29,7 +29,9 @@ def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random", 
 
 
 def generate_qkv(
-    q, k, v, query_padding_mask=None, key_padding_mask=None, kvpacked=False, qkvpacked=False
+    q, k, v, query_padding_mask=None, key_padding_mask=None, 
+    kvpacked=False, qkvpacked=False, add_unused_qkv=False,
+    query_unused_mask=None, key_unused_mask=None,
 ):
     """
     Arguments:
@@ -44,9 +46,14 @@ def generate_qkv(
     _, seqlen_k, nheads_k, _ = k.shape
     assert k.shape == (batch_size, seqlen_k, nheads_k, d)
     assert v.shape == (batch_size, seqlen_k, nheads_k, d)
+    if query_unused_mask is not None or key_unused_mask is not None:
+        assert not kvpacked
+        assert not qkvpacked
 
     if query_padding_mask is not None:
-        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q = unpad_input(q, query_padding_mask)
+        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, seqused_q = unpad_input(
+            q, query_padding_mask, query_unused_mask,
+        )
         output_pad_fn = lambda output_unpad: pad_input(
             output_unpad, indices_q, batch_size, seqlen_q
         )
@@ -55,20 +62,22 @@ def generate_qkv(
         cu_seqlens_q = torch.arange(
             0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32, device=q_unpad.device
         )
+        seqused_q = None
         max_seqlen_q = seqlen_q
         output_pad_fn = lambda output_unpad: rearrange(
             output_unpad, "(b s) h d -> b s h d", b=batch_size
         )
 
     if key_padding_mask is not None:
-        k_unpad, indices_k, cu_seqlens_k, max_seqlen_k = unpad_input(k, key_padding_mask)
-        v_unpad, _, _, _ = unpad_input(v, key_padding_mask)
+        k_unpad, indices_k, cu_seqlens_k, max_seqlen_k, seqused_k = unpad_input(k, key_padding_mask, key_unused_mask)
+        v_unpad, _, _, _, _ = unpad_input(v, key_padding_mask, key_unused_mask)
     else:
         k_unpad = rearrange(k, "b s h d -> (b s) h d")
         v_unpad = rearrange(v, "b s h d -> (b s) h d")
         cu_seqlens_k = torch.arange(
             0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32, device=k_unpad.device
         )
+        seqused_k = None
         max_seqlen_k = seqlen_k
 
     if qkvpacked:
@@ -125,6 +134,8 @@ def generate_qkv(
             v_unpad.detach().requires_grad_(),
             cu_seqlens_q,
             cu_seqlens_k,
+            seqused_q,
+            seqused_k,
             max_seqlen_q,
             max_seqlen_k,
             q.detach().requires_grad_(),

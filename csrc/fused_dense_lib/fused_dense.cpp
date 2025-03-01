@@ -53,8 +53,7 @@ std::vector<at::Tensor> linear_bias_wgrad(at::Tensor input, at::Tensor d_output,
   CHECK_SHAPE(d_output, batch_size, out_features);
 
   // Otherwise the kernel will be launched from cuda:0 device
-  // Cast to char to avoid compiler warning about narrowing
-  at::cuda::CUDAGuard device_guard{(char)input.get_device()};
+  at::cuda::CUDAGuard device_guard{input.device()};
 
   // create output/workspace tensor
   auto opts = input.options();
@@ -91,7 +90,7 @@ std::vector<at::Tensor> linear_bias_wgrad(at::Tensor input, at::Tensor d_output,
 }
 
 std::vector<at::Tensor> linear_act_forward(at::Tensor input, at::Tensor weight,
-                                           c10::optional<at::Tensor> bias_,
+                                           std::optional<at::Tensor> bias_,
                                            bool is_gelu, bool save_pre_act, int heuristic) {
 
   int64_t batch_size = input.size(0);
@@ -115,8 +114,7 @@ std::vector<at::Tensor> linear_act_forward(at::Tensor input, at::Tensor weight,
   }
 
   // Otherwise the kernel will be launched from cuda:0 device
-  // Cast to char to avoid compiler warning about narrowing
-  at::cuda::CUDAGuard device_guard{(char)input.get_device()};
+  at::cuda::CUDAGuard device_guard{input.device()};
 
   // create output/workspace tensor
   auto opts = input.options();
@@ -176,8 +174,7 @@ std::vector<at::Tensor> bias_act_linear_dgrad_bgrad(
   CHECK_SHAPE(pre_act, batch_size, is_gelu ? in_features : in_features / 8);
 
   // Otherwise the kernel will be launched from cuda:0 device
-  // Cast to char to avoid compiler warning about narrowing
-  at::cuda::CUDAGuard device_guard{(char)weight.get_device()};
+  at::cuda::CUDAGuard device_guard{weight.device()};
 
   // create output/workspace tensor
   auto opts = weight.options();

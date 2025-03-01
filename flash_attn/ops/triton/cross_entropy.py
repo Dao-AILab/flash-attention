@@ -3,6 +3,7 @@
 from typing import Tuple, Optional, Union
 
 import torch
+import torch.nn.functional as F
 
 import triton
 import triton.language as tl
@@ -39,25 +40,29 @@ def cross_entropy_fwd_kernel(
     HAS_SMOOTHING: tl.constexpr,
     # if SPLIT (e.g. tensor parallel), don't include the LSE in the loss since it's not the final LSE
     SPLIT: tl.constexpr,
+    PRECOMPUTED_LSE: tl.constexpr,  # If LSE is already computed (also no smoothing and logit_scale == 1.0)
 ):
     row_idx = tl.program_id(0)
     logits_ptr = logits_ptr + row_idx * logits_row_stride.to(tl.int64)
     sum_logits = 0.0  # For smoothing
-    # Statistics for online softmax
-    m_i = -float("inf")
-    l_i = 0.0
-    for col_offset in range(0, n_cols, BLOCK_SIZE):
-        cols = col_offset + tl.arange(0, BLOCK_SIZE)
-        logits = tl.load(logits_ptr + cols, mask=cols < n_cols, other=-float("inf")).to(
-            tl.float32
-        ) * logit_scale
-        if HAS_SMOOTHING:
-            sum_logits += tl.sum(tl.where(cols < n_cols, logits, 0.0))
-        m_i_new = tl.maximum(m_i, tl.max(logits))
-        l_i = tl.exp(m_i - m_i_new) * l_i + tl.sum(tl.exp(logits - m_i_new))
-        m_i = m_i_new
-    lse = tl.log(l_i) + m_i
-    tl.store(lse_ptr + row_idx, lse)
+    if not PRECOMPUTED_LSE:
+        # Statistics for online softmax
+        m_i = -float("inf")
+        l_i = 0.0
+        for col_offset in range(0, n_cols, BLOCK_SIZE):
+            cols = col_offset + tl.arange(0, BLOCK_SIZE)
+            logits = tl.load(logits_ptr + cols, mask=cols < n_cols, other=-float("inf")).to(
+                tl.float32
+            ) * logit_scale
+            if HAS_SMOOTHING:
+                sum_logits += tl.sum(tl.where(cols < n_cols, logits, 0.0))
+            m_i_new = tl.maximum(m_i, tl.max(logits))
+            l_i = tl.exp(m_i - m_i_new) * l_i + tl.sum(tl.exp(logits - m_i_new))
+            m_i = m_i_new
+        lse = tl.log(l_i) + m_i
+        tl.store(lse_ptr + row_idx, lse)
+    else:
+        lse = tl.load(lse_ptr + row_idx)
     label_idx = tl.load(labels_ptr + row_idx)
     if label_idx == ignore_index:
         loss = 0.0
@@ -135,7 +140,7 @@ def cross_entropy_bwd_kernel(
     if HAS_SMOOTHING:
         smooth_positive = 1.0 - smoothing
         smooth_negative = smoothing / total_classes
-        probs = tl.where(col_offsets == label_idx, probs - (1 - smoothing), probs) - smooth_negative
+        probs = tl.where(col_offsets == label_idx, probs - smooth_positive, probs) - smooth_negative
     else:
         probs = tl.where(col_offsets == label_idx, probs - 1.0, probs)
     tl.store(dlogits_ptr + col_offsets, (dloss * logit_scale) * probs, mask=col_offsets < n_cols)
@@ -148,6 +153,7 @@ class CrossEntropyLoss(torch.autograd.Function):
         ctx,
         logits,
         labels,
+        precomputed_lse=None,
         smoothing=0.0,
         logit_scale=1.0,
         lse_square_scale=0.0,
@@ -155,12 +161,19 @@ class CrossEntropyLoss(torch.autograd.Function):
         inplace_backward=False,
         process_group=None,
     ):
+        # For some reason Triton generates wrong code when labels has dtype long and its address
+        # is not aligned to 16 bytes. The ld.global.b64 seems to load the wrong label index.
+        if labels.dtype == torch.long and labels.data_ptr() % 16 != 0:
+            labels = F.pad(labels, (0, 1))[..., :-1]
+            assert labels.data_ptr() % 16 == 0
+        assert logit_scale > 0.0
         n_rows, n_cols = logits.shape
         assert labels.shape == (n_rows,)
         world_size = 1 if process_group is None else torch.distributed.get_world_size(process_group)
         total_classes = world_size * n_cols
         rank = 0 if process_group is None else torch.distributed.get_rank(process_group)
         class_start_idx = rank * n_cols
+        use_precomputed_lse = precomputed_lse is not None and logit_scale == 1.0 and smoothing == 0.0
 
         if logits.stride(-1) != 1:
             logits = logits.contiguous()
@@ -172,7 +185,11 @@ class CrossEntropyLoss(torch.autograd.Function):
             else (8 if BLOCK_SIZE < 8192 else (16 if BLOCK_SIZE < 128 * 1024 else 32))
         )
         losses = torch.empty(n_rows, dtype=torch.float, device=logits.device)
-        lse = torch.empty(n_rows, dtype=torch.float, device=logits.device)
+        if use_precomputed_lse:
+            assert precomputed_lse.shape == (n_rows,)
+            lse = precomputed_lse.contiguous()
+        else:
+            lse = torch.empty(n_rows, dtype=torch.float, device=logits.device)
         z_losses = torch.empty(n_rows, dtype=torch.float, device=logits.device)
         # Need this, otherwise Triton tries to launch from cuda:0 and we get
         # ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
@@ -192,8 +209,9 @@ class CrossEntropyLoss(torch.autograd.Function):
                 n_cols,  # shapes
                 logits.stride(0),  # strides
                 BLOCK_SIZE=BLOCK_SIZE,  # constants
-                num_warps=num_warps,
                 SPLIT=world_size > 1,
+                PRECOMPUTED_LSE=use_precomputed_lse,
+                num_warps=num_warps,
             )
 
         if world_size > 1:
@@ -234,8 +252,6 @@ class CrossEntropyLoss(torch.autograd.Function):
         ctx.total_classes = total_classes
         ctx.class_start_idx = class_start_idx
         ctx.inplace_backward = inplace_backward
-
-
         return losses, z_losses
 
     @staticmethod
@@ -270,11 +286,13 @@ class CrossEntropyLoss(torch.autograd.Function):
                 BLOCK_SIZE=BLOCK_SIZE,  # constants
                 num_warps=num_warps,
             )
-        return dlogits, None, None, None, None, None, None, None, None
+        return dlogits, None, None, None, None, None, None, None, None, None
+
 
 def cross_entropy_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
+    precomputed_lse: Optional[torch.Tensor] = None,
     label_smoothing: float = 0.0,
     logit_scale: float = 1.0,
     lse_square_scale: float = 0.0,
@@ -302,6 +320,7 @@ def cross_entropy_loss(
     return CrossEntropyLoss.apply(
         logits,
         labels,
+        precomputed_lse,
         label_smoothing,
         logit_scale,
         lse_square_scale,
