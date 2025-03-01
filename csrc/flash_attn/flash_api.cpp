@@ -573,7 +573,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     if (tree_dfs_order_end_k_.has_value()) {
         const at::Tensor tree_dfs_order_end_k = tree_dfs_order_end_k_.value(), tree_dfs_order_start_q = tree_dfs_order_start_q_.value();
         TORCH_CHECK(is_causal, "In tree attention, is_causal must be True");
-        TORCH_CHECK(window_size_left == -1 && window_size_right == -1, "In tree attention, is_local must be False");
+        if (window_size_left < max_seqlen_k)
+            TORCH_CHECK(window_size_left == -1 && window_size_right == -1, "In tree attention, is_local must be False");
         TORCH_CHECK(!alibi_slopes_.has_value(), "tree attention does not support alibi");
         TORCH_CHECK(tree_dfs_order_start_q.dtype() == torch::kInt32, "tree_dfs_order_start_q must have dtype int32");
         TORCH_CHECK(tree_dfs_order_end_k.dtype() == torch::kInt32, "tree_dfs_order_end_k must have dtype int32");
