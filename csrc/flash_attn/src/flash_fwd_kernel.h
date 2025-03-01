@@ -327,7 +327,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         mask.template apply_mask<Is_causal, Is_even_MN>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16, 
-            params.tree_end_position_id_k, params.tree_start_position_id_q
+            params.tree_dfs_order_end_k, params.tree_dfs_order_start_q
         );
 
         FLASH_NAMESPACE::cp_async_wait<0>();
@@ -403,7 +403,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16,
-            params.tree_end_position_id_k, params.tree_start_position_id_q
+            params.tree_dfs_order_end_k, params.tree_dfs_order_start_q
         );
 
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local || Is_tree_attention>(acc_s, acc_o, params.scale_softmax_log2);

@@ -90,8 +90,8 @@ def test_flash_attn_tree_attention_output(heads, mha_type, head_dim, dtype, rand
                                         cu_seqlens, cu_seqlens, 
                                         max_seqlen_varlen, max_seqlen_varlen, 
                                         causal=True, 
-                                        tree_end_position_id_k=end_pos_id,
-                                        tree_start_position_id_q=start_pos_id)
+                                        tree_dfs_order_end_k=end_pos_id,
+                                        tree_dfs_order_start_q=start_pos_id)
     output_pack.backward(grad_output[mask])
 
     def merge(x):

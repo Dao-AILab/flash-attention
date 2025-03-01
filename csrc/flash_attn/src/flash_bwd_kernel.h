@@ -510,8 +510,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                                             binfo.actual_seqlen_q,
                                             // binfo.actual_seqlen_k, m_block * kBlockM + (tidx / 32) % AtomLayoutMS * 16 + (tidx % 32) / 4,
                                             AtomLayoutMS * 16, 
-                                            params.tree_end_position_id_k + binfo.sum_s_k, 
-                                            params.tree_start_position_id_q + binfo.sum_s_q);
+                                            params.tree_dfs_order_end_k + binfo.sum_s_k, 
+                                            params.tree_dfs_order_start_q + binfo.sum_s_q);
         } else if (Is_causal) {
             // Putting this causal masking right after acc_s is *much* slower for some reason.
             // TD [2023-08-16]: We need the 2nd condition because if seqlen_q is long and seqlen_k is short

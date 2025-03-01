@@ -85,7 +85,7 @@ template <typename Engine, typename Layout>
 __forceinline__ __device__ void apply_mask_causal_tree_attention(Tensor<Engine, Layout> &tensor, const int col_idx_offset_,
                                          const int max_seqlen_k, const int row_idx_offset,
                                          const int max_seqlen_q, const int warp_row_stride, 
-                                         const int *tree_end_position_id_k, const int *tree_start_position_id_q) {
+                                         const int *tree_dfs_order_end_k, const int *tree_dfs_order_start_q) {
     // Causal masking is equivalent to local masking with window_size_left = infinity and window_size_right = 0
     // apply_mask_local</*HasWSLeft=*/false>(tensor, col_idx_offset_, max_seqlen_k, row_idx_offset,
     //                                       max_seqlen_q, warp_row_stride, -1, 0);
@@ -109,7 +109,7 @@ __forceinline__ __device__ void apply_mask_causal_tree_attention(Tensor<Engine, 
                 #pragma unroll
                 for (int j = 0; j < size<1, 0>(tensor); ++j) {
                     const int col_idx = col_idx_base + j;
-                    if (col_idx >= col_idx_limit_right || row_idx < max_seqlen_q && tree_start_position_id_q[row_idx] > tree_end_position_id_k[col_idx]) {
+                    if (col_idx >= col_idx_limit_right || row_idx < max_seqlen_q && tree_dfs_order_start_q[row_idx] > tree_dfs_order_end_k[col_idx]) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
                 }
@@ -177,8 +177,8 @@ struct Mask {
                                                const int col_idx_offset_,
                                                const int row_idx_offset,
                                                const int warp_row_stride, 
-                                               const int *tree_end_position_id_k = nullptr, 
-                                               const int *tree_start_position_id_q = nullptr) {
+                                               const int *tree_dfs_order_end_k = nullptr, 
+                                               const int *tree_dfs_order_start_q = nullptr) {
         static_assert(!(Causal_mask && Is_local), "Cannot be both causal and local");
         static_assert(Layout::rank == 3, "Only support 3D Tensor");
         static_assert(decltype(size<0>(tensor_))::value == 4, "First dimension must be 4");
@@ -212,8 +212,8 @@ struct Mask {
                 }
             } else {
                 if constexpr (Is_tree_attention) {
-                    tree_end_position_id_k += sum_s_k;
-                    tree_start_position_id_q += sum_s_q;
+                    tree_dfs_order_end_k += sum_s_k;
+                    tree_dfs_order_start_q += sum_s_q;
                 }
                 #pragma unroll
                 for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
@@ -248,7 +248,7 @@ struct Mask {
                                     }
                                 }
                                 if constexpr (Is_tree_attention) {
-                                    if (col_idx < max_seqlen_k && row_idx < max_seqlen_q && tree_start_position_id_q[row_idx] > tree_end_position_id_k[col_idx]) {
+                                    if (col_idx < max_seqlen_k && row_idx < max_seqlen_q && tree_dfs_order_start_q[row_idx] > tree_dfs_order_end_k[col_idx]) {
                                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                                     }
                                 }

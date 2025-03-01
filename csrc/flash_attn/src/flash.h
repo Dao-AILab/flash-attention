@@ -76,8 +76,8 @@ struct Flash_fwd_params : public Qkv_params {
     int * __restrict__ leftpad_k;
 
     // tree attention 
-    int * __restrict__ tree_end_position_id_k;
-    int * __restrict__ tree_start_position_id_q;
+    int * __restrict__ tree_dfs_order_end_k;
+    int * __restrict__ tree_dfs_order_start_q;
 
     // If provided, the actual length of each k sequence.
     int * __restrict__ seqused_k;
