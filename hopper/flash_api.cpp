@@ -515,7 +515,6 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         bool is_causal,
         int window_size_left,
         int window_size_right,
-        int sink_token_length,
         float const softcap,
         bool const is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
         int num_splits,
@@ -712,7 +711,6 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
                      sm_margin);
     params.total_q = total_q;
     params.total_k = total_k;
-    params.sink_token_length = sink_token_length;
     params.b_k = batch_size_k;
     params.dv = head_size_v;
     params.dv_rounded = head_size_v_rounded;
@@ -1041,7 +1039,6 @@ std::vector<at::Tensor> mha_bwd(
     bool is_causal,
     int window_size_left,
     int window_size_right,
-    int const sink_token_length,
     float const softcap,
     bool const deterministic,
     int const sm_margin) {
@@ -1275,7 +1272,6 @@ std::vector<at::Tensor> mha_bwd(
     params.total_q = total_q;
     params.total_k = total_k;
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
-    params.sink_token_length = sink_token_length;
 
     // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();

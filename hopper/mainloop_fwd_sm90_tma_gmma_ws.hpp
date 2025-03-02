@@ -378,7 +378,7 @@ struct CollectiveMainloopFwdSm90 {
         float const softmax_scale;
         float const* ptr_q_descale, *ptr_k_descale, *ptr_v_descale;
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
-        int const window_size_left = -1, window_size_right = -1, sink_token_length = 0;
+        int const window_size_left = -1, window_size_right = -1;
         float const softcap_val;
         int const num_splits;
         int const* const kv_batch_idx = nullptr;
@@ -433,7 +433,7 @@ struct CollectiveMainloopFwdSm90 {
         float const* ptr_q_descale, *ptr_k_descale, *ptr_v_descale;
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
         float const softcap_val;
-        int const window_size_left, window_size_right, sink_token_length;
+        int const window_size_left, window_size_right;
         int const num_splits;
         int const* const kv_batch_idx = nullptr;
         int const* const cu_seqlens_q = nullptr;
@@ -540,7 +540,7 @@ struct CollectiveMainloopFwdSm90 {
                 args.ptr_q_descale, args.ptr_k_descale, args.ptr_v_descale,
                 args.stride_q_descale, args.stride_k_descale, args.stride_v_descale,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
-                args.window_size_left, args.window_size_right, args.sink_token_length,
+                args.window_size_left, args.window_size_right,
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
@@ -848,33 +848,6 @@ struct CollectiveMainloopFwdSm90 {
             n_block_prev = n_block;
             if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
         }
-        // if constexpr (Is_local) {
-        // Disable sink token code for now
-        if constexpr (false && Is_local) {
-            static constexpr int kBlockN = get<1>(TileShape_MNK{});
-            int n_block_sink_max = cute::ceil_div(params.sink_token_length, kBlockN);
-            #pragma unroll 1
-            for (n_block = std::min(n_block, n_block_sink_max - 1); n_block >= 0; --n_block) {
-                PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
-                ++smem_pipe_write;
-                if (should_load_KV) {
-                    if constexpr (PagedKV) {
-                        paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
-                    }
-                    if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
-                    load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
-                    if constexpr (!Transpose_V) {
-                        if constexpr (IntraWGOverlap) {
-                            load_V(n_block_prev, smem_pipe_write_v, cute::true_type{} /*Seqlenk_mask*/);
-                        } else {
-                            load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
-                        }
-                    }
-                }
-                n_block_prev = n_block;
-                if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
-            }
-        }
         scheduler_prefetch();
         if constexpr (!Transpose_V && IntraWGOverlap) {
             if (should_load_KV) { load_V(n_block_prev, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
@@ -1058,7 +1031,7 @@ struct CollectiveMainloopFwdSm90 {
         int n_block = n_block_max - 1;
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(
-            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
+            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
             params.qhead_per_khead_divmod
         );
 
@@ -1118,7 +1091,6 @@ struct CollectiveMainloopFwdSm90 {
             cute::copy(smem_tiled_copy_Q, tSsQ_copy_view, tSrQ_copy_view);
         }
 
-        // TODO: check the case where n_block_max <= n_block_min but there are sink tokens
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read);
@@ -1232,12 +1204,6 @@ struct CollectiveMainloopFwdSm90 {
                 for (; n_block >= n_block_min; --n_block) {
                     fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
                 }
-                // Disable sink token code for now
-                // int n_block_sink_max = cute::ceil_div(params.sink_token_length, kBlockN);
-                // #pragma unroll 1
-                // for (n_block = std::min(n_block, n_block_sink_max - 1); n_block >= 0; --n_block) {
-                //     fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
-                // }
             }
             // Tell producers that smem_q is ready
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
@@ -1341,12 +1307,6 @@ struct CollectiveMainloopFwdSm90 {
                 for (; n_block >= n_block_min; --n_block) {
                     fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
                 }
-                // Disable sink token code for now
-                // int n_block_sink_max = cute::ceil_div(params.sink_token_length, kBlockN);
-                // #pragma unroll 1
-                // for (n_block = std::min(n_block, n_block_sink_max - 1); n_block >= 0; --n_block) {
-                //     fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
-                // }
             }
             warp_scheduler_barrier_arrive();
             // Tell producers that smem_q is ready

@@ -103,8 +103,6 @@ COMPILED_HDIMS = (
 def test_flash_attn_output(
         seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv, mha_type, dtype
 ):
-    # sink_token_length = 0 if not local else 4
-    sink_token_length = 0 if not local else 0
     if V_colmajor and (seqlen_k % 16 != 0 or dtype != torch.float8_e4m3fn):
         pytest.skip("V_colmajor requires seqlen_k to be a multiple of 16 and dtype to be float8_e4m3fn")
     device = "cuda"
@@ -152,7 +150,6 @@ def test_flash_attn_output(
             qv=qv_ref,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
-            sink_token_length=sink_token_length,
             softcap=softcap
         )
         out_pt, attn_pt = attention_ref(
@@ -165,7 +162,6 @@ def test_flash_attn_output(
             qv=qv_ref,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
-            sink_token_length=sink_token_length,
             softcap=softcap,
             upcast=False,
             reorder_ops=True,
@@ -198,7 +194,6 @@ def test_flash_attn_output(
                 qv=qv,
                 q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
-                sink_token_length=sink_token_length,
                 softcap=softcap,
                 pack_gqa=pack_gqa,
                 num_splits=num_splits
@@ -230,7 +225,6 @@ def test_flash_attn_output(
         #     d ** (-0.5),
         #     causal,
         #     window_size[0], window_size[1],
-        #     sink_token_length,
         #     softcap,
         #     deterministic,
         #     0,  # sm_margin
