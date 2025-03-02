@@ -75,13 +75,11 @@ struct CollectiveMainloopFwdSm90 {
     static_assert(!LargeHeadDimV || kHeadDimV % 256 == 0);
     static_assert(!LargeHeadDimV || kBlockM <= 64, "kBlockM must be 64 or less for large Headdim_V");
     static_assert(!LargeHeadDimV || !MmaPV_is_RS, "MmaPV must be SS for large Headdim_V");
-    static_assert(!(HasQv && !IntraWGOverlap), "HasQv requires IntraWGOverlap");
 
     // Register bandwidth is actually a bottleneck so we don't want Q to be in registers.
     // Leaving this option here for reference.
     static constexpr bool MmaQK_is_RS = false;
     // We can have MmaPV with P in smem in rmem to reduce register pressure at the cost of more smem.
-    static_assert(!(!MmaPV_is_RS && !IntraWGOverlap), "MmaPV must be RS if IntraWGOverlap is disabled");
     static_assert(!(!MmaPV_is_RS && Is_FP8), "MmaPV must be RS if FP8");
     static_assert(!(!MmaPV_is_RS && Transpose_V), "MmaPV must be RS if Transpose_V");
 
@@ -1266,27 +1264,51 @@ struct CollectiveMainloopFwdSm90 {
             auto fwd_step = [&](int const n_block, auto mask_fn, auto is_first_iter_type, auto check_inf_type) {
                 static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
                 static constexpr bool Check_inf = decltype(check_inf_type)::value;
+                auto smem_pipe_read_prev = smem_pipe_read;
+                if constexpr (!Is_first_iter) { ++smem_pipe_read; }
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
                 warp_scheduler_barrier_arrive();
-                warpgroup_wait<0>();
-                pipeline_k.consumer_release(smem_pipe_read);  // release K
+                if constexpr (!HasQv) {
+                    warpgroup_wait<0>();
+                    pipeline_k.consumer_release(smem_pipe_read);  // release K
+                } else {
+                    if constexpr (Is_first_iter) {
+                        shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
+                    }
+                    consumer_wait(pipeline_v, smem_pipe_read);
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/1>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                    pipeline_k.consumer_release(smem_pipe_read);  // release K
+                    warpgroup_wait<0>();
+                }
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
                 Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
                 Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
                 convert_type_out(tOrP_acc, tOrP);
                 if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
+                if constexpr (LargeHeadDimV) {
+                    cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
+                }
+                if constexpr (!MmaPV_is_RS) { cute::copy(smem_tiled_copy_P, smem_thr_copy_P.retile_S(tOrP), tPsP); }
                 if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
-                consumer_wait(pipeline_v, smem_pipe_read);
+                if constexpr (!MmaPV_is_RS) {
+                    cutlass::arch::fence_view_async_shared();
+                    __syncwarp();
+                    if constexpr (LargeHeadDimV) {
+                        cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
+                    }
+                }
+                if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                warpgroup_wait<0>();
                 pipeline_v.consumer_release(smem_pipe_read);  // release V
-                ++smem_pipe_read;
             };
 
             auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
@@ -1331,8 +1353,14 @@ struct CollectiveMainloopFwdSm90 {
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             Tensor scores_scale = softmax.finalize(v_descale);
+            if constexpr (LargeHeadDimV) {
+                cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
+                store_scales(scores_scale, smem_pipe_read.index());
+                cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
+            }
             softmax.rescale_o(tOrO, scores_scale);
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+            ++smem_pipe_read;
         }
         ++work_idx;
         return true;
@@ -1391,15 +1419,16 @@ struct CollectiveMainloopFwdSm90 {
             }
         };
 
-        clear(tOrO);
+        // clear(tOrO);
         // tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
 
         typename Softmax::TensorT scores_scale;
 
         int n_block = n_block_max - 1;
-        pipeline_v.consumer_wait(smem_pipe_read);
+        // If HasQv, then by the time P is ready, V must be ready as well
+        if constexpr (!HasQv) { pipeline_v.consumer_wait(smem_pipe_read); }
         cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
-        flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+        flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
         pipeline_v.consumer_release(smem_pipe_read);  // release V
         --n_block;
@@ -1409,8 +1438,10 @@ struct CollectiveMainloopFwdSm90 {
             load_scales(scores_scale, smem_pipe_read.index());
             softmax.rescale_o(tOrO, scores_scale);
             ++smem_pipe_read;
-            auto barrier_token = pipeline_v.consumer_try_wait(smem_pipe_read);
-            pipeline_v.consumer_wait(smem_pipe_read, barrier_token);
+            if constexpr (!HasQv) {
+                auto barrier_token = pipeline_v.consumer_try_wait(smem_pipe_read);
+                pipeline_v.consumer_wait(smem_pipe_read, barrier_token);
+            }
             flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
             cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
             pipeline_v.consumer_release(smem_pipe_read);  // release V

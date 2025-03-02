@@ -17,7 +17,7 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             // With this workaround in Cutlass 3.8, tile size 192 x 128 got slower for non-causal, idk why
             // https://github.com/NVIDIA/cutlass/blob/833f6990e031b48b4cd2fcf55e0849c51ef6bac2/include/cute/container/tuple.hpp#L131
             // Switch to tile size 192 x 192 for now
-            return {same_hdim ? 192 : 64, same_hdim ? 192 : 64, false, true};
+            return {same_hdim ? 192 : 64, same_hdim ? 192 : 64, false, same_hdim};
             // Good for long seqlen (>= 4k) but suffers from tile quantization at short seqlen
             // return {192, is_causal || is_local ? 192 : 176, true, false};
         } else if (headdim <= 96) {

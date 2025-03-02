@@ -1,6 +1,7 @@
 from collections import namedtuple
 from functools import partial
 import math
+import os
 from typing import NamedTuple
 import torch
 import torch.nn as nn
@@ -33,6 +34,8 @@ try:
 except ImportError:
     triton_attention = None
 triton_attention = None
+
+DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
 
 
 def time_fwd(func, *args, repeats=30, verbose=True, desc="", **kwargs):
@@ -358,7 +361,7 @@ for headdim in [128]:
                 m1 = time_fwd(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, window_size=window_size, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3')
                 # pytorch_profiler(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, window_size=window_size, softcap=softcap, num_splits=num_splits)
             time_f[(causal, headdim, batch_size, seqlen), "Flash3"] = m1.mean
-            if dtype != torch.float8_e4m3fn and headdim == headdim_v:
+            if dtype != torch.float8_e4m3fn and headdim == headdim_v and not DISABLE_BACKWARD:
                 time.sleep(1)
                 if not varlen:
                     _, m1b = benchmark_backward(flash_attn_func_v3, q, k, v, causal=causal, window_size=window_size, sink_token_length=sink_token_length, softcap=softcap, deterministic=deterministic,
@@ -387,7 +390,7 @@ for headdim in [128]:
                     print(f'CuDNN fwd: {m2.mean * 1e3:.3f}ms, {(nFLOPS / m2.mean * 1e-12):.1f} TFLOPS')
                     print(f'CuDNN bwd: {m2b.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m2b.mean * 1e-12):.1f} TFLOPS')
             print(f'Fav3 fwd: {m1.mean * 1e3:.3f}ms, {(nFLOPS / m1.mean * 1e-12):.1f} TFLOPS')
-            if dtype != torch.float8_e4m3fn and headdim == headdim_v:
+            if dtype != torch.float8_e4m3fn and headdim == headdim_v and not DISABLE_BACKWARD:
                 print(f'Fav3 bwd: {m1b.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m1b.mean * 1e-12):.1f} TFLOPS')
             # benchmark_forward(torch.square, k)
             # print(f'cuBLAS: {m5.mean * 1e3:.3f}ms, {(nFLOPS_matmul / m5.mean * 1e-12):.1f} TFLOPS')

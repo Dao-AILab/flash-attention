@@ -363,6 +363,7 @@ public:
         int num_head, num_batch;
         int const qhead_per_khead;
         int const seqlen;
+        cutlass::FastDivmod head_divmod;
         cutlass::FastDivmod nsplits_divmod;
         int* const tile_count_semaphore;
         int* const cu_seqlens;
@@ -381,6 +382,7 @@ public:
         assert(!Split || args.num_splits < (1 << 8)); // We use the top 8 bits to store num_splits
         return {args.num_head, args.num_batch,
                 args.qhead_per_khead, args.seqlen,
+                cutlass::FastDivmod(args.num_head),
                 cutlass::FastDivmod(!Split ? 1 : args.num_splits),
                 args.tile_count_semaphore, args.cu_seqlens, args.seqused,
                 // args.num_m_blocks_ptr, args.num_splits_dynamic_ptr};
@@ -510,6 +512,9 @@ public:
         if constexpr (Split) {
             int bidh_actual = bidh / num_splits;
             int split_idx = bidh - bidh_actual * num_splits;
+            // TODO: idk why this gives wrong answer nondeterministically
+            // int bidh_actual, split_idx;
+            // split_idx = params.head_divmod.divmod(bidh_actual, bidh);
             // Use the top 8 bits to store num_splits and the next 8 bits to store split_idx
             // reinterpret_cast to uint32_t to make sure we're not doing sign extension when we shift
             uint32_t bidh_packed = reinterpret_cast<uint32_t&>(bidh_actual) + (reinterpret_cast<uint32_t&>(split_idx) << 16) + (reinterpret_cast<uint32_t&>(num_splits) << 24);

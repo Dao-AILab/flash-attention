@@ -102,10 +102,10 @@ __global__ void prepare_varlen_num_blocks_kernel(
     for (int bidb_start = kNumBatchPerWarp * warp_idx; bidb_start < num_batch; bidb_start += kNumBatchPerWarp * num_warps) {
         bool is_valid = bidb_start + lane < num_batch && lane < kNumBatchPerWarp;
         int num_n_blocks = is_valid ? num_n_blocks_ptr[bidb_start + lane] : 0;
-        int num_split_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
+        int num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
         if (is_valid) {
-            num_splits_dynamic_ptr[bidb_start + lane] = num_split_dynamic;
-            // printf("idx = %d, num_m_blocks = %d, num_n_blocks = %d, num_split_static = %d, num_split_dynamic = %d\n", bidb_start + lane, num_m_blocks_ptr[bidb_start + lane], num_n_blocks, num_splits_static, num_split_dynamic);
+            num_splits_dynamic_ptr[bidb_start + lane] = num_splits_dynamic;
+            // printf("idx = %d, num_m_blocks = %d, num_n_blocks = %d, num_split_static = %d, num_splits_dynamic = %d\n", bidb_start + lane, num_m_blocks_ptr[bidb_start + lane], num_n_blocks, num_splits_static, num_splits_dynamic);
         }
     }
 
