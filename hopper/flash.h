@@ -62,6 +62,7 @@ struct Flash_fwd_params : public Qkv_params {
     index_t v_descale_head_stride;
 
     // The dimensions.
+    // b = q_ranges.shape[0]; seqlen_q: max_seqlen_q, seqlen_k: max_seqlen_k
     int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;
     int total_q, total_k, total_knew;
     int b_k;  // When having KV cache and with cache_batch_idx, K & V might have larger batch size than Q
@@ -70,6 +71,11 @@ struct Flash_fwd_params : public Qkv_params {
     // The scaling factors for the kernel.
     float scale_softmax;
     float softcap;
+
+    // array of length b holding the starting index and ending index of each sequence.
+    // only used for flex flash attention.
+    int * __restrict__ q_ranges;
+    int * __restrict__ k_ranges;
 
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;

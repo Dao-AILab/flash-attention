@@ -75,6 +75,8 @@ void set_params_fprop(Flash_fwd_params &params,
                       const at::Tensor k,
                       const at::Tensor v,
                       at::Tensor out,
+                      void *q_ranges_d,
+                      void *k_ranges_d,
                       void *cu_seqlens_q_d,
                       void *cu_seqlens_k_d,
                       void *seqused_q,
@@ -120,6 +122,8 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
+    params.q_ranges = static_cast<int *>(q_ranges_d);
+    params.k_ranges = static_cast<int *>(k_ranges_d);
     params.seqused_q = static_cast<int *>(seqused_q);
     params.seqused_k = static_cast<int *>(seqused_k);
 
@@ -213,6 +217,7 @@ void set_params_dgrad(Flash_bwd_params &params,
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
                      q, k, v, out,
+                     nullptr, nullptr, // q_ranges_d, k_ranges_d
                      cu_seqlens_q_d,
                      cu_seqlens_k_d,
                      seqused_q,
@@ -417,7 +422,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // Always enable PackGQA for Split
     // params.page_table must already be set
     // This needs to match the kernel configs
-    bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
+    bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.q_ranges || params.k_ranges || params.seqused_q || params.seqused_k || params.leftpad_k;
     auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
     // Strictly speaking we need to pass in (varlen && params.num_splits > 1) but num_splits
     // has not been set here. It's OK though because we might just underestimate kBlockN a bit
@@ -495,6 +500,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<const at::Tensor> &v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
         std::optional<const at::Tensor> &q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
         std::optional<at::Tensor> &out_,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
+        std::optional<const at::Tensor> &q_ranges_,  // (b, 2)
+        std::optional<const at::Tensor> &k_ranges_,  // (b, 2)
         std::optional<const at::Tensor> &cu_seqlens_q_,  // b+1
         std::optional<const at::Tensor> &cu_seqlens_k_,  // b+1
         std::optional<const at::Tensor> &cu_seqlens_k_new_,  // b+1
@@ -570,26 +577,47 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(!paged_KV, "If cu_seqlens_k is passed in, then page table is not supported");
         TORCH_CHECK(!kv_batch_idx_.has_value(), "If cu_seqlens_k is passed in, then page table is not supported");
     }
+
+    at::Tensor q_ranges;
+    bool const is_flex_q = q_ranges_.has_value();
+    if (is_flex_q) {
+        q_ranges = q_ranges_.value();
+        CHECK_DEVICE(q_ranges); CHECK_CONTIGUOUS(q_ranges);
+        TORCH_CHECK(q_ranges.dtype() == torch::kInt32, "q_ranges must have dtype torch.int32");
+        TORCH_CHECK(q_ranges.dim() == 2, "q_ranges must be a 2D tensor");
+        TORCH_CHECK(q_ranges.size(1) == 2, "q_ranges must have 2 columns");
+        TORCH_CHECK(!is_varlen_q, "q_ranges is conflict with varlen queries");
+    }
+    at::Tensor k_ranges;
+    bool const is_flex_k = k_ranges_.has_value();
+    if (is_flex_k) {
+        k_ranges = k_ranges_.value();
+        CHECK_DEVICE(k_ranges); CHECK_CONTIGUOUS(k_ranges);
+        TORCH_CHECK(k_ranges.dtype() == torch::kInt32, "k_ranges must have dtype torch.int32");
+        TORCH_CHECK(k_ranges.dim() == 2, "k_ranges must be a 2D tensor");
+        TORCH_CHECK(k_ranges.size(1) == 2, "k_ranges must have 2 columns");
+        TORCH_CHECK(!is_varlen_k, "k_ranges is conflict with varlen keys");
+    }
     // This is what we will template on
-    bool const is_varlen = is_varlen_q || is_varlen_k || seqused_q_.has_value() || seqused_k_.has_value() || leftpad_k_.has_value();
+    bool const is_varlen = is_varlen_q || is_varlen_k || is_flex_q || is_flex_k || seqused_q_.has_value() || seqused_k_.has_value() || leftpad_k_.has_value();
     #ifdef FLASHATTENTION_DISABLE_VARLEN
         TORCH_CHECK(!is_varlen, "This flash attention build does not support varlen.");
     #endif
 
     auto const sizes = q.sizes();
-    const int batch_size = !is_varlen_q ? sizes[0] : cu_seqlens_q.size(0) - 1;
-    int seqlen_q = !is_varlen_q ? sizes[1] : max_seqlen_q_.value();
-    int total_q = !is_varlen_q ? batch_size * sizes[1] : sizes[0];
+    const int batch_size = !(is_varlen_q || is_flex_q) ? sizes[0] : (!is_flex_q ? cu_seqlens_q.size(0) - 1 : q_ranges.size(0));
+    int seqlen_q = !(is_varlen_q || is_flex_q) ? sizes[1] : max_seqlen_q_.value();
+    int total_q = !(is_varlen_q || is_flex_q) ? batch_size * sizes[1] : sizes[0];
     int num_heads = q.size(-2);
     int const head_size = q.size(-1);
     int const head_size_v = v.size(-1);
     int const max_num_pages_per_seq = !paged_KV ? 0 : page_table.size(1);
     int const num_pages = !paged_KV ? 0 : k.size(0);
     int const page_size = !paged_KV ? 1 : k.size(1);
-    int const seqlen_k = !is_varlen_k ? (!paged_KV ? k.size(1) : max_num_pages_per_seq * page_size) : max_seqlen_k_.value();
-    int const total_k = !is_varlen_k ? batch_size * k.size(1) : k.size(0);
+    int const seqlen_k = !(is_varlen_k || is_flex_k) ? (!paged_KV ? k.size(1) : max_num_pages_per_seq * page_size) : max_seqlen_k_.value();
+    int const total_k = !(is_varlen_k || is_flex_k) ? batch_size * k.size(1) : k.size(0);
     int const num_heads_k = k.size(-2);
-    int const batch_size_k = !paged_KV ? (!is_varlen_k ? k.size(0) : cu_seqlens_k.size(0) - 1) : page_table.size(0);
+    int const batch_size_k = !paged_KV ? (!(is_varlen_k || is_flex_k) ? k.size(0) : !is_flex_k ? cu_seqlens_k.size(0) - 1 : k_ranges.size(0)) : page_table.size(0);
     if (!kv_batch_idx_.has_value()) {
         TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
     }
@@ -617,20 +645,28 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM.
     is_causal = window_size_left < 0 && window_size_right == 0;
 
-    if (!is_varlen_q) {
+    if (!(is_varlen_q || is_flex_q)) {
         CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
     } else {
         CHECK_SHAPE(q, total_q, num_heads, head_size);
-        CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+        if (is_flex_q) {
+            CHECK_SHAPE(q_ranges, batch_size, 2);
+        } else {
+            CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+        }
     }
     if (!paged_KV) {
-        if (!is_varlen_k) {
+        if (!(is_varlen_k || is_flex_k)) {
             CHECK_SHAPE(k, batch_size_k, seqlen_k, num_heads_k, head_size);
             CHECK_SHAPE(v, batch_size_k, seqlen_k, num_heads_k, head_size_v);
         } else {
             CHECK_SHAPE(k, total_k, num_heads_k, head_size);
             CHECK_SHAPE(v, total_k, num_heads_k, head_size_v);
-            CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+            if (is_flex_k) {
+                CHECK_SHAPE(k_ranges, batch_size_k, 2);
+            } else {
+                CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+            }
         }
     } else {
         CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size);
@@ -663,13 +699,13 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(out.scalar_type() == out_type, "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
-        if (!is_varlen_q) {
+        if (!(is_varlen_q || is_flex_q)) {
             CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_v);
         } else {
             CHECK_SHAPE(out, total_q, num_heads, head_size_v);
         }
     } else {
-        out = !is_varlen_q
+        out = !(is_varlen_q || is_flex_q)
             ? torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(out_type))
             : torch::empty({total_q, num_heads, head_size_v}, opts.dtype(out_type));
     }
@@ -685,7 +721,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     at::Tensor softmax_lse;
-    if (!is_varlen_q) {
+    if (!(is_varlen_q || is_flex_q)) {
         softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     } else {
         softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
@@ -699,8 +735,10 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
                      num_heads, num_heads_k,
                      head_size, head_size_rounded,
                      q, k, v, out,
-                     !is_varlen_q ? nullptr : cu_seqlens_q.data_ptr(),
-                     !is_varlen_k ? nullptr : cu_seqlens_k.data_ptr(),
+                     is_flex_q ? q_ranges.data_ptr() : nullptr,
+                     is_flex_k ? k_ranges.data_ptr() : nullptr,
+                     is_varlen_q ? cu_seqlens_q.data_ptr() : nullptr,
+                     is_varlen_k ? cu_seqlens_k.data_ptr() : nullptr,
                      seqused_q_.has_value() ? seqused_q_.value().data_ptr() : nullptr,
                      seqused_k_.has_value() ? seqused_k_.value().data_ptr() : nullptr,
                      softmax_lse.data_ptr(),
@@ -785,7 +823,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(q_v.dtype() == q_type, "q_v must have the same dtype as query");
         CHECK_DEVICE(q_v);
         TORCH_CHECK(q_v.stride(-1) == 1, "q_v tensor must have contiguous last dimension");
-        if (!is_varlen_q) {
+        if (!(is_varlen_q || is_flex_q)) {
             CHECK_SHAPE(q_v, batch_size, seqlen_q, num_heads, head_size_v);
         } else {
             CHECK_SHAPE(q_v, total_q, num_heads, head_size_v);
@@ -794,7 +832,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         // All stride are in elements, not bytes.
         params.qv_row_stride = q_v.stride(-3);
         params.qv_head_stride = q_v.stride(-2);
-        if (!is_varlen_q) {
+        if (!(is_varlen_q || is_flex_q)) {
             params.qv_batch_stride = q_v.stride(0);
         }
     }
@@ -844,7 +882,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     auto outaccum_type = at::ScalarType::Float;
     if (params.num_splits > 1) {
         TORCH_CHECK(params.num_splits <= 256, "num_splits > 256 not supported");
-        if (!is_varlen_q) {
+        if (!(is_varlen_q || is_flex_q)) {
             out_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q, head_size_v}, opts.dtype(outaccum_type));
             softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
             params.oaccum_batch_stride = out_accum.stride(1);

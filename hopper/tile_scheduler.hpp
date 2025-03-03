@@ -23,6 +23,7 @@ struct TileSchedulerArguments {
     int const seqlen_k, headdim, element_size;  // Used to calculate L2 swizzling
     int* const tile_count_semaphore = nullptr;
     int* const cu_seqlens = nullptr;
+    int* const q_ranges = nullptr;
     int* const seqused = nullptr;
     // int* const num_m_blocks_ptr = nullptr;
     int* const num_splits_dynamic_ptr = nullptr;
@@ -39,11 +40,15 @@ public:
 
     // Device side kernel params
     struct Params {
+        // num_blocks is num_blocks_m, where m is the number of blocks in the M dimension (blockIdx.x)
+        // num_head is num_head_q if not PackGQA, else qhead_per_khead
+        // num_batch is num_batch_q, which means q_ranges.size(0)
         int const num_blocks, num_head, num_batch, num_splits;
         int const qhead_per_khead;
         int const seqlen;
         cutlass::FastDivmod nsplits_divmod;
         int* const cu_seqlens;
+        int* const q_ranges;
         int* const seqused;
     };
 
@@ -52,7 +57,9 @@ public:
         return {args.num_blocks, args.num_head, args.num_batch, !Split ? 1 : args.num_splits,
                 args.qhead_per_khead, args.seqlen,
                 cutlass::FastDivmod(!Split ? 1 : args.num_splits),
-                !Varlen ? nullptr : args.cu_seqlens, !Varlen ? nullptr : args.seqused};
+                !Varlen ? nullptr : args.cu_seqlens, 
+                !Varlen ? nullptr : args.q_ranges,
+                !Varlen ? nullptr : args.seqused};
     }
 
     static dim3
@@ -95,9 +102,14 @@ public:
     get_initial_work(Params const& params) const {
         WorkTileInfo work_info {int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), true};
         if constexpr (Varlen) {
-            int seqlen = params.seqused
-                ? params.seqused[work_info.bidb]
-                : (params.cu_seqlens ? params.cu_seqlens[work_info.bidb + 1] - params.cu_seqlens[work_info.bidb] : params.seqlen);
+            int seqlen = params.seqlen;
+            if (params.seqused) {
+                seqlen = params.seqused[work_info.bidb];
+            } else if (params.cu_seqlens) {
+                seqlen = params.cu_seqlens[work_info.bidb + 1] - params.cu_seqlens[work_info.bidb];
+            } else if (params.q_ranges) {
+                seqlen = params.q_ranges[2 * work_info.bidb + 1] - params.q_ranges[2 * work_info.bidb];
+            }
             if constexpr (PackGQA) { seqlen *= params.qhead_per_khead; }
             work_info.is_valid_tile = work_info.block_idx * kBlock < seqlen;
         }
@@ -366,6 +378,7 @@ public:
         cutlass::FastDivmod nsplits_divmod;
         int* const tile_count_semaphore;
         int* const cu_seqlens;
+        int* const q_ranges;
         int* const seqused;
         // int* const num_m_blocks_ptr;
         int* const num_splits_dynamic_ptr;
@@ -382,7 +395,7 @@ public:
         return {args.num_head, args.num_batch,
                 args.qhead_per_khead, args.seqlen,
                 cutlass::FastDivmod(!Split ? 1 : args.num_splits),
-                args.tile_count_semaphore, args.cu_seqlens, args.seqused,
+                args.tile_count_semaphore, args.cu_seqlens, args.q_ranges, args.seqused,
                 // args.num_m_blocks_ptr, args.num_splits_dynamic_ptr};
                 args.num_splits_dynamic_ptr};
     }
@@ -442,6 +455,8 @@ public:
                     int cur_cu_seqlen = batch_idx <= params.num_batch ? params.cu_seqlens[batch_idx] : 0;
                     int next_cu_seqlen = __shfl_down_sync(0xffffffff, cur_cu_seqlen, 1);
                     seqlen = next_cu_seqlen - cur_cu_seqlen;
+                } else if (params.q_ranges) {
+                    seqlen = params.q_ranges[2 * batch_idx + 1] - params.q_ranges[2 * batch_idx];
                 } else {
                     seqlen = params.seqlen;
                 }

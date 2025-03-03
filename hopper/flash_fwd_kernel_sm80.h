@@ -186,6 +186,7 @@ public:
                 !PagedKV ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
                 get<0>(params.mainloop.shape_K_new),
                 params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
+                params.mainloop.q_ranges, params.mainloop.k_ranges,
                 params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
             };
             if constexpr (AppendKV) {

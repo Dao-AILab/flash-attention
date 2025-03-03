@@ -141,6 +141,7 @@ public:
         float* ptr_LSE;
         StrideLSE const stride_LSE;
         int const* cu_seqlens = nullptr;
+        int const* q_ranges = nullptr;
         int const* seqused = nullptr;
         int const* num_splits_dynamic_ptr = nullptr;
     };
@@ -159,6 +160,7 @@ public:
         StrideLSE const stride_LSE;
         cutlass::FastDivmod seqlen_divmod, head_divmod;
         int const* cu_seqlens = nullptr;
+        int const* q_ranges = nullptr;
         int const* seqused = nullptr;
         int const* num_splits_dynamic_ptr = nullptr;
     };
@@ -181,6 +183,7 @@ public:
             args.stride_LSE,
             cutlass::FastDivmod(get<0>(args.shape_LSE_partial)), cutlass::FastDivmod(get<2>(args.shape_LSE_partial)),
             args.cu_seqlens,
+            args.q_ranges,
             args.seqused,
             args.num_splits_dynamic_ptr
         };
@@ -200,7 +203,7 @@ public:
         int const k_block = blockIdx.y;
         int const batch = !Varlen ? 0 : blockIdx.z;
         int const num_splits = get<1>(params.shape_LSE_partial);
-        flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
+        flash::SeqlenInfoFwd<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.q_ranges, params.seqused};
         int const offset = seqlen_info.offset;
         int const seqlen = seqlen_info.seqlen;
         int max_idx = seqlen * get<2>(params.shape_LSE_partial) * get<3>(params.shape_LSE_partial);

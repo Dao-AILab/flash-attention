@@ -13,6 +13,7 @@ namespace flash {
 __global__ void prepare_varlen_num_blocks_kernel(
         int seqlen_q_static, int seqlen_k_static, int seqlen_k_new_static,
         int const* const cu_seqlens_q, int const* const cu_seqlens_k, int const* const cu_seqlens_k_new,
+        int const* const q_ranges, int const* const k_ranges,
         int const* const seqused_q, int const* const seqused_k, int const* const leftpad_k_ptr,
         int num_batch, int num_head, int qhead_per_khead, int num_sm, int num_splits_static,
         cutlass::FastDivmod blockm_divmod, cutlass::FastDivmod blockn_divmod,
@@ -39,6 +40,8 @@ __global__ void prepare_varlen_num_blocks_kernel(
             int cur_cu_seqlen = batch_idx <= num_batch ? cu_seqlens_q[batch_idx] : 0;
             int next_cu_seqlen = __shfl_down_sync(0xffffffff, cur_cu_seqlen, 1);
             seqlen = next_cu_seqlen - cur_cu_seqlen;
+        } else if (q_ranges) {
+            seqlen = batch_idx < num_batch ? q_ranges[batch_idx * 2 + 1] - q_ranges[batch_idx * 2] : 0;
         } else {
             seqlen = seqlen_q_static;
         }
@@ -57,6 +60,8 @@ __global__ void prepare_varlen_num_blocks_kernel(
             int cur_cu_seqlen = batch_idx <= num_batch ? cu_seqlens_k[batch_idx] : 0;
             int next_cu_seqlen = __shfl_down_sync(0xffffffff, cur_cu_seqlen, 1);
             seqlen = next_cu_seqlen - cur_cu_seqlen;
+        } else if (k_ranges) {
+            seqlen = batch_idx < num_batch ? k_ranges[batch_idx * 2 + 1] - k_ranges[batch_idx * 2] : 0;
         } else {
             seqlen = seqlen_k_static;
         }
@@ -119,6 +124,7 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
     flash::prepare_varlen_num_blocks_kernel<<<1 /*grid*/, 256 /*block*/, 0, stream>>>(
         params.seqlen_q, params.seqlen_k, params.seqlen_knew,
         params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
+        params.q_ranges, params.k_ranges,
         params.seqused_q, params.seqused_k, params.leftpad_k,
         params.b, !packgqa ? params.h : params.h_k, qhead_per_khead, params.num_sm, params.num_splits,
         cutlass::FastDivmod(blockM), cutlass::FastDivmod(blockN),

@@ -24,6 +24,8 @@ def _flash_attn_forward(
         v_new,
         qv,
         out,
+        q_ranges,
+        k_ranges,
         cu_seqlens_q,
         cu_seqlens_k,
         cu_seqlens_k_new,
@@ -51,6 +53,7 @@ def _flash_attn_forward(
     assert sink_token_length == 0, "sink_token_length not supported yet"
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    q_ranges, k_ranges = [maybe_contiguous(x) for x in (q_ranges, k_ranges)]
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
         maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new)
     ]
@@ -67,6 +70,8 @@ def _flash_attn_forward(
         v_new,
         qv,
         out,
+        q_ranges,
+        k_ranges,
         cu_seqlens_q,
         cu_seqlens_k,
         cu_seqlens_k_new,
@@ -261,6 +266,7 @@ class FlashAttnFunc(torch.autograd.Function):
             None, None,  # k_new, v_new
             qv,  # qv
             None,  # out
+            None, None, # q_ranges, k_ranges
             None, None, None,   # cu_seqlens_q/k/k_new
             None, None,   # seqused_q/k
             None, None,   # max_seqlen_q/k
@@ -354,6 +360,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None, None,  # k_new, v_new
             qv,  # qv
             None,  # out
+            None, None, # q_ranges, k_ranges
             cu_seqlens_q,
             cu_seqlens_k,
             None,   # cu_seqlens_k_new
@@ -603,6 +610,63 @@ def flash_attn_varlen_func(
     )
 
 
+def flex_flash_attn_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_ranges: torch.Tensor,
+    k_ranges: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    seqused_q=None,
+    seqused_k=None,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None, k_descale=None, v_descale=None,
+    window_size=(-1, -1),
+    sink_token_length=0,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    sm_margin=0,
+):
+    if softmax_scale is None:
+        softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
+    assert isinstance(max_seqlen_q, int), f"max_seqlen_q must be an int, otherwise would lead to performance degradation"
+    assert isinstance(max_seqlen_k, int), f"max_seqlen_k must be an int, otherwise would lead to performance degradation"
+    out, softmax_lse, *rest = _flash_attn_forward(
+            q,
+            k,
+            v,
+            None, None,  # k_new, v_new
+            qv,  # qv
+            None,  # out
+            q_ranges, 
+            k_ranges,
+            None, # cu_seqlens_q
+            None, # cu_seqlens_k
+            None,   # cu_seqlens_k_new
+            seqused_q,
+            seqused_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            None, None, None,   # page_table, kv_batch_idx, leftpad_k,
+            None, None,  # rotary_cos/sin
+            q_descale, k_descale, v_descale,
+            softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            sink_token_length=sink_token_length,
+            softcap=softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            sm_margin=sm_margin,
+        )
+    return out, softmax_lse
+
+
 def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
     return flash_attn_3_cuda.fwd_combine(out_partial, lse_partial, out, out_dtype)
 
@@ -740,6 +804,7 @@ def flash_attn_with_kvcache(
         v,
         qv,
         None,  # out
+        None, None, # q_ranges, k_ranges
         cu_seqlens_q,
         None,  # cu_seqlens_k
         cu_seqlens_k_new,

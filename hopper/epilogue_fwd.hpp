@@ -125,6 +125,7 @@ struct CollectiveEpilogueFwd {
         StrideLSE const stride_LSE;
         int32_t const nheads_kv;
         int const* cu_seqlens = nullptr;
+        int const* q_ranges = nullptr;
         int const* seqused = nullptr;
     };
 
@@ -142,6 +143,7 @@ struct CollectiveEpilogueFwd {
         cutlass::FastDivmod qhead_per_khead_divmod;
         TMA_O tma_store_O;
         int const* cu_seqlens = nullptr;
+        int const* q_ranges = nullptr;
         int const* seqused = nullptr;
     };
 
@@ -177,7 +179,7 @@ struct CollectiveEpilogueFwd {
         return {args.ptr_O, args.shape_O, args.stride_O, shape_O_packed, stride_O_packed,
                 args.ptr_LSE, args.stride_LSE, shape_LSE_packed, stride_LSE_packed,
                 cutlass::FastDivmod(qhead_per_khead),
-                tma_store_O, args.cu_seqlens, args.seqused};
+                tma_store_O, args.cu_seqlens, args.q_ranges, args.seqused};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -238,8 +240,8 @@ struct CollectiveEpilogueFwd {
             }
         }
 
-        flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused};
-        bool is_varlen = Varlen && params.cu_seqlens;
+        flash::SeqlenInfoFwd<Varlen, kBlockM> seqlen_info{bidb, size<0>(params.shape_O), params.cu_seqlens, params.q_ranges, params.seqused};
+        bool is_varlen = Varlen && (params.cu_seqlens || params.q_ranges);
         int offset_o = seqlen_info.offset;
         int seqlen_o = seqlen_info.seqlen;
         int warp_group_idx = __shfl_sync(0xFFFFFFFF, thread_idx / cutlass::NumThreadsPerWarpGroup, 0);
@@ -370,8 +372,8 @@ struct CollectiveEpilogueFwd {
         static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
         auto [m_block, bidh, bidb, split_idx] = block_coord;
         split_idx &= 0x0000FFFF; // Only use the lower 16 bits of split_idx
-        flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused};
-        bool const is_varlen = Varlen && params.cu_seqlens;
+        flash::SeqlenInfoFwd<Varlen, kBlockM> seqlen_info{bidb, size<0>(params.shape_O), params.cu_seqlens, params.q_ranges, params.seqused};
+        bool const is_varlen = Varlen && (params.cu_seqlens || params.q_ranges);
         int offset_o = seqlen_info.offset;
         int seqlen_o = seqlen_info.seqlen;
         int qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;

@@ -387,6 +387,8 @@ struct CollectiveMainloopFwdSm90 {
         int const* const cu_seqlens_q = nullptr;
         int const* const cu_seqlens_k = nullptr;
         int const* const cu_seqlens_k_new = nullptr;
+        int const* const q_ranges = nullptr;
+        int const* const k_ranges = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
@@ -441,6 +443,8 @@ struct CollectiveMainloopFwdSm90 {
         int const* const cu_seqlens_q = nullptr;
         int const* const cu_seqlens_k = nullptr;
         int const* const cu_seqlens_k_new = nullptr;
+        int const* const q_ranges = nullptr;
+        int const* const k_ranges = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
@@ -546,6 +550,7 @@ struct CollectiveMainloopFwdSm90 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
+                args.q_ranges, args.k_ranges,
                 args.seqused_q, args.seqused_k, args.leftpad_k};
     }
 
@@ -631,8 +636,8 @@ struct CollectiveMainloopFwdSm90 {
         constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
 
-        bool const is_varlen_q = Varlen && params.cu_seqlens_q;
-        bool const is_varlen_k = Varlen && params.cu_seqlens_k;
+        bool const is_varlen_q = Varlen && (params.cu_seqlens_q || params.q_ranges);
+        bool const is_varlen_k = Varlen && (params.cu_seqlens_k || params.k_ranges);
         Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
@@ -1558,7 +1563,7 @@ struct CollectiveMainloopFwdSm90 {
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
         int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
 
-        bool const is_varlen_k = Varlen && params.cu_seqlens_k;
+        bool const is_varlen_k = Varlen && (params.cu_seqlens_k || params.k_ranges);
         Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K), params.shape_K, params.stride_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
         Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V), shape_V, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);

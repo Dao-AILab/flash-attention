@@ -209,6 +209,8 @@ struct CollectiveMainloopFwdSm80 {
         int const* const cu_seqlens_q = nullptr;
         int const* const cu_seqlens_k = nullptr;
         int const* const cu_seqlens_k_new = nullptr;
+        int const* const q_ranges = nullptr;
+        int const* const k_ranges = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
@@ -253,6 +255,8 @@ struct CollectiveMainloopFwdSm80 {
         int const* const cu_seqlens_q = nullptr;
         int const* const cu_seqlens_k = nullptr;
         int const* const cu_seqlens_k_new = nullptr;
+        int const* const q_ranges = nullptr;
+        int const* const k_ranges = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
@@ -295,6 +299,7 @@ struct CollectiveMainloopFwdSm80 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
+                args.q_ranges, args.k_ranges,
                 args.seqused_q, args.seqused_k, args.leftpad_k};
     }
 
@@ -333,8 +338,8 @@ struct CollectiveMainloopFwdSm80 {
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutV{});
         Tensor sVt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
 
-        bool const is_varlen_q = Varlen && params.cu_seqlens_q;
-        bool const is_varlen_k = Varlen && params.cu_seqlens_k;
+        bool const is_varlen_q = Varlen && (params.cu_seqlens_q || params.q_ranges);
+        bool const is_varlen_k = Varlen && (params.cu_seqlens_k || params.k_ranges);
 
         int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
         Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
@@ -680,7 +685,7 @@ struct CollectiveMainloopFwdSm80 {
         Tensor mKnew = make_tensor(make_gmem_ptr(params.ptr_K_new), params.shape_K_new, params.stride_K_new)(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
         Tensor mVnew = make_tensor(make_gmem_ptr(params.ptr_V_new), params.shape_K_new, params.stride_V_new)(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
 
-        bool const is_varlen_k = Varlen && params.cu_seqlens_k;
+        bool const is_varlen_k = Varlen && (params.cu_seqlens_k || params.k_ranges);
         Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K), params.shape_K, params.stride_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
 

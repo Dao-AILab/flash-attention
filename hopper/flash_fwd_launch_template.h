@@ -76,8 +76,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         flash::enable_sm80_to_sm89<flash::FlashAttnFwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
 
-    bool const is_varlen_q = params.cu_seqlens_q;
-    bool const is_varlen_k = params.cu_seqlens_k;
+    bool const is_varlen_q = params.cu_seqlens_q || params.q_ranges;
+    bool const is_varlen_k = params.cu_seqlens_k || params.k_ranges;
     bool const is_varlen_k_new = params.cu_seqlens_knew;
     int seqlen_q = !is_varlen_q ? params.seqlen_q : params.total_q;
     int batch_q = !is_varlen_q ? params.b : 1;
@@ -124,6 +124,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.num_splits,
         params.kv_batch_idx,
         params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
+        params.q_ranges, params.k_ranges,
         params.seqused_q, params.seqused_k,
         params.leftpad_k,
     };
@@ -138,7 +139,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         static_cast<float*>(!Split ? params.softmax_lse_ptr : params.softmax_lseaccum_ptr),
         {_1{}, seqlen_q, !is_varlen_q ? params.h * seqlen_q : 0, !Split ? 0 : params.h * seqlen_q * batch_q},  // stride_LSE
         params.h_k,
-        params.cu_seqlens_q, params.seqused_q
+        params.cu_seqlens_q, params.q_ranges, params.seqused_q
     };
 
     int qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
@@ -149,7 +150,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.h / params.h_k,
         params.seqlen_q,
         params.seqlen_k, params.d, sizeof(Element),
-        params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q,
+        params.tile_count_semaphore, params.cu_seqlens_q, params.q_ranges, params.seqused_q,
         // params.num_m_blocks_ptr, params.num_splits_dynamic_ptr,
         params.num_splits_dynamic_ptr,
     };
@@ -199,7 +200,7 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
             static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
-            VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
+            VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.q_ranges || params.k_ranges || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
                 // Only needed here to decide if we should use cluster
                 static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKV, Has_softcap)) : 128;
 
