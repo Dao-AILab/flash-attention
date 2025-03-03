@@ -169,6 +169,28 @@ python setup.py install
 pytest tests/test_flash_attn.py
 ```
 
+### INTEL Support
+Current supported hardware includes Intel® Data Center GPU Max Series, Intel Arc B-Series Graphics.
+
+**Requirements:**
+- [Intel GPU Driver Installation](https://www.intel.com/content/www/us/en/developer/articles/tool/pytorch-prerequisites-for-intel-gpu/2-6.html)
+
+We recommend the
+[stock Pytorch](https://download.pytorch.org/whl/nightly/xpu), which has all the required tools to install FlashAttention.
+
+To maximize performance on Intel hardware, we utilize SYCL along with inline assembly (part of the code) for optimized execution.
+
+#### Supported feature
+FlashAttention-2 SYCL backend currently supports:
+1. Fwd with causal masking
+2. Arbitrary Q and KV sequence lengths
+3. Both forward's and backward's head dimensions up to 256.
+
+#### In Developement
+The following features are under active development:
+1. Paged Attention 
+2. Sliding Window
+3. Further Performance Improvements
 
 ## How to use FlashAttention
 

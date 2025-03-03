@@ -24,11 +24,11 @@ from torch.utils.cpp_extension import (
     BuildExtension,
     CppExtension,
     CUDAExtension,
+    SyclExtension,
     CUDA_HOME,
     ROCM_HOME,
     IS_HIP_EXTENSION,
 )
-
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -39,16 +39,23 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
+IS_ROCM = False
+IS_CUDA = False
+IS_XPU = False
 if BUILD_TARGET == "auto":
     if IS_HIP_EXTENSION:
         IS_ROCM = True
+    elif CUDA_HOME is not None:
+        IS_CUDA = True
     else:
-        IS_ROCM = False
+        IS_XPU = True
 else:
     if BUILD_TARGET == "cuda":
-        IS_ROCM = False
+        IS_CUDA = True
     elif BUILD_TARGET == "rocm":
         IS_ROCM = True
+    elif BUILD_TARGET == "xpu":
+        IS_XPU = True
 
 PACKAGE_NAME = "flash_attn"
 
@@ -146,20 +153,23 @@ ext_modules = []
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if os.path.isdir(".git"):
-    subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
-    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
+    if IS_ROCM:
+        subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
+
+    if IS_CUDA:
+        subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
 else:
     if IS_ROCM:
         if not USE_TRITON_ROCM:
-            assert (
-                os.path.exists("csrc/composable_kernel/example/ck_tile/01_fmha/generate.py")
+            assert os.path.exists(
+                "csrc/composable_kernel/example/ck_tile/01_fmha/generate.py"
             ), "csrc/composable_kernel is missing, please use source distribution or git clone"
-    else:
-        assert (
-            os.path.exists("csrc/cutlass/include/cutlass/cutlass.h")
+    elif IS_CUDA:
+        assert os.path.exists(
+            "csrc/cutlass/include/cutlass/cutlass.h"
         ), "csrc/cutlass is missing, please use source distribution or git clone"
 
-if not SKIP_CUDA_BUILD and not IS_ROCM:
+if not SKIP_CUDA_BUILD and IS_CUDA:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
@@ -356,6 +366,12 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if FORCE_CXX11_ABI:
             torch._C._GLIBCXX_USE_CXX11_ABI = True
 
+        # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
+        # torch._C._GLIBCXX_USE_CXX11_ABI
+        # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
+        if FORCE_CXX11_ABI:
+            torch._C._GLIBCXX_USE_CXX11_ABI = True
+
         sources = ["csrc/flash_attn_ck/flash_api.cpp",
                 "csrc/flash_attn_ck/flash_common.cpp",
                 "csrc/flash_attn_ck/mha_bwd.cpp",
@@ -424,6 +440,29 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                 include_dirs=include_dirs,
             )
         )
+else:
+    print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
+    TORCH_MAJOR = int(torch.__version__.split(".")[0])
+    TORCH_MINOR = int(torch.__version__.split(".")[1])
+    if FORCE_CXX11_ABI:
+        torch._C._GLIBCXX_USE_CXX11_ABI = True
+    ext_modules.append(
+        SyclExtension(
+            name="flash_attn_sycl",
+            sources=[
+                "csrc/flash_attn_sycl/flash_api.sycl",
+                "csrc/flash_attn_sycl/flash_fwd.sycl",
+            ],
+            extra_compile_args = {
+                "cxx": ["-O3", "-std=c++20", "-ffast-math"],
+                "sycl": ["-fsycl", "-ffast-math"],
+            },
+        include_dirs = [
+            Path(this_dir) / "csrc" / "flash_attn_sycl",
+            Path(this_dir) / "csrc" / "sytla_kernel" / "flash_attn_sycl" / "include",
+        ]
+        )
+    )
 
 
 def get_package_version():
@@ -449,21 +488,29 @@ def get_wheel_url():
         torch_hip_version = get_hip_version()
         hip_version = f"{torch_hip_version.major}{torch_hip_version.minor}"
         wheel_filename = f"{PACKAGE_NAME}-{flash_version}+rocm{hip_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
-    else:
+    elif IS_CUDA:
         # Determine the version numbers that will be used to determine the correct wheel
         # We're using the CUDA version used to build torch, not the one currently installed
         # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
         torch_cuda_version = parse(torch.version.cuda)
         # For CUDA 11, we only compile for CUDA 11.8, and for CUDA 12 we only compile for CUDA 12.3
         # to save CI time. Minor versions should be compatible.
-        torch_cuda_version = parse("11.8") if torch_cuda_version.major == 11 else parse("12.3")
+        torch_cuda_version = (
+            parse("11.8") if torch_cuda_version.major == 11 else parse("12.3")
+        )
         # cuda_version = f"{cuda_version_raw.major}{cuda_version_raw.minor}"
         cuda_version = f"{torch_cuda_version.major}"
 
         # Determine wheel URL based on CUDA version, torch version, python version and OS
         wheel_filename = f"{PACKAGE_NAME}-{flash_version}+cu{cuda_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
-
-    wheel_url = BASE_WHEEL_URL.format(tag_name=f"v{flash_version}", wheel_name=wheel_filename)
+    else:
+        torch_xpu_version = parse(torch.version.xpu)
+        xpu_version = f"{torch_xpu_version.major}"
+        wheel_filename = f"{PACKAGE_NAME}-{flash_version}+sycl{xpu_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
+    
+    wheel_url = BASE_WHEEL_URL.format(
+        tag_name=f"v{flash_version}", wheel_name=wheel_filename
+    )
 
     return wheel_url, wheel_filename
 
