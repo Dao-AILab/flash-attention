@@ -83,6 +83,9 @@ struct CollectiveMainloopFwdSm90 {
     static_assert(!(!MmaPV_is_RS && Is_FP8), "MmaPV must be RS if FP8");
     static_assert(!(!MmaPV_is_RS && Transpose_V), "MmaPV must be RS if Transpose_V");
 
+    // Slightly faster in this case to have WG1 use RS instead of SS to avoid waiting for the P smem write
+    static constexpr bool MmaPV_use_RS_WG1 = !MmaPV_is_RS && kHeadDim == 64 && kHeadDimV == 512;
+
     using AtomLayoutQK = Layout<Shape<Int<kBlockM / 64>, _1, _1>>;
     using TiledMmaQK = decltype(cute::make_tiled_mma(
         std::conditional_t<
@@ -108,6 +111,10 @@ struct CollectiveMainloopFwdSm90 {
     using TiledMmaQV = decltype(cute::make_tiled_mma(
         cute::GMMA::ss_op_selector<Element, Element, ElementAccum, TileShape_MNK_QV>(),
         AtomLayoutQK{}));
+    // For hdim64,512, WG1 can use RS but WG2 must use SS
+    using TiledMmaPV_RS = decltype(cute::make_tiled_mma(
+        cute::GMMA::rs_op_selector<Element, Element, ElementAccum, TileShape_MNK_PV, GMMA::Major::K, MmaMajorV>(),
+        AtomLayoutPV{}));
 
     static constexpr int NumMmaThreadsQK = size(TiledMmaQK{});
     static constexpr int NumMmaThreads = size(TiledMmaPV{});
@@ -128,17 +135,17 @@ struct CollectiveMainloopFwdSm90 {
         make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
 
     using SmemLayoutAtomVt = decltype(cutlass::gemm::collective::detail::ss_smem_selector<TmaMajorV, Element,
-        decltype(cute::get<1>(TileShape_MNK_PV{})), decltype(cute::get<2>(TileShape_MNK_PV{}))>());
+                                      Int<kHeadDimV>, decltype(cute::get<2>(TileShape_MNK_PV{}))>());
     using SmemLayoutVt = decltype(tile_to_shape(
         SmemLayoutAtomVt{},
-        make_shape(shape<1>(TileShape_MNK_PV{}), shape<2>(TileShape_MNK_PV{}), Int<kStages>{}),
+        make_shape(Int<kHeadDimV>{}, shape<2>(TileShape_MNK_PV{}), Int<kStages>{}),
         std::conditional_t<TmaMajorV == GMMA::Major::K, cute::Step<_1, _2, _3>, cute::Step<_2, _1, _3>>{}));
 
     using SmemLayoutAtomVtMma = decltype(cutlass::gemm::collective::detail::ss_smem_selector<MmaMajorV, Element,
-        decltype(cute::get<1>(TileShape_MNK_PV{})), decltype(cute::get<2>(TileShape_MNK_PV{}))>());
+                                         Int<kHeadDimV>, decltype(cute::get<2>(TileShape_MNK_PV{}))>());
     using SmemLayoutVtMma = decltype(tile_to_shape(
         SmemLayoutAtomVtMma{},
-        make_shape(shape<1>(TileShape_MNK_PV{}), shape<2>(TileShape_MNK_PV{}), Int<kStages>{}),
+        make_shape(Int<kHeadDimV>{}, shape<2>(TileShape_MNK_PV{}), Int<kStages>{}),
         std::conditional_t<MmaMajorV == GMMA::Major::K, cute::Step<_1, _2, _3>, cute::Step<_2, _1, _3>>{}));
 
     using SmemLayoutAtomQv = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
@@ -148,7 +155,7 @@ struct CollectiveMainloopFwdSm90 {
         decltype(cute::get<1>(TileShape_MNK_QV{})), decltype(cute::get<2>(TileShape_MNK_QV{}))>());
     using SmemLayoutVMmaQV = decltype(tile_to_shape(
         SmemLayoutAtomVMmaQV{},
-        make_shape(shape<1>(TileShape_MNK_QV{}), shape<2>(TileShape_MNK_QV{}), Int<kStages>{})));
+        make_shape(shape<1>(TileShape_MNK_QV{}), Int<kHeadDimV>{}, Int<kStages>{})));
     static_assert(CUTE_STATIC_V(size(SmemLayoutVMmaQV{})) == size(SmemLayoutVtMma{}));
 
     // Only used if we're using cp.async to load V
@@ -1263,16 +1270,25 @@ struct CollectiveMainloopFwdSm90 {
                 }
                 if constexpr (!MmaPV_is_RS) { cute::copy(smem_tiled_copy_P, smem_thr_copy_P.retile_S(tOrP), tPsP); }
                 if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
-                if constexpr (!MmaPV_is_RS) {
-                    cutlass::arch::fence_view_async_shared();
-                    __syncwarp();
-                    if constexpr (LargeHeadDimV) {
-                        cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
+                auto arrive_P_write_barrier = [&] {
+                    if constexpr (!MmaPV_is_RS) {
+                        cutlass::arch::fence_view_async_shared();
+                        __syncwarp();
+                        if constexpr (LargeHeadDimV) {
+                            cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
+                        }
                     }
-                }
+                };
+                if constexpr (!MmaPV_use_RS_WG1) { arrive_P_write_barrier(); }
                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                if constexpr (!MmaPV_use_RS_WG1) {
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                } else {
+                    TiledMmaPV_RS tiled_mma_pv_rs;
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                }
+                if constexpr (MmaPV_use_RS_WG1) { arrive_P_write_barrier(); }
                 warpgroup_wait<0>();
                 pipeline_v.consumer_release(smem_pipe_read);  // release V
             };
@@ -1385,7 +1401,7 @@ struct CollectiveMainloopFwdSm90 {
         typename Softmax::TensorT scores_scale;
 
         int n_block = n_block_max - 1;
-        // If HasQv, then by the time P is ready, V must be ready as well
+        // If HasQv, then by the time P is ready, V must have been ready as well
         if constexpr (!HasQv) { pipeline_v.consumer_wait(smem_pipe_read); }
         cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
         flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
@@ -1393,6 +1409,7 @@ struct CollectiveMainloopFwdSm90 {
         pipeline_v.consumer_release(smem_pipe_read);  // release V
         --n_block;
 
+        #pragma unroll 1
         for (; n_block >= n_block_min; --n_block) {
             cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
             load_scales(scores_scale, smem_pipe_read.index());
