@@ -90,7 +90,9 @@ def _write_ninja_file(path,
                       objects,
                       ldflags,
                       library_target,
-                      with_cuda) -> None:
+                      with_cuda,
+                      **kwargs,  # kwargs (ignored) to absorb new flags in torch.utils.cpp_extension
+                      ) -> None:
     r"""Write a ninja file that does the desired compiling and linking.
 
     `path`: Where to write this file
