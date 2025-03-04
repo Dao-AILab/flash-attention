@@ -23,6 +23,9 @@ set(PYTHON_SUPPORTED_VERSIONS "3.8" "3.9" "3.10" "3.11" "3.12")
 
 # Supported NVIDIA architectures.
 set(CUDA_SUPPORTED_ARCHS "8.0;8.6;8.9;9.0")
+if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
+    list(APPEND CUDA_SUPPORTED_ARCHS "10.0" "10.1" "12.0")
+endif()
 
 # Supported AMD GPU architectures.
 set(HIP_SUPPORTED_ARCHS "gfx906;gfx908;gfx90a;gfx940;gfx941;gfx942;gfx1030;gfx1100")
@@ -132,7 +135,7 @@ if (FA2_ENABLED)
 
     # For CUDA we set the architectures on a per file basis
     if (VLLM_GPU_LANG STREQUAL "CUDA")
-        cuda_archs_loose_intersection(FA2_ARCHS "8.0;9.0" "${CUDA_ARCHS}")
+        cuda_archs_loose_intersection(FA2_ARCHS "8.0;9.0;10.0;10.1;12.0" "${CUDA_ARCHS}")
         message(STATUS "FA2_ARCHS: ${FA2_ARCHS}")
 
         set_gencode_flags_for_srcs(
@@ -196,8 +199,9 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
     set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS})
 
     # For CUDA we set the architectures on a per file basis
+    # FaV3 is not yet supported in Blackwell
     if (VLLM_GPU_LANG STREQUAL "CUDA")
-        cuda_archs_loose_intersection(FA3_ARCHS "8.0;9.0a" "${CUDA_ARCHS}")
+        cuda_archs_loose_intersection(FA3_ARCHS "8.0;9.0a;" "${CUDA_ARCHS}")
         message(STATUS "FA3_ARCHS: ${FA3_ARCHS}")
 
         set_gencode_flags_for_srcs(
