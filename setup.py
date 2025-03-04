@@ -56,6 +56,17 @@ else:
         IS_ROCM = True
     elif BUILD_TARGET == "xpu":
         IS_XPU = True
+        
+def is_xpu_supported_hardware():
+    supported_hardware = ["Intel(R) Data Center GPU Max", "Intel(R) Arc(TM) B580 Graphics", "Intel(R) Arc(TM) 140V GPU"]
+    if IS_XPU:
+        device_name = torch.xpu.get_device_name()
+        return any(hardware in device_name for hardware in supported_hardware)
+    else:
+        warnings.warn("Current supported hardware are Intel(R) Data Center GPU Max, Intel(R) Arc(TM) B580 Graphics, Intel(R) Arc(TM) 140V GPU, skip build due to unsupported hardware")
+        return False
+        
+IS_XPU = IS_XPU and is_xpu_supported_hardware()
 
 PACKAGE_NAME = "flash_attn"
 
@@ -454,12 +465,12 @@ else:
                 "csrc/flash_attn_sycl/flash_fwd.sycl",
             ],
             extra_compile_args = {
-                "cxx": ["-O3", "-std=c++20", "-ffast-math"],
+                "cxx": ["-O3", "-std=c++17"],
                 "sycl": ["-fsycl", "-ffast-math"],
             },
         include_dirs = [
             Path(this_dir) / "csrc" / "flash_attn_sycl",
-            Path(this_dir) / "csrc" / "sytla_kernel" / "flash_attn_sycl" / "include",
+            Path(this_dir) / "csrc" / "sytla_kernel" / "include",
         ]
         )
     )

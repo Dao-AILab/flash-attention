@@ -170,7 +170,7 @@ pytest tests/test_flash_attn.py
 ```
 
 ### INTEL Support
-Current supported hardware includes Intel® Data Center GPU Max Series, Intel Arc B-Series Graphics.
+Current support primarily targets consumer GPUs, including Intel(R) Arc(TM) B580 Graphics and Intel® Core™ Ultra 7 Processor(Lunar Lake).
 
 **Requirements:**
 - [Intel GPU Driver Installation](https://www.intel.com/content/www/us/en/developer/articles/tool/pytorch-prerequisites-for-intel-gpu/2-6.html)
