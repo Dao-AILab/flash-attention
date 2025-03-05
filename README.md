@@ -174,6 +174,7 @@ Current support primarily targets consumer GPUs, including Intel(R) Arc(TM) B580
 
 **Requirements:**
 - [Intel GPU Driver Installation](https://www.intel.com/content/www/us/en/developer/articles/tool/pytorch-prerequisites-for-intel-gpu/2-6.html)
+- Pytorch 2.7 and above
 
 We recommend the
 [stock Pytorch](https://download.pytorch.org/whl/nightly/xpu), which has all the required tools to install FlashAttention.
