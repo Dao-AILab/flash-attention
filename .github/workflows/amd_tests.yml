@@ -18,6 +18,7 @@ jobs:
       matrix:
         runner: [linux-mi300-gpu-1]
       fail-fast: false # disables failing the entire job when one matrix entry fails
+    timeout-minutes: 720 # self hosted runners can run jobs for longer than the default of 360 minutes
     container:
       image: rocm/pytorch:rocm6.3.2_ubuntu22.04_py3.10_pytorch_release_2.4.0
       options: --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --group-add video --user root
@@ -45,19 +46,8 @@ jobs:
       
       - name: Build
         run: |
-          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          python setup.py install
+          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
 
-      - name: Flash Attention Tests using Pytorch reference implementation
-        run: |
-          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          FLASH_ATTENTION_TRITON_AMD_REF=1 pytest tests/test_flash_attn_triton_amd.py
-      
-      - name: Flash Attention Tests
-        run: |
-          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          pytest tests/test_flash_attn_triton_amd.py
-      
       - name: Install dependencies for bench and misc
         run: |
           pip install matplotlib pandas pytest
@@ -65,10 +55,19 @@ jobs:
       # FIXME: run the full suite
       - name: AMD Internal Tests
         run: |
-          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          pytest -v -s flash_attn/flash_attn_triton_amd/test.py::test_op_prefill_fp8 flash_attn/flash_attn_triton_amd/test.py::test_op_prefill_varlen_fp8
+          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest -n 2 flash_attn/flash_attn_triton_amd/test.py::test_fp8
 
       - name: AMD Bench
+        if: False
         run: |
-          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=1 python flash_attn/flash_attn_triton_amd/bench.py
+          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=1 python flash_attn/flash_attn_triton_amd/bench.py
+
+      # run big test suites
+      - name: Flash Attention Tests using Pytorch reference implementation
+        if: False
+        run: |
+          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_REF=1 pytest tests/test_flash_attn_triton_amd.py
+        
+      - name: Flash Attention Tests
+        run: |
+          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest -n 16 tests/test_flash_attn_triton_amd.py

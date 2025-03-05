@@ -228,8 +228,8 @@ def attention_varlen_forward_pytorch_ref_impl(
     total_L_q = q.shape[0]
     total_L_k = k.shape[0]
 
-    o = torch.empty((total_L_q, nheads_q, head_dim), dtype=q.dtype, device=q.device)
-    softmax_lse = torch.empty((total_L_q, nheads_q), dtype=torch.float32, device=q.device)
+    o = torch.zeros((total_L_q, nheads_q, head_dim), dtype=q.dtype, device=q.device)
+    softmax_lse = torch.zeros((total_L_q, nheads_q), dtype=torch.float32, device=q.device)
     sd_mask = torch.zeros((batch_size, nheads_q, max_seqlen_q, max_seqlen_k), dtype=torch.float32, device=q.device)
 
     # Compute group_size for MQA/GQA handling
@@ -303,7 +303,7 @@ def attention_varlen_forward_pytorch_ref_impl(
         softmax_lse[start_q:end_q, :] = softmax_lse_i
         sd_mask[i, :, :seqlen_q, :seqlen_k] = sd_mask_i
 
-    return o, softmax_lse, sd_mask
+    return softmax_lse, sd_mask
 
 
 

@@ -63,6 +63,7 @@ SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
+SKIP_CK_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CK_BUILD", "TRUE") == "TRUE" if USE_TRITON_ROCM else False
 
 def get_platform():
     """
@@ -140,11 +141,11 @@ ext_modules = []
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if IS_ROCM:
-    if not USE_TRITON_ROCM:
+    if not SKIP_CK_BUILD:
         subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"])
 else:
     if IS_ROCM:
-        if not USE_TRITON_ROCM:
+        if not SKIP_CK_BUILD:
             assert (
                 os.path.exists("csrc/composable_kernel/example/ck_tile/01_fmha/generate.py")
             ), "csrc/composable_kernel is missing, please use source distribution or git clone"
@@ -316,10 +317,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
-    if USE_TRITON_ROCM:
-        # Skip C++ extension compilation if using Triton Backend
-        pass
-    else:
+    # Skips CK C++ extension compilation if using Triton Backend
+    if not SKIP_CK_BUILD:
         ck_dir = "csrc/composable_kernel"
 
         #use codegen get code dispatch

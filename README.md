@@ -145,8 +145,7 @@ These features are supported in Fwd for now. We will add them to backward soon.
 1) ALiBi
 
 These features are in development
-1) FP8
-2) Paged Attention 
+1) Paged Attention 
 2) Sliding Window
 3) Performance Improvements
 
@@ -179,7 +178,7 @@ FROM rocm/pytorch:rocm6.3.2_ubuntu22.04_py3.10_pytorch_release_2.4.0
 WORKDIR /workspace
 
 # install triton
-RUN pip install triton=3.2.0
+RUN pip install triton==3.2.0
 
 # install flash attention
 ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"

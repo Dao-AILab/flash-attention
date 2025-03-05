@@ -41,3 +41,6 @@ gpucore.*
 *.html
 *.json
 *.txt
+*.pth
+training/logs
+training/data
