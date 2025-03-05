@@ -20,7 +20,7 @@ struct TileSchedulerArguments {
     int const num_blocks, num_head, num_batch, num_splits;
     int const qhead_per_khead;
     int const seqlen;  // Only used if Varlen and cu_seqlens == nullptr and seqused == nullptr
-    int const seqlen_k, headdim, element_size;  // Used to calculate L2 swizzling
+    int const seqlen_k, headdim, headdim_v, element_size;  // Used to calculate L2 swizzling
     int* const tile_count_semaphore = nullptr;
     int* const cu_seqlens = nullptr;
     int* const seqused = nullptr;
@@ -235,7 +235,7 @@ public:
 
     static Params
     to_underlying_arguments(TileSchedulerArguments const& args) {
-        int const size_one_kv_head = args.seqlen_k * args.headdim * args.element_size * 2;
+        int const size_one_kv_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size * 2;
         int const size_l2 = 32 * 1024 * 1024;  // 32 MB for K & V
         // Swizzle is the size of each "section". Round swizzle to a power of 2
         // If not PackGQA already, the size of each section can increase by qhead_per_khead

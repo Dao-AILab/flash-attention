@@ -165,7 +165,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         num_blocks_n, params.h, params.b, 1 /*num_splits*/,
         params.h / params.h_k,
         params.seqlen_k,
-        params.seqlen_q, params.d, sizeof(Element),
+        params.seqlen_q, params.d, params.dv, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens_k, params.seqused_k
     };
 

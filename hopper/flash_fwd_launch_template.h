@@ -148,7 +148,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         num_blocks_m, !PackGQA ? params.h : params.h_k, params.b, params.num_splits,
         params.h / params.h_k,
         params.seqlen_q,
-        params.seqlen_k, params.d, sizeof(Element),
+        params.seqlen_k, params.d, params.dv, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q,
         // params.num_m_blocks_ptr, params.num_splits_dynamic_ptr,
         params.num_splits_dynamic_ptr,

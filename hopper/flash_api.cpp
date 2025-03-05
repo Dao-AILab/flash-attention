@@ -611,6 +611,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     // TODO: check this
     if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
     if (window_size_right >= seqlen_q - 1) { window_size_right = -1; }
+    // causal=true is the same as causal=false in this case
+    if (seqlen_q == 1 && window_size_left == -1 && window_size_right == -1) { is_causal = false; }
     if (is_causal) { window_size_right = 0; }
     // There's a case where is_causal=false, window_size=(-1, 0). Then set_params_fprop will set params.is_causal=true.
     // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM.
@@ -1272,6 +1274,7 @@ std::vector<at::Tensor> mha_bwd(
     params.total_q = total_q;
     params.total_k = total_k;
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
+    params.dv = head_size;  // We don't support hdim_v being different from hdim_qk for now
 
     // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
