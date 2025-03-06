@@ -2,6 +2,7 @@
 # pip install "git+https://github.com/openai/triton.git#egg=triton&subdirectory=python"
 import pickle
 import math
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -60,17 +61,15 @@ def benchmark_forward(
 
     for _ in range(5):
         y = fn(*inputs, **kwinputs)    
-    
-    start_event = torch.xpu.Event(enable_timing=True)
-    end_event = torch.xpu.Event(enable_timing=True)
-    
+        
+    torch.xpu.synchronize()    
     elapsed_time = [0] * repeats
     for i in range(repeats):
-        start_event.record()
+        start_time = time.perf_counter()
         y = fn(*inputs, **kwinputs)
-        end_event.record()
         torch.xpu.synchronize()
-        elapsed_time[i] = start_event.elapsed_time(end_event)
+        end_time = time.perf_counter()
+        elapsed_time[i] = (end_time - start_time) * 1e3
     
     min_time = min(elapsed_time)
     avg = sum(elapsed_time) / repeats
