@@ -68,6 +68,9 @@ def is_xpu_supported_hardware():
         
 IS_XPU = IS_XPU and is_xpu_supported_hardware()
 
+if IS_XPU:
+    from xpu_build_extension import BuildExtension
+
 PACKAGE_NAME = "flash_attn"
 
 BASE_WHEEL_URL = (
