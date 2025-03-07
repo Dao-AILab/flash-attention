@@ -20,10 +20,11 @@ __global__ void prepare_varlen_num_blocks_kernel(
         int* const num_splits_dynamic_ptr) {
 
     static constexpr int kNumBatchPerWarp = cutlass::NumThreadsPerWarp - 1;
+    static constexpr int kSmemSize = 1;
     // Assume that there's only one block in the grid
-    __shared__ int smem[1];
+    __shared__ int smem[kSmemSize];
 
-    if (threadIdx.x == 0) { smem[0] = 0; }
+    if (threadIdx.x < kSmemSize) { smem[threadIdx.x] = 0; }
     __syncthreads();
 
     if (threadIdx.x == 0) { *tile_count_semaphore = 0; }
