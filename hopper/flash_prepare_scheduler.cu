@@ -27,7 +27,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
     if (threadIdx.x < kSmemSize) { smem[threadIdx.x] = 0; }
     __syncthreads();
 
-    if (threadIdx.x == 0) { *tile_count_semaphore = 0; }
+    if (threadIdx.x == 0 && tile_count_semaphore) { *tile_count_semaphore = 0; }
 
     int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
 
@@ -82,7 +82,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
         int num_m_blocks = get_num_m_blocks(bidb_start);
         int num_n_blocks = get_num_n_blocks(bidb_start);
         if (bidb_start + lane < num_batch && lane < kNumBatchPerWarp) {
-            num_m_blocks_ptr[bidb_start + lane] = num_m_blocks;
+            // num_m_blocks_ptr[bidb_start + lane] = num_m_blocks;
             num_n_blocks_ptr[bidb_start + lane] = num_n_blocks;
             // printf("idx = %d, num_m = %d, num_n = %d\n", bidb_start + lane, num_m_blocks, num_n_blocks);
         }

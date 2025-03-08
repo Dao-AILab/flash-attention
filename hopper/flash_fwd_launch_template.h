@@ -53,7 +53,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>,
         flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKV, AppendKV, PackGQA, Split>
     >;
-    using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, FP8_TransposeV>;
+    using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV>;
 
     static constexpr int NumProducerThreads = Arch >= 90 ? CollectiveMainloop::NumProducerThreads : CollectiveMainloop::NumMmaThreads;
     using SchedulerPersistent = std::conditional_t<Varlen,
@@ -128,15 +128,15 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.leftpad_k,
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
-        static_cast<ElementOut*>(!Split ? params.o_ptr : params.oaccum_ptr),
+        static_cast<ElementOut*>(params.o_ptr),
         {seqlen_q, params.dv, params.h, batch_q, params.num_splits},  // shape_O
-        {!Split ? params.o_row_stride : params.oaccum_row_stride,
-         _1{},
-         !Split ? params.o_head_stride : params.oaccum_head_stride,
-         !is_varlen_q ? (!Split ? params.o_batch_stride : params.oaccum_batch_stride) : 0,
-         !Split ? 0 : params.oaccum_split_stride},  // stride_O
-        static_cast<float*>(!Split ? params.softmax_lse_ptr : params.softmax_lseaccum_ptr),
-        {_1{}, seqlen_q, !is_varlen_q ? params.h * seqlen_q : 0, !Split ? 0 : params.h * seqlen_q * batch_q},  // stride_LSE
+        {params.o_row_stride, _1{}, params.o_head_stride, !is_varlen_q ? params.o_batch_stride : 0, 0}, // stride_O
+        static_cast<float*>(params.oaccum_ptr),
+        {params.oaccum_row_stride, _1{}, params.oaccum_head_stride, !is_varlen_q ? params.oaccum_batch_stride : 0, params.oaccum_split_stride}, // stride_O_partial
+        static_cast<float*>(params.softmax_lse_ptr),
+        {_1{}, seqlen_q, !is_varlen_q ? params.h * seqlen_q : 0, 0},  // stride_LSE
+        static_cast<float*>(params.softmax_lseaccum_ptr),
+        {_1{}, seqlen_q, !is_varlen_q ? params.h * seqlen_q : 0, params.h * seqlen_q * batch_q},  // stride_LSE_partial
         params.h_k,
         params.cu_seqlens_q, params.seqused_q
     };
@@ -150,11 +150,11 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.seqlen_q,
         params.seqlen_k, params.d, params.dv, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q,
-        // params.num_m_blocks_ptr, params.num_splits_dynamic_ptr,
+        // params.num_m_blocks_ptr,
         params.num_splits_dynamic_ptr,
     };
 
-    if constexpr (Varlen && UsePersistentScheduler) {
+    if constexpr (Varlen) {
         prepare_varlen_num_blocks(params, stream, PackGQA, kBlockM, kBlockN);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
@@ -195,7 +195,7 @@ template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool Pag
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
-    using T_out = std::conditional_t<!Split, std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>, float>;
+    using T_out = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
             static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;

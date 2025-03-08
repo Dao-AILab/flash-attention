@@ -872,14 +872,14 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         tile_count_semaphore = torch::empty({1}, opts.dtype(torch::kInt32));
         if (!is_varlen) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
         params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
-        if (is_varlen) {
-            num_m_n_blocks_splits = torch::empty({batch_size * 3}, opts.dtype(torch::kInt32));
-            params.num_m_blocks_ptr = num_m_n_blocks_splits.data_ptr<int>();
-            params.num_n_blocks_ptr = num_m_n_blocks_splits.data_ptr<int>() + batch_size;
-            params.num_splits_dynamic_ptr = num_m_n_blocks_splits.data_ptr<int>() + batch_size * 2;
-        }
     } else {
         params.tile_count_semaphore = nullptr;
+    }
+    if (is_varlen) {
+        num_m_n_blocks_splits = torch::empty({batch_size * 3}, opts.dtype(torch::kInt32));
+        params.num_m_blocks_ptr = num_m_n_blocks_splits.data_ptr<int>();
+        params.num_n_blocks_ptr = num_m_n_blocks_splits.data_ptr<int>() + batch_size;
+        params.num_splits_dynamic_ptr = num_m_n_blocks_splits.data_ptr<int>() + batch_size * 2;
     }
 
     if (q_type == at::ScalarType::Float8_e4m3fn) {

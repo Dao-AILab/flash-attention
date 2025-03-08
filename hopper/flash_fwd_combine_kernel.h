@@ -130,37 +130,39 @@ public:
 
     // Device side arguments
     struct Arguments {
-        ElementPartial const* ptr_O_partial;
+        ElementPartial const* const ptr_O_partial;
         ShapeOPartial const shape_O_partial;
         StrideOPartial const stride_O_partial;
-        float const* ptr_LSE_partial;
+        float const* const ptr_LSE_partial;
         ShapeLSEPartial const shape_LSE_partial;
         StrideLSEPartial const stride_LSE_partial;
-        Element* ptr_O;
+        Element* const ptr_O;
         StrideO const stride_O;
-        float* ptr_LSE;
+        float* const ptr_LSE;
         StrideLSE const stride_LSE;
-        int const* cu_seqlens = nullptr;
-        int const* seqused = nullptr;
-        int const* num_splits_dynamic_ptr = nullptr;
+        int const* const cu_seqlens = nullptr;
+        int const* const seqused = nullptr;
+        int const* const num_splits_dynamic_ptr = nullptr;
+        int* const semaphore_to_reset = nullptr;
     };
 
     // Kernel entry point API
     struct Params {
-        ElementPartial const* ptr_O_partial;
+        ElementPartial const* const ptr_O_partial;
         ShapeOPartial const shape_O_partial;
         StrideOPartial const stride_O_partial;
-        float const* ptr_LSE_partial;
+        float const* const ptr_LSE_partial;
         ShapeLSEPartial const shape_LSE_partial;
         StrideLSEPartial const stride_LSE_partial;
-        Element* ptr_O;
+        Element* const ptr_O;
         StrideO const stride_O;
-        float* ptr_LSE;
+        float* const ptr_LSE;
         StrideLSE const stride_LSE;
         cutlass::FastDivmod seqlen_divmod, head_divmod;
-        int const* cu_seqlens = nullptr;
-        int const* seqused = nullptr;
-        int const* num_splits_dynamic_ptr = nullptr;
+        int const* const cu_seqlens = nullptr;
+        int const* const seqused = nullptr;
+        int const* const num_splits_dynamic_ptr = nullptr;
+        int* const semaphore_to_reset = nullptr;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -182,7 +184,8 @@ public:
             cutlass::FastDivmod(get<0>(args.shape_LSE_partial)), cutlass::FastDivmod(get<2>(args.shape_LSE_partial)),
             args.cu_seqlens,
             args.seqused,
-            args.num_splits_dynamic_ptr
+            args.num_splits_dynamic_ptr,
+            args.semaphore_to_reset
         };
     }
 
@@ -200,6 +203,11 @@ public:
         int const k_block = blockIdx.y;
         int const batch = blockIdx.z;
         int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[batch] : get<1>(params.shape_LSE_partial);
+
+        if (params.semaphore_to_reset && threadIdx.x == 0 && blockIdx.x == gridDim.x - 1 && blockIdx.y == gridDim.y - 1 && blockIdx.z == gridDim.z - 1) {
+            *params.semaphore_to_reset = 0;
+        }
+        if (num_splits <= 1) { return; }
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
         int const offset = seqlen_info.offset;
         int const seqlen = seqlen_info.seqlen;
