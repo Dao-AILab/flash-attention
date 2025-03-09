@@ -376,7 +376,7 @@ def nvcc_threads_args():
 
 
 # NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.3.107"}
-NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.6.85", "ptxas": "12.8.61"}
+NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.6.85", "ptxas": "12.8.93"}
 exe_extension = sysconfig.get_config_var("EXE")
 
 
