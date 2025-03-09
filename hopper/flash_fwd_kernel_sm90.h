@@ -35,7 +35,6 @@ public:
     static_assert(CollectiveMainloop::Varlen == CollectiveEpilogue::Varlen);
     static constexpr bool Has_softcap = CollectiveMainloop::Has_softcap;
     static constexpr bool Varlen = CollectiveMainloop::Varlen;
-    static constexpr bool PagedKV = CollectiveMainloop::PagedKV;
     static constexpr bool Split = CollectiveMainloop::Split;
     static constexpr bool Is_FP8 = CollectiveMainloop::Is_FP8;
     static constexpr bool Transpose_V = CollectiveMainloop::Transpose_V;
@@ -308,7 +307,7 @@ public:
             cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
 
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
-            // might use cp.async to load KV (if PagedKV) while AppendKV always uses TMA to load
+            // might use cp.async to load KV (if PagedKVNonTMA) while AppendKV always uses TMA to load
             // KV_new. Since the pipeline states are different, we have to manually sync to make
             // sure the two pipelines don't race when accessing smem_k and smem_v.
             PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
@@ -330,7 +329,7 @@ public:
                 SeqlenInfo_t seqlen_info{
                     get<2>(block_coord) /*bidb*/,
                     get<0>(params.mainloop.shape_Q),
-                    !PagedKV ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
+                    !params.mainloop.ptr_pagetable ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
                     get<0>(params.mainloop.shape_K_new),
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
@@ -390,7 +389,7 @@ public:
                 SeqlenInfo_t seqlen_info{
                     bidb,
                     get<0>(params.mainloop.shape_Q),
-                    !PagedKV ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
+                    !params.mainloop.ptr_pagetable ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
                     get<0>(params.mainloop.shape_K_new),
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,

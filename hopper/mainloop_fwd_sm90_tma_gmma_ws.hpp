@@ -29,7 +29,7 @@ namespace flash {
 using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
-        bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_, bool HasQv_,
+        bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
         bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_>
 struct CollectiveMainloopFwdSm90 {
 
@@ -46,7 +46,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
     static constexpr bool Varlen = Varlen_;
-    static constexpr bool PagedKV = PagedKV_;
+    static constexpr bool PagedKVNonTMA = PagedKVNonTMA_;
     static constexpr bool AppendKV = AppendKV_;
     static constexpr bool HasQv = HasQv_;
     static constexpr bool PackGQA = PackGQA_;
@@ -54,7 +54,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool V_colmajor = V_colmajor_;
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
     static constexpr bool Use_TMA_Q = !PackGQA;
-    static constexpr bool Use_TMA_KV = !PagedKV;
+    static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
@@ -208,7 +208,7 @@ struct CollectiveMainloopFwdSm90 {
     using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
     using GmemTiledCopyKV = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<0>(ClusterShape{})));
 
-    // We use CpAsync for K and V if PagedKV and AppendKV, since TMA doesn't work there
+    // We use CpAsync for K and V if PagedKVNonTMA and AppendKV, since TMA doesn't work there
     static constexpr int kHeadDimGCD = cute::gcd(kHeadDim, kHeadDimV);
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDimGCD % kGmemElemsPerLoad == 0, "Headdim and HeaddimV must be a multiple of kGmemElemsPerLoad");
@@ -221,7 +221,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int kBlockKGmem = (kBytePerHalfRow % 128 == 0 ? 128 : (kBytePerHalfRow % 64 == 0 ? 64 : 32)) / sizeof(Element);
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerLoad;
     static_assert(NumMmaThreads % kGmemThreadsPerRow == 0, "NumMmaThreads must be a multiple of kGmemThreadsPerRow");
-    // We assume threads loading the same row are in the same warp. This is for an optimization in PagedKV where
+    // We assume threads loading the same row are in the same warp. This is for an optimization in PagedKVNonTMA where
     // these threads share the same page table entry and share the work of computing pointers to paged K and paged V.
     static_assert(cutlass::NumThreadsPerWarp % kGmemThreadsPerRow == 0, "kGmemThreadsPerRow must divide NumThreadsPerWarp");
     using GmemLayoutAtom = Layout<Shape <Int<NumMmaThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
@@ -360,7 +360,7 @@ struct CollectiveMainloopFwdSm90 {
         Element const* const ptr_Q;
         ShapeQKV const shape_Q;
         StrideQK const stride_Q;
-        Element* const ptr_K;  // Not Element const* since we might append to KV cache in-place
+        Element* const ptr_K;  // not Element const* since we might append to KV cache in-place
         ShapeQKV const shape_K;
         StrideQK const stride_K;
         Element* const ptr_V;
@@ -429,6 +429,7 @@ struct CollectiveMainloopFwdSm90 {
         ShapePageTable const shape_pagetable;
         StridePageTable const stride_pagetable;
         cutlass::FastDivmod page_size_divmod;
+        cutlass::FastDivmod blockN_per_page_size_divmod;
         cutlass::FastDivmod qhead_per_khead_divmod;
         TMA_Q tma_load_Q;
         TMA_K tma_load_K;
@@ -528,6 +529,11 @@ struct CollectiveMainloopFwdSm90 {
             assert(args.ptr_rotary_cos != nullptr && args.ptr_rotary_sin != nullptr);
         }
         assert(args.num_splits >= 1);
+        int page_size = !args.ptr_pagetable ? 1 : get<0>(args.shape_K);
+        if (!PagedKVNonTMA && args.ptr_pagetable != nullptr) {
+            assert(page_size % kBlockN == 0);
+            assert(!args.leftpad_k);
+        }
         // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         // Right after this, we multiply by log2(e) before applying exp2.
         // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
@@ -540,7 +546,8 @@ struct CollectiveMainloopFwdSm90 {
                 args.ptr_rotary_cos, args.shape_rotary, args.stride_rotary_cos,
                 args.ptr_rotary_sin, args.stride_rotary_sin, args.is_rotary_interleaved,
                 args.ptr_pagetable, args.shape_pagetable, args.stride_pagetable,
-                cutlass::FastDivmod(int(get<0>(args.shape_K))),
+                cutlass::FastDivmod(page_size),  // page_size_divmod
+                cutlass::FastDivmod(!args.ptr_pagetable ? 1 : cute::ceil_div(page_size, kBlockN)),  // blockN_per_page_size_divmod
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
                 tma_load_Q, tma_load_K, tma_load_V, tma_load_K_new, tma_load_V_new, tma_load_Qv,
                 !Has_softcap ? float(args.softmax_scale * M_LOG2E) : float(args.softcap_val * M_LOG2E),
@@ -639,24 +646,24 @@ struct CollectiveMainloopFwdSm90 {
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
         Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
-        Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
+        Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, _);
         auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
-        Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
+        Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv, _);
 
         Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
         // if (cute::thread0()) { printf("Varlen = %d, params.leftpad_k = %p, leftpad_k = %d\n", Varlen, params.leftpad_k, leftpad_k); }
-        Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
-        Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _));  // (K, N, _)
+        Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
+        Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
 
         auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
         Tensor tQgQ = group_modes<0, 3>(block_tma_Q.partition_S(gQ));  // (TMA)
         Tensor tQsQ = group_modes<0, 3>(block_tma_Q.partition_D(sQ));  // (TMA)
         // tma_partition doesn't handle position_independent_swizzle_tensor correctly, so we need to do it manually
         auto block_tma_K = params.tma_load_K.get_slice(cluster_local_block_id.x);
-        Tensor tKgK_TMA = group_modes<0, 3>(block_tma_K.partition_S(gK_TMA));  // (TMA, k)
+        Tensor tKgK_TMA = group_modes<0, 3>(block_tma_K.partition_S(gK_TMA));  // (TMA, k, batch)
         Tensor tKsK_TMA = group_modes<0, 3>(block_tma_K.partition_D(sK));  // (TMA, PIPE)
         auto block_tma_V = params.tma_load_V.get_slice(cluster_local_block_id.x);
-        Tensor tVgVt_TMA = group_modes<0, 3>(block_tma_V.partition_S(gVt_TMA));  // (TMA, k)
+        Tensor tVgVt_TMA = group_modes<0, 3>(block_tma_V.partition_S(gVt_TMA));  // (TMA, k, batch)
         Tensor tVsVt_TMA = group_modes<0, 3>(block_tma_V.partition_D(sVt));  // (TMA, PIPE)
         auto [tQvgQv, tQvsQv] = [&] {
             if constexpr (HasQv) {
@@ -672,12 +679,16 @@ struct CollectiveMainloopFwdSm90 {
             }
         }();
 
+        // This is used to index into the batch dimension of mK and mV
+        int const bidb_kv_idx = !is_varlen_k && !params.ptr_pagetable ? bidb_kv : 0;
+
         using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, Element, Transpose_V || !IntraWGOverlap /*KV_Same_Iter*/>;
         PagedKVManager_t paged_kv_manager(
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
             params.ptr_V, params.headdim_v, params.stride_V,
-            params.page_size_divmod, bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k
+            params.page_size_divmod, params.blockN_per_page_size_divmod,
+            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k, bidb_kv_idx
         );
 
         // Set up for transposing V, only used if Transpose_V
@@ -729,9 +740,10 @@ struct CollectiveMainloopFwdSm90 {
 
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
             pipeline_k.producer_acquire(smem_pipe_write);
-            if constexpr (!PagedKV) {
+            if constexpr (!PagedKVNonTMA) {
+                auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_K_TMA();
                 copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
-                    tKgK_TMA(_, n_block), tKsK_TMA(_, smem_pipe_write.index()));
+                    tKgK_TMA(_, n_block_idx, bidb_kv_idx), tKsK_TMA(_, smem_pipe_write.index()));
             } else {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
                 paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_pi(_, _, smem_pipe_write.index()));
@@ -742,9 +754,10 @@ struct CollectiveMainloopFwdSm90 {
         auto load_V = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
             auto pipeline_v_load = cute::conditional_return<!Transpose_V>(pipeline_v, pipeline_vt);
             pipeline_v_load.producer_acquire(smem_pipe_write);
-            if constexpr (!PagedKV) {
+            if constexpr (!PagedKVNonTMA) {
+                auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_V_TMA();
                 copy(params.tma_load_V.with(*pipeline_v_load.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
-                    tVgVt_TMA(_, n_block), tVsVt_TMA(_, smem_pipe_write.index()));
+                    tVgVt_TMA(_, n_block_idx, bidb_kv_idx), tVsVt_TMA(_, smem_pipe_write.index()));
             } else {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
                 paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sVcpasync(_, _, smem_pipe_write.index()));
@@ -777,8 +790,10 @@ struct CollectiveMainloopFwdSm90 {
         bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync());
 
         if (should_load_KV) {
-            if constexpr (PagedKV) {
+            if constexpr (PagedKVNonTMA) {
                 paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
+            } else {
+                paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block);
             }
             if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
             // if (thread_idx == 0) { printf("Producer: main load, before load_K, index = %d\n", smem_pipe_write.index());}
@@ -839,8 +854,10 @@ struct CollectiveMainloopFwdSm90 {
             PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
             ++smem_pipe_write;
             if (should_load_KV) {
-                if constexpr (PagedKV) {
+                if constexpr (PagedKVNonTMA) {
                     paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
+                } else {
+                    paged_kv_manager.load_page_table_TMA(n_block);
                 }
                 if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
                 load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
@@ -1569,12 +1586,16 @@ struct CollectiveMainloopFwdSm90 {
                         params.ptr_rotary_sin, params.stride_rotary_sin,
                         params.is_rotary_interleaved, thread_idx, seqlen_k_new, offset_rotary);
 
+        // This is used to index into the batch dimension of mK and mV
+        int const bidb_kv_idx = !is_varlen_k && !params.ptr_pagetable ? bidb_kv : 0;
+
         using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 2 /*LoadsPerRow_LB*/>;
         PagedKVManager_t paged_kv_manager(
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
             params.ptr_V, params.headdim_v, params.stride_V,
-            params.page_size_divmod, bidb_kv, bidh_kv, thread_idx, seqlen_k_new, offset_k
+            params.page_size_divmod, params.blockN_per_page_size_divmod,
+            bidb_kv, bidh_kv, thread_idx, seqlen_k_new, offset_k, bidb_kv_idx
             // passing offset_k instead of leftpad_k will move the PageTable pointer to the right position
         );
 
@@ -1587,7 +1608,7 @@ struct CollectiveMainloopFwdSm90 {
         }
 
         static_assert(std::is_same_v<GmemLayoutAtom, typename Rotary_t::LayoutAtom>);
-        static_assert(!PagedKV || std::is_same_v<GmemLayoutAtom, typename PagedKVManager_t::GmemLayoutAtomKVCpAsync>);
+        static_assert(!PagedKVNonTMA || std::is_same_v<GmemLayoutAtom, typename PagedKVManager_t::GmemLayoutAtomKVCpAsync>);
         GmemTiledCopyAppendKV gmem_tiled_copy_kv;
         auto gmem_thr_copy_kv = gmem_tiled_copy_kv.get_thread_slice(thread_idx);
         Tensor tKsK = gmem_thr_copy_kv.partition_S(sK);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
@@ -1611,7 +1632,7 @@ struct CollectiveMainloopFwdSm90 {
             if (get<1>(params.shape_rotary) <= 0) {
                 pipeline_k_new.consumer_wait(smem_pipe_read);
                 Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_read.index());
-                if constexpr (!PagedKV) {
+                if constexpr (!PagedKVNonTMA) {
                     Tensor tKgK_cur = tKgK(_, _, _, n_block);
                     // Clear_OOB_K must be false since we don't want to write zeros to gmem
                     flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
@@ -1622,15 +1643,15 @@ struct CollectiveMainloopFwdSm90 {
                 }
             } else {
                 Tensor gK_cur = gK(_, _, n_block);
-                auto tPrKPtr = cute::conditional_return<PagedKV>(paged_kv_manager.compute_K_ptr(), nullptr);
+                auto tPrKPtr = cute::conditional_return<PagedKVNonTMA>(paged_kv_manager.compute_K_ptr(), nullptr);
                 if (params.is_rotary_interleaved) {
                     auto [tRrCos, tRrSin] = rotary.template load_cos_sin<true /*kInterleaved*/>(n_block);
                     pipeline_k_new.consumer_wait(smem_pipe_read);
-                    rotary.template apply_K_interleaved<PagedKV>(sK(_, _, smem_pipe_read.index()), gK_cur, tKpK, tRrCos, tRrSin, tPrKPtr, n_block);
+                    rotary.template apply_K_interleaved<PagedKVNonTMA>(sK(_, _, smem_pipe_read.index()), gK_cur, tKpK, tRrCos, tRrSin, tPrKPtr, n_block);
                 } else {
                     auto [tRrCosCont, tRrSinCont] = rotary.template load_cos_sin<false /*kInterleaved*/>(n_block);
                     pipeline_k_new.consumer_wait(smem_pipe_read);
-                    rotary.template apply_K_contiguous<PagedKV>(sK(_, _, smem_pipe_read.index()), gK_cur, tKpK, tRrCosCont, tRrSinCont, tPrKPtr, n_block, get<1>(params.shape_K));
+                    rotary.template apply_K_contiguous<PagedKVNonTMA>(sK(_, _, smem_pipe_read.index()), gK_cur, tKpK, tRrCosCont, tRrSinCont, tPrKPtr, n_block, get<1>(params.shape_K));
                 }
             }
             // Without this sync I'm getting race condition when seqlen_k is large
@@ -1646,7 +1667,7 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_v_new.consumer_wait(smem_pipe_read);
             int const n_limit = std::min(seqlen_k_new - n_block * kBlockN, kBlockN);
             Tensor tVsV_cur = tVsV(_, _, _, smem_pipe_read.index());
-            if constexpr (!PagedKV) {
+            if constexpr (!PagedKVNonTMA) {
                 Tensor tVgV_cur = tVgV(_, _, _, n_block);
                 // Clear_OOB_K must be false since we don't want to write zeros to gmem
                 flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
@@ -1661,7 +1682,7 @@ struct CollectiveMainloopFwdSm90 {
 
         #pragma unroll 1
         for (int n_block = n_block_new_max - 1; n_block >= n_block_new_min; --n_block) {
-            if constexpr (PagedKV) { paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/>(n_block); }
+            if constexpr (PagedKVNonTMA) { paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/>(n_block); }
             store_K(n_block, smem_pipe_read);
             // if (thread_idx == 0) { printf("Done storing K, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
             store_V(n_block, smem_pipe_read);

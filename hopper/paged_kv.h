@@ -78,9 +78,11 @@ struct PagedKVManager {
 
     GmemTiledCopyKVCpAsync gmem_tiled_copy_kv;
     cutlass::FastDivmod const &page_size_divmod;
+    cutlass::FastDivmod const &blockN_per_page_size_divmod;
     int const thread_idx;
     int const seqlen_k;
     int const leftpad_k;
+    int const* const ptr_page_table;
     GmemThrCopyKVCpAsync const gmem_thr_copy_kv;
     TensorPageTable mPageTable;
     TensorKV mK_paged, mV_paged;
@@ -88,20 +90,27 @@ struct PagedKVManager {
     TensortVpV tVpV;
     TensorPageOffset tPrPageOffset;
     TensorKVPtr tPrVPtr;
+    int bidb_kv_idx, bidb_kv_idx_prev, n_block_idx, n_block_idx_prev;  // Only used for TMA
 
     CUTLASS_DEVICE
-    PagedKVManager(int const* const ptr_page_table,
+    PagedKVManager(int const* const ptr_page_table_,
                    ShapePageTable const &shape_pagetable, StridePageTable const &stride_pagetable,
                    Element* const ptr_K, ShapeKV const &shape_K, StrideKV const &stride_K,
                    Element* const ptr_V, int const headdim_v, StrideKV const &stride_V,
                    cutlass::FastDivmod const &page_size_divmod,
-                   int const bidb, int const bidh, int const thread_idx, int const seqlen_k, int const leftpad_k
+                   cutlass::FastDivmod const &blockN_per_page_size_divmod,
+                   int const bidb, int const bidh, int const thread_idx, int const seqlen_k, int const leftpad_k,
+                   int bidb_kv_idx
                    )
         : page_size_divmod(page_size_divmod)
+        , blockN_per_page_size_divmod(blockN_per_page_size_divmod)
         , thread_idx(thread_idx)
         , seqlen_k(seqlen_k)
         , leftpad_k(leftpad_k)
+        , ptr_page_table(ptr_page_table_)
         , gmem_thr_copy_kv(gmem_tiled_copy_kv.get_thread_slice(thread_idx))
+        , bidb_kv_idx(bidb_kv_idx)
+        , bidb_kv_idx_prev(bidb_kv_idx)
 
     {
         mPageTable = make_tensor(make_gmem_ptr(ptr_page_table), shape_pagetable, stride_pagetable)(bidb, _);
@@ -141,6 +150,38 @@ struct PagedKVManager {
             // if (cute::thread0()) { printf("row = %d, page_idx = %d, page_offset = %d, page = %d, leftpad_k = %d, seqlen_k = %d\n", row, page_idx, page_offset, page, leftpad_k, seqlen_k); }
         }
         if constexpr (First_iter && !KV_Same_Iter) { compute_V_ptr(); }
+    };
+
+    template <bool First_iter=false>
+    CUTLASS_DEVICE
+    void load_page_table_TMA(const int n_block) {
+        // We require that page size is a multiple of kBlockN, and there's no leftpad_k
+        if (ptr_page_table) {
+            bidb_kv_idx = mPageTable[blockN_per_page_size_divmod.divmod(n_block_idx, n_block)];
+        } else {
+            n_block_idx = n_block;
+        }
+        if constexpr (First_iter && !KV_Same_Iter) {
+            bidb_kv_idx_prev = bidb_kv_idx;
+            n_block_idx_prev = n_block_idx;
+        }
+    };
+
+    CUTLASS_DEVICE
+    cute::tuple<int, int> get_indices_for_K_TMA() {
+        return {n_block_idx, bidb_kv_idx};
+    };
+
+    CUTLASS_DEVICE
+    cute::tuple<int, int> get_indices_for_V_TMA() {
+        if constexpr (KV_Same_Iter) {
+            return {n_block_idx, bidb_kv_idx};
+        } else {
+            cute::tuple<int, int> const indices = {n_block_idx_prev, bidb_kv_idx_prev};
+            bidb_kv_idx_prev = bidb_kv_idx;
+            n_block_idx_prev = n_block_idx;
+            return indices;
+        }
     };
 
     CUTLASS_DEVICE

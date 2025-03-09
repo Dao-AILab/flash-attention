@@ -415,7 +415,10 @@ struct CollectiveMainloopFwdSm80 {
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
             params.ptr_V, params.headdim_v, params.stride_V,
-            params.page_size_divmod, bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k
+            params.page_size_divmod,
+            params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
+            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k,
+            0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
         );
 
         auto load_K = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
@@ -698,8 +701,11 @@ struct CollectiveMainloopFwdSm80 {
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
             params.ptr_V, params.headdim_v, params.stride_V,
-            params.page_size_divmod, bidb_kv, bidh_kv, thread_idx, seqlen_k_new, offset_k
+            params.page_size_divmod,
+            params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
+            bidb_kv, bidh_kv, thread_idx, seqlen_k_new, offset_k,
             // passing offset_k instead of leftpad_k will move the PageTable pointer to the right position
+            0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
         );
 
         static_assert(std::is_same_v<GmemLayoutAtomAppend, typename Rotary_t::LayoutAtom>);
