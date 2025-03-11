@@ -17,6 +17,11 @@ from einops import rearrange
 from flash_attn_interface import flash_attn_with_kvcache
 
 try:
+    from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+except ImportError:
+    flash_mla_with_kvcache, get_mla_metadata = None, None
+
+try:
     from flash_attn.utils.benchmark import pytorch_profiler
 except ImportError:
     pytorch_profiler = None
@@ -26,8 +31,8 @@ attn_variant = attn_variants[3]
 device = "cuda"
 dtype = torch.bfloat16
 seqlen = 8192
-nheads = 128
-nheads_kv = nheads if attn_variant == "mha" else (min(nheads // 8, 8) if attn_variant == "gqa" else 1)
+nheads_q = 128
+nheads_kv = nheads_q if attn_variant == "mha" else (min(nheads_q // 8, 8) if attn_variant == "gqa" else 1)
 headdim = 64 if attn_variant == "mla" else 128
 headdim_v = 512 if attn_variant == "mla" else headdim
 has_qv = headdim == 64 and headdim_v == 512
@@ -36,6 +41,7 @@ seqlen_q = 1
 page_size = 64 if attn_variant == "mla" else 128
 
 use_bench_cudagraph = False
+should_run_flashmla = attn_variant == "mla" and page_size == 64 and flash_mla_with_kvcache is not None
 
 torch.manual_seed(0)
 
@@ -46,13 +52,13 @@ cache_seqlens = None
 # cache_seqlens = torch.tensor([1024] * batch_size, device=device, dtype=torch.int)
 # cache_seqlens = torch.tensor([4500, 45000, 1800, 1800], dtype=torch.int32, device=device)
 
-print(f"{attn_variant.upper()}, nheads_q = {nheads}, nheads_kv = {nheads_kv}, headdim = {headdim}, headdim_v = {headdim_v}, page_size = {page_size}")
+print(f"{attn_variant.upper()}, nheads_q = {nheads_q}, nheads_kv = {nheads_kv}, headdim = {headdim}, headdim_v = {headdim_v}, page_size = {page_size}")
 
 for seqlen in [s * 1024 for s in [1, 2, 4, 8, 16, 32, 64]]:
 # for seqlen in [s * 1024 for s in [1]]:
     cache_seqlens = torch.tensor([seqlen] * batch_size, device=device, dtype=torch.int)
     num_splits = 0
-    q = torch.randn(batch_size, seqlen_q, nheads, headdim, dtype=dtype, device=device)
+    q = torch.randn(batch_size, seqlen_q, nheads_q, headdim, dtype=dtype, device=device)
     try:
         v_cache = torch.randn(batch_size, seqlen, nheads_kv, headdim_v, dtype=dtype, device=device)
         k_cache = torch.randn(batch_size, seqlen, nheads_kv, headdim, dtype=dtype, device=device)
@@ -65,7 +71,7 @@ for seqlen in [s * 1024 for s in [1, 2, 4, 8, 16, 32, 64]]:
             page_table = None
     except torch.OutOfMemoryError:
         continue
-    qv = torch.randn(batch_size, seqlen_q, nheads, headdim_v, dtype=dtype, device=device) if has_qv else None
+    qv = torch.randn(batch_size, seqlen_q, nheads_q, headdim_v, dtype=dtype, device=device) if has_qv else None
 
     # Time in ms
     fn = lambda: flash_attn_with_kvcache(q, k_cache, v_cache, cache_seqlens=cache_seqlens, num_splits=num_splits, qv=qv, page_table=page_table, causal=True)
@@ -76,14 +82,28 @@ for seqlen in [s * 1024 for s in [1, 2, 4, 8, 16, 32, 64]]:
         with torch.cuda.stream(torch.cuda.Stream()):
             t0 = do_bench_cudagraph(fn, rep=10)
     # exit(0)
+    if should_run_flashmla:
+        # Separate out the preprocessing since this can be done once and reused for all layers
+        scheduler_metadata = get_mla_metadata(cache_seqlens, seqlen_q * nheads_q // nheads_kv, nheads_kv)
+        q_concat = torch.concat([q, qv], dim=-1) if has_qv else q
+        kv_cache_concat = torch.concat([v_cache, k_cache], dim=-1)
+        fn = lambda: flash_mla_with_kvcache(q_concat, kv_cache_concat, page_table, cache_seqlens, headdim_v, *scheduler_metadata, causal=True)
+        time.sleep(1)  # to avoid power throttling
+        if not use_bench_cudagraph:
+            t1 = do_bench(fn, warmup=1, rep=10)
+        else:
+            with torch.cuda.stream(torch.cuda.Stream()):
+                t1 = do_bench_cudagraph(fn, rep=10)
 
     total_seqlen = seqlen * batch_size if cache_seqlens is None else cache_seqlens.sum().item()
     mem_io = total_seqlen * nheads_kv * (headdim + headdim_v) * 2 + q.numel() * 2 + (qv.numel() * 2 if has_qv else 0) + q.numel() * headdim_v // headdim * 2  # last time is for the output
-    flops = seqlen_q * total_seqlen * nheads * (headdim + headdim_v * (2 if has_qv else 1)) * 2
+    flops = seqlen_q * total_seqlen * nheads_q * (headdim + headdim_v * (2 if has_qv else 1)) * 2
     ideal_h100_time_mem = mem_io / 3.35e12 * 1e6
     ideal_h100_time_flop = flops / 989e12 * 1e6
     ideal_h100_time = max(ideal_h100_time_mem, ideal_h100_time_flop)
-    print(f"Seqlen = {seqlen}, time{'' if not use_bench_cudagraph else ' w CUDA Graph'}: {t0 * 1e3:.0f} us, {mem_io * 1e-9 / (t0 * 1e-3):.0f} GB/s, {flops * 1e-12 / (t0 * 1e-3):.0f} TFLOPS/s")
+    print(f"Seqlen = {seqlen}, FA3 time{'' if not use_bench_cudagraph else ' w CUDA Graph'}: {t0 * 1e3:.0f} us, {mem_io * 1e-9 / (t0 * 1e-3):.0f} GB/s, {flops * 1e-12 / (t0 * 1e-3):.0f} TFLOPS/s")
+    if should_run_flashmla:
+        print(f"Seqlen = {seqlen}, FlashMLA time{'' if not use_bench_cudagraph else ' w CUDA Graph'}: {t1 * 1e3:.0f} us, {mem_io * 1e-9 / (t1 * 1e-3):.0f} GB/s, {flops * 1e-12 / (t1 * 1e-3):.0f} TFLOPS/s")
     print(f"Ideal time: {ideal_h100_time:.0f} us")
 
     # if pytorch_profiler is not None:
