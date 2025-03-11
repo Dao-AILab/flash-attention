@@ -177,26 +177,31 @@ endif ()
 # FA3 requires CUDA 12.0 or later
 if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
     # BF16 source files
-    file(GLOB FA3_BF16_GEN_SRCS 
+    file(GLOB FA3_BF16_GEN_SRCS
         "hopper/instantiations/flash_fwd_hdimall_bf16*_sm90.cu")
-    file(GLOB FA3_BF16_GEN_SRCS_ 
+    file(GLOB FA3_BF16_GEN_SRCS_
         "hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
     list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
-    file(GLOB FA3_BF16_GEN_SRCS_ 
+    file(GLOB FA3_BF16_GEN_SRCS_
         "hopper/instantiations/flash_fwd_*_bf16_*_sm80.cu")
     list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
     # FP16 source files
-    file(GLOB FA3_FP16_GEN_SRCS 
+    file(GLOB FA3_FP16_GEN_SRCS
         "hopper/instantiations/flash_fwd_hdimall_fp16*_sm90.cu")
-    file(GLOB FA3_FP16_GEN_SRCS_ 
+    file(GLOB FA3_FP16_GEN_SRCS_
         "hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
     list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
-    file(GLOB FA3_FP16_GEN_SRCS_ 
+    file(GLOB FA3_FP16_GEN_SRCS_
         "hopper/instantiations/flash_fwd_*_fp16_*_sm80.cu")
     list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
+    # FP8 source files
+    file(GLOB FA3_FP8_GEN_SRCS
+        "hopper/instantiations/flash_fwd_hdimall_e4m3*_sm90.cu")
+    file(GLOB FA3_FP8_GEN_SRCS_
+        "hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
+    list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
 
-    # TODO add fp8 source files when FP8 is enabled
-    set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS})
+    set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
 
     # For CUDA we set the architectures on a per file basis
     # FaV3 is not yet supported in Blackwell
@@ -240,7 +245,6 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         FLASHATTENTION_DISABLE_UNEVEN_K
         # FLASHATTENTION_DISABLE_LOCAL
         FLASHATTENTION_DISABLE_PYBIND
-        FLASHATTENTION_DISABLE_FP8 # TODO Enable FP8
         FLASHATTENTION_VARLEN_ONLY # Custom flag to save on binary size
     )
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS 12.0)

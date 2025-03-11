@@ -96,6 +96,9 @@ def flash_attn_varlen_func(
     return_softmax_lse=False,
     out=None,
     fa_version: int = DEFAULT_FA_VERSION,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -194,10 +197,11 @@ def flash_attn_varlen_func(
             None,
         )
     elif fa_version == 3:
+        assert alibi_slopes is None, "Alibi is not supported in FA3"
         out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
             q, k, v,
             None, None,       # k_new, v_new
-            q_v,              #
+            q_v,
             out,
             cu_seqlens_q,
             cu_seqlens_k,     # cu_seqlens_k
@@ -205,10 +209,10 @@ def flash_attn_varlen_func(
             None, seqused_k,  # seqused_q, seqused_k
             max_seqlen_q, max_seqlen_k,
             block_table,
-            alibi_slopes,
             None,             # kv_batch_idx
+            None,             # leftpad_k
             None, None,       # rotary_cos, rotary_sin
-            None, None, None, # q_descale, k_descale, v_descale
+            q_descale, k_descale, v_descale,
             softmax_scale,
             causal,
             real_window_size[0], real_window_size[1],
@@ -247,6 +251,9 @@ def flash_attn_with_kvcache(
     *,
     out=None,
     fa_version: int = DEFAULT_FA_VERSION,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -346,7 +353,7 @@ def flash_attn_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
-    
+
     if fa_version == 2:
         out, softmax_lse = torch.ops._vllm_fa2_C.fwd_kvcache(
             q, k_cache, v_cache,
@@ -368,29 +375,30 @@ def flash_attn_with_kvcache(
             num_splits,
         )
     elif fa_version == 3:
+        assert alibi_slopes is None, "Alibi is not supported in FA3"
         out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
             q, k_cache, v_cache, # q, k, v
-            k, v,             # k_new, v_new
-            None,             # q_v
+            k, v,                # k_new, v_new
+            None,                # q_v
             out,
-            None, None,       # cu_seqlens_q, cu_seqlens_k
-            None,             # cu_seqlens_k_new
+            None, None,          # cu_seqlens_q, cu_seqlens_k
+            None,                # cu_seqlens_k_new
             None, cache_seqlens, # seqused_q, seqused_k
-            None, None,       # max_seqlen_q, max_seqlen_k
+            None, None,          # max_seqlen_q, max_seqlen_k
             block_table,
-            alibi_slopes,
-            cache_batch_idx,  # kv_batch_idx
-            None, None,       # rotary_cos, rotary_sin
-            None, None, None, # q_descale, k_descale, v_descale
+            cache_batch_idx,     # kv_batch_idx
+            None,                # leftpad_k
+            None, None,          # rotary_cos, rotary_sin
+            q_descale, k_descale, v_descale,
             softmax_scale,
             causal,
             window_size[0], window_size[1],
-            0,                # sink_token_length
+            0,                   # sink_token_length
             softcap,
-            True,             # rotary_interleaved
-            num_splits,       # num_splits
-            None,             # pack_gqa
-            0,                # sm_margin
+            rotary_interleaved,  # rotary_interleaved
+            num_splits,          # num_splits
+            None,                # pack_gqa
+            0,                   # sm_margin
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")
