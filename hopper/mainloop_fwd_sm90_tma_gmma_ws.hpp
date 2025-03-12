@@ -353,7 +353,7 @@ struct CollectiveMainloopFwdSm90 {
         ? (NumMmaWarpGroups >= 2) && (!Is_FP8 ? kHeadDim <= 128 : kHeadDim >= 128)
         : NumMmaWarpGroups == 2)
         && !LargeHeadDimV;
-    static constexpr bool RescaleOBeforeGemm = kHeadDim > 128 && (!Is_FP8 || V_colmajor);
+    static constexpr bool RescaleOBeforeGemm = kHeadDim > 128 && (!Is_FP8 || V_colmajor) && IntraWGOverlap;
 
     // Host side kernel arguments
     struct Arguments {
@@ -1061,8 +1061,8 @@ struct CollectiveMainloopFwdSm90 {
             float const k_descale = params.ptr_k_descale == nullptr ? 1.0f : params.ptr_k_descale[bidb * get<0>(params.stride_k_descale) + bidh_kv * get<1>(params.stride_k_descale)];
             softcap_val *= q_descale * k_descale;
         }
-        // Softcapping needs to happen before masking since if we apply after masking, softcapping can turn
-        // -inf to e.g. -50.0, which can affect the attention softmax.
+        // Softcapping needs to happen before masking since if we apply after masking, softcapping
+        // can turn -inf to e.g. -50.0, which can affect the attention softmax.
         auto scoremod_premask_fn = [&](auto& tSrS) {
             if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
         };
@@ -1126,10 +1126,6 @@ struct CollectiveMainloopFwdSm90 {
             cute::copy(smem_tiled_copy_Q, tSsQ_copy_view, tSrQ_copy_view);
         }
 
-        // Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
-        clear(tOrO);
-        // tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
-
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read);
@@ -1156,6 +1152,10 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
             if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             --n_block;
+
+            // Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
+            clear(tOrO);
+            // tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
 
             // Each step does gemm0 for iter n_block, gemm1 for iter n_block + 1, and softmax for iter n_block.
             auto fwd_step = [&](int const n_block, auto mask_fn, auto check_inf_type) {
@@ -1285,10 +1285,10 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
                 if constexpr (!MmaPV_use_RS_WG1) {
-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                    flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 } else {
                     TiledMmaPV_RS tiled_mma_pv_rs;
-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                    flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 }
                 if constexpr (!MmaPV_is_RS && MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 warpgroup_wait<0>();
