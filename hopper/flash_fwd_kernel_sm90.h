@@ -370,7 +370,8 @@ public:
             CUTLASS_PRAGMA_NO_UNROLL
             for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
                  work_tile_info.is_valid(params.scheduler);
-                 work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
+                 // get_next_work will be called before the epilogue
+                 ) {
                 // Attention output (GEMM-II) accumulator.
                 Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
                 float softmax_scale_log2 = params.mainloop.softmax_scale_log2;
@@ -426,6 +427,8 @@ public:
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, seqlen_info, block_coord, shared_storage);
                     }
                 }
+                // Do this here before the epilogue so that the next tile is ready to go.
+                work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info);
                 if (tile_valid) {
                     // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
                     epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma_pv,
