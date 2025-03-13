@@ -10,6 +10,7 @@
 #include "cutlass/device_kernel.h"  // For device_kernel
 #include <cutlass/kernel_hardware_info.h>
 #include "cutlass/cluster_launch.hpp"
+#include "cutlass/kernel_launch.h"
 
 #include "static_switch.h"
 #include "flash.h"
@@ -186,7 +187,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         if (smem_size >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
-        kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
+        // kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
+        cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, Arch >= 90 && Varlen /*launch_with_pdl*/);
     }
     CHECK_CUDA_KERNEL_LAUNCH();
 }

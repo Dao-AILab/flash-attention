@@ -12,6 +12,8 @@
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
 
+#include "cutlass/arch/grid_dependency_control.h"
+
 #include "seqlen.h"
 #include "utils.h"
 
@@ -205,6 +207,7 @@ public:
         int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[batch] : get<1>(params.shape_LSE_partial);
 
         if (params.semaphore_to_reset && threadIdx.x == 0 && blockIdx.x == gridDim.x - 1 && blockIdx.y == gridDim.y - 1 && blockIdx.z == gridDim.z - 1) {
+            cutlass::arch::wait_on_dependent_grids();
             *params.semaphore_to_reset = 0;
         }
         if (num_splits <= 1) { return; }
@@ -231,6 +234,8 @@ public:
         Tensor cLSE = make_identity_tensor(make_shape(size<0>(sLSE), size<1>(sLSE)));    // (NUM_SPLITS, BLK_M) -> (num_splits, blk_m)
         // Repeat the partitioning with identity layouts
         Tensor tLSEcLSE = gmem_thr_copy_LSE.partition_S(cLSE);
+
+        cutlass::arch::wait_on_dependent_grids();
 
         #pragma unroll
         for (int m = 0; m < size<2>(tLSEcLSE); ++m) {

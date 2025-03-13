@@ -366,27 +366,27 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     });
 }
 
-void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl=false) {
     #ifndef FLASHATTENTION_DISABLE_SPLIT
     // If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
     // so that kBlockM is smaller and we have more parallelism.
     if (params.is_fp32) {
         if (params.dv <= 64) {
-            run_mha_fwd_combine_<float, float, 64>(params, stream);
+            run_mha_fwd_combine_<float, float, 64>(params, stream, enable_pdl);
         } else {
-            run_mha_fwd_combine_<float, float, 128>(params, stream);
+            run_mha_fwd_combine_<float, float, 128>(params, stream, enable_pdl);
         }
     } else if (params.is_bf16) {
         if (params.dv <= 64) {
-            run_mha_fwd_combine_<cutlass::bfloat16_t, float, 64>(params, stream);
+            run_mha_fwd_combine_<cutlass::bfloat16_t, float, 64>(params, stream, enable_pdl);
         } else {
-            run_mha_fwd_combine_<cutlass::bfloat16_t, float, 128>(params, stream);
+            run_mha_fwd_combine_<cutlass::bfloat16_t, float, 128>(params, stream, enable_pdl);
         }
     } else {
         if (params.dv <= 64) {
-            run_mha_fwd_combine_<cutlass::half_t, float, 64>(params, stream);
+            run_mha_fwd_combine_<cutlass::half_t, float, 64>(params, stream, enable_pdl);
         } else {
-            run_mha_fwd_combine_<cutlass::half_t, float, 128>(params, stream);
+            run_mha_fwd_combine_<cutlass::half_t, float, 128>(params, stream, enable_pdl);
         }
     }
     #else
@@ -970,7 +970,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
             //     params.b = 1;
             //     params.seqlen_q = total_q;
             // }
-            run_mha_fwd_combine(params, stream);
+            run_mha_fwd_combine(params, stream, true /*enable_pdl*/);
         }
     } else if (total_q > 0 && num_heads_k > 0) {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
@@ -1419,10 +1419,11 @@ mha_combine(const at::Tensor &out_partial,         // num_splits x batch_size x 
     params.o_row_stride = out.stride(1);
     params.o_head_stride = out.stride(2);
     params.o_batch_stride = out.stride(0);
+    params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
 
     if (seqlen > 0 && batch_size > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
-        run_mha_fwd_combine(params, stream);
+        run_mha_fwd_combine(params, stream, false /*enable_pdl*/);
     }
 
     at::Tensor out_padded = out;

@@ -6,6 +6,8 @@
 #include "cutlass/barrier.h"
 #include "cutlass/arch/barrier.h"
 
+#include "cutlass/arch/grid_dependency_control.h"
+
 #include "flash.h"
 
 namespace flash {
@@ -16,13 +18,17 @@ __global__ void prepare_varlen_num_blocks_kernel(
         int const* const seqused_q, int const* const seqused_k, int const* const leftpad_k_ptr,
         int num_batch, int num_head, int qhead_per_khead, int num_sm, int num_splits_static,
         cutlass::FastDivmod blockm_divmod, cutlass::FastDivmod blockn_divmod,
-        int* const tile_count_semaphore, int* const num_m_blocks_ptr, int* const num_n_blocks_ptr,
+        int* const tile_count_semaphore, int* const num_n_blocks_ptr,
+        // int* const num_m_blocks_ptr,
         int* const num_splits_dynamic_ptr) {
 
     static constexpr int kNumBatchPerWarp = cutlass::NumThreadsPerWarp - 1;
     static constexpr int kSmemSize = 1;
     // Assume that there's only one block in the grid
     __shared__ int smem[kSmemSize];
+
+    // There's only 1 block in the grid, so might as well start launching the main attn kernel
+    cutlass::arch::launch_dependent_grids();
 
     if (threadIdx.x < kSmemSize) { smem[threadIdx.x] = 0; }
     __syncthreads();
@@ -109,7 +115,6 @@ __global__ void prepare_varlen_num_blocks_kernel(
             // printf("idx = %d, num_m_blocks = %d, num_n_blocks = %d, num_split_static = %d, num_splits_dynamic = %d\n", bidb_start + lane, num_m_blocks_ptr[bidb_start + lane], num_n_blocks, num_splits_static, num_splits_dynamic);
         }
     }
-
 }
 
 } // flash
@@ -123,6 +128,7 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
         params.seqused_q, params.seqused_k, params.leftpad_k,
         params.b, !packgqa ? params.h : params.h_k, qhead_per_khead, params.num_sm, params.num_splits,
         cutlass::FastDivmod(blockM), cutlass::FastDivmod(blockN),
-        params.tile_count_semaphore, params.num_m_blocks_ptr, params.num_n_blocks_ptr,
+        params.tile_count_semaphore, params.num_n_blocks_ptr,
+        // params.num_m_blocks_ptr,
         params.num_splits_dynamic_ptr);
 }

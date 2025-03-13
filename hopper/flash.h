@@ -212,4 +212,4 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
 template <int Arch, typename T, int kHeadDim, bool Has_softcap>
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
 template <typename T, typename Tpartial, int kBlockK>
-void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream);
+void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl);

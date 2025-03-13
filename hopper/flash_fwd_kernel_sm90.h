@@ -14,6 +14,8 @@
 #include <cutlass/kernel_hardware_info.h>
 #include "cutlass/pipeline/pipeline.hpp"
 
+#include "cutlass/arch/grid_dependency_control.h"
+
 #include "seqlen.h"
 #include "utils.h"
 #include "softmax.h"
@@ -320,6 +322,8 @@ public:
             }
             if (!SingleProducerWarp && warp_idx_in_warpgroup != 0) { scheduler.init_consumer(); }
 
+            cutlass::arch::wait_on_dependent_grids();
+
             // Load Q, K, V
             for (auto work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler) : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
                  work_tile_info.is_valid(params.scheduler);
@@ -428,6 +432,11 @@ public:
                 }
                 // Do this here before the epilogue so that the next tile is ready to go.
                 work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info);
+                if constexpr (Split && Varlen) {
+                    if (!work_tile_info.is_valid(params.scheduler)) {  // Last tile
+                        cutlass::arch::launch_dependent_grids();
+                    }
+                }
                 if (tile_valid) {
                     // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
                     epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma_pv,
