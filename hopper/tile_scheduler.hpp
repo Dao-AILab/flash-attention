@@ -388,7 +388,6 @@ public:
         // If Split, for the purpose of scheduling, we pretend that instead there are
         // (args.num_splits * args.num_head) number of heads.
         assert(args.tile_count_semaphore != nullptr);
-        assert(!Split || args.num_splits_dynamic_ptr != nullptr);
         assert(num_head < (1 << 16));  // We use the top 16 bits to store num_splits & split_idx
         assert(!Split || args.num_splits < (1 << 8)); // We use the top 8 bits to store num_splits
         return {args.num_head, args.num_batch,
@@ -468,7 +467,9 @@ public:
         auto get_num_splits = [&] (int bidb_start) {
             int batch_idx = lane + bidb_start;
             return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
-                ? (!Split ? 1 : params.num_splits_dynamic_ptr[batch_idx])
+                ? (!Split ? 1 : (params.num_splits_dynamic_ptr
+                                ? params.num_splits_dynamic_ptr[batch_idx]
+                                : params.nsplits_divmod.divisor))
                 : 0;
         };
 

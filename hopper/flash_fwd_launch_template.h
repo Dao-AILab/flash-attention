@@ -155,7 +155,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.num_splits_dynamic_ptr,
     };
 
-    if constexpr (Varlen) {
+    if (Varlen && params.num_splits_dynamic_ptr) {
         prepare_varlen_num_blocks(params, stream, PackGQA, kBlockM, kBlockN);
         CHECK_CUDA_KERNEL_LAUNCH();
     }

@@ -447,7 +447,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // If varlen, we use dynamic split, so this heuristic just needs to get an upper bound on num_splits.
     // We assume the case where there's 1 long sequence and the rest are short, i.e. pretending
     // that batch = 1.
-    int total_mblocks = (!varlen ? params.b : 1) * params.h_k * num_m_blocks;
+    int total_mblocks = (params.num_splits_dynamic_ptr ? 1 : params.b) * params.h_k * num_m_blocks;
     return num_splits_heuristic(total_mblocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);
     #endif
 }
@@ -798,6 +798,31 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         }
     }
 
+    at::Tensor tile_count_semaphore;
+    // We don't use the persistent scheduler if Split and not Varlen
+    bool const persistent_scheduler = params.arch >= 90
+        ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
+        : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
+    // 992 = 32 * 31 is the max supported batch in prepare_varlen_num_blocks kernel
+    bool const use_dynamic_split = is_varlen && params.b <= 992;
+    if (persistent_scheduler || use_dynamic_split) {  // This needs to be set before get_num_splits
+        tile_count_semaphore = torch::empty({int(persistent_scheduler) + int(use_dynamic_split) * batch_size}, opts.dtype(torch::kInt32));
+        if (persistent_scheduler) {
+            if (!is_varlen) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
+            params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+        } else {
+            params.tile_count_semaphore = nullptr;
+        }
+        if (use_dynamic_split) {
+            // params.num_m_blocks_ptr = num_m_n_blocks_splits.data_ptr<int>();
+            // params.num_n_blocks_ptr = num_m_n_blocks_splits.data_ptr<int>() + batch_size;
+            params.num_splits_dynamic_ptr = tile_count_semaphore.data_ptr<int>() + 1;
+        } else {
+            params.num_splits_dynamic_ptr = nullptr;
+        }
+    }
+
+
     params.pagedkv_tma = get_pagedkv_tma(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
     // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
@@ -880,25 +905,6 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         params.oaccum_head_stride = out_accum.stride(-3);
         params.lseaccum_split_stride = softmax_lse_accum.stride(0);
         params.lseaccum_head_stride = softmax_lse_accum.stride(-2);
-    }
-
-    at::Tensor tile_count_semaphore, num_m_n_blocks_splits;
-    // We don't use the persistent scheduler if Split and not Varlen
-    bool const persistent_scheduler = params.arch >= 90
-        ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
-        : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
-    if (persistent_scheduler) {
-        tile_count_semaphore = torch::empty({1}, opts.dtype(torch::kInt32));
-        if (!is_varlen) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
-        params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
-    } else {
-        params.tile_count_semaphore = nullptr;
-    }
-    if (is_varlen) {
-        num_m_n_blocks_splits = torch::empty({batch_size * 3}, opts.dtype(torch::kInt32));
-        params.num_m_blocks_ptr = num_m_n_blocks_splits.data_ptr<int>();
-        params.num_n_blocks_ptr = num_m_n_blocks_splits.data_ptr<int>() + batch_size;
-        params.num_splits_dynamic_ptr = num_m_n_blocks_splits.data_ptr<int>() + batch_size * 2;
     }
 
     if (q_type == at::ScalarType::Float8_e4m3fn) {

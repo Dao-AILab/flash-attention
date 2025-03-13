@@ -18,19 +18,19 @@ __global__ void prepare_varlen_num_blocks_kernel(
         int const* const seqused_q, int const* const seqused_k, int const* const leftpad_k_ptr,
         int num_batch, int num_head, int qhead_per_khead, int num_sm, int num_splits_static,
         cutlass::FastDivmod blockm_divmod, cutlass::FastDivmod blockn_divmod,
-        int* const tile_count_semaphore, int* const num_n_blocks_ptr,
+        int* const tile_count_semaphore,
         // int* const num_m_blocks_ptr,
         int* const num_splits_dynamic_ptr) {
 
     static constexpr int kNumBatchPerWarp = cutlass::NumThreadsPerWarp - 1;
     static constexpr int kSmemSize = 1;
     // Assume that there's only one block in the grid
-    __shared__ int smem[kSmemSize];
+    __shared__ int total_blocks_smem[kSmemSize];
 
     // There's only 1 block in the grid, so might as well start launching the main attn kernel
     cutlass::arch::launch_dependent_grids();
 
-    if (threadIdx.x < kSmemSize) { smem[threadIdx.x] = 0; }
+    if (threadIdx.x < kSmemSize) { total_blocks_smem[threadIdx.x] = 0; }
     __syncthreads();
 
     if (threadIdx.x == 0 && tile_count_semaphore) { *tile_count_semaphore = 0; }
@@ -83,37 +83,26 @@ __global__ void prepare_varlen_num_blocks_kernel(
 
     int total_blocks = 0;
     int warp_idx = threadIdx.x / cutlass::NumThreadsPerWarp;
-    int num_warps = blockDim.x / cutlass::NumThreadsPerWarp;
-    for (int bidb_start = kNumBatchPerWarp * warp_idx; bidb_start < num_batch; bidb_start += kNumBatchPerWarp * num_warps) {
-        int num_m_blocks = get_num_m_blocks(bidb_start);
-        int num_n_blocks = get_num_n_blocks(bidb_start);
-        if (bidb_start + lane < num_batch && lane < kNumBatchPerWarp) {
-            // num_m_blocks_ptr[bidb_start + lane] = num_m_blocks;
-            num_n_blocks_ptr[bidb_start + lane] = num_n_blocks;
-            // printf("idx = %d, num_m = %d, num_n = %d\n", bidb_start + lane, num_m_blocks, num_n_blocks);
-        }
-        total_blocks += num_m_blocks * num_n_blocks;
-    }
+    int bidb_start = kNumBatchPerWarp * warp_idx;
+    int num_m_blocks = get_num_m_blocks(bidb_start);
+    int num_n_blocks = get_num_n_blocks(bidb_start);
+    total_blocks += num_m_blocks * num_n_blocks;
 
     // Warp sum
     #pragma unroll
     for (int i = cutlass::NumThreadsPerWarp / 2; i >= 1; i /= 2) {
         total_blocks += __shfl_down_sync(0xffffffff, total_blocks, i);
     }
-    if (lane == 0) { atomicAdd(smem, total_blocks); }
+    if (lane == 0) { atomicAdd(total_blocks_smem, total_blocks); }
     __syncthreads();
-    total_blocks = smem[0];
+    total_blocks = total_blocks_smem[0];
     // 10% margin
     int blocks_per_sm = static_cast<int>(ceilf(float(total_blocks) * 1.1f * float(num_head) / float(num_sm)));
     // blocks_per_sm = std::max(1, blocks_per_sm);  // 1 is the minimum number of blocks per SM
-    for (int bidb_start = kNumBatchPerWarp * warp_idx; bidb_start < num_batch; bidb_start += kNumBatchPerWarp * num_warps) {
-        bool is_valid = bidb_start + lane < num_batch && lane < kNumBatchPerWarp;
-        int num_n_blocks = is_valid ? num_n_blocks_ptr[bidb_start + lane] : 0;
-        int num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
-        if (is_valid) {
-            num_splits_dynamic_ptr[bidb_start + lane] = num_splits_dynamic;
-            // printf("idx = %d, num_m_blocks = %d, num_n_blocks = %d, num_split_static = %d, num_splits_dynamic = %d\n", bidb_start + lane, num_m_blocks_ptr[bidb_start + lane], num_n_blocks, num_splits_static, num_splits_dynamic);
-        }
+    int num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
+    if (bidb_start + lane < num_batch && lane < kNumBatchPerWarp) {
+        num_splits_dynamic_ptr[bidb_start + lane] = num_splits_dynamic;
+        // printf("idx = %d, num_m_blocks = %d, num_n_blocks = %d, num_split_static = %d, num_splits_dynamic = %d\n", bidb_start + lane, num_m_blocks_ptr[bidb_start + lane], num_n_blocks, num_splits_static, num_splits_dynamic);
     }
 }
 
@@ -121,14 +110,15 @@ __global__ void prepare_varlen_num_blocks_kernel(
 
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa,
                                int blockM, int blockN) {
+    // Only support batch <= 992 (32 warps, each with 31 batches)
     int qhead_per_khead = !packgqa ? 1 : cutlass::ceil_div(params.h, params.h_k);
-    flash::prepare_varlen_num_blocks_kernel<<<1 /*grid*/, 256 /*block*/, 0, stream>>>(
+    flash::prepare_varlen_num_blocks_kernel<<<1 /*grid*/, 1024 /*block*/, 0, stream>>>(
         params.seqlen_q, params.seqlen_k, params.seqlen_knew,
         params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
         params.seqused_q, params.seqused_k, params.leftpad_k,
         params.b, !packgqa ? params.h : params.h_k, qhead_per_khead, params.num_sm, params.num_splits,
         cutlass::FastDivmod(blockM), cutlass::FastDivmod(blockN),
-        params.tile_count_semaphore, params.num_n_blocks_ptr,
+        params.tile_count_semaphore,
         // params.num_m_blocks_ptr,
         params.num_splits_dynamic_ptr);
 }
