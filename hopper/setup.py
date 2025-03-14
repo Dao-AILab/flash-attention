@@ -651,6 +651,5 @@ setup(
         "torch",
         "einops",
         "packaging",
-        "ninja",
     ],
 )
