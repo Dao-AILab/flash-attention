@@ -81,13 +81,12 @@ __global__ void prepare_varlen_num_blocks_kernel(
             ? blockn_divmod.div(seqlen + blockn_divmod.divisor - 1) : 0;
     };
 
-    int total_blocks = 0;
     int warp_idx = threadIdx.x / cutlass::NumThreadsPerWarp;
     int bidb_start = kNumBatchPerWarp * warp_idx;
     int num_m_blocks = get_num_m_blocks(bidb_start);
     int num_n_blocks = get_num_n_blocks(bidb_start);
-    total_blocks += num_m_blocks * num_n_blocks;
 
+    int total_blocks = num_m_blocks * num_n_blocks;
     // Warp sum
     #pragma unroll
     for (int i = cutlass::NumThreadsPerWarp / 2; i >= 1; i /= 2) {

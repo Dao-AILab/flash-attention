@@ -798,17 +798,26 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         }
     }
 
-    at::Tensor tile_count_semaphore;
-    // We don't use the persistent scheduler if Split and not Varlen
-    bool const persistent_scheduler = params.arch >= 90
-        ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
-        : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
     // 992 = 32 * 31 is the max supported batch in prepare_varlen_num_blocks kernel
     bool const use_dynamic_split = is_varlen && params.b <= 992;
-    if (persistent_scheduler || use_dynamic_split) {  // This needs to be set before get_num_splits
-        tile_count_semaphore = torch::empty({int(persistent_scheduler) + int(use_dynamic_split) * batch_size}, opts.dtype(torch::kInt32));
-        if (persistent_scheduler) {
-            if (!is_varlen) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
+    // Temporarily set num_splits_dynamic_ptr to 1 since get_num_splits checks it
+    params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
+
+    params.pagedkv_tma = get_pagedkv_tma(params);
+    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
+    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+
+    // This needs to be set after get_num_splits
+    at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
+    // We don't use the persistent scheduler if Split and not Varlen
+    bool const scheduler_needs_semaphore = params.arch >= 90
+        ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
+        : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
+    if (scheduler_needs_semaphore || use_dynamic_split) {  // This needs to be set before get_num_splits
+        tile_count_semaphore = torch::empty({int(scheduler_needs_semaphore) + int(use_dynamic_split) * batch_size}, opts.dtype(torch::kInt32));
+        if (scheduler_needs_semaphore) {
+            if (!use_dynamic_split) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
             params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
         } else {
             params.tile_count_semaphore = nullptr;
@@ -821,12 +830,6 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
             params.num_splits_dynamic_ptr = nullptr;
         }
     }
-
-
-    params.pagedkv_tma = get_pagedkv_tma(params);
-    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
-    // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
-    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
 
     if (q_v_.has_value()) {
         TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
