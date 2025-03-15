@@ -559,8 +559,6 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
-@pytest.mark.parametrize("num_splits", [1] + ([0] if not DISABLE_SPLIT else []))
-# @pytest.mark.parametrize("num_splits", [1])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
@@ -623,7 +621,6 @@ def test_flash_attn_kvcache(
     local,
     new_kv,
     mha_type,
-    num_splits,
     dtype,
 ):
     if page_size is not None and seqlen_k % page_size != 0:
@@ -825,88 +822,98 @@ def test_flash_attn_kvcache(
         qv_unpad = qv_unpad.to(dtype) if (varlen_q and qv is not None) else None
         cos = cos.to(dtype) if cos is not None else None
         sin = sin.to(dtype) if sin is not None else None
-        out, lse, *rest = flash_attn_with_kvcache(
-            q if not varlen_q else q_unpad,
-            k_cache if page_size is None else k_cache_paged,
-            v_cache if page_size is None else v_cache_paged,
-            k if not new_kv or not varlen_q else k_unpad,
-            v if not new_kv or not varlen_q else v_unpad,
-            qv=qv if not varlen_q else qv_unpad,
-            rotary_cos=cos,
-            rotary_sin=sin,
-            cache_seqlens=cache_seqlens,
-            cache_batch_idx=cache_batch_idx,
-            cache_leftpad=cache_leftpad,
-            page_table=page_table,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k_new=cu_seqlens_k_new,
-            max_seqlen_q=max_seqlen_q,
-            causal=causal,
-            window_size=window_size,
-            rotary_interleaved=rotary_interleaved,
-            num_splits=num_splits,
-            return_softmax_lse=True
-        )
-        if varlen_q:
-            out = output_pad_fn(out)
-        # out = flash_attn_with_kvcache(
-        #     q, k_cache, v_cache, cache_seqlens=cache_seqlens, causal=causal, window_size=window_size
-        # )
-        # out = flash_attn_with_kvcache(q, k_cache, v_cache, causal=causal, window_size=window_size)
-        # qk = torch.einsum("bqhd,bkhd->bhqk", q, k_cache_ref)
-        # m = qk.amax(-1, keepdim=True)
-        # s_tmp = torch.exp((qk - m) / math.sqrt(d))
-        # o1 = torch.einsum('bhst,bthd->bshd', s_tmp, v_cache_ref)
-        # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
-        # probs = torch.softmax(qk, dim=-1)
-        print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-        print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
-        print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
-        print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-        # breakpoint()
-
-        # Check that FlashAttention's numerical error is at most twice the numerical error
-        # of a Pytorch implementation.
-        if new_kv:
+        k_cache_saved = k_cache.clone() if page_size is None else k_cache_paged.clone()
+        v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
+        num_splits_vals = [1, 0] if not DISABLE_SPLIT else [1]
+        for num_splits in num_splits_vals:
             if page_size is None:
-                k_cache_select = (
-                    k_cache.to(dtype_ref) if not has_batch_idx else k_cache.to(dtype_ref)[cache_batch_idx]
-                )
-                v_cache_select = (
-                    v_cache.to(dtype_ref) if not has_batch_idx else v_cache.to(dtype_ref)[cache_batch_idx]
-                )
+                k_cache.copy_(k_cache_saved)
+                v_cache.copy_(v_cache_saved)
             else:
-                k_cache_select = rearrange(
-                    k_cache_paged.to(dtype_ref)[(page_table if not has_batch_idx else page_table[cache_batch_idx]).flatten()],
-                    "(b nblocks) block_size ... -> b (nblocks block_size) ...",
-                    b=batch_size,
-                )[:, :seqlen_k].to(dtype_ref)
-                v_cache_select = rearrange(
-                    v_cache_paged.to(dtype_ref)[(page_table if not has_batch_idx else page_table[cache_batch_idx]).flatten()],
-                    "(b nblocks) block_size ... -> b (nblocks block_size) ...",
-                    b=batch_size,
-                )[:, :seqlen_k].to(dtype_ref)
-            k_cache_ref = k_cache_ref.to(dtype).to(dtype_ref)
-            v_cache_ref = v_cache_ref.to(dtype).to(dtype_ref)
-            if dtype is not torch.float8_e4m3fn:
-                assert torch.equal(v_cache_select, v_cache_ref)
-            else:
-                assert torch.allclose(v_cache_select, v_cache_ref, rtol=1e-3, atol=1e-3)
+                k_cache_paged.copy_(k_cache_saved)
+                v_cache_paged.copy_(v_cache_saved)
+            out, lse, *rest = flash_attn_with_kvcache(
+                q if not varlen_q else q_unpad,
+                k_cache if page_size is None else k_cache_paged,
+                v_cache if page_size is None else v_cache_paged,
+                k if not new_kv or not varlen_q else k_unpad,
+                v if not new_kv or not varlen_q else v_unpad,
+                qv=qv if not varlen_q else qv_unpad,
+                rotary_cos=cos,
+                rotary_sin=sin,
+                cache_seqlens=cache_seqlens,
+                cache_batch_idx=cache_batch_idx,
+                cache_leftpad=cache_leftpad,
+                page_table=page_table,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k_new=cu_seqlens_k_new,
+                max_seqlen_q=max_seqlen_q,
+                causal=causal,
+                window_size=window_size,
+                rotary_interleaved=rotary_interleaved,
+                num_splits=num_splits,
+                return_softmax_lse=True
+            )
+            if varlen_q:
+                out = output_pad_fn(out)
+            # out = flash_attn_with_kvcache(
+            #     q, k_cache, v_cache, cache_seqlens=cache_seqlens, causal=causal, window_size=window_size
+            # )
+            # out = flash_attn_with_kvcache(q, k_cache, v_cache, causal=causal, window_size=window_size)
+            # qk = torch.einsum("bqhd,bkhd->bhqk", q, k_cache_ref)
+            # m = qk.amax(-1, keepdim=True)
+            # s_tmp = torch.exp((qk - m) / math.sqrt(d))
+            # o1 = torch.einsum('bhst,bthd->bshd', s_tmp, v_cache_ref)
+            # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
+            # probs = torch.softmax(qk, dim=-1)
+            print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+            print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+            print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+            print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
             # breakpoint()
-            # if rotary_dim == 0 and dtype is not torch.float8_e4m3fn:
-            if rotary_dim == 0:
-                assert torch.equal(k_cache_select, k_cache_ref)
-            else:
-                # if not torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3):
-                #     breakpoint()
-                if dtype is not torch.float8_e4m3fn:
-                    assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
+
+            # Check that FlashAttention's numerical error is at most twice the numerical error
+            # of a Pytorch implementation.
+            if new_kv:
+                if page_size is None:
+                    k_cache_select = (
+                        k_cache.to(dtype_ref) if not has_batch_idx else k_cache.to(dtype_ref)[cache_batch_idx]
+                    )
+                    v_cache_select = (
+                        v_cache.to(dtype_ref) if not has_batch_idx else v_cache.to(dtype_ref)[cache_batch_idx]
+                    )
                 else:
-                    assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-1, atol=1e-1)
-        mult = 4 if dtype == torch.float8_e4m3fn else 2
-        assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
-        mult_mean = 3 if dtype == torch.float8_e4m3fn else 1.5
-        assert (out - out_ref).abs().mean().item() <= mult_mean * (out_pt - out_ref).abs().mean().item()
+                    k_cache_select = rearrange(
+                        k_cache_paged.to(dtype_ref)[(page_table if not has_batch_idx else page_table[cache_batch_idx]).flatten()],
+                        "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+                        b=batch_size,
+                    )[:, :seqlen_k].to(dtype_ref)
+                    v_cache_select = rearrange(
+                        v_cache_paged.to(dtype_ref)[(page_table if not has_batch_idx else page_table[cache_batch_idx]).flatten()],
+                        "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+                        b=batch_size,
+                    )[:, :seqlen_k].to(dtype_ref)
+                k_cache_ref = k_cache_ref.to(dtype).to(dtype_ref)
+                v_cache_ref = v_cache_ref.to(dtype).to(dtype_ref)
+                if dtype is not torch.float8_e4m3fn:
+                    assert torch.equal(v_cache_select, v_cache_ref)
+                else:
+                    assert torch.allclose(v_cache_select, v_cache_ref, rtol=1e-3, atol=1e-3)
+                # breakpoint()
+                # if rotary_dim == 0 and dtype is not torch.float8_e4m3fn:
+                if rotary_dim == 0:
+                    assert torch.equal(k_cache_select, k_cache_ref)
+                else:
+                    # if not torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3):
+                    #     breakpoint()
+                    if dtype is not torch.float8_e4m3fn:
+                        assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
+                    else:
+                        assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-1, atol=1e-1)
+            mult = 4 if dtype == torch.float8_e4m3fn else 2
+            assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
+            mult_mean = 3 if dtype == torch.float8_e4m3fn else 1.5
+            assert (out - out_ref).abs().mean().item() <= mult_mean * (out_pt - out_ref).abs().mean().item()
 
 
 def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype):
