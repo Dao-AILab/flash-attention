@@ -695,7 +695,7 @@ def test_flash_attn_kvcache(
                 v_cache_paged,
                 num_blocks,
             ) = _generate_block_kvcache(
-                seqlen_k, page_size, batch_size_cache, nheads_k, d, dv, device, dtype_ref
+                seqlen_k, page_size, batch_size_cache, nheads_k, d, dv, device, dtype, dtype_ref
             )
         cache_seqlens = torch.randint(
             0 if new_kv else 1,
@@ -930,14 +930,14 @@ def test_flash_attn_kvcache(
             assert (out - out_ref).abs().mean().item() <= mult_mean * (out_pt - out_ref).abs().mean().item()
 
 
-def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype):
+def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref):
     num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
     k_cache_paged = torch.randn(
-        num_blocks, page_size, nheads_k, d, device=device, dtype=dtype
-    )
+        num_blocks, page_size, nheads_k, d, device=device, dtype=dtype_ref
+    ).to(dtype).to(dtype_ref)
     v_cache_paged = torch.randn(
-        num_blocks, page_size, nheads_k, dv, device=device, dtype=dtype
-    )
+        num_blocks, page_size, nheads_k, dv, device=device, dtype=dtype_ref
+    ).to(dtype).to(dtype_ref)
     page_table = rearrange(
         torch.randperm(num_blocks, dtype=torch.int32, device=device),
         "(b nblocks) -> b nblocks",
