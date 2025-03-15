@@ -153,6 +153,7 @@ struct Flash_fwd_params : public Qkv_params {
     // int * __restrict__ num_m_blocks_ptr;
     // int * __restrict__ num_n_blocks_ptr;
     int * __restrict__ num_splits_dynamic_ptr;
+    bool skip_scheduler_metadata_computation;
 
     int arch;
     int num_sm;
@@ -208,7 +209,7 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
-void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa, int blockM, int blockN);
+void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa, int blockM, int blockN, bool enable_pdl);
 template <int Arch, typename T, int kHeadDim, bool Has_softcap>
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
 template <typename T, typename Tpartial, int kBlockK>

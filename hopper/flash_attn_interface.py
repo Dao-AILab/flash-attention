@@ -44,6 +44,7 @@ def _flash_attn_forward(
         window_size=(-1, -1),
         softcap=0.0,
         rotary_interleaved=True,
+        scheduler_metadata=None,
         num_splits=1,
         pack_gqa=None,
         sm_margin=0):
@@ -86,11 +87,12 @@ def _flash_attn_forward(
         window_size[1],
         softcap,
         rotary_interleaved,
+        scheduler_metadata,
         num_splits,
         pack_gqa,
         sm_margin,
     )
-    return (out, softmax_lse, *rest)
+    return out, softmax_lse, *rest
 
 
 def _flash_attn_backward(
@@ -608,6 +610,7 @@ def flash_attn_with_kvcache(
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
     rotary_interleaved=True,
+    scheduler_metadata=None,
     num_splits=0,    # Can be tuned for speed
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
@@ -733,9 +736,51 @@ def flash_attn_with_kvcache(
         window_size=window_size,
         softcap=softcap,
         rotary_interleaved=rotary_interleaved,
+        scheduler_metadata=scheduler_metadata,
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
+
+
+def get_scheduler_metadata(
+    batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim,
+    cache_seqlens: torch.Tensor,
+    qkv_dtype=torch.bfloat16,
+    headdim_v=None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    cache_leftpad: Optional[torch.Tensor] = None,
+    page_size: Optional[int] = None,
+    max_seqlen_k_new=0,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    has_softcap=False,
+    num_splits=0,    # Can be tuned for speed
+    pack_gqa=None,   # Can be tuned for speed
+    sm_margin=0,     # Can be tuned if some SMs are used for communication
+):
+    cache_seqlens = maybe_contiguous(cache_seqlens)
+    if headdim_v is None:
+        headdim_v = headdim
+    scheduler_metadata = flash_attn_3_cuda.get_scheduler_metadata(
+        batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
+        qkv_dtype,
+        cache_seqlens,
+        cu_seqlens_q,
+        None,  # cu_seqlens_k
+        cu_seqlens_k_new,
+        None,  # seqused_q
+        cache_leftpad,
+        page_size,
+        max_seqlen_k_new,
+        causal,
+        window_size[0], window_size[1],
+        has_softcap,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+    )
+    return scheduler_metadata

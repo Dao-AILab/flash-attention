@@ -20,7 +20,8 @@ __global__ void prepare_varlen_num_blocks_kernel(
         cutlass::FastDivmod blockm_divmod, cutlass::FastDivmod blockn_divmod,
         int* const tile_count_semaphore,
         // int* const num_m_blocks_ptr,
-        int* const num_splits_dynamic_ptr) {
+        int* const num_splits_dynamic_ptr,
+        bool enable_pdl) {
 
     static constexpr int kNumBatchPerWarp = cutlass::NumThreadsPerWarp - 1;
     static constexpr int kSmemSize = 1;
@@ -28,7 +29,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
     __shared__ int total_blocks_smem[kSmemSize];
 
     // There's only 1 block in the grid, so might as well start launching the main attn kernel
-    cutlass::arch::launch_dependent_grids();
+    if (enable_pdl) { cutlass::arch::launch_dependent_grids(); }
 
     if (threadIdx.x < kSmemSize) { total_blocks_smem[threadIdx.x] = 0; }
     __syncthreads();
@@ -108,7 +109,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
 } // flash
 
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa,
-                               int blockM, int blockN) {
+                               int blockM, int blockN, bool enable_pdl) {
     // Only support batch <= 992 (32 warps, each with 31 batches)
     int qhead_per_khead = !packgqa ? 1 : cutlass::ceil_div(params.h, params.h_k);
     flash::prepare_varlen_num_blocks_kernel<<<1 /*grid*/, 1024 /*block*/, 0, stream>>>(
@@ -119,5 +120,5 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
         cutlass::FastDivmod(blockM), cutlass::FastDivmod(blockN),
         params.tile_count_semaphore,
         // params.num_m_blocks_ptr,
-        params.num_splits_dynamic_ptr);
+        params.num_splits_dynamic_ptr, enable_pdl);
 }

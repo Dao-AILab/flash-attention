@@ -19,7 +19,8 @@ from test_util import (
     generate_random_padding_mask,
 )
 
-from flash_attn_interface import flash_attn_func, flash_attn_varlen_func, flash_attn_combine, flash_attn_with_kvcache
+from flash_attn_interface import flash_attn_func, flash_attn_varlen_func, flash_attn_combine
+from flash_attn_interface import flash_attn_with_kvcache, get_scheduler_metadata
 
 
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
@@ -825,13 +826,25 @@ def test_flash_attn_kvcache(
         k_cache_saved = k_cache.clone() if page_size is None else k_cache_paged.clone()
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
         num_splits_vals = [1, 0] if not DISABLE_SPLIT else [1]
-        for num_splits in num_splits_vals:
+        precompute_metadata_vals = [False, True]
+        for num_splits, precompute_metadata in itertools.product(num_splits_vals, precompute_metadata_vals):
             if page_size is None:
                 k_cache.copy_(k_cache_saved)
                 v_cache.copy_(v_cache_saved)
             else:
                 k_cache_paged.copy_(k_cache_saved)
                 v_cache_paged.copy_(v_cache_saved)
+            if precompute_metadata:
+                scheduler_metadata = get_scheduler_metadata(
+                    batch_size, seqlen_q, seqlen_k, nheads, nheads_k, d,
+                    cache_seqlens, q.dtype, headdim_v=dv, cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k_new=cu_seqlens_k_new, cache_leftpad=cache_leftpad,
+                    max_seqlen_k_new=seqlen_new, page_size=page_size,
+                    causal=causal, window_size=window_size,
+                    num_splits=num_splits
+                )
+            else:
+                scheduler_metadata = None
             out, lse, *rest = flash_attn_with_kvcache(
                 q if not varlen_q else q_unpad,
                 k_cache if page_size is None else k_cache_paged,
@@ -851,6 +864,7 @@ def test_flash_attn_kvcache(
                 causal=causal,
                 window_size=window_size,
                 rotary_interleaved=rotary_interleaved,
+                scheduler_metadata=scheduler_metadata,
                 num_splits=num_splits,
                 return_softmax_lse=True
             )

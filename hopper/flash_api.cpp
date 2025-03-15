@@ -15,6 +15,7 @@
 #include "static_switch.h"
 #include "tile_size.h"
 #include "heuristics.h"
+#include "cuda_check.h"
 
 // Copied from https://github.com/pytorch/pytorch/commit/7931eee5c5ebcdf468bff4d308510b03355cd909
 // This is so that we can pass in torch.dtype as a parameter to the function.
@@ -490,6 +491,127 @@ inline int round_up_headdim(int head_size) {
     return 256;
 }
 
+// Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
+at::Tensor
+mha_fwd_get_scheduler_metadata(
+        int batch_size,
+        int max_seqlen_q,
+        int max_seqlen_k,
+        int num_heads,
+        int num_heads_k,
+        int headdim,
+        int headdim_v,
+        at::ScalarType qkv_dtype,
+        const at::Tensor &seqused_k, // b
+        std::optional<const at::Tensor> &cu_seqlens_q_,  // b+1
+        std::optional<const at::Tensor> &cu_seqlens_k_,  // b+1
+        std::optional<const at::Tensor> &cu_seqlens_k_new_,  // b+1
+        std::optional<const at::Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
+        std::optional<const at::Tensor> &leftpad_k_, // b
+        std::optional<int> page_size,
+        int max_seqlen_k_new,  // 0 means we're not appending new KV
+        bool is_causal,
+        int window_size_left,
+        int window_size_right,
+        bool has_softcap,
+        int num_splits,
+        std::optional<bool> pack_gqa_,
+        int const sm_margin
+        ) {
+
+    TORCH_CHECK(qkv_dtype == at::ScalarType::Half || qkv_dtype == at::ScalarType::BFloat16 || qkv_dtype == at::ScalarType::Float8_e4m3fn,
+                "FlashAttention only supports fp16, bf16, and fp8_e4m3 data type");
+    TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    // Reset the parameters
+    Flash_fwd_params params{};
+    params.is_bf16 = qkv_dtype == at::ScalarType::BFloat16;
+    params.is_e4m3 = qkv_dtype == at::ScalarType::Float8_e4m3fn;
+    params.b = batch_size;
+    params.seqlen_q = max_seqlen_q;
+    params.seqlen_k = max_seqlen_k;
+    params.h = num_heads;
+    params.h_k = num_heads_k;
+    params.d = headdim;
+    params.dv = headdim_v;
+    params.d_rounded = round_up_headdim(headdim);
+    params.dv_rounded = round_up_headdim(headdim_v);
+    params.seqlen_knew = max_seqlen_k_new;
+
+    bool const is_varlen_q = cu_seqlens_q_.has_value();
+    params.cu_seqlens_q = is_varlen_q ? cu_seqlens_q_.value().data_ptr<int>() : nullptr;
+    bool const is_varlen_k = cu_seqlens_k_.has_value();
+    params.cu_seqlens_k = is_varlen_k ? cu_seqlens_k_.value().data_ptr<int>() : nullptr;
+    params.cu_seqlens_knew = cu_seqlens_k_new_.has_value() ? cu_seqlens_k_new_.value().data_ptr<int>() : nullptr;
+    params.seqused_q = seqused_q_.has_value() ? seqused_q_.value().data_ptr<int>() : nullptr;
+    params.seqused_k = seqused_k.data_ptr<int>();
+    params.leftpad_k = leftpad_k_.has_value() ? leftpad_k_.value().data_ptr<int>() : nullptr;
+    params.knew_ptr = params.seqlen_knew > 0 ? reinterpret_cast<int*>(1) : nullptr;
+    if (window_size_left >= max_seqlen_k - 1) { window_size_left = -1; }
+    if (window_size_right >= max_seqlen_q - 1) { window_size_right = -1; }
+    // causal=true is the same as causal=false in this case
+    if (max_seqlen_q == 1 && window_size_left == -1 && window_size_right == -1) {
+        // Special case of hdim 128 where we want causal to have kBlockN=128, better for pagedKV and TMA
+        if ((headdim <= 64 || headdim > 128) || !page_size.has_value()) {
+            is_causal = false;
+        }
+    }
+    if (is_causal) { window_size_right = 0; }
+
+    params.is_causal = window_size_left < 0 && window_size_right == 0;
+    params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
+    if (window_size_left < 0 && window_size_right >= 0) { window_size_left = max_seqlen_k - 1; }
+    if (window_size_left >= 0 && window_size_right < 0) { window_size_right = max_seqlen_q - 1; }
+    params.window_size_left = window_size_left;
+    params.window_size_right = window_size_right;
+    params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
+    params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
+    params.softcap = has_softcap ? 1.0f : 0.0f;
+
+    params.page_size = page_size.has_value() ? page_size.value() : 1;
+    params.page_table = !page_size.has_value() ? nullptr : reinterpret_cast<int*>(1);
+
+    bool const use_dynamic_split = params.b <= 992;
+    params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
+
+    params.pagedkv_tma = get_pagedkv_tma(params);
+    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
+    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+
+    bool is_varlen = true;
+
+    // Otherwise the kernel will be launched from cuda:0 device
+    // Cast to char to avoid compiler warning about narrowing
+    at::cuda::CUDAGuard device_guard{(char)seqused_k.get_device()};
+
+    auto opts = seqused_k.options();
+    // This needs to be set after get_num_splits
+    at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
+    bool const scheduler_needs_semaphore = params.arch >= 90 || params.num_splits > 1;
+    if (scheduler_needs_semaphore || use_dynamic_split) {
+        tile_count_semaphore = torch::empty({int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b}, opts.dtype(torch::kInt32));
+        if (scheduler_needs_semaphore) {
+            if (!use_dynamic_split) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
+            params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+        } else {
+            params.tile_count_semaphore = nullptr;
+        }
+        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
+    }
+
+    if (params.num_splits_dynamic_ptr) {
+        auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
+        auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
+        int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
+        int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
+        CHECK_CUDA_KERNEL_LAUNCH();
+    }
+    return tile_count_semaphore;
+}
+
 // b: batch_size
 // b_k: batch_size_k
 // s_q: seqlen_q
@@ -528,6 +650,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         int window_size_right,
         float const softcap,
         bool const is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
+        std::optional<at::Tensor> &scheduler_metadata_,  // (b + 1)
         int num_splits,
         std::optional<bool> pack_gqa_,
         int const sm_margin
@@ -814,21 +937,24 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     bool const scheduler_needs_semaphore = params.arch >= 90
         ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
         : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
-    if (scheduler_needs_semaphore || use_dynamic_split) {  // This needs to be set before get_num_splits
-        tile_count_semaphore = torch::empty({int(scheduler_needs_semaphore) + int(use_dynamic_split) * batch_size}, opts.dtype(torch::kInt32));
-        if (scheduler_needs_semaphore) {
-            if (!use_dynamic_split) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
-            params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+    if (scheduler_needs_semaphore || use_dynamic_split) {
+        int metadata_size = int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b;
+        params.skip_scheduler_metadata_computation = scheduler_metadata_.has_value();
+        if (scheduler_metadata_.has_value()) {
+            at::Tensor scheduler_metadata = scheduler_metadata_.value();
+            CHECK_DEVICE(scheduler_metadata);
+            CHECK_SHAPE(scheduler_metadata, metadata_size);
+            CHECK_CONTIGUOUS(scheduler_metadata);
+            TORCH_CHECK(scheduler_metadata.dtype() == torch::kInt32, "scheduler_metadata must have dtype int32");
+            tile_count_semaphore = scheduler_metadata;
         } else {
-            params.tile_count_semaphore = nullptr;
+            tile_count_semaphore = torch::empty({metadata_size}, opts.dtype(torch::kInt32));
         }
-        if (use_dynamic_split) {
-            // params.num_m_blocks_ptr = num_m_n_blocks_splits.data_ptr<int>();
-            // params.num_n_blocks_ptr = num_m_n_blocks_splits.data_ptr<int>() + batch_size;
-            params.num_splits_dynamic_ptr = tile_count_semaphore.data_ptr<int>() + 1;
-        } else {
-            params.num_splits_dynamic_ptr = nullptr;
+        if (scheduler_needs_semaphore && !use_dynamic_split) {
+            tile_count_semaphore.zero_();  // If varlen we'll manually do the zero-ing
         }
+        params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() : nullptr;
+        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
     }
 
     if (q_v_.has_value()) {
@@ -1449,4 +1575,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fwd", &mha_fwd, "Forward pass");
     m.def("bwd", &mha_bwd, "Backward pass");
     m.def("fwd_combine", &mha_combine, "Combine partial attention outputs");
+    m.def("get_scheduler_metadata", &mha_fwd_get_scheduler_metadata, "Get scheduler metadata for varlen forward pass");
 }

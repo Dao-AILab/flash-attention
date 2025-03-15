@@ -56,7 +56,7 @@ def time_fwd(func, *args, repeats=30, verbose=True, desc="", **kwargs):
     # time_f = benchmark_forward(lambda: graph.replay(), repeats=repeats, verbose=verbose, desc=desc)
     # # return time_f[1].mean
     # return time_f[1]
-    return Timing(do_bench(lambda: func(*args, **kwargs), warmup=5, rep=repeats) * 1e-3)
+    return Timing(do_bench(lambda: func(*args, **kwargs), warmup=3, rep=repeats) * 1e-3)
 
 
 def flops(batch, nheads, seqlen_q, seqlen_k, headdim, headdim_v, causal=False, window_size=(-1, -1)):
@@ -404,7 +404,8 @@ for headdim in [128]:
     # import pickle
     # # with open(f'flash3_attn_time_h100_hdim{headdim}_causal.plk', 'wb') as fp:
     # # with open(f'flash3_attn_time_h100_cudnn_triton_20241208.plk', 'wb') as fp:
-    # with open(f'flash3_attn_time_h100_fa3_20241208.plk', 'wb') as fp:
+    # with open(f'flash3_attn_time_h100_fa3_20250313.plk', 'wb') as fp:
+    # # with open(f'flash3_attn_time_h100_fa3_fp8_20250313.plk', 'wb') as fp:
     # # with open(f'flash3_attn_time_h100_fp8_hdim{headdim}.plk', 'wb') as fp:
     # # with open(f'flash3_attn_time_h100_hdim{headdim}_1031.plk', 'wb') as fp:
     #     pickle.dump((time_f, time_b), fp, protocol=pickle.HIGHEST_PROTOCOL)
