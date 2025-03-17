@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.cuda.amp import custom_bwd, custom_fwd
+from torch.amp import custom_bwd, custom_fwd
 from torch.distributed import ProcessGroup
 
 from flash_attn.ops.activations import gelu_bwd, relu_bwd, sqrelu_bwd, sqrelu_fwd
@@ -26,7 +26,7 @@ from flash_attn.utils.distributed import (
 
 class FusedDenseFunc(torch.autograd.Function):
     @staticmethod
-    @custom_fwd
+    @custom_fwd(device_type="cuda")
     def forward(
         ctx, x, weight, bias, return_residual=False, process_group=None, sequence_parallel=True
     ):
@@ -67,7 +67,7 @@ class FusedDenseFunc(torch.autograd.Function):
         return output if not return_residual else (output, x)
 
     @staticmethod
-    @custom_bwd
+    @custom_bwd(device_type="cuda")
     def backward(ctx, grad_output, *args):
         grad_output = grad_output.contiguous()
         if ctx.return_residual:
@@ -248,7 +248,7 @@ class RowParallelLinear(nn.Linear):
 
 class FusedMLPFunc(torch.autograd.Function):
     @staticmethod
-    @custom_fwd
+    @custom_fwd(device_type="cuda")
     def forward(
         ctx,
         x,
@@ -345,7 +345,7 @@ class FusedMLPFunc(torch.autograd.Function):
         return output2 if not return_residual else (output2, x)
 
     @staticmethod
-    @custom_bwd
+    @custom_bwd(device_type="cuda")
     def backward(ctx, grad_output, *args):
         grad_output = grad_output.contiguous()
         checkpoint_lvl = ctx.checkpoint_lvl
