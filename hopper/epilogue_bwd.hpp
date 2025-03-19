@@ -4,8 +4,8 @@
 
 #pragma once
 
-#include <cutlass/cutlass.h>
-#include <cutlass/barrier.h>
+#include "cutlass/cutlass.h"
+#include "cutlass/barrier.h"
 #include "cute/tensor.hpp"
 
 #include "cutlass/gemm/collective/builders/sm90_common.inl"

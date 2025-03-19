@@ -226,7 +226,7 @@ struct Rotary {
 
         // The main bottleneck here is actually instruction cache misses.
 
-        // Similar to PagedKV, it's expensive to compute the pointers.
+        // Similar to PagedKVNonTMA, it's expensive to compute the pointers.
         // We split the work among threads loading the same row, then __shfl_sync the pointers.
         static constexpr int NumPtrPerThread = cute::ceil_div(CUTE_STATIC_V(cute::size<1>(tRrCos)), kGmemThreadsPerRow);
         Tensor tPrCosPtr = make_tensor<Element const*>(Shape<Int<NumPtrPerThread>>{});
@@ -350,7 +350,7 @@ struct Rotary {
         }
     };
 
-    template <bool PagedKV=false, typename TensorsK, typename TensorgK, typename TensorpK, typename TensortRrR, typename TensorKPtr>
+    template <bool PagedKVNonTMA=false, typename TensorsK, typename TensorgK, typename TensorpK, typename TensortRrR, typename TensorKPtr>
     CUTLASS_DEVICE
     void
     apply_K_interleaved(TensorsK const &sK,  // (kBlockN, kHeadDim)
@@ -377,7 +377,7 @@ struct Rotary {
         CUTE_STATIC_ASSERT_V(size<0>(tRrCos) == size<0>(tRrSin));
         static_assert(decltype(size<0>(tKsK))::value == decltype(size<0>(tRrCos))::value * 2);
         static_assert(decltype(size<0>(tRrCos))::value % 2 == 0);  // Since we do fast conversion from fp16/bf16 to fp32
-        if constexpr (PagedKV) {
+        if constexpr (PagedKVNonTMA) {
             static_assert(decltype(size(tPrKPtr))::value == cute::ceil_div(size<1>(tKcK), kGmemThreadsPerRow));
         }
 
@@ -385,7 +385,7 @@ struct Rotary {
         for (int m = 0; m < size<1>(tKsK); ++m) {
             int const row = get<0>(tKcK(_0{}, m, _0{}));
             auto mK_cur_copy = [&] {
-                if constexpr (PagedKV) {
+                if constexpr (PagedKVNonTMA) {
                     Element* k_ptr = reinterpret_cast<Element*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrKPtr(m / kGmemThreadsPerRow)), (m % kGmemThreadsPerRow), kGmemThreadsPerRow));
                     Tensor mK_cur = make_tensor(make_gmem_ptr(k_ptr), Shape<Int<kHeadDim>>{});
                     return cute::tiled_divide(mK_cur, Shape<Int<kGmemElemsPerLoad>>{});
@@ -400,7 +400,7 @@ struct Rotary {
                         Tensor rK = make_fragment_like(tKsK(_, m, k));
                         cute::copy(tiled_copy_k, tKsK(_, m, k), rK);
                         if (tRpR(k)) { apply_rotary_interleaved(rK, tRrCos(_, m, k), tRrSin(_, m, k)); }
-                        if constexpr (!PagedKV) {
+                        if constexpr (!PagedKVNonTMA) {
                             cute::copy(tiled_copy_k, rK, tKgK(_, m, k));
                         } else {
                             int const ki = get<1>(tKcK(_0{}, _0{}, k)) / kGmemElemsPerLoad;
@@ -412,7 +412,7 @@ struct Rotary {
         }
     };
 
-    template <bool PagedKV=false, typename TensorsK, typename TensorgK, typename TensorpK, typename TensortRrR, typename TensorKPtr>
+    template <bool PagedKVNonTMA=false, typename TensorsK, typename TensorgK, typename TensorpK, typename TensortRrR, typename TensorKPtr>
     CUTLASS_DEVICE
     void
     apply_K_contiguous(TensorsK const &sK,  // (kBlockN, kHeadDim)
@@ -439,7 +439,7 @@ struct Rotary {
         CUTE_STATIC_ASSERT_V(size<0>(tRrCosCont) == size<0>(tRrSinCont));
         CUTE_STATIC_ASSERT_V(size<0>(tKcK) == size<0>(tRrCosCont));
         static_assert(decltype(size<0>(tRrCosCont))::value % 2 == 0);  // Since we do fast conversion from fp16/bf16 to fp32
-        if constexpr (PagedKV) {
+        if constexpr (PagedKVNonTMA) {
             static_assert(decltype(size(tPrKPtr))::value == cute::ceil_div(size<1>(tKcK), kGmemThreadsPerRow));
         }
 
@@ -449,7 +449,7 @@ struct Rotary {
         for (int m = 0; m < size<1>(tKcK); ++m) {
             int const row = get<0>(tKcK(_0{}, m, _0{}));
             Tensor gK_cur_copy = [&] {
-                if constexpr (PagedKV) {
+                if constexpr (PagedKVNonTMA) {
                     Element* k_ptr = reinterpret_cast<Element*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrKPtr(m / kGmemThreadsPerRow)), (m % kGmemThreadsPerRow), kGmemThreadsPerRow));
                     Tensor mK_cur = make_tensor(make_gmem_ptr(k_ptr), Shape<Int<kHeadDim>>{});
                     return cute::tiled_divide(mK_cur, Shape<Int<kGmemElemsPerLoad>>{});

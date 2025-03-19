@@ -90,7 +90,9 @@ def _write_ninja_file(path,
                       objects,
                       ldflags,
                       library_target,
-                      with_cuda) -> None:
+                      with_cuda,
+                      **kwargs,  # kwargs (ignored) to absorb new flags in torch.utils.cpp_extension
+                      ) -> None:
     r"""Write a ninja file that does the desired compiling and linking.
 
     `path`: Where to write this file
@@ -374,7 +376,7 @@ def nvcc_threads_args():
 
 
 # NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.3.107"}
-NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.6.85", "ptxas": "12.8.61"}
+NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.6.85", "ptxas": "12.8.93"}
 exe_extension = sysconfig.get_config_var("EXE")
 
 
@@ -506,6 +508,7 @@ if not SKIP_CUDA_BUILD:
     )
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine.cu"]
+    sources += ["flash_prepare_scheduler.cu"]
     nvcc_flags = [
         "-O3",
         "-std=c++17",
@@ -517,7 +520,7 @@ if not SKIP_CUDA_BUILD:
         # f"--split-compile={os.getenv('NVCC_THREADS', '4')}",  # split-compile is faster
         "-lineinfo",
         "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",  # Necessary for the WGMMA shapes that we use
-        # "-DCUTLASS_ENABLE_GDC_FOR_SM90",  # For PDL
+        "-DCUTLASS_ENABLE_GDC_FOR_SM90",  # For PDL
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
         "-DNDEBUG",  # Important, otherwise performance is severely impacted
     ]
