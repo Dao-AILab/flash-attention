@@ -310,7 +310,7 @@ struct CollectiveMainloopBwdSm90 {
         float const* const ptr_dPsum;
         StrideLSE const stride_dPsum;
         float const softmax_scale;
-        int const window_size_left, window_size_right, sink_token_length;
+        int const window_size_left, window_size_right;
         float const softcap_val;
         int const num_batch;
         int* const dq_semaphore;
@@ -337,7 +337,7 @@ struct CollectiveMainloopBwdSm90 {
         float const* const ptr_dPsum;
         StrideLSE const stride_dPsum;
         float const softmax_scale, softmax_scale_log2;
-        int const window_size_left, window_size_right, sink_token_length;
+        int const window_size_left, window_size_right;
         float const softcap_val;
         int const num_batch;
         int* const dq_semaphore;
@@ -394,7 +394,7 @@ struct CollectiveMainloopBwdSm90 {
                 args.ptr_LSE_log2, args.shape_LSE, args.stride_LSE_log2, args.ptr_dPsum, args.stride_dPsum,
                 args.softmax_scale,
                 !Has_softcap ? float(args.softmax_scale * M_LOG2E) : float(args.softcap_val * M_LOG2E),
-                args.window_size_left, args.window_size_right, args.sink_token_length,
+                args.window_size_left, args.window_size_right,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
@@ -428,7 +428,7 @@ struct CollectiveMainloopBwdSm90 {
         };
         auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
             seqlen_info, n_block, bidb,
-            params.window_size_left, params.window_size_right, params.sink_token_length);
+            params.window_size_left, params.window_size_right, 0 /*sink_token_length*/);
         // It's possible to have m_block_max <= m_block_min. Loading Q, K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) {
@@ -596,7 +596,7 @@ struct CollectiveMainloopBwdSm90 {
         };
         auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
             seqlen_info, n_block, bidb, params.window_size_left,
-            params.window_size_right, params.sink_token_length);
+            params.window_size_right, 0 /*sink_token_length*/);
         // It's possible to have m_block_max <= m_block_min. Exit early
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return; }
@@ -686,7 +686,7 @@ struct CollectiveMainloopBwdSm90 {
         };
         auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
             seqlen_info, n_block, bidb, params.window_size_left,
-            params.window_size_right, params.sink_token_length);
+            params.window_size_right, 0 /*sink_token_length*/);
         // It's possible to have m_block_max <= m_block_min. Exit early
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return false; }
@@ -792,7 +792,7 @@ struct CollectiveMainloopBwdSm90 {
         // if (blockIdx.x == 0 && threadIdx.x == 128) { print(mdQaccum); printf("\n"); print(gdQaccum_); printf("\n"); print(gdQaccum); printf("\n"); print(tdQgdQaccum); printf("\n"); }
 
         flash::Mask<kBlockM, kBlockN, false /*PackGQA*/, TiledMmaSdP, SdP_swapAB> mask(
-            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
+            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
             params.qhead_per_khead_divmod
         );
 

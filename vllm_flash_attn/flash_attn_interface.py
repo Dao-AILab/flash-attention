@@ -73,6 +73,48 @@ def fa_version_unsupported_reason(fa_version: int, device = None) \
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
+# NOTE only used in FA3
+def get_scheduler_metadata(
+    batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim,
+    cache_seqlens: torch.Tensor,
+    qkv_dtype=torch.bfloat16,
+    headdim_v=None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    cache_leftpad: Optional[torch.Tensor] = None,
+    page_size: Optional[int] = None,
+    max_seqlen_k_new=0,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    has_softcap=False,
+    num_splits=0,    # Can be tuned for speed
+    pack_gqa=None,   # Can be tuned for speed
+    sm_margin=0,     # Can be tuned if some SMs are used for communication
+):
+    cache_seqlens = maybe_contiguous(cache_seqlens)
+    if headdim_v is None:
+        headdim_v = headdim
+    scheduler_metadata = torch.ops._vllm_fa3_C.get_scheduler_metadata(
+        batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
+        qkv_dtype,
+        cache_seqlens,
+        cu_seqlens_q,
+        None,  # cu_seqlens_k
+        cu_seqlens_k_new,
+        None,  # seqused_q
+        cache_leftpad,
+        page_size,
+        max_seqlen_k_new,
+        causal,
+        window_size[0], window_size[1],
+        has_softcap,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+    )
+
+    return scheduler_metadata
+
 
 def flash_attn_varlen_func(
     q,
@@ -95,10 +137,13 @@ def flash_attn_varlen_func(
     block_table=None,
     return_softmax_lse=False,
     out=None,
-    fa_version: int = DEFAULT_FA_VERSION,
+    # FA3 Only
+    scheduler_metadata=None,
     q_descale=None,
     k_descale=None,
     v_descale=None,
+    # Version selector
+    fa_version: int = DEFAULT_FA_VERSION,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -173,6 +218,12 @@ def flash_attn_varlen_func(
     dummy_cu_seqlens_k = torch.empty_like(cu_seqlens_q)
     
     if fa_version == 2:
+        if scheduler_metadata is not None and q_descale is not None \
+            and k_descale is not None and v_descale is not None:
+                raise NotImplementedError(
+                    "FA2 does not support scheduler_metadata, q_descale, "
+                    "k_descale, v_descale"
+                )
         out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
             q, k, v,
             out,
@@ -216,9 +267,9 @@ def flash_attn_varlen_func(
             softmax_scale,
             causal,
             real_window_size[0], real_window_size[1],
-            0,                # sink_token_length
             softcap,
             True,             # rotary_interleaved
+            scheduler_metadata,
             0,                # num_splits
             None,             # pack_gqa
             0,                # sm_margin
@@ -250,10 +301,13 @@ def flash_attn_with_kvcache(
     return_softmax_lse=False,
     *,
     out=None,
-    fa_version: int = DEFAULT_FA_VERSION,
+    # FA3 Only
+    scheduler_metadata=None,
     q_descale=None,
     k_descale=None,
     v_descale=None,
+    # Version selector
+    fa_version: int = DEFAULT_FA_VERSION,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -355,6 +409,12 @@ def flash_attn_with_kvcache(
     block_table = maybe_contiguous(block_table)
 
     if fa_version == 2:
+        if scheduler_metadata is not None and q_descale is not None \
+            and k_descale is not None and v_descale is not None:
+                raise NotImplementedError(
+                    "FA2 does not support scheduler_metadata, q_descale, "
+                    "k_descale, v_descale"
+                )
         out, softmax_lse = torch.ops._vllm_fa2_C.fwd_kvcache(
             q, k_cache, v_cache,
             k, v,             # k_new, v_new
@@ -393,9 +453,9 @@ def flash_attn_with_kvcache(
             softmax_scale,
             causal,
             window_size[0], window_size[1],
-            0,                   # sink_token_length
             softcap,
             rotary_interleaved,  # rotary_interleaved
+            scheduler_metadata,
             num_splits,          # num_splits
             None,                # pack_gqa
             0,                   # sm_margin

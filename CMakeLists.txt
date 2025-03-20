@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.26)
 
-project(vllm_flash_attn LANGUAGES CXX)
+project(vllm_flash_attn LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -213,7 +213,9 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
             SRCS "${FA3_GEN_SRCS}"
             CUDA_ARCHS "${FA3_ARCHS}")
         set_gencode_flags_for_srcs(
-            SRCS "hopper/flash_fwd_combine.cu"
+            SRCS 
+                hopper/flash_fwd_combine.cu
+                hopper/flash_prepare_scheduler.cu
             CUDA_ARCHS "${FA3_ARCHS}")
     endif()
 
@@ -223,6 +225,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         LANGUAGE ${VLLM_GPU_LANG}
         SOURCES
             hopper/flash_fwd_combine.cu
+            hopper/flash_prepare_scheduler.cu
             hopper/flash_api.cpp
             hopper/flash_api_torch_lib.cpp
             ${FA3_GEN_SRCS}
