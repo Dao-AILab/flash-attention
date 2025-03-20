@@ -296,7 +296,7 @@ struct CollectiveMainloopBwdSm80 {
         float const* const ptr_dPsum;
         StrideLSE const stride_dPsum;
         float const softmax_scale;
-        int const window_size_left, window_size_right, sink_token_length;
+        int const window_size_left, window_size_right;
         float const softcap_val;
         int const num_batch;
         int* const dq_semaphore;
@@ -328,7 +328,7 @@ struct CollectiveMainloopBwdSm80 {
         float const* const ptr_dPsum;
         StrideLSE const stride_dPsum;
         float const softmax_scale, softmax_scale_log2;
-        int const window_size_left, window_size_right, sink_token_length;
+        int const window_size_left, window_size_right;
         float const softcap_val;
         int const num_batch;
         int *const dq_semaphore;
@@ -359,7 +359,7 @@ struct CollectiveMainloopBwdSm80 {
                 args.ptr_LSE_log2, args.shape_LSE, args.stride_LSE_log2, args.ptr_dPsum, args.stride_dPsum,
                 args.softmax_scale,
                 !Has_softcap ? float(args.softmax_scale * M_LOG2E) : float(args.softcap_val * M_LOG2E),
-                args.window_size_left, args.window_size_right, args.sink_token_length,
+                args.window_size_left, args.window_size_right,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
@@ -385,7 +385,7 @@ struct CollectiveMainloopBwdSm80 {
         };
         auto m_block_min_max = BlockMN_t::get_m_block_min_max(
             seqlen_info, n_block, bidb,
-            params.window_size_left, params.window_size_right, params.sink_token_length);
+            params.window_size_left, params.window_size_right, 0 /*sink_token_length*/);
         int const m_block_min = get<0>(m_block_min_max);
         int const m_block_max = get<1>(m_block_min_max);
         // It's possible to have m_block_max <= m_block_min. Exit early
@@ -532,7 +532,7 @@ struct CollectiveMainloopBwdSm80 {
         int const seqlen_k = seqlen_info.seqlen_k;
 
         flash::Mask<kBlockM, kBlockN, false /*PackGQA*/, TiledMmaSdP, SdP_swapAB> mask(
-            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
+            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
             params.qhead_per_khead_divmod
         );
 

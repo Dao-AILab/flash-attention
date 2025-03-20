@@ -202,7 +202,7 @@ struct CollectiveMainloopFwdSm80 {
         float const softmax_scale;
         float const* ptr_q_descale, *ptr_k_descale, *ptr_v_descale;
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
-        int const window_size_left = -1, window_size_right = -1, sink_token_length = 0;
+        int const window_size_left = -1, window_size_right = -1;
         float const softcap_val;
         int const num_splits;
         int const* const kv_batch_idx = nullptr;
@@ -247,7 +247,7 @@ struct CollectiveMainloopFwdSm80 {
         float const* ptr_q_descale, *ptr_k_descale, *ptr_v_descale;
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
         float const softcap_val;
-        int const window_size_left, window_size_right, sink_token_length;
+        int const window_size_left, window_size_right;
         int const num_splits;
         int const* const kv_batch_idx = nullptr;
         int const* const cu_seqlens_q = nullptr;
@@ -291,7 +291,7 @@ struct CollectiveMainloopFwdSm80 {
                 args.ptr_q_descale, args.ptr_k_descale, args.ptr_v_descale,
                 args.stride_q_descale, args.stride_k_descale, args.stride_v_descale,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
-                args.window_size_left, args.window_size_right, args.sink_token_length,
+                args.window_size_left, args.window_size_right,
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
@@ -415,7 +415,10 @@ struct CollectiveMainloopFwdSm80 {
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
             params.ptr_V, params.headdim_v, params.stride_V,
-            params.page_size_divmod, bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k
+            params.page_size_divmod,
+            params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
+            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k,
+            0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
         );
 
         auto load_K = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
@@ -541,7 +544,7 @@ struct CollectiveMainloopFwdSm80 {
         if constexpr (!Share_QV_Smem) { preprocess_Q(); }
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma> mask(
-            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
+            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
             params.qhead_per_khead_divmod
         );
 
@@ -640,12 +643,6 @@ struct CollectiveMainloopFwdSm80 {
             for (; n_block >= n_block_min; --n_block) {
                 fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
             }
-            // Disable sink token code for now
-            // int n_block_sink_max = cute::ceil_div(params.sink_token_length, kBlockN);
-            // #pragma unroll 1
-            // for (n_block = std::min(n_block, n_block_sink_max - 1); n_block >= 0; --n_block) {
-            //     fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
-            // }
         }
         float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
         Tensor scores_scale = softmax.finalize(v_descale);
@@ -704,8 +701,11 @@ struct CollectiveMainloopFwdSm80 {
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
             params.ptr_V, params.headdim_v, params.stride_V,
-            params.page_size_divmod, bidb_kv, bidh_kv, thread_idx, seqlen_k_new, offset_k
+            params.page_size_divmod,
+            params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
+            bidb_kv, bidh_kv, thread_idx, seqlen_k_new, offset_k,
             // passing offset_k instead of leftpad_k will move the PageTable pointer to the right position
+            0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
         );
 
         static_assert(std::is_same_v<GmemLayoutAtomAppend, typename Rotary_t::LayoutAtom>);

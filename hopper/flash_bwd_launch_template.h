@@ -120,7 +120,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         static_cast<float*>(params.dsoftmax_sum),
         {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
         params.scale_softmax,
-        params.window_size_left, params.window_size_right, params.sink_token_length,
+        params.window_size_left, params.window_size_right,
         params.softcap,
         params.b,
         params.dq_semaphore,
@@ -165,7 +165,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         num_blocks_n, params.h, params.b, 1 /*num_splits*/,
         params.h / params.h_k,
         params.seqlen_k,
-        params.seqlen_q, params.d, sizeof(Element),
+        params.seqlen_q, params.d, params.dv, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens_k, params.seqused_k
     };
 
