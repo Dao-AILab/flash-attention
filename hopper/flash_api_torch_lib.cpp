@@ -9,6 +9,14 @@
  *  Externs for the flash_attn ops to be exposed as a pytorch library
  */
 
+// b: batch_size
+// b_k: batch_size_k
+// s_q: seqlen_q
+// s_k: seqlen_k
+// s_k_new: seqlen_k_new
+// h: num_heads
+// h_k: num_heads_k
+// d: head_size
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
         const at::Tensor &k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table.
@@ -37,12 +45,41 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         bool is_causal,
         int window_size_left,
         int window_size_right,
-        int sink_token_length,
         float const softcap,
         bool const is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
+        std::optional<at::Tensor> &scheduler_metadata_,  // (b + 1)
         int num_splits,
         std::optional<bool> pack_gqa_,
-        int const sm_margin);
+        int const sm_margin
+);
+
+// Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
+at::Tensor
+mha_fwd_get_scheduler_metadata(
+        int batch_size,
+        int max_seqlen_q,
+        int max_seqlen_k,
+        int num_heads,
+        int num_heads_k,
+        int headdim,
+        int headdim_v,
+        at::ScalarType qkv_dtype,
+        const at::Tensor &seqused_k, // b
+        std::optional<const at::Tensor> &cu_seqlens_q_,  // b+1
+        std::optional<const at::Tensor> &cu_seqlens_k_,  // b+1
+        std::optional<const at::Tensor> &cu_seqlens_k_new_,  // b+1
+        std::optional<const at::Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
+        std::optional<const at::Tensor> &leftpad_k_, // b
+        std::optional<int> page_size,
+        int max_seqlen_k_new,  // 0 means we're not appending new KV
+        bool is_causal,
+        int window_size_left,
+        int window_size_right,
+        bool has_softcap,
+        int num_splits,
+        std::optional<bool> pack_gqa_,
+        int const sm_margin
+);
 
 /**
  *  Torch Library Registration
@@ -74,13 +111,40 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    bool     is_causal,"
             "    int      window_size_left,"
             "    int      window_size_right,"
-            "    int      sink_token_length,"
             "    float    softcap,"
             "    bool     is_rotary_interleaved,"
+            "    Tensor?  scheduler_metadata,"
             "    int      num_splits,"
             "    bool?    pack_gqa,"
             "    int      sm_margin) -> Tensor[]");
     ops.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
+
+    ops.def("get_scheduler_metadata("
+            "    int      batch_size,"
+            "    int      max_seqlen_q,"
+            "    int      max_seqlen_k,"
+            "    int      num_heads,"
+            "    int      num_heads_k,"
+            "    int      headdim,"
+            "    int      headdim_v,"
+            "    ScalarType qkv_dtype,"
+            "    Tensor   seqused_k,"
+            "    Tensor?  cu_seqlens_q,"
+            "    Tensor?  cu_seqlens_k,"
+            "    Tensor?  cu_seqlens_k_new,"
+            "    Tensor?  seqused_q,"
+            "    Tensor?  leftpad_k,"
+            "    int?     page_size,"
+            "    int      max_seqlen_k_new," // 0 means we're not appending new KV
+            "    bool     is_causal,"
+            "    int      window_size_left,"
+            "    int      window_size_right,"
+            "    bool     has_softcap,"
+            "    int      num_splits,"
+            "    bool?    pack_gqa,"
+            "    int      sm_margin) -> Tensor");
+   ops.impl("get_scheduler_metadata", torch::kCUDA, 
+        make_pytorch_shim(&mha_fwd_get_scheduler_metadata));
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME);
