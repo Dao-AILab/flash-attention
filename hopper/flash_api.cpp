@@ -641,6 +641,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<const at::Tensor> &leftpad_k_, // b
         std::optional<const at::Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
         std::optional<const at::Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
+        std::optional<const at::Tensor> &seqlens_rotary_, // b
         std::optional<at::Tensor> &q_descale_,  // (b, h_k), not (b, h)
         std::optional<at::Tensor> &k_descale_,  // (b, h_k)
         std::optional<at::Tensor> &v_descale_,  // (b, h_k)
@@ -1002,6 +1003,13 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         params.rotary_cos_ptr = rotary_cos.data_ptr();
         params.rotary_sin_ptr = rotary_sin.data_ptr();
         params.is_rotary_interleaved = is_rotary_interleaved;
+        if (seqlens_rotary_.has_value()) {
+            at::Tensor seqlens_rotary = seqlens_rotary_.value();
+            CHECK_DEVICE(seqlens_rotary); CHECK_CONTIGUOUS(seqlens_rotary);
+            TORCH_CHECK(seqlens_rotary.dtype() == torch::kInt32, "seqlens_rotary must have dtype torch.int32");
+            CHECK_SHAPE(seqlens_rotary, batch_size);
+            params.seqlens_rotary = seqlens_rotary.data_ptr<int>();
+        }
     } else {
         params.rotary_dim = 0;
     }

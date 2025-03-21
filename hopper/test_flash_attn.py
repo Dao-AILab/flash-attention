@@ -564,12 +564,13 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
 # @pytest.mark.parametrize("new_kv", [True])
-# @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(False, False)])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
+@pytest.mark.parametrize("has_rotary_seqlens", [False, True])
+# @pytest.mark.parametrize("has_rotary_seqlens", [False])
 @pytest.mark.parametrize("rotary_interleaved", [False, True] if not DISABLE_APPENDKV else [False])
 # @pytest.mark.parametrize("rotary_interleaved", [True])
 @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0] if (not DISABLE_APPENDKV) and (apply_rotary_emb is not None) else [0.0])
@@ -617,6 +618,7 @@ def test_flash_attn_kvcache(
     page_size,
     rotary_fraction,
     rotary_interleaved,
+    has_rotary_seqlens,
     seqlen_new_eq_seqlen_q,
     causal,
     local,
@@ -629,6 +631,8 @@ def test_flash_attn_kvcache(
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
+        pytest.skip()
+    if rotary_fraction == 0.0 and has_rotary_seqlens:
         pytest.skip()
     device = "cuda"
     # set seed
@@ -733,6 +737,7 @@ def test_flash_attn_kvcache(
                 key_padding_mask, arange >= cache_leftpad.unsqueeze(-1).expand(-1, seqlen_k)
             )
         # cache_seqlens = torch.tensor([64], dtype=torch.int32, device=device)
+        rotary_seqlens = cache_seqlens if not has_rotary_seqlens else cache_seqlens // 2
         if rotary_dim > 0:
             angle = (
                 torch.rand(
@@ -747,7 +752,7 @@ def test_flash_attn_kvcache(
             sin = torch.sin(angle).to(dtype=dtype_ref).to(dtype).to(dtype_ref)
             if causal or local:
                 q_ro = apply_rotary_emb(
-                    q, cos, sin, seqlen_offsets=cache_seqlens, interleaved=rotary_interleaved
+                    q, cos, sin, seqlen_offsets=rotary_seqlens, interleaved=rotary_interleaved
                 )
             else:
                 q_ro = rearrange(
@@ -755,7 +760,7 @@ def test_flash_attn_kvcache(
                         rearrange(q, "b s h d -> b 1 (s h) d"),
                         cos,
                         sin,
-                        seqlen_offsets=cache_seqlens,
+                        seqlen_offsets=rotary_seqlens,
                         interleaved=rotary_interleaved,
                     ),
                     "b 1 (s h) d -> b s h d",
@@ -763,7 +768,7 @@ def test_flash_attn_kvcache(
                 )
             # q_ro = q
             k_ro = apply_rotary_emb(
-                k, cos, sin, seqlen_offsets=cache_seqlens, interleaved=rotary_interleaved
+                k, cos, sin, seqlen_offsets=rotary_seqlens, interleaved=rotary_interleaved
             )
         else:
             cos, sin = None, None
@@ -861,6 +866,7 @@ def test_flash_attn_kvcache(
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k_new=cu_seqlens_k_new,
                 max_seqlen_q=max_seqlen_q,
+                rotary_seqlens=rotary_seqlens,
                 causal=causal,
                 window_size=window_size,
                 rotary_interleaved=rotary_interleaved,

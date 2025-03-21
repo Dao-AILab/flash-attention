@@ -36,6 +36,7 @@ def _flash_attn_forward(
         leftpad_k,
         rotary_cos,
         rotary_sin,
+        seqlens_rotary,
         q_descale,
         k_descale,
         v_descale,
@@ -58,6 +59,7 @@ def _flash_attn_forward(
         maybe_contiguous(x) for x in (page_table, kv_batch_idx, leftpad_k)
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
+    seqlens_rotary = maybe_contiguous(seqlens_rotary)
     out, softmax_lse, *rest = flash_attn_3_cuda.fwd(
         q,
         k,
@@ -78,6 +80,7 @@ def _flash_attn_forward(
         leftpad_k,
         rotary_cos,
         rotary_sin,
+        seqlens_rotary,
         q_descale,
         k_descale,
         v_descale,
@@ -257,7 +260,7 @@ class FlashAttnFunc(torch.autograd.Function):
             None, None,   # seqused_q/k
             None, None,   # max_seqlen_q/k
             None, None, None,   # page_table, kv_batch_idx, leftpad_k,
-            None, None,  # rotary_cos/sin
+            None, None, None,  # rotary_cos/sin, seqlens_rotary
             q_descale, k_descale, v_descale,
             softmax_scale,
             causal=causal,
@@ -350,7 +353,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_q,
             max_seqlen_k,
             None, None, None,   # page_table, kv_batch_idx, leftpad_k,
-            None, None,  # rotary_cos/sin
+            None, None, None,  # rotary_cos/sin, seqlens_rotary
             q_descale, k_descale, v_descale,
             softmax_scale,
             causal=causal,
@@ -602,6 +605,7 @@ def flash_attn_with_kvcache(
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
+    rotary_seqlens: Optional[torch.Tensor] = None,
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
@@ -730,6 +734,7 @@ def flash_attn_with_kvcache(
         cache_leftpad,
         rotary_cos,
         rotary_sin,
+        rotary_seqlens,
         q_descale, k_descale, v_descale,
         softmax_scale,
         causal=causal,

@@ -112,6 +112,7 @@ struct Flash_fwd_params : public Qkv_params {
     // The cos and sin matrices for rotary embedding.
     void * __restrict__ rotary_cos_ptr;
     void * __restrict__ rotary_sin_ptr;
+    int *__restrict__ seqlens_rotary;
 
     // The indices to index into the KV cache.
     int * __restrict__ kv_batch_idx;
