@@ -2,7 +2,7 @@ import torch
 import triton # type: ignore
 import triton.language as tl # type: ignore
 from typing import Literal, Optional
-from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, compute_fp8_scaling_factors, get_shape_from_layout, \
+from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, compute_fp8_scaling_factors, get_shapes_from_layout, \
     get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, is_fp8
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
@@ -1009,8 +1009,8 @@ def attention_prefill_backward_triton_split_impl(
     layout: Literal["bshd", "bhsd", "thd"],
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
-    max_seqlen_q: int,
-    max_seqlen_k: int,
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
     dropout_p: float,
     philox_seed: Optional[int],
     philox_offset: Optional[int],
@@ -1025,37 +1025,25 @@ def attention_prefill_backward_triton_split_impl(
     DEBUG_TRITON_DETAIL: bool = False,
 ):
     IS_FP8 = is_fp8(q)
+    FP8_RETURN_DESCALE: tl.constexpr = False
     if IS_FP8:
         FP8_MAX = torch.finfo(q.dtype).max
-        
-        # assert descale_o is not None and descale_dq is not None and descale_dk is not None and descale_dv is not None, f"In fp8, you need to provide empty tensors to store descale factors for dq, dk, dv and o"
-           
-        FP8_RETURN_DESCALE: tl.constexpr = False 
 
-        # auto grad implict casting cause do to be fp32 for some reason
-        # do = do.to(q.dtype)
+        # assert that the main inputs are fp8
+        assert is_fp8(do) and is_fp8(q) and is_fp8(k) and is_fp8(v), f"Non fp8 type found: do.dtype={do.dtype}, q.dtype={q.dtype}, k.dtype={k.dtype}, v.dtype={v.dtype}. All tensors must be fp8."
 
-        # assert that fp8 types are the same
-        assert do.dtype == q.dtype == k.dtype == v.dtype, f"Data type mismatch: do.dtype={do.dtype}, q.dtype={q.dtype}, k.dtype={k.dtype}, v.dtype={v.dtype}. All tensors must have the same dtype."
-
-        # check that the grads are in fp32 to accumlate values
-        # assert dv.dtype == torch.float32
-        # assert dk.dtype == torch.float32
-        # assert dv.dtype == torch.float32
-
-        stride_descale_q_z = descale_q.stride(0)
-        stride_descale_k_z = descale_k.stride(0)
-        stride_descale_v_z = descale_v.stride(0)
-        stride_descale_do_z = descale_do.stride(0)
+        stride_descale_q_z = descale_q.stride(0) if descale_q is not None else None
+        stride_descale_k_z = descale_k.stride(0) if descale_k is not None else None
+        stride_descale_v_z = descale_v.stride(0) if descale_v is not None else None
+        stride_descale_do_z = descale_do.stride(0) if descale_do is not None else None
     else:
         FP8_MAX = None
-        FP8_RETURN_DESCALE: tl.constexpr = False
         stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = stride_descale_do_z = None
 
 
     # get strides and shape
-    batch, nheads_q, nheads_k, head_size, max_seqlen_q, max_seqlen_k = \
-        get_shape_from_layout(
+    batch, nheads_q, nheads_k, head_size, max_seqlen_q_final, max_seqlen_k_final = \
+        get_shapes_from_layout(
             q, k, layout,
             cu_seqlens_q, cu_seqlens_k,
             max_seqlen_q, max_seqlen_k
@@ -1095,14 +1083,14 @@ def attention_prefill_backward_triton_split_impl(
         stride_deltam, stride_deltah = delta.stride()
     else:
         stride_deltab, stride_deltah, stride_deltam = delta.stride()
-    pre_grid = (triton.cdiv(max_seqlen_q, PRE_BLOCK), batch, nheads_q)
+    pre_grid = (triton.cdiv(max_seqlen_q_final, PRE_BLOCK), batch, nheads_q)
     _bwd_preprocess[pre_grid](
         o, do,
         delta,
         stride_ob, stride_oh, stride_om, stride_ok,
         stride_deltab, stride_deltah, stride_deltam,
         stride_descale_do_z,
-        cu_seqlens_q, max_seqlen_q,
+        cu_seqlens_q, max_seqlen_q_final,
         descale_do,
         BLOCK_M=PRE_BLOCK,
         HEAD_DIM=HEAD_DIM,
@@ -1121,7 +1109,7 @@ def attention_prefill_backward_triton_split_impl(
         (0, 0 , 0 , 0)
     if use_dropout:
         dropout_mask = torch.zeros(
-            (batch, nheads_q, max_seqlen_q, max_seqlen_k),
+            (batch, nheads_q, max_seqlen_q_final, max_seqlen_k_final),
             device=q.device,
             dtype=torch.float32
         )
@@ -1130,7 +1118,7 @@ def attention_prefill_backward_triton_split_impl(
             if not IS_VARLEN:
                 dropout_mask = create_dropout_mask(
                     dropout_p,
-                    (batch, nheads_q, max_seqlen_q, max_seqlen_k),
+                    (batch, nheads_q, max_seqlen_q_final, max_seqlen_k_final),
                     seed = philox_seed
                 )
             else:
@@ -1141,8 +1129,8 @@ def attention_prefill_backward_triton_split_impl(
         stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn = \
             dropout_mask.stride()
 
-    grid_dkdv = ((max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1, batch, nheads_k)
-    grid_dq = ((max_seqlen_q + BLOCK_M2 - 1) // BLOCK_M2, batch, nheads_k)
+    grid_dkdv = ((max_seqlen_k_final + BLOCK_N1 - 1) // BLOCK_N1, batch, nheads_k)
+    grid_dq = ((max_seqlen_q_final + BLOCK_M2 - 1) // BLOCK_M2, batch, nheads_k)
     if causal:
         if DEBUG_TRITON: print(f"_bwd_kernel_dkdv: grid = {grid_dkdv}, block_size = ({BLOCK_M1, BLOCK_N1})", )  # noqa: E701
         _bwd_kernel_dkdv_causal[grid_dkdv](
@@ -1158,7 +1146,7 @@ def attention_prefill_backward_triton_split_impl(
             stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k,
+            max_seqlen_q_final, max_seqlen_k_final,
             dropout_mask, dropout_p, philox_seed, philox_offset,
             descale_q, descale_k, descale_v, descale_do,
             BLOCK_M1, BLOCK_N1, BLK_SLICE_FACTOR,
@@ -1190,7 +1178,7 @@ def attention_prefill_backward_triton_split_impl(
             stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k,
+            max_seqlen_q_final, max_seqlen_k_final,
             dropout_mask, dropout_p, philox_seed, philox_offset,
             descale_q, descale_k, descale_v, descale_do,
             BLOCK_M2, BLOCK_N2, BLK_SLICE_FACTOR,
@@ -1221,7 +1209,7 @@ def attention_prefill_backward_triton_split_impl(
             stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k,
+            max_seqlen_q_final, max_seqlen_k_final,
             dropout_mask, dropout_p, philox_seed, philox_offset,
             descale_q, descale_k, descale_v, descale_do,
             BLOCK_M1, BLOCK_N1, BLK_SLICE_FACTOR,
@@ -1252,7 +1240,7 @@ def attention_prefill_backward_triton_split_impl(
             stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k,
+            max_seqlen_q_final, max_seqlen_k_final,
             dropout_mask, dropout_p, philox_seed, philox_offset,
             descale_q, descale_k, descale_v, descale_do,
             BLOCK_M2, BLOCK_N2, BLK_SLICE_FACTOR,

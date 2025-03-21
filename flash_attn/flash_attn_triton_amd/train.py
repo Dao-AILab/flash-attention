@@ -7,7 +7,7 @@ import pandas as pd
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from datasets import load_dataset
-from flash_attn import flash_attn_qkvpacked_func, flash_attn_qkvpacked_fp8_func
+from flash_attn import flash_attn_qkvpacked_func, flash_attn_qkvpacked_fp8_func, flash_attn_varlen_qkvpacked_func, flash_attn_varlen_qkvpacked_fp8_func
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"using device: {device}")
@@ -132,8 +132,9 @@ class FlashLM(nn.Module):
 # Data
 # -------------------------------
 class TextDataset(Dataset):
-    def __init__(self, sequences):
+    def __init__(self, sequences, max_len=None):
         self.sequences = sequences
+        self.max_len = max_len
 
     def __len__(self):
         return len(self.sequences)
@@ -144,7 +145,23 @@ class TextDataset(Dataset):
         return (torch.tensor(seq[:-1], dtype=torch.long),
                 torch.tensor(seq[1:], dtype=torch.long))
 
-def prepare_dataset(max_len=256):
+class VarLenTextDataset(Dataset):
+    def __init__(self, sequences, max_len=256):
+        self.sequences = sequences
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        seq = self.sequences[idx]
+        # Ensure the sequence doesn't exceed max_len+1
+        seq = seq[:self.max_len+1]
+        # input: all tokens except the last, target: all tokens except the first
+        return (torch.tensor(seq[:-1], dtype=torch.long),
+                torch.tensor(seq[1:], dtype=torch.long))
+
+def prepare_dataset(batch_size, is_varlen=False, min_len=10, max_len=256, ratio_shorter=0.7):
     # load the WikiText-2
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 
@@ -155,23 +172,95 @@ def prepare_dataset(max_len=256):
     word2idx = {word: idx for idx, word in enumerate(vocab)}
     token_ids = [word2idx[word] for word in tokens]
     
-    # create sequences of length max_len+1, where:
-    # - input: first max_len tokens
-    # - target: next max_len tokens (i.e., the input shifted by one)
-    sequences = []
-    for i in range(0, len(token_ids) - max_len, max_len):
-        seq = token_ids[i : i + max_len + 1]
-        if len(seq) == max_len + 1:
-            sequences.append(seq)
+    num_workers = 2
+    if is_varlen:
+        # VARIABLE LENGTH: create sequences of different lengths
+        sequences = []
+        for i in range(0, len(token_ids) - max_len, max_len // 2):  # overlap to get more sequences
+            # Decide target length for this sequence
+            if np.random.random() < ratio_shorter:
+                # Shorter sequence
+                target_len = np.random.randint(min_len + 1, max_len + 1)
+            else:
+                # Full length sequence
+                target_len = max_len + 1
+                
+            # Extract sequence up to target length or whatever's available
+            seq_end = min(i + target_len, len(token_ids))
+            seq = token_ids[i:seq_end]
+            
+            # Only keep sequences that are long enough
+            if len(seq) > min_len + 1:  # +1 because we need both input and target
+                sequences.append(seq)
 
-    # split dataset
-    num_samples = len(sequences)
-    num_train = int(0.8 * num_samples)
-    num_val = num_samples - num_train
-    train_dataset, val_dataset = random_split(TextDataset(sequences), [num_train, num_val])
+        print(f"Created {len(sequences)} variable-length sequences")
+        
+        # Get some statistics
+        lens = [len(seq) for seq in sequences]
+        print(f"Sequence length stats: min={min(lens)}, max={max(lens)}, mean={np.mean(lens):.1f}")
+        
+        # split dataset
+        num_samples = len(sequences)
+        num_train = int(0.8 * num_samples)
+        num_val = num_samples - num_train
+        
+        # Use appropriate dataset class based on whether we need variable length
+        dataset_class = VarLenTextDataset
+        train_sequences = sequences[:num_train]
+        val_sequences = sequences[num_train:]
+        
+        train_dataset = dataset_class(train_sequences, max_len)
+        val_dataset = dataset_class(val_sequences, max_len)
+
+
+        # collate function
+        def collate_fn(batch):
+            """
+            Collate function that creates a flat representation for variable length flash attention.
+            """
+            # Separate inputs and targets
+            inputs, targets = zip(*batch)
+            
+            # Get sequence lengths
+            seq_lens = torch.tensor([len(x) for x in inputs], dtype=torch.int32)
+            
+            # Concatenate inputs and targets into single tensors
+            flat_inputs = torch.cat(inputs)
+            flat_targets = torch.cat(targets)
+            
+            # Create cumulative sequence lengths tensor
+            cu_seqlens = torch.zeros(len(seq_lens) + 1, dtype=torch.int32)
+            cu_seqlens[1:] = torch.cumsum(seq_lens, dim=0)
+            
+            # Calculate max sequence length for this batch
+            max_seqlen = seq_lens.max().item()
+            
+            return flat_inputs, flat_targets, seq_lens, cu_seqlens, max_seqlen
+
+        # data loaders
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=collate_fn)
+        val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
+    else:
+        # FIXED LENGTH: create sequences of length max_len+1
+        sequences = []
+        for i in range(0, len(token_ids) - max_len, max_len):
+            seq = token_ids[i : i + max_len + 1]
+            if len(seq) == max_len + 1:
+                sequences.append(seq)
+
+        # split dataset
+        num_samples = len(sequences)
+        num_train = int(0.8 * num_samples)
+        num_val = num_samples - num_train
+        train_dataset, val_dataset = random_split(TextDataset(sequences), [num_train, num_val])
+    
+        # data loaders
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     
     vocab_size = len(vocab)
-    return train_dataset, val_dataset, vocab_size
+    print(f"vocab size: {vocab_size}, train samples: {len(train_dataset)}, validation samples: {len(val_dataset)}")
+    return train_dataloader, val_dataloader, vocab_size
 
 # -------------------------------
 # Training
@@ -222,15 +311,13 @@ def main():
     num_epochs = 20
     learning_rate = 3e-4
     max_len = 128 # total length including both input and target tokens
+    is_varlen = False
     causal=True
     dropout=0.1
     
     # prep data
     print("Preparing Dataset")
-    train_dataset, val_dataset, vocab_size = prepare_dataset(max_len=max_len)
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-    print(f"vocab size: {vocab_size}, train samples: {len(train_dataset)}, validation samples: {len(val_dataset)}")
+    train_dataloader, val_dataloader, vocab_size = prepare_dataset(batch_size, max_len=max_len, is_varlen=is_varlen)
     
     # create language models
     print("Creating Models")

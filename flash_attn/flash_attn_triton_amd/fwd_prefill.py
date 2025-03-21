@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional
-from .utils import DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, compute_fp8_scaling_factors, get_shape_from_layout, get_strides_from_layout, is_cdna, is_fp8, is_rdna, write_dropout_mask, create_dropout_mask
+from .utils import DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, compute_fp8_scaling_factors, get_shapes_from_layout, get_strides_from_layout, is_cdna, is_fp8, is_rdna, write_dropout_mask, create_dropout_mask
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = DROPOUT_USE_PYTORCH
@@ -570,21 +570,20 @@ def attention_prefill_forward_triton_impl(
                                         descale_v: Optional[torch.Tensor] = None,
 ):
     IS_FP8 = is_fp8(q)
+    FP8_RETURN_DESCALE: tl.constexpr = False
     if IS_FP8:
-        FP8_MAX: tl.constexpr=torch.finfo(q.dtype).max
-        FP8_RETURN_DESCALE: tl.constexpr = False
+        FP8_MAX: tl.constexpr = torch.finfo(q.dtype).max
 
-        assert q.dtype == k.dtype == v.dtype, f"Data type mismatch: q.dtype={q.dtype}, k.dtype={k.dtype}, v.dtype={v.dtype}. All tensors must have the same dtype."
+        assert is_fp8(q) and is_fp8(k) and is_fp8(v), f"Non fp8 type found: q.dtype={q.dtype}, k.dtype={k.dtype}, v.dtype={v.dtype}. All tensors must be fp8."
 
         # Get strides for the kernel
-        descale_q_stride_z = descale_q.stride(0)
-        descale_k_stride_z = descale_k.stride(0)
-        descale_v_stride_z = descale_v.stride(0)
+        stride_descale_q_z = descale_q.stride(0) if descale_q is not None else None
+        stride_descale_k_z = descale_k.stride(0) if descale_k is not None else None
+        stride_descale_v_z = descale_v.stride(0) if descale_v is not None else None
     else:
         descale_q = descale_k = descale_v = None
-        descale_q_stride_z = descale_k_stride_z = descale_v_stride_z = None
-        FP8_MAX: tl.constexpr = None
-        FP8_RETURN_DESCALE: tl.constexpr = False
+        stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = None
+        FP8_MAX = None
 
     # check if varlen
     is_varlen = layout == "thd"
@@ -593,7 +592,7 @@ def attention_prefill_forward_triton_impl(
     if (bias is not None):
         assert (bias.numel() < 2**31)
 
-    batch, nheads_q, nheads_k, head_size, seqlen_q, seqlen_k = get_shape_from_layout(q, k, layout, cu_seqlens_q, cu_seqlens_k, max_seqlens_q, max_seqlens_k)
+    batch, nheads_q, nheads_k, head_size, seqlen_q, seqlen_k = get_shapes_from_layout(q, k, layout, cu_seqlens_q, cu_seqlens_k, max_seqlens_q, max_seqlens_k)
     q_strides, k_strides, v_strides, o_strides = get_strides_from_layout(q, k, v, o, layout)
 
     # Get closest power of 2 over or equal to 32.
@@ -645,7 +644,7 @@ def attention_prefill_forward_triton_impl(
 
 
     attn_fwd[grid](q, k, v, bias,
-                    descale_q, descale_k, descale_v, descale_q_stride_z, descale_k_stride_z, descale_v_stride_z,
+                    descale_q, descale_k, descale_v, stride_descale_q_z, stride_descale_k_z, stride_descale_v_z,
                     sm_scale, softmax_lse, o, *q_strides, *k_strides, *v_strides, *o_strides,
                     *bias_strides, *alibi_strides, *scores_strides, stride_lse_z, stride_lse_h, stride_lse_m, cu_seqlens_q, cu_seqlens_k,
                     dropout_p=dropout_p, philox_seed=philox_seed, philox_offset_base=philox_offset, sd_mask=sd_mask, dropout_mask=dropout_mask, alibi_slopes=alibi_slopes, 

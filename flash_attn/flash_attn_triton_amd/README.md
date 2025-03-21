@@ -47,7 +47,7 @@ FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd
 ###### Docker
 You can also use the Dockerfile below which does the above steps on top of the latest rocm/pytorch image.
 ```
-FROM rocm/pytorch:rocm6.3.2_ubuntu22.04_py3.10_pytorch_release_2.4.0
+FROM rocm/pytorch:latest
 
 WORKDIR /workspace
 

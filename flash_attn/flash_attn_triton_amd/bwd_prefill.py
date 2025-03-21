@@ -2,7 +2,7 @@ from typing import Literal, Optional
 import torch
 import triton
 import triton.language as tl
-from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, compute_fp8_scaling_factors, get_shape_from_layout, get_strides_from_layout, is_fp8, write_dropout_mask, create_dropout_mask
+from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, compute_fp8_scaling_factors, get_shapes_from_layout, get_strides_from_layout, is_fp8, write_dropout_mask, create_dropout_mask
 
 # TODO: move this into utils.py so it's shared among kernels
 # NOTE: triton fails to import tl.constexprs so create them here for the file
@@ -606,9 +606,6 @@ def attention_prefill_backward_triton_impl(
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
     descale_do: Optional[torch.Tensor] = None,
-    # debug
-    ZERO_TENSORS: bool = False,
-    ACCUMLATE_FP32: bool = False,
 ):
     if DEBUG:
         print()
@@ -643,29 +640,9 @@ def attention_prefill_backward_triton_impl(
     IS_FP8 = is_fp8(q)
     if IS_FP8:
         FP8_MAX=torch.finfo(q.dtype).max
-        # fp8 is sensitive
-        ZERO_TENSORS = False
-        ACCUMLATE_FP32 = False
     else:
         FP8_MAX=None
-    
-    if DEBUG:
-        print()
-        print("IS_FP8:", IS_FP8)
 
-    # zero out
-    if ZERO_TENSORS:
-        dq.zero_()
-        dk.zero_()
-        dv.zero_()
-    
-    # accumlate to fp32
-    if ACCUMLATE_FP32:
-        og_dtype = dq.dtype
-        dq = dq.to(torch.float32)
-        dk = dk.to(torch.float32)
-        dv = dv.to(torch.float32)
-    
     # make contigious
     q = q.contiguous()
     k = k.contiguous()
@@ -673,7 +650,7 @@ def attention_prefill_backward_triton_impl(
     softmax_lse = softmax_lse.contiguous()
 
     # get strides and shape
-    batch, nheads_q, nheads_k, head_size, max_seqlen_q, max_seqlen_k = get_shape_from_layout(q, k, layout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+    batch, nheads_q, nheads_k, head_size, max_seqlen_q, max_seqlen_k = get_shapes_from_layout(q, k, layout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
     q_strides, k_strides, v_strides, o_strides = get_strides_from_layout(q, k, v, o, layout)
     stride_qz, stride_qh, stride_qm, stride_qk =  q_strides
     stride_kz, stride_kh, stride_kn, stride_kk = k_strides
@@ -822,11 +799,6 @@ def attention_prefill_backward_triton_impl(
 
     if sequence_parallel:
         dq = dq.sum(dim=0)
-
-    if ACCUMLATE_FP32:
-        dq = dq.to(og_dtype)
-        dk = dk.to(og_dtype)
-        dv = dv.to(og_dtype)
 
     if DEBUG:
         print("attention_prefill_backward_triton_impl outputs")

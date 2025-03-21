@@ -1,12 +1,12 @@
 import csv
 import math
-from typing import Optional
 import torch
 import os
 import random
 import functools
 import triton
 import triton.language as tl
+from typing import Literal, Optional, Union
 
 # -------------------------------
 # Gloabl Variables
@@ -38,13 +38,10 @@ class MetaData():
     causal = False
     num_contexts = 0
     varlen = False
-    layout = None
-    cache_seqlens = None
+    layout: Optional[Literal["bshd", "bhsd", "thd"]] = None
+    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None
     cache_batch_idx = None
-    new_kv = False
-    seqlen_new = None
-    k_new = None
-    v_new = None
+    packing = None
     return_scores= False
     dropout_p= 0.0
     philox_seed, philox_offset = None, None # if dropout_p > 0.0 seed the RNG so we get reproducible results for testing.
@@ -71,10 +68,6 @@ class MetaData():
                 f"  layout={self.layout},\n"
                 f"  cache_seqlens={self.cache_seqlens},\n"
                 f"  cache_batch_idx={self.cache_batch_idx},\n"
-                f"  new_kv={self.new_kv},\n"
-                f"  seqlen_new={self.seqlen_new},\n"
-                f"  k_new={self.k_new},\n"
-                f"  v_new={self.v_new},\n"
                 f"  dropout_p={self.dropout_p},\n"
                 f"  return_scores={self.return_scores}\n"
                 f")")
@@ -126,7 +119,7 @@ class MetaData():
     def check_args(self, q, k, v, o):
         assert q.dim() == k.dim() and q.dim() == v.dim()
 
-        batch, nheads_q, nheads_k, head_size, _, _ = get_shape_from_layout(q, k, self.layout, self.cu_seqlens_q, self.cu_seqlens_k, self.max_seqlens_q, self.max_seqlens_k)
+        batch, nheads_q, nheads_k, head_size, _, _ = get_shapes_from_layout(q, k, self.layout, self.cu_seqlens_q, self.cu_seqlens_k, self.max_seqlens_q, self.max_seqlens_k)
         if self.varlen:
             assert q.dim() == 3
             assert self.cu_seqlens_q is not None
@@ -151,28 +144,33 @@ class MetaData():
 # -------------------------------
 # Input Helper
 # -------------------------------
-def random_seqlens_composition(N, Z):
+def random_seqlens_composition(SEQ_LEN, BATCH):
     # generate a random composition of N into Z positive parts.
-    idx = torch.randperm(N - 1)[: Z - 1] + 1
+    idx = torch.randperm(SEQ_LEN - 1)[: BATCH - 1] + 1
     idx, _ = torch.sort(idx)
     breakpoints = torch.cat([
         torch.tensor([0], dtype=torch.long),
         idx,
-        torch.tensor([N], dtype=torch.long),
+        torch.tensor([SEQ_LEN], dtype=torch.long),
     ])
     seqlens = (breakpoints[1:] - breakpoints[:-1]).to(torch.int32)
     return seqlens
 
 def generate_varlen_tensor(
-    batch_size: int,
     total_seqlen: int,
     num_heads: int,
     head_size: int,
+    batch_size: Optional[int] = None,
     equal_seqlens: bool = False,
     device: str = "cuda",
     dtype: torch.dtype = torch.float32,
     DEBUG_INPUT: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
+    # get valid batch_size
+    if batch_size is None:
+        valid_batch_sizes = [bs for bs in [1, 2, 4, 8, 16, 32, 64] if bs <= total_seqlen]
+        batch_size = random.choice(valid_batch_sizes)
+    
     # get seqlens
     if equal_seqlens:
         seqlens = torch.full(
@@ -210,75 +208,127 @@ def generate_varlen_tensor(
 
     return x, cu_seqlens, max_seqlen
 
-def varlen_input_helper(BATCH, HQ, HK, TOTAL_SEQLENS_Q, TOTAL_SEQLENS_K, D_HEAD, dtype, device="cuda", equal_seqlens=False, DEBUG_INPUT=False):
-    torch.manual_seed(20)
-    q, cu_seqlens_q, _ = generate_varlen_tensor(BATCH, TOTAL_SEQLENS_Q, HQ, D_HEAD, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-    k, cu_seqlens_k, _ = generate_varlen_tensor(BATCH, TOTAL_SEQLENS_K, HK, D_HEAD, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-    v, _, _ = generate_varlen_tensor(BATCH, TOTAL_SEQLENS_K, HK, D_HEAD, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-    sm_scale = D_HEAD ** -0.5
-
-    input_metadata = MetaData(sm_scale=sm_scale)
-    input_metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k)
-
-    return q, k, v, input_metadata
-
-def nonvarlen_input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout, device="cuda", DEBUG_INPUT=False):
-    torch.manual_seed(20)
-
-    # Initialize q, k, v
-    if layout == 'bhsd':
-        q_tensor_shape = (Z, HQ, N_CTX_Q, D_HEAD)
-        k_tensor_shape = (Z, HK, N_CTX_K, D_HEAD)
-    elif layout == 'bshd':
-        q_tensor_shape = (Z, N_CTX_Q, HQ, D_HEAD)
-        k_tensor_shape = (Z, N_CTX_K, HK, D_HEAD)
-    else:
-        assert False, f'Got unsupported tensor layout: {layout}'
+def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda", DEBUG_INPUT=False):
+    tensor_shape = (BATCH, SEQ_LEN, NUM_HEADS, D_HEAD)
 
     if DEBUG_INPUT:
-        if layout == "bhsd":
-            q = torch.arange(N_CTX_Q, dtype=dtype, device=device).view(1, 1, N_CTX_Q, 1).expand(*q_tensor_shape).contiguous().requires_grad_()
-            k = torch.arange(N_CTX_K, dtype=dtype, device=device).view(1, 1, N_CTX_K, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
-            v = torch.arange(N_CTX_K, dtype=dtype, device=device).view(1, 1, N_CTX_K, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
-        elif layout == "bshd":
-            q = torch.arange(N_CTX_Q, dtype=dtype, device=device).view(1, N_CTX_Q, 1, 1).expand(*q_tensor_shape).contiguous().requires_grad_()
-            k = torch.arange(N_CTX_K, dtype=dtype, device=device).view(1, N_CTX_K, 1, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
-            v = torch.arange(N_CTX_K, dtype=dtype, device=device).view(1, N_CTX_K, 1, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
+        x = torch.arange(SEQ_LEN, dtype=dtype, device=device).view(1, SEQ_LEN, 1, 1).expand(*tensor_shape).contiguous()
     else:
-        q = torch.randn(q_tensor_shape, dtype=dtype, device=device, requires_grad=True)
-        k = torch.randn(k_tensor_shape, dtype=dtype, device=device, requires_grad=True)
-        v = torch.randn(k_tensor_shape, dtype=dtype, device=device, requires_grad=True)
-    
-    if DEBUG_INPUT:
-        sm_scale = 1
-    else:
-        sm_scale = D_HEAD**-0.5
-    input_metadata = MetaData(sm_scale=sm_scale)
-    input_metadata.max_seqlens_q = N_CTX_Q
-    input_metadata.max_seqlens_k = N_CTX_K
-    input_metadata.layout = layout
-    return q, k, v, input_metadata
+        x = torch.randn(tensor_shape, dtype=dtype, device=device)
 
-def input_helper(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout, device="cuda", DEBUG_INPUT=False):
+    # requires grad
+    x.requires_grad_()
+
+    return x
+
+def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype, device="cuda", DEBUG_INPUT=False):
+    tensor_shape = (BATCH, NUM_HEADS, SEQ_LEN, D_HEAD)
+
+    if DEBUG_INPUT:
+        x = torch.arange(SEQ_LEN, dtype=dtype, device=device).view(1, 1, SEQ_LEN, 1).expand(*tensor_shape).contiguous()
+    else:
+        x = torch.randn(tensor_shape, dtype=dtype, device=device)
+
+    # requires grad
+    x.requires_grad_()
+
+    return x
+
+def input_helper(
+    BATCH: int,
+    HQ: int,
+    HK: int,
+    N_CTX_Q: int,
+    N_CTX_K: int,
+    D_HEAD: int,
+    dtype: torch.dtype,
+    layout: Literal["bshd", "bhsd", "thd"],
+    packing: Optional[Literal["kv", "qkv"]] = None,
+    device: Literal["cpu", "cuda"] = "cuda",
+    DEBUG_INPUT: bool = False,
+):
+    torch.manual_seed(20)
     if layout == "thd":
-        q, k, v, metadata = varlen_input_helper(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-    else:
-        q, k, v, metadata = nonvarlen_input_helper(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout, device=device, DEBUG_INPUT=DEBUG_INPUT)
+        # set params
+        TOTAL_SEQLENS_Q = BATCH * N_CTX_Q
+        TOTAL_SEQLENS_K = BATCH * N_CTX_K
+        equal_seqlens=False
+        
+        # gen tensors
+        q, cu_seqlens_q, _ = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+        k, cu_seqlens_k, _ = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+        v, cu_seqlens_v, _ = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+        
+        # setup metadata
+        if DEBUG_INPUT:
+            sm_scale = 1
+        else:
+            sm_scale = D_HEAD**-0.5
+        metadata = MetaData(sm_scale=sm_scale)
+        metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k)
+    elif layout == 'bshd' or layout == "bhsd":
+        # gen tensors
+        if layout == "bshd":
+            q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+            k = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+            v = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+        elif layout == "bhsd":
+            q = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+            k = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+            v = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
 
-    return q, k, v, metadata
+        # setup metadata
+        if DEBUG_INPUT:
+            sm_scale = 1
+        else:
+            sm_scale = D_HEAD**-0.5
+        metadata = MetaData(sm_scale=sm_scale)
+        metadata.max_seqlens_q = N_CTX_Q
+        metadata.max_seqlens_k = N_CTX_K
+        metadata.layout = layout
+    else:
+        raise ValueError(f"Unknown layout: {layout}")
+
+    # create dout
+    if DEBUG_INPUT:
+        do = torch.ones_like(q)
+    else:
+        do = torch.randn_like(q)
+
+    # deal with packing
+    if packing is None:
+        return q, k, v, do, metadata
+    elif packing == "kv":
+        # pack k and v
+        if layout in ["bhsd", "thd"]:
+            kv = torch.stack([k, v], dim=1)
+        elif layout == "bshd":
+            kv = torch.stack([k, v], dim=2)
+        else:
+            raise ValueError(f"Unknown layout: {layout}")
+
+        return q, kv, do, metadata
+    elif packing == "qkv":
+        # qkv packing - requires same sequence length for q and k
+        assert N_CTX_Q == N_CTX_K, "For QKV packing, Q and K must have same sequence length"
+        assert HQ == HK, "For QKV packing, Q and K must have same number of heads"
+
+        # pack q, k, and v
+        if layout in ["bhsd", "thd"]:
+            qkv = torch.stack([q, k, v], dim=1)
+        elif layout == "bshd":
+            qkv = torch.stack([q, k, v], dim=2)
+        else:
+            raise ValueError(f"Unknown layout: {layout}")
+
+        return qkv, do, metadata
+    else:
+        assert False, f"Unsupported packing mode: {packing}"
+
 
 # -------------------------------
 # FP8
 # -------------------------------
-@triton.jit
-def compute_fp8_scaling_factors(x, fp8_max: tl.constexpr):
-    # compute fp8 scaling and descaling factor for a block
-    x_amax = tl.max(tl.abs(x)) # NOTE: abs deals with negative values
-    x_amax = tl.where(x_amax <= 1e-9, 1e-9, x_amax)
-    scale_x = fp8_max / x_amax
-    descale_x = x_amax / fp8_max
-    return scale_x, descale_x
-
 def is_fp8(x):
     if x.dtype in {torch.float8_e4m3fnuz, torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e5m2fnuz}:
         if arch_supports_fp8():
@@ -288,179 +338,231 @@ def is_fp8(x):
     else:
         return False
 
-def cast_nonvarlen_to_fp8(
-    x: torch.Tensor,
-    fp8_dtype,
-    layout,
-    clamp_val=1e-9,
-):
-    if layout == "bshd":
-        if len(x.shape) != 4:
-            raise ValueError(f"'bshd' tensor should have shape [batch, seqlen, heads, dim], got {x.shape}")
-        reduce_dims = (1, 3)  # seq_len and dim dimensions
-    elif layout == "bhsd":
-        if len(x.shape) != 4:
-            raise ValueError(f"'bhsd' tensor should have shape [batch, heads, seqlen, dim], got {x.shape}")
-        reduce_dims = (2, 3)  # seq_len and dim dimensions
+@triton.jit
+def compute_fp8_scaling_factors(x, fp8_max: tl.constexpr):
+    # compute fp8 scaling and descaling factor for a block
+    x_amax = tl.max(tl.abs(x)) # NOTE: abs deals with negative values
+    x_amax = tl.where(x_amax <= 1e-9, 1e-9, x_amax)
+    scale_x = fp8_max / x_amax
+    descale_x = x_amax / fp8_max
+    return scale_x, descale_x
+
+@triton.jit
+def _cast_varlen_to_fp8_kernel_2d(
+    X, X_fp8, Descale,
+    cu_seqlens, H, MAX_SEQLEN,
+    stride_batch, stride_seq, stride_head, stride_dim,
+    stride_out_batch, stride_out_seq, stride_out_head, stride_out_dim,
+    stride_desc_batch, stride_desc_head,
+    FP8_CLAMP_VAL, 
+    FP8_MAX,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ACTUAL_HEAD_DIM: tl.constexpr,
+    IS_VARLEN: tl.constexpr
+    ):
+    # Process one (batch, head) pair per kernel
+    b_id = tl.program_id(0)
+    h_id = tl.program_id(1)
+    
+    # Get sequence bounds for this batch
+    if IS_VARLEN:
+        seq_start = tl.load(cu_seqlens + b_id)
+        seq_end = tl.load(cu_seqlens + b_id + 1)
+        seqlen = seq_end - seq_start
     else:
-        raise ValueError(f"Unknown layout: {layout}")
-  
-
-    # Compute the absolute max along reduce_dims, clamped to avoid 0-scale
-    x_abs_max = x.abs().amax(dim=reduce_dims)
-    x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
-
-    # Unsqueeze back to a shape suitable for broadcast
-    unsqueeze_dims = sorted(reduce_dims)
-    for d in unsqueeze_dims:
-        x_abs_max = x_abs_max.unsqueeze(d)
-
-    # compute scale and descale
-    fp8_max = torch.finfo(fp8_dtype).max
-    scale = fp8_max / x_abs_max
-    descale_factor = x_abs_max / fp8_max
-
-    # cast to FP8, optionally setting requires_grad
-    x_fp8 = (x * scale).to(fp8_dtype)
-
-    return x_fp8, descale_factor
-
-def cast_varlen_to_fp8(
-    x: torch.Tensor,
-    fp8_dtype: torch.dtype,
-    cu_seqlens,
-    clamp_val: float = 1e-9,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # validate tensor shape
-    if len(x.shape) != 3:
-        raise ValueError(f"tensor should have shape [total_seqlen, heads, dim], got {x.shape}")
-    num_heads = x.shape[1]
+        seq_start = 0
+        seqlen = MAX_SEQLEN  
     
-    # Get batch size from cu_seqlens
-    batch = cu_seqlens.shape[0] - 1
-    fp8_max = torch.finfo(fp8_dtype).max
+    # initialize max value tracker
+    x_max_val = 0.0
     
-    # Compute scale and descale factors per sequence
-    x_fp8 = torch.zeros_like(x, dtype=fp8_dtype)
-    descale_factors = torch.zeros((batch, num_heads), device=x.device, dtype=torch.float32)
-    
-    for i in range(batch):
-        start = cu_seqlens[i]
-        end = cu_seqlens[i + 1]
-        x_slice = x[start:end]  # Slice for current sequence
+    # STEP 1: Find max absolute value across the entire sequence
+    num_of_blocks = tl.cdiv(seqlen, BLOCK_SIZE)
+    for blk_idx in range(0, num_of_blocks):
+        # print("blk_idx:", blk_idx)
+        # offsets
+        offs_seq = blk_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        offs_dim = tl.arange(0, HEAD_DIM)
         
-        # Standard tensor (0: seq_len, 2: head_dim)
-        x_abs_max = x_slice.abs().amax(dim=(0, 2))  # [heads]
-        
-        # apply minimum clamping
-        x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
-        
-        # compute scale and descale factors
-        scale_i = fp8_max / x_abs_max
-        descale_i = x_abs_max / fp8_max
-        
-        # store descale factors
-        descale_factors[i, :] = descale_i
-        
-        scale_reshape = scale_i.reshape(1, num_heads, 1)
-        
-        # scale and cast to FP8
-        x_fp8[start:end] = (x_slice * scale_reshape).to(fp8_dtype)
-        
-    return x_fp8, descale_factors
+        # Create mask for valid elements
+        mask_seq = offs_seq[:, None] < seqlen
+        if ACTUAL_HEAD_DIM != HEAD_DIM:
+            mask_dim = offs_dim[None, :] < ACTUAL_HEAD_DIM
+            mask_seq = mask_seq & mask_dim
 
-def decast_fp8(
-    x_fp8: torch.Tensor,
-    descale_factor: torch.Tensor,
-    original_dtype: torch.dtype,
-    layout: str,
-    cu_seqlens: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    x_orig = x_fp8.to(original_dtype)
+        # Load block
+        adj_x =  b_id * stride_batch + h_id * stride_head + seq_start * stride_seq + offs_seq[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+        x_block = tl.load(X + adj_x, mask=mask_seq, other=0.0)
+        # print("x_block:", x_block)
+        
+        # Find max absolute value in this block
+        block_max = tl.max(tl.abs(x_block))
+        # print("block_max:", block_max)
+        
+        # Update overall max
+        x_max_val = tl.maximum(x_max_val, block_max)
+        # print("x_max_val:", x_max_val)
     
-    if layout in ("bshd", "bhsd"):
-        return x_orig * descale_factor
-    elif layout == "thd":
-        if cu_seqlens is None:
-            raise ValueError("cu_seqlens must be provided for varlen layout ('thd')")
+    # clamp to avoid division by zero issues
+    x_max_val = tl.maximum(x_max_val, FP8_CLAMP_VAL)
+    
+    # compute scale and descale factors for the entire sequence
+    scale = FP8_MAX / x_max_val
+    descale = x_max_val / FP8_MAX
+    
+    # store descale factor for this (batch, head) pair
+    desc_ptr = Descale + b_id * stride_desc_batch + h_id# * stride_desc_head
+    tl.store(desc_ptr, descale)
+
+    # STEP 2: Apply scaling to the entire sequence and convert to FP8
+    for blk_idx in range(0, num_of_blocks):
+        # offsets
+        offs_seq = blk_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        offs_dim = tl.arange(0, HEAD_DIM)
         
-        if len(x_orig.shape) != 3:
-            raise ValueError(f"tensor should have shape [total_seqlen, heads, dim], got {x_orig.shape}")
+        # Create mask for valid elements
+        mask_seq = offs_seq[:, None] < seqlen
+        if ACTUAL_HEAD_DIM != HEAD_DIM:
+            mask_dim = offs_dim[None, :] < ACTUAL_HEAD_DIM
+            mask_seq = mask_seq & mask_dim
         
-        # create output tensor
-        x_out = x_orig.clone()
-        batch = cu_seqlens.shape[0] - 1
+        # Load block - Using the fixed addressing
+        addr = b_id * stride_batch + h_id * stride_head + seq_start * stride_seq + offs_seq[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+        x_block = tl.load(X + addr, mask=mask_seq, other=0.0)
         
-        # apply descaling per sequence
-        for i in range(batch):
-            start = int(cu_seqlens[i].item())
-            end = int(cu_seqlens[i + 1].item())
-            
-            # reshape to [1, heads, 1]
-            factor = descale_factor[i].reshape(1, -1, 1)
-            
-            # apply descaling
-            x_out[start:end] = x_out[start:end] * factor
+        # Apply scale and convert to FP8
+        x_fp8_block = (x_block * scale).to(X_fp8.type.element_ty)
         
-        return x_out
-    else:
-        raise ValueError(f"Unknown layout: {layout}")
+        # Store results
+        addr_out = b_id * stride_out_batch + h_id * stride_out_head + seq_start * stride_out_seq + offs_seq[:, None] * stride_out_seq + offs_dim[None, :] * stride_out_dim
+        tl.store(X_fp8 + addr_out, x_fp8_block, mask=mask_seq)
 
 def cast_to_fp8(
     x: torch.Tensor,
     fp8_dtype: torch.dtype,
-    layout: str,
+    layout: Literal["bshd", "thd"],
     clamp_val: float = 1e-9,
-    cu_seqlens=None
+    cu_seqlens: Optional[torch.Tensor] = None,
+    max_seqlen: Optional[int] = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if layout in ("bshd", "bhsd"):
-        return cast_nonvarlen_to_fp8(x, fp8_dtype, layout, clamp_val=clamp_val)
-    elif layout == "thd":
-        if cu_seqlens is None:
-            raise ValueError("cu_seqlens must be provided for varlen (thd) layout")
-        return cast_varlen_to_fp8(x, fp8_dtype, cu_seqlens, clamp_val=clamp_val)
-    else:
-        raise ValueError(f"Unknown layout: {layout}")
+    if DEBUG:
+        print()
+        print("cast_to_fp8")
+        print("x:", x, x.shape)
+        print("fp8_dtype:", fp8_dtype)
+        print("cu_seqlens:", cu_seqlens)
+        print("max_seqlen:", max_seqlen)
+        print("clamp_val:", clamp_val)
+
+    # extract dimensions
+    batch, max_seqlen_final, num_heads, head_dim = get_shape_from_layout(x, layout, cu_seqlens, max_seqlen)
+    is_varlen = layout == "thd"
+    fp8_max = torch.finfo(fp8_dtype).max
+    if DEBUG:
+        print("batch:", batch)
+        print("max_seqlen_final:", max_seqlen_final)
+        print("num_heads:", num_heads)
+        print("head_dim:", head_dim)
+
+    # get closest power of 2 for head_dim
+    padded_head_dim = 1 << (head_dim - 1).bit_length()
+    padded_head_dim = max(padded_head_dim, 32)
+
+    # kernel params
+    x_fp8 = torch.zeros_like(x, dtype=fp8_dtype)
+    descale_factors = torch.zeros((batch, num_heads), device=x.device, dtype=torch.float32)
+    BLOCK_SIZE = 128
+
+    # calculate strides
+    stride_batch, stride_head, stride_seq, stride_dim = get_stride_from_layout(x, layout)
+    stride_out_batch, stride_out_head, stride_out_seq, stride_out_dim = get_stride_from_layout(x_fp8, layout)
+    stride_desc_batch, stride_desc_head = descale_factors.stride()
+
+    if DEBUG:
+        print("stride_batch", stride_batch)
+        print("stride_head", stride_head)
+        print("stride_seq", stride_seq)
+        print("stride_dim", stride_dim)
+        print("stride_out_batch", stride_out_batch)
+        print("stride_out_head", stride_out_head)
+        print("stride_out_seq", stride_out_seq)
+        print("stride_out_dim", stride_out_dim)
+        print("stride_desc_batch", stride_desc_batch)
+        print("stride_desc_head", stride_desc_head)
+
+    grid = (batch, num_heads)
+    _cast_varlen_to_fp8_kernel_2d[grid](
+        x, x_fp8, descale_factors,
+        cu_seqlens, num_heads, max_seqlen_final,
+        stride_batch, stride_seq, stride_head, stride_dim,
+        stride_out_batch, stride_out_seq, stride_out_head, stride_out_dim,
+        stride_desc_batch, stride_desc_head,
+        clamp_val, fp8_max,
+        BLOCK_SIZE=BLOCK_SIZE,
+        HEAD_DIM=padded_head_dim, 
+        ACTUAL_HEAD_DIM=head_dim,
+        IS_VARLEN=is_varlen
+    )
+    
+    if DEBUG:
+        print("x_fp8:", x_fp8, x_fp8.shape)
+        print("descale_factors:", descale_factors, descale_factors.shape)
+    return x_fp8, descale_factors
+
 # -------------------------------
 # Misc
 # -------------------------------
-def get_shape_from_layout(q, k, layout, cu_seqlens_q = None, cu_seqlens_k = None, max_seqlen_q=None, max_seqlen_k=None):
+def get_shape_from_layout(
+    x: torch.Tensor,
+    layout: Literal["bshd", "thd"],
+    cu_seqlens: Optional[torch.Tensor] = None,
+    max_seqlen: Optional[int] = None,
+) -> tuple[int, int, int, int]:
     if layout == 'bhsd':
-        batch_q, nheads_q, max_seqlen_q, head_size_q = q.shape
-        batch_k, nheads_k, max_seqlen_k, head_size_k = k.shape
+        batch, num_heads, max_seqlen_final, head_dim = x.shape
     elif layout == 'bshd':
-        batch_q, max_seqlen_q, nheads_q, head_size_q = q.shape
-        batch_k, max_seqlen_k, nheads_k, head_size_k = k.shape
+        batch, max_seqlen_final, num_heads, head_dim = x.shape
     elif  layout == 'thd':
-        batch_q, max_seqlen_q, nheads_q, head_size_q = len(cu_seqlens_q) - 1, max_seqlen_q, q.shape[1], q.shape[2]
-        batch_k, max_seqlen_k, nheads_k, head_size_k = len(cu_seqlens_k) - 1, max_seqlen_k, k.shape[1], k.shape[2]
+        total_seqlen, num_heads, head_dim = x.shape
+        if cu_seqlens is None:
+            raise ValueError("cu_seqlens must be provided for varlen (thd) layout") 
+        if max_seqlen is None:
+            raise ValueError("max_seqlen must be provided for varlen (thd) layout")
+        
+        batch, max_seqlen_final, num_heads, head_dim = len(cu_seqlens) - 1, max_seqlen, num_heads, head_dim
     else:
         assert False, "Got unsupported layout."
+
+    return batch, max_seqlen_final, num_heads, head_dim
+
+
+def get_shapes_from_layout(q, k, layout, cu_seqlens_q = None, cu_seqlens_k = None, max_seqlen_q=None, max_seqlen_k=None):
+    batch_q, seqlen_q, nheads_q, head_size_q = get_shape_from_layout(q, layout, cu_seqlens_q, max_seqlen_q)
+    batch_k, seqlen_k, nheads_k, head_size_k = get_shape_from_layout(k, layout, cu_seqlens_k, max_seqlen_k)
     
     # assert
     assert batch_q == batch_k
     assert head_size_q == head_size_k
 
-    return batch_q, nheads_q, nheads_k, head_size_q, max_seqlen_q, max_seqlen_k
+    return batch_q, nheads_q, nheads_k, head_size_q, seqlen_q, seqlen_k
 
-def get_strides_from_layout(q, k, v, o, layout):
+def get_stride_from_layout(x, layout):
     if layout == 'thd':
-        q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
-        k_strides = (0, k.stride(1), k.stride(0), k.stride(2))
-        v_strides = (0, v.stride(1), v.stride(0), v.stride(2))
-        o_strides = (0, o.stride(1), o.stride(0), o.stride(2))
+        strides = (0, x.stride(1), x.stride(0), x.stride(2))  
     elif layout == 'bhsd':
-        q_strides = (q.stride(0), q.stride(1), q.stride(2), q.stride(3))
-        k_strides = (k.stride(0), k.stride(1), k.stride(2), k.stride(3))
-        v_strides = (v.stride(0), v.stride(1), v.stride(2), v.stride(3))
-        o_strides = (o.stride(0), o.stride(1), o.stride(2), o.stride(3))
+        strides = (x.stride(0), x.stride(1), x.stride(2), x.stride(3))
     elif layout == 'bshd':
-        q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
-        k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
-        v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
-        o_strides = (o.stride(0), o.stride(2), o.stride(1), o.stride(3))
+        strides = (x.stride(0), x.stride(2), x.stride(1), x.stride(3))
     else:
         assert False, 'Got unsupported layout.'
+    return strides
+
+def get_strides_from_layout(q, k, v, o, layout):
+    q_strides = get_stride_from_layout(q, layout)
+    k_strides = get_stride_from_layout(k, layout)
+    v_strides = get_stride_from_layout(v, layout)
+    o_strides = get_stride_from_layout(o, layout)
     return q_strides, k_strides, v_strides, o_strides
 
 def get_padded_headsize(size):

@@ -803,9 +803,9 @@ class FlashAttnVarlenQKVPackedFP8Func(torch.autograd.Function):
 
          # cast input to fp8
         fp8_dtype = torch.float8_e4m3fnuz 
-        q_fp8, descale_q = cast_to_fp8(q, fp8_dtype, "thd", cu_seqlens=cu_seqlens)
-        k_fp8, descale_k = cast_to_fp8(k, fp8_dtype, "thd", cu_seqlens=cu_seqlens)
-        v_fp8, descale_v = cast_to_fp8(v, fp8_dtype, "thd", cu_seqlens=cu_seqlens)
+        q_fp8, descale_q = cast_to_fp8(q, fp8_dtype, "thd", cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        k_fp8, descale_k = cast_to_fp8(k, fp8_dtype, "thd", cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        v_fp8, descale_v = cast_to_fp8(v, fp8_dtype, "thd", cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         
         out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
             q_fp8,
@@ -853,7 +853,7 @@ class FlashAttnVarlenQKVPackedFP8Func(torch.autograd.Function):
 
         # scale grads
         fp8_dtype = torch.float8_e4m3fnuz 
-        dout_padded_fp8, descale_do = cast_to_fp8(dout_padded, fp8_dtype, "thd", cu_seqlens=cu_seqlens)
+        dout_padded_fp8, descale_do = cast_to_fp8(dout_padded, fp8_dtype, "thd", cu_seqlens=cu_seqlens, max_seqlen=ctx.max_seqlen)
         
         _flash_attn_varlen_backward(
             dout_padded_fp8,
@@ -1468,9 +1468,9 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
         
         # cast input to fp8
         fp8_dtype = torch.float8_e4m3fnuz 
-        q_fp8, descale_q = cast_to_fp8(q, fp8_dtype, "thd", cu_seqlens=cu_seqlens_q)
-        k_fp8, descale_k = cast_to_fp8(k, fp8_dtype, "thd", cu_seqlens=cu_seqlens_k)
-        v_fp8, descale_v = cast_to_fp8(v, fp8_dtype, "thd", cu_seqlens=cu_seqlens_k)
+        q_fp8, descale_q = cast_to_fp8(q, fp8_dtype, "thd", cu_seqlens=cu_seqlens_q, max_seqlen=max_seqlen_q)
+        k_fp8, descale_k = cast_to_fp8(k, fp8_dtype, "thd", cu_seqlens=cu_seqlens_k, max_seqlen=max_seqlen_k)
+        v_fp8, descale_v = cast_to_fp8(v, fp8_dtype, "thd", cu_seqlens=cu_seqlens_k, max_seqlen=max_seqlen_k)
         
         
         out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
@@ -1522,7 +1522,7 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
         
         # descale factors that are returned with kernel outputs
         fp8_dtype = torch.float8_e4m3fnuz 
-        dout_padded_fp8, descale_do = cast_to_fp8(dout_padded, fp8_dtype, "thd", cu_seqlens=cu_seqlens_q)
+        dout_padded_fp8, descale_do = cast_to_fp8(dout_padded, fp8_dtype, "thd", cu_seqlens=cu_seqlens_q, max_seqlen=ctx.max_seqlen_q)
 
         _flash_attn_varlen_backward(
             dout_padded_fp8,

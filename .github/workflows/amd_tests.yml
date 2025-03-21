@@ -4,8 +4,6 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [main_perf]
-  push:
-    branches: [main_perf, rebase/main_perf]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -20,7 +18,7 @@ jobs:
       fail-fast: false # disables failing the entire job when one matrix entry fails
     timeout-minutes: 720 # self hosted runners can run jobs for longer than the default of 360 minutes
     container:
-      image: rocm/pytorch:rocm6.3.2_ubuntu22.04_py3.10_pytorch_release_2.4.0
+      image: rocm/pytorch:latest
       options: --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --group-add video --user root
     steps:
       - name: Checkout
@@ -55,7 +53,7 @@ jobs:
       # FIXME: run the full suite
       - name: AMD Internal Tests
         run: |
-          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest -n 2 flash_attn/flash_attn_triton_amd/test.py::test_fp8
+          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest flash_attn/flash_attn_triton_amd/test.py::test_fp8
 
       - name: AMD Bench
         if: False
@@ -67,7 +65,7 @@ jobs:
         if: False
         run: |
           FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_REF=1 pytest tests/test_flash_attn_triton_amd.py
-        
+
       - name: Flash Attention Tests
         run: |
-          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest -n 16 tests/test_flash_attn_triton_amd.py
+          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd.py
