@@ -273,10 +273,11 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             if (params.is_bf16) {
                                 #ifndef FLASHATTENTION_DISABLE_HDIM64
                                 if (params.d <= 64) {
-                                    if (params.dv > 64 && Arch == 90) {
+                                    if (params.dv > 256 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                    }
-                                    else {
+                                    } else if (params.dv > 64 && Arch == 90) {
+                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                                    } else {
                                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     }
                                 }
@@ -303,10 +304,11 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 #ifndef FLASHATTENTION_DISABLE_FP16
                                 #ifndef FLASHATTENTION_DISABLE_HDIM64
                                 if (params.d <= 64) {
-                                    if (params.dv > 64 && Arch == 90) {
+                                    if (params.dv > 256 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                    }
-                                    else {
+                                    } else if (params.dv > 64 && Arch == 90) {
+                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                                    } else {
                                         return run_mha_fwd_<Arch, cutlass::half_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     }
                                 }
@@ -1501,7 +1503,6 @@ mha_combine(const at::Tensor &out_partial,         // num_splits x batch_size x 
     const int seqlen = sizes[2];
     const int num_heads = sizes[3];
     const int head_size_og = sizes[4];
-    TORCH_CHECK(head_size_og <= 512, "FlashAttention combine only supports head dimension at most 512");
     TORCH_CHECK(num_splits <= 256, "FlashAttention combine only supports num_splits at most 256");
 
     CHECK_SHAPE(out_partial, num_splits, batch_size, seqlen, num_heads, head_size_og);
