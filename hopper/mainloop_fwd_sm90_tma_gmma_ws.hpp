@@ -780,7 +780,7 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_v.producer_commit(smem_pipe_write);
             // Very important: PipelineTmaAsync::consumer_release assumes that the warpgroup is synchronized
             // before calling. Without this we get race conditions.
-            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<uint32_t>(FwdNamedBarriers::ProducerWG) /*id*/);
+            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, cutlass::arch::ReservedNamedBarriers::TransposeBarrier /*id*/);
             pipeline_vt.consumer_release(smem_pipe_read);
         };
 

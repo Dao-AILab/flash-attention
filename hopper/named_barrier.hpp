@@ -49,30 +49,24 @@ static void named_barrier_arrive(uint32_t num_threads, cutlass::arch::ReservedNa
 
 enum class FwdNamedBarriers {
     QueryEmpty = 0,
-    ProducerWG = 1,
-    TileCountSmemEmpty = 2,
-    TileCountSmemFull = 3,
-    WarpSchedulerWG1 = 4,
-    WarpSchedulerWG2 = 5,
-    WarpSchedulerWG3 = 6,
-    AppendKV = 7,
-    QueryRotated = 8,
-    PFull = 9,
-    PEmpty = 6,  // HACK: PEmpty is only used when we don't have 3 WGs
+    WarpSchedulerWG1 = 1,
+    WarpSchedulerWG2 = 2,
+    WarpSchedulerWG3 = 3,
+    AppendKV = 4,
+    QueryRotated = 5,
+    PFull = 6,
+    PEmpty = 7,
 };
 
 enum class BwdNamedBarriers {
     KVEmpty = 0,
     PdS = 1,
-    // This needs to match FwdNamedBarriers::TileCountSmemEmpty since TileScheduler uses it
-    TileCountSmemEmpty = 2,
-    TileCountSmemFull = 3,
-    dQEmptyWG1 = 4,
-    dQEmptyWG2 = 5,
-    dQEmptyWG3 = 6,
-    dQFullWG1 = 7,
-    dQFullWG2 = 8,
-    dQFullWG3 = 9,
+    dQEmptyWG1 = 2,
+    dQEmptyWG2 = 3,
+    dQEmptyWG3 = 4,
+    dQFullWG1 = 5,
+    dQFullWG2 = 6,
+    dQFullWG3 = 7,
 };
 
 } // flash
