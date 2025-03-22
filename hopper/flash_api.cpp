@@ -493,6 +493,16 @@ inline int round_up_headdim(int head_size) {
     return 256;
 }
 
+inline int round_up_headdimv(int head_size) {
+    if (head_size <= 64) { return 64; }
+    if (head_size <= 96) { return 96; }
+    if (head_size <= 128) { return 128; }
+    if (head_size <= 192) { return 192; }
+    if (head_size <= 256) { return 256; }
+    return 512;
+}
+
+
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
 at::Tensor
 mha_fwd_get_scheduler_metadata(
@@ -537,7 +547,7 @@ mha_fwd_get_scheduler_metadata(
     params.d = headdim;
     params.dv = headdim_v;
     params.d_rounded = round_up_headdim(headdim);
-    params.dv_rounded = round_up_headdim(headdim_v);
+    params.dv_rounded = headdim_v == headdim ? params.d_rounded : round_up_headdimv(headdim_v);
     params.seqlen_knew = max_seqlen_k_new;
 
     bool const is_varlen_q = cu_seqlens_q_.has_value();
@@ -827,7 +837,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     int const head_size_rounded = round_up_headdim(head_size);
-    int const head_size_v_rounded = round_up_headdim(head_size_v);
+    int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdimv(head_size_v);
     int const seqlen_q_rounded = round_multiple(seqlen_q, 128);
     int const seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
