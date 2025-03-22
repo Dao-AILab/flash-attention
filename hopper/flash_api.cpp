@@ -502,7 +502,6 @@ inline int round_up_headdimv(int head_size) {
     return 512;
 }
 
-
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
 at::Tensor
 mha_fwd_get_scheduler_metadata(

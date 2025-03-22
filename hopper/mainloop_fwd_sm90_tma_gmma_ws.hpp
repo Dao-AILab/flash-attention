@@ -1258,8 +1258,8 @@ struct CollectiveMainloopFwdSm90 {
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
-                warp_scheduler_barrier_arrive();
                 if constexpr (!HasQv) {
+                    warp_scheduler_barrier_arrive();
                     warpgroup_wait<0>();
                     pipeline_k.consumer_release(smem_pipe_read);  // release K
                 } else {
@@ -1267,7 +1267,9 @@ struct CollectiveMainloopFwdSm90 {
                         shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
                     }
                     consumer_wait(pipeline_v, smem_pipe_read);
-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/1>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                    warp_scheduler_barrier_arrive();
+                    warpgroup_wait<1>();
                     pipeline_k.consumer_release(smem_pipe_read);  // release K
                     warpgroup_wait<0>();
                 }
