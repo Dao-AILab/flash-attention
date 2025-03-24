@@ -27,6 +27,16 @@
     }                                                                                            \
   }()
 
+#ifdef FLASHATTENTION_ENABLE_UPCAST
+  #define UPCAST_SWITCH BOOL_SWITCH
+#else
+  #define UPCAST_SWITCH(COND, CONST_NAME, ...)                                                   \
+  [&] {                                                                                          \
+    constexpr static bool CONST_NAME = false;                                                    \
+    return __VA_ARGS__();                                                                        \
+  }()
+#endif
+
 #ifdef FLASHATTENTION_DISABLE_LOCAL
   #define CAUSAL_LOCAL_SWITCH(CAUSAL_COND, LOCAL_COND, CAUSAL_CONST_NAME, LOCAL_CONST_NAME, ...) \
     [&] {                                                                                        \

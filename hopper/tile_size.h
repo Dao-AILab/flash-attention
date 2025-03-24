@@ -9,7 +9,7 @@
 // Return {kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap}
 constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         int headdim, int headdim_v, bool is_causal, bool is_local, int element_size=2,
-        bool v_colmajor=false, bool paged_kv_non_TMA=false, bool softcap=false) {
+        bool v_colmajor=false, bool paged_kv_non_TMA=false, bool softcap=false, bool v_upcast=false) {
     if (element_size == 2) {
         if (headdim <= 64) {
             // return {same_hdim ? 192 : 64, same_hdim ? 128 : 64, same_hdim, same_hdim};
@@ -39,15 +39,15 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         }
     } else {
         if (headdim <= 64) {
-            return {192, 160, true, true};
+            return {192, v_upcast ? 128 : 160, true, true};
         } else if (headdim <= 96) {
             return {192, 128, true, true};
         } else if (headdim <= 128) {
-            return {128, paged_kv_non_TMA ? 160 : (v_colmajor || (softcap && is_local) ? 192 : 224), true, true};
+            return {128, paged_kv_non_TMA || v_upcast ? 160 : (v_colmajor || (softcap && is_local) ? 192 : 224), true, true};
         } else if (headdim <= 192) {
             return {128, (paged_kv_non_TMA || softcap) && is_local ? 128 : 160, true, true};
         } else {
-            return {128, is_local ? 64 : 128, true, !paged_kv_non_TMA};  // PagedKV uses more registers so we disabled IntraWGOverlap
+            return {128, is_local ? 64 : (v_upcast ? 96 : 128), true, !paged_kv_non_TMA};  // PagedKV uses more registers so we disabled IntraWGOverlap
         }
     }
 }

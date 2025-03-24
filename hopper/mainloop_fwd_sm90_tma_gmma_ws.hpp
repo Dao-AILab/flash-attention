@@ -30,7 +30,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementMmaPV_ = Element_>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -39,9 +39,13 @@ struct CollectiveMainloopFwdSm90 {
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
     using TileShape_MNK_QV = Shape<decltype(get<0>(TileShape_MNK{})), decltype(get<1>(TileShape_MNK{})), Int<kHeadDimV>>;
     using Element = Element_;
+    using ElementMmaPV = ElementMmaPV_;
+    using ElementQv = ElementMmaPV;
     using ElementAccum = ElementAccum_;
     using ArchTag = ArchTag_;
-    static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;;
+    static_assert(cutlass::sizeof_bits_v<Element> == cutlass::sizeof_bits_v<ElementMmaPV> ||
+        (cutlass::sizeof_bits_v<Element> == 8 && cutlass::sizeof_bits_v<ElementMmaPV> == 16), "If Element is not ElementMmaPV, require 8 => 16 bits.");
+    static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;
     static constexpr bool Is_causal = Is_causal_;
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
@@ -52,7 +56,9 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
-    static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
+    static constexpr bool Upcast_V = cutlass::sizeof_bits_v<Element> == 8 && cutlass::sizeof_bits_v<ElementMmaPV> == 16;
+    static constexpr bool Transpose_V = Is_FP8 && !V_colmajor && !Upcast_V;
+    static constexpr bool Transform_V = Transpose_V || Upcast_V;
     static constexpr bool Use_TMA_Q = !PackGQA;
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
@@ -60,10 +66,18 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
     static constexpr bool LargeHeadDimV = kHeadDimV > 256;
 
+    static_assert(!(V_colmajor && Upcast_V), "Don't support upcasting V when V is colmajor.");
+    static_assert(!(Transpose_V && Upcast_V), "Don't both upcast V and transpose V.");
+    static_assert(!(LargeHeadDimV && Upcast_V), "Don't upcast V for large headdim V.");
+    static_assert(!(HasQv && Upcast_V), "Don't upcast V for HasQv");
+    static_assert(!HasQv || cute::is_same_v<Element, ElementQv>, "Type safeguard for HasQv: Element = ElementQv");
+
     static_assert(ArchTag::kMinComputeCapability >= 90);
 
-    static constexpr cute::GMMA::Major MmaMajorV = !Is_FP8 && !V_colmajor ? GMMA::Major::MN : GMMA::Major::K;
+    static constexpr cute::GMMA::Major MmaMajorV = !Transpose_V && !V_colmajor ? GMMA::Major::MN : GMMA::Major::K;
     static constexpr cute::GMMA::Major TmaMajorV = !V_colmajor ? GMMA::Major::MN : GMMA::Major::K;
+    static_assert(!Upcast_V || (MmaMajorV == GMMA::Major::MN && TmaMajorV == GMMA::Major::MN),
+        "If upcasting V, both MmaMajorV and TmaMajorV are GMMA::Major::MN.");
 
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -81,7 +95,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool MmaQK_is_RS = false;
     // We can have MmaPV with P in smem in rmem to reduce register pressure at the cost of more smem.
     static_assert(!(!MmaPV_is_RS && Is_FP8), "MmaPV must be RS if FP8");
-    static_assert(!(!MmaPV_is_RS && Transpose_V), "MmaPV must be RS if Transpose_V");
+    static_assert(!(!MmaPV_is_RS && Transform_V), "MmaPV must be RS if Transform_V");
 
     // Slightly faster in this case to have WG1 use RS instead of SS to avoid waiting for the P smem write
     static constexpr bool MmaPV_use_RS_WG1 = !MmaPV_is_RS && kHeadDim == 64 && kHeadDimV == 512;
@@ -102,23 +116,23 @@ struct CollectiveMainloopFwdSm90 {
     using TiledMmaPV = decltype(cute::make_tiled_mma(
         std::conditional_t<
             !MmaPV_is_RS,
-            decltype(cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
+            decltype(cute::GMMA::ss_op_selector<ElementMmaPV, ElementMmaPV, ElementAccum,
                      TileShape_MNK_PV, GMMA::Major::K, MmaMajorV>()),
-            decltype(cute::GMMA::rs_op_selector<Element, Element, ElementAccum,
+            decltype(cute::GMMA::rs_op_selector<ElementMmaPV, ElementMmaPV, ElementAccum,
                      TileShape_MNK_PV, GMMA::Major::K, MmaMajorV>())
         >{},
         AtomLayoutPV{}));
     using TiledMmaQV = decltype(cute::make_tiled_mma(
-        cute::GMMA::ss_op_selector<Element, Element, ElementAccum, TileShape_MNK_QV>(),
+        cute::GMMA::ss_op_selector<ElementQv, ElementQv, ElementAccum, TileShape_MNK_QV>(),
         AtomLayoutQK{}));
     // For hdim64,512, WG1 can use RS but WG2 must use SS
     using TiledMmaPV_RS = decltype(cute::make_tiled_mma(
-        cute::GMMA::rs_op_selector<Element, Element, ElementAccum, TileShape_MNK_PV, GMMA::Major::K, MmaMajorV>(),
+        cute::GMMA::rs_op_selector<ElementMmaPV, ElementMmaPV, ElementAccum, TileShape_MNK_PV, GMMA::Major::K, MmaMajorV>(),
         AtomLayoutPV{}));
 
     static constexpr int NumMmaThreadsQK = size(TiledMmaQK{});
     static constexpr int NumMmaThreads = size(TiledMmaPV{});
-    static constexpr int NumProducerThreads = !Transpose_V && Use_TMA_KV && Use_TMA_Q ? cutlass::NumThreadsPerWarp : cutlass::NumThreadsPerWarpGroup;
+    static constexpr int NumProducerThreads = !Transform_V && Use_TMA_KV && Use_TMA_Q ? cutlass::NumThreadsPerWarp : cutlass::NumThreadsPerWarpGroup;
     static_assert(NumMmaThreadsQK % cutlass::NumThreadsPerWarpGroup == 0);
     static_assert(NumMmaThreads % cutlass::NumThreadsPerWarpGroup == 0);
     static constexpr int NumMmaWarpGroups = NumMmaThreads / cutlass::NumThreadsPerWarpGroup;
@@ -141,17 +155,17 @@ struct CollectiveMainloopFwdSm90 {
         make_shape(Int<kHeadDimV>{}, shape<2>(TileShape_MNK_PV{}), Int<kStages>{}),
         std::conditional_t<TmaMajorV == GMMA::Major::K, cute::Step<_1, _2, _3>, cute::Step<_2, _1, _3>>{}));
 
-    using SmemLayoutAtomVtMma = decltype(cutlass::gemm::collective::detail::ss_smem_selector<MmaMajorV, Element,
+    using SmemLayoutAtomVtMma = decltype(cutlass::gemm::collective::detail::ss_smem_selector<MmaMajorV, ElementMmaPV,
                                          Int<kHeadDimV>, decltype(cute::get<2>(TileShape_MNK_PV{}))>());
     using SmemLayoutVtMma = decltype(tile_to_shape(
         SmemLayoutAtomVtMma{},
         make_shape(Int<kHeadDimV>{}, shape<2>(TileShape_MNK_PV{}), Int<kStages>{}),
         std::conditional_t<MmaMajorV == GMMA::Major::K, cute::Step<_1, _2, _3>, cute::Step<_2, _1, _3>>{}));
 
-    using SmemLayoutAtomQv = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
+    using SmemLayoutAtomQv = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, ElementQv,
         decltype(cute::get<0>(TileShape_MNK_QV{})), decltype(cute::get<2>(TileShape_MNK_QV{}))>());
     using SmemLayoutQv = decltype(tile_to_shape(SmemLayoutAtomQv{}, select<0, 2>(TileShape_MNK_QV{})));
-    using SmemLayoutAtomVMmaQV = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
+    using SmemLayoutAtomVMmaQV = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, ElementMmaPV,
         decltype(cute::get<1>(TileShape_MNK_QV{})), decltype(cute::get<2>(TileShape_MNK_QV{}))>());
     using SmemLayoutVMmaQV = decltype(tile_to_shape(
         SmemLayoutAtomVMmaQV{},
@@ -165,14 +179,14 @@ struct CollectiveMainloopFwdSm90 {
         SmemLayoutAtomVCpAsync{},
         make_shape(shape<1>(TileShape_MNK{}), Int<kHeadDimV>{}, Int<kStages>{})));
 
-    using SmemLayoutAtomP = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
+    using SmemLayoutAtomP = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, ElementMmaPV,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<1>(TileShape_MNK{}))>());
     using SmemLayoutP = decltype(tile_to_shape(SmemLayoutAtomP{}, select<0, 1>(TileShape_MNK{})));
 
     // Only for LargeHeadDimV where WG0 sends WG1 the scales
     using SmemLayoutScale = cute::Layout<cute::Shape<Int<kBlockM>, Int<kStages>>>;
 
-    using SmemCopyAtomP = Copy_Atom<cute::SM90_U32x4_STSM_N, Element>;
+    using SmemCopyAtomP = Copy_Atom<cute::SM90_U32x4_STSM_N, ElementMmaPV>;
 
     // Use LDSM.T and STSM to transpose V in the case of FP8 and V being row-major.
     // For FP16/BF16 we don't do any transposing.
@@ -204,6 +218,31 @@ struct CollectiveMainloopFwdSm90 {
     using R2STiledCopyV = decltype(make_tiled_copy(
         Copy_Atom<SM90_U32x4_STSM_N, Element>{}, Layout<STSM_thread_shape, STSM_thread_stride>{},
         Layout<STSM_value_shape, STSM_value_stride>{}));
+
+    // Use LDSM and STSM for upcasting V, e.g. FP8 to FP16
+    constexpr static int UpcastThrDivisor = kHeadDimV % 128 == 0 ? 2 : 1;
+    constexpr static int UpcastValDivisor = kHeadDimV % 64 == 0 ? 2 : 1;
+    static_assert(!Upcast_V || (kHeadDimV % 128 == 0 && kBlockN % 16 == 0)
+        || (kHeadDimV % 64 == 0 && kBlockN % 32 == 0)
+        || (kHeadDimV % 32 == 0 && kBlockN % 64 == 0));
+    // (128, 16), (64, 32), (32, 64) for hdim 128, 64, 32, dividing into (HeadDim, kBlockN)
+    using LDSM_upcast_div_shape = Shape<Shape<_16, Int<2 * UpcastValDivisor>>, _8>;
+    using LDSM_upcast_thr_shape = Shape<_4, _1, _8, Int<UpcastThrDivisor>, Int<4 / UpcastThrDivisor>>;
+    using LDSM_upcast_val_shape = Shape<_4, Int<2 * UpcastValDivisor>, _1, _1, Int<2 / UpcastValDivisor>>;
+
+    using S2RTiledCopyUpcastVt = decltype(make_tiled_copy(
+            Copy_Atom<SM75_U32x4_LDSM_N, Element>{},
+            Layout<LDSM_upcast_thr_shape, LayoutLeft::Apply<LDSM_upcast_thr_shape>>{},
+            Layout<LDSM_upcast_val_shape, LayoutLeft::Apply<LDSM_upcast_val_shape>>{}));
+
+    using STSM_upcast_div_shape = Shape<Shape<Int<16 / sizeof(ElementMmaPV)>, Int<2 * UpcastValDivisor * sizeof(ElementMmaPV)>>, _8>;
+    using STSM_upcast_thr_shape = LDSM_upcast_thr_shape;
+    using STSM_upcast_val_shape = Shape<Int<4/sizeof(ElementMmaPV)>, Int<2 * UpcastValDivisor>, _1, _1, Int<2 / UpcastValDivisor>>;
+    
+    using R2STiledCopyUpcastV = decltype(make_tiled_copy(
+        Copy_Atom<SM90_U32x4_STSM_N, ElementMmaPV>{},
+        Layout<STSM_upcast_thr_shape, LayoutLeft::Apply<STSM_upcast_thr_shape>>{},
+        Layout<STSM_upcast_val_shape, LayoutLeft::Apply<STSM_upcast_val_shape>>{}));
 
     using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
     using GmemTiledCopyKV = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<0>(ClusterShape{})));
@@ -268,7 +307,7 @@ struct CollectiveMainloopFwdSm90 {
 
     using TMA_Qv_ = decltype(make_tma_copy_A_sm90(
         GmemTiledCopyQ{},
-        make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQK{}),
+        make_tensor(make_gmem_ptr(static_cast<ElementQv const*>(nullptr)), ShapeQKV{}, StrideQK{}),
         SmemLayoutQv{},
         TileShape_MNK_QV{},
         ClusterShape{}));
@@ -278,11 +317,11 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutVt{})) * cutlass::sizeof_bits_v<Element> / 8);
-    static constexpr uint32_t TmaTransactionBytesQv = static_cast<uint32_t>(size(SmemLayoutQv{}) * cutlass::sizeof_bits_v<Element> / 8);
+    static constexpr uint32_t TmaTransactionBytesQv = static_cast<uint32_t>(size(SmemLayoutQv{}) * cutlass::sizeof_bits_v<ElementQv> / 8);
 
     using PipelineTmaAsync = std::conditional_t<CUTE_STATIC_V(size(ClusterShape{})) == 1, typename cutlass::PipelineTmaAsyncNoCluster<kStages>, typename cutlass::PipelineTmaAsync<kStages>>;
     using MainloopPipelineK = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
-    using MainloopPipelineV = std::conditional_t<!Transpose_V && Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
+    using MainloopPipelineV = std::conditional_t<!Transform_V && Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
     using MainloopPipelineVt = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
     // We always use TMA for K_new and V_new
     using MainloopPipelineKVNew = PipelineTmaAsync;
@@ -299,9 +338,9 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr size_t SmemAlignmentP = cutlass::detail::alignment_for_swizzle(SmemLayoutP{});
     static_assert(SmemAlignmentP >= 128, "Require at least 128B alignment");
 
-    using SmemP_t = std::conditional_t<MmaPV_is_RS, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutP>, SmemAlignmentP>>;
+    using SmemP_t = std::conditional_t<MmaPV_is_RS, cute::array<ElementMmaPV, 0>, cute::array_aligned<ElementMmaPV, cute::cosize_v<SmemLayoutP>, SmemAlignmentP>>;
     using SmemScale_t = std::conditional_t<!LargeHeadDimV, cute::array<float, 0>, cute::array_aligned<float, cute::cosize_v<SmemLayoutScale>, 128>>;
-    using SmemQv_t = std::conditional_t<!HasQv, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutQv>, SmemAlignmentQv>>;
+    using SmemQv_t = std::conditional_t<!HasQv, cute::array<ElementQv, 0>, cute::array_aligned<ElementQv, cute::cosize_v<SmemLayoutQv>, SmemAlignmentQv>>;
     // Sometimes even with SmemP_t = cute::array<Element, 0>, putting it in the TensorStorage struct causes
     // smem size to go from 227KB to 228KB and we get "invalid argument".
 
@@ -337,8 +376,9 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr size_t SmemAlignmentVt = cutlass::detail::alignment_for_swizzle(SmemLayoutVt{});
     static constexpr size_t SmemAlignmentV = cutlass::detail::alignment_for_swizzle(SmemLayoutVtMma{});
     static_assert(SmemAlignmentVt >= 128 and SmemAlignmentV >= 128, "Require at least 128B alignment");
+    // used for TransformV, i.e. TransposeV or UpcastV
     struct TensorStorageTransposeV : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentV), _0> {
-        cute::array_aligned<Element, cute::cosize_v<SmemLayoutVtMma>, SmemAlignmentV> smem_v;
+        cute::array_aligned<ElementMmaPV, cute::cosize_v<SmemLayoutVtMma>, SmemAlignmentV> smem_v;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVt> smem_vt;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
@@ -346,14 +386,14 @@ struct CollectiveMainloopFwdSm90 {
         SmemScale_t smem_scale;
     };
 
-    using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose, TensorStorageTransposeV>;
+    using TensorStorage = std::conditional_t<!Transform_V, TensorStorageNoTranspose, TensorStorageTransposeV>;
 
     // These are tuned for speed. They don't affect correctness.
     static constexpr bool UseSchedulerBarrier = (IntraWGOverlap
         ? (NumMmaWarpGroups >= 2) && (!Is_FP8 ? kHeadDim <= 128 : kHeadDim >= 128)
         : NumMmaWarpGroups == 2)
         && !LargeHeadDimV;
-    static constexpr bool RescaleOBeforeGemm = kHeadDim > 128 && (!Is_FP8 || V_colmajor) && IntraWGOverlap;
+    static constexpr bool RescaleOBeforeGemm = kHeadDim > 128 && (!Is_FP8 || V_colmajor || Upcast_V) && IntraWGOverlap;
 
     // Host side kernel arguments
     struct Arguments {
@@ -371,7 +411,7 @@ struct CollectiveMainloopFwdSm90 {
         StrideQK const stride_K_new;
         Element const* const ptr_V_new;
         StrideV const stride_V_new;
-        Element const* const ptr_Qv;
+        ElementQv const* const ptr_Qv;
         StrideQK const stride_Qv;
         Element const* const ptr_rotary_cos;
         ShapeRotary const shape_rotary;
@@ -416,7 +456,7 @@ struct CollectiveMainloopFwdSm90 {
         StrideQK const stride_K_new;
         Element const* const ptr_V_new;
         StrideV const stride_V_new;
-        Element const* const ptr_Qv;
+        ElementQv const* const ptr_Qv;
         StrideV const stride_Qv;
         ShapeQPacked const shape_Qv_packed;
         StrideQPacked const stride_Qv_packed;
@@ -618,17 +658,17 @@ struct CollectiveMainloopFwdSm90 {
         // as_position_independent_swizzle_tensor makes address calculation easier when we do LDSM & STSM to transpose.
         // But it requires smem_vt and smem_v to be aligned to e.g 512 bytes.
         Tensor sVt = [&] {
-            if constexpr (!Transpose_V) {
+            if constexpr (!Transform_V) {
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
             } else {
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVt{}));
             }
         }();
-        // Only used if Transpose_V
+        // Only used if Transform_V
         Tensor sV = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{}));
         // Only used if we're using cp.async to load V
         Tensor sVcpasync = [&] {
-            if constexpr (!Transpose_V) {
+            if constexpr (!Transform_V) {
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVCpAsync{}));
             } else {
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVCpAsync{}));
@@ -684,7 +724,7 @@ struct CollectiveMainloopFwdSm90 {
         // This is used to index into the batch dimension of mK and mV
         int const bidb_kv_idx = !is_varlen_k && !params.ptr_pagetable ? bidb_kv : 0;
 
-        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, Element, Transpose_V || !IntraWGOverlap /*KV_Same_Iter*/>;
+        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, Element, Transform_V || !IntraWGOverlap /*KV_Same_Iter*/>;
         PagedKVManager_t paged_kv_manager(
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
@@ -732,6 +772,84 @@ struct CollectiveMainloopFwdSm90 {
             }
         };
 
+        // Set up for upcasting V, only used if Upcast_V
+        S2RTiledCopyUpcastVt s2r_tiled_copy_upcast_vt;
+        R2STiledCopyUpcastV r2s_tiled_copy_upcast_v;
+        auto s2r_thr_copy_upcast_vt = s2r_tiled_copy_upcast_vt.get_thread_slice(thread_idx);
+        auto r2s_thr_copy_upcast_v = r2s_tiled_copy_upcast_v.get_thread_slice(thread_idx);
+        auto sVt_upcast_divide = flat_divide(flat_divide(sVt, product_each(LDSM_upcast_div_shape{})), make_coord(get<0,0>(LDSM_upcast_div_shape{})));
+        auto sV_upcast_divide = flat_divide(flat_divide(sV, product_each(STSM_upcast_div_shape{})), make_coord(get<0,0>(STSM_upcast_div_shape{})));
+        static_assert(rank(sVt_upcast_divide) == 6); static_assert(rank(sV_upcast_divide) == 6);
+        
+        Tensor tUpcastsVt_ = s2r_thr_copy_upcast_vt.partition_S(sVt_upcast_divide);
+        Tensor tUpcastsV_ = r2s_thr_copy_upcast_v.partition_D(sV_upcast_divide);
+        Tensor tUpcastsVt = logical_divide(group_modes<1, rank(tUpcastsVt_) - 1>(tUpcastsVt_), Shape<Underscore, _1>{});
+        Tensor tUpcastsV = logical_divide(group_modes<1, rank(tUpcastsV_) - 1>(tUpcastsV_), Shape<Underscore, Int<sizeof(ElementMmaPV)>>{});
+
+        static constexpr int Upcast_ILP = size<1>(tUpcastsVt) % 2 == 0 ? 2 : 1;
+        Tensor tUpcastsVt_ILP = logical_divide(tUpcastsVt, Shape<Underscore, Int<Upcast_ILP>>{});
+        Tensor tUpcastsV_ILP = logical_divide(tUpcastsV, Shape<Underscore, Shape<Underscore, Int<Upcast_ILP>>>{});
+
+        auto upcast_V = [&](int stage) {
+            if constexpr (Upcast_V) {
+                #pragma unroll
+                for (int i = 0; i < size<1, 1>(tUpcastsVt_ILP); ++i) {
+                    Tensor tUpcastrV = make_fragment_like(tUpcastsVt_ILP(_, make_coord(_, _0{}), _0{}));
+                    static_assert(size<0>(tUpcastrV) == 16);
+                    static_assert(size<1>(tUpcastrV) == Upcast_ILP);
+                    static_assert(rank(tUpcastrV) == 2);
+                    cute::copy(s2r_tiled_copy_upcast_vt, tUpcastsVt_ILP(_, make_coord(_, i), stage), tUpcastrV);
+
+                    // measured slower
+                    // Tensor tUpcastrV_dst_all = make_tensor_like<ElementMmaPV>(tUpcastrV);
+                    // convert_type_out(tUpcastrV, tUpcastrV_dst_all);
+                    
+                    static constexpr int numel = decltype(size(tUpcastrV))::value;
+                    cutlass::NumericArrayConverter<ElementMmaPV, Element, numel> convert_op;
+                    auto frag = convert_op(*reinterpret_cast<const cutlass::Array<Element, numel> *>(tUpcastrV.data()));
+                    Tensor tUpcastrV_dst_all = make_tensor(make_rmem_ptr<ElementMmaPV>(&frag), tUpcastrV.layout());
+                    // Tensor tUpcastrV_dst_all = convert_type_unsafe<ElementMmaPV>(tUpcastrV); // equivalent
+                    
+                    auto tUpcastrV_dst = flat_divide(tUpcastrV_dst_all, Shape<Int<16/sizeof(ElementMmaPV)>>{});
+
+                    static_assert(size<0>(tUpcastrV_dst) == 8);
+                    static_assert(size<1>(tUpcastrV_dst) == sizeof(ElementMmaPV));
+                    static_assert(size<2>(tUpcastrV_dst) == Upcast_ILP);
+                    static_assert(rank(tUpcastrV_dst) == 3);
+
+                    #pragma unroll
+                    for(int j = 0; j < sizeof(ElementMmaPV); ++j) {
+                        cute::copy(r2s_tiled_copy_upcast_v,
+                            tUpcastrV_dst(make_coord(_, j, _)),
+                            tUpcastsV_ILP(_, make_coord(j, make_coord(_, i)), stage));
+                    }
+                }
+            }
+
+            // No ILP version
+            // if constexpr (Upcast_V) {
+            //     #pragma unroll
+            //     for (int i = 0; i < size<1>(tUpcastsVt); ++i) {
+            //         Tensor tUpcastrV = make_fragment_like(tUpcastsVt(_, _0{}, _0{}));
+            //         static_assert(size(tUpcastrV) == 16, "16 byte value for upcast");
+            //         cute::copy(s2r_tiled_copy_upcast_vt, tUpcastsVt(_, i, stage), tUpcastrV);
+
+            //         Tensor tUpcastrV_src = logical_divide(tUpcastrV, Shape<Int<16 / sizeof(ElementMmaPV)>>{});
+            //         Tensor tUpcastrV_dst = make_tensor_like<ElementMmaPV>(tUpcastrV_src);
+
+            //         #pragma unroll
+            //         for(int j = 0; j < sizeof(ElementMmaPV); ++j) {
+            //             auto half_coord = make_coord(make_coord(_,j));
+            //             auto tUpcastrV_src_half = tUpcastrV_src(half_coord);
+            //             auto tUpcastrV_dst_half = tUpcastrV_dst(half_coord);
+            //             convert_type_out(tUpcastrV_src_half, tUpcastrV_dst_half);
+            //             cute::copy(r2s_tiled_copy_upcast_v, tUpcastrV_dst_half, tUpcastsV(_, make_coord(j, i), stage));
+            //         }
+                            
+            //     }
+            // }
+        };
+
         uint16_t mcast_mask_kv = 0;
         if constexpr (cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST>) {
             auto block_layout = Layout<ClusterShape>{}; // (m,n) -> block_id
@@ -754,7 +872,7 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         auto load_V = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
-            auto pipeline_v_load = cute::conditional_return<!Transpose_V>(pipeline_v, pipeline_vt);
+            auto pipeline_v_load = cute::conditional_return<!Transform_V>(pipeline_v, pipeline_vt);
             pipeline_v_load.producer_acquire(smem_pipe_write);
             if constexpr (!PagedKVNonTMA) {
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_V_TMA();
@@ -774,7 +892,11 @@ struct CollectiveMainloopFwdSm90 {
             PipelineState smem_pipe_read{smem_pipe_write.index(), smem_pipe_write.phase() ^ 1, smem_pipe_write.count()};
             pipeline_vt.consumer_wait(smem_pipe_read);
             pipeline_v.producer_acquire(smem_pipe_write);
-            transpose_V(smem_pipe_write.index());
+            if constexpr(Transpose_V) {
+                transpose_V(smem_pipe_write.index());
+            } else if constexpr(Upcast_V) {
+                upcast_V(smem_pipe_write.index());
+            }
             // SMEM fence to make sure V is transposed before math
             cutlass::arch::fence_view_async_shared();
             pipeline_v.producer_commit(smem_pipe_write);
@@ -797,7 +919,7 @@ struct CollectiveMainloopFwdSm90 {
             } else {
                 paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block);
             }
-            if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
+            if constexpr (Transform_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
             // if (thread_idx == 0) { printf("Producer: main load, before load_K, index = %d\n", smem_pipe_write.index());}
             load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
             // if (thread_idx == 0) { printf("Producer: main load, after load K, index = %d\n", smem_pipe_write.index());}
@@ -831,7 +953,7 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (HasQv) {
                 Tensor mQv = make_tensor(make_gmem_ptr(params.ptr_Qv + seqlen_info.offset_q * get<0>(params.stride_Qv)), params.shape_Qv_packed, params.stride_Qv_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
                 Tensor sQv_pi = cute::as_position_independent_swizzle_tensor(sQv);
-                using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK_QV{}), get<2>(TileShape_MNK_QV{}), NumProducerThreads, Element>;
+                using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK_QV{}), get<2>(TileShape_MNK_QV{}), NumProducerThreads, ElementQv>;
                 PackGQAt::load_Q(mQv, sQv_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_info.seqlen_q, m_block);
                 auto &barrier_Qv = shared_storage.pipelines.barrier_Qv;
                 cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Qv));
@@ -846,12 +968,12 @@ struct CollectiveMainloopFwdSm90 {
         shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
         // if (thread_idx == 0) { printf("Producer: main load, after barrier_O\n");}
 
-        if constexpr (!Transpose_V && !IntraWGOverlap) {
+        if constexpr (!Transform_V && !IntraWGOverlap) {
             if (should_load_KV) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
         }
         int n_block_prev = n_block;
         --n_block;
-        #pragma unroll (!Transpose_V && Use_TMA_KV ? 2 : 1)
+        #pragma unroll (!Transform_V && Use_TMA_KV ? 2 : 1)
         for (; n_block >= n_block_min; --n_block) {
             PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
             ++smem_pipe_write;
@@ -861,9 +983,9 @@ struct CollectiveMainloopFwdSm90 {
                 } else {
                     paged_kv_manager.load_page_table_TMA(n_block);
                 }
-                if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
+                if constexpr (Transform_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
                 load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
-                if constexpr (!Transpose_V) {
+                if constexpr (!Transform_V) {
                     if constexpr (IntraWGOverlap) {
                         load_V(n_block_prev, smem_pipe_write_v, cute::true_type{} /*Seqlenk_mask*/);
                     } else {
@@ -872,13 +994,13 @@ struct CollectiveMainloopFwdSm90 {
                 }
             }
             n_block_prev = n_block;
-            if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
+            if constexpr (Transform_V) { copy_Vt_to_V(smem_pipe_write_v); }
         }
         scheduler_prefetch();
-        if constexpr (!Transpose_V && IntraWGOverlap) {
+        if constexpr (!Transform_V && IntraWGOverlap) {
             if (should_load_KV) { load_V(n_block_prev, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
         }
-        if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }
+        if constexpr (Transform_V) { copy_Vt_to_V(smem_pipe_write); }
         ++smem_pipe_write;
         // At the end, all threads have the correct smem_pipe_write.
         ++work_idx;
@@ -901,7 +1023,7 @@ struct CollectiveMainloopFwdSm90 {
             */
             pipeline_k.producer_tail(smem_pipe_write);
             pipeline_v.producer_tail(smem_pipe_write);
-            if constexpr (Transpose_V) { pipeline_vt.producer_tail(smem_pipe_write); }
+            if constexpr (Transform_V) { pipeline_vt.producer_tail(smem_pipe_write); }
         }
     }
 
@@ -981,8 +1103,8 @@ struct CollectiveMainloopFwdSm90 {
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});
         Tensor sP = [&] {
             if constexpr (MmaPV_is_RS) {
-                // We might not have smem_p if !MmaPV_is_RS, just use smem_q as a placeholder since we don't use it
-                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutP{});
+                // We might not have smem_p if !MmaPV_is_RS, just use smem_v as a placeholder since we don't use it
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutP{});
             } else {
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_p.data()), SmemLayoutP{});
             }
@@ -1146,9 +1268,9 @@ struct CollectiveMainloopFwdSm90 {
             // Don't need to store scales to send to WG1 (in the case of LargeHeadDimV) since it's 1.f
 
             softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
-            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
+            if constexpr (Is_FP8 && Transpose_V) { flash::permute_Cregs_fp8(tSrS); }
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
-            Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
+            Tensor tOrP = make_tensor_like<ElementMmaPV>(tOrP_acc);
             convert_type_out(tOrP_acc, tOrP);
             if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
             if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
@@ -1191,7 +1313,7 @@ struct CollectiveMainloopFwdSm90 {
                     warpgroup_wait<0>();
                     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
                 }
-                if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
+                if constexpr (Is_FP8 && Transpose_V) { flash::permute_Cregs_fp8(tSrS); }
                 convert_type_out(make_tensor(tSrS.data(), tOrP.layout()), tOrP);
                 if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
@@ -1243,7 +1365,7 @@ struct CollectiveMainloopFwdSm90 {
             warpgroup_wait<0>();
             pipeline_v.consumer_release(smem_pipe_read);  // release V, otherwise producers will hang
             softmax.rescale_o(tOrO, scores_scale);
-            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+            if constexpr (Is_FP8 && Transpose_V) { flash::permute_output_fp8(tOrO); }
             ++smem_pipe_read;
 
         } else {  // No intra-WG overlap
@@ -1278,9 +1400,9 @@ struct CollectiveMainloopFwdSm90 {
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
-                if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
+                if constexpr (Is_FP8 && Transpose_V) { flash::permute_Cregs_fp8(tSrS); }
                 Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
-                Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
+                Tensor tOrP = make_tensor_like<ElementMmaPV>(tOrP_acc);
                 convert_type_out(tOrP_acc, tOrP);
                 if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
@@ -1341,7 +1463,7 @@ struct CollectiveMainloopFwdSm90 {
                 cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
             }
             softmax.rescale_o(tOrO, scores_scale);
-            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+            if constexpr (Is_FP8 && Transpose_V) { flash::permute_output_fp8(tOrO); }
             ++smem_pipe_read;
         }
         ++work_idx;
@@ -1360,6 +1482,7 @@ struct CollectiveMainloopFwdSm90 {
            cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
            SharedStorage& shared_storage
            ) {
+        static_assert(!Upcast_V, "Upcast V not supported for mma_pv.");
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         // can't use auto [m_block, ...] = block_coord since structured binding cannot be captured in lambda
         int const m_block = get<0>(block_coord);

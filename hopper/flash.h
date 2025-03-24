@@ -144,6 +144,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_e4m3;
     bool is_causal;
     bool is_local;
+    bool upcast_V;
 
     bool is_rotary_interleaved;
 
