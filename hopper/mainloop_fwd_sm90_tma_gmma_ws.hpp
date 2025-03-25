@@ -1582,7 +1582,7 @@ struct CollectiveMainloopFwdSm90 {
 
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
         Tensor sVt = [&] {
-            if constexpr (!Transpose_V) {
+            if constexpr (!Transform_V) {
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
             } else {
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVt{});
@@ -1685,7 +1685,7 @@ struct CollectiveMainloopFwdSm90 {
         Tensor sK = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{}));
         // We want to use SmemLayoutVCpAsync to have shape (kBlockN, kHeadDim) instead of (kHeadDim, kBlockN)
         Tensor sV = [&] {
-            if constexpr (!Transpose_V) {
+            if constexpr (!Transform_V) {
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVCpAsync{}));
             } else {
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVCpAsync{}));
