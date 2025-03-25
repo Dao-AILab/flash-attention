@@ -388,7 +388,7 @@ public:
         // If Split, for the purpose of scheduling, we pretend that instead there are
         // (args.num_splits * args.num_head) number of heads.
         assert(args.tile_count_semaphore != nullptr);
-        assert(num_head < (1 << 16));  // We use the top 16 bits to store num_splits & split_idx
+        assert(args.num_head < (1 << 16));  // We use the top 16 bits to store num_splits & split_idx
         assert(!Split || args.num_splits < (1 << 8)); // We use the top 8 bits to store num_splits
         return {args.num_head, args.num_batch,
                 args.qhead_per_khead, args.seqlen,
