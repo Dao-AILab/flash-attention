@@ -318,11 +318,11 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
                       const at::Tensor &block_offset,
                       const at::Tensor &column_count,
                       const at::Tensor &column_index,
-                      const c10::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+                      const std::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
                       const at::Tensor &cu_seqlens_q,  // b+1
                       const at::Tensor &cu_seqlens_k,  // b+1
-                      const c10::optional<at::Tensor> &seqused_k, // b. If given, only this many elements of each batch element's keys are used.
-                      const c10::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
+                      const std::optional<at::Tensor> &seqused_k, // b. If given, only this many elements of each batch element's keys are used.
+                      const std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
                       int64_t max_seqlen_q,
                       const int64_t max_seqlen_k,
                       const double p_dropout,
@@ -331,7 +331,7 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
                       bool is_causal,
                       const double softcap,
                       const bool return_softmax,
-                      c10::optional<at::Generator> gen_) {
+                      std::optional<at::Generator> gen_) {
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x = cc_major == 8 && cc_minor >= 0;
