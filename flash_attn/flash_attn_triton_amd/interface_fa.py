@@ -280,8 +280,12 @@ def varlen_fwd(
     metadata = MetaData(sm_scale=softmax_scale)
     if return_softmax:
         metadata.return_scores = True
-    metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k)  # set layout to "thd" and other metdata
-
+    metadata.varlen = True
+    metadata.layout = 'thd'
+    metadata.cu_seqlens_q = cu_seqlens_q
+    metadata.cu_seqlens_k = cu_seqlens_k
+    metadata.max_seqlens_q = max_seqlen_q
+    metadata.max_seqlens_k = max_seqlen_k
     # get shapes
     batch, nheads_q, nheads_k, head_size , seqlen_q, seqlen_k = get_shape_from_layout(q, k, metadata.layout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
 
