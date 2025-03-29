@@ -1124,7 +1124,11 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
             //     params.b = 1;
             //     params.seqlen_q = total_q;
             // }
+            // This will zero out the semaphore if needed
             run_mha_fwd_combine(params, stream, true /*enable_pdl*/);
+        } else if (scheduler_needs_semaphore && params.skip_scheduler_metadata_computation) {
+            // need to zero out the semaphore in this case
+            tile_count_semaphore.index({torch::indexing::Slice(0, 1)}).zero_();
         }
     } else if (total_q > 0 && num_heads_k > 0) {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
