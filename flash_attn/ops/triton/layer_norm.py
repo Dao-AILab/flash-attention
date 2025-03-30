@@ -10,10 +10,12 @@ import math
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import custom_fwd, custom_bwd
 
 import triton
 import triton.language as tl
+
+from flash_attn.utils.torch import custom_fwd, custom_bwd
+
 
 def triton_autotune_configs():
     # Return configs with a valid warp count for the current device
