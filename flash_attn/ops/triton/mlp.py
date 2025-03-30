@@ -4,7 +4,7 @@ import fused_dense_lib as fused_dense_cuda
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import custom_bwd, custom_fwd
+from torch.amp import custom_bwd, custom_fwd
 
 from flash_attn.ops.activations import sqrelu_bwd, sqrelu_fwd
 from flash_attn.ops.triton.linear import triton_dgrad_act, triton_linear_act
@@ -12,7 +12,7 @@ from flash_attn.ops.triton.linear import triton_dgrad_act, triton_linear_act
 
 class FusedDenseSqreluDenseFunc(torch.autograd.Function):
     @staticmethod
-    @custom_fwd
+    @custom_fwd(device_type="cuda")
     def forward(ctx, x, weight1, bias1, weight2, bias2, checkpoint_lvl=0):
         """checkpoint_lvl:
         0: no recomputation in the bwd
@@ -62,7 +62,7 @@ class FusedDenseSqreluDenseFunc(torch.autograd.Function):
         return output2.reshape(*batch_shape, output2.shape[-1])
 
     @staticmethod
-    @custom_bwd
+    @custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
         grad_output = grad_output.contiguous()
         checkpoint_lvl = ctx.checkpoint_lvl
