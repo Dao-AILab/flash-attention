@@ -55,7 +55,7 @@ struct Tile {
   INLINE void zero() { set(ValueT(0)); }
 
   // Returns sub group size
-  INLINE static constexpr int get_sg_size() { return Layout::ArchConfig::kSubGroupSize; }
+  INLINE static constexpr int get_sg_size() { return Layout::Arch::kSubGroupSize; }
 
   // Returns the tile's block width
   INLINE static constexpr int get_block_width() {
@@ -256,8 +256,8 @@ struct Tile {
   }
 };
 
-template <typename ValueT_, typename Layout_>
-Tile<ValueT_, Layout_> exp(const Tile<ValueT_, Layout_> &src) {
+template <typename ValueT_, typename Layout_, typename Func_>
+INLINE Tile<ValueT_, Layout_> elementwise(const Tile<ValueT_, Layout_> &src, Func_ func) {
   Tile<ValueT_, Layout_> dst;
 
 #pragma unroll
@@ -269,7 +269,7 @@ Tile<ValueT_, Layout_> exp(const Tile<ValueT_, Layout_> &src) {
 
 #pragma unroll
       for (int i = 0; i < Layout_::kLength; i++) {
-        dst_block[i] = sycl::exp(src_block[i]);
+        dst_block[i] = func(src_block[i]);
       }
     }
   }
@@ -278,24 +278,13 @@ Tile<ValueT_, Layout_> exp(const Tile<ValueT_, Layout_> &src) {
 }
 
 template <typename ValueT_, typename Layout_>
+Tile<ValueT_, Layout_> exp(const Tile<ValueT_, Layout_> &src) {
+  return elementwise(src, [](ValueT_ x) { return sycl::exp(x); });
+}
+
+template <typename ValueT_, typename Layout_>
 Tile<ValueT_, Layout_> exp2(const Tile<ValueT_, Layout_> &src) {
-  Tile<ValueT_, Layout_> dst(0);
-
-#pragma unroll
-  for (int x = 0; x < Layout_::kReplicaX; x++) {
-#pragma unroll
-    for (int y = 0; y < Layout_::kReplicaY; y++) {
-      auto &dst_block = dst.block_as_array(x, y);
-      auto &src_block = src.block_as_array(x, y);
-
-#pragma unroll
-      for (int i = 0; i < Layout_::kLength; i++) {
-        dst_block[i] = sycl::exp2(src_block[i]);
-      }
-    }
-  }
-
-  return dst;
+  return elementwise(src, [](ValueT_ x) { return sycl::exp2(x); });
 }
 
 //==------------------------------- MakeTile -------------------------------==//

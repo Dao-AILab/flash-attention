@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sytla/core/common.hpp"
+#include <type_traits>
 
 namespace sytla {
 
@@ -37,13 +38,6 @@ struct SubArray {
   INLINE SubArray(SubArray &&rhs) = default;
   INLINE SubArray &operator=(const SubArray &rhs) = default;
 
-// Remove this due to ambiguous construction funciton
-//   INLINE SubArray(const ElementT &val) {
-// #pragma unroll
-//     for (int i = 0; i < kLength; ++i) {
-//       data_[i] = val;
-//     }
-//   }
   INLINE SubArray(VectorT vec) { data_ = sycl::bit_cast<Storage>(vec); }
 
   INLINE VectorT vector() const { return sycl::bit_cast<VectorT>(data_); }
@@ -70,20 +64,37 @@ struct SubArray {
   INLINE ElementT &operator[](int index) { return data_[index]; }
 };
 
-//==------------------------------- Operators ------------------------------==//
+// ==------------------------------- Operators ------------------------------==//
+
+// #define __SUB_ARRAY_BINOP_SCALAR(OP)                                                               \
+//   template <typename T, int N>                                                                     \
+//   INLINE SubArray<T, N> operator OP(const SubArray<T, N> &lhs, const T & rhs) {                    \
+//     return SubArray<T, N>{lhs.vector() OP rhs};                                                    \
+//   }                                                                                                \
+//   template <typename T, int N>                                                                     \
+//   INLINE SubArray<T, N> operator OP(const T & lhs, const SubArray<T, N> &rhs) {                    \
+//     return SubArray<T, N>{lhs OP rhs.vector()};                                                    \
+//   }                                                                                                \
+//   template <typename T, int N>                                                                     \
+//   INLINE SubArray<T, N> operator OP(const SubArray<T, N> &lhs, const SubArray<T, N> &rhs) {        \
+//     return SubArray<T, N>{lhs.vector() OP rhs.vector()};                                           \
+//   }
 
 #define __SUB_ARRAY_BINOP_SCALAR(OP)                                                               \
-  template <typename T, int N>                                                                     \
-  INLINE SubArray<T, N> operator OP(const SubArray<T, N> &lhs, const T &rhs) {                     \
-    return SubArray<T, N>{lhs.vector() OP rhs};                                                    \
-  }                                                                                                \
-  template <typename T, int N>                                                                     \
-  INLINE SubArray<T, N> operator OP(const T &lhs, const SubArray<T, N> &rhs) {                     \
-    return SubArray<T, N>{lhs OP rhs.vector()};                                                    \
-  }                                                                                                \
-  template <typename T, int N>                                                                     \
-  INLINE SubArray<T, N> operator OP(const SubArray<T, N> &lhs, const SubArray<T, N> &rhs) {        \
-    return SubArray<T, N>{lhs.vector() OP rhs.vector()};                                           \
+  template <typename Lhs, typename Rhs,                                                            \
+            typename T = typename std::common_type_t<Lhs, Rhs>::ElementT,                          \
+            int N = std::common_type_t<Lhs, Rhs>::kLength,                                         \
+            typename enable = std::enable_if_t<std::is_same_v<Lhs, SubArray<T, N>> ||              \
+                                               std::is_same_v<Rhs, SubArray<T, N>>>>               \
+  INLINE auto operator OP(const Lhs &lhs, const Rhs &rhs) {                                        \
+    auto get_vector = [](const auto &x) {                                                          \
+      if constexpr (std::is_same_v<std::decay_t<decltype(x)>, SubArray<T, N>>) {                   \
+        return x.vector();                                                                         \
+      } else {                                                                                     \
+        return x;                                                                                  \
+      }                                                                                            \
+    };                                                                                             \
+    return SubArray<T, N>{get_vector(lhs) OP get_vector(rhs)};                                     \
   }
 
 __SUB_ARRAY_BINOP_SCALAR(+)
@@ -105,7 +116,7 @@ INLINE SubArray<T, N> max(const SubArray<T, N> &lhs, const SubArray<T, N> &rhs) 
 template <typename T, int N>
 INLINE SubArray<T, N> exp(const SubArray<T, N> &x) {
   SubArray<T, N> ret;
-  #pragma unroll
+#pragma unroll
   for (int i = 0; i < SubArray<T, N>::size(); ++i) {
     ret[i] = sycl::exp(x[i]);
   }
@@ -115,7 +126,7 @@ INLINE SubArray<T, N> exp(const SubArray<T, N> &x) {
 template <typename T, int N>
 INLINE SubArray<T, N> exp2(const SubArray<T, N> &x) {
   SubArray<T, N> ret;
-  #pragma unroll
+#pragma unroll
   for (int i = 0; i < SubArray<T, N>::size(); ++i) {
     ret[i] = sycl::exp2(x[i]);
   }

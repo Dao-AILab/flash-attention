@@ -91,7 +91,9 @@ INLINE std::enable_if_t<kHorizontal && N == 8, float> reduce(const vector_type_t
     return inline_asm::__sum_f_8x16(v);
   }
 #else
-  return 0.0f;
+  // throw an error in non-SYCL environments
+  assert(false &&
+         "Reduction for float8 is only supported in SYCL device code with inline assembly");
 #endif
 }
 
@@ -105,7 +107,9 @@ INLINE std::enable_if_t<kHorizontal && N == 16, float> reduce(const vector_type_
     return inline_asm::__sum_f_16x16(v);
   }
 #else
-  return 0.0f;
+  // throw an error in non-SYCL environments
+  assert(false &&
+         "Reduction for float16 is only supported in SYCL device code with inline assembly");
 #endif
 }
 
