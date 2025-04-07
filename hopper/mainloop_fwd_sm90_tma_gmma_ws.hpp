@@ -1658,7 +1658,7 @@ struct CollectiveMainloopFwdSm90 {
                     rotary.template apply_K_contiguous<PagedKVNonTMA>(sK(_, _, smem_pipe_read.index()), gK_cur, tKpK, tRrCosCont, tRrSinCont, tPrKPtr, n_block, get<1>(params.shape_K));
                 }
             }
-            // Without this sync I'm getting race condition when seqlen_k is large
+            // Without this fence I'm getting race condition when seqlen_k is large
             cutlass::arch::fence_view_async_shared();
             // Very important: PipelineTmaAsync::consumer_release assumes that the warpgroup is synchronized
             // before calling.
