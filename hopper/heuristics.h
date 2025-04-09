@@ -22,9 +22,20 @@ inline bool should_pack_gqa(bool varlen_q, int seqlen_q, int qhead_per_khead, in
 // splits as that would incur more HBM reads/writes.
 // So we find the best efficiency, then find the smallest number of splits that gets 85%
 // of the best efficiency.
-inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
+inline int num_splits_heuristic(int total_mblocks, int num_SMs, int num_n_blocks, int num_m_blocks, int size_one_kv_head, bool is_causal_or_local, int max_splits) {
     // If we have enough to almost fill the SMs, then just use 1 split
-    if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
+    // However, in the case of super long seqlen where each head of KV doesn't even fit into
+    // L2 (we assume that L2 size is 50MB), we want to split.
+    if (total_mblocks >= 0.8f * num_SMs) {
+        int const size_l2 = 50 * 1024 * 1024;
+        // Only split if there are enough queries to go over the KV at least twice
+        // Don't split if causal
+        if (size_one_kv_head > size_l2 && num_m_blocks >= num_SMs * 2 && !is_causal_or_local) {
+            return std::min((size_one_kv_head + size_l2 - 1) / size_l2, max_splits);
+        } else {
+            return 1;
+        }
+    }
     // If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
     if (num_n_blocks <= 4) { return 1; }
     max_splits = std::min({max_splits, num_SMs, num_n_blocks});
@@ -32,7 +43,7 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
     std::vector<float> efficiency;
     efficiency.reserve(max_splits);
     for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
+        float n_waves = float(total_mblocks * num_splits) / num_SMs;
         float eff = n_waves / ceil(n_waves);
         // printf("num_splits = %d, eff = %f\n", num_splits, eff);
         if (eff > max_efficiency) { max_efficiency = eff; }

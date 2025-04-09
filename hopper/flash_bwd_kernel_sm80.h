@@ -133,8 +133,8 @@ public:
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
-        CollectiveMainloop collective_mainloop;
-        CollectiveEpilogue collective_epilogue;
+        CollectiveMainloop mainloop;
+        CollectiveEpilogue epilogue;
 
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.smem_scheduler));
         // Initialize matmul objects.
@@ -155,15 +155,14 @@ public:
             // dK and dV output accumulator.
             Tensor tdKrdK = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
             Tensor tdVrdV = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
-            bool tile_valid = collective_mainloop.mma(
-                params.mainloop, tdKrdK, tdVrdV, threadIdx.x, block_coord,
-                shared_storage);
+            bool tile_valid = mainloop.mma(params.mainloop, tdKrdK, tdVrdV, threadIdx.x,
+                                           block_coord, shared_storage);
             scheduler.prefetch_next_work(params.scheduler, work_tile_info);
             if (tile_valid) {
-                collective_epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
-                                          threadIdx.x, block_coord);
+                epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
+                               threadIdx.x, block_coord);
             } else {
-                collective_epilogue.store_zero(params.epilogue, threadIdx.x, block_coord);
+                epilogue.store_zero(params.epilogue, threadIdx.x, block_coord);
             }
         }
 

@@ -12,6 +12,8 @@
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
 
+#include "cutlass/arch/grid_dependency_control.h"
+
 #include "seqlen.h"
 #include "utils.h"
 
@@ -40,11 +42,11 @@ public:
     static constexpr uint32_t MinBlocksPerMultiprocessor = 2;
 
     static constexpr int kBlockM = get<0>(TileShape_MK{});
-    static constexpr int kHeadDim = get<1>(TileShape_MK{});
+    static constexpr int kBlockK = get<1>(TileShape_MK{});
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(ElementPartial);
-    static_assert(kHeadDim % kGmemElemsPerLoad == 0, "Headdim must be a multiple of kGmemElemsPerLoad");
-    static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
+    static_assert(kBlockK % kGmemElemsPerLoad == 0, "kBlockK must be a multiple of kGmemElemsPerLoad");
+    static constexpr int kBlockKGmem = kBlockK % 128 == 0 ? 128 : (kBlockK % 64 == 0 ? 64 : 32);
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerLoad;
     static_assert(MaxThreadsPerBlock % kGmemThreadsPerRow == 0, "MaxThreadsPerBlock must be a multiple of kGmemThreadsPerRow");
     using GmemCopyAtom = std::conditional_t<
@@ -98,8 +100,8 @@ public:
                  Stride<Int<kBlockMSmem>, _1>>{}));
     using SmemLayoutLSE = decltype(tile_to_shape(SmemLayoutAtomLSE{}, Shape<Int<kMaxSplits>, Int<kBlockM>>{}));
 
-    using SmemLayoutO = Layout<Shape<Int<kBlockM>, Int<kHeadDim>, Int<kStages>>,
-                               Stride<Int<kHeadDim>, _1, Int<kBlockM * kHeadDim>>>;
+    using SmemLayoutO = Layout<Shape<Int<kBlockM>, Int<kBlockK>, Int<kStages>>,
+                               Stride<Int<kBlockK>, _1, Int<kBlockM * kBlockK>>>;
 
     // We want each column (kMaxSplits) to be processed by threads in the same warp.
     // To reduce the number of shuffles, we want as few threads on the same column as possible.
@@ -128,38 +130,41 @@ public:
 
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
-
     // Device side arguments
     struct Arguments {
-        ElementPartial const* ptr_O_partial;
+        ElementPartial const* const ptr_O_partial;
         ShapeOPartial const shape_O_partial;
         StrideOPartial const stride_O_partial;
-        float const* ptr_LSE_partial;
+        float const* const ptr_LSE_partial;
         ShapeLSEPartial const shape_LSE_partial;
         StrideLSEPartial const stride_LSE_partial;
-        Element* ptr_O;
+        Element* const ptr_O;
         StrideO const stride_O;
-        float* ptr_LSE;
+        float* const ptr_LSE;
         StrideLSE const stride_LSE;
-        int const* cu_seqlens = nullptr;
-        int const* seqused = nullptr;
+        int const* const cu_seqlens = nullptr;
+        int const* const seqused = nullptr;
+        int const* const num_splits_dynamic_ptr = nullptr;
+        int* const semaphore_to_reset = nullptr;
     };
 
     // Kernel entry point API
     struct Params {
-        ElementPartial const* ptr_O_partial;
+        ElementPartial const* const ptr_O_partial;
         ShapeOPartial const shape_O_partial;
         StrideOPartial const stride_O_partial;
-        float const* ptr_LSE_partial;
+        float const* const ptr_LSE_partial;
         ShapeLSEPartial const shape_LSE_partial;
         StrideLSEPartial const stride_LSE_partial;
-        Element* ptr_O;
+        Element* const ptr_O;
         StrideO const stride_O;
-        float* ptr_LSE;
+        float* const ptr_LSE;
         StrideLSE const stride_LSE;
         cutlass::FastDivmod seqlen_divmod, head_divmod;
-        int const* cu_seqlens = nullptr;
-        int const* seqused = nullptr;
+        int const* const cu_seqlens = nullptr;
+        int const* const seqused = nullptr;
+        int const* const num_splits_dynamic_ptr = nullptr;
+        int* const semaphore_to_reset = nullptr;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -180,7 +185,9 @@ public:
             args.stride_LSE,
             cutlass::FastDivmod(get<0>(args.shape_LSE_partial)), cutlass::FastDivmod(get<2>(args.shape_LSE_partial)),
             args.cu_seqlens,
-            args.seqused
+            args.seqused,
+            args.num_splits_dynamic_ptr,
+            args.semaphore_to_reset
         };
     }
 
@@ -195,17 +202,29 @@ public:
 
         int const thread_idx = threadIdx.x;
         int const m_block = blockIdx.x;
-        int const batch = !Varlen ? 0 : blockIdx.y;
-        int const num_splits = get<1>(params.shape_LSE_partial);
+        int const k_block = blockIdx.y;
+        int const batch = blockIdx.z;
+        int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[batch] : get<1>(params.shape_LSE_partial);
+
+        if (params.semaphore_to_reset && threadIdx.x == 0 && blockIdx.x == gridDim.x - 1 && blockIdx.y == gridDim.y - 1 && blockIdx.z == gridDim.z - 1) {
+            cutlass::arch::wait_on_dependent_grids();
+            *params.semaphore_to_reset = 0;
+        }
+        if (num_splits <= 1) { return; }
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
         int const offset = seqlen_info.offset;
         int const seqlen = seqlen_info.seqlen;
-        int max_idx = seqlen * get<2>(params.shape_LSE_partial) * get<3>(params.shape_LSE_partial);
+        int max_idx = seqlen * get<2>(params.shape_LSE_partial);
+        if constexpr (Varlen) {
+            if (m_block * kBlockM >= max_idx) { return; }
+        }
 
         cutlass::FastDivmod seqlen_divmod_dynamic(seqlen);
 
         // Step 1: load LSE_partial from gmem -> smem
-        Tensor mLSEpartial = make_tensor(make_gmem_ptr(params.ptr_LSE_partial + offset * get<0>(params.stride_LSE_partial)), select<1, 0, 2, 3>(params.shape_LSE_partial), select<1, 0, 2, 3>(params.stride_LSE_partial));  // (num_splits, seqlen, head, batch)
+        Tensor mLSEpartial = make_tensor(make_gmem_ptr(params.ptr_LSE_partial + offset * get<0>(params.stride_LSE_partial)),
+                                         select<1, 0, 2, 3>(params.shape_LSE_partial),
+                                         select<1, 0, 2, 3>(params.stride_LSE_partial))(_, _, _, !Varlen ? batch : 0);  // (num_splits, seqlen, head)
         Tensor mLSEpartial_copy = cute::tiled_divide(mLSEpartial, Shape<_1, Int<kGmemElemsPerLoadLSE>>{});
         GmemTiledCopyLSE gmem_tiled_copy_LSE;
         auto gmem_thr_copy_LSE = gmem_tiled_copy_LSE.get_thread_slice(thread_idx);
@@ -216,19 +235,20 @@ public:
         // Repeat the partitioning with identity layouts
         Tensor tLSEcLSE = gmem_thr_copy_LSE.partition_S(cLSE);
 
+        cutlass::arch::wait_on_dependent_grids();
+
         #pragma unroll
         for (int m = 0; m < size<2>(tLSEcLSE); ++m) {
             int mi = int(get<1>(tLSEcLSE(_0{}, _0{}, m)));
             int idx = m_block * kBlockM + mi;
             if (idx < max_idx) {
-                int m_idx, bidh, bidb;
+                int m_idx, bidh;
                 if constexpr (!Varlen) {
-                    bidb = params.head_divmod.divmod(bidh, params.seqlen_divmod.divmod(m_idx, idx));
+                    bidh = params.seqlen_divmod.divmod(m_idx, idx);
                 } else {
                     bidh = seqlen_divmod_dynamic.divmod(m_idx, idx);
-                    bidb = 0;
                 }
-                Tensor mLSEpartial_cur_copy = mLSEpartial_copy(_, _, m_idx, bidh, bidb);
+                Tensor mLSEpartial_cur_copy = mLSEpartial_copy(_, _, m_idx, bidh);
                 #pragma unroll
                 for (int s = 0; s < size<1>(tLSEcLSE); ++s) {
                     int si = get<0>(tLSEcLSE(_0{}, s, _0{}));
@@ -254,33 +274,32 @@ public:
         Tensor cO = cute::make_identity_tensor(TileShape_MK{});  // (BLK_M,BLK_K) -> (blk_m,blk_k)
         // Repeat the partitioning with identity layouts
         Tensor tOcO = gmem_thr_copy_O_partial.partition_D(cO);
-        Tensor mOpartial = make_tensor(make_gmem_ptr(params.ptr_O_partial + offset * get<0>(params.stride_O_partial)), params.shape_O_partial, params.stride_O_partial);  // (seqlen, d, num_splits, head, batch)
+        Tensor mOpartial = make_tensor(make_gmem_ptr(params.ptr_O_partial + offset * get<0>(params.stride_O_partial)),
+                                       params.shape_O_partial, params.stride_O_partial)(_, _, _, _, !Varlen ? batch : 0);  // (seqlen, d, num_splits, head)
 
         // Precompute these values to avoid recomputing them in the loop
         Tensor tOmidx = make_tensor<int>(make_shape(size<1>(tOcO)));
         Tensor tObidh = make_tensor<int>(make_shape(size<1>(tOcO)));
-        Tensor tObidb = make_tensor<int>(make_shape(size<1>(tOcO)));
         Tensor tOrOptr = make_tensor<ElementPartial const*>(make_shape(size<1>(tOcO)));
         #pragma unroll
         for (int m = 0; m < size<1>(tOcO); ++m) {
             int mi = get<0>(tOcO(_0{}, m, _0{}));
             int idx = m_block * kBlockM + mi;
             if constexpr (!Varlen) {
-                tObidb[m] = params.head_divmod.divmod(tObidh(m), params.seqlen_divmod.divmod(tOmidx(m), idx));
+                tObidh(m) = params.seqlen_divmod.divmod(tOmidx(m), idx);
             } else {
                 tObidh[m] = seqlen_divmod_dynamic.divmod(tOmidx(m), idx);
-                tObidb[m] = 0;
             }
-            tOrOptr[m] = &mOpartial(tOmidx(m), _0{}, _0{}, tObidh(m), tObidb(m));
+            tOrOptr[m] = &mOpartial(tOmidx(m), k_block * kBlockK, _0{}, tObidh(m));
             if (idx >= max_idx) {
-                tObidb[m] = -1;
+                tObidh[m] = -1;
             }
         }
 
         Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOcO)));
         if constexpr (!(Is_even_K)) {
             #pragma unroll
-            for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(params.shape_O_partial); }
+            for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(params.shape_O_partial) - k_block * kBlockK; }
         }
 
         Tensor tOsOpartial = gmem_thr_copy_O_partial.partition_D(sO);
@@ -289,8 +308,8 @@ public:
             Tensor tOsOpartial_cur = tOsOpartial(_, _, _, stage);
             #pragma unroll
             for (int m = 0; m < size<1>(tOcO); ++m) {
-                if (tObidb(m) >= 0)  {
-                    Tensor mOpartial_cur = make_tensor(make_gmem_ptr(tOrOptr[m]), mOpartial(_0{}, _, _, _0{}, _0{}).layout());
+                if (tObidh(m) >= 0)  {
+                    Tensor mOpartial_cur = make_tensor(make_gmem_ptr(tOrOptr[m]), mOpartial(_0{}, _, _, _0{}).layout());
                     Tensor mOpartial_cur_copy = cute::tiled_divide(mOpartial_cur, Shape<Int<kGmemElemsPerLoad>>{});
                     #pragma unroll
                     for (int k = 0; k < size<2>(tOcO); ++k) {
@@ -358,26 +377,35 @@ public:
         // Store the scales exp(lse - lse_logsum) back to smem
         cute::copy(s2r_tiled_copy_LSE, ts2rrLSE, ts2rsLSE);
 
-        // Step 5: store final LSE back to gmem
-        auto shape_LSE = select<0, 2, 3>(params.shape_LSE_partial);
-        Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE + offset * get<0>(params.stride_LSE)), shape_LSE, params.stride_LSE);
+        // Store max_valid_split to smem
         #pragma unroll
         for (int m = 0; m < size<2>(ts2rrLSE); ++m) {
-            if (get<0>(ts2rcLSE(_0{}, _0{}, m)) == 0) {  // Only the thread responsible for s=0 writes to gmem
+            if (get<0>(ts2rcLSE(_0{}, _0{}, m)) == 0) {  // Only the thread responsible for s=0 writes to smem
                 int mi = int(get<1>(ts2rcLSE(_0{}, _0{}, m)));
-                int idx = m_block * kBlockM + mi;
-                if (idx < max_idx) {
-                    int m_idx, bidh, bidb;
-                    if constexpr (!Varlen) {
-                        bidb = params.head_divmod.divmod(bidh, params.seqlen_divmod.divmod(m_idx, idx));
-                    } else {
-                        bidh = seqlen_divmod_dynamic.divmod(m_idx, idx);
-                        bidb = 0;
-                    }
-                    // printf("thread_idx = %d, m = %d, mi = %d, idx = %d, m_idx = %d, bidh = %d, bidb = %d, lse_sum = %f\n", thread_idx, m, mi, idx, m_idx, bidh, bidb, lse_sum(m));
-                    mLSE(m_idx, bidh, bidb) = lse_sum(m);
-                }
                 if (mi < kBlockM) { sMaxValidSplit[mi] = max_valid_split[m]; }
+            }
+        }
+
+        // Step 5: store final LSE back to gmem
+        if (k_block == 0) {
+            auto shape_LSE = select<0, 2, 3>(params.shape_LSE_partial);
+            Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE + offset * get<0>(params.stride_LSE)), shape_LSE, params.stride_LSE)(_, _, !Varlen ? batch : 0);
+            #pragma unroll
+            for (int m = 0; m < size<2>(ts2rrLSE); ++m) {
+                if (get<0>(ts2rcLSE(_0{}, _0{}, m)) == 0) {  // Only the thread responsible for s=0 writes to gmem
+                    int mi = int(get<1>(ts2rcLSE(_0{}, _0{}, m)));
+                    int idx = m_block * kBlockM + mi;
+                    if (idx < max_idx) {
+                        int m_idx, bidh;
+                        if constexpr (!Varlen) {
+                            bidh = params.seqlen_divmod.divmod(m_idx, idx);
+                        } else {
+                            bidh = seqlen_divmod_dynamic.divmod(m_idx, idx);
+                        }
+                        // printf("thread_idx = %d, m = %d, mi = %d, idx = %d, m_idx = %d, bidh = %d, bidb = %d, lse_sum = %f\n", thread_idx, m, mi, idx, m_idx, bidh, bidb, lse_sum(m));
+                        mLSE(m_idx, bidh) = lse_sum(m);
+                    }
+                }
             }
         }
 
@@ -408,7 +436,7 @@ public:
 
             #pragma unroll
             for (int m = 0; m < size<1>(tOrOpartial); ++m) {
-                if (tObidb(m) >= 0 && scale(m) > 0.f) {
+                if (tObidh(m) >= 0 && scale(m) > 0.f) {
                     #pragma unroll
                     for (int k = 0; k < size<2>(tOrOpartial); ++k) {
                         if (Is_even_K || tOpO(k)) {
@@ -427,20 +455,21 @@ public:
         // Step 7: Write the final O to gmem
         Tensor rO = make_tensor_like<Element>(tOrO);
         flash::convert_type_out(tOrO, rO);
-        auto shape_O = select<0, 1, 3, 4>(params.shape_O_partial);
-        Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset * get<0>(params.stride_O)), shape_O, params.stride_O);
+        auto shape_O = make_shape(get<0>(params.shape_O_partial), get<1>(params.shape_O_partial) - k_block * kBlockK, get<3>(params.shape_O_partial), get<4>(params.shape_O_partial));
+        Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset * get<0>(params.stride_O) + k_block * kBlockK * get<1>(params.stride_O)),
+                                shape_O, params.stride_O)(_, _, _, !Varlen ? batch : 0);
         Tensor mO_copy = cute::tiled_divide(mO, Shape<_1, Int<kGmemElemsPerLoad>>{});
         GmemTiledCopy gmem_tiled_copy_O;
         auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
 
         #pragma unroll
         for (int m = 0; m < size<1>(tOcO); ++m) {
-            if (tObidb(m) >= 0)  {
+            if (tObidh(m) >= 0)  {
                 #pragma unroll
                 for (int k = 0; k < size<2>(tOcO); ++k) {
                     int k_idx = get<1>(tOcO(_0{}, _0{}, k)) / kGmemElemsPerLoad;
                     if (Is_even_K || tOpO(k)) {
-                        cute::copy(gmem_tiled_copy_O, rO(_, m, k), mO_copy(_, tOmidx(m), k_idx, tObidh(m), tObidb(m)));
+                        cute::copy(gmem_tiled_copy_O, rO(_, m, k), mO_copy(_, tOmidx(m), k_idx, tObidh(m)));
                     }
                 }
             }

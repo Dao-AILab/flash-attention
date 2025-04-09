@@ -12,6 +12,7 @@
 #include "cute/tensor.hpp"
 
 #include "seqlen.h"
+#include "block.h"
 #include "mask.h"
 #include "pack_gqa.h"
 #include "paged_kv.h"
@@ -22,7 +23,7 @@ namespace flash {
 
 using namespace cute;
 
-template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, class Element_, class ElementAccum_, class ArchTag_,
+template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
         bool PackGQA_, bool Split_>
 struct CollectiveMainloopFwdSm80 {
@@ -30,6 +31,7 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kStages = Stages;
     static_assert(kStages > 0, "kStages must be greater than 0");
     using TileShape_MNK = TileShape_MNK_;
+    using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
     using Element = Element_;
     using ElementAccum = ElementAccum_;
     using ArchTag = ArchTag_;
@@ -43,7 +45,6 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool Transpose_V = Is_FP8;
-    using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
 
     static_assert(ArchTag::kMinComputeCapability >= 80);
 
@@ -52,6 +53,9 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+
+    using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
+    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
 
     using MMA_Atom_Arch = std::conditional_t<
         ArchTag::kMinComputeCapability >= 80,
@@ -177,12 +181,15 @@ struct CollectiveMainloopFwdSm80 {
         ShapeQKV const shape_K;
         StrideQK const stride_K;
         Element* const ptr_V;
+        int32_t const headdim_v;
         StrideV const stride_V;
         Element const* const ptr_K_new;
         ShapeQKV const shape_K_new;
         StrideQK const stride_K_new;
         Element const* const ptr_V_new;
         StrideV const stride_V_new;
+        Element const* const ptr_Qv;
+        StrideQK const stride_Qv;
         Element const* const ptr_rotary_cos;
         ShapeRotary const shape_rotary;
         StrideRotary const stride_rotary_cos;
@@ -195,7 +202,7 @@ struct CollectiveMainloopFwdSm80 {
         float const softmax_scale;
         float const* ptr_q_descale, *ptr_k_descale, *ptr_v_descale;
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
-        int const window_size_left = -1, window_size_right = -1, sink_token_length = 0;
+        int const window_size_left = -1, window_size_right = -1;
         float const softcap_val;
         int const num_splits;
         int const* const kv_batch_idx = nullptr;
@@ -205,6 +212,7 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
+        int const* const seqlens_rotary = nullptr;
     };
 
     // Device side kernel params
@@ -218,6 +226,7 @@ struct CollectiveMainloopFwdSm80 {
         ShapeQKV const shape_K;
         StrideQK const stride_K;
         Element* const ptr_V;
+        int32_t const headdim_v;
         StrideV const stride_V;
         Element const* const ptr_K_new;
         ShapeQKV const shape_K_new;
@@ -239,7 +248,7 @@ struct CollectiveMainloopFwdSm80 {
         float const* ptr_q_descale, *ptr_k_descale, *ptr_v_descale;
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
         float const softcap_val;
-        int const window_size_left, window_size_right, sink_token_length;
+        int const window_size_left, window_size_right;
         int const num_splits;
         int const* const kv_batch_idx = nullptr;
         int const* const cu_seqlens_q = nullptr;
@@ -248,6 +257,7 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
+        int const* const seqlens_rotary = nullptr;
     };
 
     static Params
@@ -272,7 +282,7 @@ struct CollectiveMainloopFwdSm80 {
         // (assigning it to params.softcap_val) and pre-multiply softcap_val * log2(e)
         // (assigning it to params.softmax_scale_log2).
         return {args.ptr_Q, args.shape_Q, args.stride_Q, shape_Q_packed, stride_Q_packed,
-                args.ptr_K, args.shape_K, args.stride_K, args.ptr_V, args.stride_V,
+                args.ptr_K, args.shape_K, args.stride_K, args.ptr_V, args.headdim_v, args.stride_V,
                 args.ptr_K_new, args.shape_K_new, args.stride_K_new, args.ptr_V_new, args.stride_V_new,
                 args.ptr_rotary_cos, args.shape_rotary, args.stride_rotary_cos,
                 args.ptr_rotary_sin, args.stride_rotary_sin, args.is_rotary_interleaved,
@@ -283,41 +293,11 @@ struct CollectiveMainloopFwdSm80 {
                 args.ptr_q_descale, args.ptr_k_descale, args.ptr_v_descale,
                 args.stride_q_descale, args.stride_k_descale, args.stride_v_descale,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
-                args.window_size_left, args.window_size_right, args.sink_token_length,
+                args.window_size_left, args.window_size_right,
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k};
-    }
-
-    CUTLASS_DEVICE
-    cute::tuple<int, int> get_n_block_min_max(Params const& params, SeqlenInfo_t const& seqlen_info,
-                                              int m_block, int bidb, int split_idx=0, int num_splits=1) {
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
-        static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        int const seqlen_k = seqlen_info.seqlen_k;
-        int const seqlen_q = seqlen_info.seqlen_q;
-        int n_block_max = cute::ceil_div(seqlen_k, kBlockN);
-        if constexpr (Is_causal || Is_local) {
-            int m_idx_max = (m_block + 1) * kBlockM;
-            if (PackGQA) { m_idx_max = params.qhead_per_khead_divmod.divide(m_idx_max - 1) + 1 ; }
-            n_block_max = std::min(n_block_max,
-                                   cute::ceil_div(m_idx_max + seqlen_k - seqlen_q + params.window_size_right, kBlockN));
-        }
-        int n_block_min = 0;
-        if constexpr (Is_local) {
-            int m_idx_min = m_block * kBlockM;
-            if (PackGQA) { m_idx_min = params.qhead_per_khead_divmod.divide(m_idx_min); }
-            n_block_min = std::max(int(0), (m_idx_min + seqlen_k - seqlen_q - params.window_size_left) / kBlockN);
-        }
-        // if (threadIdx.x == 128) { printf("Inside, bid.x = %d, bid.y = %d, bid.z = %d, split_idx = %d, n_block_min: %d, n_block_max: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, split_idx, n_block_min, n_block_max); }
-        if constexpr (Split) {
-            int num_n_blocks_per_split = n_block_max <= n_block_min ? 0 : cute::ceil_div(n_block_max - n_block_min, num_splits);
-            n_block_min = n_block_min + split_idx * num_n_blocks_per_split;
-            n_block_max = std::min(n_block_min + num_n_blocks_per_split, n_block_max);
-        }
-        // if (threadIdx.x == 128) { printf("After split, inside, bid.y = %d, bid.z = %d, split_idx = %d, n_block_min: %d, n_block_max: %d\n", blockIdx.y, blockIdx.z, split_idx, n_block_min, n_block_max); }
-        return {n_block_min, n_block_max};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
@@ -340,7 +320,9 @@ struct CollectiveMainloopFwdSm80 {
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
-        auto n_block_min_max = get_n_block_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
+        auto n_block_min_max = BlockMN_t::get_n_block_min_max(
+            seqlen_info, m_block, bidb, split_idx, params.num_splits,
+            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
         int const n_block_min = get<0>(n_block_min_max);
         int const n_block_max = get<1>(n_block_min_max);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
@@ -430,12 +412,15 @@ struct CollectiveMainloopFwdSm80 {
         }
         cute::cp_async_fence();
 
-        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element, true /*KV_Same_Iter*/>;
+        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/>;
         PagedKVManager_t paged_kv_manager(
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
-            params.ptr_V, params.stride_V,
-            params.page_size_divmod, bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k
+            params.ptr_V, params.headdim_v, params.stride_V,
+            params.page_size_divmod,
+            params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
+            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k,
+            0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
         );
 
         auto load_K = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
@@ -489,11 +474,11 @@ struct CollectiveMainloopFwdSm80 {
                 flash::cp_async_wait<Share_QV_Smem ? 1 : kStages * 2 - 1>();
             } else {
                 if (get<1>(params.shape_rotary) > 0) {  // Apply rotary to Q
-                    int const offset_rotary = seqlen_info.seqlen_k_og + seqlen_info.leftpad_k;
                     using Rotary_t = Rotary<kBlockM, kHeadDim, NumMmaThreads, Element, !(Is_causal || Is_local) /*FixedPosition*/>;
                     Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
                                     params.ptr_rotary_sin, params.stride_rotary_sin,
-                                    params.is_rotary_interleaved, thread_idx, seqlen_q, offset_rotary);
+                                    params.is_rotary_interleaved, thread_idx, seqlen_q,
+                                    seqlen_info.seqlen_rotary);
                     int const qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
                     if (params.is_rotary_interleaved) {
                         auto [tRrCos, tRrSin] = cute::conditional_return<!PackGQA>(
@@ -561,7 +546,7 @@ struct CollectiveMainloopFwdSm80 {
         if constexpr (!Share_QV_Smem) { preprocess_Q(); }
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma> mask(
-            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
+            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
             params.qhead_per_khead_divmod
         );
 
@@ -660,31 +645,12 @@ struct CollectiveMainloopFwdSm80 {
             for (; n_block >= n_block_min; --n_block) {
                 fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
             }
-            // Disable sink token code for now
-            // int n_block_sink_max = cute::ceil_div(params.sink_token_length, kBlockN);
-            // #pragma unroll 1
-            // for (n_block = std::min(n_block, n_block_sink_max - 1); n_block >= 0; --n_block) {
-            //     fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
-            // }
         }
         float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
         Tensor scores_scale = softmax.finalize(v_descale);
         softmax.rescale_o(tOrO, scores_scale);
         if constexpr (Is_FP8) { flash::permute_output_fp8(tOrO); }
         return true;
-    }
-
-    CUTLASS_DEVICE
-    cute::tuple<int, int> get_n_block_k_new_min_max(Params const& params, SeqlenInfo_t const& seqlen_info,
-                                                    int m_block, int bidb, int split_idx=0, int num_splits=1) {
-        static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        auto [n_block_min, n_block_max] = get_n_block_min_max(params, seqlen_info, m_block, bidb, split_idx, num_splits);
-        int const idx_k_new_min = std::max(n_block_min * kBlockN - seqlen_info.seqlen_k_og, 0);
-        int const idx_k_new_max = std::min(n_block_max * kBlockN - seqlen_info.seqlen_k_og, seqlen_info.seqlen_k_new);
-        int const n_block_new_min = idx_k_new_min / kBlockN;
-        int const n_block_new_max = idx_k_new_max > idx_k_new_min ? cute::ceil_div(idx_k_new_max, kBlockN) : n_block_new_min;
-        // if (threadIdx.x == 128 && m_block == 0) { printf("bidb = %d, seqlen_k_new = %d, seqlen_k_og = %d, n_block_min = %d, n_block_max = %d, idx_k_new_min = %d, idx_k_new_max = %d, n_block_new_min = %d, n_block_new_max = %d\n", bidb, seqlen_k_new, seqlen_k_og, n_block_min, n_block_max, idx_k_new_min, idx_k_new_max, n_block_new_min, n_block_new_max);}
-        return {n_block_new_min, n_block_new_max};
     }
 
     template <typename SharedStorage>
@@ -696,7 +662,9 @@ struct CollectiveMainloopFwdSm80 {
                  cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord
     ) {
         auto [m_block, bidh, bidb, split_idx] = block_coord;
-        auto n_block_new_min_max = get_n_block_k_new_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
+        auto n_block_new_min_max = BlockMN_t::get_n_block_k_new_min_max(
+            seqlen_info, m_block, bidb, split_idx, params.num_splits,
+            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
         int const n_block_new_min = get<0>(n_block_new_min_max);
         int const n_block_new_max = get<1>(n_block_new_min_max);
         if (n_block_new_max <= n_block_new_min) { return false; }
@@ -723,20 +691,23 @@ struct CollectiveMainloopFwdSm80 {
 
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
         static constexpr int kHeadDim = get<2>(TileShape_MNK{});
-        int const offset_rotary = seqlen_info.seqlen_k_og + seqlen_info.leftpad_k;
         int const seqlen_k_new = seqlen_info.seqlen_k_new;
         using Rotary_t = Rotary<kBlockN, kHeadDim, NumMmaThreads, Element>;
         Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
                         params.ptr_rotary_sin, params.stride_rotary_sin,
-                        params.is_rotary_interleaved, thread_idx, seqlen_k_new, offset_rotary);
+                        params.is_rotary_interleaved, thread_idx, seqlen_k_new,
+                        seqlen_info.seqlen_rotary);
 
-        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 2 /*LoadsPerRow_LB*/>;
+        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 2 /*LoadsPerRow_LB*/>;
         PagedKVManager_t paged_kv_manager(
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
-            params.ptr_V, params.stride_V,
-            params.page_size_divmod, bidb_kv, bidh_kv, thread_idx, seqlen_k_new, offset_k
+            params.ptr_V, params.headdim_v, params.stride_V,
+            params.page_size_divmod,
+            params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
+            bidb_kv, bidh_kv, thread_idx, seqlen_k_new, offset_k,
             // passing offset_k instead of leftpad_k will move the PageTable pointer to the right position
+            0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
         );
 
         static_assert(std::is_same_v<GmemLayoutAtomAppend, typename Rotary_t::LayoutAtom>);

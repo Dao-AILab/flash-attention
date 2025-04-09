@@ -55,11 +55,11 @@ fmha_fwd_appendkv_args get_ck_fmha_fwd_appendkv_args(const int b,
                                                      const at::Tensor vcache,
                                                      const at::Tensor knew,
                                                      const at::Tensor vnew,
-                                                     c10::optional<const at::Tensor> &seqlens_k_,
-                                                     c10::optional<const at::Tensor> &rotary_cos_,
-                                                     c10::optional<const at::Tensor> &rotary_sin_,
-                                                     c10::optional<const at::Tensor> &cache_batch_idx_,
-                                                     c10::optional<at::Tensor> &block_table_)
+                                                     std::optional<const at::Tensor> &seqlens_k_,
+                                                     std::optional<const at::Tensor> &rotary_cos_,
+                                                     std::optional<const at::Tensor> &rotary_sin_,
+                                                     std::optional<const at::Tensor> &cache_batch_idx_,
+                                                     std::optional<at::Tensor> &block_table_)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // kcache: (batch_size_c, seqlen_k, nheads_k, d) or (num_blocks, page_block_size, nheads_k, d)
@@ -149,9 +149,9 @@ fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
                                                    const at::Tensor k,
                                                    const at::Tensor v,
                                                    const at::Tensor seqlens_k,
-                                                   c10::optional<const at::Tensor> &cache_batch_idx_,
-                                                   c10::optional<at::Tensor> &block_table_,
-                                                   c10::optional<at::Tensor> &alibi_slopes_,
+                                                   std::optional<const at::Tensor> &cache_batch_idx_,
+                                                   std::optional<at::Tensor> &block_table_,
+                                                   std::optional<at::Tensor> &alibi_slopes_,
                                                    at::Tensor out,
                                                    at::Tensor lse,
                                                    at::Tensor lse_acc,
@@ -269,16 +269,16 @@ std::vector<at::Tensor>
 mha_fwd_kvcache(at::Tensor &q,                                      // batch_size x seqlen_q x num_heads x head_size
                 const at::Tensor &kcache,                           // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                 const at::Tensor &vcache,                           // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-                c10::optional<const at::Tensor> &k_,                // batch_size x seqlen_knew x num_heads_k x head_size
-                c10::optional<const at::Tensor> &v_,                // batch_size x seqlen_knew x num_heads_k x head_size
-                c10::optional<const at::Tensor> &seqlens_k_,        // batch_size
-                c10::optional<const at::Tensor> &rotary_cos_,       // seqlen_ro x (rotary_dim / 2)
-                c10::optional<const at::Tensor> &rotary_sin_,       // seqlen_ro x (rotary_dim / 2)
-                c10::optional<const at::Tensor> &cache_batch_idx_, // indices to index into the KV cache
-                c10::optional<const at::Tensor> & /*leftpad_k_*/,   // batch_size
-                c10::optional<at::Tensor> &block_table_,            // batch_size x max_num_blocks_per_seq
-                c10::optional<at::Tensor> &alibi_slopes_,           // num_heads or batch_size x num_heads
-                c10::optional<at::Tensor> &out_,                    // batch_size x seqlen_q x num_heads x head_size
+                std::optional<const at::Tensor> &k_,                // batch_size x seqlen_knew x num_heads_k x head_size
+                std::optional<const at::Tensor> &v_,                // batch_size x seqlen_knew x num_heads_k x head_size
+                std::optional<const at::Tensor> &seqlens_k_,        // batch_size
+                std::optional<const at::Tensor> &rotary_cos_,       // seqlen_ro x (rotary_dim / 2)
+                std::optional<const at::Tensor> &rotary_sin_,       // seqlen_ro x (rotary_dim / 2)
+                std::optional<const at::Tensor> &cache_batch_idx_, // indices to index into the KV cache
+                std::optional<const at::Tensor> & /*leftpad_k_*/,   // batch_size
+                std::optional<at::Tensor> &block_table_,            // batch_size x max_num_blocks_per_seq
+                std::optional<at::Tensor> &alibi_slopes_,           // num_heads or batch_size x num_heads
+                std::optional<at::Tensor> &out_,                    // batch_size x seqlen_q x num_heads x head_size
                 const float softmax_scale,
                 bool is_causal,
                 int window_size_left,

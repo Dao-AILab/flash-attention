@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "namespace_config.h"
 #include <cute/tensor.hpp>
 
 #include <cutlass/cutlass.h>
@@ -14,7 +15,7 @@
 #include "kernel_traits.h"
 #include "utils.h"
 
-namespace flash {
+namespace FLASH_NAMESPACE {
 
 using namespace cute;
 
@@ -32,8 +33,8 @@ inline __device__ void dot_do_o(Tensor<Engine0, Layout0> const &do_, Tensor<Engi
                                                              make_layout(get<0>(do_.layout()),
                                                                          get<2>(do_.layout()))));
     Tensor o_reshaped = make_tensor(o.data(), do_reshaped.layout());
-    Tensor do_fp32 = flash::convert_type<float>(do_reshaped);
-    Tensor o_fp32 = flash::convert_type<float>(o_reshaped);
+    Tensor do_fp32 = FLASH_NAMESPACE::convert_type<float>(do_reshaped);
+    Tensor o_fp32 = FLASH_NAMESPACE::convert_type<float>(o_reshaped);
     #pragma unroll
     for (int mi = 0; mi < size<0>(do_reshaped); ++mi) {
         float dP_sum_cur = do_fp32(mi, 0) * o_fp32(mi, 0);
@@ -41,8 +42,8 @@ inline __device__ void dot_do_o(Tensor<Engine0, Layout0> const &do_, Tensor<Engi
         for (int ni = 1; ni < size<1>(do_reshaped); ni++) {
             dP_sum_cur += do_fp32(mi, ni) * o_fp32(mi, ni);
         }
-        flash::SumOp<float> sum_op;
-        dP_sum_cur = flash::Allreduce<THREADS_PER_ROW>::run(dP_sum_cur, sum_op) * scale;
+        FLASH_NAMESPACE::SumOp<float> sum_op;
+        dP_sum_cur = FLASH_NAMESPACE::Allreduce<THREADS_PER_ROW>::run(dP_sum_cur, sum_op) * scale;
         if (threadIdx.x % THREADS_PER_ROW == 0) {
             dP_sum(mi * gdP_col_stride + threadIdx.x / THREADS_PER_ROW) = dP_sum_cur;
         }
@@ -78,7 +79,7 @@ inline __device__ void compute_dot_do_o(const Params &params) {
     const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
         + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
     const index_t row_offset_dq_accum = binfo.q_offset(params.seqlen_q_rounded * params.h * params.d_rounded, params.h * params.d_rounded, bidb)
-        + (m_block * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128 * bidb)) * params.h * params.d_rounded + bidh * params.d_rounded;
+        + (m_block * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128ll * bidb)) * params.h * params.d_rounded + bidh * params.d_rounded;
     // Regarding 128 * params.b see a comment in mha_varlen_bwd about padding of dq_accum and softmax_d
     const index_t row_offset_dpsum = (params.unpadded_lse ? (bidh * (params.total_q + 128 * params.b) + binfo.q_offset(params.seqlen_q_rounded, 1, bidb) + 128 * bidb): (bidb * params.h + bidh) * params.seqlen_q_rounded) + m_block * kBlockM;
 
@@ -116,10 +117,10 @@ inline __device__ void compute_dot_do_o(const Params &params) {
 
     Tensor tdOrdO = make_fragment_like(tdOgdO);
     Tensor tdOrO = make_fragment_like(tdOgO);
-    flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true>(
+    FLASH_NAMESPACE::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true>(
         gmem_tiled_copy_dO, tdOgdO, tdOrdO, tdOcdO, tdOpdO, binfo.actual_seqlen_q - m_block * kBlockM
     );
-    flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true>(
+    FLASH_NAMESPACE::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true>(
         gmem_tiled_copy_dO, tdOgO, tdOrO, tdOcdO, tdOpdO, binfo.actual_seqlen_q - m_block * kBlockM
     );
     // By right we need to scale dP up by 1/p_dropout, but instead we don't and only scale the final
@@ -204,7 +205,7 @@ inline __device__ void convert_dQ(const Params &params, const int nsplits) {
     const index_t row_offset_dq = binfo.q_offset(params.dq_batch_stride, params.dq_row_stride, bidb)
         + m_block * kBlockM * params.dq_row_stride + bidh * params.dq_head_stride;
     const index_t row_offset_dq_accum = binfo.q_offset(params.seqlen_q_rounded * params.h * params.d_rounded, params.h * params.d_rounded, bidb)
-        + (m_block * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128 * bidb)) * params.h * params.d_rounded + bidh * params.d_rounded;
+        + (m_block * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128ll * bidb)) * params.h * params.d_rounded + bidh * params.d_rounded;
 
     Tensor gdQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.dq_ptr) + row_offset_dq),
                              Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -244,7 +245,7 @@ inline __device__ void convert_dQ(const Params &params, const int nsplits) {
     #pragma unroll
     for (int i = 0; i < size(acc_dq); ++i) { acc_dq(i) *= params.scale_softmax_rp_dropout; }
     // Convert acc_dq from fp32 to fp16
-    Tensor rdQ = flash::convert_type<Element>(acc_dq);
+    Tensor rdQ = FLASH_NAMESPACE::convert_type<Element>(acc_dq);
     Tensor taccdQrdQ = smem_thr_copy_dQ.retile_S(rdQ);  // ((Atom,AtomNum), MMA_N, MMA_N)
     cute::copy(smem_tiled_copy_dQ, taccdQrdQ, taccdQsdQ);
     __syncthreads();
@@ -257,7 +258,7 @@ inline __device__ void convert_dQ(const Params &params, const int nsplits) {
     #pragma unroll
     for (int k = 0; k < size(tdQpdQ); ++k) { tdQpdQ(k) = get<1>(tdQcdQ(0, 0, k)) < params.d; }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+    FLASH_NAMESPACE::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_dQ, tdQrdQ, tdQgdQ, tdQcdQ, tdQpdQ, binfo.actual_seqlen_q - m_block * kBlockM
     );
 }
@@ -349,8 +350,8 @@ inline __device__ void convert_dKV(const Params &params) {
         acc_dv(i) = tdVrdVaccum(i) * params.rp_dropout;
     }
     // Convert acc_dk from fp32 to fp16
-    Tensor rdK = flash::convert_type<Element>(acc_dk);
-    Tensor rdV = flash::convert_type<Element>(acc_dv);
+    Tensor rdK = FLASH_NAMESPACE::convert_type<Element>(acc_dk);
+    Tensor rdV = FLASH_NAMESPACE::convert_type<Element>(acc_dv);
     Tensor taccdKrdK = smem_thr_copy_dKV.retile_S(rdK);  // ((Atom,AtomNum), MMA_N, MMA_N)
     Tensor taccdVrdV = smem_thr_copy_dKV.retile_S(rdV);  // ((Atom,AtomNum), MMA_N, MMA_N)
     cute::copy(smem_tiled_copy_dKV, taccdKrdK, taccdKsdK);
@@ -367,10 +368,10 @@ inline __device__ void convert_dKV(const Params &params) {
     #pragma unroll
     for (int k = 0; k < size(tdKVpdKV); ++k) { tdKVpdKV(k) = get<1>(tdKVcdKV(0, 0, k)) < params.d; }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+    FLASH_NAMESPACE::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_dKV, tdKrdK, tdKgdK, tdKVcdKV, tdKVpdKV, binfo.actual_seqlen_k - n_block * kBlockN
     );
-    flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+    FLASH_NAMESPACE::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_dKV, tdVrdV, tdVgdV, tdKVcdKV, tdKVpdKV, binfo.actual_seqlen_k - n_block * kBlockN
     );
 }

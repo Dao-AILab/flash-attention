@@ -18,13 +18,13 @@ def timeit(fn, *args, **kwargs):
     # Warmup
     for _ in range(5):
         fn(*args, **kwargs)
-    
+
     # Benchmark using PyTorch Timer
     t = benchmark.Timer(
         stmt='fn(*args, **kwargs)',
         globals={'fn': fn, 'args': args, 'kwargs': kwargs}
     )
-    
+
     # Measure execution time
     measurement = t.timeit(20)  # Runs the function 20 times
     # measurement = t.blocked_autorange(min_run_time=1)
@@ -38,14 +38,15 @@ def main():
     ).multi_processor_count
 
     max_splits = 129
-    check_all_splits = False
+    check_all_splits = True
 
     causal = True
     # causal = False
     # dtype=torch.float16
     dtype=torch.bfloat16
+    tp_degree = 1
 
-    torch.manual_seed(42)  
+    torch.manual_seed(42)
 
     model_configs = [
         # ("Gemma-2-2B", 8, 4, 256),
@@ -56,6 +57,7 @@ def main():
         # ("Qwen-2.5-7B", 28, 4, 128),
         # ("Llama-3.1-8B", 32, 8, 128),
         ("Llama-3.1-70B", 64, 8, 128),
+        # ("Mistral Large", 96, 8, 128),
         # ("Llama-3.1-405B", 128, 8, 128),
         # ("Llama-3.2-1B", 32, 8, 64),
         # ("Llama-3.2-3B", 24, 8, 128),
@@ -66,28 +68,32 @@ def main():
 
     all_batch_configs.extend(itertools.product(
         # [1024, 2048, 4096, 8192, 16384, 32768, 131072],  # context_seqlen
-        [4096, 16384, 65536],  # context_seqlen
-        # [131072],  # context_seqlen
+        # [4096, 16384, 65536],  # context_seqlen
+        [131072],  # context_seqlen
         # [i for i in range(1, (num_sms) + 1)], # num_requests
         [1, 4, 8, 16],  # num_requests
         # [1],  # num_requests
-        [1, 4, 8, 16],  # query_seqlen
-        # [1],  # query_seqlen
+        # [1, 4, 8, 16],  # query_seqlen
+        [1],  # query_seqlen
     ))
 
     num_caches = max(reqs for _, reqs, _ in all_batch_configs)
     cache_seqlen = max(seqlen for seqlen, _, _ in all_batch_configs)
 
     for model_name, nheads_q, nheads_kv, headdim in model_configs:
+        assert nheads_kv % tp_degree == 0
+        print(f"***{model_name}***")
+        print(f"QHEADS:{nheads_q}, KVHEADS:{nheads_kv}, HEADDIM:{headdim}, TP:{tp_degree}")
+        nheads_q //= tp_degree
+        nheads_kv //= tp_degree
+
         k_cache = torch.randn(
             (num_caches, cache_seqlen, nheads_kv, headdim), device="cuda", dtype=dtype
         )
         v_cache = torch.randn(
             (num_caches, cache_seqlen, nheads_kv, headdim), device="cuda", dtype=dtype
         )
-        print(f"***{model_name}***")
-        print(f"QHEADS:{nheads_q}, KVHEADS:{nheads_kv}, HEADDIM:{headdim}")
-        
+
         if check_all_splits is False:
             print(f"{'CONTEXT':<9}{'BSZ':<5}{'QLEN':<6}{'FA2':<10}{'FA3':<9}{'RATIO':<7}{'GB/s':<10}")
 
@@ -139,7 +145,7 @@ def main():
                 cache_seqlens=cache_seqlens,
                 cache_batch_idx=cache_idxs,
                 causal=causal,
-                gqa_parallel=False,
+                pack_gqa=False,
                 num_splits=1,
             ) * 1000. * 1000.
 
@@ -151,16 +157,16 @@ def main():
                 cache_seqlens=cache_seqlens,
                 cache_batch_idx=cache_idxs,
                 causal=causal,
-                gqa_parallel=True,
+                pack_gqa=True,
                 num_splits=0,
-                max_seqlen_k_hint=context_seqlen
+                # max_seqlen_k_hint=context_seqlen
             ) * 1000. * 1000.
 
             if check_all_splits:
-            
+
                 fa3_fastest_num_splits = 0
                 fa3_fastest_splitk_time = float("inf")
-                
+
                 for num_splits in range(1, max_splits):
                     t = timeit(
                         flash_attn_interface.flash_attn_with_kvcache,
@@ -170,7 +176,7 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=False,
+                        pack_gqa=False,
                         num_splits=num_splits
                     ) * 1000. * 1000.
 
@@ -181,7 +187,7 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=False,
+                        pack_gqa=False,
                         num_splits=num_splits
                     )
 
@@ -192,7 +198,7 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=False,
+                        pack_gqa=False,
                         num_splits=1
                     )
 
@@ -220,7 +226,7 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=True,
+                        pack_gqa=True,
                         num_splits=num_splits
                     ) * 1000. * 1000.
 
@@ -231,7 +237,7 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=True,
+                        pack_gqa=True,
                         num_splits=num_splits
                     )
 
@@ -242,7 +248,7 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=True,
+                        pack_gqa=True,
                         num_splits=1
                     )
 
@@ -257,7 +263,7 @@ def main():
                     if t < fa3_fastest_splitk_time_gqa:
                         fa3_fastest_splitk_time_gqa = t
                         fa3_fastest_num_splits_gqa = num_splits
-                
+
                 efficiency = (num_work_tiles * fa3_fastest_num_splits_gqa)/num_sms
                 heuristic_ratio = fa3_time_gqa_heuristic/fa3_fastest_splitk_time_gqa
                 # remeasure to smooth anomalies
@@ -271,11 +277,11 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=True,
+                        pack_gqa=True,
                         # num_splits=num_splits_select,
                         # num_splits=1,
                         num_splits=0,
-                        max_seqlen_k_hint=context_seqlen
+                        # max_seqlen_k_hint=context_seqlen
                     ) * 1000. * 1000.
 
                     fa3_fastest_splitk_time_gqa = timeit(
@@ -286,9 +292,9 @@ def main():
                         cache_seqlens=cache_seqlens,
                         cache_batch_idx=cache_idxs,
                         causal=causal,
-                        gqa_parallel=True,
+                        pack_gqa=True,
                         num_splits=fa3_fastest_num_splits_gqa
-                    ) * 1000. * 1000. 
+                    ) * 1000. * 1000.
 
             if check_all_splits is True:
                 print(
@@ -308,7 +314,7 @@ def main():
                     # f"RATIO (FA2/3):{fa2_time_heuristic/fa3_time_gqa_heuristic:.2f}, "
                     f"RATIO:{fa3_time_gqa_heuristic/fa3_fastest_splitk_time_gqa:.2f}, "
                     f"EFF:{efficiency:.2f}, "
-                    f"GB/s:{bytes_kv/fa3_time_gqa_heuristic * 1e-3:.2f}" 
+                    f"GB/s:{bytes_kv/fa3_time_gqa_heuristic * 1e-3:.2f}"
                 )
 
             if check_all_splits is False:

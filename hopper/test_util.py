@@ -30,22 +30,23 @@ def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random", 
 
 
 def generate_qkv(
-    q, k, v, query_padding_mask=None, key_padding_mask=None, kvpacked=False, qkvpacked=False,
+    q, k, v, query_padding_mask=None, key_padding_mask=None, qv=None, kvpacked=False, qkvpacked=False,
     query_unused_mask=None, key_unused_mask=None,
 ):
     """
     Arguments:
         q: (batch_size, seqlen_q, nheads, d)
         k: (batch_size, seqlen_k, nheads_k, d)
-        v: (batch_size, seqlen_k, nheads_k, d)
+        v: (batch_size, seqlen_k, nheads_k, d_v)
         query_padding_mask: (batch_size, seqlen), bool
         key_padding_mask: (batch_size, seqlen), bool
     """
     assert not (kvpacked and qkvpacked)
     batch_size, seqlen_q, nheads, d = q.shape
+    d_v = v.shape[-1]
     _, seqlen_k, nheads_k, _ = k.shape
     assert k.shape == (batch_size, seqlen_k, nheads_k, d)
-    assert v.shape == (batch_size, seqlen_k, nheads_k, d)
+    assert v.shape == (batch_size, seqlen_k, nheads_k, d_v)
     if query_unused_mask is not None or key_unused_mask is not None:
         assert not kvpacked
         assert not qkvpacked
@@ -57,6 +58,7 @@ def generate_qkv(
         output_pad_fn = lambda output_unpad: pad_input(
             output_unpad, indices_q, batch_size, seqlen_q
         )
+        qv_unpad = rearrange(qv, "b s ... -> (b s) ...")[indices_q] if qv is not None else None
     else:
         q_unpad = rearrange(q, "b s h d -> (b s) h d")
         cu_seqlens_q = torch.arange(
@@ -67,6 +69,7 @@ def generate_qkv(
         output_pad_fn = lambda output_unpad: rearrange(
             output_unpad, "(b s) h d -> b s h d", b=batch_size
         )
+        qv_unpad = rearrange(qv, "b s ... -> (b s) ...") if qv is not None else None
 
     if key_padding_mask is not None:
         k_unpad, indices_k, cu_seqlens_k, max_seqlen_k, seqused_k = unpad_input(
@@ -134,6 +137,7 @@ def generate_qkv(
             q_unpad.detach().requires_grad_(),
             k_unpad.detach().requires_grad_(),
             v_unpad.detach().requires_grad_(),
+            qv_unpad.detach()  if qv is not None else None,
             cu_seqlens_q,
             cu_seqlens_k,
             seqused_q,
@@ -143,6 +147,7 @@ def generate_qkv(
             q.detach().requires_grad_(),
             k.detach().requires_grad_(),
             v.detach().requires_grad_(),
+            qv.detach() if qv is not None else None,
             output_pad_fn,
             dq_pad_fn,
             dk_pad_fn,
@@ -196,6 +201,7 @@ def attention_ref(
     dropout_p=0.0,
     dropout_mask=None,
     causal=False,
+    qv=None,
     q_descale=None, k_descale=None, v_descale=None,
     window_size=(-1, -1),  # -1 means infinite window size
     sink_token_length=0,
@@ -208,7 +214,8 @@ def attention_ref(
     Arguments:
         q: (batch_size, seqlen_q, nheads, head_dim)
         k: (batch_size, seqlen_k, nheads, head_dim)
-        v: (batch_size, seqlen_k, nheads, head_dim)
+        v: (batch_size, seqlen_k, nheads, head_dim_v)
+        qv: (batch_size, seqlen_q, nheads, head_dim_v)
         query_padding_mask: (batch_size, seqlen_q)
         key_padding_mask: (batch_size, seqlen_k)
         attn_bias: broadcastable to (batch_size, nheads, seqlen_q, seqlen_k)
@@ -221,7 +228,7 @@ def attention_ref(
             without changing the math. This is to estimate the numerical error from operation
             reordering.
     Output:
-        output: (batch_size, seqlen_q, nheads, head_dim)
+        output: (batch_size, seqlen_q, nheads, head_dim_v)
         attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
     """
     if causal:
@@ -229,9 +236,11 @@ def attention_ref(
     dtype_og = q.dtype
     if upcast:
         q, k, v = q.float(), k.float(), v.float()
+        qv = qv.float() if qv is not None else None
     if q_descale is not None:
-        q_descale = repeat(q_descale, "b h -> b (h g)", g = q.shape[2] // k.shape[2])
-        q = (q.float() * rearrange(q_descale, "b h -> b 1 h 1")).to(dtype=q.dtype)
+        q_descale = repeat(q_descale, "b h -> b 1 (h g) 1", g=q.shape[2] // k.shape[2])
+        q = (q.float() * q_descale).to(q.dtype)
+        qv = (qv.float() * q_descale).to(qv.dtype) if qv is not None else None
     if k_descale is not None:
         k = (k.float() * rearrange(k_descale, "b h -> b 1 h 1")).to(dtype=k.dtype)
     if v_descale is not None:
@@ -240,10 +249,14 @@ def attention_ref(
     k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
     d = q.shape[-1]
+    dv = v.shape[-1]
+    softmax_scale = 1.0 / math.sqrt(d if qv is None else d + dv)
     if not reorder_ops:
-        scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
+        scores = torch.einsum("bthd,bshd->bhts", q * softmax_scale, k)
     else:
-        scores = torch.einsum("bthd,bshd->bhts", q, k / math.sqrt(d))
+        scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
+    if qv is not None:
+        scores = scores + torch.einsum("bthd,bshd->bhts", qv * softmax_scale, v)
     if softcap > 0:
         scores = torch.tanh(scores / softcap) * softcap
     if key_padding_mask is not None:

@@ -4,8 +4,8 @@
 
 #pragma once
 
-#include <cutlass/cutlass.h>
-#include <cutlass/barrier.h>
+#include "cutlass/cutlass.h"
+#include "cutlass/barrier.h"
 #include "cute/tensor.hpp"
 
 #include "cutlass/gemm/collective/builders/sm90_common.inl"
@@ -238,7 +238,7 @@ struct CollectiveEpilogueBwd {
             Tensor tdKVsdK = gmem_thr_copy_dKV.partition_S(sdK); // (TMA, TMA_M, TMA_K)
             Tensor tdKVrdV = make_fragment_like(tdKVgdV);
             Tensor tdKVrdK = make_fragment_like(tdKVgdK);
-            Tensor cdKV = cute::make_identity_tensor(select<1, 2>(TileShape_MNK{}));  // (BLK_M,BLK_K) -> (blk_m,blk_k)
+            Tensor cdKV = cute::make_identity_tensor(select<1, 2>(TileShape_MNK{}));  // (BLK_N,BLK_K) -> (blk_n,blk_k)
             // Repeat the partitioning with identity layouts
             Tensor tdKVcdKV = gmem_thr_copy_dKV.partition_D(cdKV);
             Tensor tdKVpdKV = make_tensor<bool>(make_shape(size<2>(tdKVgdV)));

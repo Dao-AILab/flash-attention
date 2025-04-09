@@ -13,6 +13,7 @@
 
 #include "seqlen.h"
 #include "mask.h"
+#include "mask.h"
 #include "softmax.h"
 #include "utils.h"
 
@@ -38,7 +39,6 @@ struct CollectiveMainloopBwdSm80 {
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
     static constexpr bool Varlen = Varlen_;
-    using SeqlenInfo_t = flash::SeqlenInfoQK<Varlen, CUTE_STATIC_V(get<0>(TileShape_MNK{}))>;
     static constexpr int NumMmaWarps = NumMmaWarpGroups * cutlass::NumWarpsPerWarpGroup;
 
     static constexpr bool SdP_swapAB = SdP_swapAB_;
@@ -50,6 +50,9 @@ struct CollectiveMainloopBwdSm80 {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+
+    using SeqlenInfo_t = flash::SeqlenInfoQK<Varlen, kBlockM>;
+    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local>;
 
     static_assert(ArchTag::kMinComputeCapability >= 80);
 
@@ -293,7 +296,7 @@ struct CollectiveMainloopBwdSm80 {
         float const* const ptr_dPsum;
         StrideLSE const stride_dPsum;
         float const softmax_scale;
-        int const window_size_left, window_size_right, sink_token_length;
+        int const window_size_left, window_size_right;
         float const softcap_val;
         int const num_batch;
         int* const dq_semaphore;
@@ -325,7 +328,7 @@ struct CollectiveMainloopBwdSm80 {
         float const* const ptr_dPsum;
         StrideLSE const stride_dPsum;
         float const softmax_scale, softmax_scale_log2;
-        int const window_size_left, window_size_right, sink_token_length;
+        int const window_size_left, window_size_right;
         float const softcap_val;
         int const num_batch;
         int *const dq_semaphore;
@@ -356,30 +359,10 @@ struct CollectiveMainloopBwdSm80 {
                 args.ptr_LSE_log2, args.shape_LSE, args.stride_LSE_log2, args.ptr_dPsum, args.stride_dPsum,
                 args.softmax_scale,
                 !Has_softcap ? float(args.softmax_scale * M_LOG2E) : float(args.softcap_val * M_LOG2E),
-                args.window_size_left, args.window_size_right, args.sink_token_length,
+                args.window_size_left, args.window_size_right,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
-    }
-
-    CUTLASS_DEVICE
-    cute::tuple<int, int> get_m_block_min_max(Params const& params, SeqlenInfo_t const& seqlen_info,
-                                              int n_block, int bidb) {
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
-        int const seqlen_q = seqlen_info.seqlen_q;
-        int const seqlen_k = seqlen_info.seqlen_k;
-        int m_block_max = cute::ceil_div(seqlen_q, kBlockM);
-        if constexpr (Is_local) {
-            static constexpr int kBlockN = get<1>(TileShape_MNK{});
-            if (n_block >= cute::ceil_div(params.sink_token_length, kBlockN)) {
-                m_block_max = std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + seqlen_q - seqlen_k + params.window_size_left, kBlockM));
-            }
-        }
-        int m_block_min = 0;
-        if constexpr (Is_causal || Is_local) {
-            m_block_min = std::max(m_block_min, (n_block * kBlockN + seqlen_q - seqlen_k - params.window_size_right) / kBlockM);
-        }
-        return {m_block_min, m_block_max};
     }
 
     template <typename SharedStorage, typename FrgTensordKV>
@@ -400,7 +383,9 @@ struct CollectiveMainloopBwdSm80 {
             bidb, get<0>(params.shape_Q), size<0>(params.shape_K),
             params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k
         };
-        auto m_block_min_max = get_m_block_min_max(params, seqlen_info, n_block, bidb);
+        auto m_block_min_max = BlockMN_t::get_m_block_min_max(
+            seqlen_info, n_block, bidb,
+            params.window_size_left, params.window_size_right, 0 /*sink_token_length*/);
         int const m_block_min = get<0>(m_block_min_max);
         int const m_block_max = get<1>(m_block_min_max);
         // It's possible to have m_block_max <= m_block_min. Exit early
@@ -547,7 +532,7 @@ struct CollectiveMainloopBwdSm80 {
         int const seqlen_k = seqlen_info.seqlen_k;
 
         flash::Mask<kBlockM, kBlockN, false /*PackGQA*/, TiledMmaSdP, SdP_swapAB> mask(
-            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
+            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
             params.qhead_per_khead_divmod
         );
 
@@ -861,7 +846,7 @@ struct CollectiveMainloopBwdSm80 {
                     tdKrdK, tdKrdS, tdKrQ, tdKsdSt, tdKsQ_cur,
                     tiled_mma_dKV, smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt, cute::conditional_return<(kStages > 1)>(nullptr, load_dO_next));
             }
-            if constexpr (kStages == 1) {  
+            if constexpr (kStages == 1) {
                 __syncthreads();
                 do_mma_dQ(load_Q_next);
             }
