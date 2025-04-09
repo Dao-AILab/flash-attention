@@ -38,8 +38,8 @@ def rotary_kernel(
     BLOCK_M: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
-    pid_batch = tl.program_id(axis=1)
-    pid_head = tl.program_id(axis=2)
+    pid_head = tl.program_id(axis=1)
+    pid_batch = tl.program_id(axis=2)
     rotary_dim_half = rotary_dim // 2
 
     if not IS_VARLEN:
@@ -193,7 +193,7 @@ def apply_rotary(
         if rotary_dim <= 32
         else (64 if rotary_dim <= 64 else (128 if rotary_dim <= 128 else 256))
     )
-    grid = lambda META: (triton.cdiv(seqlen, META["BLOCK_M"]), batch, nheads)  # noqa
+    grid = lambda META: (triton.cdiv(seqlen, META["BLOCK_M"]), nheads, batch)  # noqa
     BLOCK_M = 4 if interleaved else (8 if rotary_dim <= 128 else 4)
 
     # Need this, otherwise Triton tries to launch from cuda:0 and we get
@@ -223,5 +223,6 @@ def apply_rotary(
             interleaved,
             conjugate,
             BLOCK_M,
+            num_warps=2 if rotary_dim <= 64 else 4,
         )
     return output
