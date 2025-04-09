@@ -107,9 +107,9 @@ public:
         }
         if constexpr (Varlen && Split) {
             int num_splits_dynamic = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[work_info.bidb] : params.num_splits;
+            is_valid_tile &= work_info.split_idx < num_splits_dynamic;
             // Use the top 16 bits to store num_splits
             work_info.split_idx |= (num_splits_dynamic << 16);
-            is_valid_tile &= work_info.split_idx < num_splits_dynamic;
         }
         work_info.bidb = is_valid_tile ? work_info.bidb : -1;
         return work_info;
