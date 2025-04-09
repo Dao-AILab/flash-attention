@@ -272,10 +272,11 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             if (params.is_bf16) {
                                 #ifndef FLASHATTENTION_DISABLE_HDIM64
                                 if (params.d <= 64) {
-                                    if (params.dv > 64 && Arch == 90) {
+                                    if (params.dv > 256 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                    }
-                                    else {
+                                    } else if (params.dv > 64 && Arch == 90) {
+                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                                    } else {
                                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     }
                                 }
@@ -302,10 +303,11 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 #ifndef FLASHATTENTION_DISABLE_FP16
                                 #ifndef FLASHATTENTION_DISABLE_HDIM64
                                 if (params.d <= 64) {
-                                    if (params.dv > 64 && Arch == 90) {
+                                    if (params.dv > 256 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                    }
-                                    else {
+                                    } else if (params.dv > 64 && Arch == 90) {
+                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                                    } else {
                                         return run_mha_fwd_<Arch, cutlass::half_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     }
                                 }
@@ -490,6 +492,15 @@ inline int round_up_headdim(int head_size) {
     return 256;
 }
 
+inline int round_up_headdimv(int head_size) {
+    if (head_size <= 64) { return 64; }
+    if (head_size <= 96) { return 96; }
+    if (head_size <= 128) { return 128; }
+    if (head_size <= 192) { return 192; }
+    if (head_size <= 256) { return 256; }
+    return 512;
+}
+
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
 at::Tensor
 mha_fwd_get_scheduler_metadata(
@@ -534,7 +545,7 @@ mha_fwd_get_scheduler_metadata(
     params.d = headdim;
     params.dv = headdim_v;
     params.d_rounded = round_up_headdim(headdim);
-    params.dv_rounded = round_up_headdim(headdim_v);
+    params.dv_rounded = headdim_v == headdim ? params.d_rounded : round_up_headdimv(headdim_v);
     params.seqlen_knew = max_seqlen_k_new;
 
     bool const is_varlen_q = cu_seqlens_q_.has_value();
@@ -640,6 +651,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<const at::Tensor> &leftpad_k_, // b
         std::optional<const at::Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
         std::optional<const at::Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
+        std::optional<const at::Tensor> &seqlens_rotary_, // b
         std::optional<at::Tensor> &q_descale_,  // (b, h_k), not (b, h)
         std::optional<at::Tensor> &k_descale_,  // (b, h_k)
         std::optional<at::Tensor> &v_descale_,  // (b, h_k)
@@ -823,7 +835,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     int const head_size_rounded = round_up_headdim(head_size);
-    int const head_size_v_rounded = round_up_headdim(head_size_v);
+    int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdimv(head_size_v);
     int const seqlen_q_rounded = round_multiple(seqlen_q, 128);
     int const seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
@@ -1001,6 +1013,13 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         params.rotary_cos_ptr = rotary_cos.data_ptr();
         params.rotary_sin_ptr = rotary_sin.data_ptr();
         params.is_rotary_interleaved = is_rotary_interleaved;
+        if (seqlens_rotary_.has_value()) {
+            at::Tensor seqlens_rotary = seqlens_rotary_.value();
+            CHECK_DEVICE(seqlens_rotary); CHECK_CONTIGUOUS(seqlens_rotary);
+            TORCH_CHECK(seqlens_rotary.dtype() == torch::kInt32, "seqlens_rotary must have dtype torch.int32");
+            CHECK_SHAPE(seqlens_rotary, batch_size);
+            params.seqlens_rotary = seqlens_rotary.data_ptr<int>();
+        }
     } else {
         params.rotary_dim = 0;
     }
@@ -1104,7 +1123,11 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
             //     params.b = 1;
             //     params.seqlen_q = total_q;
             // }
+            // This will zero out the semaphore if needed
             run_mha_fwd_combine(params, stream, true /*enable_pdl*/);
+        } else if (scheduler_needs_semaphore && params.skip_scheduler_metadata_computation) {
+            // need to zero out the semaphore in this case
+            tile_count_semaphore.index({torch::indexing::Slice(0, 1)}).zero_();
         }
     } else if (total_q > 0 && num_heads_k > 0) {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
@@ -1492,7 +1515,6 @@ mha_combine(const at::Tensor &out_partial,         // num_splits x batch_size x 
     const int seqlen = sizes[2];
     const int num_heads = sizes[3];
     const int head_size_og = sizes[4];
-    TORCH_CHECK(head_size_og <= 512, "FlashAttention combine only supports head dimension at most 512");
     TORCH_CHECK(num_splits <= 256, "FlashAttention combine only supports num_splits at most 256");
 
     CHECK_SHAPE(out_partial, num_splits, batch_size, seqlen, num_heads, head_size_og);

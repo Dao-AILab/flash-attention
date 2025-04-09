@@ -212,6 +212,7 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
+        int const* const seqlens_rotary = nullptr;
     };
 
     // Device side kernel params
@@ -256,6 +257,7 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
+        int const* const seqlens_rotary = nullptr;
     };
 
     static Params
@@ -295,7 +297,7 @@ struct CollectiveMainloopFwdSm80 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
@@ -472,11 +474,11 @@ struct CollectiveMainloopFwdSm80 {
                 flash::cp_async_wait<Share_QV_Smem ? 1 : kStages * 2 - 1>();
             } else {
                 if (get<1>(params.shape_rotary) > 0) {  // Apply rotary to Q
-                    int const offset_rotary = seqlen_info.seqlen_k_og + seqlen_info.leftpad_k;
                     using Rotary_t = Rotary<kBlockM, kHeadDim, NumMmaThreads, Element, !(Is_causal || Is_local) /*FixedPosition*/>;
                     Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
                                     params.ptr_rotary_sin, params.stride_rotary_sin,
-                                    params.is_rotary_interleaved, thread_idx, seqlen_q, offset_rotary);
+                                    params.is_rotary_interleaved, thread_idx, seqlen_q,
+                                    seqlen_info.seqlen_rotary);
                     int const qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
                     if (params.is_rotary_interleaved) {
                         auto [tRrCos, tRrSin] = cute::conditional_return<!PackGQA>(
@@ -689,12 +691,12 @@ struct CollectiveMainloopFwdSm80 {
 
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
         static constexpr int kHeadDim = get<2>(TileShape_MNK{});
-        int const offset_rotary = seqlen_info.seqlen_k_og + seqlen_info.leftpad_k;
         int const seqlen_k_new = seqlen_info.seqlen_k_new;
         using Rotary_t = Rotary<kBlockN, kHeadDim, NumMmaThreads, Element>;
         Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
                         params.ptr_rotary_sin, params.stride_rotary_sin,
-                        params.is_rotary_interleaved, thread_idx, seqlen_k_new, offset_rotary);
+                        params.is_rotary_interleaved, thread_idx, seqlen_k_new,
+                        seqlen_info.seqlen_rotary);
 
         using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 2 /*LoadsPerRow_LB*/>;
         PagedKVManager_t paged_kv_manager(

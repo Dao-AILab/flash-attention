@@ -36,6 +36,7 @@ def _flash_attn_forward(
         leftpad_k,
         rotary_cos,
         rotary_sin,
+        seqlens_rotary,
         q_descale,
         k_descale,
         v_descale,
@@ -58,6 +59,7 @@ def _flash_attn_forward(
         maybe_contiguous(x) for x in (page_table, kv_batch_idx, leftpad_k)
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
+    seqlens_rotary = maybe_contiguous(seqlens_rotary)
     out, softmax_lse, *rest = flash_attn_3_cuda.fwd(
         q,
         k,
@@ -78,6 +80,7 @@ def _flash_attn_forward(
         leftpad_k,
         rotary_cos,
         rotary_sin,
+        seqlens_rotary,
         q_descale,
         k_descale,
         v_descale,
@@ -171,17 +174,26 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             num_heads_k = (qkv.shape[2] - num_heads_q) // 2
             assert num_heads_k * 2 + num_heads_q == qkv.shape[2]
             q, k, v = qkv.split([num_heads_q, num_heads_k, num_heads_k], dim=-2)
-        out, q, k, v, out_padded, softmax_lse = _flash_attn_forward(
+        out, softmax_lse, *rest = _flash_attn_forward(
             q,
             k,
             v,
+            None, None,  # k_new, v_new
+            None,  # qv
+            None,  # out
+            None, None, None,   # cu_seqlens_q/k/k_new
+            None, None,   # seqused_q/k
+            None, None,   # max_seqlen_q/k
+            None, None, None,   # page_table, kv_batch_idx, leftpad_k,
+            None, None, None,  # rotary_cos/sin, seqlens_rotary
+            q_descale, k_descale, v_descale,
             softmax_scale,
             causal=causal,
-            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
             softcap=softcap,
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
+        # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
+        ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -211,6 +223,9 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             v,
             out,
             softmax_lse,
+            None, None, # cu_seqlens_q, cu_seqlens_k,
+            None, None, # sequed_q, sequed_k,
+            None, None, # max_seqlen_q, max_seqlen_k,
             dq,
             dk,
             dv,
@@ -257,7 +272,7 @@ class FlashAttnFunc(torch.autograd.Function):
             None, None,   # seqused_q/k
             None, None,   # max_seqlen_q/k
             None, None, None,   # page_table, kv_batch_idx, leftpad_k,
-            None, None,  # rotary_cos/sin
+            None, None, None,  # rotary_cos/sin, seqlens_rotary
             q_descale, k_descale, v_descale,
             softmax_scale,
             causal=causal,
@@ -350,7 +365,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_q,
             max_seqlen_k,
             None, None, None,   # page_table, kv_batch_idx, leftpad_k,
-            None, None,  # rotary_cos/sin
+            None, None, None,  # rotary_cos/sin, seqlens_rotary
             q_descale, k_descale, v_descale,
             softmax_scale,
             causal=causal,
@@ -602,6 +617,7 @@ def flash_attn_with_kvcache(
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
+    rotary_seqlens: Optional[torch.Tensor] = None,
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
@@ -730,6 +746,7 @@ def flash_attn_with_kvcache(
         cache_leftpad,
         rotary_cos,
         rotary_sin,
+        rotary_seqlens,
         q_descale, k_descale, v_descale,
         softmax_scale,
         causal=causal,

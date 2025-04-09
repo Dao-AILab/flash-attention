@@ -36,15 +36,15 @@ nheads_q = 128
 
 use_bench_cudagraph = False
 
-attn_variants = ["mha", "gqa", "mqa", "mla"]
-for attn_variant in attn_variants:
-# for attn_variant in attn_variants[3:]:
-    nheads_kv = nheads_q if attn_variant == "mha" else (max(nheads_q // 8, 1) if attn_variant == "gqa" else 1)
-    headdim = 64 if attn_variant == "mla" else 128
-    headdim_v = 512 if attn_variant == "mla" else headdim
-    has_qv = headdim == 64 and headdim_v == 512
+attn_variants = ["mha", "gqa", "mqa", "mla", "gla"]
+# for attn_variant in attn_variants:
+for attn_variant in attn_variants[3:5]:
+    nheads_kv = nheads_q if attn_variant == "mha" else (max(nheads_q // 8, 1) if attn_variant == "gqa" else (1 if attn_variant == "mla" else 2))
+    headdim = 64 if attn_variant in ["mla", "gla"] else 128
+    headdim_v = 512 if attn_variant == "mla" else (256 if attn_variant == "gla" else headdim)
+    has_qv = headdim == 64 and headdim_v > 64
     # page_size = None
-    page_size = 64 if attn_variant == "mla" else 128
+    page_size = 64 if attn_variant in ["mla", "gla"] else 128
 
     should_run_flashmla = attn_variant == "mla" and page_size == 64 and flash_mla_with_kvcache is not None
 
@@ -60,7 +60,7 @@ for attn_variant in attn_variants:
     print(f"\n{attn_variant.upper()}, nheads_q = {nheads_q}, nheads_kv = {nheads_kv}, headdim = {headdim}, headdim_v = {headdim_v}, page_size = {page_size}")
 
     for seqlen in [s * 1024 for s in [1, 2, 4, 8, 16, 32, 64]]:
-    # for seqlen in [s * 1024 for s in [1]]:
+    # for seqlen in [s * 1024 for s in [8]]:
         cache_seqlens = torch.tensor([seqlen] * batch_size, device=device, dtype=torch.int)
         num_splits = 0
         q = torch.randn(batch_size, seqlen_q, nheads_q, headdim, dtype=dtype, device=device)
@@ -84,6 +84,7 @@ for attn_variant in attn_variants:
             cache_seqlens, q.dtype, headdim_v=headdim_v, page_size=page_size, causal=True
         )
         # scheduler_metadata = None
+        # breakpoint()
         fn0 = lambda: flash_attn_with_kvcache(q, k_cache, v_cache, cache_seqlens=cache_seqlens, num_splits=num_splits, qv=qv, page_table=page_table, causal=True, scheduler_metadata=scheduler_metadata)
         time.sleep(1)  # to avoid power throttling
         # Time in ms
@@ -109,7 +110,7 @@ for attn_variant in attn_variants:
                     t1 = do_bench_cudagraph(fn1, rep=10)
 
         total_seqlen = seqlen * batch_size if cache_seqlens is None else cache_seqlens.sum().item()
-        mem_io = total_seqlen * nheads_kv * (headdim + headdim_v) * 2 + q.numel() * 2 + (qv.numel() * 2 if has_qv else 0) + q.numel() * headdim_v // headdim * 2  # last time is for the output
+        mem_io = total_seqlen * nheads_kv * (headdim + headdim_v) * 2 + q.numel() * 2 + (qv.numel() * 2 if has_qv else 0) + q.numel() * headdim_v // headdim * 2  # last term is for the output
         flops = seqlen_q * total_seqlen * nheads_q * (headdim + headdim_v * (2 if has_qv else 1)) * 2
         ideal_h100_time_mem = mem_io / 3.35e12 * 1e6
         ideal_h100_time_flop = flops / 989e12 * 1e6

@@ -64,12 +64,13 @@ struct SeqlenInfoQKNewK {
 
     int const leftpad_k;
     int const offset_q, offset_k, offset_k_new;
-    int const seqlen_q, seqlen_k_og, seqlen_k_new, seqlen_k;
+    int const seqlen_q, seqlen_k_og, seqlen_k_new, seqlen_k, seqlen_rotary;
 
     CUTLASS_DEVICE
     SeqlenInfoQKNewK(int const bidb, int const seqlen_q_static, int const seqlen_k_static, int const shape_K_new_0,
                      int const* const cu_seqlens_q, int const* const cu_seqlens_k, int const* const cu_seqlens_k_new,
-                     int const* const seqused_q, int const* const seqused_k, int const* const ptr_leftpad_k
+                     int const* const seqused_q, int const* const seqused_k, int const* const ptr_leftpad_k,
+                     int const* const seqlens_rotary
                      )
         : leftpad_k(ptr_leftpad_k ? ptr_leftpad_k[bidb] : 0)
         , offset_q(!Varlen || cu_seqlens_q == nullptr ? 0 : cu_seqlens_q[bidb])
@@ -85,6 +86,7 @@ struct SeqlenInfoQKNewK {
                        ? 0
                        : (cu_seqlens_k_new ? cu_seqlens_k_new[bidb + 1] - cu_seqlens_k_new[bidb] : shape_K_new_0))
         , seqlen_k(!AppendKV ? seqlen_k_og : seqlen_k_og + seqlen_k_new)
+        , seqlen_rotary(!AppendKV || !seqlens_rotary ? seqlen_k_og + leftpad_k : seqlens_rotary[bidb])
     {
     }
 
