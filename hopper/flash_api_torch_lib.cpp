@@ -38,6 +38,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<const at::Tensor> &leftpad_k_, // b
         std::optional<const at::Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
         std::optional<const at::Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
+        std::optional<const at::Tensor> &seqlens_rotary_, // b
         std::optional<at::Tensor> &q_descale_,  // (b, h_k), not (b, h)
         std::optional<at::Tensor> &k_descale_,  // (b, h_k)
         std::optional<at::Tensor> &v_descale_,  // (b, h_k)
@@ -104,6 +105,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    Tensor?  leftpad_k,"
             "    Tensor?  rotary_cos,"
             "    Tensor?  rotary_sin,"
+            "    Tensor?  seqlens_rotary,"
             "    Tensor?  q_descale,"
             "    Tensor?  k_descale,"
             "    Tensor?  v_descale,"

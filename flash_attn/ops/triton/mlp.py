@@ -4,8 +4,8 @@ import fused_dense_lib as fused_dense_cuda
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import custom_bwd, custom_fwd
 
+from flash_attn.utils.torch import custom_fwd, custom_bwd
 from flash_attn.ops.activations import sqrelu_bwd, sqrelu_fwd
 from flash_attn.ops.triton.linear import triton_dgrad_act, triton_linear_act
 

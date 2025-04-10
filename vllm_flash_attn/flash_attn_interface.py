@@ -22,6 +22,7 @@ try:
     FA3_UNAVAILABLE_REASON = None
     FA3_AVAILABLE = True
 except ImportError as e:
+    raise e
     FA3_UNAVAILABLE_REASON = str(e)
     FA3_AVAILABLE = False
 
@@ -262,7 +263,7 @@ def flash_attn_varlen_func(
             block_table,
             None,             # kv_batch_idx
             None,             # leftpad_k
-            None, None,       # rotary_cos, rotary_sin
+            None, None, None, # rotary_cos, rotary_sin, seqlens_rotary
             q_descale, k_descale, v_descale,
             softmax_scale,
             causal,
@@ -448,7 +449,7 @@ def flash_attn_with_kvcache(
             block_table,
             cache_batch_idx,     # kv_batch_idx
             None,                # leftpad_k
-            None, None,          # rotary_cos, rotary_sin
+            None, None, None,    # rotary_cos, rotary_sin, seqlens_rotary
             q_descale, k_descale, v_descale,
             softmax_scale,
             causal,

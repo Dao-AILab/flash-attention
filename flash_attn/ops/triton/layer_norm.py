@@ -10,10 +10,12 @@ import math
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import custom_fwd, custom_bwd
 
 import triton
 import triton.language as tl
+
+from flash_attn.utils.torch import custom_fwd, custom_bwd
+
 
 def triton_autotune_configs():
     # Return configs with a valid warp count for the current device
@@ -635,7 +637,9 @@ def _layer_norm_bwd(
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
     if N > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count
+    # Increasing the multiple (e.g. 8) will allow more thread blocks to be launched and hide the
+    # latency of the gmem reads/writes, but will increase the time of summing up dw / db.
+    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 8
     _dw = torch.empty((sm_count, N), dtype=torch.float32, device=weight.device)
     _db = (
         torch.empty((sm_count, N), dtype=torch.float32, device=bias.device)
@@ -1018,12 +1022,12 @@ class LayerNormLinearFn(torch.autograd.Function):
             norm_bias,
             eps,
             residual,
-            out_dtype=None if not torch.is_autocast_enabled() else torch.get_autocast_gpu_dtype(),
+            out_dtype=None if not torch.is_autocast_enabled() else torch.get_autocast_dtype("cuda"),
             residual_dtype=residual_dtype,
             is_rms_norm=is_rms_norm,
         )
         y = y.reshape(x_shape_og)
-        dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else y.dtype
+        dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled() else y.dtype
         linear_weight = linear_weight.to(dtype)
         linear_bias = linear_bias.to(dtype) if linear_bias is not None else None
         out = F.linear(y.to(linear_weight.dtype), linear_weight, linear_bias)
