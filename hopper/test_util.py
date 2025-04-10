@@ -190,6 +190,35 @@ def construct_local_mask(
         )
 
 
+def construct_chunk_mask(
+    seqlen_q,
+    seqlen_k,
+    attention_chunk,
+    query_padding_mask=None,
+    key_padding_mask=None,
+    key_leftpad=None,
+    device=None,
+):
+    row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")
+    col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
+    if key_leftpad is not None:
+        key_leftpad = rearrange(key_leftpad, "b -> b 1 1 1")
+        col_idx = repeat(col_idx, "s -> b 1 1 s", b=key_leftpad.shape[0])
+        col_idx = torch.where(col_idx >= key_leftpad, col_idx - key_leftpad, 2**32)
+    sk = (
+        seqlen_k
+        if key_padding_mask is None
+        else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
+    )
+    sq = (
+        seqlen_q
+        if query_padding_mask is None
+        else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
+    )
+    sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
+    return col_idx < ((row_idx + sk - sq) // attention_chunk) * attention_chunk
+
+
 def attention_ref(
     q,
     k,
@@ -204,6 +233,7 @@ def attention_ref(
     qv=None,
     q_descale=None, k_descale=None, v_descale=None,
     window_size=(-1, -1),  # -1 means infinite window size
+    attention_chunk=0,
     sink_token_length=0,
     softcap=0.0,
     upcast=True,
@@ -273,6 +303,17 @@ def attention_ref(
             device=q.device,
         )
         scores.masked_fill_(local_mask, float("-inf"))
+    if attention_chunk > 0:
+        chunk_mask = construct_chunk_mask(
+            seqlen_q,
+            seqlen_k,
+            attention_chunk,
+            query_padding_mask,
+            key_padding_mask,
+            key_leftpad=key_leftpad,
+            device=q.device,
+        )
+        scores.masked_fill_(chunk_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
     attention = torch.softmax(scores, dim=-1).to(v.dtype)

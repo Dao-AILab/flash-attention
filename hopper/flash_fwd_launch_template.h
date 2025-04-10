@@ -120,7 +120,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         {params.q_descale_batch_stride, params.q_descale_head_stride},
         {params.k_descale_batch_stride, params.k_descale_head_stride},
         {params.v_descale_batch_stride, params.v_descale_head_stride},
-        params.window_size_left, params.window_size_right,
+        params.window_size_left, params.window_size_right, params.attention_chunk,
         params.softcap,
         params.num_splits,
         params.kv_batch_idx,
