@@ -1,0 +1,177 @@
+#include "sytla.hpp"
+
+#include <c10/xpu/XPUStream.h>
+#include <torch/python.h>
+#include <string>
+#include "static_switch.h"
+
+#define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
+#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+
+struct Flash_fwd_params {
+  // The QKV matrices.
+  void* __restrict__ query;
+  void* __restrict__ key;
+  void* __restrict__ value;
+  void* __restrict__ output;
+
+  int bs;
+  int nheads;
+  int q_seqlen;
+  int kv_seqlen;
+  int head_dim;
+  float softmax_scale;
+  bool is_causal;
+  std::string data_type;
+
+  Flash_fwd_params() = default;
+  Flash_fwd_params(void* __restrict__ query,
+                   void* __restrict__ key,
+                   void* __restrict__ value,
+                   void* __restrict__ output,
+                   int bs,
+                   int nheads,
+                   int q_seqlen,
+                   int kv_seqlen,
+                   int head_dim,
+                   float softmax_scale,
+                   bool is_causal,
+                   std::string data_type)
+      : query(query),
+        key(key),
+        value(value),
+        output(output),
+        bs(bs),
+        nheads(nheads),
+        q_seqlen(q_seqlen),
+        kv_seqlen(kv_seqlen),
+        head_dim(head_dim),
+        softmax_scale(softmax_scale),
+        is_causal(is_causal),
+        data_type(data_type) {}
+};
+
+template <typename KernelTraits, bool kIsCausal>
+void launch_flash_fwd_kernel(Flash_fwd_params& params, at::xpu::XPUStream& stream) {
+  using Kernel = sytla::flash::FlashForward<KernelTraits, kIsCausal>;
+  using T = typename KernelTraits::ScalarT;
+  typename Kernel::Arguments args{reinterpret_cast<T*>(params.query),
+                                  reinterpret_cast<T*>(params.key),
+                                  reinterpret_cast<T*>(params.value),
+                                  reinterpret_cast<T*>(params.output),
+                                  params.softmax_scale,
+                                  params.bs,
+                                  params.nheads,
+                                  params.head_dim,
+                                  params.q_seqlen,
+                                  params.kv_seqlen};
+  Kernel kernel(args);
+  auto nd_range = kernel.get_nd_range();
+  auto queue = stream.queue();
+  queue.submit([&](sycl::handler& cgh) { cgh.parallel_for(nd_range, kernel); });
+}
+
+void run_flash_fwd(Flash_fwd_params& params, at::xpu::XPUStream& stream) {
+  FP16_SWITCH(params.data_type == "fp16", [&] {
+    HEADDIM_SWITCH(params.head_dim,  [&] {
+    BOOL_SWITCH(params.is_causal, kIsCausal, [&] {
+        using Traits = sytla::flash::FlashForwardTraits<ScalarT, kHeadDim, kIsCausal>;
+        launch_flash_fwd_kernel<Traits, kIsCausal>(params, stream);
+      });
+    });
+  });
+}
+
+std::vector<at::Tensor> mha_fwd(at::Tensor& q,
+                                const at::Tensor& k,
+                                const at::Tensor& v,
+                                std::optional<at::Tensor>& out_,
+                                std::optional<at::Tensor>& alibi_slopes_,
+                                const float p_dropout,
+                                const float softmax_scale,
+                                bool is_causal,
+                                int window_size_left,
+                                int window_size_right,
+                                const float softcap,
+                                const bool return_softmax,
+                                std::optional<at::Generator> gen_) {
+  auto q_dtype = q.dtype();
+  TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16, "FlashAttention only support fp16 and bf16 data type");
+  TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+  TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+
+  TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
+  TORCH_CHECK(k.is_contiguous(), "k must be contiguous");
+  TORCH_CHECK(v.is_contiguous(), "v must be contiguous");
+
+  // TODO: remove below limitations in the future
+  TORCH_CHECK(p_dropout == 0.f && !gen_.has_value(), "dropout does not support for now");
+  TORCH_CHECK(softcap == 0.f, "softcap does not support for now");
+  TORCH_CHECK(!return_softmax, "return_softmax does not support for now");
+  TORCH_CHECK(!alibi_slopes_.has_value(), "alibi_slopes_ does not support for now");
+  const auto sizes = q.sizes();
+
+  const int batch_size = sizes[0];
+  int seqlen_q = sizes[1];
+  int num_heads = sizes[2];
+  const int head_size = sizes[3];
+  const int seqlen_k = k.size(1);
+  const int num_heads_k = k.size(2);
+  TORCH_CHECK(num_heads == num_heads_k, "Number of heads in query/key must be the same for now");
+  TORCH_CHECK(batch_size > 0, "batch size must be positive");
+  TORCH_CHECK(head_size * 2 % 64 == 0, "q/k/v must have leading dimension that is a multiple of 64");
+
+  if (window_size_left >= seqlen_k) {
+    window_size_left = -1;
+  }
+  if (window_size_right >= seqlen_k) {
+    window_size_right = -1;
+  }
+  // causal=true is the same as causal=false in this case
+  if (seqlen_q == 1 && !alibi_slopes_.has_value()) {
+    is_causal = false;
+  }
+  if (is_causal) {
+    window_size_right = 0;
+  }
+
+  CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
+  CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
+  CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
+
+  at::Tensor out;
+  if (out_.has_value()) {
+    out = out_.value();
+    TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+    CHECK_DEVICE(out);
+    TORCH_CHECK(out.is_contiguous(), "Output tensor must be contiguous");
+    CHECK_SHAPE(out, batch_size, sizes[1], sizes[2], head_size);
+  } else {
+    out = torch::empty_like(q);
+  }
+  auto opts = q.options();
+  auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+  at::Tensor p = torch::empty({0}, q.options());
+  auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kXPU);
+  auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
+
+  std::string data_type = q.dtype() == torch::kFloat16 ? "fp16" : "bf16";
+  Flash_fwd_params params(q.data_ptr(),
+                          k.data_ptr(),
+                          v.data_ptr(),
+                          out.data_ptr(),
+                          batch_size,
+                          num_heads,
+                          seqlen_q,
+                          seqlen_k,
+                          head_size,
+                          softmax_scale,
+                          is_causal,
+                          data_type);
+  auto stream = at::xpu::getCurrentXPUStream();
+
+  run_flash_fwd(params, stream);
+
+  return {out, softmax_lse, p, rng_state};
+}
