@@ -18,7 +18,7 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             if (headdim_v == 512) {
                 return {64, 64, false, false};
             } else if (headdim_v == 256) {
-                return {128, 112, true, false};
+                return {128, 96, true, false};
             } else {
                 // Switch to tile size 192 x 192 for now
                 bool const use_blockN_128 = is_causal || is_local;
