@@ -22,38 +22,171 @@ namespace FLASH_NAMESPACE {
 // set_params_splitkv, and set_params_alibi in flash_api.cpp
 //
 void set_params_fprop(Flash_fwd_params &params,
-                    // sizes
-                    const size_t b,
-                    const size_t seqlen_q,
-                    const size_t seqlen_k,
-                    const size_t seqlen_q_rounded,
-                    const size_t seqlen_k_rounded,
-                    const size_t h,
-                    const size_t h_k,
-                    const size_t d,
-                    const size_t d_rounded,
-                    // device pointers
-                    const at::Tensor q,
-                    const at::Tensor k,
-                    const at::Tensor v,
-                    at::Tensor out,
-                    void *cu_seqlens_q_d,
-                    void *cu_seqlens_k_d,
-                    void *seqused_k,
-                    void *p_d,
-                    void *softmax_lse_d,
-                    float p_dropout,
-                    float softmax_scale,
-                    int window_size_left,
-                    int window_size_right,
-                    const float softcap,
-                    bool seqlenq_ngroups_swapped=false,
-                    const bool unpadded_lse=false);
+                      // sizes
+                      const size_t b,
+                      const size_t seqlen_q,
+                      const size_t seqlen_k,
+                      const size_t seqlen_q_rounded,
+                      const size_t seqlen_k_rounded,
+                      const size_t h,
+                      const size_t h_k,
+                      const size_t d,
+                      const size_t d_rounded,
+                      // device pointers
+                      const at::Tensor q,
+                      const at::Tensor k,
+                      const at::Tensor v,
+                      at::Tensor out,
+                      void *cu_seqlens_q_d,
+                      void *cu_seqlens_k_d,
+                      void *seqused_k,
+                      void *p_d,
+                      void *softmax_lse_d,
+                      float p_dropout,
+                      float softmax_scale,
+                      int window_size_left,
+                      int window_size_right,
+                      const float softcap,
+                      bool seqlenq_ngroups_swapped=false,
+                      const bool unpadded_lse=false) {
+
+    // Reset the parameters
+    params = {};
+
+    params.is_bf16 = q.dtype() == torch::kBFloat16;
+
+    // Set the pointers and strides.
+    params.q_ptr = q.data_ptr();
+    params.k_ptr = k.data_ptr();
+    params.v_ptr = v.data_ptr();
+    // All stride are in elements, not bytes.
+    params.q_row_stride = q.stride(-3);
+    params.k_row_stride = k.stride(-3);
+    params.v_row_stride = v.stride(-3);
+    params.q_head_stride = q.stride(-2);
+    params.k_head_stride = k.stride(-2);
+    params.v_head_stride = v.stride(-2);
+    params.o_ptr = out.data_ptr();
+    params.o_row_stride = out.stride(-3);
+    params.o_head_stride = out.stride(-2);
+
+    if (cu_seqlens_q_d == nullptr) {
+        params.q_batch_stride = q.stride(0);
+        params.k_batch_stride = k.stride(0);
+        params.v_batch_stride = v.stride(0);
+        params.o_batch_stride = out.stride(0);
+        if (seqlenq_ngroups_swapped) {
+             params.q_batch_stride *= seqlen_q;
+             params.o_batch_stride *= seqlen_q;
+        }
+    }
+
+    params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
+    params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
+    params.seqused_k = static_cast<int *>(seqused_k);
+
+    // P = softmax(QK^T)
+    params.p_ptr = p_d;
+
+    // Softmax sum
+    params.softmax_lse_ptr = softmax_lse_d;
+
+    // Set the dimensions.
+    params.b = b;
+    params.h = h;
+    params.h_k = h_k;
+    params.h_h_k_ratio = h / h_k;
+    params.seqlen_q = seqlen_q;
+    params.seqlen_k = seqlen_k;
+    params.seqlen_q_rounded = seqlen_q_rounded;
+    params.seqlen_k_rounded = seqlen_k_rounded;
+    params.d = d;
+    params.d_rounded = d_rounded;
+
+    // Set the different scale values.
+    #ifdef FLASHATTENTION_DISABLE_SOFTCAP
+        TORCH_CHECK(softcap <= 0.0, "This flash attention build does not support softcap.");
+    #endif
+    if (softcap > 0.0) {
+        params.softcap = softmax_scale / softcap;
+        params.scale_softmax = softcap;
+        params.scale_softmax_log2 = softcap * M_LOG2E;
+    } else{
+        // Remove potential NaN
+        params.softcap = 0.0;
+        params.scale_softmax = softmax_scale;
+        params.scale_softmax_log2 = softmax_scale * M_LOG2E;
+    }
+
+    // Set this to probability of keeping an element to simplify things.
+    params.p_dropout = 1.f - p_dropout;
+    // Convert p from float to int so we don't have to convert the random uint to float to compare.
+    // [Minor] We want to round down since when we do the comparison we use <= instead of <
+    // params.p_dropout_in_uint = uint32_t(std::floor(params.p_dropout * 4294967295.0));
+    // params.p_dropout_in_uint16_t = uint16_t(std::floor(params.p_dropout * 65535.0));
+    params.p_dropout_in_uint8_t = uint8_t(std::floor(params.p_dropout * 255.0));
+    params.rp_dropout = 1.f / params.p_dropout;
+    params.scale_softmax_rp_dropout = params.rp_dropout * params.scale_softmax;
+    TORCH_CHECK(p_dropout < 1.f);
+    #ifdef FLASHATTENTION_DISABLE_DROPOUT
+        TORCH_CHECK(p_dropout == 0.0f, "This flash attention build does not support dropout.");
+    #endif
+
+    // Causal is the special case where window_size_right == 0 and window_size_left < 0.
+    // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
+    params.is_causal = window_size_left < 0 && window_size_right == 0;
+
+    if (window_size_left < 0 && window_size_right >= 0) { window_size_left = seqlen_k; }
+    if (window_size_left >= 0 && window_size_right < 0) { window_size_right = seqlen_k; }
+    params.window_size_left = window_size_left;
+    params.window_size_right = window_size_right;
+
+    #ifdef FLASHATTENTION_DISABLE_LOCAL
+        TORCH_CHECK(params.is_causal || (window_size_left < 0 && window_size_right < 0),
+            "This flash attention build does not support local attention.");
+    #endif
+
+    params.is_seqlens_k_cumulative = true;
+
+    #ifdef FLASHATTENTION_DISABLE_UNEVEN_K
+        TORCH_CHECK(d == d_rounded, "This flash attention build does not support headdim not being a multiple of 32.");
+    #endif
+
+    params.unpadded_lse = unpadded_lse;
+    params.seqlenq_ngroups_swapped = seqlenq_ngroups_swapped;
+}
 
 std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, const int batch_size,
     const int num_heads, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
     const int head_size_rounded, const float p_dropout,
-    const int num_splits, const int num_sm, struct c10::TensorOptions opts);
+    const int num_splits, const int num_sm, struct c10::TensorOptions opts) {
+
+    // This needs to match with run_mha_fwd_splitkv_dispatch
+    const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+    const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+    // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
+    // In any case we don't expect seqlen_q to be larger than 64 for inference.
+    const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
+    params.num_splits = num_splits;
+    at::Tensor softmax_lse_accum;
+    at::Tensor out_accum;
+
+    if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
+        if (num_splits < 1) {
+            // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
+            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
+        }
+        if (params.num_splits > 1) {
+            softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+            out_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
+            params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+            params.oaccum_ptr = out_accum.data_ptr();
+        }
+        TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
+    }
+
+    return std::make_tuple(softmax_lse_accum, out_accum);
+}
 
 void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi_slopes_, int batch_size, int num_heads){
 #ifdef FLASHATTENTION_DISABLE_ALIBI
