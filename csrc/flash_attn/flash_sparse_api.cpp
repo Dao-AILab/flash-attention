@@ -55,7 +55,24 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     const int head_size_rounded, const float p_dropout,
     const int num_splits, const int num_sm, struct c10::TensorOptions opts);
 
-void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi_slopes_, int batch_size, int num_heads);
+void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi_slopes_, int batch_size, int num_heads){
+#ifdef FLASHATTENTION_DISABLE_ALIBI
+    TORCH_CHECK(!alibi_slopes_.has_value(), "This flash attention build does not support alibi.");
+    params.alibi_slopes_ptr = nullptr;
+#else
+    if (alibi_slopes_.has_value()) {
+        auto alibi_slopes = alibi_slopes_.value();
+        TORCH_CHECK(alibi_slopes.dtype() == torch::kFloat32, "ALiBi slopes must have dtype fp32");
+        CHECK_DEVICE(alibi_slopes);
+        TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
+        TORCH_CHECK(alibi_slopes.sizes() == torch::IntArrayRef({num_heads}) || alibi_slopes.sizes() == torch::IntArrayRef({batch_size, num_heads}));
+        params.alibi_slopes_ptr = alibi_slopes.data_ptr();
+        params.alibi_slopes_batch_stride = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
+    } else {
+        params.alibi_slopes_ptr = nullptr;
+    }
+#endif
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 
