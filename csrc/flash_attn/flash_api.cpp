@@ -579,7 +579,9 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
     //     params.philox_args = gen->philox_cuda_state(counter_offset);
     // }
 
-    set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+    set_params_alibi(params, 
+        const_cast<std::optional<at::Tensor> &>(alibi_slopes_), 
+        batch_size, num_heads);
 
     if (seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -784,7 +786,9 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
     //     params.philox_args = gen->philox_cuda_state(counter_offset);
     // }
 
-    set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+    set_params_alibi(params, 
+        const_cast<std::optional<at::Tensor> &>(alibi_slopes_), 
+        batch_size, num_heads);
 
     if (max_seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
