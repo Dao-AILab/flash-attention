@@ -17,6 +17,6 @@
  
  ////////////////////////////////////////////////////////////////////////////////////////////////////
  
- template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_sparse_(Flash_fwd_params_sparse &params, cudaStream_t stream);
+ template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_sparse_(Flash_fwd_params &params, cudaStream_t stream);
  
  }  // namespace FLASH_NAMESPACE
