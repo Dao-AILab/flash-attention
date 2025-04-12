@@ -7,6 +7,7 @@
 #include "namespace_config.h"
 #include "flash_fwd_launch_template.h"
 #include "flash_fwd_sparse_kernel.h"
+#include "flash_sparse.h"
 
 namespace FLASH_NAMESPACE {
 
