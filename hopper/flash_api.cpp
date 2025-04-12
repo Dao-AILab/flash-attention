@@ -162,8 +162,12 @@ void set_params_fprop(Flash_fwd_params &params,
     params.is_local = (window_size_left >= 0 || window_size_right >= 0 || attention_chunk >= 1) && !params.is_causal;
 
     // TODO: check this
-    if (window_size_left < 0 && window_size_right >= 0) { window_size_left = seqlen_k - 1; }
-    if (window_size_left >= 0 && window_size_right < 0) { window_size_right = seqlen_q - 1; }
+    if (window_size_left < 0) { window_size_left = seqlen_k - 1; }
+    if (window_size_right < 0) { window_size_right = seqlen_q - 1; }
+    if (attention_chunk > 0) {
+        window_size_left = std::min(window_size_left, attention_chunk - 1);
+        window_size_right = std::min(window_size_right, attention_chunk - 1);
+    }
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
     params.attention_chunk = attention_chunk;
@@ -446,7 +450,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // If is_local, we're not going to load all of seqlen_k
     int const seqlen_k_loaded = !params.is_local
         ? params.seqlen_k
-        : std::max(0, std::min(params.seqlen_k, params.window_size_right + std::max(params.window_size_left, params.attention_chunk) + 1 + kBlockM));
+        : std::max(0, std::min(params.seqlen_k, params.window_size_right + params.window_size_left + 1 + kBlockM));
     int const num_n_blocks = (seqlen_k_loaded + kBlockN - 1) / kBlockN;
     int const num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
     int const size_one_kv_head = params.seqlen_k * (params.d + params.dv) * (params.is_e4m3 ? 1 : 2);
@@ -576,8 +580,12 @@ mha_fwd_get_scheduler_metadata(
 
     params.is_causal = window_size_left < 0 && window_size_right == 0 && attention_chunk == 0;
     params.is_local = (window_size_left >= 0 || window_size_right >= 0 || attention_chunk >= 1) && !params.is_causal;
-    if (window_size_left < 0 && window_size_right >= 0) { window_size_left = max_seqlen_k - 1; }
-    if (window_size_left >= 0 && window_size_right < 0) { window_size_right = max_seqlen_q - 1; }
+    if (window_size_left < 0) { window_size_left = max_seqlen_k - 1; }
+    if (window_size_right < 0) { window_size_right = max_seqlen_q - 1; }
+    if (attention_chunk >0) {
+        window_size_left = std::min(window_size_left, attention_chunk - 1);
+        window_size_right = std::min(window_size_right, attention_chunk - 1);
+    }
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
     params.attention_chunk = attention_chunk;
@@ -767,9 +775,6 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         }
     }
     if (is_causal) { window_size_right = 0; }
-    // There's a case where is_causal=false, window_size=(-1, 0). Then set_params_fprop will set params.is_causal=true.
-    // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM.
-    is_causal = window_size_left < 0 && window_size_right == 0 && attention_chunk == 0;
 
     if (!is_varlen_q) {
         CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);

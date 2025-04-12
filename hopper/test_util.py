@@ -216,7 +216,11 @@ def construct_chunk_mask(
         else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
     )
     sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
-    return col_idx < ((row_idx + sk - sq) // attention_chunk) * attention_chunk
+    # Subtract remainder instead of divide and then multiply to take care of negative values
+    col_limit_left_chunk = row_idx + sk - sq - (row_idx + sk - sq) % attention_chunk
+    return torch.logical_or(
+        col_idx < col_limit_left_chunk, col_idx >= col_limit_left_chunk + attention_chunk
+    )
 
 
 def attention_ref(
@@ -291,6 +295,7 @@ def attention_ref(
         scores = torch.tanh(scores / softcap) * softcap
     if key_padding_mask is not None:
         scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
+    local_mask = None
     if window_size[0] >= 0 or window_size[1] >= 0:
         local_mask = construct_local_mask(
             seqlen_q,
@@ -302,7 +307,6 @@ def attention_ref(
             key_leftpad=key_leftpad,
             device=q.device,
         )
-        scores.masked_fill_(local_mask, float("-inf"))
     if attention_chunk > 0:
         chunk_mask = construct_chunk_mask(
             seqlen_q,
@@ -313,7 +317,9 @@ def attention_ref(
             key_leftpad=key_leftpad,
             device=q.device,
         )
-        scores.masked_fill_(chunk_mask, float("-inf"))
+        local_mask = torch.logical_or(local_mask, chunk_mask) if local_mask is not None else chunk_mask
+    if local_mask is not None:
+        scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
@@ -325,7 +331,7 @@ def attention_ref(
     if key_padding_mask is not None:
         attention = attention.masked_fill(rearrange(~key_padding_mask, "b s -> b 1 1 s"), 0.0)
     # Some rows might be completely masked out so we fill them with zero instead of NaN
-    if window_size[0] >= 0 or window_size[1] >= 0:
+    if local_mask is not None:
         attention = attention.masked_fill(torch.all(local_mask, dim=-1, keepdim=True), 0.0)
     dropout_scaling = 1.0 / (1 - dropout_p)
     # attention_drop = attention.masked_fill(~dropout_mask, 0.0) * dropout_scaling

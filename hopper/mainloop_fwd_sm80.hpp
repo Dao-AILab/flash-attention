@@ -552,8 +552,7 @@ struct CollectiveMainloopFwdSm80 {
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
-            params.attention_chunk_divmod,
-            params.qhead_per_khead_divmod
+            params.attention_chunk_divmod, params.qhead_per_khead_divmod
         );
 
         float softcap_val = params.softcap_val;
@@ -626,23 +625,17 @@ struct CollectiveMainloopFwdSm80 {
         --n_block;
         if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
             auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-            int const m_idx_min = !PackGQA ? m_block * kBlockM : params.qhead_per_khead_divmod.divide(m_block * kBlockM);
-            int const n_block_min_causal_local_mask =
-                std::max(n_block_min, (m_idx_min + seqlen_k - seqlen_q + params.window_size_right) / kBlockN);
+            int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
+                seqlen_info, m_block, n_block_min, params.window_size_right,
+                params.attention_chunk_divmod, params.qhead_per_khead_divmod);
             #pragma unroll 1
             for (; n_block >= n_block_min_causal_local_mask; --n_block) {
                 fwd_step(n_block, mask_fn, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
             }
         }
-        int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : params.qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
-        int const n_idx = m_idx_max + seqlen_k - seqlen_q;
-        int n_idx_left = n_idx - params.window_size_left;
-        if (params.attention_chunk_divmod.divisor > 0) {
-            n_idx_left = std::max(n_idx_left, params.attention_chunk_divmod.divide(n_idx) * params.attention_chunk_divmod.divisor);
-        }
-        int const n_block_min_before_local_mask = !Is_local
-            ? n_block_min
-            : std::max(n_block_min, cute::ceil_div(n_idx_left, kBlockN));
+        int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
+            seqlen_info, m_block, n_block_min, params.window_size_left,
+            params.attention_chunk_divmod, params.qhead_per_khead_divmod);
         auto no_mask_fn = [](auto& tSrS, int n_block) { };
         #pragma unroll 1
         for (; n_block >= n_block_min_before_local_mask; --n_block) {

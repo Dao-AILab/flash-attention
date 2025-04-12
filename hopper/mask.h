@@ -109,14 +109,14 @@ struct Mask {
                         int const row_idx = !PackGQA
                             ? get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM
                             :  __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
-                        int const col_limit_right = !Seqlenk_mask
+                        int col_limit_right = !Seqlenk_mask
                             ? row_idx + local_row_offset_right
                             : __viaddmin_s32(row_idx, local_row_offset_right, seqlenk_col_limit);
                         int col_limit_left = row_idx + local_row_offset_left;
                         if (attention_chunk_divmod.divisor > 0) {
-                            // TODO: does divide round to -inf or 0? We want to round to -inf
-                            int col_limit_left_chunk = attention_chunk_divmod.divide(row_idx + seqlen_k - seqlen_q) * attention_chunk_divmod.divisor - n_block * kBlockN - thread_col_offset;
+                            int col_limit_left_chunk = flash::round_down(attention_chunk_divmod, row_idx + seqlen_k - seqlen_q) - n_block * kBlockN - thread_col_offset;
                             col_limit_left = std::max(col_limit_left, col_limit_left_chunk);
+                            col_limit_right = std::min(col_limit_right, col_limit_left_chunk + attention_chunk_divmod.divisor);
                         }
                         #pragma unroll
                         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
