@@ -582,7 +582,7 @@ mha_fwd_get_scheduler_metadata(
     params.is_local = (window_size_left >= 0 || window_size_right >= 0 || attention_chunk >= 1) && !params.is_causal;
     if (window_size_left < 0) { window_size_left = max_seqlen_k - 1; }
     if (window_size_right < 0) { window_size_right = max_seqlen_q - 1; }
-    if (attention_chunk >0) {
+    if (attention_chunk > 0) {
         window_size_left = std::min(window_size_left, attention_chunk - 1);
         window_size_right = std::min(window_size_right, attention_chunk - 1);
     }

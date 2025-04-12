@@ -850,7 +850,7 @@ def test_flash_attn_kvcache(
                     cache_seqlens, q.dtype, headdim_v=dv, cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k_new, cache_leftpad=cache_leftpad,
                     max_seqlen_k_new=seqlen_new, page_size=page_size,
-                    causal=causal, window_size=window_size,
+                    causal=causal, window_size=window_size, attention_chunk=attention_chunk,
                     num_splits=num_splits
                 )
             else:
