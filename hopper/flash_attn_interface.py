@@ -1,9 +1,8 @@
 # Copyright (c) 2023, Tri Dao.
 
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
@@ -165,7 +164,7 @@ def _hopper_flash_attn_forward_fake(
 
     out = torch.empty_like(q)
 
-    is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None or sequed_q is not None or sequed_k is not None or leftpad_k is not None
+    is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None or leftpad_k is not None
     if is_varlen:
         total_q, num_heads, _ = q.shape
         softmax_lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device, layout=q.layout)
