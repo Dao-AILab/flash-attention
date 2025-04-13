@@ -69,11 +69,11 @@ def _hopper_flash_attn_forward(
         causal: bool,
         window_size_left: int,
         window_size_right: int,
-        attention_chunk: int,
+        attention_chunk: int = 0,
         softcap: float = 0.0,
         rotary_interleaved: bool =True,
         scheduler_metadata: Optional[torch.Tensor] = None,
-        num_splits: int =1,
+        num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
         sm_margin: int = 0
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -155,11 +155,11 @@ def _hopper_flash_attn_forward_fake(
         causal: bool,
         window_size_left: int,
         window_size_right: int,
-        attention_chunk: int,
+        attention_chunk: int = 0,
         softcap: float = 0.0,
         rotary_interleaved: bool =True,
         scheduler_metadata: Optional[torch.Tensor] = None,
-        num_splits: int =1,
+        num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
         sm_margin: int = 0
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -212,7 +212,7 @@ def _hopper_flash_attn_backward(
         window_size_right: int,
         softcap: float =0.0,
         deterministic: bool = False,
-        sm_margin: int =0,
+        sm_margin: int = 0,
 ) -> None:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -264,7 +264,7 @@ def _hopper_flash_attn_backward_fake(
         window_size_right: int,
         softcap: float =0.0,
         deterministic: bool = False,
-        sm_margin: int =0,
+        sm_margin: int = 0,
 ) -> None:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if dq is None:
