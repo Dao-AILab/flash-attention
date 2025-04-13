@@ -69,6 +69,7 @@ def _hopper_flash_attn_forward(
         causal: bool,
         window_size_left: int,
         window_size_right: int,
+        attention_chunk: int,
         softcap: float = 0.0,
         rotary_interleaved: bool =True,
         scheduler_metadata: Optional[torch.Tensor] = None,
@@ -115,6 +116,7 @@ def _hopper_flash_attn_forward(
         causal,
         window_size_left,
         window_size_right,
+        attention_chunk,
         softcap,
         rotary_interleaved,
         scheduler_metadata,
@@ -153,6 +155,7 @@ def _hopper_flash_attn_forward_fake(
         causal: bool,
         window_size_left: int,
         window_size_right: int,
+        attention_chunk: int,
         softcap: float = 0.0,
         rotary_interleaved: bool =True,
         scheduler_metadata: Optional[torch.Tensor] = None,
@@ -288,6 +291,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         causal,
         q_descale=None, k_descale=None, v_descale=None,
         window_size=(-1, -1),
+        attention_chunk=0,
         softcap=0.0,
         deterministic=False,
         num_heads_q=None,
@@ -320,6 +324,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
+            attention_chunk=attention_chunk,
             softcap=softcap,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
@@ -327,6 +332,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.attention_chunk = attention_chunk
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.ndim = qkv.dim()
@@ -336,6 +342,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse = ctx.saved_tensors
+        assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         if ctx.ndim == 5:
             qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
             dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
@@ -367,7 +374,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.deterministic,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None, None, None, None, None
+        return dqkv, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -383,6 +390,7 @@ class FlashAttnFunc(torch.autograd.Function):
         qv=None,
         q_descale=None, k_descale=None, v_descale=None,
         window_size=(-1, -1),
+        attention_chunk=0,
         softcap=0.0,
         num_splits=1,
         pack_gqa=None,
@@ -409,6 +417,7 @@ class FlashAttnFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
+            attention_chunk=attention_chunk,
             softcap=softcap,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
@@ -419,6 +428,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.attention_chunk = attention_chunk
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
@@ -427,6 +437,7 @@ class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse = ctx.saved_tensors
+        assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
             dout,
@@ -452,7 +463,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -474,6 +485,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         qv=None,
         q_descale=None, k_descale=None, v_descale=None,
         window_size=(-1, -1),
+        attention_chunk=0,
         softcap=0.0,
         num_splits=1,
         pack_gqa=None,
@@ -504,6 +516,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
+            attention_chunk=attention_chunk,
             softcap=softcap,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
@@ -516,6 +529,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.attention_chunk = attention_chunk
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
@@ -524,6 +538,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
+        assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
             dout,
@@ -552,7 +567,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -561,6 +576,7 @@ def flash_attn_qkvpacked_func(
     causal=False,
     q_descale=None, k_descale=None, v_descale=None,
     window_size=(-1, -1),
+    attention_chunk=0,
     softcap=0.0,
     deterministic=False,
     num_heads_q=None,
@@ -605,6 +621,7 @@ def flash_attn_qkvpacked_func(
         causal,
         q_descale, k_descale, v_descale,
         window_size,
+        attention_chunk,
         softcap,
         deterministic,
         num_heads_q,
@@ -620,6 +637,7 @@ def flash_attn_func(
     qv=None,
     q_descale=None, k_descale=None, v_descale=None,
     window_size=(-1, -1),
+    attention_chunk=0,
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
@@ -680,6 +698,7 @@ def flash_attn_func(
         qv,
         q_descale, k_descale, v_descale,
         window_size,
+        attention_chunk,
         softcap,
         num_splits,
         pack_gqa,
@@ -703,6 +722,7 @@ def flash_attn_varlen_func(
     qv=None,
     q_descale=None, k_descale=None, v_descale=None,
     window_size=(-1, -1),
+    attention_chunk=0,
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
@@ -724,6 +744,7 @@ def flash_attn_varlen_func(
         qv,
         q_descale, k_descale, v_descale,
         window_size,
+        attention_chunk,
         softcap,
         num_splits,
         pack_gqa,
@@ -759,6 +780,7 @@ def flash_attn_with_kvcache(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
+    attention_chunk=0,
     softcap=0.0, # 0.0 means deactivated
     rotary_interleaved=True,
     scheduler_metadata=None,
@@ -887,6 +909,7 @@ def flash_attn_with_kvcache(
         causal=causal,
         window_size_left=window_size[0],
         window_size_right=window_size[1],
+        attention_chunk=attention_chunk,
         softcap=softcap,
         rotary_interleaved=rotary_interleaved,
         scheduler_metadata=scheduler_metadata,
@@ -910,6 +933,7 @@ def get_scheduler_metadata(
     max_seqlen_k_new=0,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
+    attention_chunk=0,
     has_softcap=False,
     num_splits=0,    # Can be tuned for speed
     pack_gqa=None,   # Can be tuned for speed
@@ -931,6 +955,7 @@ def get_scheduler_metadata(
         max_seqlen_k_new,
         causal,
         window_size[0], window_size[1],
+        attention_chunk,
         has_softcap,
         num_splits,
         pack_gqa,

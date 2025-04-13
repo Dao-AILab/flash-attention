@@ -310,7 +310,7 @@ struct CollectiveMainloopBwdSm90 {
         float const* const ptr_dPsum;
         StrideLSE const stride_dPsum;
         float const softmax_scale;
-        int const window_size_left, window_size_right;
+        int const window_size_left, window_size_right, attention_chunk;
         float const softcap_val;
         int const num_batch;
         int* const dq_semaphore;
@@ -338,6 +338,7 @@ struct CollectiveMainloopBwdSm90 {
         StrideLSE const stride_dPsum;
         float const softmax_scale, softmax_scale_log2;
         int const window_size_left, window_size_right;
+        cutlass::FastDivmod attention_chunk_divmod;
         float const softcap_val;
         int const num_batch;
         int* const dq_semaphore;
@@ -378,6 +379,9 @@ struct CollectiveMainloopBwdSm90 {
             TileShape_MNK{},
             ClusterShape{}); // no mcast for KV
         if constexpr (Deterministic) { assert(args.dq_semaphore != nullptr); }
+        // Avoid dividing by zero
+        cutlass::FastDivmod attention_chunk_divmod(args.attention_chunk >= 1 ? args.attention_chunk : 1);
+        attention_chunk_divmod.divisor = args.attention_chunk;
         // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         // Right after this, we multiply by log2(e) before applying exp2.
         // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
@@ -394,7 +398,7 @@ struct CollectiveMainloopBwdSm90 {
                 args.ptr_LSE_log2, args.shape_LSE, args.stride_LSE_log2, args.ptr_dPsum, args.stride_dPsum,
                 args.softmax_scale,
                 !Has_softcap ? float(args.softmax_scale * M_LOG2E) : float(args.softcap_val * M_LOG2E),
-                args.window_size_left, args.window_size_right,
+                args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
@@ -793,7 +797,7 @@ struct CollectiveMainloopBwdSm90 {
 
         flash::Mask<kBlockM, kBlockN, false /*PackGQA*/, TiledMmaSdP, SdP_swapAB> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
-            params.qhead_per_khead_divmod
+            params.attention_chunk_divmod, params.qhead_per_khead_divmod
         );
 
         int m_block = m_block_min;

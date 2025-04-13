@@ -85,6 +85,7 @@ void set_params_fprop(Flash_fwd_params &params,
                       float softmax_scale,
                       int window_size_left,
                       int window_size_right,
+                      int attention_chunk,
                       const float softcap=0.f,
                       const int sm_margin=0) {
 
@@ -157,14 +158,19 @@ void set_params_fprop(Flash_fwd_params &params,
 
     // Causal is the special case where window_size_right == 0 and window_size_left < 0.
     // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
-    params.is_causal = window_size_left < 0 && window_size_right == 0;
-    params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
+    params.is_causal = window_size_left < 0 && window_size_right == 0 && attention_chunk == 0;
+    params.is_local = (window_size_left >= 0 || window_size_right >= 0 || attention_chunk >= 1) && !params.is_causal;
 
     // TODO: check this
-    if (window_size_left < 0 && window_size_right >= 0) { window_size_left = seqlen_k - 1; }
-    if (window_size_left >= 0 && window_size_right < 0) { window_size_right = seqlen_q - 1; }
+    if (window_size_left < 0) { window_size_left = seqlen_k - 1; }
+    if (window_size_right < 0) { window_size_right = seqlen_q - 1; }
+    if (attention_chunk > 0) {
+        window_size_left = std::min(window_size_left, attention_chunk - 1);
+        window_size_right = std::min(window_size_right, attention_chunk - 1);
+    }
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
+    params.attention_chunk = attention_chunk;
 
     params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
     params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
@@ -207,6 +213,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                       float softmax_scale,
                       int window_size_left,
                       int window_size_right,
+                      int attention_chunk,
                       const float softcap=0.f,
                       bool deterministic=false,
                       int const sm_margin=0) {
@@ -223,6 +230,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                      softmax_scale,
                      window_size_left,
                      window_size_right,
+                     attention_chunk,
                      softcap,
                      sm_margin);
 
@@ -524,6 +532,7 @@ mha_fwd_get_scheduler_metadata(
         bool is_causal,
         int window_size_left,
         int window_size_right,
+        int attention_chunk,
         bool has_softcap,
         int num_splits,
         std::optional<bool> pack_gqa_,
@@ -561,7 +570,7 @@ mha_fwd_get_scheduler_metadata(
     if (window_size_left >= max_seqlen_k - 1) { window_size_left = -1; }
     if (window_size_right >= max_seqlen_q - 1) { window_size_right = -1; }
     // causal=true is the same as causal=false in this case
-    if (max_seqlen_q == 1 && window_size_left == -1 && window_size_right == -1) {
+    if (max_seqlen_q == 1 && window_size_left == -1 && window_size_right == -1 && attention_chunk == 0) {
         // Special case of hdim 128 where we want causal to have kBlockN=128, better for pagedKV and TMA
         if ((headdim <= 64 || headdim > 128) || !page_size.has_value()) {
             is_causal = false;
@@ -569,12 +578,17 @@ mha_fwd_get_scheduler_metadata(
     }
     if (is_causal) { window_size_right = 0; }
 
-    params.is_causal = window_size_left < 0 && window_size_right == 0;
-    params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
-    if (window_size_left < 0 && window_size_right >= 0) { window_size_left = max_seqlen_k - 1; }
-    if (window_size_left >= 0 && window_size_right < 0) { window_size_right = max_seqlen_q - 1; }
+    params.is_causal = window_size_left < 0 && window_size_right == 0 && attention_chunk == 0;
+    params.is_local = (window_size_left >= 0 || window_size_right >= 0 || attention_chunk >= 1) && !params.is_causal;
+    if (window_size_left < 0) { window_size_left = max_seqlen_k - 1; }
+    if (window_size_right < 0) { window_size_right = max_seqlen_q - 1; }
+    if (attention_chunk > 0) {
+        window_size_left = std::min(window_size_left, attention_chunk - 1);
+        window_size_right = std::min(window_size_right, attention_chunk - 1);
+    }
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
+    params.attention_chunk = attention_chunk;
     params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
     params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
     params.softcap = has_softcap ? 1.0f : 0.0f;
@@ -660,6 +674,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         bool is_causal,
         int window_size_left,
         int window_size_right,
+        int attention_chunk,
         float const softcap,
         bool const is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
         std::optional<at::Tensor> &scheduler_metadata_,  // (b + 1)
@@ -753,16 +768,13 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
     if (window_size_right >= seqlen_q - 1) { window_size_right = -1; }
     // causal=true is the same as causal=false in this case
-    if (seqlen_q == 1 && window_size_left == -1 && window_size_right == -1) {
+    if (seqlen_q == 1 && window_size_left == -1 && window_size_right == -1 && attention_chunk == 0) {
         // Special case of hdim 128 where we want causal to have kBlockN=128, better for pagedKV and TMA
         if ((head_size <= 64 || head_size > 128) || !paged_KV) {
             is_causal = false;
         }
     }
     if (is_causal) { window_size_right = 0; }
-    // There's a case where is_causal=false, window_size=(-1, 0). Then set_params_fprop will set params.is_causal=true.
-    // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM.
-    is_causal = window_size_left < 0 && window_size_right == 0;
 
     if (!is_varlen_q) {
         CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
@@ -868,6 +880,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
                      softmax_scale,
                      window_size_left,
                      window_size_right,
+                     attention_chunk,
                      softcap,
                      sm_margin);
     params.total_q = total_q;
@@ -1445,6 +1458,7 @@ std::vector<at::Tensor> mha_bwd(
                      softmax_scale,
                      window_size_left,
                      window_size_right,
+                     0,  // attention_chunk
                      softcap,
                      deterministic,
                      sm_margin);

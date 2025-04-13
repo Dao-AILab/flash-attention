@@ -135,6 +135,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     // Local window size
     int window_size_left, window_size_right;
+    int attention_chunk;
 
     // Pointer to the RNG seed (idx 0) and offset (idx 1).
     uint64_t * rng_state;

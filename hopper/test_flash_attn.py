@@ -63,7 +63,7 @@ COMPILED_HDIMS = (
 @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
+# @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("V_colmajor", [False, True])
 @pytest.mark.parametrize("V_colmajor", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -120,7 +120,8 @@ def test_flash_attn_output(
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
-    for dv in dv_vals:
+    attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if not DISABLE_LOCAL else [0]
+    for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
         q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
         if softcap > 0.0:
             # Ensure the values of qk are at least within softcap range.
@@ -153,6 +154,7 @@ def test_flash_attn_output(
             qv=qv_ref,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
+            attention_chunk=attention_chunk,
             softcap=softcap
         )
         out_pt, attn_pt = attention_ref(
@@ -165,6 +167,7 @@ def test_flash_attn_output(
             qv=qv_ref,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
+            attention_chunk=attention_chunk,
             softcap=softcap,
             upcast=False,
             reorder_ops=True,
@@ -197,6 +200,7 @@ def test_flash_attn_output(
                 qv=qv,
                 q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
+                attention_chunk=attention_chunk,
                 softcap=softcap,
                 pack_gqa=pack_gqa,
                 num_splits=num_splits
@@ -339,7 +343,8 @@ def test_flash_attn_varlen_output(
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
-    for dv in dv_vals:
+    attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k and not DISABLE_LOCAL else [0]
+    for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
         q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
         if softcap > 0.0:
             # Ensure the values of qk are at least within softcap range.
@@ -416,6 +421,7 @@ def test_flash_attn_varlen_output(
             qv=qv_ref,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
+            attention_chunk=attention_chunk,
             softcap=softcap
         )
         out_pt, attn_pt = attention_ref(
@@ -428,6 +434,7 @@ def test_flash_attn_varlen_output(
             qv=qv_ref,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
+            attention_chunk=attention_chunk,
             softcap=softcap,
             upcast=False,
             reorder_ops=True,
@@ -463,6 +470,7 @@ def test_flash_attn_varlen_output(
                 q_descale=q_descale,
                 k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
+                attention_chunk=attention_chunk,
                 softcap=softcap,
             )
             out = output_pad_fn(out_unpad)
@@ -587,7 +595,7 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("d", [128])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -650,7 +658,8 @@ def test_flash_attn_kvcache(
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
-    for dv in dv_vals:
+    attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if (causal or local) and not DISABLE_LOCAL else [0]
+    for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
         has_qv = d == 64 and dv >= 256
         q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
         if has_qv:
@@ -798,6 +807,7 @@ def test_flash_attn_kvcache(
             causal=causal,
             qv=qv,
             window_size=window_size,
+            attention_chunk=attention_chunk,
             key_leftpad=cache_leftpad,
         )
         out_pt, _ = attention_ref(
@@ -809,6 +819,7 @@ def test_flash_attn_kvcache(
             causal=causal,
             qv=qv,
             window_size=window_size,
+            attention_chunk=attention_chunk,
             upcast=False,
             reorder_ops=True,
             key_leftpad=cache_leftpad,
@@ -835,11 +846,11 @@ def test_flash_attn_kvcache(
         for num_splits, precompute_metadata in itertools.product(num_splits_vals, precompute_metadata_vals):
             if precompute_metadata:
                 scheduler_metadata = get_scheduler_metadata(
-                    batch_size, seqlen_q, seqlen_k, nheads, nheads_k, d,
+                    batch_size, max_seqlen_q if varlen_q else seqlen_q, seqlen_k, nheads, nheads_k, d,
                     cache_seqlens, q.dtype, headdim_v=dv, cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k_new, cache_leftpad=cache_leftpad,
                     max_seqlen_k_new=seqlen_new, page_size=page_size,
-                    causal=causal, window_size=window_size,
+                    causal=causal, window_size=window_size, attention_chunk=attention_chunk,
                     num_splits=num_splits
                 )
             else:
@@ -871,6 +882,7 @@ def test_flash_attn_kvcache(
                     rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,
+                    attention_chunk=attention_chunk,
                     rotary_interleaved=rotary_interleaved,
                     scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
