@@ -165,6 +165,8 @@ def _flash_attn_varlen_forward(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    tree_dfs_order_end_k=None,
+    tree_dfs_order_start_q=None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
@@ -189,6 +191,8 @@ def _flash_attn_varlen_forward(
         softcap,
         return_softmax,
         None,
+        tree_dfs_order_end_k,
+        tree_dfs_order_start_q
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
@@ -356,6 +360,8 @@ def _flash_attn_varlen_backward(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    tree_dfs_order_end_k=None,
+    tree_dfs_order_start_q=None
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -389,6 +395,8 @@ def _flash_attn_varlen_backward(
         deterministic,
         None,
         rng_state,
+        tree_dfs_order_end_k,
+        tree_dfs_order_start_q
     )
     # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
     #     breakpoint()
@@ -916,6 +924,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_softmax,
         block_table,
         is_grad_enabled,
+        tree_dfs_order_end_k,
+        tree_dfs_order_start_q
     ):
         is_grad = is_grad_enabled and any(
             x.requires_grad for x in [q, k, v]
@@ -944,10 +954,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=block_table,
+            tree_dfs_order_end_k=tree_dfs_order_end_k,
+            tree_dfs_order_start_q=tree_dfs_order_start_q
         )
         if is_grad:
             ctx.save_for_backward(
-                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
+                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state,
+                tree_dfs_order_end_k, tree_dfs_order_start_q
             )
             ctx.dropout_p = dropout_p
             ctx.max_seqlen_q = max_seqlen_q
@@ -964,7 +977,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state, tree_dfs_order_end_k, tree_dfs_order_start_q = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         head_size_og = dout.size(2)
         dout_padded = dout
@@ -993,11 +1006,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state=rng_state,
+            tree_dfs_order_end_k=tree_dfs_order_end_k,
+            tree_dfs_order_start_q=tree_dfs_order_start_q
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -1389,6 +1404,8 @@ def flash_attn_varlen_func(
     deterministic=False,
     return_attn_probs=False,
     block_table=None,
+    tree_dfs_order_end_k=None,
+    tree_dfs_order_start_q=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1463,6 +1480,8 @@ def flash_attn_varlen_func(
         return_attn_probs,
         block_table,
         torch.is_grad_enabled(),
+        tree_dfs_order_end_k,
+        tree_dfs_order_start_q
     )
 
 
