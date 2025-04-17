@@ -13,6 +13,7 @@ from typing import Literal, Optional, Union
 # -------------------------------
 AUTOTUNE = os.environ.get('FLASH_ATTENTION_TRITON_AMD_AUTOTUNE', '0').lower() in ('1', 'true', 'yes')
 DEBUG = os.environ.get('FLASH_ATTENTION_TRITON_AMD_DEBUG', '0').lower() in ('1', 'true', 'yes')
+USE_REF = os.environ.get('FLASH_ATTENTION_TRITON_AMD_REF', '0').lower() in ('1', 'true', 'yes')
 PERF = os.environ.get('FLASH_ATTENTION_TRITON_AMD_PERF', '0').lower() in ('1', 'true', 'yes')
 USE_SINGLE_BWD_KERNEL = os.environ.get('USE_SINGLE_BWD_KERNEL', '0').lower() in ('1', 'true', 'yes')
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
@@ -35,15 +36,15 @@ class MetaData():
     max_seqlens_k = 0
     bias = None
     alibi_slopes = None
-    causal = False
+    causal: bool = False
     num_contexts = 0
-    varlen = False
+    varlen: bool = False
     layout: Optional[Literal["bshd", "bhsd", "thd"]] = None
     cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None
     cache_batch_idx = None
     packing = None
     return_scores= False
-    dropout_p= 0.0
+    dropout_p: float = 0.0
     philox_seed, philox_offset = None, None # if dropout_p > 0.0 seed the RNG so we get reproducible results for testing.
     # NOTE: scale sm_scale by log_2(e) and use 2^x in the loop as we do not have native e^x support in HW.
     use_exp2 = False
@@ -75,18 +76,17 @@ class MetaData():
     def __init__(self, sm_scale=1.0):
         self.sm_scale = sm_scale
 
-    def set_varlen_params(self, cu_seqlens_q, cu_seqlens_k):
+    def set_varlen_params(self, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k):
         self.varlen = True
         self.layout = 'thd'
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_k = cu_seqlens_k
+        self.max_seqlens_q = max_seqlen_q
+        self.max_seqlens_k = max_seqlen_k
+
         # Without "varlen", there should still be one sequence.
         assert len(cu_seqlens_q) >= 2
         assert len(cu_seqlens_q) == len(cu_seqlens_k)
-        self.num_contexts = len(cu_seqlens_q) - 1
-        for i in range(0, self.num_contexts):
-            self.max_seqlens_q = max(cu_seqlens_q[i + 1].item() - cu_seqlens_q[i].item(), self.max_seqlens_q)
-            self.max_seqlens_k = max(cu_seqlens_k[i + 1].item() - cu_seqlens_k[i].item(), self.max_seqlens_k)
 
     def need_bias(self, bias, batch, nheads, seqlen_q, seqlen_k):
         assert bias.is_cuda
@@ -102,8 +102,8 @@ class MetaData():
         assert alibi_slopes.shape[1] == nheads
         self.alibi_slopes = alibi_slopes
 
-    def need_causal(self):
-        self.causal = True
+    def need_causal(self, causal):
+        self.causal = causal
 
     def need_rotary(self, sin, cos, rotary_interleaved, rotary_conjunction=False):
         self.rotary_sin = sin
@@ -111,10 +111,11 @@ class MetaData():
         self.rotary_interleaved = rotary_interleaved
         self.rotary_conjunction = rotary_conjunction
 
-    def need_dropout(self, dropout_p):
-        self.dropout_p = dropout_p
-        self.return_scores = True
-        self.philox_seed, self.philox_offset = 0x1BF58, 0x1D4B49
+    def need_dropout(self, dropout_p, return_scores = True):
+        if dropout_p > 0.0:
+            self.dropout_p = dropout_p
+            self.return_scores = return_scores
+            self.philox_seed, self.philox_offset = 0x1BF58, 0x1D4B49
 
     def check_args(self, q, k, v, o):
         assert q.dim() == k.dim() and q.dim() == v.dim()
@@ -165,7 +166,18 @@ def generate_varlen_tensor(
     device: str = "cuda",
     dtype: torch.dtype = torch.float32,
     DEBUG_INPUT: bool = False
-) -> tuple[torch.Tensor, torch.Tensor, int]:
+):
+    if DEBUG:
+        print("total_seqlen", total_seqlen)
+        print("num_heads", num_heads)
+        print("head_size", head_size)
+
+    # save fp8 type
+    is_fp8_dtype = is_dtype_fp8(dtype)
+    if is_fp8_dtype:
+        og_fp8_dtype = dtype
+        dtype = torch.float32
+
     # get valid batch_size
     if batch_size is None:
         valid_batch_sizes = [bs for bs in [1, 2, 4, 8, 16, 32, 64] if bs <= total_seqlen]
@@ -203,36 +215,61 @@ def generate_varlen_tensor(
     else:
         x = torch.randn((total_seqlen, num_heads, head_size), dtype=dtype, device=device)
 
-    # requires grad
-    x.requires_grad_()
-
-    return x, cu_seqlens, max_seqlen
+    if is_fp8_dtype:
+        # cast to fp8
+        x, descale_x = cast_to_fp8(x, og_fp8_dtype, "thd", cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        x.requires_grad_()
+        return x, cu_seqlens, max_seqlen, descale_x
+    else:
+        x.requires_grad_()
+        return x, cu_seqlens, max_seqlen
 
 def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda", DEBUG_INPUT=False):
-    tensor_shape = (BATCH, SEQ_LEN, NUM_HEADS, D_HEAD)
+    # save fp8 type
+    is_fp8_dtype = is_dtype_fp8(dtype)
+    if is_fp8_dtype:
+        og_fp8_dtype = dtype
+        dtype = torch.float32
 
+    # gen tensor
+    tensor_shape = (BATCH, SEQ_LEN, NUM_HEADS, D_HEAD)
     if DEBUG_INPUT:
         x = torch.arange(SEQ_LEN, dtype=dtype, device=device).view(1, SEQ_LEN, 1, 1).expand(*tensor_shape).contiguous()
     else:
         x = torch.randn(tensor_shape, dtype=dtype, device=device)
-
-    # requires grad
-    x.requires_grad_()
-
-    return x
+    
+    if is_fp8_dtype:
+        # cast to fp8
+        x, descale_x = cast_to_fp8(x, og_fp8_dtype, "bshd")
+        x.requires_grad_()
+        return x, descale_x
+    else:
+        x.requires_grad_()
+        return x
 
 def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype, device="cuda", DEBUG_INPUT=False):
+    # save fp8 type
+    is_fp8_dtype = is_dtype_fp8(dtype)
+    if is_fp8_dtype:
+        og_fp8_dtype = dtype
+        dtype = torch.float32
+    
+    # gen tensor
     tensor_shape = (BATCH, NUM_HEADS, SEQ_LEN, D_HEAD)
-
     if DEBUG_INPUT:
         x = torch.arange(SEQ_LEN, dtype=dtype, device=device).view(1, 1, SEQ_LEN, 1).expand(*tensor_shape).contiguous()
     else:
         x = torch.randn(tensor_shape, dtype=dtype, device=device)
+    
 
-    # requires grad
-    x.requires_grad_()
-
-    return x
+    if is_fp8_dtype:
+        # cast to fp8
+        x, descale_x = cast_to_fp8(x, og_fp8_dtype, "bhsd") # FIXME: I don't the casting fn supports this atm
+        x.requires_grad_()
+        return x, descale_x
+    else:
+        x.requires_grad_()
+        return x
 
 def input_helper(
     BATCH: int,
@@ -241,6 +278,8 @@ def input_helper(
     N_CTX_Q: int,
     N_CTX_K: int,
     D_HEAD: int,
+    CAUSAL: bool,
+    DROPOUT_P: float,
     dtype: torch.dtype,
     layout: Literal["bshd", "bhsd", "thd"],
     packing: Optional[Literal["kv", "qkv"]] = None,
@@ -248,6 +287,8 @@ def input_helper(
     DEBUG_INPUT: bool = False,
 ):
     torch.manual_seed(20)
+    is_fp8_dtype = is_dtype_fp8(dtype)
+
     if layout == "thd":
         # set params
         TOTAL_SEQLENS_Q = BATCH * N_CTX_Q
@@ -255,9 +296,17 @@ def input_helper(
         equal_seqlens=False
         
         # gen tensors
-        q, cu_seqlens_q, _ = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-        k, cu_seqlens_k, _ = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-        v, cu_seqlens_v, _ = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+        # TODO: the gen functions should maybe have different gen modes like random, ones, increasing seqlen
+        if is_fp8_dtype:
+            q, cu_seqlens_q, max_seqlen_q, descale_q = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+            k, cu_seqlens_k, max_seqlen_k, descale_k = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+            v, _, _ , descale_v = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+            do, _, _ , descale_do = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
+        else:
+            q, cu_seqlens_q, max_seqlen_q = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+            k, cu_seqlens_k, max_seqlen_k = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+            v, _, _ = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+            do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
         
         # setup metadata
         if DEBUG_INPUT:
@@ -265,17 +314,33 @@ def input_helper(
         else:
             sm_scale = D_HEAD**-0.5
         metadata = MetaData(sm_scale=sm_scale)
-        metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k)
+        metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+        metadata.need_causal(CAUSAL)
+        metadata.need_dropout(DROPOUT_P)
     elif layout == 'bshd' or layout == "bhsd":
         # gen tensors
         if layout == "bshd":
-            q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-            k = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-            v = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+            if is_fp8_dtype:
+                q, descale_q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                k, descale_k = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                v, descale_v = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                do, descale_do = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device)
+            else:
+                q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                k = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                v = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
         elif layout == "bhsd":
-            q = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-            k = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-            v = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+            if is_fp8_dtype:
+                q, descale_q = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                k, descale_k = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                v, descale_v = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                do, descale_do = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device)
+            else:
+                q = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                k = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                v = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
 
         # setup metadata
         if DEBUG_INPUT:
@@ -286,18 +351,17 @@ def input_helper(
         metadata.max_seqlens_q = N_CTX_Q
         metadata.max_seqlens_k = N_CTX_K
         metadata.layout = layout
+        metadata.need_causal(CAUSAL)
+        metadata.need_dropout(DROPOUT_P)
     else:
         raise ValueError(f"Unknown layout: {layout}")
 
-    # create dout
-    if DEBUG_INPUT:
-        do = torch.ones_like(q)
-    else:
-        do = torch.randn_like(q)
-
     # deal with packing
     if packing is None:
-        return q, k, v, do, metadata
+        if is_fp8_dtype:
+            return (q, descale_q), (k, descale_k), (v, descale_v), (do, descale_do), metadata
+        else:
+            return q, k, v, do, metadata
     elif packing == "kv":
         # pack k and v
         if layout in ["bhsd", "thd"]:
@@ -307,7 +371,10 @@ def input_helper(
         else:
             raise ValueError(f"Unknown layout: {layout}")
 
-        return q, kv, do, metadata
+        if is_fp8_dtype:
+            raise ValueError("FP8 not supported kv packing yet")
+        else:
+            return q, kv, do, metadata
     elif packing == "qkv":
         # qkv packing - requires same sequence length for q and k
         assert N_CTX_Q == N_CTX_K, "For QKV packing, Q and K must have same sequence length"
@@ -321,7 +388,10 @@ def input_helper(
         else:
             raise ValueError(f"Unknown layout: {layout}")
 
-        return qkv, do, metadata
+        if is_fp8_dtype:
+            raise ValueError("FP8 not supported qkv packing yet")
+        else:
+            return qkv, do, metadata
     else:
         assert False, f"Unsupported packing mode: {packing}"
 
@@ -329,14 +399,17 @@ def input_helper(
 # -------------------------------
 # FP8
 # -------------------------------
-def is_fp8(x):
-    if x.dtype in {torch.float8_e4m3fnuz, torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e5m2fnuz}:
+def is_dtype_fp8(dtype):
+    if dtype in {torch.float8_e4m3fnuz, torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e5m2fnuz}:
         if arch_supports_fp8():
             return True
         else:
             raise RuntimeError("This device doesnot support fp8")
     else:
         return False
+
+def is_fp8(x):
+    return is_dtype_fp8(x.dtype)
 
 @triton.jit
 def compute_fp8_scaling_factors(x, fp8_max: tl.constexpr):
@@ -446,7 +519,7 @@ def cast_to_fp8(
     cu_seqlens: Optional[torch.Tensor] = None,
     max_seqlen: Optional[int] = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if DEBUG:
+    if False:
         print()
         print("cast_to_fp8")
         print("x:", x, x.shape)
@@ -455,11 +528,14 @@ def cast_to_fp8(
         print("max_seqlen:", max_seqlen)
         print("clamp_val:", clamp_val)
 
+    # check types are valid
+    assert x.dtype in {torch.float16, torch.float32, torch.float64, torch.bfloat16} and is_dtype_fp8(fp8_dtype), f"Cannot cast {x.dtype} to {fp8_dtype}"
+
     # extract dimensions
     batch, max_seqlen_final, num_heads, head_dim = get_shape_from_layout(x, layout, cu_seqlens, max_seqlen)
     is_varlen = layout == "thd"
     fp8_max = torch.finfo(fp8_dtype).max
-    if DEBUG:
+    if False:
         print("batch:", batch)
         print("max_seqlen_final:", max_seqlen_final)
         print("num_heads:", num_heads)
@@ -479,7 +555,7 @@ def cast_to_fp8(
     stride_out_batch, stride_out_head, stride_out_seq, stride_out_dim = get_stride_from_layout(x_fp8, layout)
     stride_desc_batch, stride_desc_head = descale_factors.stride()
 
-    if DEBUG:
+    if False:
         print("stride_batch", stride_batch)
         print("stride_head", stride_head)
         print("stride_seq", stride_seq)
@@ -505,7 +581,7 @@ def cast_to_fp8(
         IS_VARLEN=is_varlen
     )
     
-    if DEBUG:
+    if False:
         print("x_fp8:", x_fp8, x_fp8.shape)
         print("descale_factors:", descale_factors, descale_factors.shape)
     return x_fp8, descale_factors
@@ -515,7 +591,7 @@ def cast_to_fp8(
 # -------------------------------
 def get_shape_from_layout(
     x: torch.Tensor,
-    layout: Literal["bshd", "thd"],
+    layout: Literal["bshd", "bhsd", "thd"],
     cu_seqlens: Optional[torch.Tensor] = None,
     max_seqlen: Optional[int] = None,
 ) -> tuple[int, int, int, int]:
@@ -547,7 +623,7 @@ def get_shapes_from_layout(q, k, layout, cu_seqlens_q = None, cu_seqlens_k = Non
 
     return batch_q, nheads_q, nheads_k, head_size_q, seqlen_q, seqlen_k
 
-def get_stride_from_layout(x, layout):
+def get_stride_from_layout(x: torch.Tensor, layout:Literal["bshd", "bhsd", "thd"]):
     if layout == 'thd':
         strides = (0, x.stride(1), x.stride(0), x.stride(2))  
     elif layout == 'bhsd':
@@ -557,6 +633,9 @@ def get_stride_from_layout(x, layout):
     else:
         assert False, 'Got unsupported layout.'
     return strides
+
+def get_shape_and_strides_from_layout(x: torch.Tensor, layout: Literal["bshd", "bhsd", "thd"], cu_seqlens: Optional[torch.Tensor] = None, max_seqlen: Optional[int] = None):
+    return get_shape_from_layout(x, layout, cu_seqlens, max_seqlen), get_stride_from_layout(x, layout)
 
 def get_strides_from_layout(q, k, v, o, layout):
     q_strides = get_stride_from_layout(q, layout)
@@ -578,18 +657,6 @@ def compute_alibi_tensor_ref(alibi_slopes, seqlen_q, seqlen_k):
     k_idx = torch.arange(seqlen_k, dtype=torch.int32, device="cuda").unsqueeze(0)  # (1, N_CTX_K)
     relative_pos = torch.abs(q_idx + seqlen_k - seqlen_q - k_idx)  # (N_CTX_Q, N_CTX_K)
     return -1 * alibi_slopes.unsqueeze(-1).unsqueeze(-1) * relative_pos  # (Z, H, N_CTX_Q, N_CTX_K)
-
-def _strides(x: torch.Tensor, *stride_names: str):
-    if x is None:
-        return {f"stride_{s}": 0 for i, s in enumerate(stride_names)}
-
-    assert x.ndim == len(stride_names)
-    return {f"stride_{s}": x.stride(i) for i, s in enumerate(stride_names)}
-
-def get_input_shapes():
-    cases = [(max(1, 2**(16 - i)), 1, 2**i, 16, 1, 128)
-             for i in range(8, 18)] + [(max(1, 2**(16 - i)), 1, 2**i, 16, 2, 128) for i in range(8, 18)]
-    return cases
 
 # -------------------------------
 # Dropouts
@@ -663,7 +730,7 @@ def get_arch():
 
 @functools.cache
 def is_cdna():
-    return is_hip() and get_arch() in ('gfx908', 'gfx90a', 'gfx940', 'gfx941', 'gfx942')
+    return is_hip() and get_arch() in ('gfx908', 'gfx90a', 'gfx940', 'gfx941', 'gfx942', 'gfx950')
 
 @functools.cache
 def is_rdna():

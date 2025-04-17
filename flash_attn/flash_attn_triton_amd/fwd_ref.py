@@ -303,7 +303,7 @@ def attention_varlen_forward_pytorch_ref_impl(
         softmax_lse[start_q:end_q, :] = softmax_lse_i
         sd_mask[i, :, :seqlen_q, :seqlen_k] = sd_mask_i
 
-    return softmax_lse, sd_mask
+    return o, softmax_lse, sd_mask
 
 
 

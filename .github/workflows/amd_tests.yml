@@ -48,24 +48,16 @@ jobs:
 
       - name: Install dependencies for bench and misc
         run: |
-          pip install matplotlib pandas pytest
+          pip install numpy==1.24 matplotlib pandas tabulate
 
-      # FIXME: run the full suite
       - name: AMD Internal Tests
         run: |
-          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest flash_attn/flash_attn_triton_amd/test.py::test_fp8
-
-      - name: AMD Bench
-        if: False
-        run: |
-          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=1 python flash_attn/flash_attn_triton_amd/bench.py
-
-      # run big test suites
-      - name: Flash Attention Tests using Pytorch reference implementation
-        if: False
-        run: |
-          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_REF=1 pytest tests/test_flash_attn_triton_amd.py
+          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0 pytest flash_attn/flash_attn_triton_amd/test.py
 
       - name: Flash Attention Tests
         run: |
-          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd.py
+          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0 pytest tests/test_flash_attn_triton_amd.py
+
+      - name: AMD Bench
+        run: |
+          python flash_attn/flash_attn_triton_amd/bench.py -benchmark_fn flash_attn_func flash_attn_varlen_func flash_attn_with_kvcache

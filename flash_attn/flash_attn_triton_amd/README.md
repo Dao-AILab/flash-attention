@@ -44,6 +44,11 @@ To test that things are working, you can run our tests. These tests take hours s
 FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd.py
 ```
 
+You can use autotune for better performance by using this flag `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE"`
+```
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE" python $PATH_TO_CODE
+```
+
 ###### Docker
 You can also use the Dockerfile below which does the above steps on top of the latest rocm/pytorch image.
 ```

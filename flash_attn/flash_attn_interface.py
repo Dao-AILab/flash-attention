@@ -5,7 +5,6 @@ from typing import Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 import os
-from .flash_attn_triton_amd.utils import cast_to_fp8
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
@@ -14,6 +13,7 @@ if USE_TRITON_ROCM:
     from .flash_attn_triton_amd import interface_fa as flash_attn_gpu
 else:
     import flash_attn_2_cuda as flash_attn_gpu
+from .flash_attn_triton_amd.fp8 import flash_attn_fp8_func, flash_attn_varlen_fp8_func, flash_attn_qkvpacked_fp8_func, flash_attn_varlen_qkvpacked_fp8_func
 
 # isort: on
 
@@ -91,10 +91,7 @@ def _flash_attn_forward(
     window_size_right: int,
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
-    return_softmax: bool,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None
+    return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
@@ -111,9 +108,6 @@ def _flash_attn_forward(
         softcap,
         return_softmax,
         None,
-        descale_q,
-        descale_k,
-        descale_v
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -172,9 +166,6 @@ def _flash_attn_varlen_forward(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
@@ -199,9 +190,6 @@ def _flash_attn_varlen_forward(
         softcap,
         return_softmax,
         None,
-        descale_q,
-        descale_k,
-        descale_v
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
@@ -272,10 +260,6 @@ def _flash_attn_backward(
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -304,10 +288,6 @@ def _flash_attn_backward(
         deterministic,
         None,
         rng_state,
-        descale_q,
-        descale_k,
-        descale_v,
-        descale_do
     )
     return softmax_d
 
@@ -377,10 +357,6 @@ def _flash_attn_varlen_backward(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -414,10 +390,6 @@ def _flash_attn_varlen_backward(
         deterministic,
         None,
         rng_state,
-        descale_q,
-        descale_k,
-        descale_v,
-        descale_do
     )
     # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
     #     breakpoint()
@@ -553,133 +525,6 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         return dqkv, None, None, None, None, None, None, None, None, None
 
 
-class FlashAttnQKVPackedFP8Func(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        qkv,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        softcap,
-        alibi_slopes,
-        deterministic,
-        return_softmax,
-        is_grad_enabled,
-    ):
-        is_grad = is_grad_enabled and qkv.requires_grad
-        if softmax_scale is None:
-            softmax_scale = qkv.shape[-1] ** (-0.5)
-        q, k, v = qkv[:, :, 0].detach(), qkv[:, :, 1].detach(), qkv[:, :, 2].detach()
-        head_size_og = q.size(3)
-        if head_size_og % 8 != 0:
-            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
-            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
-            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-
-        # cast input to fp8
-        fp8_dtype = torch.float8_e4m3fnuz 
-        q_fp8, descale_q = cast_to_fp8(q, fp8_dtype, "bshd")
-        k_fp8, descale_k = cast_to_fp8(k, fp8_dtype, "bshd")
-        v_fp8, descale_v = cast_to_fp8(v, fp8_dtype, "bshd")
-
-        out_padded, softmax_lse, S_dmask, rng_state =  _flash_attn_forward(
-            q_fp8,
-            k_fp8,
-            v_fp8,
-            dropout_p,
-            softmax_scale,
-            causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-            softcap=softcap,
-            alibi_slopes=alibi_slopes,
-            return_softmax=return_softmax and dropout_p > 0,
-            descale_q=descale_q,
-            descale_k=descale_k,
-            descale_v=descale_v
-        )
-        if is_grad:
-            ctx.save_for_backward(q_fp8, k_fp8, v_fp8, out_padded, softmax_lse, rng_state, descale_q, descale_k, descale_v)
-            ctx.dropout_p = dropout_p
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.softcap = softcap
-            ctx.alibi_slopes = alibi_slopes
-            ctx.deterministic = deterministic
-        out = out_padded[..., :head_size_og]
-        return out if not return_softmax else (out, softmax_lse, S_dmask)
-
-    @staticmethod
-    def backward(ctx, dout, *args):
-        q_fp8, k_fp8, v_fp8, out, softmax_lse, rng_state, descale_q, descale_k, descale_v = ctx.saved_tensors
-        qkv_shape = q_fp8.shape[:-2] + (3, *q_fp8.shape[-2:])
-        # for fp8 we accumlate in fp32
-        dqkv = torch.empty(qkv_shape, dtype=torch.float32, device=q_fp8.device)
-        head_size_og = dout.size(3)
-        dout_padded = dout
-        if head_size_og % 8 != 0:
-            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
-        
-        # scale grads
-        fp8_dtype = torch.float8_e4m3fnuz 
-        dout_padded_fp8, descale_do = cast_to_fp8(dout_padded, fp8_dtype, "bshd")
-        
-        
-        _flash_attn_backward(
-            dout_padded_fp8,
-            q_fp8,
-            k_fp8,
-            v_fp8,
-            out,
-            softmax_lse,
-            dqkv[:, :, 0],
-            dqkv[:, :, 1],
-            dqkv[:, :, 2],
-            ctx.dropout_p,
-            ctx.softmax_scale,
-            ctx.causal,
-            ctx.window_size[0],
-            ctx.window_size[1],
-            ctx.softcap,
-            ctx.alibi_slopes,
-            ctx.deterministic,
-            rng_state=rng_state,
-            descale_q=descale_q,
-            descale_k=descale_k,
-            descale_v=descale_v,
-            descale_do=descale_do
-        )
-        dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None, None, None, None
-
-
-def flash_attn_qkvpacked_fp8_func(
-    qkv,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0,  # <=0.0 means deactivate
-    alibi_slopes=None,
-    deterministic=False,
-    return_attn_probs=False,
-):
-    return FlashAttnQKVPackedFP8Func.apply(
-        qkv,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        softcap,
-        alibi_slopes,
-        deterministic,
-        return_attn_probs,
-        torch.is_grad_enabled(),
-    )
-
 class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -772,149 +617,6 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
         return dqkv, None, None, None, None, None, None, None, None, None, None, None
-
-class FlashAttnVarlenQKVPackedFP8Func(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        qkv,
-        cu_seqlens,
-        max_seqlen,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        softcap,
-        alibi_slopes,
-        deterministic,
-        return_softmax,
-        is_grad_enabled,
-    ):
-        is_grad = is_grad_enabled and qkv.requires_grad
-        if softmax_scale is None:
-            softmax_scale = qkv.shape[-1] ** (-0.5)
-        q, k, v = qkv[:, 0].detach(), qkv[:, 1].detach(), qkv[:, 2].detach()
-        head_size_og = q.size(2)
-        if head_size_og % 8 != 0:
-            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
-            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
-            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-
-
-         # cast input to fp8
-        fp8_dtype = torch.float8_e4m3fnuz 
-        q_fp8, descale_q = cast_to_fp8(q, fp8_dtype, "thd", cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-        k_fp8, descale_k = cast_to_fp8(k, fp8_dtype, "thd", cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-        v_fp8, descale_v = cast_to_fp8(v, fp8_dtype, "thd", cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-        
-        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
-            q_fp8,
-            k_fp8,
-            v_fp8,
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            dropout_p,
-            softmax_scale,
-            causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-            softcap=softcap,
-            alibi_slopes=alibi_slopes,
-            return_softmax=return_softmax and dropout_p > 0,
-            block_table=None,
-            descale_q=descale_q,
-            descale_k=descale_k,
-            descale_v=descale_v
-        )
-        if is_grad:
-            ctx.save_for_backward(q_fp8, k_fp8, v_fp8, out_padded, softmax_lse, cu_seqlens, rng_state, descale_q, descale_k, descale_v)
-            ctx.dropout_p = dropout_p
-            ctx.max_seqlen = max_seqlen
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.softcap = softcap
-            ctx.alibi_slopes = alibi_slopes
-            ctx.deterministic = deterministic
-        out = out_padded[..., :head_size_og]
-        return out if not return_softmax else (out, softmax_lse, S_dmask)
-
-    @staticmethod
-    def backward(ctx, dout, *args):
-        q_fp8, k_fp8, v_fp8, out, softmax_lse, cu_seqlens, rng_state, descale_q, descale_k, descale_v = ctx.saved_tensors
-        qkv_shape = q_fp8.shape[:-2] + (3, *q_fp8.shape[-2:])
-        dqkv = torch.empty(qkv_shape, dtype=torch.float32, device=q_fp8.device)
-        head_size_og = dout.size(2)
-        dout_padded = dout
-        if head_size_og % 8 != 0:
-            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
-
-        # scale grads
-        fp8_dtype = torch.float8_e4m3fnuz 
-        dout_padded_fp8, descale_do = cast_to_fp8(dout_padded, fp8_dtype, "thd", cu_seqlens=cu_seqlens, max_seqlen=ctx.max_seqlen)
-        
-        _flash_attn_varlen_backward(
-            dout_padded_fp8,
-            q_fp8,
-            k_fp8,
-            v_fp8,
-            out,
-            softmax_lse,
-            dqkv[:, 0],
-            dqkv[:, 1],
-            dqkv[:, 2],
-            cu_seqlens,
-            cu_seqlens,
-            ctx.max_seqlen,
-            ctx.max_seqlen,
-            ctx.dropout_p,
-            ctx.softmax_scale,
-            ctx.causal,
-            ctx.window_size[0],
-            ctx.window_size[1],
-            ctx.softcap,
-            ctx.alibi_slopes,
-            ctx.deterministic,
-            rng_state=rng_state,
-            descale_q=descale_q,
-            descale_k=descale_k,
-            descale_v=descale_v,
-            descale_do=descale_do
-        )
-        dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None, None, None, None, None, None
-
-
-def flash_attn_varlen_qkvpacked_fp8_func(
-    qkv,
-    cu_seqlens,
-    max_seqlen,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
-    alibi_slopes=None,
-    deterministic=False,
-    return_attn_probs=False,
-):
-    return FlashAttnVarlenQKVPackedFP8Func.apply(
-        qkv,
-        cu_seqlens,
-        max_seqlen,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        softcap,
-        alibi_slopes,
-        deterministic,
-        return_attn_probs,
-        torch.is_grad_enabled(),
-    )
-
 
 
 class FlashAttnKVPackedFunc(torch.autograd.Function):
@@ -1193,140 +895,6 @@ class FlashAttnFunc(torch.autograd.Function):
         dv = dv[..., : dout.shape[-1]]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
-class FlashAttnFP8Func(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q,
-        k,
-        v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        softcap,
-        alibi_slopes,
-        deterministic,
-        return_softmax,
-        is_grad_enabled
-    ):
-        is_grad = is_grad_enabled and any(
-            x.requires_grad for x in [q, k, v]
-        )
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
-        head_size_og = q.size(3)
-        if head_size_og % 8 != 0:
-            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
-            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
-            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        
-
-        # cast input to fp8
-        fp8_dtype = torch.float8_e4m3fnuz 
-        q_fp8, descale_q = cast_to_fp8(q, fp8_dtype, "bshd")
-        k_fp8, descale_k = cast_to_fp8(k, fp8_dtype, "bshd")
-        v_fp8, descale_v = cast_to_fp8(v, fp8_dtype, "bshd")
-                
-        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
-            q_fp8,
-            k_fp8,
-            v_fp8,
-            dropout_p,
-            softmax_scale,
-            causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-            softcap=softcap,
-            alibi_slopes=alibi_slopes,
-            return_softmax=return_softmax and dropout_p > 0,
-            descale_q=descale_q,
-            descale_k=descale_k,
-            descale_v=descale_v
-        )
-        if is_grad:
-            ctx.save_for_backward(q_fp8, k_fp8, v_fp8, out_padded, softmax_lse, rng_state, descale_q, descale_k, descale_v)
-            ctx.dropout_p = dropout_p
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.softcap = softcap
-            ctx.alibi_slopes = alibi_slopes
-            ctx.deterministic = deterministic
-        out = out_padded[..., :head_size_og]
-        return out if not return_softmax else (out, softmax_lse, S_dmask)
-
-    @staticmethod
-    def backward(ctx, dout, *args):
-        q_fp8, k_fp8, v_fp8, out, softmax_lse, rng_state, descale_q, descale_k, descale_v= ctx.saved_tensors
-        # For fp8 we accumlate in fp32
-        dq, dk, dv = torch.empty_like(q_fp8, dtype=torch.float32), torch.empty_like(k_fp8, dtype=torch.float32), torch.empty_like(v_fp8, dtype=torch.float32)
-        head_size_og = dout.size(3)
-        dout_padded = dout
-        if head_size_og % 8 != 0:
-            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
-        
-        # descale factors that are returned with kernel outputs
-        fp8_dtype = torch.float8_e4m3fnuz 
-        dout_padded_fp8, descale_do = cast_to_fp8(dout_padded, fp8_dtype, "bshd")
-        
-        _flash_attn_backward(
-            dout_padded_fp8,
-            q_fp8,
-            k_fp8,
-            v_fp8,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            ctx.dropout_p,
-            ctx.softmax_scale,
-            ctx.causal,
-            ctx.window_size[0],
-            ctx.window_size[1],
-            ctx.softcap,
-            ctx.alibi_slopes,
-            ctx.deterministic,
-            rng_state=rng_state,
-            descale_q=descale_q,
-            descale_k=descale_k,
-            descale_v=descale_v,
-            descale_do=descale_do
-        )
-        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : dout.shape[-1]]
-        dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
-
-def flash_attn_fp8_func(
-    q,
-    k,
-    v,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
-    alibi_slopes=None,
-    deterministic=False,
-    return_attn_probs=False
-):
-    return FlashAttnFP8Func.apply(
-        q,
-        k,
-        v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        softcap,
-        alibi_slopes,
-        deterministic,
-        return_attn_probs,
-        torch.is_grad_enabled()
-    )
-
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
@@ -1432,169 +1000,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dv = dv[..., : dout.shape[-1]]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
-
-class FlashAttnVarlenFP8Func(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        softcap,
-        alibi_slopes,
-        deterministic,
-        return_softmax,
-        block_table,
-        is_grad_enabled,
-    ):
-        is_grad = is_grad_enabled and any(
-            x.requires_grad for x in [q, k, v]
-        )
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
-        head_size_og = q.size(2)
-        if head_size_og % 8 != 0:
-            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
-            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
-            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        
-        # cast input to fp8
-        fp8_dtype = torch.float8_e4m3fnuz 
-        q_fp8, descale_q = cast_to_fp8(q, fp8_dtype, "thd", cu_seqlens=cu_seqlens_q, max_seqlen=max_seqlen_q)
-        k_fp8, descale_k = cast_to_fp8(k, fp8_dtype, "thd", cu_seqlens=cu_seqlens_k, max_seqlen=max_seqlen_k)
-        v_fp8, descale_v = cast_to_fp8(v, fp8_dtype, "thd", cu_seqlens=cu_seqlens_k, max_seqlen=max_seqlen_k)
-        
-        
-        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
-            q_fp8,
-            k_fp8,
-            v_fp8,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p,
-            softmax_scale,
-            causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-            softcap=softcap,
-            alibi_slopes=alibi_slopes,
-            return_softmax=return_softmax and dropout_p > 0,
-            block_table=block_table,
-            descale_q=descale_q,
-            descale_k=descale_k,
-            descale_v=descale_v
-        )
-        if is_grad:
-            ctx.save_for_backward(
-                q_fp8, k_fp8, v_fp8, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state, descale_q, descale_k, descale_v
-            )
-            ctx.dropout_p = dropout_p
-            ctx.max_seqlen_q = max_seqlen_q
-            ctx.max_seqlen_k = max_seqlen_k
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.softcap = softcap
-            ctx.alibi_slopes = alibi_slopes
-            ctx.deterministic = deterministic
-        out = out_padded[..., :head_size_og]
-        return out if not return_softmax else (out, softmax_lse, S_dmask)
-
-    @staticmethod
-    def backward(ctx, dout, *args):
-        q_fp8, k_fp8, v_fp8, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state, descale_q, descale_k, descale_v = ctx.saved_tensors
-        # for fp8 we accumlate in fp32
-        dq, dk, dv = torch.empty_like(q_fp8, dtype=torch.float32), torch.empty_like(k_fp8, dtype=torch.float32), torch.empty_like(v_fp8, dtype=torch.float32)
-        head_size_og = dout.size(2)
-        dout_padded = dout
-        if head_size_og % 8 != 0:
-            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
-        
-        # descale factors that are returned with kernel outputs
-        fp8_dtype = torch.float8_e4m3fnuz 
-        dout_padded_fp8, descale_do = cast_to_fp8(dout_padded, fp8_dtype, "thd", cu_seqlens=cu_seqlens_q, max_seqlen=ctx.max_seqlen_q)
-
-        _flash_attn_varlen_backward(
-            dout_padded_fp8,
-            q_fp8,
-            k_fp8,
-            v_fp8,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            ctx.max_seqlen_q,
-            ctx.max_seqlen_k,
-            ctx.dropout_p,
-            ctx.softmax_scale,
-            ctx.causal,
-            ctx.window_size[0],
-            ctx.window_size[1],
-            ctx.softcap,
-            ctx.alibi_slopes,
-            ctx.deterministic,
-            rng_state=rng_state,
-            descale_q=descale_q,
-            descale_k=descale_k,
-            descale_v=descale_v,
-            descale_do=descale_do
-        )
-        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : dout.shape[-1]]
-        dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
-
-
-def flash_attn_varlen_fp8_func(
-    q,
-    k,
-    v,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
-    alibi_slopes=None,
-    deterministic=False,
-    return_attn_probs=False,
-    block_table=None
-):
-    return FlashAttnVarlenFP8Func.apply(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        softcap,
-        alibi_slopes,
-        deterministic,
-        return_attn_probs,
-        block_table,
-        torch.is_grad_enabled()
-    )
 
 def flash_attn_qkvpacked_func(
     qkv,

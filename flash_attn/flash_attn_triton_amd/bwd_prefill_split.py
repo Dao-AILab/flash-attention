@@ -6,8 +6,8 @@ from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, compute_fp8_scaling
     get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, is_fp8
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
-tl_DROPOUT_USE_PYTORCH: tl.constexpr = DROPOUT_USE_PYTORCH
-tl_DROPOUT_DUMP: tl.constexpr = DROPOUT_DUMP
+tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
+tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
 
 # This function computes delta given output Out and gradient DO
 # Here is the I/O shape:
@@ -249,7 +249,7 @@ def _bwd_kernel_dkdv_causal(
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    FP8_RETURN_DESCALE: tl.constexpr,
+    FP8_OUTPUT: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
@@ -572,7 +572,7 @@ def _bwd_kernel_dq_causal(
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    FP8_RETURN_DESCALE: tl.constexpr,
+    FP8_OUTPUT: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
@@ -756,7 +756,7 @@ def _bwd_kernel_dkdv_noncausal(
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    FP8_RETURN_DESCALE: tl.constexpr,
+    FP8_OUTPUT: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
@@ -888,7 +888,7 @@ def _bwd_kernel_dq_noncausal(
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    FP8_RETURN_DESCALE: tl.constexpr,
+    FP8_OUTPUT: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
@@ -1016,29 +1016,46 @@ def attention_prefill_backward_triton_split_impl(
     philox_offset: Optional[int],
     use_exp2: bool,
     # fp8
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
-    # debug
-    DEBUG_TRITON: bool = False,
-    DEBUG_TRITON_DETAIL: bool = False,
+    descale_q: Optional[torch.Tensor],
+    descale_k: Optional[torch.Tensor],
+    descale_v: Optional[torch.Tensor],
+    descale_o: Optional[torch.Tensor],
+    descale_do: Optional[torch.Tensor],
+    descale_dq: Optional[torch.Tensor],
+    descale_dk: Optional[torch.Tensor],
+    descale_dv: Optional[torch.Tensor],
 ):
+    # debug
+    DEBUG_TRITON: bool = False
+    DEBUG_TRITON_DETAIL: bool = False
+
+
+    # fp8
     IS_FP8 = is_fp8(q)
-    FP8_RETURN_DESCALE: tl.constexpr = False
     if IS_FP8:
         FP8_MAX = torch.finfo(q.dtype).max
 
         # assert that the main inputs are fp8
         assert is_fp8(do) and is_fp8(q) and is_fp8(k) and is_fp8(v), f"Non fp8 type found: do.dtype={do.dtype}, q.dtype={q.dtype}, k.dtype={k.dtype}, v.dtype={v.dtype}. All tensors must be fp8."
 
+        if is_fp8(o):
+            FP8_OUTPUT = True
+            assert descale_o is not None, f"descale_o is None. In fp8, you need to pass a tensor for descale_o along with a tensor o."
+            assert descale_dq is not None, f"descale_dq is None. In fp8, you need to pass a tensor for descale_dq along with a tensor dq."
+            assert descale_dk is not None, f"descale_dk is None. In fp8, you need to pass a tensor for descale_dk along with a tensor dk."
+            assert descale_dv is not None, f"descale_dv is None. In fp8, you need to pass a tensor for descale_dv along with a tensor dv."
+        else:
+            FP8_OUTPUT = False
+
         stride_descale_q_z = descale_q.stride(0) if descale_q is not None else None
         stride_descale_k_z = descale_k.stride(0) if descale_k is not None else None
         stride_descale_v_z = descale_v.stride(0) if descale_v is not None else None
+        stride_descale_o_z = descale_o.stride(0) if descale_o is not None else None
         stride_descale_do_z = descale_do.stride(0) if descale_do is not None else None
     else:
         FP8_MAX = None
-        stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = stride_descale_do_z = None
+        FP8_OUTPUT = False
+        stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = stride_descale_o_z = stride_descale_do_z = None
 
 
     # get strides and shape
@@ -1156,7 +1173,7 @@ def attention_prefill_backward_triton_split_impl(
             USE_EXP2=use_exp2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            FP8_RETURN_DESCALE=FP8_RETURN_DESCALE,
+            FP8_OUTPUT=FP8_OUTPUT,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu = WAVES_PER_EU,
@@ -1188,7 +1205,7 @@ def attention_prefill_backward_triton_split_impl(
             USE_EXP2=use_exp2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            FP8_RETURN_DESCALE=FP8_RETURN_DESCALE,
+            FP8_OUTPUT=FP8_OUTPUT,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu = WAVES_PER_EU,
@@ -1219,7 +1236,7 @@ def attention_prefill_backward_triton_split_impl(
             USE_EXP2=use_exp2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            FP8_RETURN_DESCALE=FP8_RETURN_DESCALE,
+            FP8_OUTPUT=FP8_OUTPUT,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu = WAVES_PER_EU,
@@ -1250,11 +1267,12 @@ def attention_prefill_backward_triton_split_impl(
             USE_EXP2=use_exp2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            FP8_RETURN_DESCALE=FP8_RETURN_DESCALE,
+            FP8_OUTPUT=FP8_OUTPUT,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu = WAVES_PER_EU,
             DEBUG_TRITON=DEBUG_TRITON,
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
+
     return delta
