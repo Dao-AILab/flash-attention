@@ -430,7 +430,7 @@ def _bwd_kernel(
             )
 
 
-# NOTE: smaller blocks have lower accuracy. more accumlation error probably 128 * 128 seems good but leads to oom. 64 * 64 has accumlation errors but no oom.
+# NOTE: smaller blocks have lower accuracy. more accumulation error probably 128 * 128 seems good but leads to oom. 64 * 64 has accumulation errors but no oom.
 def attention_prefill_backward_triton_impl(
     do,
     q,
@@ -475,7 +475,7 @@ def attention_prefill_backward_triton_impl(
         print("use_exp2:", use_exp2)
         print("sequence_parallel:", sequence_parallel)
 
-    # make contigious
+    # make contiguous
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
@@ -498,7 +498,7 @@ def attention_prefill_backward_triton_impl(
     else:
         BLOCK_M = 64 
         BLOCK_N = 64
-    num_warps = 4 # NOTE: originial is 8. changing it to 1 caused issues be careful
+    num_warps = 4 # NOTE: original is 8. changing it to 1 caused issues be careful
     num_stages = 1
     waves_per_eu = 1
 
@@ -532,7 +532,7 @@ def attention_prefill_backward_triton_impl(
             dq = torch.zeros((num_blocks_n,) + q.shape, device=q.device, dtype=q.dtype)
             copy_back["dq"] = True
         else:
-            # NOTE: the kernel does inplace accumlation so dq has to be zeros. This avoids the case where we are passed empty dq and it is not all zeros
+            # NOTE: the kernel does inplace accumulation so dq has to be zeros. This avoids the case where we are passed empty dq and it is not all zeros
             dq.zero_()
     stride_dq_all = dq.stride()[0]
 
@@ -554,7 +554,7 @@ def attention_prefill_backward_triton_impl(
     if DEBUG:
         print("copy_back:", copy_back)
 
-    # assert contigious
+    # assert contiguous
     assert do.is_contiguous()
     assert q.is_contiguous()
     assert k.is_contiguous()
