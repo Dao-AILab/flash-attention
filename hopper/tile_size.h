@@ -9,7 +9,7 @@
 // Return {kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap}
 constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         int headdim, int headdim_v, bool is_causal, bool is_local, int element_size=2,
-        bool v_colmajor=false, bool paged_kv_non_TMA=false, bool softcap=false) {
+        bool v_colmajor=false, bool paged_kv_non_TMA=false, bool softcap=false, bool use_one_mma_wg=false) {
     if (element_size == 2) {
         if (headdim <= 64) {
             // return {same_hdim ? 192 : 64, same_hdim ? 128 : 64, same_hdim, same_hdim};
@@ -29,7 +29,11 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         } else if (headdim <= 96) {
             return {192, is_local || paged_kv_non_TMA ? 128 : 144, false, true};
         } else if (headdim <= 128) {
-            return {128, is_causal || is_local || paged_kv_non_TMA ? 128 : 176, true, true};
+            if (use_one_mma_wg) {
+                return {64, is_causal || is_local || paged_kv_non_TMA ? 128 : 176, true, true};
+            } else {
+                return {128, is_causal || is_local || paged_kv_non_TMA ? 128 : 176, true, true};
+            }
             // {128, 192, false, false} and {192, 128, false, true} are quite good too
             // 128 x 192 hits the limit of smem if MmaPV_is_RS, 128 x 144 hits the limit if !MmaPV_is_RS
         } else if (headdim <= 192) {
