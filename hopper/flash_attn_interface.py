@@ -330,9 +330,9 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.deterministic,
             ctx.sm_margin,
         )
-        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : dout.shape[-1]]
-        dv = dv[..., : dout.shape[-1]]
+        dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
+        dk = dk[..., : k.shape[-1]]
+        dv = dv[..., : v.shape[-1]]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
@@ -432,9 +432,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.deterministic,
             ctx.sm_margin,
         )
-        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : dout.shape[-1]]
-        dv = dv[..., : dout.shape[-1]]
+        dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
+        dk = dk[..., : k.shape[-1]]
+        dv = dv[..., : v.shape[-1]]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
