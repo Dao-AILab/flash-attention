@@ -1212,15 +1212,15 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 // h_k: num_heads_k
 // d: head_size
 std::vector<at::Tensor> mha_bwd(
-    const at::Tensor &dout,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+    const at::Tensor &dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
     const at::Tensor &q,     // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor &k,     // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
-    const at::Tensor &v,     // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
-    const at::Tensor &out,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+    const at::Tensor &v,     // (b, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k
+    const at::Tensor &out,   // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
     const at::Tensor &softmax_lse,    // (b, h, s_q) or (h, total_q) if there is cu_seqlens_q
     std::optional<at::Tensor> &dq_,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     std::optional<at::Tensor> &dk_,   // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
-    std::optional<at::Tensor> &dv_,   // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
+    std::optional<at::Tensor> &dv_,   // (b, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k
     std::optional<const at::Tensor> &cu_seqlens_q_,   // b+1
     std::optional<const at::Tensor> &cu_seqlens_k_,   // b+1
     std::optional<const at::Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
@@ -1288,12 +1288,15 @@ std::vector<at::Tensor> mha_bwd(
     int const total_q = !is_varlen_q ? batch_size * sizes[1] : sizes[0];
     int const num_heads = q.size(-2);
     int const head_size = q.size(-1);
+    int const head_size_v = v.size(-1);
     int const seqlen_k = !is_varlen_k ? k.size(1) : max_seqlen_k_.value();
     int const total_k = !is_varlen_k ? batch_size * k.size(1) : k.size(0);
     int const num_heads_k = k.size(-2);
     TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
+    TORCH_CHECK(head_size_v % 8 == 0, "head_size_v should be a multiple of 8");
     int const max_headdim = get_max_headdim();
     TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
+    TORCH_CHECK(head_size_v <= head_size, "FlashAttention backward rounds head_size_v to head_size_rounded");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
@@ -1306,6 +1309,7 @@ std::vector<at::Tensor> mha_bwd(
 
     int const arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
     int const head_size_rounded = round_up_headdim(head_size);
+    int const head_size_v_rounded = head_size_rounded;
     // Very important that these match the kernel configs
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
     int const kBlockM_sm90 = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
@@ -1334,20 +1338,20 @@ std::vector<at::Tensor> mha_bwd(
 
     if (!is_varlen_q) {
         CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
-        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size);
-        CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size);
+        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_v);
+        CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size_v);
     } else {
         CHECK_SHAPE(q, total_q, num_heads, head_size);
-        CHECK_SHAPE(out, total_q, num_heads, head_size);
-        CHECK_SHAPE(dout, total_q, num_heads, head_size);
+        CHECK_SHAPE(out, total_q, num_heads, head_size_v);
+        CHECK_SHAPE(dout, total_q, num_heads, head_size_v);
         CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     }
     if (!is_varlen_k) {
         CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
-        CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
+        CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
     } else {
         CHECK_SHAPE(k, total_k, num_heads_k, head_size);
-        CHECK_SHAPE(v, total_k, num_heads_k, head_size);
+        CHECK_SHAPE(v, total_k, num_heads_k, head_size_v);
         CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
     }
 
@@ -1397,9 +1401,9 @@ std::vector<at::Tensor> mha_bwd(
         CHECK_DEVICE(dv);
         TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
         if (!is_varlen_k) {
-            CHECK_SHAPE(dv, batch_size, seqlen_k, num_heads_k, head_size);
+            CHECK_SHAPE(dv, batch_size, seqlen_k, num_heads_k, head_size_v);
         } else {
-            CHECK_SHAPE(dv, total_k, num_heads_k, head_size);
+            CHECK_SHAPE(dv, total_k, num_heads_k, head_size_v);
         }
     } else {
         dv = torch::empty_like(v);
@@ -1429,10 +1433,10 @@ std::vector<at::Tensor> mha_bwd(
     if (num_heads_k != num_heads) {  // MQA / GQA
         if (!is_varlen) {
             dk_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded * head_size_rounded}, opts.dtype(at::kFloat));
-            dv_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded * head_size_rounded}, opts.dtype(at::kFloat));
+            dv_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded * head_size_v_rounded}, opts.dtype(at::kFloat));
         } else {
             dk_accum = torch::zeros({num_heads_k, total_k_padded_rounded, head_size_rounded}, opts.dtype(at::kFloat));
-            dv_accum = torch::zeros({num_heads_k, total_k_padded_rounded, head_size_rounded}, opts.dtype(at::kFloat));
+            dv_accum = torch::zeros({num_heads_k, total_k_padded_rounded, head_size_v_rounded}, opts.dtype(at::kFloat));
         }
     }
 
@@ -1465,7 +1469,8 @@ std::vector<at::Tensor> mha_bwd(
     params.total_q = total_q;
     params.total_k = total_k;
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
-    params.dv = head_size;  // We don't support hdim_v being different from hdim_qk for now
+    params.dv = head_size_v;
+    params.dv_rounded = head_size_v_rounded;
 
     // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
