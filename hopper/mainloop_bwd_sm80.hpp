@@ -284,8 +284,10 @@ struct CollectiveMainloopBwdSm80 {
         ShapeQKV const shape_K;
         StrideQKV const stride_K;
         Element const* const ptr_V;
+        ShapeQKV const shape_V;
         StrideQKV const stride_V;
         Element const* const ptr_dO;
+        ShapeQKV const shape_dO;
         StrideQKV const stride_dO;
         ElementAccum* const ptr_dQaccum;
         ShapedQaccum const shape_dQaccum;
@@ -315,8 +317,10 @@ struct CollectiveMainloopBwdSm80 {
         ShapeQKV const shape_K;
         StrideQKV const stride_K;
         Element const* const ptr_V;
+        ShapeQKV const shape_V;
         StrideQKV const stride_V;
         Element const* const ptr_dO;
+        ShapeQKV const shape_dO;
         StrideQKV const stride_dO;
         ElementAccum* const ptr_dQaccum;
         ShapedQaccum const shape_dQaccum;
@@ -356,8 +360,8 @@ struct CollectiveMainloopBwdSm80 {
         // (the original softmax_scale) at the end.
         return {args.ptr_Q, args.shape_Q, args.stride_Q,
                 args.ptr_K, args.shape_K, args.stride_K,
-                args.ptr_V, args.stride_V,
-                args.ptr_dO, args.stride_dO,
+                args.ptr_V, args.shape_V, args.stride_V,
+                args.ptr_dO, args.shape_dO, args.stride_dO,
                 args.ptr_dQaccum, args.shape_dQaccum, args.stride_dQaccum,
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
                 args.ptr_LSE_log2, args.shape_LSE, args.stride_LSE_log2, args.ptr_dPsum, args.stride_dPsum,
@@ -417,9 +421,9 @@ struct CollectiveMainloopBwdSm80 {
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
         int bidh_kv = params.qhead_per_khead_divmod.divide(bidh);
         Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q), params.shape_Q, params.stride_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
-        Tensor mdO = make_tensor(make_gmem_ptr(params.ptr_dO), params.shape_Q, params.stride_dO)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mdO = make_tensor(make_gmem_ptr(params.ptr_dO), params.shape_dO, params.stride_dO)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K), params.shape_K, params.stride_K)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
-        Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
+        Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V), params.shape_V, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, !is_varlen_q ? bidb : 0);
         Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_LSE, params.stride_dPsum)(_, bidh, !is_varlen_q ? bidb : 0);
         Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.ptr_dQaccum)),
@@ -531,6 +535,9 @@ struct CollectiveMainloopBwdSm80 {
         for (int k = 0; k < size(tQpQ); ++k) { tQpQ(k) = get<1>(tQcQ(_0{}, _0{}, k)) < get<1>(params.shape_Q); }
         Tensor cLSE = cute::make_identity_tensor(select<0>(TileShape_MNK{}));
         Tensor tLSEcLSE = gmem_thr_copy_lse.partition_S(cLSE);
+        Tensor tdOpdO = make_tensor<bool>(make_shape(size<2>(tdOsdO)));
+        #pragma unroll
+        for (int k = 0; k < size(tdOpdO); ++k) { tdOpdO(k) = get<1>(tQcQ(_0{}, _0{}, k)) < get<1>(params.shape_dO); }
 
         int const seqlen_q = seqlen_info.seqlen_q;
         int const seqlen_k = seqlen_info.seqlen_k;
@@ -549,9 +556,12 @@ struct CollectiveMainloopBwdSm80 {
             Tensor cKV = cute::make_identity_tensor(select<1, 2>(TileShape_MNK{}));
             Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);
             Tensor t0KVcKV = gmem_thr0_copy_QKV.partition_S(cKV);
-            Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
+            Tensor tKpK = make_tensor<bool>(make_shape(size<2>(tKsK)));
+            Tensor tVpV = make_tensor<bool>(make_shape(size<2>(tVsV)));
             #pragma unroll
-            for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(_0{}, _0{}, k)) < get<1>(params.shape_K); }
+            for (int k = 0; k < size(tKpK); ++k) { tKpK(k) = get<1>(tKVcKV(_0{}, _0{}, k)) < get<1>(params.shape_K); }
+            #pragma unroll
+            for (int k = 0; k < size(tVpV); ++k) { tVpV(k) = get<1>(tKVcKV(_0{}, _0{}, k)) < get<1>(params.shape_V); }
             // Do we need bound check to make sure the row doesn't go above kBlockN
             static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0;
             // static_assert(EvenN);  // It simplifies the loading of K and V
@@ -571,7 +581,7 @@ struct CollectiveMainloopBwdSm80 {
                     bool const predicate_n = get<0>(t0KVcKV(_0{}, m, _0{})) < seqlenk_row_limit;
                     #pragma unroll
                     for (int k = 0; k < size<2>(tVsV); ++k) {
-                        cute::copy(gmem_tiled_copy_QKV.with(tKVpKV(k) && predicate_n), tVgV(_, m, k), tVsV(_, m, k));
+                        cute::copy(gmem_tiled_copy_QKV.with(tVpV(k) && predicate_n), tVgV(_, m, k), tVsV(_, m, k));
                     }
                 }
             }
@@ -584,7 +594,7 @@ struct CollectiveMainloopBwdSm80 {
                     bool const predicate_n = get<0>(t0KVcKV(_0{}, m, _0{})) < seqlenk_row_limit;
                     #pragma unroll
                     for (int k = 0; k < size<2>(tKsK); ++k) {
-                        cute::copy(gmem_tiled_copy_QKV.with(tKVpKV(k) && predicate_n), tKgK(_, m, k), tKsK(_, m, k));
+                        cute::copy(gmem_tiled_copy_QKV.with(tKpK(k) && predicate_n), tKgK(_, m, k), tKsK(_, m, k));
                     }
                 }
             }
@@ -657,7 +667,7 @@ struct CollectiveMainloopBwdSm80 {
                     bool const predicate_m = get<0>(t0QcQ(_0{}, m, _0{})) < seqlenq_row_limit;
                     #pragma unroll
                     for (int k = 0; k < size<2>(tdOsdO); ++k) {
-                        cute::copy(gmem_tiled_copy_QKV.with(tQpQ(k) && predicate_m), tdOgdO_cur(_, m, k), tdOsdO_cur(_, m, k));
+                        cute::copy(gmem_tiled_copy_QKV.with(tdOpdO(k) && predicate_m), tdOgdO_cur(_, m, k), tdOsdO_cur(_, m, k));
                     }
                 }
             }
