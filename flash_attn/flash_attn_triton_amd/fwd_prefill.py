@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional, Union
-from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, compute_fp8_scaling_factors, get_shapes_from_layout, get_strides_from_layout, is_cdna, is_fp8, is_rdna, write_dropout_mask, create_dropout_mask
+from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, compute_alibi_block, compute_fp8_scaling_factors, get_shapes_from_layout, get_strides_from_layout, is_cdna, is_fp8, is_rdna, create_dropout_mask
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
@@ -26,40 +26,6 @@ def load_fn(ptrs, offset_first, offset_second, boundary_first, boundary_second):
         tensor = tl.load(ptrs)
     return tensor
 
-
-@triton.jit
-def compute_alibi_block(alibi_slope, seqlen_q, seqlen_k, offs_m, offs_n, transpose=False):
-    # when seqlen_k and seqlen_q are different we want the diagonal to stick to the bottom right of the attention matrix
-    # for casual mask we want something like this where (1 is kept and 0 is masked)
-    # seqlen_q = 2 and seqlen_k = 5
-    #   1 1 1 1 0
-    #   1 1 1 1 1
-    # seqlen_q = 5 and seqlen_k = 2
-    #        0 0
-    #        0 0
-    #        0 0
-    #        1 0
-    #        1 1
-    # for alibi the diagonal is 0 indicating no penalty for attending to that spot and increasing penalty for attending further from the diagonal
-    # e.g. alibi_slope = 1, seqlen_q = 2, seqlen_k = 5, offs_m = [0, 1, 2, 3], offs_n = [0, 1, 2, 3, 4], transpose = False
-    # 1. offs_m[:,None] = [[0],
-    #                       [1],
-    # 2. offs_m[:,None] + seqlen_k = [[5],
-    #                                  [6],
-    # 3. offs_m[:,None] + seqlen_k - seqlen_q = [[3],
-    #                                             [4],
-    # 4. offs_m[:,None] + seqlen_k - seqlen_q - offs_n[None,:] = [[3], - [[0, 1, 2, 3, 4]] =  [[ 3, 2, 1, 0,-1],
-    #                                                            [4],                           [ 4, 3, 2, 1, 0]]
-    # 5. -1 * alibi_slope * tl.abs(relative_pos_block) = [[ -3, -2, -1, 0,-1],
-    #                                                     [ -4, -3, -2, -1, 0]],
-    relative_pos_block = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
-    alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
-    if transpose:
-        return alibi_block.T
-    else:
-        return alibi_block
-
-
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stride_vk, stride_bn, stride_sn, start_m,
                     actual_seqlen_k, actual_seqlen_q, dropout_p, philox_seed, philox_ptrs, sd_mask_ptrs, dropout_mask_ptrs,
@@ -68,7 +34,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
                     IS_CAUSAL: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,
                     OFFS_M: tl.constexpr, OFFS_N: tl.constexpr, PRE_LOAD_V: tl.constexpr, MASK_STEPS: tl.constexpr,
                     ENABLE_DROPOUT: tl.constexpr, PADDED_HEAD: tl.constexpr,
-                    ACTUAL_BLOCK_DMODEL: tl.constexpr, SM_SCALE: tl.constexpr, USE_EXP2: tl.constexpr,
+                    ACTUAL_BLOCK_DMODEL: tl.constexpr, SM_SCALE: tl.constexpr, USE_ALIBI: tl.constexpr, USE_EXP2: tl.constexpr,
                     RETURN_SCORES: tl.constexpr, ACCUMULATOR_TYPE):
     if USE_EXP2:
         RCP_LN2: tl.constexpr = 1.4426950408889634
@@ -123,8 +89,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
             bias = load_fn(bias_ptrs, OFFS_M, bias_offs_n, actual_seqlen_q, actual_seqlen_k)
             qk_scaled += bias
 
-        if alibi_slope is not None:
-            # Compute the global position of each token within the sequence
+        if USE_ALIBI:
+            # compute the global position of each token within the sequence
             global_m_positions = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
             global_n_positions = start_n + tl.arange(0, BLOCK_N)
             alibi_block = compute_alibi_block(alibi_slope, actual_seqlen_q, actual_seqlen_k, global_m_positions,
@@ -460,7 +426,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
                                         False, BLOCK_M, BLOCK_DMODEL, BLOCK_N, offs_m, offs_n,
                                         # _, MASK_STEPS, ...
                                         PRE_LOAD_V, False, ENABLE_DROPOUT, PADDED_HEAD,
-                                        ACTUAL_BLOCK_DMODEL, SM_SCALE,  USE_EXP2=USE_EXP2, RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE)
+                                        ACTUAL_BLOCK_DMODEL, SM_SCALE, USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE)
         block_min = block_max
         block_max = n_blocks * BLOCK_N
 
@@ -487,7 +453,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
                                         IS_CAUSAL, BLOCK_M, BLOCK_DMODEL, BLOCK_N, offs_m, offs_n,
                                         # _, MASK_STEPS, ...
                                         PRE_LOAD_V, True, ENABLE_DROPOUT, PADDED_HEAD,
-                                        ACTUAL_BLOCK_DMODEL, SM_SCALE, USE_EXP2=USE_EXP2, RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE)
+                                        ACTUAL_BLOCK_DMODEL, SM_SCALE, USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE)
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     l_recip = 1 / l_i[:, None]
@@ -612,6 +578,7 @@ def attention_prefill_forward_triton_impl(
 
     # check flags
     is_varlen = layout == "thd"
+    use_alibi, (stride_az, stride_ah) = (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
     is_inference = False if cache_seqlens is None else True
     if is_inference:
         assert layout == "bshd", f"{layout} layout is not supported with inference. Use bshd layout"
@@ -667,20 +634,15 @@ def attention_prefill_forward_triton_impl(
     else:
         bias_strides = (0, 0, 0, 0)
 
-    if alibi_slopes is not None:
-        alibi_strides = (alibi_slopes.stride(0), alibi_slopes.stride(1))
-    else:
-        alibi_strides = (0, 0)
-
     attn_fwd[grid](q, k, v, bias, cache_seqlens, cache_batch_idx,
                     descale_q, descale_k, descale_v, descale_o, stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_o_z,
                     sm_scale, softmax_lse, o, *q_strides, *k_strides, *v_strides, *o_strides,
-                    *bias_strides, *alibi_strides, *scores_strides, stride_lse_z, stride_lse_h, stride_lse_m, cu_seqlens_q, cu_seqlens_k,
+                    *bias_strides, stride_az, stride_ah, *scores_strides, stride_lse_z, stride_lse_h, stride_lse_m, cu_seqlens_q, cu_seqlens_k,
                     dropout_p=dropout_p, philox_seed=philox_seed, philox_offset_base=philox_offset, sd_mask=sd_mask, dropout_mask=dropout_mask, alibi_slopes=alibi_slopes, 
                     HQ=nheads_q, HK=nheads_k, ACTUAL_BLOCK_DMODEL=head_size, MAX_SEQLENS_Q=max_seqlens_q,
                     MAX_SEQLENS_K=max_seqlens_k, IS_CAUSAL=causal, IS_VARLEN=is_varlen, IS_INFERENCE=is_inference,
                     BLOCK_DMODEL=padded_d_model, USE_BIAS=False if bias is None else True,
-                    USE_ALIBI=False if alibi_slopes is None else True, ENABLE_DROPOUT=dropout_p
+                    USE_ALIBI=use_alibi, ENABLE_DROPOUT=dropout_p
                     > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_softmax, IS_FP8=IS_FP8, FP8_MAX=FP8_MAX, FP8_OUTPUT=FP8_OUTPUT)
 
     return softmax_lse, sd_mask if return_softmax else None 

@@ -139,11 +139,14 @@ def test_op_prefill_fwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
     q_ref = q.clone()
     k_ref = k.clone()
     v_ref = v.clone()
-    o_ref, softmax_lse_ref, sd_mask_ref  = attention_forward_pytorch_ref_impl(
+    o_ref = torch.zeros_like(q).contiguous() if DEBUG_INPUT else torch.empty_like(q)
+    softmax_lse_ref, sd_mask_ref  = attention_forward_pytorch_ref_impl(
         q_ref, 
         k_ref, 
-        v_ref, 
-        metadata.sm_scale, 
+        v_ref,
+        o_ref,
+        metadata.sm_scale,
+        metadata.alibi_slopes,
         causal, 
         layout,
         metadata.cu_seqlens_q,
@@ -270,12 +273,15 @@ def test_op_prefill_bwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
     # fwd
     q_ref = q.clone() 
     k_ref = k.clone()
-    v_ref = v.clone()    
-    output_ref, softmax_lse_ref, sd_mask_ref = attention_forward_pytorch_ref_impl(
+    v_ref = v.clone()
+    output_ref = torch.zeros_like(q).contiguous() if DEBUG_INPUT else torch.empty_like(q)
+    softmax_lse_ref, sd_mask_ref = attention_forward_pytorch_ref_impl(
         q_ref,
         k_ref, 
         v_ref,
-        metadata.sm_scale, 
+        output_ref,
+        metadata.sm_scale,
+        metadata.alibi_slopes,
         causal, 
         layout,
         metadata.cu_seqlens_q,
@@ -290,14 +296,21 @@ def test_op_prefill_bwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
 
     # bwd
     do_ref = do.clone()
-    dq_ref, dk_ref, dv_ref, delta_ref = attention_backward_pytorch_ref_impl(
+    dq_ref = torch.zeros_like(q).contiguous() if DEBUG_INPUT else torch.empty_like(q)
+    dk_ref = torch.zeros_like(k).contiguous() if DEBUG_INPUT else torch.empty_like(k)
+    dv_ref = torch.zeros_like(v).contiguous() if DEBUG_INPUT else torch.empty_like(v)
+    delta_ref = attention_backward_pytorch_ref_impl(
         do_ref,
         q_ref,
         k_ref,
         v_ref,
         output_ref,
         softmax_lse_ref,
+        dq_ref,
+        dk_ref,
+        dv_ref,
         metadata.sm_scale,
+        metadata.alibi_slopes,
         causal,
         layout,
         metadata.cu_seqlens_q,

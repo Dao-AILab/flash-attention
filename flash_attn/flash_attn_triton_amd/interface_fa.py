@@ -87,11 +87,13 @@ def fwd(q: torch.Tensor,
     if USE_REF:
         if DEBUG:
             print("Using reference implementation")
-        out_ref, softmax_lse_ref, sd_mask_ref = attention_forward_pytorch_ref_impl(
+        softmax_lse_ref, sd_mask_ref = attention_forward_pytorch_ref_impl(
                                                 q,
                                                 k,
                                                 v,
+                                                out,
                                                 metadata.sm_scale,
+                                                metadata.alibi_slopes,
                                                 metadata.causal,
                                                 metadata.layout,
                                                 metadata.cu_seqlens_q,
@@ -102,7 +104,6 @@ def fwd(q: torch.Tensor,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
                                                 metadata.use_exp2)
-        out = out_ref
         softmax_lse=softmax_lse_ref
         sd_mask=sd_mask_ref
     else:
@@ -142,7 +143,7 @@ def fwd(q: torch.Tensor,
         if is_fp8(out):
             print("descale_o:", descale_o, descale_o.shape if descale_o is not None else None)
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
-        print("exp_scores:", sd_mask, sd_mask.shape if sd_mask is not None else None )
+        print("sd_mask:", sd_mask, sd_mask.shape if sd_mask is not None else None )
 
     return out, softmax_lse, sd_mask, rng_state
 
@@ -229,7 +230,11 @@ def bwd(
             v,
             out,
             softmax_lse,
+            dq,
+            dk,
+            dv,
             softmax_scale,
+            alibi_slopes,
             causal,
             "bshd",
             None,
@@ -435,7 +440,9 @@ def varlen_fwd(
                                                 q,
                                                 k,
                                                 v,
+                                                out,
                                                 metadata.sm_scale,
+                                                metadata.alibi_slopes,
                                                 metadata.causal,
                                                 metadata.layout,
                                                 metadata.cu_seqlens_q,
@@ -573,7 +580,11 @@ def varlen_bwd(
             v,
             out,
             softmax_lse,
+            dq,
+            dk,
+            dv,
             softmax_scale,
+            alibi_slopes,
             causal,
             "thd",
             cu_seqlens_q,
