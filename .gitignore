@@ -22,30 +22,10 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
+.eggs/
 
 # IDE-related
 .idea/
 
 # Dev
 venv
-
-# AMD
-scripts
-csrc/flash_attn_ck
-.eggs
-log
-*.log
-core.*
-gpucore.*
-*.csv
-*.png
-*.html
-*.json
-*.txt
-*.pth
-*.md
-training/logs
-training/data
-# ck modules
-csrc/composable_kernel
-csrc/cutlass

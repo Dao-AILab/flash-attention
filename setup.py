@@ -65,6 +65,11 @@ FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 SKIP_CK_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CK_BUILD", "TRUE") == "TRUE" if USE_TRITON_ROCM else False
 
+@functools.lru_cache(maxsize=None)
+def cuda_archs() -> str:
+    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;120").split(";")
+
+
 def get_platform():
     """
     Returns the platform name as used in wheel filenames.
@@ -140,9 +145,10 @@ ext_modules = []
 
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
-if IS_ROCM:
+if os.path.isdir(".git"):
     if not SKIP_CK_BUILD:
-        subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"])
+        subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
+        subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
 else:
     if IS_ROCM:
         if not SKIP_CK_BUILD:
@@ -325,10 +331,10 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if not os.path.exists("./build"):
             os.makedirs("build")
 
-        os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --output_dir build --receipt 2")
-        os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_appendkv --output_dir build --receipt 2")
-        os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --output_dir build --receipt 2")
-        os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d bwd --output_dir build --receipt 2")
+        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2"], check=True)
+        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2"], check=True)
+        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2"], check=True)
+        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2"], check=True)
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650

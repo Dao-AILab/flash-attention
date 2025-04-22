@@ -13,7 +13,6 @@ if USE_TRITON_ROCM:
     from .flash_attn_triton_amd import interface_fa as flash_attn_gpu
 else:
     import flash_attn_2_cuda as flash_attn_gpu
-from .flash_attn_triton_amd.fp8 import flash_attn_fp8_func, flash_attn_varlen_fp8_func, flash_attn_qkvpacked_fp8_func, flash_attn_varlen_qkvpacked_fp8_func
 
 # isort: on
 
