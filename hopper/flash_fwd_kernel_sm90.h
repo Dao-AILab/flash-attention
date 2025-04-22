@@ -101,6 +101,7 @@ public:
                 // We want smem_o to line up with the start of smem_v
                 typename CollectiveEpilogue::TensorStorage epilogue;
             };
+            cute::array_aligned<uint32_t, 512> sparse_masks;  // supports up to 1M context with blocksize 64
         } tensors;
         struct PipelineStorage : cute::aligned_struct<16, _1> {
             alignas(16) BarrierQ barrier_Q;
@@ -378,6 +379,7 @@ public:
                  // get_next_work will be called before the epilogue
                  ) {
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
+
                 int const bidb = get<2>(block_coord);
                 SeqlenInfo_t seqlen_info{
                     bidb,

@@ -659,6 +659,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> q_descale_,  // (b, h_k), not (b, h)
         std::optional<at::Tensor> k_descale_,  // (b, h_k)
         std::optional<at::Tensor> v_descale_,  // (b, h_k)
+        std::optional<at::Tensor> sparse_masks_,  // (b, h, ceil_div(max_s, q_blk), ceil(max_t, k_blk*8)) with row compression, 0 means the block is masked out
         std::optional<double> softmax_scale_,
         bool is_causal,
         int64_t window_size_left,
@@ -666,6 +667,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         int64_t attention_chunk,
         double softcap,
         bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
+        int64_t sparse_block_q,
+        int64_t sparse_block_k,
         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
@@ -1094,6 +1097,17 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         }
     }
 
+    if (sparse_masks_.has_value()) {
+        TORCH_CHECK(max_seqlen_q_.has_value());
+        TORCH_CHECK(max_seqlen_k_.has_value());
+        auto sparse_masks = sparse_masks_.value();
+        params.sparse_masks = reinterpret_cast<uint32_t *>(sparse_masks.data_ptr());
+        params.sparse_block_q = sparse_block_q;
+        params.sparse_block_k = sparse_block_k;
+        params.max_seqlen_q = max_seqlen_q_.value();
+        params.max_seqlen_k = max_seqlen_k_.value();
+    }
+
     #ifdef FLASHATTENTION_DISABLE_LOCAL
     TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
     #endif
@@ -1111,6 +1125,13 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     #endif
     #ifdef FLASHATTENTION_DISABLE_APPENDKV
     TORCH_CHECK(!k_new_.has_value(), "This flash attention build does not support appending KV.");
+    #endif
+
+    #ifndef FLASHATTENTION_DISABLE_PAGEDKV
+    TORCH_CHECK(!params.page_table || !params.sparse_masks, "block sparse flash attention does not support paged KV.");
+    #endif
+    #ifndef FLASHATTENTION_DISABLE_APPENDKV
+    TORCH_CHECK(!params.page_table || !params.sparse_masks, "block sparse flash attention does not support appending KV.");
     #endif
 
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
@@ -1642,6 +1663,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? q_descale = None,"
         "Tensor? k_descale = None,"
         "Tensor? v_descale = None,"
+        "Tensor? sparse_masks = None,"
         "float? softmax_scale = None,"
         "bool is_causal = False,"
         "int window_size_left = -1,"
@@ -1649,6 +1671,8 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int attention_chunk = 0,"
         "float softcap = 0.0,"
         "bool is_rotary_interleaved = False,"
+        "int sparse_block_q = 0,"
+        "int sparse_block_k = 0,"
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
