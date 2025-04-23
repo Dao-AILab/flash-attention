@@ -215,7 +215,14 @@ def test_flash_attn_output(
             # of a Pytorch implementation.
             assert (out - out_ref).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
 
-        if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor and not has_qv and not d < dv:
+        if (
+            not DISABLE_BACKWARD 
+            and dtype != torch.float8_e4m3fn 
+            and not V_colmajor 
+            and not has_qv 
+            and not d < dv
+            and not attention_chunk != 0
+        ):
             g = torch.randn_like(out)
             do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             # import flash_attn_3_cuda
@@ -484,7 +491,13 @@ def test_flash_attn_varlen_output(
             assert (out - out_ref).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
 
 
-        if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not has_qv and not d < dv:
+        if (
+            not DISABLE_BACKWARD 
+            and dtype != torch.float8_e4m3fn 
+            and not has_qv 
+            and not d < dv
+            and not attention_chunk != 0
+        ):
             g_unpad = torch.randn_like(out_unpad)
             do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda
