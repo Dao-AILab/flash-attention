@@ -16,7 +16,7 @@ jobs:
       matrix:
           # Using ubuntu-20.04 instead of 22.04 for more compatibility (glibc). Ideally we'd use the
           # manylinux docker image, but I haven't figured out how to install CUDA on manylinux.
-          os: [ubuntu-20.04]
+          os: [ubuntu-22.04]
           python-version: ['3.10'] #['3.9', '3.10', '3.11', '3.12', '3.13']
           torch-version: ['2.8.0'] #['2.2.2', '2.3.1', '2.4.0', '2.5.1', '2.6.0']
           cuda-version: ['12.8.1']
@@ -134,25 +134,3 @@ jobs:
         run: |
           ls dist
 
-      - name: Get the tag version
-        id: extract_branch
-        run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
-
-      - name: Get Release with tag
-        id: get_current_release
-        uses: joutvhu/get-release@v1
-        with:
-          tag_name: ${{ steps.extract_branch.outputs.branch }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Release Asset
-        id: upload_release_asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.get_current_release.outputs.upload_url }}
-          asset_path: ./dist/${{env.wheel_name}}
-          asset_name: ${{env.wheel_name}}
-          asset_content_type: application/*
