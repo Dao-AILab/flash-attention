@@ -219,8 +219,8 @@ def test_flash_attn_output(
             not DISABLE_BACKWARD 
             and dtype != torch.float8_e4m3fn 
             and not V_colmajor 
-            and not has_qv 
-            and not d < dv
+            and not has_qv
+            and not dv > 256
             and not attention_chunk != 0
         ):
             g = torch.randn_like(out)
@@ -494,8 +494,8 @@ def test_flash_attn_varlen_output(
         if (
             not DISABLE_BACKWARD 
             and dtype != torch.float8_e4m3fn 
-            and not has_qv 
-            and not d < dv
+            and not has_qv
+            and not dv > 256
             and not attention_chunk != 0
         ):
             g_unpad = torch.randn_like(out_unpad)
