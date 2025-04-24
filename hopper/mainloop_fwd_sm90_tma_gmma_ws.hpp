@@ -665,6 +665,7 @@ struct CollectiveMainloopFwdSm90 {
         auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
         Tensor tQgQ = group_modes<0, 3>(block_tma_Q.partition_S(gQ));  // (TMA)
         Tensor tQsQ = group_modes<0, 3>(block_tma_Q.partition_D(sQ));  // (TMA)
+        if (Use_TMA_Q && thread_idx == 0) { prefetch(params.tma_load_Q, tQgQ); }
         // tma_partition doesn't handle position_independent_swizzle_tensor correctly, so we need to do it manually
         auto block_tma_K = params.tma_load_K.get_slice(cluster_local_block_id.x);
         Tensor tKgK_TMA = group_modes<0, 3>(block_tma_K.partition_S(gK_TMA));  // (TMA, k, batch)
