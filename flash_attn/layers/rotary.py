@@ -1,4 +1,4 @@
-# Copyright (c) 2023, Tri Dao.
+# Copyright (c) 2025, Tri Dao.
 
 import math
 from typing import Optional, Tuple, Union
@@ -362,27 +362,15 @@ class RotaryEmbedding(torch.nn.Module):
         base=10000.0,
         interleaved=False,
         scale_base=None,
-        pos_idx_in_fp32=True,
         device=None,
     ):
         """
         interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead
             of 1st half and 2nd half (GPT-NeoX style).
-        pos_idx_in_fp32: if True, the position indices [0.0, ..., seqlen - 1] are in fp32,
-            otherwise they might be in lower precision.
-            This option was added because previously (before 2023-07-02), when we construct
-            the position indices, we use the dtype of self.inv_freq. In most cases this would
-            be fp32, but if the model is trained in pure bf16 (not mixed precision), then
-            self.inv_freq would be bf16, and the position indices are also in bf16.
-            Because of the limited precision of bf16 (e.g. 1995.0 is rounded to 2000.0), the
-            embeddings for some positions will coincide.
-            To maintain compatibility with models previously trained in pure bf16,
-            we add this option.
         """
         super().__init__()
         self.dim = dim
         self.base = float(base)
-        self.pos_idx_in_fp32 = pos_idx_in_fp32
         # Generate and save the inverse frequency buffer (non trainable)
         inv_freq = self._compute_inv_freq(device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -421,21 +409,16 @@ class RotaryEmbedding(torch.nn.Module):
             self._seq_len_cached = seqlen
             # We want fp32 here, not self.inv_freq.dtype, since the model could be loaded in bf16
             # And the output of arange can be quite large, so bf16 would lose a lot of precision.
-            # However, for compatibility reason, we add an option to use the dtype of self.inv_freq.
-            if self.pos_idx_in_fp32:
-                t = torch.arange(seqlen, device=device, dtype=torch.float32)
-                # We want fp32 here as well since inv_freq will be multiplied with t, and the output
-                # will be large. Having it in bf16 will lose a lot of precision and cause the
-                # cos & sin output to change significantly.
-                # We want to recompute self.inv_freq if it was not loaded in fp32
-                if self.inv_freq.dtype != torch.float32:
-                    inv_freq = self._compute_inv_freq(device=device)
-                else:
-                    inv_freq = self.inv_freq
+            t = torch.arange(seqlen, device=device, dtype=torch.float32)
+            # We want fp32 here as well since inv_freq will be multiplied with t, and the output
+            # will be large. Having it in bf16 will lose a lot of precision and cause the
+            # cos & sin output to change significantly.
+            # We want to recompute self.inv_freq if it was not loaded in fp32
+            if self.inv_freq.dtype != torch.float32:
+                inv_freq = self._compute_inv_freq(device=device)
             else:
-                t = torch.arange(seqlen, device=device, dtype=self.inv_freq.dtype)
                 inv_freq = self.inv_freq
-            # Don't do einsum, it converts fp32 to fp16 under AMP
+            # Don't do einsum, it converts fp32 to bf16 under AMP
             # freqs = torch.einsum("i,j->ij", t, self.inv_freq)
             freqs = torch.outer(t, inv_freq)
             if self.scale is None:
@@ -479,26 +462,16 @@ class RotaryEmbedding(torch.nn.Module):
         elif isinstance(seqlen_offset, int):
             self._update_cos_sin_cache(seqlen + seqlen_offset, device=qkv.device, dtype=qkv.dtype)
         if kv is None:
-            if self.scale is None:
-                return apply_rotary_emb_qkv_(
-                    qkv,
-                    self._cos_cached,
-                    self._sin_cached,
-                    interleaved=self.interleaved,
-                    seqlen_offsets=seqlen_offset,
-                    num_heads_q=num_heads_q,
-                )
-            else:
-                return apply_rotary_emb_qkv_(
-                    qkv,
-                    self._cos_cached,
-                    self._sin_cached,
-                    self._cos_k_cached,
-                    self._sin_k_cached,
-                    interleaved=self.interleaved,
-                    seqlen_offsets=seqlen_offset,
-                    num_heads_q=num_heads_q,
-                )
+            return apply_rotary_emb_qkv_(
+                qkv,
+                self._cos_cached,
+                self._sin_cached,
+                self._cos_k_cached if self.scale is not None else None,
+                self._sin_k_cached if self.scale is not None else None,
+                interleaved=self.interleaved,
+                seqlen_offsets=seqlen_offset,
+                num_heads_q=num_heads_q,
+            )
         else:
             q = qkv
             q = apply_rotary_emb_func(
@@ -509,20 +482,11 @@ class RotaryEmbedding(torch.nn.Module):
                 inplace=True,
                 seqlen_offsets=seqlen_offset,
             )
-            if self.scale is None:
-                kv = apply_rotary_emb_kv_(
-                    kv,
-                    self._cos_cached,
-                    self._sin_cached,
-                    interleaved=self.interleaved,
-                    seqlen_offsets=seqlen_offset,
-                )
-            else:
-                kv = apply_rotary_emb_kv_(
-                    kv,
-                    self._cos_k_cached,
-                    self._sin_k_cached,
-                    interleaved=self.interleaved,
-                    seqlen_offsets=seqlen_offset,
-                )
+            kv = apply_rotary_emb_kv_(
+                kv,
+                self._cos_cached if self.scale is None else self._cos_k_cached,
+                self._sin_cached if self.scale is None else self._sin_k_cached,
+                interleaved=self.interleaved,
+                seqlen_offsets=seqlen_offset,
+            )
             return q, kv

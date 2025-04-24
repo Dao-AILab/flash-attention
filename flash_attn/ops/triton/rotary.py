@@ -138,13 +138,6 @@ def apply_rotary(
     assert headdim <= 256, "Only support headdim <= 256"
     assert seqlen_ro >= seqlen, "seqlen_ro must be >= seqlen"
 
-    assert (
-        cos.dtype == sin.dtype
-    ), f"cos and sin must have the same dtype, got {cos.dtype} and {sin.dtype}"
-    assert (
-        x.dtype == cos.dtype
-    ), f"Input and cos/sin must have the same dtype, got {x.dtype} and {cos.dtype}"
-
     cos, sin = cos.contiguous(), sin.contiguous()
     if isinstance(seqlen_offsets, torch.Tensor):
         assert seqlen_offsets.shape == (batch,)
