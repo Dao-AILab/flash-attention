@@ -298,8 +298,10 @@ struct CollectiveMainloopBwdSm90 {
         ShapeQKV const shape_K;
         StrideQKV const stride_K;
         Element const* const ptr_V;
+        ShapeQKV const shape_V;
         StrideQKV const stride_V;
         Element const* const ptr_dO;
+        ShapeQKV const shape_dO;
         StrideQKV const stride_dO;
         ElementAccum* const ptr_dQaccum;
         ShapedQaccum const shape_dQaccum;
@@ -324,6 +326,8 @@ struct CollectiveMainloopBwdSm90 {
     struct Params {
         ShapeQKV const shape_Q;
         ShapeQKV const shape_K;
+        ShapeQKV const shape_V;
+        ShapeQKV const shape_dO;
         ElementAccum* const ptr_dQaccum;
         ShapedQaccum const shape_dQaccum;
         StridedQaccum stride_dQaccum;
@@ -357,7 +361,7 @@ struct CollectiveMainloopBwdSm90 {
             SmemLayoutQ{}(_, _, _0{}),
             TileShape_MNK{},
             ClusterShape{}); // mcast along N mode for this M load, if any
-        Tensor mdO = make_tensor(make_gmem_ptr(args.ptr_dO), args.shape_Q, args.stride_dO);
+        Tensor mdO = make_tensor(make_gmem_ptr(args.ptr_dO), args.shape_dO, args.stride_dO);
         TMA_QdO tma_load_dO = make_tma_copy_A_sm90(
             GmemTiledCopyQdO{},
             mdO,
@@ -371,7 +375,7 @@ struct CollectiveMainloopBwdSm90 {
             SmemLayoutK{},
             TileShape_MNK{},
             ClusterShape{}); // no mcast for KV
-        Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V), args.shape_K, args.stride_V);
+        Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V), args.shape_V, args.stride_V);
         TMA_V tma_load_V = make_tma_copy_B_sm90(
             GmemTiledCopyKV{},
             mV,
@@ -391,7 +395,8 @@ struct CollectiveMainloopBwdSm90 {
         // (1 - tanh^2) * softmax_scale / softcap_val * softcap_val = (1 - tanh^2) * softmax_scale.
         // Instead we multiply by (1 - tanh^2) and multiply dK and dV by params.softmax_scale
         // (the original softmax_scale) at the end.
-        return {args.shape_Q, args.shape_K,
+        return {args.shape_Q, args.shape_K, 
+                args.shape_V, args.shape_dO,
                 args.ptr_dQaccum, args.shape_dQaccum, args.stride_dQaccum,
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
                 tma_load_Q, tma_load_dO, tma_load_K, tma_load_V,
@@ -457,9 +462,9 @@ struct CollectiveMainloopBwdSm90 {
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
         Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
-        Tensor mdO = params.tma_load_dO.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mdO = params.tma_load_dO.get_tma_tensor(params.shape_dO)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mK = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
-        Tensor mV = params.tma_load_V.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
+        Tensor mV = params.tma_load_V.get_tma_tensor(params.shape_V)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, !is_varlen_q ? bidb : 0);
         Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_LSE, params.stride_dPsum)(_, bidh, !is_varlen_q ? bidb : 0);
 
