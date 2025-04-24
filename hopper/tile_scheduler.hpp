@@ -210,6 +210,8 @@ public:
 
 };
 
+///////////////////////////////////////////////////////////////////////////////
+
 template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
         bool Split=false, bool PackGQA=false, bool WarpSpecialized=true>
 class DynamicPersistentTileScheduler {
@@ -246,12 +248,14 @@ public:
 
     static Params
     to_underlying_arguments(TileSchedulerArguments const& args) {
-        int const size_one_kv_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size * 2;
+        int const size_one_kv_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size;
         int const size_l2 = 32 * 1024 * 1024;  // 32 MB for K & V
         // Swizzle is the size of each "section". Round swizzle to a power of 2
         // If not PackGQA already, the size of each section can increase by qhead_per_khead
         // Need to be careful about the case where only one head will fit
-        int const swizzle = (size_l2 < size_one_kv_head ? 1 : (1 << cutlass::find_log2(size_l2 / size_one_kv_head))) * (PackGQA ? 1 : args.qhead_per_khead);
+        auto find_log2_floor = [&](int n) { return 31 - cutlass::clz(n); };
+        // Seems faster if swizzle if a power of 2
+        int const swizzle = (size_l2 < size_one_kv_head ? 1 : (1 << find_log2_floor(size_l2 / size_one_kv_head))) * (PackGQA ? 1 : args.qhead_per_khead);
         // If we're in the last section (called residual), we don't want to divide by
         // swizzle. Instead we want to divide by the remainder.
         int const num_hb_remainder = (args.num_head * args.num_batch) % swizzle;
@@ -354,6 +358,110 @@ public:
     }
 
 };
+
+///////////////////////////////////////////////////////////////////////////////
+
+class SingleTileBwdLPTScheduler {
+
+public:
+
+    using SharedStorage = int;
+
+    // Device side kernel params
+    struct Params {
+        int const total_blocks;
+        cutlass::FastDivmod const m_block_divmod, head_divmod;
+        cutlass::FastDivmod const l2_minor_divmod, l2_major_divmod;
+        cutlass::FastDivmod const l2_minor_residual_divmod;
+        int const num_hb_quotient;
+    };
+
+    static Params
+    to_underlying_arguments(TileSchedulerArguments const& args) {
+        // Since it's the bwd pass, seqlen_k get passed to args.seqlen and seqlen_q is passed to args.seqlen_k
+        int const size_one_qdo_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size;
+        int const size_one_dqaccum_head = args.seqlen_k * args.headdim * sizeof(float);
+        int const size_one_head = size_one_qdo_head + size_one_dqaccum_head;
+        int const size_l2 = 40 * 1024 * 1024;  // 40 MB for Q, dO, and dQaccum
+        // Swizzle is the size of each "section". Round swizzle to a power of 2
+        // Need to be careful about the case where only one head will fit
+        auto find_log2_floor = [&](int n) { return 31 - cutlass::clz(n); };
+        // Seems faster if swizzle if a power of 2
+        int const swizzle = size_l2 < size_one_head ? 1 : (1 << find_log2_floor(size_l2 / size_one_head));
+        // If we're in the last section (called residual), we don't want to divide by
+        // swizzle. Instead we want to divide by the remainder.
+        int const num_hb_remainder = (args.num_head * args.num_batch) % swizzle;
+        // printf("num_blocks = %d, num_head = %d, num_batch = %d, size_one_head = %d, ratio = %d, swizzle = %d, num_hb_remainder = %d\n", args.num_blocks, args.num_head, args.num_batch, size_one_head, size_l2 / size_one_head, swizzle, num_hb_remainder);
+        assert(args.tile_count_semaphore != nullptr);
+        return {args.num_blocks * args.num_head * args.num_batch,
+                cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head),
+                cutlass::FastDivmod(swizzle), cutlass::FastDivmod(swizzle * args.num_blocks),
+                // don't divide by 0
+                cutlass::FastDivmod(num_hb_remainder > 0 ? num_hb_remainder : 1),
+                (args.num_head * args.num_batch) / swizzle};
+    }
+
+    static dim3
+    get_grid_shape(Params const& params, int num_sm) {
+        return {uint32_t(params.total_blocks)};
+    }
+
+    struct WorkTileInfo {
+        int tile_idx;
+
+        CUTLASS_DEVICE
+        bool
+        is_valid(Params const& params) const {
+            return tile_idx < params.total_blocks;
+        }
+
+        CUTLASS_DEVICE
+        cute::tuple<int32_t, int32_t, int32_t, int32_t>
+        get_block_coord(Params const& params) const {
+            int block, bidh, bidb;
+            int l2_mod, bidhb, bidhb_residual;
+            bidhb = params.l2_major_divmod.divmod(l2_mod, tile_idx);
+            // If we're in the last section (called residual), we don't want to divide by
+            // swizzle. Instead we want to divide by the remainder.
+            if (bidhb < params.num_hb_quotient) {
+                block = params.l2_minor_divmod.divmod(bidhb_residual, l2_mod);
+            } else {
+                block = params.l2_minor_residual_divmod.divmod(bidhb_residual, l2_mod);
+            }
+            bidb = params.head_divmod.divmod(bidh, bidhb * params.l2_minor_divmod.divisor + bidhb_residual);
+            return {block, bidh, bidb, 0 /*split_idx*/};
+        }
+
+    };
+
+    CUTLASS_DEVICE
+    SingleTileBwdLPTScheduler(SharedStorage* const smem_scheduler) { }
+
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    WorkTileInfo
+    get_initial_work(Params const& params) const {
+        return {int(blockIdx.x)};
+    }
+
+    CUTLASS_DEVICE
+    void
+    init_consumer() const {}
+
+    CUTLASS_DEVICE
+    void
+    prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {}
+
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    WorkTileInfo
+    get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+        return {params.total_blocks};
+    }
+
+};
+
+///////////////////////////////////////////////////////////////////////////////
 
 template<int kBlock, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp, bool Split=false, bool PackGQA=false, bool WarpSpecialized=true>
 class VarlenDynamicPersistentTileScheduler {
@@ -595,5 +703,7 @@ public:
     }
 
 };
+
+///////////////////////////////////////////////////////////////////////////////
 
 } // flash

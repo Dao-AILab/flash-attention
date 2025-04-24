@@ -107,6 +107,7 @@ struct CollectiveEpilogueBwd {
         ShapedKV const shape_dK;
         StridedKV const stride_dK;
         Element* ptr_dV;
+        ShapedKV const shape_dV;
         StridedKV const stride_dV;
         int const num_heads_q;
         int* dk_semaphore;
@@ -121,6 +122,7 @@ struct CollectiveEpilogueBwd {
         ShapedKV const shape_dK;
         StridedKV const stride_dK;
         Element* ptr_dV;
+        ShapedKV const shape_dV;
         StridedKV const stride_dV;
         TMA_dKV tma_store_dK, tma_store_dV;
         int const* cu_seqlens = nullptr;
@@ -130,7 +132,7 @@ struct CollectiveEpilogueBwd {
     static Params
     to_underlying_arguments(Arguments const& args) {
         Tensor mdK = make_tensor(make_gmem_ptr(args.ptr_dK), args.shape_dK, args.stride_dK);
-        Tensor mdV = make_tensor(make_gmem_ptr(args.ptr_dV), args.shape_dK, args.stride_dV);
+        Tensor mdV = make_tensor(make_gmem_ptr(args.ptr_dV), args.shape_dV, args.stride_dV);
         TMA_dKV tma_store_dK = [&] {
             if constexpr (Use_TMA) {
                 return make_tma_copy(GmemTiledCopydKVTMA{}, mdK, SmemLayoutdKVTMA{}, select<1, 2>(TileShape_MNK{}), _1{}); // no mcast for dKV
@@ -145,7 +147,7 @@ struct CollectiveEpilogueBwd {
                 return nullptr;
             }
         }();
-        return {args.ptr_dK, args.shape_dK, args.stride_dK, args.ptr_dV, args.stride_dV,
+        return {args.ptr_dK, args.shape_dK, args.stride_dK, args.ptr_dV, args.shape_dV, args.stride_dV,
                 tma_store_dK, tma_store_dV, args.cu_seqlens, args.seqused};
     }
 
@@ -197,7 +199,7 @@ struct CollectiveEpilogueBwd {
                                                 cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
             Tensor mdK = params.tma_store_dK.get_tma_tensor(params.shape_dK);
-            Tensor mdV = params.tma_store_dV.get_tma_tensor(params.shape_dK);
+            Tensor mdV = params.tma_store_dV.get_tma_tensor(params.shape_dV);
             Tensor gdK = local_tile(mdK(_, _, bidh, bidb), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
             Tensor gdV = local_tile(mdV(_, _, bidh, bidb), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
             auto block_tma_dK = params.tma_store_dK.get_slice(_0{});
@@ -227,7 +229,7 @@ struct CollectiveEpilogueBwd {
             bool const is_varlen = Varlen && params.cu_seqlens;
             Tensor mdK = make_tensor(make_gmem_ptr(params.ptr_dK), params.shape_dK, params.stride_dK)(_, _, bidh, !is_varlen ? bidb : 0);
             Tensor gdK = local_tile(cute::domain_offset(make_coord(seqlen_info.offset, _0{}), mdK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
-            Tensor mdV = make_tensor(make_gmem_ptr(params.ptr_dV), params.shape_dK, params.stride_dV)(_, _, bidh, !is_varlen ? bidb : 0);
+            Tensor mdV = make_tensor(make_gmem_ptr(params.ptr_dV), params.shape_dV, params.stride_dV)(_, _, bidh, !is_varlen ? bidb : 0);
             Tensor gdV = local_tile(cute::domain_offset(make_coord(seqlen_info.offset, _0{}), mdV), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
 
             GmemTiledCopydKV gmem_tiled_copy_dKV;
@@ -241,25 +243,28 @@ struct CollectiveEpilogueBwd {
             Tensor cdKV = cute::make_identity_tensor(select<1, 2>(TileShape_MNK{}));  // (BLK_N,BLK_K) -> (blk_n,blk_k)
             // Repeat the partitioning with identity layouts
             Tensor tdKVcdKV = gmem_thr_copy_dKV.partition_D(cdKV);
-            Tensor tdKVpdKV = make_tensor<bool>(make_shape(size<2>(tdKVgdV)));
+            Tensor tdKVpdV = make_tensor<bool>(make_shape(size<2>(tdKVgdV)));
+            Tensor tdKVpdK = make_tensor<bool>(make_shape(size<2>(tdKVgdK)));
             #pragma unroll
-            for (int k = 0; k < size(tdKVpdKV); ++k) { tdKVpdKV(k) = get<1>(tdKVcdKV(_0{}, _0{}, k)) < get<1>(params.shape_dK); }
+            for (int k = 0; k < size(tdKVpdV); ++k) { tdKVpdV(k) = get<1>(tdKVcdKV(_0{}, _0{}, k)) < get<1>(params.shape_dV); }
+            #pragma unroll
+            for (int k = 0; k < size(tdKVpdK); ++k) { tdKVpdK(k) = get<1>(tdKVcdKV(_0{}, _0{}, k)) < get<1>(params.shape_dK); }
             // Need to check OOB when reading from smem if kBlockN isn't evenly tiled
             static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(size<0>(GmemLayoutAtom{})) == 0;
             flash::copy</*Is_even_MN=*/EvenN, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
-                gmem_tiled_copy_dKV, tdKVsdV, tdKVrdV, tdKVcdKV, tdKVpdKV, kBlockN);
+                gmem_tiled_copy_dKV, tdKVsdV, tdKVrdV, tdKVcdKV, tdKVpdV, kBlockN);
             flash::copy</*Is_even_MN=*/EvenN, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
-                gmem_tiled_copy_dKV, tdKVsdK, tdKVrdK, tdKVcdKV, tdKVpdKV, kBlockN);
+                gmem_tiled_copy_dKV, tdKVsdK, tdKVrdK, tdKVcdKV, tdKVpdK, kBlockN);
             // // Tell warp 0 that smem_k and smem_v are ready
             // cutlass::arch::fence_view_async_shared(); // ensure smem reads are done before next TMA to smem_k/v
             // flash::named_barrier_arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
             // Construct identity layout for gdKV
             // Clear_OOB_K must be false since we don't want to write zeros to gmem
             flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-                gmem_tiled_copy_dKV, tdKVrdV, tdKVgdV, tdKVcdKV, tdKVpdKV, std::min(seqlen_info.seqlen - n_block * kBlockN, kBlockN)
+                gmem_tiled_copy_dKV, tdKVrdV, tdKVgdV, tdKVcdKV, tdKVpdV, std::min(seqlen_info.seqlen - n_block * kBlockN, kBlockN)
             );
             flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-                gmem_tiled_copy_dKV, tdKVrdK, tdKVgdK, tdKVcdKV, tdKVpdKV, std::min(seqlen_info.seqlen - n_block * kBlockN, kBlockN)
+                gmem_tiled_copy_dKV, tdKVrdK, tdKVgdK, tdKVcdKV, tdKVpdK, std::min(seqlen_info.seqlen - n_block * kBlockN, kBlockN)
             );
         }
     }
@@ -282,7 +287,7 @@ struct CollectiveEpilogueBwd {
         bool const is_varlen = Varlen && params.cu_seqlens;
         Tensor mdK = make_tensor(make_gmem_ptr(params.ptr_dK), params.shape_dK, params.stride_dK)(_, _, bidh, !is_varlen ? bidb : 0);
         Tensor gdK = local_tile(cute::domain_offset(make_coord(seqlen_info.offset, _0{}), mdK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
-        Tensor mdV = make_tensor(make_gmem_ptr(params.ptr_dV), params.shape_dK, params.stride_dV)(_, _, bidh, !is_varlen ? bidb : 0);
+        Tensor mdV = make_tensor(make_gmem_ptr(params.ptr_dV), params.shape_dV, params.stride_dV)(_, _, bidh, !is_varlen ? bidb : 0);
         Tensor gdV = local_tile(cute::domain_offset(make_coord(seqlen_info.offset, _0{}), mdV), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
 
         GmemTiledCopydKV gmem_tiled_copy_dKV;
@@ -295,15 +300,18 @@ struct CollectiveEpilogueBwd {
         Tensor cdKV = cute::make_identity_tensor(select<1, 2>(TileShape_MNK{}));  // (BLK_M,BLK_K) -> (blk_m,blk_k)
         // Repeat the partitioning with identity layouts
         Tensor tdKVcdKV = gmem_thr_copy_dKV.partition_D(cdKV);
-        Tensor tdKVpdKV = make_tensor<bool>(make_shape(size<2>(tdKVgdK)));
+        Tensor tdKVpdK = make_tensor<bool>(make_shape(size<2>(tdKVgdK)));
+        Tensor tdKVpdV = make_tensor<bool>(make_shape(size<2>(tdKVgdV)));
         #pragma unroll
-        for (int k = 0; k < size(tdKVpdKV); ++k) { tdKVpdKV(k) = get<1>(tdKVcdKV(_0{}, _0{}, k)) < get<1>(params.shape_dK); }
+        for (int k = 0; k < size(tdKVpdK); ++k) { tdKVpdK(k) = get<1>(tdKVcdKV(_0{}, _0{}, k)) < get<1>(params.shape_dK); }
+        #pragma unroll
+        for (int k = 0; k < size(tdKVpdV); ++k) { tdKVpdV(k) = get<1>(tdKVcdKV(_0{}, _0{}, k)) < get<1>(params.shape_dV); }
         // Clear_OOB_K must be false since we don't want to write zeros to gmem
         flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-            gmem_tiled_copy_dKV, tdKVrdKV, tdKVgdK, tdKVcdKV, tdKVpdKV, seqlen_info.seqlen - n_block * kBlockN
+            gmem_tiled_copy_dKV, tdKVrdKV, tdKVgdK, tdKVcdKV, tdKVpdK, seqlen_info.seqlen - n_block * kBlockN
         );
         flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-            gmem_tiled_copy_dKV, tdKVrdKV, tdKVgdV, tdKVcdKV, tdKVpdKV, seqlen_info.seqlen - n_block * kBlockN
+            gmem_tiled_copy_dKV, tdKVrdKV, tdKVgdV, tdKVcdKV, tdKVpdV, seqlen_info.seqlen - n_block * kBlockN
         );
     }
 
@@ -359,6 +367,7 @@ struct CollectiveEpilogueBwdGQA {
         ShapedKV const shape_dKaccum;
         StridedKV const stride_dKaccum;
         ElementAccum* ptr_dVaccum;
+        ShapedKV const shape_dVaccum;
         StridedKV const stride_dVaccum;
         int num_heads_q;
         int* dk_semaphore;
@@ -373,6 +382,7 @@ struct CollectiveEpilogueBwdGQA {
         ShapedKV const shape_dKaccum;
         StridedKV const stride_dKaccum;
         ElementAccum* ptr_dVaccum;
+        ShapedKV const shape_dVaccum;
         StridedKV const stride_dVaccum;
         cutlass::FastDivmod qhead_per_khead_divmod;
         int* dk_semaphore;
@@ -387,7 +397,7 @@ struct CollectiveEpilogueBwdGQA {
             assert(args.dk_semaphore != nullptr);
             assert(args.dv_semaphore != nullptr);
         }
-        return {args.ptr_dKaccum, args.shape_dKaccum, args.stride_dKaccum, args.ptr_dVaccum, args.stride_dVaccum,
+        return {args.ptr_dKaccum, args.shape_dKaccum, args.stride_dKaccum, args.ptr_dVaccum, args.shape_dVaccum, args.stride_dVaccum,
                 cutlass::FastDivmod(cute::ceil_div(args.num_heads_q, get<1>(args.shape_dKaccum))),
                 args.dk_semaphore, args.dv_semaphore,
                 args.cu_seqlens, args.seqused};
@@ -419,7 +429,7 @@ struct CollectiveEpilogueBwdGQA {
         flash::SeqlenInfo<Varlen, kBlockN> seqlen_info{bidb, size<0>(params.shape_dKaccum), params.cu_seqlens, params.seqused};
         bool const is_varlen = Varlen && params.cu_seqlens;
         Tensor mdKaccum = make_tensor(make_gmem_ptr(params.ptr_dKaccum), params.shape_dKaccum, params.stride_dKaccum)(_, bidh_kv, !is_varlen ? bidb : 0);
-        Tensor mdVaccum = make_tensor(make_gmem_ptr(params.ptr_dVaccum), params.shape_dKaccum, params.stride_dVaccum)(_, bidh_kv, !is_varlen ? bidb : 0);
+        Tensor mdVaccum = make_tensor(make_gmem_ptr(params.ptr_dVaccum), params.shape_dVaccum, params.stride_dVaccum)(_, bidh_kv, !is_varlen ? bidb : 0);
         Tensor gdKaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdKaccum), Shape<Int<kBlockN * kHeadDim>>{}, make_coord(n_block));  // (M * K)
         Tensor gdVaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdVaccum), Shape<Int<kBlockN * kHeadDim>>{}, make_coord(n_block));  // (M * K)
 
