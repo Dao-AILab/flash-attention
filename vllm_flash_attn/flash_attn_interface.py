@@ -22,7 +22,6 @@ try:
     FA3_UNAVAILABLE_REASON = None
     FA3_AVAILABLE = True
 except ImportError as e:
-    raise e
     FA3_UNAVAILABLE_REASON = str(e)
     FA3_AVAILABLE = False
 
