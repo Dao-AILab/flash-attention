@@ -523,6 +523,8 @@ mha_fwd_get_scheduler_metadata(
         int64_t window_size_right,
         int64_t attention_chunk,
         bool has_softcap,
+        int64_t sparse_block_q,
+        int64_t sparse_block_k,
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
         int64_t sm_margin
@@ -616,6 +618,15 @@ mha_fwd_get_scheduler_metadata(
 
     if (params.num_splits_dynamic_ptr) {
         auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
+        if (sparse_block_q != 0) {
+            if (sparse_block_q == 128 && sparse_block_k == 128) {
+                kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90_blocksparse<128, 128>();
+            } else if (sparse_block_q == 64 && sparse_block_k == 64) {
+                kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90_blocksparse<64, 64>();
+            } else {
+                TORCH_CHECK(false, "");
+            }
+        }
         auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);

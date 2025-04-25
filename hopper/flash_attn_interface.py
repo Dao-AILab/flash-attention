@@ -843,6 +843,8 @@ def get_scheduler_metadata(
     window_size=(-1, -1),  # -1 means infinite context window
     attention_chunk=0,
     has_softcap=False,
+    sparse_block_q=0,
+    sparse_block_k=0,
     num_splits=0,    # Can be tuned for speed
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
@@ -865,6 +867,8 @@ def get_scheduler_metadata(
         window_size[0], window_size[1],
         attention_chunk,
         has_softcap,
+        sparse_block_q,
+        sparse_block_k,
         num_splits,
         pack_gqa,
         sm_margin,
