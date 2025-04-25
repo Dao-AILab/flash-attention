@@ -1,10 +1,12 @@
-# Copyright (c) 2025, Tri Dao.
+# Copyright (c) 2025, Tri Dao
 
 import math
 from functools import partial
 from typing import Optional, Tuple, Union
 
 import torch
+from torch import Tensor
+
 from einops import rearrange, repeat
 from flash_attn.ops.triton.rotary import apply_rotary
 
@@ -42,8 +44,8 @@ class ApplyRotaryEmb(torch.autograd.Function):
         sin,
         interleaved=False,
         inplace=False,
-        seqlen_offsets: Union[int, torch.Tensor] = 0,
-        cu_seqlens: Optional[torch.Tensor] = None,
+        seqlen_offsets: Union[int, Tensor] = 0,
+        cu_seqlens: Optional[Tensor] = None,
         max_seqlen: Optional[int] = None,
     ):
         out = apply_rotary(
@@ -94,8 +96,8 @@ def apply_rotary_emb(
     sin,
     interleaved=False,
     inplace=False,
-    seqlen_offsets: Union[int, torch.Tensor] = 0,
-    cu_seqlens: Optional[torch.Tensor] = None,
+    seqlen_offsets: Union[int, Tensor] = 0,
+    cu_seqlens: Optional[Tensor] = None,
     max_seqlen: Optional[int] = None,
 ):
     """
@@ -134,8 +136,8 @@ def _apply_rotary_emb_qkv(
     interleaved=False,
     inplace=False,
     conjugate=False,
-    seqlen_offsets: Union[int, torch.Tensor] = 0,
-    num_heads_q: Union[int] = None,
+    seqlen_offsets: Union[int, Tensor] = 0,
+    num_heads_q: Optional[int] = None,
 ):
     apply_rotary_fn = partial(
         apply_rotary,
@@ -153,13 +155,14 @@ def _apply_rotary_emb_qkv(
             assert three == 3
             # qk = rearrange(qkv[:, :, :2], "b s t h d -> b s (t h) d")
             qk = qkv[:, :, :2].reshape(batch, seqlen, -1, headdim)
+            qk = apply_rotary_fn(qk, cos, sin)
         else:
             assert qkv.dim() == 4
             assert num_heads_q is not None
             num_heads_k = (qkv.shape[2] - num_heads_q) // 2
             assert qkv.shape[2] == num_heads_q + 2 * num_heads_k
             qk = qkv[:, :, :num_heads_q + num_heads_k]
-        qk = apply_rotary_fn(qk, cos, sin)
+            qk = apply_rotary_fn(qk, cos, sin)
         if not inplace:
             if qkv.dim() == 5:
                 qkv = torch.cat([rearrange(qk, "b s (t h) d -> b s t h d", t=2), qkv[:, :, 2:]], dim=2)
@@ -188,6 +191,100 @@ def _apply_rotary_emb_qkv(
     return qkv
 
 
+# We have to wrap these into custom ops because torch.compile hates inplace ops, and it will generate
+# extra copy ops.
+# Sadly torch.library doesn't accept type Union[int, Tensor] for seqlen_offsets, so we have to
+# register two different custom ops for the two cases and then dispatch manually.
+# This is ugly, but idk how to make it work otherwise.
+@torch.library.custom_op("flash_attn::rotary_emb_qkv_inplace", mutates_args=("qkv",), device_types="cuda")
+def _apply_rotary_emb_qkv_inplace(
+    qkv: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    cos_k: Optional[Tensor] = None,
+    sin_k: Optional[Tensor] = None,
+    interleaved: bool = False,
+    conjugate: bool = False,
+    seqlen_offsets: int = 0,
+    num_heads_q: Optional[int] = None,
+) -> bool:  # We have to return sth to make torch.library.custom_op happy
+    _apply_rotary_emb_qkv(
+        qkv, cos, sin, cos_k=cos_k, sin_k=sin_k, interleaved=interleaved, inplace=True,
+        conjugate=conjugate, seqlen_offsets=seqlen_offsets, num_heads_q=num_heads_q
+    )
+    return True
+
+
+@torch.library.register_fake("flash_attn::rotary_emb_qkv_inplace")
+def _apply_rotary_emb_qkv_inplace_fake(
+    qkv: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    cos_k: Optional[Tensor] = None,
+    sin_k: Optional[Tensor] = None,
+    interleaved: bool = False,
+    conjugate: bool = False,
+    seqlen_offsets: int = 0,
+    num_heads_q: Optional[int] = None,
+) -> bool:  # We have to return sth to make torch.library.custom_op happy
+    return True
+
+
+@torch.library.custom_op("flash_attn::rotary_emb_qkv_offsettensor_inplace", mutates_args=("qkv",), device_types="cuda")
+def _apply_rotary_emb_qkv_offsettensor_inplace(
+    qkv: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    cos_k: Optional[Tensor] = None,
+    sin_k: Optional[Tensor] = None,
+    interleaved: bool = False,
+    conjugate: bool = False,
+    seqlen_offsets: Optional[Tensor] = None,
+    num_heads_q: Optional[int] = None,
+) -> bool:  # We have to return sth to make torch.library.custom_op happy
+    if seqlen_offsets is None:
+        seqlen_offsets = 0
+    _apply_rotary_emb_qkv(
+        qkv, cos, sin, cos_k=cos_k, sin_k=sin_k, interleaved=interleaved, inplace=True,
+        conjugate=conjugate, seqlen_offsets=seqlen_offsets, num_heads_q=num_heads_q
+    )
+    return True
+
+
+@torch.library.register_fake("flash_attn::rotary_emb_qkv_offsettensor_inplace")
+def _apply_rotary_emb_qkv_inplace_fake(
+    qkv: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    cos_k: Optional[Tensor] = None,
+    sin_k: Optional[Tensor] = None,
+    interleaved: bool = False,
+    conjugate: bool = False,
+    seqlen_offsets: Optional[Tensor] = None,
+    num_heads_q: Optional[int] = None,
+) -> bool:  # We have to return sth to make torch.library.custom_op happy
+    return True
+
+
+def apply_rotary_emb_qkv_inplace(
+    qkv: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    cos_k: Optional[Tensor] = None,
+    sin_k: Optional[Tensor] = None,
+    interleaved: bool = False,
+    conjugate: bool = False,
+    seqlen_offsets: Union[int, Tensor] = 0,
+    num_heads_q: Optional[int] = None,
+) -> bool:  # We have to return sth to make torch.library.custom_op happy
+    fn = _apply_rotary_emb_qkv_inplace if isinstance(seqlen_offsets, int) else _apply_rotary_emb_qkv_offsettensor_inplace
+    fn(
+        qkv, cos, sin, cos_k=cos_k, sin_k=sin_k, interleaved=interleaved,
+        conjugate=conjugate, seqlen_offsets=seqlen_offsets, num_heads_q=num_heads_q
+    )
+    return True
+
+
 class ApplyRotaryEmbQKV_(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -199,12 +296,11 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
         sin_k=None,
         interleaved=False,
         seqlen_offsets: Union[int, torch.Tensor] = 0,
-        num_heads_q: Union[int] = None,
+        num_heads_q: Optional[int] = None,
     ):
-        qkv = _apply_rotary_emb_qkv(
+        apply_rotary_emb_qkv_inplace(
             qkv, cos, sin, cos_k, sin_k, interleaved=interleaved,
             seqlen_offsets=seqlen_offsets, num_heads_q=num_heads_q,
-            inplace=not torch.compiler.is_compiling(),  # torch.compile hates inplace ops
         )
         if isinstance(seqlen_offsets, int):
             ctx.save_for_backward(cos, sin, cos_k, sin_k)
@@ -223,10 +319,9 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
             cos, sin, cos_k, sin_k, seqlen_offsets = ctx.saved_tensors
         else:
             cos, sin, cos_k, sin_k = ctx.saved_tensors
-        dqkv = _apply_rotary_emb_qkv(
+        apply_rotary_emb_qkv_inplace(
             dqkv, cos, sin, cos_k, sin_k, interleaved=ctx.interleaved,
             seqlen_offsets=seqlen_offsets, num_heads_q=ctx.num_heads_q, conjugate=True,
-            inplace=not torch.compiler.is_compiling(),  # torch.compile hates inplace ops
         )
         return dqkv, None, None, None, None, None, None, None
 
