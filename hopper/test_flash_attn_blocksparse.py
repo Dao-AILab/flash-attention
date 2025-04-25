@@ -1,4 +1,5 @@
 import os
+import gc
 import math
 import itertools
 
@@ -52,7 +53,7 @@ def ceil_div(x, y):
     return (x - 1) // y + 1
 
 
-def generate_blocksparse_masks(batch, nheads, seqlen_q, seqlen_k, sparse_block_q, sparse_block_k, sparsity=0.75):
+def generate_blocksparse_masks(batch, nheads, seqlen_q, seqlen_k, sparse_block_q, sparse_block_k, sparsity=0.5):
     blocklen_q = ceil_div(seqlen_q, sparse_block_q)
     blocklen_k = ceil_div(seqlen_k, sparse_block_k)
     masks = torch.zeros(batch, nheads, blocklen_q, blocklen_k, dtype=torch.uint8, device="cuda")
@@ -111,8 +112,11 @@ def test_mask_pack():
 # @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("add_unused_qkv", [False])
 @pytest.mark.parametrize("d", [128])
-@pytest.mark.parametrize("seqlen_q,seqlen_k", [(2048, 2048), (2048, 2047)])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(2048, 2048), (2048, 2037), [4096, 4096]])
+@pytest.mark.parametrize("batch_size,nheads", [(1,1), (2, 32)])
 def test_flash_attn_varlen_output_sparse(
+    batch_size,
+    nheads,
     seqlen_q,
     seqlen_k,
     d,
@@ -127,16 +131,11 @@ def test_flash_attn_varlen_output_sparse(
     sparse_block_q,
     sparse_block_k,
 ):
+    gc.collect()
     dtype = getattr(torch, dtype)
     device = "cuda"
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
-    # batch_size = 40
-    # nheads = 16
-    batch_size = 9 if seqlen_q <= 2048 else 2
-    nheads = 6
-    # batch_size = 3
-    # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
@@ -260,7 +259,7 @@ def test_flash_attn_varlen_output_sparse(
         rtol = 2 if softcap == 0.0 else 3
 
         print("q/k/v_ref", q_ref.shape, k_ref.shape, v_ref.shape)
-        print("q/k/v_unpad", q_unpad.shape, k_unpad.shape, v_unpad.shape, f"max_seqlen_q={max_seqlen_q}", f"max_seqlen_k={max_seqlen_k}")
+        print("q/k/v_unpad", q_unpad.shape, k_unpad.shape, v_unpad.shape)
         print(cu_seqlens_q, cu_seqlens_k)
         pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
         num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
