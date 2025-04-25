@@ -25,7 +25,7 @@ except ImportError:
 try:
     from flash_attn.ops.fused_dense import ColumnParallelLinear, RowParallelLinear
 except ImportError:
-    ColumnParallelLinear, RowParallelLinear = None, None, None
+    ColumnParallelLinear, RowParallelLinear = None, None
 
 try:
     from flash_attn.layers.rotary import RotaryEmbedding
