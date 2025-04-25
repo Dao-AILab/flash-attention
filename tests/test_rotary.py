@@ -100,6 +100,8 @@ def test_rotary_emb_func(inplace, interleaved, rotary_fraction, seqlen_offsets_t
     "dtype", ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16])
 )
 # @pytest.mark.parametrize('dtype', ([torch.float16]))
+@pytest.mark.parametrize("compiled", [False, True])
+# @pytest.mark.parametrize("compiled", [True])
 @pytest.mark.parametrize("gqa", [False, True])
 # @pytest.mark.parametrize("gqa", [False])
 @pytest.mark.parametrize("seqlen_offsets_type", [0, int, torch.Tensor])
@@ -108,7 +110,9 @@ def test_rotary_emb_func(inplace, interleaved, rotary_fraction, seqlen_offsets_t
 # @pytest.mark.parametrize('rotary_fraction', [1.0])
 @pytest.mark.parametrize("interleaved", [False, True])
 # @pytest.mark.parametrize('interleaved', [False])
-def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, dtype):
+def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, compiled, dtype):
+    if compiled:  # Don't fall back to eager just bc of recompilation
+        torch._dynamo.config.recompile_limit = 2 ** 31
     rtol = 1e-3
     batch_size = 32
     nheads = 4
@@ -129,7 +133,8 @@ def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, 
     qkv_pt = qkv.detach().clone().requires_grad_()
     cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
     seqlen_offsets = generate_seqlen_offsets(seqlen_offsets_type, batch_size, seqlen, device)
-    out = apply_rotary_emb_qkv_(
+    fn = apply_rotary_emb_qkv_ if not compiled else torch.compile(apply_rotary_emb_qkv_)
+    out = fn(
         qkv, cos, sin, seqlen_offsets=seqlen_offsets, interleaved=interleaved,
         num_heads_q=None if not gqa else nheads
     )
