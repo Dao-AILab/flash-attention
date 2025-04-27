@@ -754,6 +754,31 @@ class LayerNormFn(torch.autograd.Function):
         residual_out=None
     ):
         x_shape_og = x.shape
+        # Check for zero sequence length
+        if x.numel() == 0:
+            ctx.zero_seq_length = True
+            # Return empty tensors of correct shape
+            y = torch.empty_like(x)
+            y1 = torch.empty_like(x) if x1 is not None else None
+            
+            residual_out = torch.empty_like(x) if residual is not None else None
+            dropout_mask = torch.empty_like(x) if return_dropout_mask else None
+            dropout_mask1 = torch.empty_like(x) if (return_dropout_mask and x1 is not None) else None
+            
+            if not return_dropout_mask:
+                if weight1 is None:
+                    return y if not prenorm else (y, residual_out)
+                else:
+                    return (y, y1) if not prenorm else (y, y1, residual_out)
+            else:
+                if weight1 is None:
+                    return ((y, dropout_mask, dropout_mask1) if not prenorm 
+                           else (y, residual_out, dropout_mask, dropout_mask1))
+                else:
+                    return ((y, y1, dropout_mask, dropout_mask1) if not prenorm 
+                           else (y, y1, residual_out, dropout_mask, dropout_mask1))
+
+        ctx.zero_seq_length = False  
         # reshape input data into 2D tensor
         x = x.reshape(-1, x.shape[-1])
         if x.stride(-1) != 1:
@@ -844,6 +869,28 @@ class LayerNormFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy, *args):
         x, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd = ctx.saved_tensors
+
+        if ctx.zero_seq_length:
+            return (
+                torch.zeros_like(x),
+                torch.zeros_like(weight),
+                torch.zeros_like(bias) if bias is not None else None,
+                torch.zeros_like(x) if ctx.has_residual else None,
+                torch.zeros_like(x) if ctx.has_x1 and ctx.dropout_p > 0.0 else None,
+                torch.zeros_like(weight1) if weight1 is not None else None,
+                torch.zeros_like(bias1) if bias1 is not None else None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        
         dy = dy.reshape(-1, dy.shape[-1])
         if dy.stride(-1) != 1:
             dy = dy.contiguous()
@@ -864,6 +911,7 @@ class LayerNormFn(torch.autograd.Function):
             assert dresidual.shape == x.shape
         else:
             dresidual = None
+        
         dx, dw, db, dresidual_in, dx1, dw1, db1 = _layer_norm_bwd(
             dy,
             x,
