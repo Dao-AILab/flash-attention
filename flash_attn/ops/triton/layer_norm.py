@@ -757,22 +757,31 @@ class LayerNormFn(torch.autograd.Function):
         # Check for zero sequence length
         if x.numel() == 0:
             ctx.zero_seq_length = True
-            # Return empty tensors of correct shape
-            y = x
-            y1 = torch.empty_like(x) if x1 is not None else None
-            
-            residual_out = torch.empty_like(x)
-            dropout_mask = torch.empty_like(x) if return_dropout_mask else None
-            dropout_mask1 = torch.empty_like(x) if (return_dropout_mask and x1 is not None) else None
-            
-            ctx.save_for_backward(
-                residual_out, weight, bias, weight1, bias1
-            )
-
-            ctx.dropout_p = dropout_p
+            # Only save minimal required tensors for backward
+            ctx.save_for_backward(weight, bias, weight1, bias1)
+            ctx.x_shape_og = x_shape_og
             ctx.has_residual = residual is not None
             ctx.has_x1 = x1 is not None
+            ctx.dropout_p = dropout_p
 
+            # Handle output tensors with correct dtype
+            y = x  # Preserve input tensor properties
+            y1 = torch.empty_like(x) if x1 is not None else None
+            
+            # Only create residual_out if prenorm is True
+            residual_out = torch.empty(x.shape, 
+                                    dtype=torch.float32 if residual_in_fp32 else x.dtype,
+                                    device=x.device) if prenorm else None
+            
+            # Handle dropout masks
+            dropout_mask = None
+            dropout_mask1 = None
+            if return_dropout_mask:
+                dropout_mask = torch.empty_like(x, dtype=torch.uint8)
+                if x1 is not None:
+                    dropout_mask1 = torch.empty_like(x, dtype=torch.uint8)
+
+            # Return based on configuration
             if not return_dropout_mask:
                 if weight1 is None:
                     return y if not prenorm else (y, residual_out)
@@ -781,10 +790,10 @@ class LayerNormFn(torch.autograd.Function):
             else:
                 if weight1 is None:
                     return ((y, dropout_mask, dropout_mask1) if not prenorm 
-                           else (y, residual_out, dropout_mask, dropout_mask1))
+                        else (y, residual_out, dropout_mask, dropout_mask1))
                 else:
                     return ((y, y1, dropout_mask, dropout_mask1) if not prenorm 
-                           else (y, y1, residual_out, dropout_mask, dropout_mask1))
+                        else (y, y1, residual_out, dropout_mask, dropout_mask1))
 
         ctx.zero_seq_length = False  
         # reshape input data into 2D tensor
@@ -877,13 +886,13 @@ class LayerNormFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy, *args):
         if ctx.zero_seq_length:
-            x, weight, bias, weight1, bias1 = ctx.saved_tensors
+            weight, bias, weight1, bias1 = ctx.saved_tensors
             return (
-                torch.zeros_like(x),
+                torch.zeros(ctx.x_shape_og, dtype=dy.dtype, device=dy.device),
                 torch.zeros_like(weight),
                 torch.zeros_like(bias) if bias is not None else None,
-                torch.zeros_like(x) if ctx.has_residual else None,
-                torch.zeros_like(x) if ctx.has_x1 and ctx.dropout_p > 0.0 else None,
+                torch.zeros(ctx.x_shape_og, dtype=dy.dtype, device=dy.device) if ctx.has_residual else None,
+                torch.zeros(ctx.x_shape_og, dtype=dy.dtype, device=dy.device) if ctx.has_x1 and ctx.dropout_p > 0.0 else None,
                 torch.zeros_like(weight1) if weight1 is not None else None,
                 torch.zeros_like(bias1) if bias1 is not None else None,
                 None,
