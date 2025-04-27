@@ -758,8 +758,27 @@ class LayerNormFn(torch.autograd.Function):
         if x.numel() == 0:
             ctx.zero_seq_length = True
             # Only save minimal required tensors for backward
-            ctx.save_for_backward(weight, bias, weight1, bias1)
+            # ctx.save_for_backward(weight, bias, weight1, bias1)
             ctx.x_shape_og = x_shape_og
+            ctx.weight_shape = weight.shape
+            ctx.weight_dtype = weight.dtype
+            ctx.weight_device = weight.device
+
+            ctx.has_bias = bias is not None
+            ctx.bias_shape = bias.shape if bias is not None else None
+            ctx.bias_dtype = bias.dtype if bias is not None else None
+            ctx.bias_device = bias.device if bias is not None else None
+
+            ctx.has_weight1 = weight1 is not None
+            ctx.weight1_shape = weight1.shape if weight1 is not None else None
+            ctx.weight1_dtype = weight1.dtype if weight1 is not None else None
+            ctx.weight1_device = weight1.device if weight1 is not None else None
+
+            ctx.has_bias1 = bias1 is not None
+            ctx.bias1_shape = bias1.shape if bias1 is not None else None
+            ctx.bias1_dtype = bias1.dtype if bias1 is not None else None
+            ctx.bias1_device = bias1.device if bias1 is not None else None
+
             ctx.has_residual = residual is not None
             ctx.has_x1 = x1 is not None
             ctx.dropout_p = dropout_p
@@ -886,15 +905,17 @@ class LayerNormFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy, *args):
         if ctx.zero_seq_length:
-            weight, bias, weight1, bias1 = ctx.saved_tensors
+            # weight, bias, weight1, bias1 = ctx.saved_tensors
             return (
                 torch.zeros(ctx.x_shape_og, dtype=dy.dtype, device=dy.device),
-                torch.zeros_like(weight),
-                torch.zeros_like(bias) if bias is not None else None,
+                torch.zeros(ctx.weight_shape, dtype=ctx.weight_dtype, device=ctx.weight_device),
+                torch.zeros(ctx.bias_shape, dtype=ctx.bias_dtype, device=ctx.bias_device) if ctx.has_bias is not None else None,
                 torch.zeros(ctx.x_shape_og, dtype=dy.dtype, device=dy.device) if ctx.has_residual else None,
                 torch.zeros(ctx.x_shape_og, dtype=dy.dtype, device=dy.device) if ctx.has_x1 and ctx.dropout_p > 0.0 else None,
-                torch.zeros_like(weight1) if weight1 is not None else None,
-                torch.zeros_like(bias1) if bias1 is not None else None,
+                torch.zeros(ctx.weight1_shape, dtype=ctx.weight1_dtype, device=ctx.weight1_device) if ctx.has_weight1 is not None else None,
+                torch.zeros(ctx.bias1_shape, dtype=ctx.bias1_dtype, device=ctx.bias1_device) if ctx.has_bias1 is not None else None,
+                # torch.zeros_like(weight1) if weight1 is not None else None,
+                # torch.zeros_like(bias1) if bias1 is not None else None,
                 None,
                 None,
                 None,
