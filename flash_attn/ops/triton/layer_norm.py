@@ -905,7 +905,6 @@ class LayerNormFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy, *args):
         if ctx.zero_seq_length:
-            # weight, bias, weight1, bias1 = ctx.saved_tensors
             return (
                 torch.zeros(ctx.x_shape_og, dtype=dy.dtype, device=dy.device),
                 torch.zeros(ctx.weight_shape, dtype=ctx.weight_dtype, device=ctx.weight_device),
@@ -914,8 +913,6 @@ class LayerNormFn(torch.autograd.Function):
                 torch.zeros(ctx.x_shape_og, dtype=dy.dtype, device=dy.device) if ctx.has_x1 and ctx.dropout_p > 0.0 else None,
                 torch.zeros(ctx.weight1_shape, dtype=ctx.weight1_dtype, device=ctx.weight1_device) if ctx.has_weight1 is not None else None,
                 torch.zeros(ctx.bias1_shape, dtype=ctx.bias1_dtype, device=ctx.bias1_device) if ctx.has_bias1 is not None else None,
-                # torch.zeros_like(weight1) if weight1 is not None else None,
-                # torch.zeros_like(bias1) if bias1 is not None else None,
                 None,
                 None,
                 None,
