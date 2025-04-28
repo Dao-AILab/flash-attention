@@ -69,17 +69,12 @@ def _flash_attn_forward_fake(
     alibi_slopes: Optional[torch.Tensor],
     rng_state: torch.Tensor,
     S_dmask: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    batch_size, seqlen_q, num_heads, head_size = q.shape
-    seqlen_k = k.shape[1]
-    out = torch.empty_like(q)
-    softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device, layout=q.layout)
-
-    return out, softmax_lse
+    softmax_lse: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(maybe_contiguous(q))
 
 
-@torch_custom_op("flash_attn::_flash_attn_forward", mutates_args=("rng_state", "S_dmask"), device_types="cuda", fake_func=_flash_attn_forward_fake)
+@torch_custom_op("flash_attn::_flash_attn_forward", mutates_args=("rng_state", "S_dmask", "softmax_lse"), device_types="cuda", fake_func=_flash_attn_forward_fake)
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -93,9 +88,10 @@ def _flash_attn_forward(
     alibi_slopes: Optional[torch.Tensor],
     rng_state: torch.Tensor,
     S_dmask: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    softmax_lse: torch.Tensor,
+) -> torch.Tensor:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse = flash_attn_gpu.fwd(
+    out = flash_attn_gpu.fwd(
         q,
         k,
         v,
@@ -110,8 +106,9 @@ def _flash_attn_forward(
         None,
         rng_state,
         S_dmask,
+        softmax_lse,
     )
-    return out, softmax_lse
+    return out
 
 
 def _flash_attn_varlen_forward_fake(
@@ -425,7 +422,9 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         if return_softmax and dropout_p > 0:
             S_dmask = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
 
-        out_padded, softmax_lse = _flash_attn_forward(
+        softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device, layout=q.layout)
+
+        out_padded = _flash_attn_forward(
             q,
             k,
             v,
@@ -438,6 +437,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             rng_state=rng_state,
             S_dmask=S_dmask,
+            softmax_lse=softmax_lse,
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -616,7 +616,9 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         if return_softmax and dropout_p > 0:
             S_dmask = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
 
-        out_padded, softmax_lse = _flash_attn_forward(
+        softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device, layout=q.layout)
+
+        out_padded = _flash_attn_forward(
             q,
             k,
             v,
@@ -629,6 +631,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             rng_state=rng_state,
             S_dmask=S_dmask,
+            softmax_lse=softmax_lse,
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -819,7 +822,9 @@ class FlashAttnFunc(torch.autograd.Function):
         if return_softmax and dropout_p > 0:
             S_dmask = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
 
-        out_padded, softmax_lse = _flash_attn_forward(
+        softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device, layout=q.layout)
+
+        out_padded = _flash_attn_forward(
             q,
             k,
             v,
@@ -832,6 +837,7 @@ class FlashAttnFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             rng_state=rng_state,
             S_dmask=S_dmask,
+            softmax_lse=softmax_lse,
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)

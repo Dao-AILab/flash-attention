@@ -347,7 +347,7 @@ void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi
 #endif
 }
 
-std::vector<at::Tensor>
+at::Tensor
 mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
         const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
         const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
@@ -361,7 +361,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         const float softcap,
         std::optional<at::Generator> gen_,
         at::Tensor &rng_state,
-        std::optional<at::Tensor> &p_) {
+        std::optional<at::Tensor> &p_,
+        at::Tensor &softmax_lse) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -438,7 +439,6 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
     auto opts = q.options();
-    auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
 
     Flash_fwd_params params;
     set_params_fprop(params,
@@ -497,7 +497,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
-    return {out, softmax_lse};
+    return out;
 }
 
 std::vector<at::Tensor>
