@@ -234,9 +234,9 @@ def _flash_attn_backward_cpp_wrapper_fake(
     v: torch.Tensor,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -247,16 +247,9 @@ def _flash_attn_backward_cpp_wrapper_fake(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    if dq is None:
-        dq = torch.empty_like(q)
-    if dk is None:
-        dk = torch.empty_like(k)
-    if dv is None:
-        dv = torch.empty_like(v)
+    q = maybe_contiguous(q)
     batch_size, seqlen_q, num_heads, _ = q.shape
     softmax_d = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128)), device=q.device, dtype=torch.float32)
-    
     return softmax_d
 
 
@@ -268,9 +261,9 @@ def _flash_attn_backward_cpp_wrapper(
     v: torch.Tensor,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
