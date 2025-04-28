@@ -75,7 +75,7 @@ def _flash_attn_forward_fake(
 
 
 @torch_custom_op("flash_attn::_flash_attn_forward", mutates_args=("rng_state", "S_dmask", "softmax_lse"), device_types="cuda", fake_func=_flash_attn_forward_fake)
-def _flash_attn_forward(
+def _flash_attn_forward_cpp_wrapper(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -109,6 +109,49 @@ def _flash_attn_forward(
         softmax_lse,
     )
     return out
+
+
+def _flash_attn_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    softcap: float,
+    alibi_slopes: Optional[torch.Tensor],
+    return_softmax: bool,
+) -> tuple[torch.Tensor]:
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+
+    batch_size, seqlen_q, num_heads, head_size = q.shape
+    seqlen_k = k.size(1)
+
+    rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    S_dmask = None
+    if return_softmax:
+        S_dmask = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
+
+    softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device, layout=q.layout)
+
+    out = _flash_attn_forward_cpp_wrapper(
+        q,
+        k,
+        v,
+        dropout_p,
+        softmax_scale,
+        causal=causal,
+        window_size_left=window_size[0],
+        window_size_right=window_size[1],
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        rng_state=rng_state,
+        S_dmask=S_dmask,
+        softmax_lse=softmax_lse,
+    )
+
+    return out, softmax_lse, S_dmask, rng_state
 
 
 def _flash_attn_varlen_forward_fake(
@@ -411,33 +454,17 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-
-        q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-
-        batch_size, seqlen_q, num_heads, head_size = q.shape
-        seqlen_k = k.size(1)
-
-        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-        S_dmask = None
-        if return_softmax and dropout_p > 0:
-            S_dmask = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
-
-        softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device, layout=q.layout)
-
-        out_padded = _flash_attn_forward(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
+        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+            q=q,
+            k=k,
+            v=v,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
             causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
+            window_size=window_size,
             softcap=softcap,
             alibi_slopes=alibi_slopes,
-            rng_state=rng_state,
-            S_dmask=S_dmask,
-            softmax_lse=softmax_lse,
+            return_softmax=return_softmax and dropout_p > 0,
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -605,33 +632,17 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-
-        q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-
-        batch_size, seqlen_q, num_heads, head_size = q.shape
-        seqlen_k = k.size(1)
-
-        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-        S_dmask = None
-        if return_softmax and dropout_p > 0:
-            S_dmask = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
-
-        softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device, layout=q.layout)
-
-        out_padded = _flash_attn_forward(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
+        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+            q=q,
+            k=k,
+            v=v,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
             causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
+            window_size=window_size,
             softcap=softcap,
             alibi_slopes=alibi_slopes,
-            rng_state=rng_state,
-            S_dmask=S_dmask,
-            softmax_lse=softmax_lse,
+            return_softmax=return_softmax and dropout_p > 0,
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -811,33 +822,17 @@ class FlashAttnFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-
-        q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-
-        batch_size, seqlen_q, num_heads, head_size = q.shape
-        seqlen_k = k.size(1)
-
-        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-        S_dmask = None
-        if return_softmax and dropout_p > 0:
-            S_dmask = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
-
-        softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device, layout=q.layout)
-
-        out_padded = _flash_attn_forward(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
+        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+            q=q,
+            k=k,
+            v=v,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
             causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
+            window_size=window_size,
             softcap=softcap,
             alibi_slopes=alibi_slopes,
-            rng_state=rng_state,
-            S_dmask=S_dmask,
-            softmax_lse=softmax_lse,
+            return_softmax=return_softmax and dropout_p > 0,
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
