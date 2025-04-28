@@ -67,8 +67,9 @@ def _flash_attn_forward_fake(
     window_size_right: int,
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
-    return_softmax: bool
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_softmax: bool,
+    rng_state: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     batch_size, seqlen_q, num_heads, head_size = q.shape
     seqlen_k = k.shape[1]
@@ -77,12 +78,11 @@ def _flash_attn_forward_fake(
     p = torch.empty((0,), dtype=q.dtype, device=q.device, layout=q.layout)
     if return_softmax:
         p = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
-    rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
 
-    return out, softmax_lse, p, rng_state
+    return out, softmax_lse, p
 
 
-@torch_custom_op("flash_attn::_flash_attn_forward", mutates_args=(), device_types="cuda", fake_func=_flash_attn_forward_fake)
+@torch_custom_op("flash_attn::_flash_attn_forward", mutates_args=("rng_state",), device_types="cuda", fake_func=_flash_attn_forward_fake)
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -94,10 +94,11 @@ def _flash_attn_forward(
     window_size_right: int,
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
-    return_softmax: bool
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_softmax: bool,
+    rng_state: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
+    out, softmax_lse, S_dmask = flash_attn_gpu.fwd(
         q,
         k,
         v,
@@ -111,8 +112,9 @@ def _flash_attn_forward(
         softcap,
         return_softmax,
         None,
+        rng_state,
     )
-    return out, softmax_lse, S_dmask, rng_state
+    return out, softmax_lse, S_dmask
 
 
 def _flash_attn_varlen_forward_fake(
@@ -415,7 +417,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state =  _flash_attn_forward(
+        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+        out_padded, softmax_lse, S_dmask =  _flash_attn_forward(
             q,
             k,
             v,
@@ -427,6 +430,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            rng_state=rng_state,
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -594,7 +598,8 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+        out_padded, softmax_lse, S_dmask = _flash_attn_forward(
             q,
             k,
             v,
@@ -606,6 +611,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            rng_state=rng_state,
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -785,7 +791,8 @@ class FlashAttnFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+        out_padded, softmax_lse, S_dmask = _flash_attn_forward(
             q,
             k,
             v,
@@ -797,6 +804,7 @@ class FlashAttnFunc(torch.autograd.Function):
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            rng_state=rng_state,
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)

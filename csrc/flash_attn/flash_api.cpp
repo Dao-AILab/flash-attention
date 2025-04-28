@@ -360,7 +360,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         int window_size_right,
         const float softcap,
         const bool return_softmax,
-        std::optional<at::Generator> gen_) {
+        std::optional<at::Generator> gen_,
+        at::Tensor &rng_state) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -479,8 +480,6 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = params.b * params.h * 32;
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
     // Forward kernel will populate memory with the seed and offset.
     params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
@@ -508,7 +507,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
-    return {out, softmax_lse, p, rng_state};
+    return {out, softmax_lse, p};
 }
 
 std::vector<at::Tensor>
