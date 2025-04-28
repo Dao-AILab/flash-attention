@@ -347,22 +347,21 @@ void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi
 #endif
 }
 
-at::Tensor
-mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
-        const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
-        const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
-        std::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
-        std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
-        const float p_dropout,
-        const float softmax_scale,
-        bool is_causal,
-        int window_size_left,
-        int window_size_right,
-        const float softcap,
-        std::optional<at::Generator> gen_,
-        at::Tensor &rng_state,
-        std::optional<at::Tensor> &p_,
-        at::Tensor &softmax_lse) {
+void mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
+             const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
+             const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
+             at::Tensor &out,             // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
+             std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+             const float p_dropout,
+             const float softmax_scale,
+             bool is_causal,
+             int window_size_left,
+             int window_size_right,
+             const float softcap,
+             std::optional<at::Generator> gen_,
+             at::Tensor &rng_state,
+             std::optional<at::Tensor> &p_,
+             at::Tensor &softmax_lse) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -393,7 +392,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     const int num_heads_k = k.size(2);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
-    TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
+    TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out must have a head_size that is a multiple of 8");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
@@ -419,18 +418,12 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
 
-    at::Tensor out;
-    if (out_.has_value()) {
-        out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
-        CHECK_DEVICE(out);
-        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
-        CHECK_SHAPE(out, batch_size, sizes[1], sizes[2], head_size);
-        if (seqlenq_ngroups_swapped) {
-            out = out.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2);
-        }
-    } else {
-        out = torch::empty_like(q);
+    TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+    CHECK_DEVICE(out);
+    TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+    CHECK_SHAPE(out, batch_size, sizes[1], sizes[2], head_size);
+    if (seqlenq_ngroups_swapped) {
+        out = out.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2);
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -497,7 +490,6 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
-    return out;
 }
 
 std::vector<at::Tensor>

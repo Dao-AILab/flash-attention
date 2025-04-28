@@ -56,29 +56,12 @@ def round_multiple(x, m):
     return (x + m - 1) // m * m
 
 
-def _flash_attn_forward_fake(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    softcap: float,
-    alibi_slopes: Optional[torch.Tensor],
-    rng_state: torch.Tensor,
-    S_dmask: Optional[torch.Tensor],
-    softmax_lse: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty_like(maybe_contiguous(q))
-
-
-@torch_custom_op("flash_attn::_flash_attn_forward", mutates_args=("rng_state", "S_dmask", "softmax_lse"), device_types="cuda", fake_func=_flash_attn_forward_fake)
+@torch_custom_op("flash_attn::_flash_attn_forward", mutates_args=("out", "rng_state", "S_dmask", "softmax_lse"), device_types="cuda")
 def _flash_attn_forward_cpp_wrapper(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    out: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -87,15 +70,14 @@ def _flash_attn_forward_cpp_wrapper(
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
     rng_state: torch.Tensor,
-    S_dmask: Optional[torch.Tensor],
+    p: Optional[torch.Tensor],
     softmax_lse: torch.Tensor,
-) -> torch.Tensor:
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out = flash_attn_gpu.fwd(
+) -> None:
+    flash_attn_gpu.fwd(
         q,
         k,
         v,
-        None,
+        out,
         alibi_slopes,
         dropout_p,
         softmax_scale,
@@ -105,10 +87,9 @@ def _flash_attn_forward_cpp_wrapper(
         softcap,
         None,
         rng_state,
-        S_dmask,
+        p,
         softmax_lse,
     )
-    return out
 
 
 def _flash_attn_forward(
@@ -124,21 +105,24 @@ def _flash_attn_forward(
     return_softmax: bool,
 ) -> tuple[torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    out = torch.empty_like(q)
 
     batch_size, seqlen_q, num_heads, head_size = q.shape
     seqlen_k = k.size(1)
 
     rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-    S_dmask = None
+    p = None
     if return_softmax:
-        S_dmask = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
+        p = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
 
     softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device, layout=q.layout)
 
-    out = _flash_attn_forward_cpp_wrapper(
+    # completely inplace function
+    _flash_attn_forward_cpp_wrapper(
         q,
         k,
         v,
+        out,
         dropout_p,
         softmax_scale,
         causal=causal,
@@ -147,11 +131,11 @@ def _flash_attn_forward(
         softcap=softcap,
         alibi_slopes=alibi_slopes,
         rng_state=rng_state,
-        S_dmask=S_dmask,
+        p=p,
         softmax_lse=softmax_lse,
     )
 
-    return out, softmax_lse, S_dmask, rng_state
+    return out, softmax_lse, p, rng_state
 
 
 def _flash_attn_varlen_forward_fake(
