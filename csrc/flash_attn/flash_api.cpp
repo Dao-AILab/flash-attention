@@ -359,9 +359,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         int window_size_left,
         int window_size_right,
         const float softcap,
-        const bool return_softmax,
         std::optional<at::Generator> gen_,
-        at::Tensor &rng_state) {
+        at::Tensor &rng_state,
+        std::optional<at::Tensor> &p_) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -438,17 +438,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
     auto opts = q.options();
-
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
-    at::Tensor p;
-    // Only return softmax if there's dropout to reduce compilation time
-    if (return_softmax) {
-        TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
-        p = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts);
-    }
-    else {
-        p = torch::empty({ 0 }, opts);
-    }
 
     Flash_fwd_params params;
     set_params_fprop(params,
@@ -461,7 +451,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
                      /*cu_seqlens_q_d=*/nullptr,
                      /*cu_seqlens_k_d=*/nullptr,
                      /*seqused_k=*/nullptr,
-                     return_softmax ? p.data_ptr() : nullptr,
+                     p_.has_value() ? p_.value().data_ptr() : nullptr,
                      softmax_lse.data_ptr(),
                      p_dropout,
                      softmax_scale,
@@ -507,7 +497,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
-    return {out, softmax_lse, p};
+    return {out, softmax_lse};
 }
 
 std::vector<at::Tensor>
