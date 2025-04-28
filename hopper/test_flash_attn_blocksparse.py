@@ -104,13 +104,9 @@ def test_mask_pack():
 @pytest.mark.parametrize("dtype", ["float16"])
 # @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("has_qv", [False])
-@pytest.mark.parametrize("deterministic", [False])
-@pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("add_unused_qkv", [False])
 @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(2048, 2048), (2048, 2037), [4096, 4096]])
 @pytest.mark.parametrize("batch_size,nheads", [(1,1), (2, 32)])
@@ -120,16 +116,16 @@ def test_flash_attn_varlen_output_sparse(
     seqlen_q,
     seqlen_k,
     d,
-    add_unused_qkv,
     causal,
     local,
-    softcap,
-    deterministic,
-    has_qv,
     mha_type,
     dtype,
     sparse_block_q,
     sparse_block_k,
+    add_unused_qkv: bool = False,
+    softcap: float = 0.0,
+    deterministic: bool = False,
+    has_qv: bool = False,
 ):
     gc.collect()
     dtype = getattr(torch, dtype)
