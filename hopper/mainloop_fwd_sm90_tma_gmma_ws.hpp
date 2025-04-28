@@ -857,6 +857,10 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         int n_block = *indices_it;
+        if (n_block < n_block_min) {
+            scheduler_prefetch();
+            return;  // invalid q block, all kv blocks are masked out
+        }
         PRODUCER_DPRINTF0("initial n_block=%d\n", n_block);
         if constexpr (BlockSparse) PRODUCER_DPRINTF0("  state: offset_=%d last_pos_=%d val_=%u ptr_=0x%p end_=0x%p\n", indices_it.offset_, indices_it.last_pos_, indices_it.val_, indices_it.ptr_, indices_it.end_);
 
@@ -1135,6 +1139,9 @@ struct CollectiveMainloopFwdSm90 {
         int const seqlen_q = seqlen_info.seqlen_q;
         int const seqlen_k = seqlen_info.seqlen_k;
         int n_block = *indices_it;
+        if (n_block < n_block_min) {
+            return false;  // invalid q block, all kv blocks are masked out
+        }
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
