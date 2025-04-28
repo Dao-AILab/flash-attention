@@ -210,7 +210,10 @@ def test_flash_attn_varlen_output_sparse(
         q_unpad, k_unpad, v_unpad = [x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)]
 
         sparse_masks = generate_blocksparse_masks(batch_size, nheads, seqlen_q, seqlen_k, sparse_block_q, sparse_block_k, sparsity=0.5)
-        sparse_masks[:, :, :, 0] = 1  # FIXME: we need at least one block
+        if batch_size * nheads > 4:
+            sparse_masks[0, 0, 0, :] = 0  # test for fully masked
+            sparse_masks[0, 0, 0, :] = 1  # test for fully used
+
         attn_bias = torch.zeros_like(sparse_masks, dtype=torch.float32)
         attn_bias[sparse_masks == 0] = -float("inf")
         attn_bias = torch.repeat_interleave(attn_bias, sparse_block_k, dim=-1)
