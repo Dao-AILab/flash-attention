@@ -56,7 +56,7 @@ def round_multiple(x, m):
     return (x + m - 1) // m * m
 
 
-@torch_custom_op("flash_attn::_flash_attn_forward", mutates_args=("out", "rng_state", "S_dmask", "softmax_lse"), device_types="cuda")
+@torch_custom_op("flash_attn::_flash_attn_forward_cpp_wrapper", mutates_args=("out", "rng_state", "p", "softmax_lse"), device_types="cuda")
 def _flash_attn_forward_cpp_wrapper(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -227,7 +227,7 @@ def _flash_attn_varlen_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-def _flash_attn_backward_fake(
+def _flash_attn_backward_cpp_wrapper_fake(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -260,7 +260,50 @@ def _flash_attn_backward_fake(
     return softmax_d
 
 
-@torch_custom_op("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda", fake_func=_flash_attn_backward_fake)
+@torch_custom_op("flash_attn::_flash_attn_backward_cpp_wrapper", mutates_args=("dq", "dk", "dv"), device_types="cuda", fake_func=_flash_attn_backward_cpp_wrapper_fake)
+def _flash_attn_backward_cpp_wrapper(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: Optional[torch.Tensor],
+    dk: Optional[torch.Tensor],
+    dv: Optional[torch.Tensor],
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    alibi_slopes: Optional[torch.Tensor],
+    deterministic: bool,
+    rng_state: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return flash_attn_gpu.bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        alibi_slopes,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        deterministic,
+        None,
+        rng_state,
+    )
+
+
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -283,31 +326,25 @@ def _flash_attn_backward(
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    (
-        dq,
-        dk,
-        dv,
-        softmax_d,
-    ) = flash_attn_gpu.bwd(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
-        dq,
-        dk,
-        dv,
-        alibi_slopes,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size_left,
-        window_size_right,
-        softcap,
-        deterministic,
-        None,
-        rng_state,
+    softmax_d = _flash_attn_backward_cpp_wrapper(
+        dout=dout,
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        softmax_lse=softmax_lse,
+        dq=dq,
+        dk=dk,
+        dv=dv,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        rng_state=rng_state,
     )
     return softmax_d
 
