@@ -449,11 +449,11 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
         out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
-            q=q,
-            k=k,
-            v=v,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
@@ -628,11 +628,11 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
         out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
-            q=q,
-            k=k,
-            v=v,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
@@ -819,11 +819,11 @@ class FlashAttnFunc(torch.autograd.Function):
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
         out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
-            q=q,
-            k=k,
-            v=v,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
