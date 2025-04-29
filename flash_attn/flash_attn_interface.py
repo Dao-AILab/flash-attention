@@ -227,33 +227,7 @@ def _flash_attn_varlen_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-def _flash_attn_backward_cpp_wrapper_fake(
-    dout: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    out: torch.Tensor,
-    softmax_lse: torch.Tensor,
-    dq: torch.Tensor,
-    dk: torch.Tensor,
-    dv: torch.Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    softcap: float,
-    alibi_slopes: Optional[torch.Tensor],
-    deterministic: bool,
-    rng_state: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    q = maybe_contiguous(q)
-    batch_size, seqlen_q, num_heads, _ = q.shape
-    softmax_d = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128)), device=q.device, dtype=torch.float32)
-    return softmax_d
-
-
-@torch_custom_op("flash_attn::_flash_attn_backward_cpp_wrapper", mutates_args=("dq", "dk", "dv"), device_types="cuda", fake_func=_flash_attn_backward_cpp_wrapper_fake)
+@torch_custom_op("flash_attn::_flash_attn_backward_cpp_wrapper", mutates_args=("dq", "dk", "dv", "softmax_d"), device_types="cuda")
 def _flash_attn_backward_cpp_wrapper(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -272,9 +246,10 @@ def _flash_attn_backward_cpp_wrapper(
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
+    softmax_d: torch.Tensor,
     rng_state: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    return flash_attn_gpu.bwd(
+) -> None:
+    flash_attn_gpu.bwd(
         dout,
         q,
         k,
@@ -294,6 +269,7 @@ def _flash_attn_backward_cpp_wrapper(
         deterministic,
         None,
         rng_state,
+        softmax_d,
     )
 
 
@@ -319,7 +295,9 @@ def _flash_attn_backward(
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    softmax_d = _flash_attn_backward_cpp_wrapper(
+    batch_size, seqlen_q, num_heads, _ = q.shape
+    softmax_d = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128)), device=q.device, dtype=torch.float32)
+    _flash_attn_backward_cpp_wrapper(
         dout=dout,
         q=q,
         k=k,
@@ -337,6 +315,7 @@ def _flash_attn_backward(
         softcap=softcap,
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
+        softmax_d=softmax_d,
         rng_state=rng_state,
     )
     return softmax_d
