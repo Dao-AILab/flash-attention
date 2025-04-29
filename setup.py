@@ -121,7 +121,7 @@ def check_if_rocm_home_none(global_option: str) -> None:
 
 
 def append_nvcc_threads(nvcc_extra_args):
-    nvcc_threads = os.getenv("NVCC_THREADS") or "2"
+    nvcc_threads = os.getenv("NVCC_THREADS") or "4"
     return nvcc_extra_args + ["--threads", nvcc_threads]
 
 
