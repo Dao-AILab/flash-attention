@@ -721,7 +721,6 @@ def _layer_norm_bwd_impl(
 ):
     M, N = x.shape
     assert x.stride(-1) == 1
-    dy = maybe_contiguous_lastdim(dy)
     assert dy.stride(-1) == 1
     assert dy.shape == (M, N)
     if dresidual is not None:
@@ -947,6 +946,7 @@ class LayerNormFn(torch.autograd.Function):
     def backward(ctx, dy, *args):
         x, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd = ctx.saved_tensors
         dy = dy.reshape(-1, dy.shape[-1])
+        dy = maybe_contiguous_lastdim(dy)
         if weight1 is not None:
             dy1, args = args[0], args[1:]
             dy1 = maybe_contiguous_lastdim(dy1.reshape(-1, dy1.shape[-1]))
