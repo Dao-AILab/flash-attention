@@ -33,7 +33,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool BlockSparse_>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, int SparseBlockQ, int SparseBlockK>
 struct CollectiveMainloopFwdSm90 {
     static_assert(!PagedKVNonTMA_, "not implemented for blocksparse");
 
@@ -50,8 +50,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
     static constexpr bool Varlen = Varlen_;
-    // static constexpr bool PagedKVNonTMA = PagedKVNonTMA_;  // FIXME: not implemented
-    static constexpr bool PagedKVNonTMA = false;  // FIXME: not implemented
+    static constexpr bool PagedKVNonTMA = PagedKVNonTMA_;
     static constexpr bool AppendKV = AppendKV_;
     static constexpr bool HasQv = HasQv_;
     static constexpr bool PackGQA = PackGQA_;
@@ -65,9 +64,9 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
     static constexpr bool LargeHeadDimV = kHeadDimV > 256;
 
-    static constexpr bool BlockSparse = BlockSparse_;
-    // FIXME: we need block_min and block_max to be aligned to mask boundary!
+    static constexpr bool BlockSparse = (SparseBlockQ != 0 && SparseBlockK != 0);
     static_assert(!Split || !BlockSparse, "split kv seq is not supported due to blocksparse alignment is not implemented");
+    static_assert(!BlockSparse || !PagedKVNonTMA, "blocksparse for paged kv is not implemented");
 
     using KVIndicesType = std::conditional_t<!BlockSparse, Range, SparseIndicesCRM<uint32_t>>;
     struct Params;
@@ -75,7 +74,6 @@ struct CollectiveMainloopFwdSm90 {
     CUTE_DEVICE
     KVIndicesType get_kv_indices(Params const& params, int bidb, int bidh, int q_block_idx, int kv_block_min, int kv_block_max) {
         if constexpr (BlockSparse) {
-            // FIXME: we need block_min and block_max to be aligned to mask boundary!
             Tensor gMasks = make_tensor(make_gmem_ptr(params.sparse_masks), params.shape_sparse_masks);
             PRODUCER_DPRINTF0("Shape(%d, %d, %d, %d)\n", get<0>(params.shape_sparse_masks), get<1>(params.shape_sparse_masks), get<2>(params.shape_sparse_masks), get<3>(params.shape_sparse_masks))
             CONSUMER_DPRINTF0("Shape(%d, %d, %d, %d)\n", get<0>(params.shape_sparse_masks), get<1>(params.shape_sparse_masks), get<2>(params.shape_sparse_masks), get<3>(params.shape_sparse_masks))
@@ -511,8 +509,6 @@ struct CollectiveMainloopFwdSm90 {
 
         uint32_t const *const sparse_masks = nullptr;
         ShapeSparseMasks shape_sparse_masks{};
-        int sparse_block_q = 0;
-        int sparse_block_k = 0;
     };
 
     static Params
@@ -625,7 +621,7 @@ struct CollectiveMainloopFwdSm90 {
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
-                args.sparse_masks, args.shape_sparse_masks, args.sparse_block_q, args.sparse_block_k
+                args.sparse_masks, args.shape_sparse_masks,
               };
     }
 
