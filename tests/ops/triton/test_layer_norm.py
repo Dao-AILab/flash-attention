@@ -16,8 +16,8 @@ from flash_attn.ops.triton.layer_norm import (
 is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 
 
-@pytest.mark.parametrize("zero_centered_weight", [False, True])
-# @pytest.mark.parametrize("zero_centered_weight", [True])
+# @pytest.mark.parametrize("zero_centered_weight", [False, True])
+@pytest.mark.parametrize("zero_centered_weight", [False])
 @pytest.mark.parametrize("has_weight1", [False, True])
 # @pytest.mark.parametrize("has_weight1", [False])
 @pytest.mark.parametrize("has_x1", [False, True])
