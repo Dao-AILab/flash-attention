@@ -745,27 +745,26 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     });
 }
 
-void
-mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multiple_of(head_size_og, 8)
-        const at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_size
-        const at::Tensor &k,   // batch_size x seqlen_k x num_heads_k x head_size
-        const at::Tensor &v,   // batch_size x seqlen_k x num_heads_k x head_size
-        const at::Tensor &out,   // batch_size x seqlen_q x num_heads x head_size
-        const at::Tensor &softmax_lse,     // b x h x seqlen_q
-        at::Tensor &dq,   // batch_size x seqlen_q x num_heads x head_size
-        at::Tensor &dk,   // batch_size x seqlen_k x num_heads_k x head_size
-        at::Tensor &dv,   // batch_size x seqlen_k x num_heads_k x head_size
-        std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
-        const float p_dropout,         // probability to drop
-        const float softmax_scale,
-        const bool is_causal,
-        int window_size_left,
-        int window_size_right,
-        const float softcap,
-        const bool deterministic,
-        std::optional<at::Generator> gen_,
-        std::optional<at::Tensor> &rng_state,
-        at::Tensor &softmax_d) {
+void mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multiple_of(head_size_og, 8)
+             const at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_size
+             const at::Tensor &k,   // batch_size x seqlen_k x num_heads_k x head_size
+             const at::Tensor &v,   // batch_size x seqlen_k x num_heads_k x head_size
+             const at::Tensor &out,   // batch_size x seqlen_q x num_heads x head_size
+             const at::Tensor &softmax_lse,     // b x h x seqlen_q
+             at::Tensor &dq,   // batch_size x seqlen_q x num_heads x head_size
+             at::Tensor &dk,   // batch_size x seqlen_k x num_heads_k x head_size
+             at::Tensor &dv,   // batch_size x seqlen_k x num_heads_k x head_size
+             std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+             const float p_dropout,         // probability to drop
+             const float softmax_scale,
+             const bool is_causal,
+             int window_size_left,
+             int window_size_right,
+             const float softcap,
+             const bool deterministic,
+             std::optional<at::Generator> gen_,
+             std::optional<at::Tensor> &rng_state,
+             at::Tensor &softmax_d) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
