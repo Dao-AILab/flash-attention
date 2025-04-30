@@ -100,7 +100,7 @@ def test_mask_pack():
     assert torch.all(mask_crm == torch.tensor([[[[(((170 * 256 + 170) * 256) +170) * 256 + 170, 1]]]], dtype=torch.uint32, device="cuda"))
 
 
-@pytest.mark.parametrize("sparse_block_q,sparse_block_k", [(128,128), (64,64)])
+@pytest.mark.parametrize("sparse_block_q,sparse_block_k", [(128,128), (128,64), (64,64)])
 @pytest.mark.parametrize("dtype", ["float16"])
 # @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("mha_type", ["mha"])
