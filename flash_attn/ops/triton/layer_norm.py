@@ -696,7 +696,9 @@ def _layer_norm_bwd(
 
 
 @triton_op("flash_attn::layer_norm_bwd_impl", mutates_args={},
-           schema="(Tensor dy, Tensor x, Tensor weight, Tensor bias, float eps, Tensor mean, Tensor rstd, Tensor? dresidual, Tensor? dy1, Tensor? weight1, Tensor? bias1, Tensor? seeds, float dropout_p, Tensor? rowscale, bool has_residual, bool has_x1, bool zero_centered_weight, bool is_rms_norm, ScalarType? x_dtype, bool recompute_output) -> (Tensor dx, Tensor dw, Tensor db, Tensor dresidual_in, Tensor dx1, Tensor dw1, Tensor db1, Tensor y)")
+           schema="(Tensor dy, Tensor x, Tensor weight, Tensor bias, float eps, Tensor mean, Tensor rstd, Tensor? dresidual, Tensor? dy1, Tensor? weight1, Tensor? bias1, Tensor? seeds, float dropout_p, Tensor? rowscale, bool has_residual, bool has_x1, bool zero_centered_weight, bool is_rms_norm, ScalarType? x_dtype, bool recompute_output) -> (Tensor dx, Tensor dw, Tensor db, Tensor dresidual_in, Tensor dx1, Tensor dw1, Tensor db1, Tensor y)",
+           allow_decomposition=False,  # Don't let torch.compile trace inside
+           )
 def _layer_norm_bwd_impl(
     dy: Tensor,
     x: Tensor,
@@ -718,12 +720,14 @@ def _layer_norm_bwd_impl(
     is_rms_norm: bool = False,
     x_dtype: Optional[torch.dtype] = None,
     recompute_output: bool = False,
-):
+) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor):
     M, N = x.shape
     assert x.stride(-1) == 1
+    dy = maybe_contiguous_lastdim(dy)
     assert dy.stride(-1) == 1
     assert dy.shape == (M, N)
     if dresidual is not None:
+        dresidual = maybe_contiguous_lastdim(dresidual)
         assert dresidual.stride(-1) == 1
         assert dresidual.shape == (M, N)
     assert weight.shape == (N,)
@@ -732,6 +736,7 @@ def _layer_norm_bwd_impl(
         assert bias.stride(-1) == 1
         assert bias.shape == (N,)
     if dy1 is not None:
+        dy1 = maybe_contiguous_lastdim(dy1)
         assert weight1 is not None
         assert dy1.shape == dy.shape
         assert dy1.stride(-1) == 1
@@ -946,16 +951,15 @@ class LayerNormFn(torch.autograd.Function):
     def backward(ctx, dy, *args):
         x, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd = ctx.saved_tensors
         dy = dy.reshape(-1, dy.shape[-1])
-        dy = maybe_contiguous_lastdim(dy)
         if weight1 is not None:
             dy1, args = args[0], args[1:]
-            dy1 = maybe_contiguous_lastdim(dy1.reshape(-1, dy1.shape[-1]))
+            dy1 = dy1.reshape(-1, dy1.shape[-1])
             assert dy1.shape == x.shape
         else:
             dy1 = None
         if ctx.prenorm:
             dresidual = args[0]
-            dresidual = maybe_contiguous_lastdim(dresidual.reshape(-1, dresidual.shape[-1]))
+            dresidual = dresidual.reshape(-1, dresidual.shape[-1])
             assert dresidual.shape == x.shape
         else:
             dresidual = None

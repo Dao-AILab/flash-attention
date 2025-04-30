@@ -14,6 +14,10 @@ def triton_op(
     *,
     mutates_args: Union[str, Iterable[str]],
     schema: Optional[str] = None,
+    # If allow_decomposition=True, this matches torch.library.triton_op behavior. If set to False,
+    # then it behaves like torch.library.custom_op instead, which doesn't decompose the operator
+    # and so inductor can't trace inside.
+    allow_decomposition=True,
 ) -> Callable:
     def dec(fn: Callable[..., object]) -> CustomOpDef:
         def backend_fn(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -35,23 +39,25 @@ def triton_op(
         # so we can just register it as the Fake/meta kernel.
         result.register_fake(fn)
 
-        # We decompose the operator when FunctionalTensorMode is active.
-        # The goal is to decompose the operator in AOTDispatcher.
-        # - With torch.compile, this means that the backend (usually Inductor)
-        #   can see a call to the triton kernel(s) and so it can directly optimize
-        #   them by inlining them into the lowering process.
-        def functional_decomp(  # type: ignore[no-untyped-def]
-            mode, op, types, args, kwargs
-        ):
-            from torch.export._trace import custom_triton_ops_decomposition_disabled
+        if allow_decomposition:
+            # We decompose the operator when FunctionalTensorMode is active.
+            # The goal is to decompose the operator in AOTDispatcher.
+            # - With torch.compile, this means that the backend (usually Inductor)
+            #   can see a call to the triton kernel(s) and so it can directly optimize
+            #   them by inlining them into the lowering process.
+            def functional_decomp(  # type: ignore[no-untyped-def]
+                mode, op, types, args, kwargs
+            ):
+                from torch.export._trace import custom_triton_ops_decomposition_disabled
 
-            if custom_triton_ops_decomposition_disabled():
-                return mode.__torch_dispatch__(op, types, args, kwargs)
-            else:
-                with mode:
-                    return fn(*args, **kwargs)
+                if custom_triton_ops_decomposition_disabled():
+                    return mode.__torch_dispatch__(op, types, args, kwargs)
+                else:
+                    with mode:
+                        return fn(*args, **kwargs)
 
-        result.register_torch_dispatch(FunctionalTensorMode, functional_decomp)
+            result.register_torch_dispatch(FunctionalTensorMode, functional_decomp)
+
         return result
 
     if fn is None:
