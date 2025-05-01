@@ -70,12 +70,15 @@ def cuda_archs() -> str:
     return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;120").split(";")
 
 
-def get_platform():
+def get_arch():
     """
-    Returns the platform name as used in wheel filenames.
+    Returns the system aarch for the current system.
     """
     if sys.platform.startswith("linux"):
-        return f'linux_{platform.uname().machine}'
+        if platform.machine() == "x86_64":
+            return "x86_64"
+        if platform.machine() == "arm64" or platform.machine() == "aarch64":
+            return "aarch64"
     elif sys.platform == "darwin":
         mac_version = ".".join(platform.mac_ver()[0].split(".")[:2])
         return f"macosx_{mac_version}_x86_64"
@@ -83,6 +86,28 @@ def get_platform():
         return "win_amd64"
     else:
         raise ValueError("Unsupported platform: {}".format(sys.platform))
+
+
+def get_system() -> str:
+    """
+    Returns the system name as used in wheel filenames.
+    """
+    if platform.system() == "Windows":
+        return "win"
+    elif platform.system() == "Darwin":
+        mac_version = ".".join(platform.mac_ver()[0].split(".")[:1])
+        return f"macos_{mac_version}"
+    elif platform.system() == "Linux":
+        return "linux"
+    else:
+        raise ValueError("Unsupported system: {}".format(platform.system()))
+
+
+def get_platform() -> str:
+    """
+    Returns the platform name as used in wheel filenames.
+    """
+    return f"{get_system()}_{get_arch()}"
 
 
 def get_cuda_bare_metal_version(cuda_dir):
@@ -189,6 +214,9 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
         if bare_metal_version >= Version("12.8") and "120" in cuda_archs():
             cc_flag.append("-gencode")
             cc_flag.append("arch=compute_120,code=sm_120")
+        if bare_metal_version >= Version("13.0") and "110" in cuda_archs():
+            cc_flag.append("-gencode")
+            cc_flag.append("arch=compute_110,code=sm_110")
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -413,7 +441,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         )
 
 
-def get_package_version():
+def get_package_version() -> str:
     with open(Path(this_dir) / "flash_attn" / "__init__.py", "r") as f:
         version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
@@ -424,7 +452,7 @@ def get_package_version():
         return str(public_version)
 
 
-def get_wheel_url():
+def get_wheel_url() -> tuple[str, str]:
     torch_version_raw = parse(torch.__version__)
     python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
     platform_name = get_platform()
@@ -463,7 +491,7 @@ class CachedWheelsCommand(_bdist_wheel):
     wheel available and short-circuits the standard full build pipeline.
     """
 
-    def run(self):
+    def run(self) -> None:
         if FORCE_BUILD:
             return super().run()
 
