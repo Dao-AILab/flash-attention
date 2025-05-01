@@ -632,4 +632,6 @@ setup(
         "einops",
         "packaging",
     ],
+    setup_requires=[
+        "ninja",
 )
