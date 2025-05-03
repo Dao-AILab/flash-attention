@@ -122,7 +122,7 @@ def attention_backward_core_ref_impl(
             print("dp:", dp, dp.shape)
 
     # calculate ds
-    if False:
+    if True:
         delta = torch.sum(o * do, axis=-1).unsqueeze(-1)
     else:
         delta = torch.sum(p * dp, axis=-1).unsqueeze(-1)

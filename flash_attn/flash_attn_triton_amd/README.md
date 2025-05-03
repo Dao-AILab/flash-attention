@@ -28,7 +28,7 @@ To get started with the triton backend for AMD, follow the steps below.
 First install the recommended Triton version 
 
 ```
-pip install triton==3.2.0
+pip install triton==3.3.0
 ```
 Then install Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.
 
@@ -56,7 +56,7 @@ FROM rocm/pytorch:latest
 WORKDIR /workspace
 
 # install triton
-RUN pip install triton==3.2.0
+RUN pip install triton==3.3.0
 
 # install flash attention
 ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"

@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional, Union
-from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, compute_alibi_block, compute_fp8_scaling_factors, get_shapes_from_layout, get_strides_from_layout, is_cdna, is_fp8, is_rdna, create_dropout_mask
+from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, compute_alibi_block, compute_fp8_scaling_factors, get_arch, get_shapes_from_layout, get_strides_from_layout, is_cdna, is_fp8, is_rdna, create_dropout_mask
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
@@ -80,15 +80,6 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
             qk += tl.dot(q, k)
         qk_scaled =  qk * SM_SCALE
 
-        if IS_CAUSAL:
-            causal_boundary = start_n + offs_n_causal
-            causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
-            qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
-        if bias_ptrs is not None:
-            bias_offs_n = start_n + tl.arange(0, BLOCK_N) if MASK_STEPS else None
-            bias = load_fn(bias_ptrs, OFFS_M, bias_offs_n, actual_seqlen_q, actual_seqlen_k)
-            qk_scaled += bias
-
         if USE_ALIBI:
             # compute the global position of each token within the sequence
             global_m_positions = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -96,6 +87,17 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
             alibi_block = compute_alibi_block(alibi_slope, actual_seqlen_q, actual_seqlen_k, global_m_positions,
                                               global_n_positions)
             qk_scaled += alibi_block
+
+        if IS_CAUSAL:
+            causal_boundary = start_n + offs_n_causal
+            causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
+            qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
+        
+        if bias_ptrs is not None:
+            bias_offs_n = start_n + tl.arange(0, BLOCK_N) if MASK_STEPS else None
+            bias = load_fn(bias_ptrs, OFFS_M, bias_offs_n, actual_seqlen_q, actual_seqlen_k)
+            qk_scaled += bias
+
         # get max scores so far
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
 
@@ -213,12 +215,28 @@ def get_autotune_configs():
         else:
             raise ValueError("Unknown Device Type")
     else:
-        return [
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1, "PRE_LOAD_V": False},
+        arch = get_arch()
+        if arch == "gfx950":
+            default_config = triton.Config(
+                {"BLOCK_M": 128, "BLOCK_N": 128, "waves_per_eu": 2, "PRE_LOAD_V": False},
                 num_stages=1,
                 num_warps=4,
-            ),
+            )
+        elif arch == "gfx942" and False: # Disabled due shared mem oom in CI when using triton==3.3.0 when using top of tree everything seems fine.
+            default_config = triton.Config(
+                {"BLOCK_M": 128, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
+                num_stages=1,
+                num_warps=4,
+            )
+        else:
+            default_config = triton.Config(
+                {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
+                num_stages=1,
+                num_warps=4,
+            )
+        
+        return [
+            default_config
         ], [
             "IS_CAUSAL",
             "dropout_p",
@@ -250,14 +268,29 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
              MAX_SEQLENS_K: tl.constexpr, IS_VARLEN: tl.constexpr, IS_INFERENCE: tl.constexpr,  IS_CAUSAL: tl.constexpr, BLOCK_M: tl.constexpr,
              BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr, PRE_LOAD_V: tl.constexpr, USE_BIAS: tl.constexpr,
              ENABLE_DROPOUT: tl.constexpr, RETURN_SCORES: tl.constexpr, USE_ALIBI: tl.constexpr, USE_EXP2: tl.constexpr, 
-             IS_FP8: tl.constexpr, FP8_MAX: tl.constexpr, FP8_OUTPUT: tl.constexpr):
+             IS_FP8: tl.constexpr, FP8_MAX: tl.constexpr, FP8_OUTPUT: tl.constexpr, FLIP_GRID: tl.constexpr):
     # set params
     ACCUMULATOR_TYPE = tl.float32
 
     # compute offsets
-    start_m = tl.program_id(0)
-    off_h_q = tl.program_id(1)
-    off_z = tl.program_id(2)
+    if FLIP_GRID:
+        #NUM_XCDS: tl.constexpr = 8
+        off_z = tl.program_id(0)
+        off_h_q = tl.program_id(1)
+        start_m = tl.program_id(2)
+
+        #start_m = (tl.cdiv(MAX_SEQLENS_Q, BLOCK_M) - 1) - start_m
+
+        # Remap heads to the same XCD
+        #pids_per_xcd = HQ // NUM_XCDS
+        #xcd_group = off_h_q % NUM_XCDS
+        #pid_in_xcd = off_h_q // NUM_XCDS
+        #off_h_q = xcd_group * pids_per_xcd + pid_in_xcd
+    else:
+        start_m = tl.program_id(0)
+        off_h_q = tl.program_id(1)
+        off_z = tl.program_id(2)
+
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL)
@@ -308,7 +341,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
             o_offset = Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
             o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_on
             acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=Out.type.element_ty)
-            o_ptrs_mask = offs_m[:, None] < seqlen_q
+            o_ptrs_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
             # We still need to write 0s to the result
             tl.store(o_ptrs, acc, mask=o_ptrs_mask)
             # The tensor allocated for L is based on MAX_SEQLENS_Q as that is
@@ -598,7 +631,11 @@ def attention_prefill_forward_triton_impl(
     # kernel is padded - there is no padding in memory for any dims.
     padded_d_model = max(padded_d_model, 16)
 
-    grid = lambda META: (triton.cdiv(max_seqlens_q, META['BLOCK_M']), nheads_q, batch)
+    FLIP_GRID = True
+    if FLIP_GRID:
+        grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META['BLOCK_M']))
+    else:
+        grid = lambda META: (triton.cdiv(max_seqlens_q, META['BLOCK_M']), nheads_q, batch)
 
     # sd_mask is used to validate dropout behavior vs the PyTorch SDPA math backend reference.  We zero this out
     # to give a consistent starting point and then populate it with the output of softmax with the sign bit set according
@@ -644,6 +681,6 @@ def attention_prefill_forward_triton_impl(
                     MAX_SEQLENS_K=max_seqlens_k, IS_CAUSAL=causal, IS_VARLEN=is_varlen, IS_INFERENCE=is_inference,
                     BLOCK_DMODEL=padded_d_model, USE_BIAS=False if bias is None else True,
                     USE_ALIBI=use_alibi, ENABLE_DROPOUT=dropout_p
-                    > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_softmax, IS_FP8=IS_FP8, FP8_MAX=FP8_MAX, FP8_OUTPUT=FP8_OUTPUT)
+                    > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_softmax, IS_FP8=IS_FP8, FP8_MAX=FP8_MAX, FP8_OUTPUT=FP8_OUTPUT, FLIP_GRID=FLIP_GRID)
 
     return softmax_lse, sd_mask if return_softmax else None 

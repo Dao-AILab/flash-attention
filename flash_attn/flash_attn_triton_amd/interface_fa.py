@@ -13,6 +13,10 @@ from einops import rearrange, repeat
 from flash_attn.layers.rotary import apply_rotary_emb
 from typing import Literal, Optional, Union
 
+
+USE_EXP2 = True
+BWD_MODE = os.environ.get('BWD_MODE', 'jingning').lower()
+
 def fwd(q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -66,12 +70,19 @@ def fwd(q: torch.Tensor,
     if return_softmax:
         metadata.return_scores = True
 
-    batch, nheads_q, nheads_k, head_size, _, _ = get_shapes_from_layout(q, k, metadata.layout)
+    # get shape
+    batch, _ , nheads_q, _= q.shape
 
     if causal:
         metadata.need_causal(True)
 
     if alibi_slopes is not None:
+        if alibi_slopes.dim() == 2:
+            pass
+        elif alibi_slopes.dim() == 1:
+            alibi_slopes = alibi_slopes.unsqueeze(0).expand(batch, -1)
+        else:
+            raise ValueError(f"Alibi can be (nheads,) or (batch_size, nheads). Given tensor with shape {alibi_slopes.shape}")
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
 
     # store rng state
@@ -101,7 +112,7 @@ def fwd(q: torch.Tensor,
                                                 metadata.dropout_p,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
-                                                metadata.use_exp2)
+                                                USE_EXP2)
         softmax_lse=softmax_lse_ref
         sd_mask=sd_mask_ref
     else:
@@ -127,7 +138,7 @@ def fwd(q: torch.Tensor,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
                                                 metadata.return_scores,
-                                                metadata.use_exp2,
+                                                USE_EXP2,
                                                 descale_q,
                                                 descale_k,
                                                 descale_v,
@@ -145,7 +156,6 @@ def fwd(q: torch.Tensor,
 
     return out, softmax_lse, sd_mask, rng_state
 
-BWD_MODE = os.environ.get('BWD_MODE', 'split').lower()
 def bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -210,10 +220,22 @@ def bwd(
     dk = torch.zeros_like(k) if dk is None else dk.zero_()
     dv = torch.zeros_like(v) if dv is None else dv.zero_()
 
-    if rng_state is not None:
+    # get shape
+    batch, _ , nheads_q, _= q.shape
+
+    if dropout_p > 0.0:
+        assert rng_state is not None
         philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
     else:
         philox_seed, philox_offset = None, None
+
+    if alibi_slopes is not None:
+        if alibi_slopes.dim() == 2:
+            pass
+        elif alibi_slopes.dim() == 1:
+            alibi_slopes = alibi_slopes.unsqueeze(0).expand(batch, -1)
+        else:
+            raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
 
     # call implementation
     if USE_REF:
@@ -241,7 +263,7 @@ def bwd(
             dropout_p,
             philox_seed,
             philox_offset,
-            False,
+            USE_EXP2,
         )
         delta = delta_ref
     else:
@@ -269,7 +291,7 @@ def bwd(
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                False,
+                USE_EXP2,
                 descale_q,
                 descale_k,
                 descale_v,
@@ -330,7 +352,15 @@ def bwd(
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                False
+                USE_EXP2,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_o,
+                descale_do,
+                descale_dq,
+                descale_dk,
+                descale_dv,
             )
             delta = delta_triton
         else:
@@ -411,13 +441,20 @@ def varlen_fwd(
     metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)  # set layout to "thd" and other metdata
     assert metadata.layout is not None
 
-    # get shapes
-    batch, nheads_q, nheads_k, head_size , seqlen_q, seqlen_k = get_shapes_from_layout(q, k, metadata.layout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+    # get shape
+    batch = len(cu_seqlens_q) - 1
+    _, nheads_q, _= q.shape
 
     if causal:
         metadata.need_causal(True)
 
     if alibi_slopes is not None:
+        if alibi_slopes.dim() == 2:
+            pass
+        elif alibi_slopes.dim() == 1:
+            alibi_slopes = alibi_slopes.unsqueeze(0).expand(batch, -1)
+        else:
+            raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
 
     # store rng state
@@ -447,7 +484,7 @@ def varlen_fwd(
                                                 metadata.dropout_p,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
-                                                metadata.use_exp2)
+                                                USE_EXP2)
         softmax_lse=softmax_lse_ref
         sd_mask=sd_mask_ref
     else:
@@ -473,7 +510,7 @@ def varlen_fwd(
                                                             metadata.philox_seed,
                                                             metadata.philox_offset,
                                                             metadata.return_scores,
-                                                            metadata.use_exp2,
+                                                            USE_EXP2,
                                                             descale_q,
                                                             descale_k,
                                                             descale_v,
@@ -558,10 +595,23 @@ def varlen_bwd(
     dk = torch.zeros_like(k) if dk is None else dk.zero_()
     dv = torch.zeros_like(v) if dv is None else dv.zero_()
 
-    if rng_state is not None:
+    # get shape
+    batch = len(cu_seqlens_q) - 1
+    _, nheads_q, _= q.shape
+
+    if dropout_p > 0.0:
+        assert rng_state is not None
         philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
     else:
         philox_seed, philox_offset = None, None
+
+    if alibi_slopes is not None:
+        if alibi_slopes.dim() == 2:
+            pass
+        elif alibi_slopes.dim() == 1:
+            alibi_slopes = alibi_slopes.unsqueeze(0).expand(batch, -1)
+        else:
+            raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
 
     # call implementation
     if USE_REF:
@@ -588,44 +638,108 @@ def varlen_bwd(
             dropout_p,
             philox_seed,
             philox_offset,
-            False,
+            USE_EXP2,
         )
         delta = delta_ref
     else:
         if DEBUG:
             print("Using Triton implementation") 
-        delta_triton = attention_prefill_backward_triton_split_impl(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            softmax_scale,
-            alibi_slopes,
-            causal,
-            "thd",
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p,
-            philox_seed,
-            philox_offset,
-            False,
-            descale_q,
-            descale_k,
-            descale_v,
-            descale_o,
-            descale_do,
-            descale_dq,
-            descale_dk,
-            descale_dv,
-        )
-        delta = delta_triton
+        if BWD_MODE == "split":
+            delta_triton = attention_prefill_backward_triton_split_impl(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dq,
+                dk,
+                dv,
+                softmax_scale,
+                alibi_slopes,
+                causal,
+                "thd",
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                philox_seed,
+                philox_offset,
+                USE_EXP2,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_o,
+                descale_do,
+                descale_dq,
+                descale_dk,
+                descale_dv,
+            )
+            delta = delta_triton
+        elif BWD_MODE == "fused":
+            delta_triton = attention_prefill_backward_triton_fused_impl(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dq,
+                dk,
+                dv,
+                softmax_scale,
+                alibi_slopes,
+                causal,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                philox_seed,
+                philox_offset,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_o,
+                True,
+            )
+            delta = delta_triton
+        elif BWD_MODE == "jingning":
+            delta_triton = attention_prefill_backward_triton_split_oneKernel_impl(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dq,
+                dk,
+                dv,
+                softmax_scale,
+                alibi_slopes,
+                causal,
+                "thd",
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                philox_seed,
+                philox_offset,
+                USE_EXP2,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_o,
+                descale_do,
+                descale_dq,
+                descale_dk,
+                descale_dv,
+            )
+            delta = delta_triton
+        else:
+            raise ValueError(f"Unknown bwd mode {BWD_MODE}")
 
     if DEBUG:
         print("varlen_bwd outputs")
@@ -697,11 +811,19 @@ def fwd_kvcache(
     k_new = k
     v_new = v
 
+    # get shape
+    batch, _ , nheads_q, _= q.shape
+
     if causal:
         metadata.need_causal(True)
 
     if alibi_slopes is not None:
-        batch, _ , nheads_q, _= q.shape
+        if alibi_slopes.dim() == 2:
+            pass
+        elif alibi_slopes.dim() == 1:
+            alibi_slopes = alibi_slopes.unsqueeze(0).expand(batch, -1)
+        else:
+            raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
 
     # rotary boolean
@@ -779,7 +901,7 @@ def fwd_kvcache(
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
                                                 metadata.return_scores,
-                                                metadata.use_exp2,
+                                                USE_EXP2,
                                                 None,
                                                 None,
                                                 None,
