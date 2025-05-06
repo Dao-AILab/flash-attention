@@ -25,7 +25,7 @@
 #include "sm90_pipeline_no_cluster.hpp"
 
 #include "indices.hpp"
-
+#include "debug.hpp"
 
 namespace flash {
 
@@ -77,7 +77,11 @@ struct CollectiveMainloopFwdSm90 {
         if constexpr (BlockSparse) {
             // FIXME: we need block_min and block_max to be aligned to mask boundary!
             Tensor gMasks = make_tensor(make_gmem_ptr(params.sparse_masks), params.shape_sparse_masks);
+            PRODUCER_DPRINTF0("Shape(%d, %d, %d, %d)\n", get<0>(params.shape_sparse_masks), get<1>(params.shape_sparse_masks), get<2>(params.shape_sparse_masks), get<3>(params.shape_sparse_masks))
+            CONSUMER_DPRINTF0("Shape(%d, %d, %d, %d)\n", get<0>(params.shape_sparse_masks), get<1>(params.shape_sparse_masks), get<2>(params.shape_sparse_masks), get<3>(params.shape_sparse_masks))
             if (!params.sparse_masks) {
+              PRODUCER_DPRINTF0("sparse_masks is null!")
+              CONSUMER_DPRINTF0("sparse_masks is null!")
               return SparseIndicesCRM<uint32_t>(nullptr, nullptr);
             }
 
@@ -810,6 +814,7 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_k.producer_acquire(smem_pipe_write);
             if constexpr (!PagedKVNonTMA) {
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_K_TMA();
+                PRODUCER_DPRINTF0("load k idx=%d\n", n_block_idx);
                 copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
                     tKgK_TMA(_, n_block_idx, bidb_kv_idx), tKsK_TMA(_, smem_pipe_write.index()));
             } else {
@@ -824,6 +829,7 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_v_load.producer_acquire(smem_pipe_write);
             if constexpr (!PagedKVNonTMA) {
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_V_TMA();
+                PRODUCER_DPRINTF0("load v idx=%d\n", n_block_idx);
                 copy(params.tma_load_V.with(*pipeline_v_load.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
                     tVgVt_TMA(_, n_block_idx, bidb_kv_idx), tVsVt_TMA(_, smem_pipe_write.index()));
             } else {
@@ -851,6 +857,8 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         int n_block = *indices_it;
+        PRODUCER_DPRINTF0("initial n_block=%d\n", n_block);
+        if constexpr (BlockSparse) PRODUCER_DPRINTF0("  state: offset_=%d last_pos_=%d val_=%u ptr_=0x%p end_=0x%p\n", indices_it.offset_, indices_it.last_pos_, indices_it.val_, indices_it.ptr_, indices_it.end_);
 
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         // If this is true, we're guaranteed that only the first warp will execute this function
@@ -858,6 +866,7 @@ struct CollectiveMainloopFwdSm90 {
         bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync());
 
         if (should_load_KV) {
+            PRODUCER_DPRINTF0("load_page_table %d\n", n_block);
             if constexpr (PagedKVNonTMA) {
                 paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
             } else {
@@ -917,11 +926,16 @@ struct CollectiveMainloopFwdSm90 {
         }
         int n_block_prev = n_block;
         n_block = *(++indices_it);
+        PRODUCER_DPRINTF0("n_block=%d\n", n_block);
+        if constexpr (BlockSparse) PRODUCER_DPRINTF0("  state: offset_=%d last_pos_=%d val_=%u ptr_=0x%p end_=0x%p\n", indices_it.offset_, indices_it.last_pos_, indices_it.val_, indices_it.ptr_, indices_it.end_);
         #pragma unroll (!Transpose_V && Use_TMA_KV ? 2 : 1)
         for (; n_block >= n_block_min; n_block = *(++indices_it)) {
+            PRODUCER_DPRINTF0("n_block=%d\n", n_block);
+            if constexpr (BlockSparse) PRODUCER_DPRINTF0("  state: offset_=%d last_pos_=%d val_=%u ptr_=0x%p end_=0x%p\n", indices_it.offset_, indices_it.last_pos_, indices_it.val_, indices_it.ptr_, indices_it.end_);
             PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
             ++smem_pipe_write;
             if (should_load_KV) {
+                PRODUCER_DPRINTF0("load_page_table %d\n", n_block);
                 if constexpr (PagedKVNonTMA) {
                     paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
                 } else {
@@ -940,6 +954,7 @@ struct CollectiveMainloopFwdSm90 {
             n_block_prev = n_block;
             if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
         }
+        PRODUCER_DPRINTF0("scheduler_prefetch\n");
         scheduler_prefetch();
         if constexpr (!Transpose_V && IntraWGOverlap) {
             if (should_load_KV) { load_V(n_block_prev, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
@@ -1223,6 +1238,7 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
             if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             n_block = *(++indices_it);
+            CONSUMER_DPRINTF0("n_block=%d\n", n_block);
 
             // Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
             clear(tOrO);
@@ -1230,6 +1246,7 @@ struct CollectiveMainloopFwdSm90 {
 
             // Each step does gemm0 for iter n_block, gemm1 for iter n_block + 1, and softmax for iter n_block.
             auto fwd_step = [&](int const n_block, auto mask_fn, auto check_inf_type) {
+                CONSUMER_DPRINTF0(" in fwd_step=%d\n", n_block);
                 static constexpr bool Check_inf = decltype(check_inf_type)::value;
                 PipelineState smem_pipe_read_v(smem_pipe_read.index(), smem_pipe_read.phase(), smem_pipe_read.count());
                 ++smem_pipe_read;
@@ -1275,6 +1292,7 @@ struct CollectiveMainloopFwdSm90 {
                     params.attention_chunk_divmod, params.qhead_per_khead_divmod);
                 #pragma unroll 1
                 for (; n_block >= n_block_min_causal_local_mask; n_block = *(++indices_it)) {
+                    CONSUMER_DPRINTF0("fwd_step=%d\n", n_block);
                     fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);
                 }
             }
@@ -1285,6 +1303,7 @@ struct CollectiveMainloopFwdSm90 {
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; n_block = *(++indices_it)) {
+                CONSUMER_DPRINTF0("fwd_step=%d\n", n_block);
                 fwd_step(n_block, no_mask_fn, cute::false_type{} /*check_inf*/);
             }
             // Separate masking iterations on the left for local attention
@@ -1292,6 +1311,7 @@ struct CollectiveMainloopFwdSm90 {
                 auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
                 #pragma unroll 1
                 for (; n_block >= n_block_min; n_block = *(++indices_it)) {
+                    CONSUMER_DPRINTF0("fwd_step=%d\n", n_block);
                     fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
                 }
             }
@@ -1367,6 +1387,7 @@ struct CollectiveMainloopFwdSm90 {
             };
 
             auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+            CONSUMER_DPRINTF0("fwd_step=%d\n", n_block);
             fwd_step(n_block, first_iter_mask_fn, cute::true_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
             n_block = *(++indices_it);
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
@@ -1376,6 +1397,7 @@ struct CollectiveMainloopFwdSm90 {
                     params.attention_chunk_divmod, params.qhead_per_khead_divmod);
                 #pragma unroll 1
                 for (; n_block >= n_block_min_causal_local_mask; n_block = *(++indices_it)) {
+                    CONSUMER_DPRINTF0("fwd_step=%d\n", n_block);
                     fwd_step(n_block, mask_fn, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
                 }
             }
@@ -1385,6 +1407,7 @@ struct CollectiveMainloopFwdSm90 {
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; n_block = *(++indices_it)) {
+                CONSUMER_DPRINTF0("fwd_step=%d\n", n_block);
                 fwd_step(n_block, no_mask_fn, cute::false_type{} /*is_first_iter*/, cute::false_type{} /*check_inf*/);
             }
             // Separate masking iterations on the left for local attention
@@ -1392,6 +1415,7 @@ struct CollectiveMainloopFwdSm90 {
                 auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
                 #pragma unroll 1
                 for (; n_block >= n_block_min; n_block = *(++indices_it)) {
+                    CONSUMER_DPRINTF0("fwd_step=%d\n", n_block);
                     fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
                 }
             }
