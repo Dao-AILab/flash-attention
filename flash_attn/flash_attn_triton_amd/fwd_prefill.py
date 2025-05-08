@@ -619,7 +619,7 @@ def attention_prefill_forward_triton_impl(
         dropout_mask = None
         scores_strides = (0, 0, 0, 0)
 
-    # stores LSE the log of the normalization constant / sum of expoential score(unnormalzied probablities)
+    # stores LSE the log of the normalization constant / sum of exponential score(unnormalized probabilities)
     if is_varlen:
         softmax_lse = torch.zeros((q.shape[0], nheads_q), device=q.device, dtype=torch.float32)
         stride_lse_m, stride_lse_h = softmax_lse.stride()

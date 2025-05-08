@@ -30,9 +30,9 @@ from .bwd_ref import attention_backward_pytorch_ref_impl
 # torch.set_printoptions(linewidth=5e5, edgeitems=10, sci_mode=False)
 # np.set_printoptions(linewidth=5000, threshold=1e4, suppress=True, precision=4)
 
-# defailt fp16 tolerance is ATOL, RTOL = 1e-5, 1e-3. See table https://pytorch.org/docs/stable/testing.html
+# default fp16 tolerance is ATOL, RTOL = 1e-5, 1e-3. See table https://pytorch.org/docs/stable/testing.html
 ATOL, RTOL = 1e-2, 1e-2 # old standard. maybe to lose. 
-# ATOL, RTOL = 1e-3, 1e-3  # catchs fa mismatch issues
+# ATOL, RTOL = 1e-3, 1e-3  # catches fa mismatch issues
 # ATOL, RTOL = 1e-4, 1e-3 # to strict. there will be small diffs
 # ATOL, RTOL = 1e-5, 1e-3 # # default fp16. there will be small diffs
 # ATOL_fp8, RTOL_fp8 = 1e-1, 1e-1 # to strict for larger tensors in fp8
@@ -161,7 +161,7 @@ def test_op_prefill_fwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
 
     if DEBUG:
         print()
-        print("Compare Triton Impl with refernce Pytorch Impl")
+        print("Compare Triton Impl with reference Pytorch Impl")
 
     # this can be set to true manually or when using dropout
     if metadata.return_scores:
@@ -330,7 +330,7 @@ def test_op_prefill_bwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
     v_triton = v.clone()
     o_triton = output_ref.clone().contiguous()
     softmax_lse_triton = softmax_lse_ref.clone().contiguous()
-    dq_triton = torch.zeros_like(q_triton, dtype=q.dtype) # NOTE: the kernel does inplace accumlation on dq so dq has to be zeros
+    dq_triton = torch.zeros_like(q_triton, dtype=q.dtype) # NOTE: the kernel does inplace accumulation on dq so dq has to be zeros
     dk_triton = torch.zeros_like(k_triton, dtype=k.dtype) if DEBUG_INPUT else torch.empty_like(k_triton, dtype=k.dtype)
     dv_triton = torch.zeros_like(v_triton, dtype=v.dtype) if DEBUG_INPUT else torch.empty_like(v_triton, dtype=v.dtype)
     delta_triton = attention_prefill_backward_triton_split_impl(
@@ -790,7 +790,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
 @pytest.mark.parametrize('test_backward', [False, True])
 @pytest.mark.skipif(not arch_supports_fp8(), reason="fp8 not supported on this device")
 @pytest.mark.skip("Breaks on CI but works locally")
-def test_ir(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, packing, test_backward): # Don't run this test in parallel. It clears the cache so it doesnot work properly if run in parallel.
+def test_ir(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, packing, test_backward): # Don't run this test in parallel. It clears the cache so it does not work properly if run in parallel.
     torch.manual_seed(20)
     device = "cuda"
     window_size = (-1, -1)

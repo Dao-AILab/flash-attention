@@ -9,7 +9,7 @@ import triton.language as tl
 from typing import Literal, Optional, Union
 
 # -------------------------------
-# Gloabl Variables
+# Global Variables
 # -------------------------------
 AUTOTUNE = os.environ.get('FLASH_ATTENTION_TRITON_AMD_AUTOTUNE', '0').lower() in ('1', 'true', 'yes')
 DEBUG = os.environ.get('FLASH_ATTENTION_TRITON_AMD_DEBUG', '0').lower() in ('1', 'true', 'yes')
@@ -439,7 +439,7 @@ def is_dtype_fp8(dtype):
         if arch_supports_fp8():
             return True
         else:
-            raise RuntimeError("This device doesnot support fp8")
+            raise RuntimeError("This device does not support fp8")
     else:
         return False
 

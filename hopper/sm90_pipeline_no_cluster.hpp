@@ -85,7 +85,7 @@ private:
   EmptyBarrier* const empty_barrier_ptr_ = nullptr;
 
   // Consumer signalling Producer of completion
-  // Ensures all blocks in the Same Row and Column get notifed.
+  // Ensures all blocks in the Same Row and Column get notified.
   CUTLASS_DEVICE
   void consumer_release(uint32_t stage, uint32_t skip = false) {
     empty_barrier_ptr_[stage].arrive(0 /*dst_blockid_*/, uint32_t(threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0) & (!skip) /*is_signaling_thread*/);

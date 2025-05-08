@@ -1491,7 +1491,7 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     if USE_TRITON_ROCM:
         if is_rdna():
             if seqlen_q == 1 and seqlen_k == 239 and d == 256:
-                pytest.skip("This config doesnot work on RDNA Devices.")
+                pytest.skip("This config does not work on RDNA Devices.")
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30

@@ -557,7 +557,7 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
                                 hqid * stride_dropouth
 
             MASK_BLOCK_M1: tl.constexpr = BLOCK_M1 // BLK_SLICE_FACTOR
-            # bound the masked operation to q len so it does not have to wast cycles
+            # bound the masked operation to q len so it does not have to waste cycles
             len_m = min(len_m, seqlen_q)
             num_steps = tl.cdiv(len_m, MASK_BLOCK_M1)
             # when q < k, we may skip the initial masked op
