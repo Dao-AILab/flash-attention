@@ -347,20 +347,21 @@ void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi
 #endif
 }
 
-std::vector<at::Tensor>
-mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
-        const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
-        const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
-        std::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
-        std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
-        const float p_dropout,
-        const float softmax_scale,
-        bool is_causal,
-        int window_size_left,
-        int window_size_right,
-        const float softcap,
-        const bool return_softmax,
-        std::optional<at::Generator> gen_) {
+void mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
+             const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
+             const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
+             at::Tensor &out,             // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
+             std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+             const float p_dropout,
+             const float softmax_scale,
+             bool is_causal,
+             int window_size_left,
+             int window_size_right,
+             const float softcap,
+             std::optional<at::Generator> gen_,
+             at::Tensor &rng_state,
+             std::optional<at::Tensor> &p_,
+             at::Tensor &softmax_lse) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -391,7 +392,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     const int num_heads_k = k.size(2);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
-    TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
+    TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out must have a head_size that is a multiple of 8");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
@@ -417,18 +418,12 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
 
-    at::Tensor out;
-    if (out_.has_value()) {
-        out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
-        CHECK_DEVICE(out);
-        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
-        CHECK_SHAPE(out, batch_size, sizes[1], sizes[2], head_size);
-        if (seqlenq_ngroups_swapped) {
-            out = out.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2);
-        }
-    } else {
-        out = torch::empty_like(q);
+    TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+    CHECK_DEVICE(out);
+    TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+    CHECK_SHAPE(out, batch_size, sizes[1], sizes[2], head_size);
+    if (seqlenq_ngroups_swapped) {
+        out = out.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2);
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -437,17 +432,6 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
     auto opts = q.options();
-
-    auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
-    at::Tensor p;
-    // Only return softmax if there's dropout to reduce compilation time
-    if (return_softmax) {
-        TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
-        p = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts);
-    }
-    else {
-        p = torch::empty({ 0 }, opts);
-    }
 
     Flash_fwd_params params;
     set_params_fprop(params,
@@ -460,7 +444,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
                      /*cu_seqlens_q_d=*/nullptr,
                      /*cu_seqlens_k_d=*/nullptr,
                      /*seqused_k=*/nullptr,
-                     return_softmax ? p.data_ptr() : nullptr,
+                     p_.has_value() ? p_.value().data_ptr() : nullptr,
                      softmax_lse.data_ptr(),
                      p_dropout,
                      softmax_scale,
@@ -479,8 +463,6 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = params.b * params.h * 32;
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
     // Forward kernel will populate memory with the seed and offset.
     params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
@@ -508,7 +490,6 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
-    return {out, softmax_lse, p, rng_state};
 }
 
 std::vector<at::Tensor>
@@ -764,26 +745,26 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     });
 }
 
-std::vector<at::Tensor>
-mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multiple_of(head_size_og, 8)
-        const at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_size
-        const at::Tensor &k,   // batch_size x seqlen_k x num_heads_k x head_size
-        const at::Tensor &v,   // batch_size x seqlen_k x num_heads_k x head_size
-        const at::Tensor &out,   // batch_size x seqlen_q x num_heads x head_size
-        const at::Tensor &softmax_lse,     // b x h x seqlen_q
-        std::optional<at::Tensor> &dq_,   // batch_size x seqlen_q x num_heads x head_size
-        std::optional<at::Tensor> &dk_,   // batch_size x seqlen_k x num_heads_k x head_size
-        std::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
-        std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
-        const float p_dropout,         // probability to drop
-        const float softmax_scale,
-        const bool is_causal,
-        int window_size_left,
-        int window_size_right,
-        const float softcap,
-        const bool deterministic,
-        std::optional<at::Generator> gen_,
-        std::optional<at::Tensor> &rng_state) {
+void mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multiple_of(head_size_og, 8)
+             const at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_size
+             const at::Tensor &k,   // batch_size x seqlen_k x num_heads_k x head_size
+             const at::Tensor &v,   // batch_size x seqlen_k x num_heads_k x head_size
+             const at::Tensor &out,   // batch_size x seqlen_q x num_heads x head_size
+             const at::Tensor &softmax_lse,     // b x h x seqlen_q
+             at::Tensor &dq,   // batch_size x seqlen_q x num_heads x head_size
+             at::Tensor &dk,   // batch_size x seqlen_k x num_heads_k x head_size
+             at::Tensor &dv,   // batch_size x seqlen_k x num_heads_k x head_size
+             std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+             const float p_dropout,         // probability to drop
+             const float softmax_scale,
+             const bool is_causal,
+             int window_size_left,
+             int window_size_right,
+             const float softcap,
+             const bool deterministic,
+             std::optional<at::Generator> gen_,
+             std::optional<at::Tensor> &rng_state,
+             at::Tensor &softmax_d) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -846,41 +827,27 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size);
     CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size);
 
-    at::Tensor dq, dk, dv;
-    if (dq_.has_value()) {
-        dq = dq_.value();
-        TORCH_CHECK(dq.dtype() == q_dtype, "dq must have the same dtype as q");
-        CHECK_DEVICE(dq);
-        TORCH_CHECK(dq.stride(-1) == 1, "dq must have contiguous last dimension");
-        CHECK_SHAPE(dq, batch_size, seqlen_q, num_heads, head_size);
-    } else {
-        dq = torch::empty_like(q);
-    }
-    if (dk_.has_value()) {
-        dk = dk_.value();
-        TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
-        CHECK_DEVICE(dk);
-        TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
-        CHECK_SHAPE(dk, batch_size, seqlen_k, num_heads_k, head_size);
-    } else {
-        dk = torch::empty_like(k);
-    }
-    if (dv_.has_value()) {
-        dv = dv_.value();
-        TORCH_CHECK(dv.dtype() == q_dtype, "dv must have the same dtype as q");
-        CHECK_DEVICE(dv);
-        TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
-        CHECK_SHAPE(dv, batch_size, seqlen_k, num_heads_k, head_size);
-    } else {
-        dv = torch::empty_like(v);
-    }
+    CHECK_DEVICE(dq);
+    CHECK_DEVICE(dk);
+    CHECK_DEVICE(dv);
+
+    TORCH_CHECK(dq.dtype() == q_dtype, "dq must have the same dtype as q");
+    TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
+    TORCH_CHECK(dv.dtype() == q_dtype, "dv must have the same dtype as q");
+
+    TORCH_CHECK(dq.stride(-1) == 1, "dq must have contiguous last dimension");
+    TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
+    TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
+
+    CHECK_SHAPE(dq, batch_size, seqlen_q, num_heads, head_size);
+    CHECK_SHAPE(dk, batch_size, seqlen_k, num_heads_k, head_size);
+    CHECK_SHAPE(dv, batch_size, seqlen_k, num_heads_k, head_size);
 
     // bool loop = seqlen_k > blocksize_c;
     // TODO: change later, for now set to true for simplicity
     bool loop = true;
 
     auto opts = q.options();
-    auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
     at::Tensor dq_accum;
     at::Tensor dk_accum, dv_accum;
     if (loop) {
@@ -966,8 +933,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         at::sum_out(dk, at::reshape(dk_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
         at::sum_out(dv, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
     }
-
-    return { dq, dk, dv, softmax_d };
 }
 
 std::vector<at::Tensor>
