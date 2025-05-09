@@ -21,7 +21,7 @@ namespace flash {
 
 using namespace cute;
 
-template <int Stages, int Stages_dO, class TileShape_MNK_, class Element_, class ElementAccum_, class ArchTag_,
+template <int Stages, int Stages_dO, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Deterministic,
         bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
         int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=8, int AtomLayoutMdQ=1,
@@ -32,6 +32,7 @@ struct CollectiveMainloopBwdSm80 {
     static constexpr int kStages_dO = Stages_dO;
     static_assert(kStages >= kStages_dO);
     using TileShape_MNK = TileShape_MNK_;
+    using TileShapeV_MNK = Shape<decltype(get<0>(TileShape_MNK{})), decltype(get<1>(TileShape_MNK{})), Int<kHeadDimV>>;
     using Element = Element_;
     using ElementAccum = ElementAccum_;
     using ArchTag = ArchTag_;
@@ -93,11 +94,16 @@ struct CollectiveMainloopBwdSm80 {
         Layout<Shape<Int<AtomLayoutNdKV>, Int<NumMmaWarps / AtomLayoutNdKV>, _1>>,
         Layout<Shape<Int<NumMmaWarps / AtomLayoutNdKV>, Int<AtomLayoutNdKV>, _1>>
     >;
-    static constexpr bool MmadKVEvenN = ((!dKV_swapAB ? kHeadDim : kBlockN) / size<1>(AtomLayoutdKV{})) % 16 == 0;
-    using TiledMmadKV = TiledMMA<
+    static constexpr bool MmadKEvenN = ((!dKV_swapAB ? kHeadDim : kBlockN) / size<1>(AtomLayoutdKV{})) % 16 == 0;
+    using TiledMmadK = TiledMMA<
         MMA_Atom_Arch,
         AtomLayoutdKV,
-        Tile<Int<16 * CUTE_STATIC_V(size<0>(AtomLayoutdKV{}))>, Int<(MmadKVEvenN ? 16 : 8) * CUTE_STATIC_V(size<1>(AtomLayoutdKV{}))>, _16>>;
+        Tile<Int<16 * CUTE_STATIC_V(size<0>(AtomLayoutdKV{}))>, Int<(MmadKEvenN ? 16 : 8) * CUTE_STATIC_V(size<1>(AtomLayoutdKV{}))>, _16>>;
+    static constexpr bool MmadVEvenN = ((!dKV_swapAB ? kHeadDimV : kBlockN) / size<1>(AtomLayoutdKV{})) % 16 == 0;
+    using TiledMmadV = TiledMMA<
+        MMA_Atom_Arch,
+        AtomLayoutdKV,
+        Tile<Int<16 * CUTE_STATIC_V(size<0>(AtomLayoutdKV{}))>, Int<(MmadVEvenN ? 16 : 8) * CUTE_STATIC_V(size<1>(AtomLayoutdKV{}))>, _16>>;
 
     using AtomLayoutdQ = std::conditional_t<
         !dQ_swapAB,
@@ -119,30 +125,47 @@ struct CollectiveMainloopBwdSm80 {
 
     static constexpr int kSwizzle = kBlockKGmem == 128 ? 4 : (kBlockKGmem == 64 ? 3 : (kBlockKGmem == 32 ? 2 : 1));
     static constexpr int kSwizzleBase = sizeof(Element) == 4 ? 2 : (sizeof(Element) == 2 ? 3 : 4);
+    static_assert(kHeadDimV % kGmemElemsPerLoad == 0, "Headdim must be a multiple of kGmemElemsPerLoad");
+    // We want each "row" to have 64 elements (128 bytes, i.e. 1 cache line). E.g. if hdim=128, we want each
+    // thread to have 4 loads in the M direction and 2 vectorized load in the K direction.
+    static constexpr int kBytePerRowV = kHeadDimV * sizeof(Element);
+    static constexpr int kBlockKGmemV = (kBytePerRowV % 128 == 0 ? 128 : (kBytePerRowV % 64 == 0 ? 64 : 32)) / sizeof(Element);
+
+    static constexpr int kSwizzleV = kBlockKGmemV == 128 ? 4 : (kBlockKGmemV == 64 ? 3 : (kBlockKGmemV == 32 ? 2 : 1));
+    static constexpr int kSwizzleBaseV = sizeof(Element) == 4 ? 2 : (sizeof(Element) == 2 ? 3 : 4);
 
     // We need to accommodate both Q and Q^T (and dO and dO^T) in shared memory.
     // Q & dO are used in the SdP Mma and Q^T and dO^T are used in the dKV Mma.
     // Since this is GMMA::Major::K, the M dimension (kBlockM) doesn't matter for the layout, only the K dimension
     // changes the layout.
-    using SmemLayoutAtomQdO = decltype(
+    using SmemLayoutAtomQ = decltype(
         composition(Swizzle<kSwizzle, kSwizzleBase, kSwizzleBase>{},
                     Layout<Shape<_8, Int<kBlockKGmem>>,
                            Stride<Int<kBlockKGmem>, _1>>{}));
+    using SmemLayoutAtomdO = decltype(
+        composition(Swizzle<kSwizzleV, kSwizzleBaseV, kSwizzleBaseV>{},
+                    Layout<Shape<_8, Int<kBlockKGmemV>>,
+                            Stride<Int<kBlockKGmemV>, _1>>{}));
     using SmemLayoutQ =
-        decltype(tile_to_shape(SmemLayoutAtomQdO{},
+        decltype(tile_to_shape(SmemLayoutAtomQ{},
                  make_shape(shape<0>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
     using SmemLayoutdO =
-        decltype(tile_to_shape(SmemLayoutAtomQdO{},
-                 make_shape(shape<0>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages_dO>{})));
+        decltype(tile_to_shape(SmemLayoutAtomdO{},
+                 make_shape(shape<0>(TileShapeV_MNK{}), shape<2>(TileShapeV_MNK{}), Int<kStages_dO>{})));
 
-    using SmemLayoutAtomKV = decltype(
+    using SmemLayoutAtomK = decltype(
         composition(Swizzle<kSwizzle, kSwizzleBase, kSwizzleBase>{},
                     // TODO: FA2 has a slightly different layout, does it matter?
                     Layout<Shape<_8, Int<kBlockKGmem>>,
                            Stride<Int<kBlockKGmem>, _1>>{}));
-    using SmemLayoutK = decltype(tile_to_shape(SmemLayoutAtomKV{}, select<1, 2>(TileShape_MNK{})));
+    using SmemLayoutAtomV = decltype(
+        composition(Swizzle<kSwizzleV, kSwizzleBaseV, kSwizzleBaseV>{},
+                    // TODO: FA2 has a slightly different layout, does it matter?
+                    Layout<Shape<_8, Int<kBlockKGmemV>>,
+                            Stride<Int<kBlockKGmemV>, _1>>{}));
+    using SmemLayoutK = decltype(tile_to_shape(SmemLayoutAtomK{}, select<1, 2>(TileShape_MNK{})));
 
-    using SmemLayoutV = decltype(tile_to_shape(SmemLayoutAtomKV{}, select<1, 2>(TileShape_MNK{})));
+    using SmemLayoutV = decltype(tile_to_shape(SmemLayoutAtomV{}, select<1, 2>(TileShapeV_MNK{})));
 
     // TD [2023-03-19]: Idk why kPBlockN = 16 and kSwizzlePdS=3 is the fastest.
     static constexpr int kPBlockN = kBlockN % 64 == 0 ? 64 : (kBlockN % 32 == 0 ? 32 : 16);
@@ -173,8 +196,8 @@ struct CollectiveMainloopBwdSm80 {
                                                make_stride(Int<kBlockM>{}, _1{}, Int<kBlockM * kHeadDim>{}))));
     using SmemLayoutdOt =
         decltype(cute::composition(SmemLayoutdO{},
-                                   make_layout(make_shape(get<2>(TileShape_MNK{}), get<0>(TileShape_MNK{}), Int<kStages_dO>{}),
-                                               make_stride(Int<kBlockM>{}, _1{}, Int<kBlockM * kHeadDim>{}))));
+                                   make_layout(make_shape(get<2>(TileShapeV_MNK{}), get<0>(TileShapeV_MNK{}), Int<kStages_dO>{}),
+                                               make_stride(Int<kBlockM>{}, _1{}, Int<kBlockM * kHeadDimV>{}))));
     using SmemLayoutKt =
         decltype(cute::composition(SmemLayoutK{},
                                    make_layout(make_shape(get<2>(TileShape_MNK{}), get<1>(TileShape_MNK{})),
@@ -430,9 +453,9 @@ struct CollectiveMainloopBwdSm80 {
                                       params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen_q ? bidb : 0);
 
         Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)
-        Tensor gdO = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mdO), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)
+        Tensor gdO = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mdO), select<0, 2>(TileShapeV_MNK{}), make_coord(_, _0{}));  // (M, K, _)
         Tensor gK = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
-        Tensor gV = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mV), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
+        Tensor gV = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mV), select<1, 2>(TileShapeV_MNK{}), make_coord(n_block, _0{}));  // (N, K)
         Tensor gLSE = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mLSE), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
         Tensor gdPsum = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mdPsum), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
         Tensor gdQaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(_));  // (M * K, _)
@@ -458,11 +481,13 @@ struct CollectiveMainloopBwdSm80 {
         // if (blockIdx.x == 0 && threadIdx.x == 128) { print(mdQaccum); printf("\n"); print(gdQaccum_); printf("\n"); print(gdQaccum); printf("\n"); print(tdQgdQaccum); printf("\n"); }
 
         TiledMmaSdP tiled_mma_SdP;
-        TiledMmadKV tiled_mma_dKV;
+        TiledMmadK tiled_mma_dK;
+        TiledMmadV tiled_mma_dV;
         TiledMmadQ tiled_mma_dQ;
 
         auto thr_mma_SdP = tiled_mma_SdP.get_thread_slice(thread_idx);
-        auto thr_mma_dKV = tiled_mma_dKV.get_thread_slice(thread_idx);
+        auto thr_mma_dK = tiled_mma_dK.get_thread_slice(thread_idx);
+        auto thr_mma_dV = tiled_mma_dV.get_thread_slice(thread_idx);
         auto thr_mma_dQ = tiled_mma_dQ.get_thread_slice(thread_idx);
 
         // Allocate "fragments/descriptors"
@@ -489,16 +514,21 @@ struct CollectiveMainloopBwdSm80 {
         Tensor tdSsdS = r2s_thr_copy_PdS.partition_D(cute::conditional_return<!SdP_swapAB>(sdS, sdSt));      // ((Atom,AtomNum),PIPE_M,PIPE_N)
         // if (blockIdx.x == 0 && threadIdx.x == 128) { print(r2s_thr_copy_PdS); print(sP); printf("\n"); print(sPt); printf("\n"); print(tPsP); printf("\n"); print(tdSsdS); printf("\n"); }
 
-        auto smem_copy_atom_dKV_B = cute::conditional_return<MmadKVEvenN>(SmemCopyAtomTransposed{}, SmemCopyAtomTransposedHalf{});
-        auto smem_tiled_copy_PdSt = cute::conditional_return<!dKV_swapAB>(make_tiled_copy_A(SmemCopyAtomTransposed{}, tiled_mma_dKV), make_tiled_copy_B(smem_copy_atom_dKV_B, tiled_mma_dKV));
-        auto smem_thr_copy_PdSt = smem_tiled_copy_PdSt.get_thread_slice(thread_idx);
-        Tensor tdVsPt = smem_thr_copy_PdSt.partition_S(sPt);
-        Tensor tdKsdSt = smem_thr_copy_PdSt.partition_S(sdSt);
+        auto smem_copy_atom_dK_B = cute::conditional_return<MmadKEvenN>(SmemCopyAtomTransposed{}, SmemCopyAtomTransposedHalf{});
+        auto smem_copy_atom_dV_B = cute::conditional_return<MmadVEvenN>(SmemCopyAtomTransposed{}, SmemCopyAtomTransposedHalf{});
+        auto smem_tiled_copy_Pt = cute::conditional_return<!dKV_swapAB>(make_tiled_copy_A(SmemCopyAtomTransposed{}, tiled_mma_dV), make_tiled_copy_B(smem_copy_atom_dV_B, tiled_mma_dV));
+        auto smem_tiled_copy_dSt = cute::conditional_return<!dKV_swapAB>(make_tiled_copy_A(SmemCopyAtomTransposed{}, tiled_mma_dK), make_tiled_copy_B(smem_copy_atom_dK_B, tiled_mma_dK));
+        auto smem_thr_copy_Pt = smem_tiled_copy_Pt.get_thread_slice(thread_idx);
+        auto smem_thr_copy_dSt = smem_tiled_copy_dSt.get_thread_slice(thread_idx);
+        Tensor tdVsPt = smem_thr_copy_Pt.partition_S(sPt);
+        Tensor tdKsdSt = smem_thr_copy_dSt.partition_S(sdSt);
 
-        auto smem_tiled_copy_QdOt = cute::conditional_return<!dKV_swapAB>(make_tiled_copy_B(smem_copy_atom_dKV_B, tiled_mma_dKV), make_tiled_copy_A(SmemCopyAtomTransposed{}, tiled_mma_dKV));
-        auto smem_thr_copy_QdOt = smem_tiled_copy_QdOt.get_thread_slice(thread_idx);
-        Tensor tdVsdOt = smem_thr_copy_QdOt.partition_S(sdOt);
-        Tensor tdKsQt = smem_thr_copy_QdOt.partition_S(sQt);
+        auto smem_tiled_copy_Qt = cute::conditional_return<!dKV_swapAB>(make_tiled_copy_B(smem_copy_atom_dK_B, tiled_mma_dK), make_tiled_copy_A(SmemCopyAtomTransposed{}, tiled_mma_dK));
+        auto smem_tiled_copy_dOt = cute::conditional_return<!dKV_swapAB>(make_tiled_copy_B(smem_copy_atom_dV_B, tiled_mma_dV), make_tiled_copy_A(SmemCopyAtomTransposed{}, tiled_mma_dV));
+        auto smem_thr_copy_Qt = smem_tiled_copy_Qt.get_thread_slice(thread_idx);
+        auto smem_thr_copy_dOt = smem_tiled_copy_dOt.get_thread_slice(thread_idx);
+        Tensor tdVsdOt = smem_thr_copy_dOt.partition_S(sdOt);
+        Tensor tdKsQt = smem_thr_copy_Qt.partition_S(sQt);
 
         auto smem_tiled_copy_dS = cute::conditional_return<!dQ_swapAB>(
             make_tiled_copy_A(SmemCopyAtom{}, tiled_mma_dQ),
@@ -553,15 +583,18 @@ struct CollectiveMainloopBwdSm80 {
             Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
             Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
             // Predicates
-            Tensor cKV = cute::make_identity_tensor(select<1, 2>(TileShape_MNK{}));
-            Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);
-            Tensor t0KVcKV = gmem_thr0_copy_QKV.partition_S(cKV);
+            Tensor cK = cute::make_identity_tensor(select<1, 2>(TileShape_MNK{}));
+            Tensor cV = cute::make_identity_tensor(select<1, 2>(TileShapeV_MNK{}));
+            Tensor tKcK = gmem_thr_copy_QKV.partition_S(cK);
+            Tensor tVcV = gmem_thr_copy_QKV.partition_S(cV);
+            Tensor t0KcK = gmem_thr0_copy_QKV.partition_S(cK);
+            Tensor t0VcV = gmem_thr0_copy_QKV.partition_S(cV);
             Tensor tKpK = make_tensor<bool>(make_shape(size<2>(tKsK)));
             Tensor tVpV = make_tensor<bool>(make_shape(size<2>(tVsV)));
             #pragma unroll
-            for (int k = 0; k < size(tKpK); ++k) { tKpK(k) = get<1>(tKVcKV(_0{}, _0{}, k)) < get<1>(params.shape_K); }
+            for (int k = 0; k < size(tKpK); ++k) { tKpK(k) = get<1>(tKcK(_0{}, _0{}, k)) < get<1>(params.shape_K); }
             #pragma unroll
-            for (int k = 0; k < size(tVpV); ++k) { tVpV(k) = get<1>(tKVcKV(_0{}, _0{}, k)) < get<1>(params.shape_V); }
+            for (int k = 0; k < size(tVpV); ++k) { tVpV(k) = get<1>(tVcV(_0{}, _0{}, k)) < get<1>(params.shape_V); }
             // Do we need bound check to make sure the row doesn't go above kBlockN
             static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0;
             // static_assert(EvenN);  // It simplifies the loading of K and V
@@ -573,12 +606,12 @@ struct CollectiveMainloopBwdSm80 {
             // // Need Clear_OOB_MN to be true here since the gemm will sum over the kBlockN dimension
             // flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true, /*Clear_OOB_K=*/true>(
             //     gmem_tiled_copy_QKV, tVgV, tVsV, t0KVcKV, tKVpKV, seqlenk_row_limit);
-            int const seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tKVcKV(_0{}, _0{}, _0{}));
+            int const seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tVcV(_0{}, _0{}, _0{}));
             #pragma unroll
             for (int m = 0; m < size<1>(tVsV); ++m) {
                 // If kBlockN doesn't evenly divide the tiled copy, only the last `m` needs to be checked
-                if (EvenN || m < size<1>(tVsV) - 1 || get<0>(tKVcKV(_0{}, m, _0{})) < kBlockN) {
-                    bool const predicate_n = get<0>(t0KVcKV(_0{}, m, _0{})) < seqlenk_row_limit;
+                if (EvenN || m < size<1>(tVsV) - 1 || get<0>(tVcV(_0{}, m, _0{})) < kBlockN) {
+                    bool const predicate_n = get<0>(t0VcV(_0{}, m, _0{})) < seqlenk_row_limit;
                     #pragma unroll
                     for (int k = 0; k < size<2>(tVsV); ++k) {
                         cute::copy(gmem_tiled_copy_QKV.with(tVpV(k) && predicate_n), tVgV(_, m, k), tVsV(_, m, k));
@@ -590,8 +623,8 @@ struct CollectiveMainloopBwdSm80 {
             //     gmem_tiled_copy_QKV, tKgK, tKsK, t0KVcKV, tKVpKV, seqlenk_row_limit);
             #pragma unroll
             for (int m = 0; m < size<1>(tKsK); ++m) {
-                if (EvenN || m < size<1>(tKsK) - 1 || get<0>(tKVcKV(_0{}, m, _0{})) < kBlockN) {
-                    bool const predicate_n = get<0>(t0KVcKV(_0{}, m, _0{})) < seqlenk_row_limit;
+                if (EvenN || m < size<1>(tKsK) - 1 || get<0>(tKcK(_0{}, m, _0{})) < kBlockN) {
+                    bool const predicate_n = get<0>(t0KcK(_0{}, m, _0{})) < seqlenk_row_limit;
                     #pragma unroll
                     for (int k = 0; k < size<2>(tKsK); ++k) {
                         cute::copy(gmem_tiled_copy_QKV.with(tKpK(k) && predicate_n), tKgK(_, m, k), tKsK(_, m, k));
@@ -817,16 +850,16 @@ struct CollectiveMainloopBwdSm80 {
             Tensor tdSadS = r2s_thr_copy_PdS.retile_S(rdS);   // ((Atom,AtomNum), MMA_N, MMA_N)
             cute::copy(r2s_tiled_copy_PdS, tdSadS, tdSsdS);
 
-            Tensor tdVrdO = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dKV, sdOt(_, _, _0{}));
+            Tensor tdVrdO = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dV, sdOt(_, _, _0{}));
             Tensor tdVsdO_cur = tdVsdOt(_, _, _, kStages_dO > 1 ? smem_pipe_read_do_cur : 0);
             if constexpr (Mma_dKV_is_RS) {
-                Tensor tdVrP = make_tensor(rP.data(), convert_layout_acc_Aregs<TiledMmadKV>(tSrS.layout()));
-                flash::gemm_rs_sm80(tdVrdV, tdVrP, tdVrdO, tdVsdO_cur, tiled_mma_dKV, smem_tiled_copy_QdOt, smem_thr_copy_QdOt);
+                Tensor tdVrP = make_tensor(rP.data(), convert_layout_acc_Aregs<TiledMmadV>(tSrS.layout()));
+                flash::gemm_rs_sm80(tdVrdV, tdVrP, tdVrdO, tdVsdO_cur, tiled_mma_dV, smem_tiled_copy_dOt, smem_thr_copy_dOt);
             } else {
-                Tensor tdVrP = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(thr_mma_dKV, sPt);
+                Tensor tdVrP = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(thr_mma_dV, sPt);
                 flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, /*SwapAB=*/dKV_swapAB>(
                     tdVrdV, tdVrP, tdVrdO, tdVsPt, tdVsdO_cur,
-                    tiled_mma_dKV, smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt, nullptr);
+                    tiled_mma_dV, smem_tiled_copy_Pt, smem_tiled_copy_dOt, smem_thr_copy_Pt, smem_thr_copy_dOt, nullptr);
             }
             // if (cute::thread0()) { print_tensor(tdVrdV); }
             __syncthreads();  // make sure sdS is written
@@ -849,16 +882,16 @@ struct CollectiveMainloopBwdSm80 {
             };
             // If kStages == 1, we want to do Mma_dK first so we can start loading Q for the next iteration
             if constexpr (kStages > 1) { do_mma_dQ(load_dO_next); }
-            Tensor tdKrQ = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dKV, sQt(_, _, _0{}));
+            Tensor tdKrQ = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dK, sQt(_, _, _0{}));
             Tensor tdKsQ_cur = tdKsQt(_, _, _, kStages > 1 ? smem_pipe_read : 0);
             if constexpr (Mma_dKV_is_RS) {
-                Tensor tdKrdS = make_tensor(rdS.data(), convert_layout_acc_Aregs<TiledMmadKV>(tdPrdP.layout()));
-                flash::gemm_rs_sm80(tdKrdK, tdKrdS, tdKrQ, tdKsQ_cur, tiled_mma_dKV, smem_tiled_copy_QdOt, smem_thr_copy_QdOt);
+                Tensor tdKrdS = make_tensor(rdS.data(), convert_layout_acc_Aregs<TiledMmadK>(tdPrdP.layout()));
+                flash::gemm_rs_sm80(tdKrdK, tdKrdS, tdKrQ, tdKsQ_cur, tiled_mma_dK, smem_tiled_copy_Qt, smem_thr_copy_Qt);
             } else {
-                Tensor tdKrdS = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(thr_mma_dKV, sdSt);
+                Tensor tdKrdS = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(thr_mma_dK, sdSt);
                 flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, /*SwapAB=*/dKV_swapAB>(
                     tdKrdK, tdKrdS, tdKrQ, tdKsdSt, tdKsQ_cur,
-                    tiled_mma_dKV, smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt, cute::conditional_return<(kStages > 1)>(nullptr, load_dO_next));
+                    tiled_mma_dK, smem_tiled_copy_dSt, smem_tiled_copy_Qt, smem_thr_copy_dSt, smem_thr_copy_Qt, cute::conditional_return<(kStages > 1)>(nullptr, load_dO_next));
             }
             if constexpr (kStages == 1) {
                 __syncthreads();

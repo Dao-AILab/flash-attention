@@ -31,8 +31,10 @@ public:
     // Mainloop derived types
     using CollectiveMainloop = CollectiveMainloop_;
     using TileShape_MNK = typename CollectiveMainloop::TileShape_MNK;
+    using TileShapeV_MNK = typename CollectiveMainloop::TileShapeV_MNK;
     using TiledMmaSdP = typename CollectiveMainloop::TiledMmaSdP;
-    using TiledMmadKV = typename CollectiveMainloop::TiledMmadKV;
+    using TiledMmadK = typename CollectiveMainloop::TiledMmadK;
+    using TiledMmadV = typename CollectiveMainloop::TiledMmadV;
     using ArchTag = typename CollectiveMainloop::ArchTag;
     using MainloopArguments = typename CollectiveMainloop::Arguments;
     using MainloopParams = typename CollectiveMainloop::Params;
@@ -138,7 +140,8 @@ public:
 
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.smem_scheduler));
         // Initialize matmul objects.
-        TiledMmadKV tiled_mma_dKV;
+        TiledMmadK tiled_mma_dK;
+        TiledMmadV tiled_mma_dV;
 
         scheduler.init_consumer();
 
@@ -153,13 +156,13 @@ public:
             cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
 
             // dK and dV output accumulator.
-            Tensor tdKrdK = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
-            Tensor tdVrdV = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
+            Tensor tdKrdK = partition_fragment_C(tiled_mma_dK, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
+            Tensor tdVrdV = partition_fragment_C(tiled_mma_dV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShapeV_MNK{}));
             bool tile_valid = mainloop.mma(params.mainloop, tdKrdK, tdVrdV, threadIdx.x,
                                            block_coord, shared_storage);
             scheduler.prefetch_next_work(params.scheduler, work_tile_info);
             if (tile_valid) {
-                epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
+                epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dK, tiled_mma_dV,
                                threadIdx.x, block_coord);
             } else {
                 epilogue.store_zero(params.epilogue, threadIdx.x, block_coord);
