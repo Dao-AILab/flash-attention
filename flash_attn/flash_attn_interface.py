@@ -17,7 +17,7 @@ else:
 # isort: on
 
 def maybe_contiguous(x):
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+    return x.contiguous() if x is not None else x
 
 
 def _get_block_size_n(device, head_dim, is_dropout, is_causal):
