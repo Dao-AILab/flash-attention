@@ -16,7 +16,7 @@
 #include "heuristics.h"
 #include "cuda_check.h"
 
-#define STRINGIZE(x) #x
+
 extern "C" {
 /* Creates a dummy empty _C module that can be imported from Python.
     The import from Python will load the .so consisting of this file
