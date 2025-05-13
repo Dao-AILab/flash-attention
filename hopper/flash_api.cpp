@@ -1624,7 +1624,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "float softcap = 0.0,"
         "bool is_rotary_interleaved = False,"
         "Tensor? scheduler_metadata = None,"
-        "int num_splits = 1,"
+        "int num_splits = 0,"
         "bool? pack_gqa = None,"
         "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
@@ -1677,7 +1677,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int window_size_right,"
         "int attention_chunk,"
         "bool has_softcap = False,"
-        "int num_splits = 1,"
+        "int num_splits = 0,"
         "bool? pack_gqa = None,"
         "int sm_margin = 0) -> Tensor");
 }
