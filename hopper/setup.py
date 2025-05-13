@@ -546,6 +546,7 @@ if not SKIP_CUDA_BUILD:
                 "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
             },
             include_dirs=include_dirs,
+            py_limited_api=True,
         )
     )
 
