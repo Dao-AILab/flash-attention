@@ -992,13 +992,11 @@ struct CollectiveMainloopFwdSm90 {
                 }
                 if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
                 load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/, should_load_scales);
-                if (should_load_KV) {
-                    if constexpr (!Transpose_V) {
-                        if constexpr (IntraWGOverlap) {
-                            load_V(n_block_prev, smem_pipe_write_v, cute::true_type{} /*Seqlenk_mask*/);
-                        } else {
-                            load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
-                        }
+                if constexpr (!Transpose_V) {
+                    if constexpr (IntraWGOverlap) {
+                        load_V(n_block_prev, smem_pipe_write_v, cute::true_type{} /*Seqlenk_mask*/);
+                    } else {
+                        load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
                     }
                 }
             }
@@ -1225,9 +1223,6 @@ struct CollectiveMainloopFwdSm90 {
         // can turn -inf to e.g. -50.0, which can affect the attention softmax.
         auto scoremod_premask_fn = [&](auto& tSrS, auto& tQscale_row, auto& tKscale_col, int stage, int m_block, int n_block) {
             if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
-            auto thread_mma = TiledMmaQK{}.get_thread_slice(thread_idx);
-            auto thread0_mma = TiledMmaQK{}.get_thread_slice(_0{});
-
             if constexpr (Is_FP8) {
                 Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tSrS.layout()));
                 if constexpr (kScalingRecipe == ScalingRecipe::PerQTokenKVBlock) {
@@ -1416,7 +1411,7 @@ struct CollectiveMainloopFwdSm90 {
                 mask_fn(tSrS, n_block);
                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS, tQscale_row), scores_scale);
                 if constexpr (LargeHeadDimV) { store_scales(scores_scale, smem_pipe_read_v.index()); }
-                softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS, scores_scale);
+                softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS, tQscale_row);
                 if constexpr (!HasQv) {
                     warpgroup_wait<0>();
                     pipeline_v.consumer_release(smem_pipe_read_v);  // release V

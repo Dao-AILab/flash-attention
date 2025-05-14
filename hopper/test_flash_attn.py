@@ -83,6 +83,7 @@ COMPILED_HDIMS = (
         (1, 1),
         (64, 128),
         (128, 192),
+        (128, 256),
         (256, 256),
         (239, 1),
         (799, 3),
@@ -103,8 +104,8 @@ COMPILED_HDIMS = (
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
-# @pytest.mark.parametrize("scaling_recipe", [0, 2])
-@pytest.mark.parametrize("scaling_recipe", [0])
+# @pytest.mark.parametrize("scaling_recipe", [0, 1])
+@pytest.mark.parametrize("scaling_recipe", [1])
 def test_flash_attn_output(
         seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv, mha_type, dtype, scaling_recipe
 ):
@@ -146,7 +147,7 @@ def test_flash_attn_output(
         if dtype == torch.float8_e4m3fn:
             if scaling_recipe == 0:
                 q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
-            elif scaling_recipe == 2:
+            elif scaling_recipe == 1:
                 kBlockN = 224 
                 q_descale = (torch.rand(nheads, batch_size * seqlen_q, device=device, dtype=torch.float32)).T
                 q_descale_ref = q_descale.reshape(batch_size, seqlen_q, nheads)
@@ -228,7 +229,8 @@ def test_flash_attn_output(
                 attention_chunk=attention_chunk,
                 softcap=softcap,
                 pack_gqa=pack_gqa,
-                num_splits=num_splits
+                num_splits=num_splits,
+                scaling_recipe=scaling_recipe,
             )
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -238,6 +240,27 @@ def test_flash_attn_output(
 
             # Check that FlashAttention's numerical error is at most twice the numerical error
             # of a Pytorch implementation.
+            # print(f"{out=}")
+            # print(f"{out_ref=}")
+
+            # for b in range(out.shape[0]):
+            #     for h in range(out.shape[2]):
+            #         out_bh = out[b, :, h, :]
+            #         out_ref_bh = out_ref[b, :, h, :]
+            #         print(f"b = {b}, h = {h}, max abs diff = {(out_bh - out_ref_bh).abs().max().item()}")
+            #         if (out_bh - out_ref_bh).abs().max().item() > rtol * (out_pt - out_ref).abs().max().item() + fwd_atol:
+            #         # if (out_bh - out_ref_bh).abs().max().item() > 0.01:
+            #             print(f"b = {b}, h = {h} failed")
+            #             for s in range(out.shape[1]):
+            #                 out_bh_s = out_bh[s]
+            #                 out_ref_bh_s = out_ref_bh[s]
+            #                 # if (out_bh_s - out_ref_bh_s).abs().max().item() > rtol * (out_pt - out_ref).abs().max().item() + fwd_atol:
+            #                 max_diff = (out_bh_s - out_ref_bh_s).abs().max().item()
+            #                 print(f"b = {b}, h = {h}, s = {s}, {max_diff = }")
+            #                 if max_diff > 0.01:
+            #                     print(f"b = {b}, h = {h}, s = {s} failed")
+            #                 # print(f"b = {b}, h = {h}, s = {s}, {out_bh_s=}")
+            #                 # print(f"b = {b}, h = {h}, s = {s}, {out_ref_bh_s=}")
             assert (out - out_ref).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
 
         if (
@@ -649,7 +672,7 @@ def test_flash_attn_varlen_output(
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
-@pytest.mark.parametrize("scaling_recipe", [0, 2])
+@pytest.mark.parametrize("scaling_recipe", [0, 1])
 def test_flash_attn_kvcache(
     seqlen_q,
     seqlen_k,
