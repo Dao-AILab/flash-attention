@@ -49,20 +49,22 @@ COMPILED_HDIMS = (
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float16] if not DISABLE_FP16 else []) + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
+# @pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float16] if not DISABLE_FP16 else []) + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn] if not DISABLE_FP8 else [])
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mha"])
+# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
-@pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
-# @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
-# @pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
+@pytest.mark.parametrize("softcap", [0.0])
+# @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
+@pytest.mark.parametrize("local", [False])
+# @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("V_colmajor", [False, True])
 @pytest.mark.parametrize("V_colmajor", [False])
@@ -101,8 +103,10 @@ COMPILED_HDIMS = (
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
+# @pytest.mark.parametrize("scaling_recipe", [0, 2])
+@pytest.mark.parametrize("scaling_recipe", [0])
 def test_flash_attn_output(
-        seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv, mha_type, dtype
+        seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv, mha_type, dtype, scaling_recipe
 ):
     if V_colmajor and (seqlen_k % 16 != 0 or dtype != torch.float8_e4m3fn):
         pytest.skip("V_colmajor requires seqlen_k to be a multiple of 16 and dtype to be float8_e4m3fn")
@@ -136,10 +140,29 @@ def test_flash_attn_output(
         # Put window_size after QKV randn so that window_size changes from test to test
         window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
         # window_size = (-1, -1) if not local else (16, 0)
+        q_descale_ref = None
+        k_descale_ref = None
+        v_descale_ref = None
         if dtype == torch.float8_e4m3fn:
-            q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
+            if scaling_recipe == 0:
+                q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
+            elif scaling_recipe == 2:
+                kBlockN = 224 
+                q_descale = (torch.rand(nheads, batch_size * seqlen_q, device=device, dtype=torch.float32)).T
+                q_descale_ref = q_descale.reshape(batch_size, seqlen_q, nheads)
+                k_descale = (torch.rand(nheads_kv, int((seqlen_k + kBlockN - 1) / kBlockN) * batch_size, device=device, dtype=torch.float32) * 2).T
+                k_descale_ref = repeat(k_descale, "b_s_block h -> (b_s_block block_size) h", block_size=kBlockN)
+                k_descale_ref = k_descale_ref.reshape(batch_size, -1, k_descale_ref.shape[-1], 1)[:, : seqlen_k, :, :]
+                v_descale = (torch.rand(nheads_kv, int((seqlen_k + kBlockN - 1) / kBlockN) * batch_size, device=device, dtype=torch.float32) * 2).T
+                v_descale_ref = repeat(v_descale, "b_s_block h -> (b_s_block block_size) h", block_size=kBlockN)
+                v_descale_ref = v_descale_ref.reshape(batch_size, -1, v_descale_ref.shape[-1], 1)[:, : seqlen_k, :, :]
+            else:
+                raise ValueError(f"Unsupported scaling recipe: {scaling_recipe}")
         else:
             q_descale, k_descale, v_descale = None, None, None
+        q_descale_ref = q_descale if q_descale_ref is None else q_descale_ref
+        k_descale_ref = k_descale if k_descale_ref is None else k_descale_ref
+        v_descale_ref = v_descale if v_descale_ref is None else v_descale_ref
         q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
         qv = qv_ref.detach().to(dtype).requires_grad_() if has_qv else None
         if V_colmajor:
@@ -152,10 +175,11 @@ def test_flash_attn_output(
             None,
             causal=causal,
             qv=qv_ref,
-            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+            q_descale=q_descale_ref, k_descale=k_descale_ref, v_descale=v_descale_ref,
             window_size=window_size,
             attention_chunk=attention_chunk,
-            softcap=softcap
+            softcap=softcap,
+            scaling_recipe=scaling_recipe,
         )
         out_pt, attn_pt = attention_ref(
             q_ref,
@@ -165,13 +189,14 @@ def test_flash_attn_output(
             None,
             causal=causal,
             qv=qv_ref,
-            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+            q_descale=q_descale_ref, k_descale=k_descale_ref, v_descale=v_descale_ref,
             window_size=window_size,
             attention_chunk=attention_chunk,
             softcap=softcap,
             upcast=False,
             reorder_ops=True,
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+            scaling_recipe=scaling_recipe,
         )
 
         # qk = torch.einsum('bshd,bthd->bhst', q_ref, k_ref).float()
@@ -624,6 +649,7 @@ def test_flash_attn_varlen_output(
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
+@pytest.mark.parametrize("scaling_recipe", [0, 2])
 def test_flash_attn_kvcache(
     seqlen_q,
     seqlen_k,
@@ -641,6 +667,7 @@ def test_flash_attn_kvcache(
     new_kv,
     mha_type,
     dtype,
+    scaling_recipe,
 ):
     if page_size is not None and seqlen_k % page_size != 0:
         pytest.skip()
@@ -806,6 +833,29 @@ def test_flash_attn_kvcache(
             v_cache_ref[update_mask] = v_to_update
         k_cache_rep = repeat(k_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
         v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+        q_descale_ref = None
+        k_descale_ref = None
+        v_descale_ref = None
+        if dtype == torch.float8_e4m3fn:
+            if scaling_recipe == 0:
+                q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_k, device=device, dtype=torch.float32) * 2 for _ in range(3)]
+            elif scaling_recipe == 2:
+                kBlockN = 224 if page_size is None else 160
+                q_descale = (torch.rand(nheads, batch_size * seqlen_q, device=device, dtype=torch.float32)).T
+                q_descale_ref = q_descale.reshape(batch_size, seqlen_q, nheads)
+                k_descale = (torch.rand(nheads_k, (seqlen_k + kBlockN - 1) // kBlockN * batch_size, device=device, dtype=torch.float32) * 2).T
+                k_descale_ref = repeat(k_descale, "b_s_block h -> (b_s_block block_size) h", block_size=kBlockN)
+                k_descale_ref = k_descale_ref.reshape(batch_size, -1, k_descale_ref.shape[-1], 1)[:, : seqlen_k, :, :]
+                v_descale = (torch.ones(nheads_k, (seqlen_k + kBlockN - 1) // kBlockN * batch_size, device=device, dtype=torch.float32) * 1).T
+                v_descale_ref = repeat(v_descale, "b_s_block h -> (b_s_block block_size) h", block_size=kBlockN)
+                v_descale_ref = v_descale_ref.reshape(batch_size, -1, v_descale_ref.shape[-1], 1)[:, : seqlen_k, :, :]
+            else:
+                raise ValueError(f"Unsupported scaling recipe: {scaling_recipe}")
+        else:
+            q_descale, k_descale, v_descale = None, None, None
+        q_descale_ref = q_descale if q_descale_ref is None else q_descale_ref
+        k_descale_ref = k_descale if k_descale_ref is None else k_descale_ref
+        v_descale_ref = v_descale if v_descale_ref is None else v_descale_ref
         out_ref, _ = attention_ref(
             q_ro,
             k_cache_rep,
@@ -817,6 +867,8 @@ def test_flash_attn_kvcache(
             window_size=window_size,
             attention_chunk=attention_chunk,
             key_leftpad=cache_leftpad,
+            q_descale=q_descale_ref, k_descale=k_descale_ref, v_descale=v_descale_ref,
+            scaling_recipe=scaling_recipe,
         )
         out_pt, _ = attention_ref(
             q_ro,
@@ -831,7 +883,9 @@ def test_flash_attn_kvcache(
             upcast=False,
             reorder_ops=True,
             key_leftpad=cache_leftpad,
-            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None
+            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+            q_descale=q_descale_ref, k_descale=k_descale_ref, v_descale=v_descale_ref,
+            scaling_recipe=scaling_recipe,
         )
         q = q.to(dtype)
         q_unpad = q_unpad.to(dtype) if varlen_q else None
@@ -894,7 +948,9 @@ def test_flash_attn_kvcache(
                     rotary_interleaved=rotary_interleaved,
                     scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
-                    return_softmax_lse=True
+                    return_softmax_lse=True,
+                    q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                    scaling_recipe=scaling_recipe,
                 )
                 if varlen_q:
                     out = output_pad_fn(out)

@@ -34,6 +34,11 @@ struct Qkv_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+enum ScalingRecipe {
+    PerKVHead = 0,
+    PerQTokenKVBlock = 1
+};
+
 struct Flash_fwd_params : public Qkv_params {
     using index_t = int64_t;
 
@@ -51,6 +56,7 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ softmax_lseaccum_ptr;
 
     // For FP8 scaling
+    ScalingRecipe scaling_recipe;
     float * __restrict__ q_descale_ptr;
     float * __restrict__ k_descale_ptr;
     float * __restrict__ v_descale_ptr;
@@ -60,6 +66,9 @@ struct Flash_fwd_params : public Qkv_params {
     index_t k_descale_head_stride;
     index_t v_descale_batch_stride;
     index_t v_descale_head_stride;
+    int q_descale_len;
+    int k_descale_len;
+    int v_descale_len;
 
     // The dimensions.
     int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;

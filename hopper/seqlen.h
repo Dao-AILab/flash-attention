@@ -64,7 +64,7 @@ struct SeqlenInfoQKNewK {
 
     int const leftpad_k;
     int const offset_q, offset_k, offset_k_new;
-    int const seqlen_q, seqlen_k_og, seqlen_k_new, seqlen_k, seqlen_rotary;
+    int const seqlen_q, seqlen_k_og, seqlen_k_new, seqlen_k, seqlen_rotary, seqlen_k_static;
 
     CUTLASS_DEVICE
     SeqlenInfoQKNewK(int const bidb, int const seqlen_q_static, int const seqlen_k_static, int const shape_K_new_0,
@@ -87,6 +87,7 @@ struct SeqlenInfoQKNewK {
                        : (cu_seqlens_k_new ? cu_seqlens_k_new[bidb + 1] - cu_seqlens_k_new[bidb] : shape_K_new_0))
         , seqlen_k(!AppendKV ? seqlen_k_og : seqlen_k_og + seqlen_k_new)
         , seqlen_rotary(!AppendKV || !seqlens_rotary ? seqlen_k_og + leftpad_k : seqlens_rotary[bidb])
+        , seqlen_k_static(seqlen_k_static)
     {
     }
 

@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <c10/util/Exception.h>
+
 #include "cute/tensor.hpp"
 
 #include "cutlass/cutlass.h"
@@ -26,12 +28,13 @@ using namespace cute;
 
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
-          bool PackGQA, bool Split, bool V_colmajor>
+          bool PackGQA, bool Split, bool V_colmajor, ScalingRecipe Scaling_Recipe>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
     static_assert(!(AppendKV && !Varlen), "AppendKV requires Varlen");
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;
+    static_assert(Scaling_Recipe == ScalingRecipe::PerKVHead || Is_FP8, "Scaling recipe is only set for FP8.");
     static constexpr bool FP8_TransposeV = Is_FP8 && !V_colmajor;
     using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
 
@@ -51,7 +54,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
     using CollectiveMainloop = std::conditional_t<
         Arch >= 90,
-        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>,
+        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, Scaling_Recipe>,
         flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split>
     >;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV>;
@@ -83,6 +86,15 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     int seqlen_q = !is_varlen_q ? params.seqlen_q : params.total_q;
     int batch_q = !is_varlen_q ? params.b : 1;
     int batch_k = !is_varlen_k ? (params.kv_batch_idx ? params.b_k : params.b) : 1;
+    if constexpr (Scaling_Recipe == ScalingRecipe::PerQTokenKVBlock) {
+        TORCH_CHECK(
+            params.k_descale_len == (params.seqlen_k + kBlockN - 1) / kBlockN * (params.kv_batch_idx ? params.b_k : params.b), 
+            "kv descale length must be equal to (seqlen_k + kBlockN - 1) / kBlockN * batch_size_k. "
+            "kBlockN: ", std::to_string(kBlockN), 
+            ", params.k_descale_len: ", std::to_string(params.k_descale_len), 
+            ", params.seqlen_k: ", std::to_string(params.seqlen_k),
+            ", batch_size_k: ", std::to_string(params.kv_batch_idx ? params.b_k : params.b));
+    }
     typename CollectiveMainloop::StrideV v_strides =
         cute::conditional_return<!V_colmajor>(
             make_stride(params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0),
@@ -117,6 +129,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         {params.page_table_batch_stride, _1{}},  // stride_page_table
         params.scale_softmax,
         params.q_descale_ptr, params.k_descale_ptr, params.v_descale_ptr,
+        // TMA requires GMEM and SMEM tensor ranks match.
+        // Here, we make GMEM tensor shape [num_q_scales, h], stride[1, num_q_scales], SMEM tensor shape [128, 1].
+        // In this case, we can actually use [128] (i.e. rank=1) as SMEM tensor layout.
+        // This makes coding a bit easier.
+        {params.q_descale_len, params.h},
+        {params.k_descale_len, params.h},
+        {params.v_descale_len, params.h},
         {params.q_descale_batch_stride, params.q_descale_head_stride},
         {params.k_descale_batch_stride, params.k_descale_head_stride},
         {params.v_descale_batch_stride, params.v_descale_head_stride},
@@ -213,7 +232,9 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                         // Only use Cluster if number of tiles along seqlen_q is even and not varlen
                         CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
                             static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
-                            run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor>(params, stream);
+                            SCALING_RECIPE_SWITCH(params.scaling_recipe, Is_FP8, kScalingRecipe, [&] {
+                                run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, kScalingRecipe>(params, stream);
+                            });
                         });
                     });
                 });

@@ -179,3 +179,19 @@
       return __VA_ARGS__();                                                                      \
     }                                                                                            \
   }()
+
+#define SCALING_RECIPE_SWITCH(SCALING_RECIPE, Is_FP8, CONST_NAME, ...)                           \
+  [&] {                                                                                          \
+    if constexpr (Is_FP8) {                                                                      \
+      if ((SCALING_RECIPE) == ScalingRecipe::PerQTokenKVBlock) {                          \
+        constexpr static ScalingRecipe CONST_NAME = ScalingRecipe::PerQTokenKVBlock;             \
+        return __VA_ARGS__();                                                                    \
+      } else {                                                                                   \
+        constexpr static ScalingRecipe CONST_NAME = ScalingRecipe::PerKVHead;                    \
+        return __VA_ARGS__();                                                                    \
+      }                                                                                          \
+    } else {                                                                                     \
+      constexpr static ScalingRecipe CONST_NAME = ScalingRecipe::PerKVHead;                      \
+      return __VA_ARGS__();                                                                      \
+    }                                                                                            \
+  }()

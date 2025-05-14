@@ -16,6 +16,7 @@
 
 #include "cutlass/arch/grid_dependency_control.h"
 
+#include "flash.h"
 #include "seqlen.h"
 #include "utils.h"
 #include "softmax.h"
@@ -60,6 +61,7 @@ public:
     using MainloopArguments = typename CollectiveMainloop::Arguments;
     using MainloopParams = typename CollectiveMainloop::Params;
     using BarrierQ = std::conditional_t<Use_TMA_Q, cutlass::arch::ClusterTransactionBarrier, cutlass::arch::ClusterBarrier>;
+    using BarrierQScale = cutlass::arch::ClusterTransactionBarrier;
 
     // Epilogue derived types
     using EpilogueArguments = typename CollectiveEpilogue::Arguments;
@@ -91,6 +93,15 @@ public:
     // and nothing else, so we'll pad in case sizeof(smem_o) > sizeof(smem_v).
     static constexpr int mainloop_smem_padding_ = int(sizeof(typename CollectiveEpilogue::TensorStorage)) - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)));
     static constexpr int mainloop_smem_padding = mainloop_smem_padding_ < 0 ? 0 : mainloop_smem_padding_;
+    struct PipelineStorage_KVBlockScaling : cute::aligned_struct<16, _1> {
+        alignas(16) typename CollectiveMainloop::MainloopPipelineKVScaling::SharedStorage pipeline_k_scaling;
+        alignas(16) typename CollectiveMainloop::MainloopPipelineKVScaling::SharedStorage pipeline_v_scaling;
+    };
+    using PipelineStorage_Scaling = cute::conditional_t<
+        Is_FP8 && CollectiveMainloop::kScalingRecipe == ScalingRecipe::PerQTokenKVBlock, 
+        PipelineStorage_KVBlockScaling,
+        std::nullptr_t
+    >;
     struct SharedStorage {
         struct TensorStorage : cute::aligned_struct<128, _1> {
             union {
@@ -104,6 +115,7 @@ public:
         } tensors;
         struct PipelineStorage : cute::aligned_struct<16, _1> {
             alignas(16) BarrierQ barrier_Q;
+            alignas(16) BarrierQScale barrier_Q_scale;
             alignas(16) BarrierQ barrier_Qv;
             alignas(16) cutlass::arch::ClusterBarrier barrier_O;
             alignas(16) typename CollectiveMainloop::MainloopPipelineK::SharedStorage pipeline_k;
@@ -113,7 +125,7 @@ public:
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
-
+        PipelineStorage_Scaling scaling_pipelines_kv;
     };
 
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -209,6 +221,7 @@ public:
 
         if (warp_idx == 0 && lane_predicate) {
             shared_storage.pipelines.barrier_Q.init(Use_TMA_Q ? 1 : NumProducerThreads /*numThreads*/);
+            shared_storage.pipelines.barrier_Q_scale.init(NumProducerThreads /*numThreads*/);
             if constexpr (HasQv) {
                 shared_storage.pipelines.barrier_Qv.init(Use_TMA_Q ? 1 : NumProducerThreads /*numThreads*/);
             }
@@ -231,7 +244,7 @@ public:
 
         static_assert(is_same_v<PipelineParamsK, PipelineParamsVt>);
         PipelineParamsVt pipeline_params_vt = pipeline_params_k;
-        if constexpr (Use_TMA_KV && !SameHeadDim) {
+        if constexpr (Use_TMA_KV && (!SameHeadDim || (Is_FP8 && CollectiveMainloop::kScalingRecipe == ScalingRecipe::PerQTokenKVBlock))) {
             pipeline_params_vt.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
             if constexpr (LargeHeadDimV) { pipeline_params_vt.num_consumers = NumMmaThreads; }
         } else {
@@ -292,6 +305,24 @@ public:
         }
         auto pipeline_v_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_v_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
 
+        auto [pipeline_k_scaling, pipeline_v_scaling] = [&] {
+            if constexpr (Is_FP8 && CollectiveMainloop::kScalingRecipe == ScalingRecipe::PerQTokenKVBlock) {
+                using MainloopPipelineKVScaling = typename CollectiveMainloop::MainloopPipelineKVScaling;
+                typename MainloopPipelineKVScaling::Params pipeline_params_kv_scaling;
+                pipeline_params_kv_scaling.role = warp_group_idx == 0
+                    ? MainloopPipelineKVScaling::ThreadCategory::Producer
+                    : MainloopPipelineKVScaling::ThreadCategory::Consumer;
+                pipeline_params_kv_scaling.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup;
+                pipeline_params_kv_scaling.producer_arv_count = NumProducerThreads;
+                return cute::make_tuple(
+                    MainloopPipelineKVScaling(shared_storage.scaling_pipelines_kv.pipeline_k_scaling, pipeline_params_kv_scaling),
+                    MainloopPipelineKVScaling(shared_storage.scaling_pipelines_kv.pipeline_v_scaling, pipeline_params_kv_scaling)
+                );
+            } else {
+                return cute::make_tuple(nullptr, nullptr);
+            }
+        }();
+
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
 
@@ -337,7 +368,7 @@ public:
                     get<0>(params.mainloop.shape_K_new),
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
-                    params.mainloop.seqlens_rotary
+                    params.mainloop.seqlens_rotary,
                 };
                 if constexpr (AppendKV) {
                     bool tile_new_valid = mainloop.load_kv_new(
@@ -353,8 +384,8 @@ public:
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
                 // pipeline_vt won't be used if we don't need to transpose V.
-                mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
-                                         shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
+                mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_k_scaling, pipeline_v_scaling, 
+                                         smem_pipe_write, shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
@@ -409,9 +440,11 @@ public:
                 if constexpr (Is_FP8 && !Has_softcap) {
                     int const bidh = get<1>(block_coord);
                     int const bidh_kv = !PackGQA ? params.mainloop.qhead_per_khead_divmod.divide(bidh) : bidh;
-                    float const q_descale = params.mainloop.ptr_q_descale == nullptr ? 1.0f : params.mainloop.ptr_q_descale[bidb * get<0>(params.mainloop.stride_q_descale) + bidh_kv * get<1>(params.mainloop.stride_q_descale)];
-                    float const k_descale = params.mainloop.ptr_k_descale == nullptr ? 1.0f : params.mainloop.ptr_k_descale[bidb * get<0>(params.mainloop.stride_k_descale) + bidh_kv * get<1>(params.mainloop.stride_k_descale)];
-                    softmax_scale_log2 *= q_descale * k_descale;
+                    if constexpr (CollectiveMainloop::kScalingRecipe == ScalingRecipe::PerKVHead) {
+                        float const q_descale = params.mainloop.ptr_q_descale == nullptr ? 1.0f : params.mainloop.ptr_q_descale[bidb * get<0>(params.mainloop.stride_q_descale) + bidh_kv * get<1>(params.mainloop.stride_q_descale)];
+                        float const k_descale = params.mainloop.ptr_k_descale == nullptr ? 1.0f : params.mainloop.ptr_k_descale[bidb * get<0>(params.mainloop.stride_k_descale) + bidh_kv * get<1>(params.mainloop.stride_k_descale)];
+                        softmax_scale_log2 *= q_descale * k_descale;
+                    }
                 }
                 flash::Softmax<!LargeHeadDimV ? 2 * (2 * kBlockM / NumMmaThreads) : 2, /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
                 // Attention output (GEMM-II) accumulator.
@@ -419,12 +452,12 @@ public:
                 bool tile_valid;
                 if constexpr (!LargeHeadDimV) {
                     tile_valid = mainloop.mma(
-                        params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
+                        params.mainloop, pipeline_k, pipeline_v, pipeline_k_scaling, pipeline_v_scaling, smem_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
-                            params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
+                            params.mainloop, pipeline_k, pipeline_v, pipeline_k_scaling, pipeline_v_scaling, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
                     } else {
                         tile_valid = mainloop.mma_pv(
