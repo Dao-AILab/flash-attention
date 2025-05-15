@@ -92,7 +92,7 @@ struct CollectiveEpilogueFwd {
     using CopyOpR2S = std::conditional_t<
         ArchTag::kMinComputeCapability >= 90,
         // cute::SM90_U32x4_STSM_N if Element size is 2 bytes (fp16, bf16)
-        decltype(cutlass::epilogue::collective::detail::sm90_get_smem_store_op_for_accumulator<StrideO, Element>()),
+        decltype(cutlass::epilogue::collective::detail::sm90_get_smem_store_op_for_accumulator<StrideO, Element, TileShape_MNK_PV>()),
         AutoVectorizingCopyWithAssumedAlignment<128>
     >;
     using SmemCopyAtomO = Copy_Atom<CopyOpR2S, Element>;
