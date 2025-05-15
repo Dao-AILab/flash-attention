@@ -127,6 +127,7 @@ struct CollectiveMainloopFwdSm90 {
     static_assert(NumMmaWarpGroups == 1 || NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
 
     using QScaleCopyAtom = Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<float>, float>;
+    // using QScaleCopyAtom = Copy_Atom<DefaultCopy, float>;
     using KVScaleCopyAtom = Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<float>, float>;
 
     using SmemLayoutAtomQ = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
@@ -624,8 +625,6 @@ struct CollectiveMainloopFwdSm90 {
          MainloopPipelineK pipeline_k,
          MainloopPipelineV pipeline_v,
          MainloopPipelineVt pipeline_vt,
-         MainloopPipelineKVScaling pipeline_k_scaling,
-         MainloopPipelineKVScaling pipeline_v_scaling,
          PipelineState& smem_pipe_write,
          SharedStorage &shared_storage,
          SchedulerPrefetch const& scheduler_prefetch,
@@ -836,7 +835,10 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (!PagedKVNonTMA) {
                 if constexpr (Is_FP8 && kScalingRecipe == ScalingRecipe::PerQTokenKVBlock) {
                     if (should_load_scales) {
-                        copy(scale_copy_k_per_block, tKgK_per_block_scale(_, n_block), tKsK_per_block_scale(_, smem_pipe_write.index()));
+                        // TODO: uncomment this for cp.async.
+                        // copy(scale_copy_k_per_block, tKgK_per_block_scale(_, n_block), tKsK_per_block_scale(_, smem_pipe_write.index()));
+                        // TODO: comment out these two lines to use cp.async.
+                        copy(tKgK_per_block_scale(_, n_block), tKsK_per_block_scale(_, smem_pipe_write.index()));
                         pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
                     }
                 }
@@ -878,7 +880,10 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_v.producer_acquire(smem_pipe_write);
             if constexpr (Is_FP8 && kScalingRecipe == ScalingRecipe::PerQTokenKVBlock) {
                 if (should_load_scales) {
-                    copy(scale_copy_v_per_block, tVgV_per_block_scale(_, n_block), tVsV_per_block_scale(_, smem_pipe_write.index()));
+                    // TODO: uncomment this for cp.async.
+                    // copy(scale_copy_v_per_block, tVgV_per_block_scale(_, n_block), tVsV_per_block_scale(_, smem_pipe_write.index()));
+                    // TODO: comment out this line to use cp.async.
+                    tVsV_per_block_scale(_0{}, smem_pipe_write.index()) = tVgV_per_block_scale(_0{}, n_block);
                 }
             } 
             transpose_V(smem_pipe_write.index());
@@ -886,7 +891,10 @@ struct CollectiveMainloopFwdSm90 {
             cutlass::arch::fence_view_async_shared();
             if constexpr (Is_FP8 && kScalingRecipe == ScalingRecipe::PerQTokenKVBlock) {
                 if (should_load_scales) {
-                    pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+                    // TODO: uncomment this line to use cp.async.
+                    // pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+                    // Comment out this line to use cp.async.
+                    pipeline_v.producer_commit(smem_pipe_write);
                 } else {
                     pipeline_v.producer_commit(smem_pipe_write);
                 }
@@ -961,9 +969,16 @@ struct CollectiveMainloopFwdSm90 {
                 auto idx = thread_idx + m_block * kBlockM;
                 auto tQpQ = make_tensor<bool>(SmemLayoutQPerTokenScaleAtom{}.shape());
                 static_assert(size(tQpQ) == 1);
-                tQpQ(0) = idx < seqlen_info.seqlen_q;
-                copy(scale_copy_q_per_token.with(tQpQ(0)), tQgQ_per_token_scale, tQsQ_per_token_scale);
-                cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&shared_storage.pipelines.barrier_Q_scale));
+                // TODO: uncomment these lines to use cp.async.
+                // tQpQ(0) = idx < seqlen_info.seqlen_q;
+                // copy(scale_copy_q_per_token.with(tQpQ(0)), tQgQ_per_token_scale, tQsQ_per_token_scale);
+                // cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&shared_storage.pipelines.barrier_Q_scale));
+
+                // TODO: comment out the 3 lines below to use cp.async.
+                if (idx < seqlen_info.seqlen_q) {
+                    copy(tQgQ_per_token_scale, tQsQ_per_token_scale);
+                }
+
                 shared_storage.pipelines.barrier_Q_scale.arrive();
             }
         }
@@ -1078,8 +1093,6 @@ struct CollectiveMainloopFwdSm90 {
     mma(Params const& params,
         MainloopPipelineK pipeline_k,
         MainloopPipelineV pipeline_v,
-        MainloopPipelineKVScaling pipeline_k_scaling,
-        MainloopPipelineKVScaling pipeline_v_scaling,
         PipelineState& smem_pipe_read,
         FrgTensorO& tOrO,
         Softmax& softmax,
@@ -1255,11 +1268,6 @@ struct CollectiveMainloopFwdSm90 {
         auto &barrier_Q_scale = shared_storage.pipelines.barrier_Q_scale;
         if constexpr (!AppendKV) {
             barrier_Q.wait(work_idx % 2);
-            if constexpr (Is_FP8 && kScalingRecipe != ScalingRecipe::PerKVHead) {
-                if (params.ptr_q_descale) {
-                    barrier_Q_scale.wait(work_idx % 2);
-                }
-            }
         } else {
             if (get<1>(params.shape_rotary) > 0) {  // Apply rotary to Q
                 using Rotary_t = Rotary<kBlockM, kHeadDim, NumMmaThreadsQK, Element, !(Is_causal || Is_local) /*FixedPosition*/>;
@@ -1275,6 +1283,11 @@ struct CollectiveMainloopFwdSm90 {
                         rotary.template load_cos_sin_packgqa<true /*kInterleaved*/>(m_block, params.qhead_per_khead_divmod)
                     );
                     barrier_Q.wait(work_idx % 2);
+                    if constexpr (Is_FP8 && kScalingRecipe != ScalingRecipe::PerKVHead) {
+                        if (params.ptr_q_descale) {
+                            barrier_Q_scale.wait(work_idx % 2);
+                        }
+                    }
                     rotary.apply_Q_interleaved(sQ_pi, tRrCos, tRrSin, m_block, qhead_per_khead);
                 } else {
                     auto [tRrCosCont, tRrSinCont] = cute::conditional_return<!PackGQA>(
@@ -1282,6 +1295,11 @@ struct CollectiveMainloopFwdSm90 {
                         rotary.template load_cos_sin_packgqa<false /*kInterleaved*/>(m_block, params.qhead_per_khead_divmod)
                     );
                     barrier_Q.wait(work_idx % 2);
+                    if constexpr (Is_FP8 && kScalingRecipe != ScalingRecipe::PerKVHead) {
+                        if (params.ptr_q_descale) {
+                            barrier_Q_scale.wait(work_idx % 2);
+                        }
+                    }
                     rotary.apply_Q_contiguous(sQ_pi, tRrCosCont, tRrSinCont, m_block, qhead_per_khead);
                 }
                 // SMEM fence to make sure the rotated Q is visible to GMMA
@@ -1305,6 +1323,9 @@ struct CollectiveMainloopFwdSm90 {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             auto tQscale_row = [&] {
                 if constexpr (Is_FP8 && kScalingRecipe == ScalingRecipe::PerQTokenKVBlock) {
+                    if (params.ptr_q_descale) {
+                        barrier_Q_scale.wait(work_idx % 2);
+                    }
                     auto thread_mma = TiledMmaQK{}.get_thread_slice(thread_idx);
                     Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
                     Tensor tScS = thread_mma.partition_C(cS);
@@ -1386,7 +1407,9 @@ struct CollectiveMainloopFwdSm90 {
                     tKscale_col(1) = sK_per_scale(smem_pipe_read.index());
                 }
                 if constexpr(!HasQv) {
-                    if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
+                    if (!UseSchedulerBarrier || warp_group_idx == 0) { 
+                        consumer_wait(pipeline_v, smem_pipe_read_v); 
+                    }
                 }
                 if constexpr (RescaleOBeforeGemm) { 
                     if constexpr (Is_FP8 && kScalingRecipe == ScalingRecipe::PerQTokenKVBlock) {
@@ -1417,6 +1440,10 @@ struct CollectiveMainloopFwdSm90 {
                     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
                 }
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
+                if constexpr (Is_FP8 && kScalingRecipe == ScalingRecipe::PerQTokenKVBlock) {
+                    tKscale_col(0) = tKscale_col(1); 
+                    tKscale_col(1) = sK_per_scale(smem_pipe_read.index());
+                }
                 convert_type_out(make_tensor(tSrS.data(), tOrP.layout()), tOrP);
                 if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
@@ -1453,7 +1480,9 @@ struct CollectiveMainloopFwdSm90 {
             }
             // Tell producers that smem_q is ready
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
-            if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
+            if constexpr (!HasQv) { 
+                consumer_wait(pipeline_v, smem_pipe_read); 
+            }
             if constexpr (RescaleOBeforeGemm) { 
                 if constexpr (Is_FP8 && kScalingRecipe == ScalingRecipe::PerQTokenKVBlock) {
                     tVscale_row(0) = tVscale_row(1);

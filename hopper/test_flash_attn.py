@@ -149,12 +149,15 @@ def test_flash_attn_output(
                 q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
             elif scaling_recipe == 1:
                 kBlockN = 224 
-                q_descale = (torch.rand(nheads, batch_size * seqlen_q, device=device, dtype=torch.float32)).T
+                # q_descale = (torch.rand(nheads, batch_size * seqlen_q, device=device, dtype=torch.float32)).T
+                q_descale = (torch.ones(nheads, batch_size * seqlen_q, device=device, dtype=torch.float32)).T
                 q_descale_ref = q_descale.reshape(batch_size, seqlen_q, nheads)
-                k_descale = (torch.rand(nheads_kv, int((seqlen_k + kBlockN - 1) / kBlockN) * batch_size, device=device, dtype=torch.float32) * 2).T
+                # k_descale = (torch.rand(nheads_kv, int((seqlen_k + kBlockN - 1) / kBlockN) * batch_size, device=device, dtype=torch.float32) * 2).T
+                k_descale = (torch.ones(nheads_kv, int((seqlen_k + kBlockN - 1) / kBlockN) * batch_size, device=device, dtype=torch.float32) * 2).T
                 k_descale_ref = repeat(k_descale, "b_s_block h -> (b_s_block block_size) h", block_size=kBlockN)
                 k_descale_ref = k_descale_ref.reshape(batch_size, -1, k_descale_ref.shape[-1], 1)[:, : seqlen_k, :, :]
-                v_descale = (torch.rand(nheads_kv, int((seqlen_k + kBlockN - 1) / kBlockN) * batch_size, device=device, dtype=torch.float32) * 2).T
+                # v_descale = (torch.rand(nheads_kv, int((seqlen_k + kBlockN - 1) / kBlockN) * batch_size, device=device, dtype=torch.float32) * 2).T
+                v_descale = (torch.ones(nheads_kv, int((seqlen_k + kBlockN - 1) / kBlockN) * batch_size, device=device, dtype=torch.float32) * 2).T
                 v_descale_ref = repeat(v_descale, "b_s_block h -> (b_s_block block_size) h", block_size=kBlockN)
                 v_descale_ref = v_descale_ref.reshape(batch_size, -1, v_descale_ref.shape[-1], 1)[:, : seqlen_k, :, :]
             else:
@@ -243,24 +246,24 @@ def test_flash_attn_output(
             # print(f"{out=}")
             # print(f"{out_ref=}")
 
-            # for b in range(out.shape[0]):
-            #     for h in range(out.shape[2]):
-            #         out_bh = out[b, :, h, :]
-            #         out_ref_bh = out_ref[b, :, h, :]
-            #         print(f"b = {b}, h = {h}, max abs diff = {(out_bh - out_ref_bh).abs().max().item()}")
-            #         if (out_bh - out_ref_bh).abs().max().item() > rtol * (out_pt - out_ref).abs().max().item() + fwd_atol:
-            #         # if (out_bh - out_ref_bh).abs().max().item() > 0.01:
-            #             print(f"b = {b}, h = {h} failed")
-            #             for s in range(out.shape[1]):
-            #                 out_bh_s = out_bh[s]
-            #                 out_ref_bh_s = out_ref_bh[s]
-            #                 # if (out_bh_s - out_ref_bh_s).abs().max().item() > rtol * (out_pt - out_ref).abs().max().item() + fwd_atol:
-            #                 max_diff = (out_bh_s - out_ref_bh_s).abs().max().item()
-            #                 print(f"b = {b}, h = {h}, s = {s}, {max_diff = }")
-            #                 if max_diff > 0.01:
-            #                     print(f"b = {b}, h = {h}, s = {s} failed")
-            #                 # print(f"b = {b}, h = {h}, s = {s}, {out_bh_s=}")
-            #                 # print(f"b = {b}, h = {h}, s = {s}, {out_ref_bh_s=}")
+            for b in range(out.shape[0]):
+                for h in range(out.shape[2]):
+                    out_bh = out[b, :, h, :]
+                    out_ref_bh = out_ref[b, :, h, :]
+                    print(f"b = {b}, h = {h}, max abs diff = {(out_bh - out_ref_bh).abs().max().item()}")
+                    if (out_bh - out_ref_bh).abs().max().item() > rtol * (out_pt - out_ref).abs().max().item() + fwd_atol:
+                    # if (out_bh - out_ref_bh).abs().max().item() > 0.01:
+                        print(f"b = {b}, h = {h} failed")
+                        for s in range(out.shape[1]):
+                            out_bh_s = out_bh[s]
+                            out_ref_bh_s = out_ref_bh[s]
+                            # if (out_bh_s - out_ref_bh_s).abs().max().item() > rtol * (out_pt - out_ref).abs().max().item() + fwd_atol:
+                            max_diff = (out_bh_s - out_ref_bh_s).abs().max().item()
+                            print(f"b = {b}, h = {h}, s = {s}, {max_diff = }")
+                            if max_diff > 0.01:
+                                print(f"b = {b}, h = {h}, s = {s} failed")
+                            # print(f"b = {b}, h = {h}, s = {s}, {out_bh_s=}")
+                            # print(f"b = {b}, h = {h}, s = {s}, {out_ref_bh_s=}")
             assert (out - out_ref).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
 
         if (
@@ -862,14 +865,14 @@ def test_flash_attn_kvcache(
         if dtype == torch.float8_e4m3fn:
             if scaling_recipe == 0:
                 q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_k, device=device, dtype=torch.float32) * 2 for _ in range(3)]
-            elif scaling_recipe == 2:
+            elif scaling_recipe == 1:
                 kBlockN = 224 if page_size is None else 160
                 q_descale = (torch.rand(nheads, batch_size * seqlen_q, device=device, dtype=torch.float32)).T
                 q_descale_ref = q_descale.reshape(batch_size, seqlen_q, nheads)
                 k_descale = (torch.rand(nheads_k, (seqlen_k + kBlockN - 1) // kBlockN * batch_size, device=device, dtype=torch.float32) * 2).T
                 k_descale_ref = repeat(k_descale, "b_s_block h -> (b_s_block block_size) h", block_size=kBlockN)
                 k_descale_ref = k_descale_ref.reshape(batch_size, -1, k_descale_ref.shape[-1], 1)[:, : seqlen_k, :, :]
-                v_descale = (torch.ones(nheads_k, (seqlen_k + kBlockN - 1) // kBlockN * batch_size, device=device, dtype=torch.float32) * 1).T
+                v_descale = (torch.rand(nheads_k, (seqlen_k + kBlockN - 1) // kBlockN * batch_size, device=device, dtype=torch.float32) * 1).T
                 v_descale_ref = repeat(v_descale, "b_s_block h -> (b_s_block block_size) h", block_size=kBlockN)
                 v_descale_ref = v_descale_ref.reshape(batch_size, -1, v_descale_ref.shape[-1], 1)[:, : seqlen_k, :, :]
             else:
