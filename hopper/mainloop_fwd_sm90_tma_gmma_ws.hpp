@@ -883,7 +883,7 @@ struct CollectiveMainloopFwdSm90 {
                     // TODO: uncomment this for cp.async.
                     // copy(scale_copy_v_per_block, tVgV_per_block_scale(_, n_block), tVsV_per_block_scale(_, smem_pipe_write.index()));
                     // TODO: comment out this line to use cp.async.
-                    tVsV_per_block_scale(_0{}, smem_pipe_write.index()) = tVgV_per_block_scale(_0{}, n_block);
+                    copy(tVgV_per_block_scale(_, n_block), tVsV_per_block_scale(_, smem_pipe_write.index()));
                 }
             } 
             transpose_V(smem_pipe_write.index());

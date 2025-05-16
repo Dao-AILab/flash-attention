@@ -29,6 +29,7 @@ try:
     import cudnn
 except ImportError:
     cudnn = None
+cudnn = None
 
 
 def convert_to_cudnn_type(torch_type):
@@ -198,13 +199,21 @@ def attention_pytorch(qkv, dropout_p=0.0, causal=True):
     output = torch.einsum('bhts,bshd->bthd', attention_drop , v)
     return output.to(dtype=qkv.dtype)
 
-def flops(batch, seqlen, headdim, nheads, causal, mode="fwd"):
+def flops(batch, q_seqlen, seqlen, headdim, nheads, causal, mode="fwd"):
     assert mode in ["fwd", "bwd", "fwd_bwd"]
-    f = 4 * batch * seqlen**2 * nheads * headdim // (2 if causal else 1)
+    f = 4 * batch * q_seqlen * seqlen * nheads * headdim // (2 if causal else 1)
     return f if mode == "fwd" else (2.5 * f if mode == "bwd" else 3.5 * f)
 
 def efficiency(flop, time):
     return (flop / time / 10**12) if not math.isnan(time) else 0.0
+
+def data_size(batch, q_seqlen, seqlen, headdim, nheads, nkvheads, nbytes, mode="fwd"):
+    assert mode in ["fwd"]
+    d_size = batch * nbytes * headdim * (q_seqlen * nheads * 2 + seqlen * nkvheads * 2)
+    return d_size
+
+def mem_bw(nbytes, time):
+    return (nbytes / time / 1024 / 1024 / 1024 / 1024) if not math.isnan(time) else 0.0
 
 def time_fwd(func, *args, **kwargs):
     time.sleep(1) # Sleep to avoid residual power throttling from the previous benchmark
@@ -216,30 +225,50 @@ torch.manual_seed(0)
 
 repeats = 30
 device = 'cuda'
-# dtype = torch.float16
+dtype = torch.float16
 dtype = torch.float8_e4m3fn
+is_gqa = True
 
+# For prefill
+q_seqlen_val = None
 # bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4224), (2, 8448), (1, 8448 * 2)]
-bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 8192 * 2)]
+# bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 8192 * 2)]
+bs_seqlen_vals = [(1, 2048 * 8)]
+# bs_seqlen_vals = [(32, 8192), (32, 2048)]
+
+# For decode 
+# q_seqlen_val = 1
+# q_seqlen_val = 4
+# bs_seqlen_vals = [(1, 128)]
 # bs_seqlen_vals = [(4, 4096), (2, 8192), (1, 8192 * 2)]
 # bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048)]
-causal_vals = [False, True]
-headdim_vals = [64, 128, 256]
-dim = 2048
+# bs_seqlen_vals = [(32, 8192*4), (32, 8192*2), (32, 8192), (32, 4096), (32, 2048), (32, 1024), (64, 8192*2), (128, 8192), (128, 4096), (128, 2048), (128, 1024)]
+
+
+# causal_vals = [False, True]
+causal_vals = [True]
+# headdim_vals = [64, 128, 256]
+headdim_vals = [128]
+dim = 128 * 16
 # dim = 256
 dropout_p = 0.0
 
-methods = (["Pytorch", "Flash3"]
-        + (["cuDNN"] if cudnn is not None else [])
-        # + (["Triton"] if attention_triton is not None else [])
-        #    + (["xformers.c"] if xops is not None else [])
-        #    + (["xformers.f"] if xops is not None else [])
-           )
+# scaling_recipe = 1
+scaling_recipe = 0
+
+methods = (["Flash3"])
+# methods = (["Pytorch", "Flash3"]
+#         + (["cuDNN"] if cudnn is not None else [])
+#         # + (["Triton"] if attention_triton is not None else [])
+#         #    + (["xformers.c"] if xops is not None else [])
+#         #    + (["xformers.f"] if xops is not None else [])
+#         )
 
 time_f = {}
 time_b = {}
 time_f_b = {}
 speed_f = {}
+mem_bw_f = {}
 speed_b = {}
 speed_f_b = {}
 for causal in causal_vals:
@@ -248,40 +277,56 @@ for causal in causal_vals:
             torch.cuda.empty_cache()
             config = (causal, headdim, batch_size, seqlen)
             nheads = dim // headdim
-            q, k, v = [torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16, requires_grad=False) for _ in range(3)]
+            nkvheads = 1 if is_gqa else nheads
+            if q_seqlen_val is not None:
+                q_seqlen = q_seqlen_val
+                q = torch.rand(batch_size, q_seqlen, nheads, headdim, device=device, dtype=torch.bfloat16, requires_grad=False)
+            else:
+                q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16, requires_grad=False)
+                q_seqlen = seqlen
+            k, v = [torch.randn(batch_size, seqlen, nkvheads, headdim, device=device, dtype=torch.bfloat16, requires_grad=False) for _ in range(2)]
             
-            qkv = torch.stack([q, k, v], dim=2)
-            qkv = qkv.to(torch.bfloat16)
-            f = time_fwd(attention_pytorch, qkv, dropout_p, causal=causal, repeats=repeats, verbose=False)
-            time_f[config, "Pytorch"] = f
-            res_baseline = attention_pytorch(qkv, dropout_p, causal=causal)
+            # qkv = torch.stack([q, k, v], dim=2)
+            # qkv = qkv.to(torch.bfloat16)
+            # f = time_fwd(attention_pytorch, qkv, dropout_p, causal=causal, repeats=repeats, verbose=False)
+            # time_f[config, "Pytorch"] = f
+            # res_baseline = attention_pytorch(qkv, dropout_p, causal=causal)
 
-            if attention_triton is not None:
-                q_transposed = q.transpose(1, 2).contiguous().to(torch.float8_e4m3fn)
-                k_transposed = k.transpose(1, 2).contiguous().to(torch.float8_e4m3fn)
-                v_transposed = v.transpose(1, 2).contiguous().permute(0, 1, 3, 2).to(torch.float8_e4m3fn)
-                scale = 1 / math.sqrt(headdim)
-                f = time_fwd(
-                    attention_triton, q_transposed, k_transposed, v_transposed,
-                    causal, scale, repeats=5, verbose=False, desc='Triton'
-                )
-                f = time_fwd(
-                    attention_triton, q_transposed, k_transposed, v_transposed,
-                    causal, scale, repeats=repeats, verbose=False, desc='Triton'
-                )
-                time_f[config, "Triton"] = f
-                res = attention_triton(
-                    q_transposed, k_transposed, v_transposed.permute(0, 1, 3, 2),
-                    causal, scale
-                ).half().transpose(1, 2)
-                torch.testing.assert_close(res, res_baseline, atol=0.5, rtol=0.5)
+            # if attention_triton is not None:
+            #     q_transposed = q.transpose(1, 2).contiguous().to(torch.float8_e4m3fn)
+            #     k_transposed = k.transpose(1, 2).contiguous().to(torch.float8_e4m3fn)
+            #     v_transposed = v.transpose(1, 2).contiguous().permute(0, 1, 3, 2).to(torch.float8_e4m3fn)
+            #     scale = 1 / math.sqrt(headdim)
+            #     f = time_fwd(
+            #         attention_triton, q_transposed, k_transposed, v_transposed,
+            #         causal, scale, repeats=5, verbose=False, desc='Triton'
+            #     )
+            #     f = time_fwd(
+            #         attention_triton, q_transposed, k_transposed, v_transposed,
+            #         causal, scale, repeats=repeats, verbose=False, desc='Triton'
+            #     )
+            #     time_f[config, "Triton"] = f
+            #     res = attention_triton(
+            #         q_transposed, k_transposed, v_transposed.permute(0, 1, 3, 2),
+            #         causal, scale
+            #     ).half().transpose(1, 2)
+            #     torch.testing.assert_close(res, res_baseline, atol=0.5, rtol=0.5)
 
             # out = torch.empty_like(q)
             q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
             softmax_scale = q.shape[-1] ** (-0.5)
-            descale_q = torch.tensor([1.0], dtype=torch.float32, device='cuda')
-            descale_k = torch.tensor([1.0], dtype=torch.float32, device='cuda')
-            descale_v = torch.tensor([1.0], dtype=torch.float32, device='cuda')
+            if scaling_recipe == 0:
+                q_descale = torch.tensor([[1.0] * nkvheads] * batch_size, dtype=torch.float32, device='cuda')
+                k_descale = torch.tensor([[1.0] * nkvheads] * batch_size, dtype=torch.float32, device='cuda') 
+                v_descale = torch.tensor([[1.0] * nkvheads] * batch_size, dtype=torch.float32, device='cuda') 
+            elif scaling_recipe == 1:
+                q_descale = torch.tensor([[1.0] * int(q_seqlen * batch_size)] * nheads, dtype=torch.float32, device='cuda').T
+                k_descale = torch.tensor([[1.0] * int((seqlen + 223) / 224) * batch_size] * nkvheads, dtype=torch.float32, device='cuda').T
+                v_descale = torch.tensor([[1.0] * int((seqlen + 223) / 224) * batch_size] * nkvheads, dtype=torch.float32, device='cuda').T
+            else:
+                raise ValueError(f"Unsupported scaling recipe: {scaling_recipe}")
+
+            # print(f"{q_descale.shape=}, {q_descale.stride()=}, {k_descale.shape=}, {k_descale.stride()=}", flush=True)
 
             # f = time_fwd(flash_attn_func, q, k, v, causal=causal, repeats=repeats, verbose=False)
             f = time_fwd(
@@ -289,14 +334,32 @@ for causal in causal_vals:
                 q, 
                 k, 
                 v, 
-                softmax_scale, 
+                None, # k_new,
+                None, # v_new,
+                None, # qv,
+                None, # out,
+                None, # cu_seqlens_q,
+                None, # cu_seqlens_k,
+                None, # cu_seqlens_k_new,
+                None, # seqused_q,
+                None, # seqused_k,
+                None, # max_seqlen_q,
+                None, # max_seqlen_k,
+                None, # page_table,
+                None, # kv_batch_idx,
+                None, # leftpad_k,
+                None, # rotary_cos,
+                None, # rotary_sin,
+                None, # seqlens_rotary,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                softmax_scale=softmax_scale, 
                 causal=causal,
                 window_size=(-1,-1),
-                descale_q=descale_q, 
-                descale_k=descale_k, 
-                descale_v=descale_v, 
                 repeats=repeats, 
-                verbose=False
+                verbose=False,
+                scaling_recipe=scaling_recipe,
             )
 
             # res = flash_attn_func(q, k, v, causal=causal)
@@ -340,12 +403,16 @@ for causal in causal_vals:
             print(f"### causal={causal}, headdim={headdim}, batch_size={batch_size}, seqlen={seqlen} ###")
             for method in methods:
                 speed_f[config, method] = efficiency(
-                    flops(batch_size, seqlen, headdim, nheads, causal, mode="fwd"),
+                    flops(batch_size, q_seqlen, seqlen, headdim, nheads, causal, mode="fwd"),
+                    time_f[config, method]
+                )
+                mem_bw_f[config, method] = mem_bw(
+                    data_size(batch_size, q_seqlen, seqlen, headdim, nheads, nkvheads, 1 if dtype == torch.float8_e4m3fn else 2, mode="fwd"),
                     time_f[config, method]
                 )
                 #print (time_f[config,method])
                 print(
-                    f"{method} fwd: {speed_f[config, method]:.2f} TFLOPs/s, {time_f[config, method] * 1e3} ms, "
+                    f"{method} fwd: {speed_f[config, method]:.2f} TFLOPs/s, {mem_bw_f[config, method]:.2f} TB/s, {time_f[config, method] * 1e3} ms, "
                 )
 
 
