@@ -1408,7 +1408,7 @@ def _bwd_kernel_dkdvdq_causal(
                              head_q_idx * stride_dropout_h)
 
         MASK_BLOCK_M: tl.constexpr = BLOCK_M // BLK_SLICE_FACTOR
-        # bound the masked operation to q len so it does not have to wast cycles
+        # bound the masked operation to q len so it does not have to waste cycles
         len_m = min(len_m, seqlen_q)
         num_steps = tl.cdiv(len_m, MASK_BLOCK_M)
         
@@ -1610,7 +1610,7 @@ def _bwd_kernel_dkdv_causal(
                              head_q_idx * stride_dropout_h)
 
         MASK_BLOCK_M: tl.constexpr = BLOCK_M // BLK_SLICE_FACTOR
-        # bound the masked operation to q len so it does not have to wast cycles
+        # bound the masked operation to q len so it does not have to waste cycles
         len_m = min(len_m, seqlen_q)
         num_steps = tl.cdiv(len_m, MASK_BLOCK_M)
         # when q < k, we may skip the initial masked op
