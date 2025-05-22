@@ -134,7 +134,7 @@ def test_flash_attn_output(
         else:
             qv_ref = None
         # Put window_size after QKV randn so that window_size changes from test to test
-        window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+        window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
         # window_size = (-1, -1) if not local else (16, 0)
         if dtype == torch.float8_e4m3fn:
             q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
