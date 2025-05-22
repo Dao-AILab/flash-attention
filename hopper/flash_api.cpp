@@ -3,8 +3,8 @@
  ******************************************************************************/
 
 #include <Python.h>
-#include <torch/nn/functional.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <torch/nn/functional/padding.h>
+#include <ATen/cuda/CUDAContextLight.h>
 #include <c10/cuda/CUDAGuard.h>
 
 #include <cutlass/numeric_types.h>
