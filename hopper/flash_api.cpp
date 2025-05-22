@@ -4,7 +4,6 @@
 
 #include <Python.h>
 #include <torch/nn/functional.h>
-#include <torch/version.h>  // For TORCH_VERSION* macros
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
