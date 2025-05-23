@@ -14,7 +14,7 @@ import flash_attn_3._C # Registers operators with PyTorch
 flash_attn_3_cuda = torch.ops.flash_attn_3
 
 def maybe_contiguous(x):
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+    return x.contiguous() if x is not None else x
 
 
 def _flash_attn_forward(
