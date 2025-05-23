@@ -386,6 +386,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = get_hip_version()
+        if hip_version > Version('5.5.00000'):
+            cc_flag += ["-mllvm", "--lsr-drop-solution=1"]
         if hip_version > Version('5.7.23302'):
             cc_flag += ["-fno-offload-uniform-block"]
         if hip_version > Version('6.1.40090'):
