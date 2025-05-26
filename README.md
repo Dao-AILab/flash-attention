@@ -4,7 +4,7 @@
 
 ```bash
 export FLASH_ATTENTION_FORCE_BUILD=TRUE
-export FLASH_ATTN_CUDA_ARCHS=80 # for amper or adalove
+export FLASH_ATTN_CUDA_ARCHS=80 # for amper or ada
 # export FLASH_ATTN_CUDA_ARCHS=90 # for hopper 
 pip install .
 ```
