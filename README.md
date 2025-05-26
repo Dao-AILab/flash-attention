@@ -11,9 +11,18 @@ pip install .
 
 If the build fails due to missing `nvcc`, ensure the CUDA toolkit is installed and available.
 For example, you can install CUDA 12.4 via conda:
-   conda install -c nvidia cuda-toolkit=12.4
+```
+conda install -c nvidia cuda-toolkit=12.4
+```
 After installation, verify that `nvcc` is in your PATH:
-   which nvcc
+```
+which nvcc
+```
+If not, you may need to manually add it to PATH:
+```
+export PATH=$CONDA_PREFIX/bin:$PATH
+```
+
 
 ## Usage
 
