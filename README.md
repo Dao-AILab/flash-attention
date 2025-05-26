@@ -1,12 +1,32 @@
 # Flash Attention 2 with Tree Attention
 
-To install:
+## Install
+
 ```bash
 export FLASH_ATTENTION_FORCE_BUILD=TRUE
-export FLASH_ATTN_CUDA_ARCHS=80 # amper or adalove
-# export FLASH_ATTN_CUDA_ARCHS=90 # hopper 
+export FLASH_ATTN_CUDA_ARCHS=80 # for amper or adalove
+# export FLASH_ATTN_CUDA_ARCHS=90 # for hopper 
 pip install .
 ```
+
+If the build fails due to missing `nvcc`, ensure the CUDA toolkit is installed and available.
+For example, you can install CUDA 12.4 via conda:
+   conda install -c nvidia cuda-toolkit=12.4
+After installation, verify that `nvcc` is in your PATH:
+   which nvcc
+
+## Usage
+
+Add the following two lines in your code to enable `flash_attn` with tree attention:
+
+```python
+from flash_attn.patch_fa_tree_attn import patch_FA_tree_attn
+patch_FA_tree_attn()
+```
+
+Additionally, for `transformers` models, make sure to enable `attn_implementation=flash_attention_2` during model initialization. Also, provide extra `FlashAttentionKwargs` in the same way as shown in [`patch.py`](https://github.com/efsotr/nano-patch-sequence-pack/blob/main/patch.py) from the nano-patch-sequence-pack repository, as demonstrated [here](https://github.com/efsotr/flash-attention-w-tree-attn/blob/0c43a382841cbc48d7b57d20fbea7a0b7887eaf8/flash_attn/patch_fa_tree_attn.py#L14) in the tree attention patch.
+
+Specifically, set `tree_dfs_order_end_k` and `tree_dfs_order_start_q` according to the following [Example](#Example)
 
 ## Tree Attention
 
