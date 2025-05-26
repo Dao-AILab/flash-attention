@@ -12,16 +12,16 @@ def get_single_grad(x):
     return grad
 
 def get_grad(*args):
-    grads = [torch.cat(list(chain([[get_single_grad(sub2) for sub2 in sub] for sub in arg]))) for arg in args]
+    grads = [torch.cat(list(chain(*[[get_single_grad(sub2) for sub2 in sub] for sub in arg]))) for arg in args]
     return grads
 
 def prepare_tree_attn(q_chunks, k_chunks, v_chunks, chunk_lens):
-    q = torch.cat(list(chain(q_chunks)))
-    k = torch.cat(list(chain(k_chunks)))
-    v = torch.cat(list(chain(v_chunks)))
-    lens = torch.tensor(list(map(lambda x: sum(map(len, x)), chunk_lens)), dtype=torch.int, device="cuda")
+    q = torch.cat(list(chain(*q_chunks)))
+    k = torch.cat(list(chain(*k_chunks)))
+    v = torch.cat(list(chain(*v_chunks)))
+    lens = torch.tensor(list(map(lambda x: sum(x), chunk_lens)), dtype=torch.int, device="cuda")
     max_seqlen = lens.max().item()
-    cu_seqlens = F.pad(torch.cumsum(lens), pad=(1, 0))
+    cu_seqlens = F.pad(torch.cumsum(lens, dim=0), pad=(1, 0)).int()
     tree_dfs_order_start_q = []
     tree_dfs_order_end_k = []
     for lens in chunk_lens:
@@ -67,7 +67,7 @@ def pad(chunks):
     return inputs
 
 def prepare(*args):
-    args = [pad(arg) for arg in args[:-1]]
+    args = [pad(arg) for arg in args]
     return args
 
 def pack(out, chunk_lens):
@@ -76,7 +76,7 @@ def pack(out, chunk_lens):
     for chunk in chunk_lens:
         mask.append([1] * (chunk[0] + chunk[1]) + [0] * (max_len - chunk[0] - chunk[1]))
         for r in chunk[2:]:
-            mask.extend([0] * chunk[0] + [1] * r + [0] * (max_len - chunk[0] - r))
+            mask.append([0] * chunk[0] + [1] * r + [0] * (max_len - chunk[0] - r))
     mask = torch.tensor(mask, dtype=torch.bool, device=out.device)
     return out[mask]
 
@@ -106,7 +106,7 @@ def test_flash_attn_tree_attention_output(heads, mha_type, head_dim, dtype, rand
 
     chunk_lens = []
     for i in range(batch_size):
-        num_responses = torch.randint(2, 3+1)
+        num_responses = torch.randint(2, 3+1, ())
         chunk_lens.append(torch.randint(*random_range, (num_responses+1,)).tolist())
 
     kwargs = {"dtype": dtype, "device": "cuda", "requires_grad": True}
@@ -122,9 +122,9 @@ def test_flash_attn_tree_attention_output(heads, mha_type, head_dim, dtype, rand
                                         tree_dfs_order_end_k=tree_dfs_order_end_k,
                                         tree_dfs_order_start_q=tree_dfs_order_start_q)
     grad_out = torch.randn_like(out_tree)
-    out_tree.backwrad(grad_out)
-    q_tree_grad, k_tree_grad, v_tree_grad = get_grad(q, k, v)
-    
+    out_tree.backward(grad_out)
+    q_tree_grad, k_tree_grad, v_tree_grad = get_grad(q_chunks, k_chunks, v_chunks)
+
     q, k, v, max_seqlen, cu_seqlens = prepare_varlen(q_chunks, k_chunks, v_chunks, chunk_lens)
     out_varlen = flash_attn_varlen_func(q, k, v, 
                                         cu_seqlens, cu_seqlens, 
@@ -132,14 +132,14 @@ def test_flash_attn_tree_attention_output(heads, mha_type, head_dim, dtype, rand
                                         causal=True)
 
     out_varlen_pack = pack_varlen(out_varlen, chunk_lens)
-    out_varlen_pack.backwrad(grad_out)
-    q_varlen_grad, k_varlen_grad, v_varlen_grad = get_grad(q, k, v)
+    out_varlen_pack.backward(grad_out)
+    q_varlen_grad, k_varlen_grad, v_varlen_grad = get_grad(q_chunks, k_chunks, v_chunks)
 
     q, k, v = prepare(q_chunks, k_chunks, v_chunks)
     out_ref, _ = attention_ref(q, k, v, causal=True)
     out_ref_pack = pack(out_ref, chunk_lens)
     out_ref_pack.backward(grad_out)
-    q_grad, k_grad, v_grad = get_grad(q, k, v)
+    q_grad, k_grad, v_grad = get_grad(q_chunks, k_chunks, v_chunks)
 
     @torch.no_grad
     def ck(name, x, y, z):
