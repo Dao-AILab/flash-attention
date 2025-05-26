@@ -52,7 +52,7 @@ Assume the input corresponds to the following sequence:
 
 * Node 0 (`prompt`) is the root, and its subtree spans indices \[0, 3].
 * Node 1 (`response1`) is a leaf node, with its subtree limited to \[1, 1].
-* Node 2 (`response2`) and Node 3 (`response3`) are also leaf or shallow nodes.
+* Node 2 (`response2`) and Node 3 (`response3`) are also leaf.
 
 The DFS traversal results in:
 
