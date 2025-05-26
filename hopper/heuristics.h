@@ -25,7 +25,7 @@ inline bool should_pack_gqa(bool varlen_q, int seqlen_q, int qhead_per_khead, in
 inline int num_splits_heuristic(int total_mblocks, int num_SMs, int num_n_blocks, int num_m_blocks, int size_one_kv_head, bool is_causal_or_local, int max_splits) {
     // If we have enough to almost fill the SMs, then just use 1 split
     // However, in the case of super long seqlen where each head of KV doesn't even fit into
-    // L2 (we assume conservatively that L2 size is 50MB), we want to split.
+    // L2 (we assume that L2 size is 50MB), we want to split.
     if (total_mblocks >= 0.8f * num_SMs) {
         int const size_l2 = 50 * 1024 * 1024;
         // Only split if there are enough queries to go over the KV at least twice

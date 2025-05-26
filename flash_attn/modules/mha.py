@@ -23,9 +23,9 @@ except ImportError:
     flash_attn_with_kvcache = None
 
 try:
-    from flash_attn.ops.fused_dense import ColumnParallelLinear, FusedDense, RowParallelLinear
+    from flash_attn.ops.fused_dense import ColumnParallelLinear, RowParallelLinear
 except ImportError:
-    FusedDense, ColumnParallelLinear, RowParallelLinear = None, None, None
+    ColumnParallelLinear, RowParallelLinear = None, None
 
 try:
     from flash_attn.layers.rotary import RotaryEmbedding
@@ -341,13 +341,6 @@ class CrossAttention(nn.Module):
         return output
 
 
-class LinearResidual(nn.Linear):
-    """Wrap nn.Linear to return the residual as well. For compatibility with FusedDense."""
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return super().forward(input), input
-
-
 def _update_kv_cache(kv, inference_params, layer_idx):
     """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
     # Pre-allocate memory for key-values for inference.
@@ -452,13 +445,6 @@ class MHA(nn.Module):
                 device=device,
             )
 
-        if fused_bias_fc and FusedDense is None:
-            raise ImportError("fused_dense is not installed")
-        linear_cls = nn.Linear if not fused_bias_fc else FusedDense
-        linear_resid_cls = (
-            LinearResidual if not fused_bias_fc else partial(FusedDense, return_residual=True)
-        )
-        wqkv_cls = linear_cls if not self.return_residual else linear_resid_cls
         inner_attn_cls = (
             partial(FlashSelfAttention, alibi_slopes=alibi_slopes, window_size=window_size)
             if use_flash_attn
@@ -470,10 +456,10 @@ class MHA(nn.Module):
             else CrossAttention
         )
         if not self.cross_attn:
-            self.Wqkv = wqkv_cls(embed_dim, qkv_dim, bias=qkv_proj_bias, **factory_kwargs)
+            self.Wqkv = nn.Linear(embed_dim, qkv_dim, bias=qkv_proj_bias, **factory_kwargs)
         else:
-            self.Wq = linear_cls(embed_dim, embed_dim, bias=qkv_proj_bias, **factory_kwargs)
-            self.Wkv = wqkv_cls(embed_dim, kv_dim, bias=qkv_proj_bias, **factory_kwargs)
+            self.Wq = nn.Linear(embed_dim, embed_dim, bias=qkv_proj_bias, **factory_kwargs)
+            self.Wkv = nn.Linear(embed_dim, kv_dim, bias=qkv_proj_bias, **factory_kwargs)
         if self.dwconv:
             if self.num_heads_kv == self.num_heads:
                 self.dwconv_qkv = nn.Conv1d(
@@ -492,7 +478,7 @@ class MHA(nn.Module):
         self.inner_cross_attn = inner_cross_attn_cls(
             causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout
         )
-        self.out_proj = linear_cls(embed_dim, embed_dim, bias=out_proj_bias, **factory_kwargs)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=out_proj_bias, **factory_kwargs)
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         dtype = self.out_proj.weight.dtype if dtype is None else dtype
@@ -646,10 +632,7 @@ class MHA(nn.Module):
         batch, seqlen = x.shape[:2]
         if not self.cross_attn and self.num_heads_kv == self.num_heads:
             assert x_kv is None and mixer_subset is None
-            if not self.return_residual:
-                qkv = self.Wqkv(x)
-            else:
-                qkv, x = self.Wqkv(x)
+            qkv = self.Wqkv(x)
             if self.dwconv:
                 qkv = rearrange(
                     self.dwconv_qkv(rearrange(qkv, "b s d -> b d s"))[..., :-2], "b d s -> b s d"
@@ -680,21 +663,11 @@ class MHA(nn.Module):
                 )
         else:
             if self.cross_attn:
-                if not self.return_residual:
-                    q = self.Wq(x if mixer_subset is None else x[:, mixer_subset])
-                    kv = self.Wkv(x_kv if x_kv is not None else x)
-                else:
-                    if x_kv is not None:
-                        kv, x_kv = self.Wkv(x_kv)
-                    else:
-                        kv, x = self.Wkv(x)
-                    q = self.Wq(x if mixer_subset is None else x[:, mixer_subset])
+                q = self.Wq(x if mixer_subset is None else x[:, mixer_subset])
+                kv = self.Wkv(x_kv if x_kv is not None else x)
             else:
                 assert self.num_heads_kv != self.num_heads
-                if not self.return_residual:
-                    qkv = self.Wqkv(x)
-                else:
-                    qkv, x = self.Wqkv(x)
+                qkv = self.Wqkv(x)
                 q = qkv[..., : self.num_heads * self.head_dim]
                 kv = qkv[..., self.num_heads * self.head_dim :]
             q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)

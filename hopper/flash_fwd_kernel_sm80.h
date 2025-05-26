@@ -187,6 +187,7 @@ public:
                 get<0>(params.mainloop.shape_K_new),
                 params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                 params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
+                params.mainloop.seqlens_rotary
             };
             if constexpr (AppendKV) {
                 bool tile_new_valid = mainloop.store_kv_new(
@@ -203,9 +204,7 @@ public:
                                threadIdx.x, block_coord);
             } else {
                 // Write 0 to gO and -inf to gLSE.
-                // If Split, we don't have to write 0 to O if the mha_combine kernel is used, since it will
-                // not use the value of O if LSE is -inf.
-                epilogue.template store_zero<!Split /*Clear_O*/>(params.epilogue, threadIdx.x, block_coord);
+                epilogue.store_zero(params.epilogue, threadIdx.x, block_coord);
             }
         }
 

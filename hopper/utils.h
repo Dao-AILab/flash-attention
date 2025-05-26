@@ -21,17 +21,7 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
-
-#define CHECK_CUDA(call)                        \
-    do {                                                                                                  \
-        cudaError_t status_ = call;                                                                       \
-        if (status_ != cudaSuccess) {                                                                     \
-            fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, cudaGetErrorString(status_)); \
-            exit(1);                                                                                      \
-        }                                                                                                 \
-    } while(0)
-
-#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())
+#include "cuda_check.h"
 
 namespace flash {
 
@@ -106,6 +96,25 @@ static __device__ __forceinline__ T run(T x, Operator &op) {
     return x;
 }
 };
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+CUTLASS_HOST_DEVICE
+int div_floor(cutlass::FastDivmod const& divmod, int dividend) {
+    // Take care of the negative case: https://stackoverflow.com/questions/39304681/division-with-negative-dividend-but-rounded-towards-negative-infinity
+    // Maybe the compiler will turn the -1 - * into bit negation operation, I haven't checked.
+    return dividend >= 0 ? divmod.divide(dividend) : -1 - divmod.divide(-1 - dividend);
+}
+
+CUTLASS_HOST_DEVICE
+int round_down(cutlass::FastDivmod const& divmod, int dividend) {
+    return div_floor(divmod, dividend) * divmod.divisor;
+}
+
+CUTLASS_HOST_DEVICE
+int round_up(cutlass::FastDivmod const& divmod, int dividend) {
+    return div_floor(divmod, dividend - 1) * divmod.divisor + divmod.divisor;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -272,15 +281,33 @@ CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const
         if constexpr (zero_init) {
             tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
         }
+        static constexpr int kNumKIters = CUTE_STATIC_V(size<2>(tCrA));
+        static constexpr int kMaxKIters = 16;
         // Unroll the K mode manually to set scale D to 1
         CUTLASS_PRAGMA_UNROLL
-        for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
+        for (int k_block = 0; k_block < std::min(kNumKIters, kMaxKIters); ++k_block) {
             if constexpr (!SwapAB) {
                 cute::gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCrC);
             } else {
                 cute::gemm(tiled_mma, tCrB(_,_,k_block), tCrA(_,_,k_block), tCrC);
             }
             tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+        }
+        // In the case of large kNumKIters, the compiler chooses to store the smem addresses
+        // in registers, causing spills. This loop forces the compiler to recompute the addresses.
+        if constexpr (kNumKIters > kMaxKIters) {
+            // This will always be zero, just a way to force the compiler to recompute the smem
+            // addresses. This results in USEL instructions. There's probably a better way to do this.
+            int const k_offset = cutlass::canonical_warp_group_idx() < 128 ? 0 : 1;
+            CUTLASS_PRAGMA_UNROLL
+            for (int k_block = kMaxKIters; k_block < kNumKIters; ++k_block) {
+                if constexpr (!SwapAB) {
+                    cute::gemm(tiled_mma, tCrA(_,_,k_block + k_offset), tCrB(_,_,k_block + k_offset), tCrC);
+                } else {
+                    cute::gemm(tiled_mma, tCrB(_,_,k_block + k_offset), tCrA(_,_,k_block + k_offset), tCrC);
+                }
+                tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+            }
         }
         warpgroup_commit_batch();
         if constexpr (wg_wait >= 0) { warpgroup_wait<wg_wait>(); }

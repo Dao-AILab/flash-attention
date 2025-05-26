@@ -14,6 +14,8 @@
 #include <cutlass/kernel_hardware_info.h>
 #include "cutlass/pipeline/pipeline.hpp"
 
+#include "cutlass/arch/grid_dependency_control.h"
+
 #include "seqlen.h"
 #include "utils.h"
 #include "softmax.h"
@@ -35,7 +37,6 @@ public:
     static_assert(CollectiveMainloop::Varlen == CollectiveEpilogue::Varlen);
     static constexpr bool Has_softcap = CollectiveMainloop::Has_softcap;
     static constexpr bool Varlen = CollectiveMainloop::Varlen;
-    static constexpr bool PagedKV = CollectiveMainloop::PagedKV;
     static constexpr bool Split = CollectiveMainloop::Split;
     static constexpr bool Is_FP8 = CollectiveMainloop::Is_FP8;
     static constexpr bool Transpose_V = CollectiveMainloop::Transpose_V;
@@ -308,7 +309,7 @@ public:
             cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
 
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
-            // might use cp.async to load KV (if PagedKV) while AppendKV always uses TMA to load
+            // might use cp.async to load KV (if PagedKVNonTMA) while AppendKV always uses TMA to load
             // KV_new. Since the pipeline states are different, we have to manually sync to make
             // sure the two pipelines don't race when accessing smem_k and smem_v.
             PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
@@ -321,6 +322,8 @@ public:
             }
             if (!SingleProducerWarp && warp_idx_in_warpgroup != 0) { scheduler.init_consumer(); }
 
+            cutlass::arch::wait_on_dependent_grids();
+
             // Load Q, K, V
             for (auto work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler) : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
                  work_tile_info.is_valid(params.scheduler);
@@ -330,10 +333,11 @@ public:
                 SeqlenInfo_t seqlen_info{
                     get<2>(block_coord) /*bidb*/,
                     get<0>(params.mainloop.shape_Q),
-                    !PagedKV ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
+                    !params.mainloop.ptr_pagetable ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
                     get<0>(params.mainloop.shape_K_new),
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
+                    params.mainloop.seqlens_rotary
                 };
                 if constexpr (AppendKV) {
                     bool tile_new_valid = mainloop.load_kv_new(
@@ -371,29 +375,18 @@ public:
             CUTLASS_PRAGMA_NO_UNROLL
             for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
                  work_tile_info.is_valid(params.scheduler);
-                 work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
-                // Attention output (GEMM-II) accumulator.
-                Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
-                float softmax_scale_log2 = params.mainloop.softmax_scale_log2;
-                // If there's tanh softcap, the scaling will be done before tanh.
+                 // get_next_work will be called before the epilogue
+                 ) {
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 int const bidb = get<2>(block_coord);
-                if constexpr (Is_FP8 && !Has_softcap) {
-                    int const bidh = get<1>(block_coord);
-                    int const bidh_kv = !PackGQA ? params.mainloop.qhead_per_khead_divmod.divide(bidh) : bidh;
-                    float const q_descale = params.mainloop.ptr_q_descale == nullptr ? 1.0f : params.mainloop.ptr_q_descale[bidb * get<0>(params.mainloop.stride_q_descale) + bidh_kv * get<1>(params.mainloop.stride_q_descale)];
-                    float const k_descale = params.mainloop.ptr_k_descale == nullptr ? 1.0f : params.mainloop.ptr_k_descale[bidb * get<0>(params.mainloop.stride_k_descale) + bidh_kv * get<1>(params.mainloop.stride_k_descale)];
-                    softmax_scale_log2 *= q_descale * k_descale;
-                }
-                flash::Softmax<!LargeHeadDimV ? 2 * (2 * kBlockM / NumMmaThreads) : 2, /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
-
                 SeqlenInfo_t seqlen_info{
                     bidb,
                     get<0>(params.mainloop.shape_Q),
-                    !PagedKV ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
+                    !params.mainloop.ptr_pagetable ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
                     get<0>(params.mainloop.shape_K_new),
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
+                    params.mainloop.seqlens_rotary
                 };
                 if constexpr (AppendKV) {
                     bool tile_new_valid = mainloop.store_kv_new(
@@ -411,6 +404,18 @@ public:
                         // if (threadIdx.x == 128) { printf("Consumer: After sync\n"); }
                     }
                 }
+                // If there's tanh softcap, the scaling will be done before tanh.
+                float softmax_scale_log2 = params.mainloop.softmax_scale_log2;
+                if constexpr (Is_FP8 && !Has_softcap) {
+                    int const bidh = get<1>(block_coord);
+                    int const bidh_kv = !PackGQA ? params.mainloop.qhead_per_khead_divmod.divide(bidh) : bidh;
+                    float const q_descale = params.mainloop.ptr_q_descale == nullptr ? 1.0f : params.mainloop.ptr_q_descale[bidb * get<0>(params.mainloop.stride_q_descale) + bidh_kv * get<1>(params.mainloop.stride_q_descale)];
+                    float const k_descale = params.mainloop.ptr_k_descale == nullptr ? 1.0f : params.mainloop.ptr_k_descale[bidb * get<0>(params.mainloop.stride_k_descale) + bidh_kv * get<1>(params.mainloop.stride_k_descale)];
+                    softmax_scale_log2 *= q_descale * k_descale;
+                }
+                flash::Softmax<!LargeHeadDimV ? 2 * (2 * kBlockM / NumMmaThreads) : 2, /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
+                // Attention output (GEMM-II) accumulator.
+                Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
                 bool tile_valid;
                 if constexpr (!LargeHeadDimV) {
                     tile_valid = mainloop.mma(
@@ -427,16 +432,20 @@ public:
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, seqlen_info, block_coord, shared_storage);
                     }
                 }
+                // Do this here before the epilogue so that the next tile is ready to go.
+                work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info);
+                if constexpr (Split && Varlen) {
+                    if (!work_tile_info.is_valid(params.scheduler)) {  // Last tile
+                        cutlass::arch::launch_dependent_grids();
+                    }
+                }
                 if (tile_valid) {
                     // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
                     epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma_pv,
                                    threadIdx.x - MmaThreadOffset, block_coord);
                 } else {
                     // Write 0 to gO and -inf to gLSE.
-                    // If Split, we don't have to write 0 to O if the mha_combine kernel is used, since it will
-                    // not use the value of O if LSE is -inf.
-                    epilogue.template store_zero<!Split /*Clear_O*/>(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
-                    // epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
+                    epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
                 }
             }
             epilogue.store_tail();

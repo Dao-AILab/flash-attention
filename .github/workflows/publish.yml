@@ -44,8 +44,8 @@ jobs:
           # manylinux docker image, but I haven't figured out how to install CUDA on manylinux.
           os: [ubuntu-20.04]
           python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
-          torch-version: ['2.2.2', '2.3.1', '2.4.0', '2.5.1', '2.6.0']
-          cuda-version: ['12.4.1']
+          torch-version: ['2.4.0', '2.5.1', '2.6.0', '2.7.0']
+          cuda-version: ['12.8.1']
           # We need separate wheels that either uses C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI) or not.
           # Pytorch wheels currently don't use it, but nvcr images have Pytorch compiled with C++11 ABI.
           # Without this we get import error (undefined symbol: _ZN3c105ErrorC2ENS_14SourceLocationESs)
@@ -54,10 +54,6 @@ jobs:
           exclude:
             # see https://github.com/pytorch/pytorch/blob/main/RELEASE.md#release-compatibility-matrix
             # Pytorch < 2.5 does not support Python 3.13
-            - torch-version: '2.2.2'
-              python-version: '3.13'
-            - torch-version: '2.3.1'
-              python-version: '3.13'
             - torch-version: '2.4.0'
               python-version: '3.13'
 
@@ -94,7 +90,7 @@ jobs:
 
       - name: Install CUDA ${{ matrix.cuda-version }}
         if: ${{ matrix.cuda-version != 'cpu' }}
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.23
         id: cuda-toolkit
         with:
           cuda: ${{ matrix.cuda-version }}
@@ -107,8 +103,6 @@ jobs:
       - name: Install PyTorch ${{ matrix.torch-version }}+cu${{ matrix.cuda-version }}
         run: |
           pip install --upgrade pip
-          # For some reason torch 2.2.0 on python 3.12 errors saying no setuptools
-          pip install setuptools==75.8.0
           # With python 3.13 and torch 2.5.1, unless we update typing-extensions, we get error
           # AttributeError: attribute '__default__' of 'typing.ParamSpec' objects is not writable
           pip install typing-extensions==4.12.2
@@ -117,8 +111,8 @@ jobs:
           # see https://github.com/pytorch/pytorch/blob/main/RELEASE.md#release-compatibility-matrix
           # This code is ugly, maybe there's a better way to do this.
           export TORCH_CUDA_VERSION=$(python -c "from os import environ as env; \
-            minv = {'2.2': 118, '2.3': 118, '2.4': 118, '2.5': 118, '2.6': 118}[env['MATRIX_TORCH_VERSION']]; \
-            maxv = {'2.2': 121, '2.3': 121, '2.4': 124, '2.5': 124, '2.6': 124}[env['MATRIX_TORCH_VERSION']]; \
+            minv = {'2.4': 118, '2.5': 118, '2.6': 118, '2.7': 118}[env['MATRIX_TORCH_VERSION']]; \
+            maxv = {'2.4': 124, '2.5': 124, '2.6': 126, '2.7': 128}[env['MATRIX_TORCH_VERSION']]; \
             print(minv if int(env['MATRIX_CUDA_VERSION']) < 120 else maxv)" \
           )
           if [[ ${{ matrix.torch-version }} == *"dev"* ]]; then
@@ -150,7 +144,7 @@ jobs:
           export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
           # Limit MAX_JOBS otherwise the github runner goes OOM
           # nvcc 11.8 can compile with 2 jobs, but nvcc 12.3 goes OOM
-          MAX_JOBS=$([ "$MATRIX_CUDA_VERSION" == "123" ] && echo 1 || echo 2) FLASH_ATTENTION_FORCE_BUILD="TRUE" FLASH_ATTENTION_FORCE_CXX11_ABI=${{ matrix.cxx11_abi}} python setup.py bdist_wheel --dist-dir=dist
+          MAX_JOBS=$([ "$MATRIX_CUDA_VERSION" == "128" ] && echo 1 || echo 2) FLASH_ATTENTION_FORCE_BUILD="TRUE" FLASH_ATTENTION_FORCE_CXX11_ABI=${{ matrix.cxx11_abi}} python setup.py bdist_wheel --dist-dir=dist
           tmpname=cu${WHEEL_CUDA_VERSION}torch${MATRIX_TORCH_VERSION}cxx11abi${{ matrix.cxx11_abi }}
           wheel_name=$(ls dist/*whl | xargs -n 1 basename | sed "s/-/+$tmpname-/2")
           ls dist/*whl |xargs -I {} mv {} dist/${wheel_name}
