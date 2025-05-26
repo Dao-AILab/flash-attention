@@ -160,8 +160,8 @@ def _flash_attn_varlen_forward(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
-    tree_dfs_order_end_k=None,
-    tree_dfs_order_start_q=None
+    tree_dfs_order_end_k: Optional[torch.Tensor] = None,
+    tree_dfs_order_start_q: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
@@ -355,8 +355,8 @@ def _flash_attn_varlen_backward(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
-    tree_dfs_order_end_k=None,
-    tree_dfs_order_start_q=None
+    tree_dfs_order_end_k: Optional[torch.Tensor] = None,
+    tree_dfs_order_start_q: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
