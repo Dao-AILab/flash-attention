@@ -62,9 +62,6 @@ def _flash_attn_forward(
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     seqlens_rotary = maybe_contiguous(seqlens_rotary)
-    
-    print(f"at /root/miniconda3/envs/fa3/lib/python3.10/site-packages/flash_attn_3-3.0.0b1-py3.10-linux-x86_64.egg/flash_attn_interface.py \ndtype q k v at fa3: {q.dtype, k.dtype, v.dtype}")
-    
     out, softmax_lse, *rest = flash_attn_3_cuda.fwd(
         q,
         k,
@@ -129,14 +126,6 @@ def _flash_attn_backward(
 ):
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    
-    q = q.to(torch.bfloat16)
-    k = k.to(torch.bfloat16)
-    v = v.to(torch.bfloat16)
-    dq = dq.to(torch.bfloat16)
-    dk = dk.to(torch.bfloat16)
-    dv = dv.to(torch.bfloat16)
-    
     dq, dk, dv, softmax_d, *rest = flash_attn_3_cuda.bwd(
         dout,
         q,
@@ -596,10 +585,7 @@ def flash_attn_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    
-    # print("-" * 60)
-    # print(f"at /flash_attn_3-3.0.0b1-py3.10-linux-x86_64.egg/flash_attn_interface.py")
-    
+
     return FlashAttnFunc.apply(
         q,
         k,
