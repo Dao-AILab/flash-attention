@@ -16,6 +16,23 @@ flash_attn_3_cuda = torch.ops.flash_attn_3
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
+def symmetric_dequantize(x_quantized, scales, dtype=torch.bfloat16):
+    """
+    Perform symmetric dequantization on the input tensor.
+    
+    Args:
+        x_quantized (torch.Tensor): Quantized tensor with shape [batch_size, seq_len, head_count, head_dim].
+        scales (torch.Tensor): Scaling factors for each head with shape [batch_size, head_count].
+        dtype (torch.dtype): Target data type after dequantization, defaults to torch.bfloat16.
+    
+    Returns:
+        torch.Tensor: Dequantized tensor with shape [batch_size, seq_len, head_count, head_dim].
+    """
+    eps = 1e-12
+    x_float = x_quantized.to(torch.float32)
+    scales_expanded = scales.view(-1, 1, scales.size(-1), 1)
+    dequantized = x_float * (scales_expanded + eps)
+    return dequantized.to(dtype)
 
 def _flash_attn_forward(
         q,
@@ -200,7 +217,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             sm_margin=sm_margin,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, q_descale, k_descale, v_descale)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -214,7 +231,14 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse = ctx.saved_tensors
+        q, k, v, out, softmax_lse, q_descale, k_descale, v_descale = ctx.saved_tensors
+        # q k v dequant
+        if q_descale is not None:
+            q = symmetric_dequantize(q, q_descale, out.dtype)
+        if k_descale is not None:
+            k = symmetric_dequantize(q, k_descale, out.dtype)
+        if v_descale is not None:
+            v = symmetric_dequantize(q, v_descale, out.dtype)
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         if ctx.ndim == 5:
             qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
@@ -226,6 +250,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             qkv_shape = q.shape[:-2] + (num_heads_q + num_heads_k * 2, *q.shape[-1:])
             dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
             dq, dk, dv = dqkv.split([num_heads_q, num_heads_k, num_heads_k], dim=-2)
+        if not all(t.dtype in (torch.float16, torch.bfloat16) for t in [dq, dk, dv]):
+            raise RuntimeError("FlashAttention backward only support fp16 and bf16 data type")
         _flash_attn_backward(
             dout,
             q,
@@ -296,7 +322,7 @@ class FlashAttnFunc(torch.autograd.Function):
             sm_margin=sm_margin,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, q_descale, k_descale, v_descale)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -308,9 +334,18 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse = ctx.saved_tensors
+        q, k, v, out, softmax_lse, q_descale, k_descale, v_descale = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
+        # q k v dequant
+        if q_descale is not None:
+            q = symmetric_dequantize(q, q_descale, out.dtype)
+        if k_descale is not None:
+            k = symmetric_dequantize(q, k_descale, out.dtype)
+        if v_descale is not None:
+            v = symmetric_dequantize(q, v_descale, out.dtype)
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        if not all(t.dtype in (torch.float16, torch.bfloat16) for t in [dq, dk, dv]):
+            raise RuntimeError("FlashAttention backward only support fp16 and bf16 data type")
         _flash_attn_backward(
             dout,
             q,
@@ -393,7 +428,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             sm_margin=sm_margin,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
-        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, q_descale, k_descale, v_descale)
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.softmax_scale = softmax_scale
@@ -407,9 +442,18 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, q_descale, k_descale, v_descale = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
+        # q k v dequant
+        if q_descale is not None:
+            q = symmetric_dequantize(q, q_descale, out.dtype)
+        if k_descale is not None:
+            k = symmetric_dequantize(q, k_descale, out.dtype)
+        if v_descale is not None:
+            v = symmetric_dequantize(q, v_descale, out.dtype)
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        if not all(t.dtype in (torch.float16, torch.bfloat16) for t in [dq, dk, dv]):
+            raise RuntimeError("FlashAttention backward only support fp16 and bf16 data type")
         _flash_attn_backward(
             dout,
             q,
