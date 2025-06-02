@@ -11,8 +11,9 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
-import cutlass.utils.ampere_helpers as sm80_utils
+import cutlass.utils.ampere_helpers as sm80_utils_basic
 
+from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfo
@@ -124,7 +125,7 @@ class FlashAttentionBackwardSm80:
         smem_usage_V = n_block_size * head_dim_v * 2
         smem_usage_QV = (smem_usage_Q + smem_usage_V) if not V_in_regs else max(smem_usage_Q, smem_usage_V)
         smem_usage = smem_usage_QV + smem_usage_dO + smem_usage_K
-        smem_capacity = sm80_utils.SMEM_CAPACITY["sm80"]
+        smem_capacity = sm80_utils_basic.SMEM_CAPACITY["sm80"]
         if smem_usage > smem_capacity:
             return False
         return True
@@ -133,7 +134,7 @@ class FlashAttentionBackwardSm80:
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: Q/K/V
         # ///////////////////////////////////////////////////////////////////////////////
-        sQ_layout_atom = utils.smem_layout_atom_sm80(self.head_dim_padded, self.dtype)
+        sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.head_dim_padded)
         self.sQ_layout = cute.tile_to_shape(
             sQ_layout_atom, (self.m_block_size, self.head_dim_padded, self.num_stages_Q), (0, 1, 2),
         )
@@ -141,7 +142,7 @@ class FlashAttentionBackwardSm80:
         self.sK_layout = cute.tile_to_shape(
             sK_layout_atom, (self.n_block_size, self.head_dim_padded), (0, 1),
         )
-        sV_layout_atom = utils.smem_layout_atom_sm80(self.head_dim_v_padded, self.dtype)
+        sV_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.head_dim_v_padded)
         self.sV_layout = cute.tile_to_shape(
             sV_layout_atom, (self.n_block_size, self.head_dim_v_padded), (0, 1),
         )
@@ -150,7 +151,7 @@ class FlashAttentionBackwardSm80:
             sdO_layout_atom, (self.m_block_size, self.head_dim_v_padded, self.num_stages_dO), (0, 1, 2),
         )
         # TODO: do we set swizzle to be 3 here explicitly?
-        sPdS_layout_atom = utils.smem_layout_atom_sm80(self.n_block_size, self.dtype)
+        sPdS_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.n_block_size)
         self.sPdS_layout = cute.tile_to_shape(
             sPdS_layout_atom, (self.m_block_size, self.n_block_size), (0, 1),
         )
@@ -784,7 +785,7 @@ class FlashAttentionBackwardSm80:
         acc_S.fill(0.0)
         cute.arch.cp_async_wait_group(1 if self.num_stages_Q > 1 else 0)
         cute.arch.barrier()
-        utils.gemm_sm80(
+        sm80_utils.gemm(
             mma_params.thr_mma_sdp, acc_S, mma_params.tSrQ, mma_params.tSrK,
             smem_copy_params.tSsQ[None, None, None, smem_pipe_read_q if self.num_stages_Q > 1 else 0],
             smem_copy_params.tSsK,
@@ -811,7 +812,7 @@ class FlashAttentionBackwardSm80:
         acc_dP.fill(0.0)
         cute.arch.cp_async_wait_group(1 if self.num_stages_dO > 1 else 0)
         cute.arch.barrier()
-        utils.gemm_sm80(
+        sm80_utils.gemm(
             mma_params.thr_mma_sdp, acc_dP, mma_params.tdPrdO, mma_params.tdPrV,
             smem_copy_params.tdPsdO[None, None, None, smem_pipe_read_do if self.num_stages_dO > 1 else 0],
             smem_copy_params.tdPsV,
@@ -848,7 +849,7 @@ class FlashAttentionBackwardSm80:
             tdVrP = mma_params.tdVrP
 
         # MMA dK
-        utils.gemm_sm80(
+        sm80_utils.gemm(
             mma_params.thr_mma_dkv, mma_params.acc_dV, tdVrP, mma_params.tdVrdO,
             smem_copy_params.tdVsPt,
             smem_copy_params.tdVsdOt[None, None, None, smem_pipe_read_do if self.num_stages_dO > 1 else 0],
@@ -866,7 +867,7 @@ class FlashAttentionBackwardSm80:
             )
             acc_dQ = cute.make_fragment(acc_shape_dQ, cutlass.Float32)
             acc_dQ.fill(0.0)
-            utils.gemm_sm80(
+            sm80_utils.gemm(
                 mma_params.thr_mma_dq, acc_dQ, mma_params.tdQrdS, mma_params.tdQrK,
                 smem_copy_params.tdQsdS, smem_copy_params.tdQsKt,
                 smem_copy_params.smem_thr_copy_dS, smem_copy_params.smem_thr_copy_Kt,
@@ -892,7 +893,7 @@ class FlashAttentionBackwardSm80:
             tdKrdS = cute.make_tensor(rdS.iterator, utils.convert_layout_acc_frgA(rdS.layout))
         else:
             tdKrdS = mma_params.tdKrdS
-        utils.gemm_sm80(
+        sm80_utils.gemm(
             mma_params.thr_mma_dkv, mma_params.acc_dK, tdKrdS, mma_params.tdKrQ,
             smem_copy_params.tdKsdSt,
             smem_copy_params.tdKsQt[None, None, None, smem_pipe_read_q if self.num_stages_Q > 1 else 0],

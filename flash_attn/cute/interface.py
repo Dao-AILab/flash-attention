@@ -12,7 +12,7 @@
 # - FP8
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -49,7 +49,7 @@ def _flash_attn_fwd(
     m_block_size: int = 128,
     n_block_size: int = 64,
     num_threads: int = 128,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     batch_size, seqlen_q, num_head, head_dim = q.shape
     _, seqlen_k, num_head_kv, _ = k.shape
@@ -133,7 +133,7 @@ def _flash_attn_bwd(
     AtomLayoutNdKV: int = 2,
     AtomLayoutMdQ: int = 2,
     V_in_regs: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v, out, dout, lse = [maybe_contiguous(t) for t in (q, k, v, out, dout, lse)]
     batch_size, seqlen_q, num_head, head_dim = q.shape
     _, seqlen_k, num_head_kv, _ = k.shape
@@ -206,11 +206,12 @@ def _flash_attn_bwd(
     )
 
     # Backward kernel: compute dk, dv, dq_accum.
-    compile_key = (dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap != 0.0, m_block_size, n_block_size, num_threads, num_stages_Q, num_stages_dO, SdP_swapAB, dKV_swapAB, dQ_swapAB, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs)
+    compile_key = (
+        dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap != 0.0, m_block_size,
+        n_block_size, num_threads, num_stages_Q, num_stages_dO, SdP_swapAB, dKV_swapAB, dQ_swapAB,
+        AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs
+    )
     if compile_key not in _flash_attn_bwd.compile_cache:
-        fa_bwd_sm80 = FlashAttentionBackwardSm80(
-            dtype, head_dim_v, m_block_size, num_threads=num_threads,
-        )
         fa_bwd_sm80 = FlashAttentionBackwardSm80(
             dtype,
             head_dim,

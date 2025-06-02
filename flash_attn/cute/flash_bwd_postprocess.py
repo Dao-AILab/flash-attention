@@ -10,6 +10,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
 
+from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute import utils
 
 
@@ -120,7 +121,7 @@ class FlashAttentionBackwardPostprocess:
         # then setting kBlockKSmem to 32 will cause "Static shape_div failure".
         # We want to treat it as 64 x 48, so kBlockKSmem should be 16.
         mma_shape_n = self.tiled_mma.get_tile_size(1)
-        sdQ_layout_atom = utils.smem_layout_atom_sm80(mma_shape_n, self.dtype)
+        sdQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, mma_shape_n)
         self.sdQ_layout = cute.tile_to_shape(
             sdQ_layout_atom, (self.m_block_size, self.head_dim_padded), (0, 1)
         )

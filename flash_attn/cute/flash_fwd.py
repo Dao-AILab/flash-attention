@@ -13,8 +13,9 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
-import cutlass.utils.ampere_helpers as sm80_utils
+import cutlass.utils.ampere_helpers as sm80_utils_basic
 
+from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax
@@ -111,7 +112,7 @@ class FlashAttentionForwardSm80:
         smem_usage_QV = (smem_usage_Q + smem_usage_V) if not Q_in_regs else max(smem_usage_Q, smem_usage_V)
         smem_usage = smem_usage_QV + smem_usage_K
         # TODO: sm86 and sm89
-        smem_capacity = sm80_utils.SMEM_CAPACITY["sm80"]
+        smem_capacity = sm80_utils_basic.SMEM_CAPACITY["sm80"]
         if smem_usage > smem_capacity:
             return False
         # Check if twice the block size is divisible by the number of threads
@@ -123,7 +124,7 @@ class FlashAttentionForwardSm80:
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: Q/K/V
         # ///////////////////////////////////////////////////////////////////////////////
-        sQ_layout_atom = utils.smem_layout_atom_sm80(self.head_dim_padded, self.dtype)
+        sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.head_dim_padded)
         self.sQ_layout = cute.tile_to_shape(
             sQ_layout_atom, (self.m_block_size, self.head_dim_padded), (0, 1),
         )
@@ -131,7 +132,7 @@ class FlashAttentionForwardSm80:
         self.sK_layout = cute.tile_to_shape(
             sK_layout_atom, (self.n_block_size, self.head_dim_padded, self.num_stages), (0, 1, 2),
         )
-        sV_layout_atom = utils.smem_layout_atom_sm80(self.head_dim_v_padded, self.dtype)
+        sV_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.head_dim_v_padded)
         self.sV_layout = cute.tile_to_shape(
             sV_layout_atom, (self.n_block_size, self.head_dim_v_padded, self.num_stages), (0, 1, 2),
         )
@@ -600,7 +601,7 @@ class FlashAttentionForwardSm80:
                        need_predicates=is_first_n_block and self.num_stages == 1)
             cute.arch.cp_async_commit_group()
         load_V_next()
-        utils.gemm_sm80(
+        sm80_utils.gemm(
             mma_params.thr_mma_qk, acc_S, mma_params.tSrQ, mma_params.tSrK,
             smem_copy_params.tSsQ,
             smem_copy_params.tSsK[None, None, None, smem_pipe_read if self.num_stages > 1 else 0],
@@ -630,7 +631,7 @@ class FlashAttentionForwardSm80:
         if cutlass.const_expr(self.num_stages > 1):
             sync()
             load_K_next()
-        utils.gemm_sm80_rs(
+        sm80_utils.gemm_rs(
             mma_params.thr_mma_pv, mma_params.acc_O, tOrS, mma_params.tOrVt,
             smem_copy_params.tOsVt[None, None, None, smem_pipe_read if self.num_stages > 1 else 0],
             smem_copy_params.smem_thr_copy_V,
