@@ -4,7 +4,6 @@
 # Lightly tested with headdim 128.
 # Features not supported yet:
 # - varlen
-# - GQA
 # - sliding window
 # - split (i.e. FlashDecoding)
 # - tuned block sizes
@@ -50,7 +49,7 @@ def _flash_attn_fwd(
     m_block_size: int = 128,
     n_block_size: int = 64,
     num_threads: int = 128,
-) -> (torch.Tensor, torch.Tensor):
+) -> tuple[torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     batch_size, seqlen_q, num_head, head_dim = q.shape
     _, seqlen_k, num_head_kv, _ = k.shape
@@ -67,6 +66,7 @@ def _flash_attn_fwd(
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
+    qhead_per_kvhead = num_head // num_head_kv
 
     out_torch_dtype = q.dtype
     device = q.device
@@ -82,13 +82,13 @@ def _flash_attn_fwd(
     lse_tensor = utils.convert_from_dlpack(lse, leading_dim=2, alignment=4)
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    # TODO: deal with GQA
-    compile_key = (dtype, head_dim, head_dim_v, causal, softcap != 0.0, m_block_size, n_block_size, num_threads)
+    compile_key = (dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap != 0.0, m_block_size, n_block_size, num_threads)
     if compile_key not in _flash_attn_fwd.compile_cache:
         fa_fwd_sm80 = FlashAttentionForwardSm80(
             dtype,
             head_dim,
             head_dim_v,
+            qhead_per_kvhead,
             m_block_size,
             n_block_size,
             num_stages=1,
@@ -133,7 +133,7 @@ def _flash_attn_bwd(
     AtomLayoutNdKV: int = 2,
     AtomLayoutMdQ: int = 2,
     V_in_regs: bool = False,
-) -> (torch.Tensor, torch.Tensor, torch.Tensor):
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v, out, dout, lse = [maybe_contiguous(t) for t in (q, k, v, out, dout, lse)]
     batch_size, seqlen_q, num_head, head_dim = q.shape
     _, seqlen_k, num_head_kv, _ = k.shape
@@ -154,14 +154,17 @@ def _flash_attn_bwd(
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
+    qhead_per_kvhead = num_head // num_head_kv
 
     device = q.device
     # TODO: check if this is the right rounding
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
     head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
     dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    # dk = torch.empty_like(k)
+    # dv = torch.empty_like(v)
+    dk = torch.empty(batch_size, seqlen_k, num_head, head_dim, dtype=q.dtype, device=device)
+    dv = torch.empty(batch_size, seqlen_k, num_head, head_dim_v, dtype=q.dtype, device=device)
     dq_accum = torch.empty(batch_size, num_head, seqlen_q_rounded * head_dim_rounded, dtype=torch.float32, device=device)
     dpsum = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
     lse_log2 = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
@@ -195,7 +198,7 @@ def _flash_attn_bwd(
     )
 
     # Backward kernel: compute dk, dv, dq_accum.
-    compile_key = (dtype, head_dim, head_dim_v, causal, softcap != 0.0, m_block_size, n_block_size, num_threads, num_stages_Q, num_stages_dO, SdP_swapAB, dKV_swapAB, dQ_swapAB, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs)
+    compile_key = (dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap != 0.0, m_block_size, n_block_size, num_threads, num_stages_Q, num_stages_dO, SdP_swapAB, dKV_swapAB, dQ_swapAB, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs)
     if compile_key not in _flash_attn_bwd.compile_cache:
         fa_bwd_sm80 = FlashAttentionBackwardSm80(
             dtype, head_dim_v, m_block_size, num_threads=num_threads,
@@ -204,6 +207,7 @@ def _flash_attn_bwd(
             dtype,
             head_dim,
             head_dim_v,
+            qhead_per_kvhead,
             m_block_size,
             n_block_size,
             num_stages_Q,
@@ -243,6 +247,11 @@ def _flash_attn_bwd(
     _flash_attn_bwd.compile_cache_post[compile_key_post](
         dq_accum_tensor, dq_tensor, softmax_scale, current_stream
     )
+
+    if qhead_per_kvhead > 1:
+        from einops import rearrange
+        dk = rearrange(dk, "b s (h m) d -> b s m h d", m=qhead_per_kvhead).sum(dim=2)
+        dv = rearrange(dv, "b s (h m) d -> b s m h d", m=qhead_per_kvhead).sum(dim=2)
 
     return dq, dk, dv
 

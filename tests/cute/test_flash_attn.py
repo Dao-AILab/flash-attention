@@ -19,8 +19,8 @@ from flash_attn.cute.interface import flash_attn_func
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
@@ -78,8 +78,8 @@ def test_flash_attn_output(
     # set seed
     torch.random.manual_seed(0)
     batch_size = 9 if seqlen_k <= 2048 else 2
-    nheads = 6
     # batch_size = 1
+    nheads = 6
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype

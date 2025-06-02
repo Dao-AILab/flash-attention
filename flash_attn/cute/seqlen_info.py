@@ -7,6 +7,7 @@ class SeqlenInfo:
     def __init__(self, seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, *, loc=None, ip=None):
         self.seqlen_q = seqlen_q
         self.seqlen_k = seqlen_k
+        self._loc = loc
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []

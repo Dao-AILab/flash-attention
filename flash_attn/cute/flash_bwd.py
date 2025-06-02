@@ -24,6 +24,7 @@ class FlashAttentionBackwardSm80:
         dtype: Type[cutlass.Numeric],
         head_dim: int,
         head_dim_v: Optional[int] = None,
+        qhead_per_kvhead: int = 1,
         m_block_size: int = 64,
         n_block_size: int = 128,
         num_stages_Q: int = 2,
@@ -54,9 +55,6 @@ class FlashAttentionBackwardSm80:
         :param is_causal: is causal
         """
         self.dtype = dtype
-        # self._head_dim = head_dim
-        self.m_block_size = m_block_size
-        self.n_block_size = n_block_size
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 32
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -66,6 +64,9 @@ class FlashAttentionBackwardSm80:
         # Can save registers (and hence be faster) if we don't have to check hdim predication
         self.check_hdim_oob = head_dim != self.head_dim_padded
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
+        self.qhead_per_kvhead = qhead_per_kvhead
+        self.m_block_size = m_block_size
+        self.n_block_size = n_block_size
         self.num_threads = num_threads
         self.is_causal = is_causal
         self.num_stages_Q = num_stages_Q
@@ -451,9 +452,10 @@ class FlashAttentionBackwardSm80:
         # (m_block_size, head_dim, m_block)
         gQ = cute.local_tile(mQ[batch_size, None, num_head, None], blkQ_shape, (None, 0))
         # (n_block_size, head_dim)
-        gK = cute.local_tile(mK[batch_size, None, num_head, None], blkK_shape, (n_block, 0))
+        num_head_kv = num_head // self.qhead_per_kvhead
+        gK = cute.local_tile(mK[batch_size, None, num_head_kv, None], blkK_shape, (n_block, 0))
         # (n_block_size, head_dim_v)
-        gV = cute.local_tile(mV[batch_size, None, num_head, None], blkV_shape, (n_block, 0))
+        gV = cute.local_tile(mV[batch_size, None, num_head_kv, None], blkV_shape, (n_block, 0))
         # (m_block_size, head_dim_v, m_block)
         gdO = cute.local_tile(mdO[batch_size, None, num_head, None], blkdO_shape, (None, 0))
         gLSE = cute.local_tile(mLSE[batch_size, num_head, None], (self.m_block_size,), (None,))

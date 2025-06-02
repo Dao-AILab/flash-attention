@@ -22,6 +22,7 @@ class AttentionMask:
         self.n_block_size = n_block_size
         self.seqlen_q = seqlen_q
         self.seqlen_k = seqlen_k
+        self._loc = loc
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []

@@ -27,6 +27,7 @@ class FlashAttentionForwardSm80:
         dtype: Type[cutlass.Numeric],
         head_dim: int,
         head_dim_v: Optional[int] = None,
+        qhead_per_kvhead: int = 1,
         m_block_size: int = 128,
         n_block_size: int = 128,
         num_stages: int = 1,
@@ -51,9 +52,6 @@ class FlashAttentionForwardSm80:
         :param is_causal: is causal
         """
         self.dtype = dtype
-        # self._head_dim = head_dim
-        self.m_block_size = m_block_size
-        self.n_block_size = n_block_size
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -63,6 +61,9 @@ class FlashAttentionForwardSm80:
         # Can save registers (and hence be faster) if we don't have to check hdim predication
         self.check_hdim_oob = head_dim != self.head_dim_padded
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
+        self.qhead_per_kvhead = qhead_per_kvhead
+        self.m_block_size = m_block_size
+        self.n_block_size = n_block_size
         self.num_threads = num_threads
         self.is_causal = is_causal
         self.has_softcap = has_softcap
@@ -348,9 +349,10 @@ class FlashAttentionForwardSm80:
         # (m_block_size, head_dim)
         gQ = cute.local_tile(mQ[batch_size, None, num_head, None], blkQ_shape, (m_block, 0))
         # (n_block_size, head_dim, n_block)
-        gK = cute.local_tile(mK[batch_size, None, num_head, None], blkK_shape, (None, 0))
+        num_head_kv = num_head // self.qhead_per_kvhead
+        gK = cute.local_tile(mK[batch_size, None, num_head_kv, None], blkK_shape, (None, 0))
         # (n_block_size, head_dim, n_block)
-        gV = cute.local_tile(mV[batch_size, None, num_head, None], blkV_shape, (None, 0))
+        gV = cute.local_tile(mV[batch_size, None, num_head_kv, None], blkV_shape, (None, 0))
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
