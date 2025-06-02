@@ -161,13 +161,16 @@ def _flash_attn_bwd(
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
     head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
     dq = torch.empty_like(q)
-    # dk = torch.empty_like(k)
-    # dv = torch.empty_like(v)
-    dk = torch.empty(batch_size, seqlen_k, num_head, head_dim, dtype=q.dtype, device=device)
-    dv = torch.empty(batch_size, seqlen_k, num_head, head_dim_v, dtype=q.dtype, device=device)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
     dq_accum = torch.empty(batch_size, num_head, seqlen_q_rounded * head_dim_rounded, dtype=torch.float32, device=device)
     dpsum = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
     lse_log2 = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
+    if qhead_per_kvhead > 1:
+        seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
+        head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
+        dk_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_rounded, dtype=torch.float32, device=device)
+        dv_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_v_rounded, dtype=torch.float32, device=device)
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
@@ -180,6 +183,11 @@ def _flash_attn_bwd(
         utils.convert_from_dlpack(t.detach(), leading_dim=2, divisibility=128 // cutlass.Float32.width)
         for t in (dq_accum, dpsum, lse_log2)
     ]
+    if qhead_per_kvhead > 1:
+        dk_accum_tensor, dv_accum_tensor = [
+            utils.convert_from_dlpack(t.detach(), leading_dim=2, divisibility=128 // cutlass.Float32.width)
+            for t in (dk_accum, dv_accum)
+        ]
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
@@ -225,12 +233,16 @@ def _flash_attn_bwd(
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
             fa_bwd_sm80, q_tensor, k_tensor, v_tensor, do_tensor, lse_log2_tensor, dpsum_tensor,
-            dq_accum_tensor, dk_tensor, dv_tensor,
+            dq_accum_tensor,
+            dk_tensor if qhead_per_kvhead == 1 else dk_accum_tensor,
+            dv_tensor if qhead_per_kvhead == 1 else dv_accum_tensor,
             softmax_scale, current_stream
         )
     _flash_attn_bwd.compile_cache[compile_key](
         q_tensor, k_tensor, v_tensor, do_tensor, lse_log2_tensor, dpsum_tensor,
-        dq_accum_tensor, dk_tensor, dv_tensor,
+        dq_accum_tensor,
+        dk_tensor if qhead_per_kvhead == 1 else dk_accum_tensor,
+        dv_tensor if qhead_per_kvhead == 1 else dv_accum_tensor,
         softmax_scale, current_stream
     )
 
@@ -249,9 +261,31 @@ def _flash_attn_bwd(
     )
 
     if qhead_per_kvhead > 1:
-        from einops import rearrange
-        dk = rearrange(dk, "b s (h m) d -> b s m h d", m=qhead_per_kvhead).sum(dim=2)
-        dv = rearrange(dv, "b s (h m) d -> b s m h d", m=qhead_per_kvhead).sum(dim=2)
+        # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
+        compile_key_post = (dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
+        if compile_key_post not in _flash_attn_bwd.compile_cache_post:
+            fa_bwd_post = FlashAttentionBackwardPostprocess(
+                dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+            )
+            # TODO: check @can_implement
+            _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
+                fa_bwd_post, dk_accum_tensor, dk_tensor, softmax_scale, current_stream
+            )
+        _flash_attn_bwd.compile_cache_post[compile_key_post](
+            dk_accum_tensor, dk_tensor, softmax_scale, current_stream
+        )
+        compile_key_post = (dtype, head_dim_v, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
+        if compile_key_post not in _flash_attn_bwd.compile_cache_post:
+            fa_bwd_post = FlashAttentionBackwardPostprocess(
+                dtype, head_dim_v, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+            )
+            # TODO: check @can_implement
+            _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
+                fa_bwd_post, dv_accum_tensor, dv_tensor, cutlass.Float32(1.0), current_stream
+            )
+        _flash_attn_bwd.compile_cache_post[compile_key_post](
+            dv_accum_tensor, dv_tensor, cutlass.Float32(1.0), current_stream
+        )
 
     return dq, dk, dv
 
