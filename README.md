@@ -4,8 +4,8 @@
 
 ```bash
 export FLASH_ATTENTION_FORCE_BUILD=TRUE
-export FLASH_ATTN_CUDA_ARCHS=80 # for amper or ada
-# export FLASH_ATTN_CUDA_ARCHS=90 # for hopper 
+export FLASH_ATTN_CUDA_ARCHS=80  # For Ampere or Ada Lovelace GPUs
+# export FLASH_ATTN_CUDA_ARCHS=90  # For Hopper GPUs
 pip install .
 ```
 
