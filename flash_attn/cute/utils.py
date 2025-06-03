@@ -138,6 +138,14 @@ def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
     return rA_mma_view
 
 
+def transpose_view(a: cute.Tensor) -> cute.Tensor:
+    """Transpose the first two dimensions of a tensor on smem.
+    """
+    shape = (a.shape[1], a.shape[0], *a.shape[2:])
+    order = (1, 0, *range(2, cute.rank(a)))
+    return cute.composition(a, cute.make_ordered_layout(shape, order=order))
+
+
 def exp2f(x: cute.TensorSSA | cutlass.Float32) -> cute.TensorSSA | cutlass.Float32:
     """exp2f calculation for both vector and scalar.
 

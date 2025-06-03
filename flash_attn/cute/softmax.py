@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
+import math
 import operator
 
 import cutlass
@@ -12,6 +13,7 @@ class Softmax:
 
     def __init__(self, softmax_scale_log2: cutlass.Float32, *, loc=None, ip=None):
         self.softmax_scale_log2 = softmax_scale_log2
+        self._loc = loc
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
@@ -107,7 +109,7 @@ class Softmax:
                 cute.arch.rcp_approx(row_sum[r] if not acc_O_mn_row_is_zero_or_nan else 1.0)
             ) * final_scale
             row_sum_cur = row_sum[r]
-            LN2 = 0.69314718055994530942
+            LN2 = math.log(2.0)
             row_sum[r] = ((row_max[r] * self.softmax_scale_log2 + log2f(row_sum_cur)) * LN2
                           if not acc_O_mn_row_is_zero_or_nan else -cutlass.Float32.inf)
             acc_O_mn[r, None] = acc_O_mn[r, None].load() * scale

@@ -39,7 +39,7 @@ class FlashAttentionForwardSm80:
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
-        All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
+        All contiguous dimensions must be at least 16 bytes aligned, which means that the head dimension
         should be a multiple of 8.
 
         :param head_dim: head dimension
@@ -120,6 +120,23 @@ class FlashAttentionForwardSm80:
             return False
         return True
 
+    def _check_type(
+        self,
+        mQ_type: Type[cutlass.Numeric],
+        mK_type: Type[cutlass.Numeric],
+        mV_type: Type[cutlass.Numeric],
+        mO_type: Type[cutlass.Numeric],
+        mLSE_type: Type[cutlass.Numeric] | None,
+    ):
+        # Get the data type and check if it is fp16 or bf16
+        if cutlass.const_expr(not (mQ_type == mK_type == mV_type == mO_type)):
+            raise TypeError("All tensors must have the same data type")
+        if cutlass.const_expr(mQ_type not in [cutlass.Float16, cutlass.BFloat16]):
+            raise TypeError("Only Float16 or BFloat16 is supported")
+        if cutlass.const_expr(mLSE_type is not None and mLSE_type not in [cutlass.Float32]):
+            raise TypeError("LSE tensor must be Float32")
+        assert mQ_type == self.dtype
+
     def _setup_attributes(self):
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: Q/K/V
@@ -187,6 +204,40 @@ class FlashAttentionForwardSm80:
         # gmem_tiled_copy_O: tiled copy for O store
         self.gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
+    def _get_tiled_mma(self):
+        tiled_mma_qk = cute.make_tiled_mma(
+            warp.MmaF16BF16Op(self.dtype, cutlass.Float32, (16, 8, 16)),
+            (self.num_threads // 32, 1, 1),
+            permutation_mnk=(self.num_threads // 32 * 16, 16, 16),
+        )
+        tiled_mma_pv = cute.make_tiled_mma(
+            warp.MmaF16BF16Op(self.dtype, cutlass.Float32, (16, 8, 16)),
+            (self.num_threads // 32, 1, 1),
+            permutation_mnk=(self.num_threads // 32 * 16, 16, 16),
+        )
+        return tiled_mma_qk, tiled_mma_pv
+
+    def _get_shared_storage_cls(self):
+        sQ_struct, sK_struct, sV_struct = [
+            cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(layout)], 1024]
+            for layout in (self.sQ_layout, self.sK_layout, self.sV_layout)
+        ]
+        cosize_sQV = utils.max_constexpr(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout))
+        sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
+
+        @cute.struct
+        class SharedStorageQKV:
+            sV: sV_struct
+            sQ: sQ_struct
+            sK: sK_struct
+
+        @cute.struct
+        class SharedStorageSharedQV:
+            sQ: sQV_struct
+            sK: sK_struct
+
+        return SharedStorageQKV if cutlass.const_expr(not self.Q_in_regs) else SharedStorageSharedQV
+
     @cute.jit
     def __call__(
         self,
@@ -207,60 +258,10 @@ class FlashAttentionForwardSm80:
         Prepares the shared memory layout, tiled copy atoms, tiled mma and shared memory storage.
         Then launches the kernel function with the prepared parameters.
         """
-        # Get the data type and check if it is fp16 or bf16
-        if cutlass.const_expr(
-            not (mQ.element_type == mK.element_type == mV.element_type == mO.element_type)
-        ):
-            raise TypeError("All tensors must have the same data type")
-        if cutlass.const_expr(mQ.element_type not in [cutlass.Float16, cutlass.BFloat16]):
-            raise TypeError("Only Float16 or BFloat16 is supported")
-        if cutlass.const_expr(mLSE is not None and mLSE.element_type not in [cutlass.Float32]):
-            raise TypeError("LSE tensor must be Float32")
-        assert mQ.element_type == self.dtype
-
+        self._check_type(*(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE)))
         self._setup_attributes()
-
-        @cute.struct
-        class SharedStorageQKV:
-            sV: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(self.sV_layout)], 1024
-            ]
-            sQ: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(self.sQ_layout)], 1024
-            ]
-            sK: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(self.sK_layout)], 1024
-            ]
-
-        cosize_sQV = utils.max_constexpr(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout))
-
-        @cute.struct
-        class SharedStorageSharedQV:
-            sQ: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cosize_sQV], 1024
-            ]
-            sK: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(self.sK_layout)], 1024
-            ]
-
-        SharedStorage = SharedStorageQKV
-        if cutlass.const_expr(self.Q_in_regs):
-            SharedStorage = SharedStorageSharedQV
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Tiled mma
-        # ///////////////////////////////////////////////////////////////////////////////
-        tiled_mma_qk = cute.make_tiled_mma(
-            warp.MmaF16BF16Op(self.dtype, cutlass.Float32, (16, 8, 16)),
-            (self.num_threads // 32, 1, 1),
-            permutation_mnk=(self.num_threads // 32 * 16, 16, 16),
-        )
-        tiled_mma_pv = cute.make_tiled_mma(
-            warp.MmaF16BF16Op(self.dtype, cutlass.Float32, (16, 8, 16)),
-            (self.num_threads // 32, 1, 1),
-            permutation_mnk=(self.num_threads // 32 * 16, 16, 16),
-        )
-
+        SharedStorage = self._get_shared_storage_cls()
+        tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         # grid_dim: (m_block, num_head, batch_size)
         grid_dim = (
             cute.ceil_div(mQ.shape[1], self.m_block_size),
@@ -367,10 +368,7 @@ class FlashAttentionForwardSm80:
         else:
             sV = cute.make_tensor(cute.recast_ptr(sQ.iterator, dtype=self.dtype), sV_layout)
         # Transpose view of V to tensor with layout (head_dim_v, n_block_size) for tiled mma
-        sVt = cute.composition(
-            sV,
-            cute.make_ordered_layout((self.head_dim_v_padded, self.n_block_size, self.num_stages), order=(1, 0, 2)),
-        )
+        sVt = utils.transpose_view(sV)
 
         gmem_thr_copy_QK = gmem_tiled_copy_QK.get_slice(tidx)
         gmem_thr_copy_V = gmem_tiled_copy_V.get_slice(tidx)

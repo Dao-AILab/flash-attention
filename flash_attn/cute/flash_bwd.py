@@ -130,6 +130,36 @@ class FlashAttentionBackwardSm80:
             return False
         return True
 
+    def _check_type(
+        self,
+        mQ_type: Type[cutlass.Numeric],
+        mK_type: Type[cutlass.Numeric],
+        mV_type: Type[cutlass.Numeric],
+        mdO_type: Type[cutlass.Numeric],
+        mLSE_type: Type[cutlass.Numeric],
+        mdPsum_type: Type[cutlass.Numeric],
+        mdQaccum_type: Type[cutlass.Numeric],
+        mdK_type: Type[cutlass.Numeric],
+        mdV_type: Type[cutlass.Numeric],
+    ):
+        if cutlass.const_expr(not (mQ_type == mK_type == mV_type == mdO_type)):
+            raise TypeError("All tensors must have the same data type")
+        if cutlass.const_expr(self.qhead_per_kvhead == 1):
+            if cutlass.const_expr(not (mdK_type == mdV_type == mQ_type)):
+                raise TypeError("mdK and mdV tensors must have the same data type as mQ")
+        else:
+            if cutlass.const_expr(not (mdK_type == mdV_type == cutlass.Float32)):
+                raise TypeError("mdKaccum and mdVaccum tensors must have the data type Float32")
+        if cutlass.const_expr(not mQ_type in [cutlass.Float16, cutlass.BFloat16]):
+            raise TypeError("Only Float16 or BFloat16 is supported")
+        if cutlass.const_expr(not mLSE_type in [cutlass.Float32]):
+            raise TypeError("LSE tensor must be Float32")
+        if cutlass.const_expr(not mdPsum_type in [cutlass.Float32]):
+            raise TypeError("dPsum tensor must be Float32")
+        if cutlass.const_expr(not mdQaccum_type in [cutlass.Float32]):
+            raise TypeError("dQaccum tensor must be Float32")
+        assert mQ_type == self.dtype
+
     def _setup_attributes(self):
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: Q/K/V
@@ -236,115 +266,7 @@ class FlashAttentionBackwardSm80:
             self.gmem_tiled_copy_dK = self.gmem_tiled_copy_dQaccum
             self.gmem_tiled_copy_dV = self.gmem_tiled_copy_dQaccum
 
-    @cute.jit
-    def __call__(
-        self,
-        mQ: cute.Tensor,
-        mK: cute.Tensor,
-        mV: cute.Tensor,
-        mdO: cute.Tensor,
-        mLSE: cute.Tensor,
-        mdPsum: cute.Tensor,
-        mdQaccum: cute.Tensor,
-        mdK: cute.Tensor,
-        mdV: cute.Tensor,
-        softmax_scale: cutlass.Float32,
-        stream: cuda.CUstream,
-    ):
-        """Configures and launches the flash attention v2 kernel.
-
-        mQ/mK/mV/mdO has same data types(supports fp16 and bf16) and same layout:
-        (batch_size, seqlen_q, num_head, head_dim):(seqlen_q * num_head * head_dim, num_head * head_dim, head_dim, 1)
-
-        Prepares the shared memory layout, tiled copy atoms, tiled mma and shared memory storage.
-        Then launches the kernel function with the prepared parameters.
-        """
-        # Get the data type and check if it is fp16 or bf16
-        if cutlass.const_expr(
-            not (mQ.element_type == mK.element_type == mV.element_type == mdO.element_type)
-        ):
-            raise TypeError("All tensors must have the same data type")
-        if cutlass.const_expr(self.qhead_per_kvhead == 1):
-            if cutlass.const_expr(not (mdK.element_type == mdV.element_type == mQ.element_type)):
-                raise TypeError("mdK and mdV tensors must have the same data type as mQ")
-        else:
-            if cutlass.const_expr(not (mdK.element_type == mdV.element_type == cutlass.Float32)):
-                raise TypeError("mdKaccum and mdVaccum tensors must have the data type Float32")
-
-        if cutlass.const_expr(not mQ.element_type in [cutlass.Float16, cutlass.BFloat16]):
-            raise TypeError("Only Float16 or BFloat16 is supported")
-        if cutlass.const_expr(not mLSE.element_type in [cutlass.Float32]):
-            raise TypeError("LSE tensor must be Float32")
-        if cutlass.const_expr(not mdPsum.element_type in [cutlass.Float32]):
-            raise TypeError("dPsum tensor must be Float32")
-        if cutlass.const_expr(not mdQaccum.element_type in [cutlass.Float32]):
-            raise TypeError("dQaccum tensor must be Float32")
-        assert mQ.element_type == self.dtype
-
-        self._setup_attributes()
-
-        @cute.struct
-        class SharedStorageSeparateQV:
-            sK: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(self.sK_layout)], 1024
-            ]
-            sV: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(self.sV_layout)], 1024
-            ]
-            sQ: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(self.sQ_layout)], 1024
-            ]
-            sdO: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(self.sdO_layout)], 1024
-            ]
-            sLSE: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(self.sLSE_layout)], 128
-            ]
-            sdPsum: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(self.sLSE_layout)], 128
-            ]
-            # TODO: the case where there's no sP
-            sP: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(self.sPdS_layout)], 128
-            ]
-            sdS: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(self.sPdS_layout)], 128
-            ]
-
-        cosize_sQV = utils.max_constexpr(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout))
-
-        @cute.struct
-        class SharedStorageSharedQV:
-            sK: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(self.sK_layout)], 1024
-            ]
-            sQ: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cosize_sQV], 1024
-            ]
-            sdO: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(self.sdO_layout)], 1024
-            ]
-            sLSE: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(self.sLSE_layout)], 128
-            ]
-            sdPsum: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(self.sLSE_layout)], 128
-            ]
-            # TODO: the case where there's no sP
-            sP: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(self.sPdS_layout)], 128
-            ]
-            sdS: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(self.sPdS_layout)], 128
-            ]
-
-        SharedStorage = SharedStorageSeparateQV
-        if cutlass.const_expr(self.share_QV_smem):
-            SharedStorage = SharedStorageSharedQV
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Tiled mma
-        # ///////////////////////////////////////////////////////////////////////////////
+    def _get_tiled_mma(self):
         num_mma_warps = self.num_threads // 32
         AtomLayoutSdP = (self.AtomLayoutMSdP, num_mma_warps // self.AtomLayoutMSdP, 1) if not self.SdP_swapAB else (num_mma_warps // self.AtomLayoutMSdP, self.AtomLayoutMSdP, 1)
         tiled_mma_sdp = cute.make_tiled_mma(
@@ -364,7 +286,70 @@ class FlashAttentionBackwardSm80:
             AtomLayoutdQ,
             permutation_mnk=(AtomLayoutdQ[0] * 16, AtomLayoutdQ[1] * 16, 16),
         )
+        return tiled_mma_sdp, tiled_mma_dkv, tiled_mma_dq
 
+    def _get_shared_storage_cls(self):
+        sQ_struct, sK_struct, sV_struct, sdO_struct = [
+            cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(layout)], 1024]
+            for layout in (self.sQ_layout, self.sK_layout, self.sV_layout, self.sdO_layout)
+        ]
+        cosize_sQV = utils.max_constexpr(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout))
+        sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
+        sLSE_struct, sdPsum_struct = [
+            cute.struct.Align[cute.struct.MemRange[cutlass.Float32, cute.cosize(layout)], 128]
+            for layout in (self.sLSE_layout, self.sLSE_layout)
+        ]
+        sP_struct, sdS_struct = [
+            cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(layout)], 128]
+            for layout in (self.sPdS_layout, self.sPdS_layout)
+        ]
+
+        @cute.struct
+        class SharedStorageSeparateQV:
+            sK: sK_struct
+            sV: sV_struct
+            sQ: sQ_struct
+            sdO: sdO_struct
+            sLSE: sLSE_struct
+            sdPsum: sdPsum_struct
+            sP: sP_struct
+            sdS: sdS_struct
+            # TODO: the case where there's no sP
+
+        @cute.struct
+        class SharedStorageSharedQV:
+            sK: sK_struct
+            sV: sV_struct
+            sQ: sQV_struct
+            sdO: sdO_struct
+            sLSE: sLSE_struct
+            sdPsum: sdPsum_struct
+            sP: sP_struct
+            sdS: sdS_struct
+
+        return SharedStorageSeparateQV if cutlass.const_expr(not self.share_QV_smem) else SharedStorageSharedQV
+
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mdO: cute.Tensor,
+        mLSE: cute.Tensor,
+        mdPsum: cute.Tensor,
+        mdQaccum: cute.Tensor,
+        mdK: cute.Tensor,
+        mdV: cute.Tensor,
+        softmax_scale: cutlass.Float32,
+        stream: cuda.CUstream,
+    ):
+        # Get the data type and check if it is fp16 or bf16
+        self._check_type(*(t.element_type if t is not None else None
+                           for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV)))
+        self._setup_attributes()
+        SharedStorage = self._get_shared_storage_cls()
+        tiled_mma_sdp, tiled_mma_dkv, tiled_mma_dq = self._get_tiled_mma()
         # grid_dim: (n_block, num_head, batch_size)
         grid_dim = (
             cute.ceil_div(mK.shape[1], self.n_block_size),
@@ -493,23 +478,7 @@ class FlashAttentionBackwardSm80:
         sdPsumMma = storage.sdPsum.get_tensor(sLSEMma_layout)
 
         # Transpose view of tensors for tiled mma
-        sQt = cute.composition(
-            sQ,
-            cute.make_ordered_layout((self.head_dim_padded, self.m_block_size, self.num_stages_Q), order=(1, 0, 2)),
-        )
-        sdOt = cute.composition(
-            sdO,
-            cute.make_ordered_layout((self.head_dim_v_padded, self.m_block_size, self.num_stages_dO), order=(1, 0, 2)),
-        )
-        sKt = cute.composition(
-            sK, cute.make_ordered_layout((self.head_dim_padded, self.n_block_size), order=(1, 0)),
-        )
-        sPt = cute.composition(
-            sP, cute.make_ordered_layout((self.n_block_size, self.m_block_size), order=(1, 0)),
-        )
-        sdSt = cute.composition(
-            sdS, cute.make_ordered_layout((self.n_block_size, self.m_block_size), order=(1, 0)),
-        )
+        sQt, sdOt, sKt, sPt, sdSt = [utils.transpose_view(t) for t in (sQ, sdO, sK, sP, sdS)]
 
         gmem_thr_copy_QK = gmem_tiled_copy_QK.get_slice(tidx)
         gmem_thr_copy_VdO = gmem_tiled_copy_VdO.get_slice(tidx)
