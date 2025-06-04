@@ -22,7 +22,7 @@ import cutlass
 import cutlass.cute as cute
 
 from flash_attn.cute import utils
-from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
+from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
@@ -49,6 +49,9 @@ def _flash_attn_fwd(
     m_block_size: int = 128,
     n_block_size: int = 64,
     num_threads: int = 128,
+    # m_block_size: int = 128,
+    # n_block_size: int = 144,
+    # num_threads: int = 256,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     batch_size, seqlen_q, num_head, head_dim = q.shape
@@ -85,6 +88,7 @@ def _flash_attn_fwd(
     compile_key = (dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap != 0.0, m_block_size, n_block_size, num_threads)
     if compile_key not in _flash_attn_fwd.compile_cache:
         fa_fwd_sm80 = FlashAttentionForwardSm80(
+        # fa_fwd_sm80 = FlashAttentionForwardSm90(
             dtype,
             head_dim,
             head_dim_v,
@@ -92,6 +96,7 @@ def _flash_attn_fwd(
             m_block_size,
             n_block_size,
             num_stages=1,
+            # num_stages=2,
             num_threads=num_threads,
             is_causal=causal,
             has_softcap=softcap != 0.0,

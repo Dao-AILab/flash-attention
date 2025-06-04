@@ -255,7 +255,9 @@ class FlashAttentionBackwardPostprocess:
 
         # Step 3: Copy dQ from register to smem
         cute.arch.barrier()  # make sure all threads have finished loading dQaccum
-        smem_copy_atom_dQ = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.dtype)
+        smem_copy_atom_dQ = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=cutlass.Float32.width
+        )
         smem_thr_copy_dQ = utils.make_tiled_copy_C(smem_copy_atom_dQ, tiled_mma).get_slice(tidx)
         taccdQrdQ = smem_thr_copy_dQ.retile(rdQ)
         taccdQsdQ = smem_thr_copy_dQ.partition_D(sdQ)

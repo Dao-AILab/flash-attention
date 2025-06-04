@@ -215,9 +215,7 @@ class FlashAttentionBackwardSm80:
         )
         # atom_universal_copy: universal copy atom for O store
         atom_universal_copy = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            self.dtype,
-            num_bits_per_copy=universal_copy_bits,
+            cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=universal_copy_bits,
         )
         # tQK_layout: thread layout for QK load
         tQK_shape_dim_1 = sQ_layout_atom.outer.shape[1] // async_copy_elems
@@ -258,7 +256,9 @@ class FlashAttentionBackwardSm80:
             cute.make_layout(async_copy_elems_accum),
         )
         self.gmem_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
-            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=cutlass.Float32.width),
+            cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=cutlass.Float32.width
+            ),
             cute.make_layout(self.num_threads),
             cute.make_layout(1)
         )
@@ -560,7 +560,9 @@ class FlashAttentionBackwardSm80:
         ).get_slice(tidx)
         # TODO: what's the number of bits? What if SdP_swapAB
         r2s_thr_copy_PdS = utils.make_tiled_copy_C(
-            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=0),
+            cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=2 * self.dtype.width
+            ),
             tiled_mma_sdp,
         ).get_slice(tidx)
 
@@ -905,7 +907,9 @@ class FlashAttentionBackwardSm80:
             # because smem_q could be changed.
             cute.arch.barrier()
             # smem copy atom for dKV
-            smem_copy_atom_dKV = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.dtype)
+            smem_copy_atom_dKV = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=2 * self.dtype.width
+            )
             smem_thr_copy_dKV = utils.make_tiled_copy_C(smem_copy_atom_dKV, tiled_mma).get_slice(tidx)
             taccdVrdV = smem_thr_copy_dKV.retile(rdV)
             taccdKrdK = smem_thr_copy_dKV.retile(rdK)

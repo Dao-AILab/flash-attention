@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
 
 import math
-from typing import Callable, Optional
+from typing import Type, Callable, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -73,6 +73,18 @@ def mma_make_fragment_B(
         return thr_mma.make_fragment_B(thr_mma.partition_B(smem))
 
 
+def get_smem_store_atom(arch: cutlass.Constexpr[int], element_type: Type[cute.Numeric]) -> cute.CopyAtom:
+    if arch < 90:
+        return cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), element_type, num_bits_per_copy=2 * element_type.width,
+        )
+    else:
+        return cute.make_copy_atom(
+            cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), element_type,
+        )
+
+
+
 @cute.jit
 def max_constexpr(
     a: cutlass.Constexpr[cute.Numeric], b: cutlass.Constexpr[cute.Numeric]
@@ -98,16 +110,20 @@ def warp_reduce(
 
 
 def convert_layout_acc_mn(acc_layout: cute.Layout) -> cute.Layout:
+    """
+    For Sm80, convert ((2, 2), MMA_M, MMA_N, ...) to ((2, MMA_M), (2, MMA_N), ...).
+    For Sm90, convert ((2, 2, V), MMA_M, MMA_N, ...) to ((2, MMA_M), (2, V, MMA_N), ...).
+    """
     acc_layout_col_major = cute.make_layout(acc_layout.shape)
     acc_layout_mn = cute.make_layout(
         (
             (acc_layout_col_major.shape[0][1], acc_layout_col_major.shape[1]),  # MMA_M
-            (acc_layout_col_major.shape[0][0], acc_layout_col_major.shape[2]),  # MMA_N
+            (acc_layout_col_major.shape[0][0], *acc_layout_col_major.shape[0][2:], acc_layout_col_major.shape[2]),  # MMA_N
             *acc_layout_col_major.shape[3:],
         ),
         stride=(
             (acc_layout_col_major.stride[0][1], acc_layout_col_major.stride[1]),  # MMA_M
-            (acc_layout_col_major.stride[0][0], acc_layout_col_major.stride[2]),  # MMA_N
+            (acc_layout_col_major.stride[0][0], *acc_layout_col_major.stride[0][2:], acc_layout_col_major.stride[2]),  # MMA_N
             *acc_layout_col_major.stride[3:],
         ),
     )
