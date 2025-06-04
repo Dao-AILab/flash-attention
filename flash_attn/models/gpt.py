@@ -310,7 +310,7 @@ def create_block(config, layer_idx=None, process_group=None, device=None, dtype=
 
 class GPTPreTrainedModel(nn.Module):
     """An abstract class to handle weights initialization and
-    a simple interface for dowloading and loading pretrained models.
+    a simple interface for downloading and loading pretrained models.
     """
 
     def __init__(self, config, *inputs, **kwargs):
