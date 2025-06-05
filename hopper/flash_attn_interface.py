@@ -249,6 +249,128 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
         return dqkv, None, None, None, None, None, None, None, None, None, None, None
 
+class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        qkv,
+        cu_seqlens,
+        seqused,
+        max_seqlen,
+        softmax_scale,
+        causal,
+        qv=None,
+        q_descale=None, k_descale=None, v_descale=None,
+        window_size=(-1, -1),
+        attention_chunk=0,
+        softcap=0.0,
+        num_splits=1,
+        pack_gqa=None,
+        deterministic=False,
+        num_heads_q=None,
+        sm_margin=0,
+    ):
+        if softmax_scale is None:
+            softmax_scale = (qkv.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
+            # softmax_scale = qkv.shape[-1] ** (-0.5)
+        if qkv.dim() == 5:
+            assert qkv.shape[-3] == 3
+            q, k, v = qkv.unbind(dim=-3)
+        else:
+            assert qkv.dim() in (3, 4)
+            assert num_heads_q is not None
+            num_heads_k = (qkv.shape[-2] - num_heads_q) // 2
+            assert num_heads_k * 2 + num_heads_q == qkv.shape[-2]
+            q, k, v = qkv.split([num_heads_q, num_heads_k, num_heads_k], dim=-2)
+            
+        if qkv.dim() != 3:
+            q = q.reshape(-1, q.shape[-2], q.shape[-1])
+            k = k.reshape(-1, k.shape[-2], k.shape[-1])
+            v = v.reshape(-1, v.shape[-2], v.shape[-1])
+        # out, q, k, v, out_padded, softmax_lse = _flash_attn_varlen_forward(
+        out, softmax_lse, *rest = _flash_attn_forward(
+            q,
+            k,
+            v,
+            None, None,  # k_new, v_new
+            qv,  # qv
+            None,  # out
+            cu_seqlens,
+            cu_seqlens,
+            None,   # cu_seqlens_k_new
+            seqused,
+            seqused,
+            max_seqlen,
+            max_seqlen,
+            None, None, None,   # page_table, kv_batch_idx, leftpad_k,
+            None, None, None,  # rotary_cos/sin, seqlens_rotary
+            q_descale, k_descale, v_descale,
+            softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            attention_chunk=attention_chunk,
+            softcap=softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            sm_margin=sm_margin,
+        )
+        # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens, seqused)
+        ctx.max_seqlen = max_seqlen
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.attention_chunk = attention_chunk
+        ctx.softcap = softcap
+        ctx.deterministic = deterministic
+        ctx.ndim = qkv.dim()
+        ctx.sm_margin = sm_margin
+        return out, softmax_lse
+    
+    
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, softmax_lse, cu_seqlens, seqused = ctx.saved_tensors
+        assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
+        if ctx.ndim == 5:
+            qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
+            dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
+            dq, dk, dv = dqkv.unbind(dim=-3)
+        else:
+            num_heads_q = q.shape[-2]
+            num_heads_k = k.shape[-2]
+            qkv_shape = q.shape[:-2] + (num_heads_q + num_heads_k * 2, *q.shape[-1:])
+            dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
+            dq, dk, dv = dqkv.split([num_heads_q, num_heads_k, num_heads_k], dim=-2)
+        if ctx.ndim != 3:
+            dq = dq.reshape(-1, dq.shape[-2], dq.shape[-1])
+            dk = dk.reshape(-1, dk.shape[-2], dk.shape[-1])
+            dv = dv.reshape(-1, dv.shape[-2], dv.shape[-1])
+        _flash_attn_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            cu_seqlens,
+            cu_seqlens,
+            seqused,
+            seqused,
+            ctx.max_seqlen,
+            ctx.max_seqlen,
+            dq,
+            dk,
+            dv,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.window_size,
+            ctx.softcap,
+            ctx.deterministic,
+            ctx.sm_margin,
+        )
+        dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
+        return dqkv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 class FlashAttnFunc(torch.autograd.Function):
 
@@ -498,6 +620,63 @@ def flash_attn_qkvpacked_func(
         sm_margin,
     )
 
+def flash_attn_varlen_qkvpacked_func(
+    qkv,
+    cu_seqlens,
+    max_seqlen,
+    seqused=None,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None, k_descale=None, v_descale=None,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    num_heads_q=None,
+    sm_margin=0,
+):
+    """
+    Arguments:
+        qkv: (total, nheads, headdim), where total = total number of tokens in the batch.
+        cu_seqlens: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into qkv.
+        max_seqlen: int. Maximum sequence length in the batch.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        qv [optional]: (batch_size, seqlen, nheads, headdim_v)
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        softcap: float. Anything > 0 activates softcapping attention.
+        attention_chunk: FA3 backward does not support attention_chunk
+        softcap: float. Anything > 0 activates softcapping attention.
+        num_splits: int. If > 1, split the key/value into this many chunks along the sequence.
+           If num_splits == 1, we don't split the key/value. If num_splits == 0, we use a heuristic
+           to automatically determine the number of splits.
+           Don't change this unless you know what you are doing.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+    """
+    return FlashAttnVarlenQKVPackedFunc.apply(
+        qkv,
+        cu_seqlens,
+        seqused,
+        max_seqlen,
+        softmax_scale,
+        causal,
+        qv,
+        q_descale, k_descale, v_descale,
+        window_size,
+        attention_chunk,
+        softcap,
+        num_splits,
+        pack_gqa,
+        deterministic,
+        num_heads_q,
+        sm_margin,
+    )
 
 def flash_attn_func(
     q,
