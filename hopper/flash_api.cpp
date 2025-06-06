@@ -250,13 +250,14 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
         if (params.is_bf16) {
             #ifndef FLASHATTENTION_DISABLE_HDIM64
             if (params.d <= 64) {
-                if (params.dv > 256 && Arch == 90) {
+                if constexpr (Arch == 90) {
+                    if (params.dv > 256) {
                     return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                } else if (params.dv > 64 && Arch == 90) {
-                    return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                } else {
-                    return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                    } else if (params.dv > 64) {
+                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                    }
                 }
+                return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
             }
             #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM96
@@ -267,11 +268,12 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
             #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM192
             if (params.d <= 192) {
-                if (params.dv <= 128 && Arch == 90) {
-                    return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                } else {
-                    return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                if constexpr (Arch == 90) {
+                    if (params.dv <= 128) {
+                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                    }
                 }
+                return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
             }
             #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM256
@@ -281,13 +283,14 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
             #ifndef FLASHATTENTION_DISABLE_FP16
             #ifndef FLASHATTENTION_DISABLE_HDIM64
             if (params.d <= 64) {
-                if (params.dv > 256 && Arch == 90) {
+                if constexpr (Arch == 90) {
+                    if (params.dv > 256) {
                     return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                } else if (params.dv > 64 && Arch == 90) {
-                    return run_mha_fwd_<Arch, cutlass::half_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                } else {
-                    return run_mha_fwd_<Arch, cutlass::half_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                    } else if (params.dv > 64) {
+                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                    }
                 }
+                return run_mha_fwd_<Arch, cutlass::half_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
             }
             #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM96
@@ -298,11 +301,12 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
             #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM192
             if (params.d <= 192) {
-                if (params.dv <= 128 && Arch == 90) {
-                    return run_mha_fwd_<Arch, cutlass::half_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                } else {
-                    return run_mha_fwd_<Arch, cutlass::half_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                if constexpr (Arch == 90) {
+                    if (params.dv <= 128) {
+                        return run_mha_fwd_<Arch, cutlass::half_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                    }
                 }
+                return run_mha_fwd_<Arch, cutlass::half_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
             }
             #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM256
@@ -325,11 +329,12 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
         #endif
         #ifndef FLASHATTENTION_DISABLE_HDIM192
         if (params.d <= 192) {
-            if (params.dv <= 128 && Arch == 90) {
-                return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-            } else {
-                return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+            if constexpr (Arch == 90) {
+                if (params.dv <= 128) {
+                    return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                }
             }
+            return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
         }
         #endif
         #ifndef FLASHATTENTION_DISABLE_HDIM256
