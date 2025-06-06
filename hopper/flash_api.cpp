@@ -285,7 +285,7 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
             if (params.d <= 64) {
                 if constexpr (Arch == 90) {
                     if (params.dv > 256) {
-                    return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                     } else if (params.dv > 64) {
                         return run_mha_fwd_<Arch, cutlass::half_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                     }
