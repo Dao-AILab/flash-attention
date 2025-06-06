@@ -56,8 +56,8 @@ COMPILED_HDIMS = (
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
-# @pytest.mark.parametrize("deterministic", [False, True])
-@pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("deterministic", [False, True])
+# @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 # @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
@@ -203,7 +203,8 @@ def test_flash_attn_output(
                 attention_chunk=attention_chunk,
                 softcap=softcap,
                 pack_gqa=pack_gqa,
-                num_splits=num_splits
+                num_splits=num_splits,
+                deterministic=deterministic
             )
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -287,8 +288,8 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
-# @pytest.mark.parametrize("deterministic", [False, True])
-@pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("deterministic", [False, True])
+# @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 # @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
@@ -475,6 +476,7 @@ def test_flash_attn_varlen_output(
                 k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
                 attention_chunk=attention_chunk,
+                deterministic=deterministic,
                 softcap=softcap,
             )
             out = output_pad_fn(out_unpad)
