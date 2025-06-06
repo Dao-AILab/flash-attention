@@ -1143,7 +1143,7 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 }
 #else
 template <int Arch, bool Has_softcap>
-void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_constexpr(Flash_bwd_params &params, cudaStream_t stream) {
     if (!params.is_bf16) {
         #ifndef FLASHATTENTION_DISABLE_FP16
         #ifndef FLASHATTENTION_DISABLE_HDIM64
@@ -1191,7 +1191,7 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         // });
     ARCH_SWITCH(params.arch, Arch, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
-            run_mha_bwd<Arch, Has_softcap>(params, stream);
+            run_mha_bwd_constexpr<Arch, Has_softcap>(params, stream);
         });
     });
 }
