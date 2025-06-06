@@ -649,7 +649,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> q_descale_,  // (b, h_k), not (b, h)
         std::optional<at::Tensor> k_descale_,  // (b, h_k)
         std::optional<at::Tensor> v_descale_,  // (b, h_k)
-        double softmax_scale,
+        std::optional<double> softmax_scale_,
         bool is_causal,
         int64_t window_size_left,
         int64_t window_size_right,
@@ -724,6 +724,10 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     int const total_k = !is_varlen_k ? batch_size * k.size(1) : k.size(0);
     int const num_heads_k = k.size(-2);
     int const batch_size_k = !paged_KV ? (!is_varlen_k ? k.size(0) : cu_seqlens_k.size(0) - 1) : page_table.size(0);
+    double softmax_scale = 1.0 / sqrt(double(head_size));
+    if (softmax_scale_.has_value()) {
+        softmax_scale = softmax_scale_.value();
+    }
     if (!kv_batch_idx_.has_value()) {
         TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
     }
@@ -1206,7 +1210,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     std::optional<at::Tensor> seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
     std::optional<int64_t> max_seqlen_q_,
     std::optional<int64_t> max_seqlen_k_,
-    double softmax_scale,
+    std::optional<double> softmax_scale_,
     bool is_causal,
     int64_t window_size_left,
     int64_t window_size_right,
@@ -1277,6 +1281,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     int const max_headdim = get_max_headdim();
     TORCH_CHECK(std::max(head_size, head_size_v) <= max_headdim, "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+    double softmax_scale = 1.0 / sqrt(double(head_size));
+    if (softmax_scale_.has_value()) {
+        softmax_scale = softmax_scale_.value();
+    }
 
     // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
     if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
@@ -1595,28 +1603,28 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor q,"
         "Tensor k,"
         "Tensor v,"
-        "Tensor(k_new!)? k_new,"
-        "Tensor(v_new!)? v_new,"
-        "Tensor? q_v,"
-        "Tensor(out!)? out,"
-        "Tensor? cu_seqlens_q,"
-        "Tensor? cu_seqlens_k,"
-        "Tensor? cu_seqlens_k_new,"
-        "Tensor? seqused_q,"
-        "Tensor? seqused_k,"
-        "int? max_seqlen_q,"
-        "int? max_seqlen_k,"
-        "Tensor? page_table,"
-        "Tensor? kv_batch_idx,"
-        "Tensor? leftpad_k,"
-        "Tensor? rotary_cos,"
-        "Tensor? rotary_sin,"
-        "Tensor? seqlens_rotary,"
-        "Tensor? q_descale,"
-        "Tensor? k_descale,"
-        "Tensor? v_descale,"
-        "float softmax_scale,"
-        "bool is_causal,"
+        "Tensor(k_new!)? k_new = None,"
+        "Tensor(v_new!)? v_new = None,"
+        "Tensor? q_v = None,"
+        "Tensor(out!)? out = None,"
+        "Tensor? cu_seqlens_q = None,"
+        "Tensor? cu_seqlens_k = None,"
+        "Tensor? cu_seqlens_k_new = None,"
+        "Tensor? seqused_q = None,"
+        "Tensor? seqused_k = None,"
+        "int? max_seqlen_q = None,"
+        "int? max_seqlen_k = None,"
+        "Tensor? page_table = None,"
+        "Tensor? kv_batch_idx = None,"
+        "Tensor? leftpad_k = None,"
+        "Tensor? rotary_cos = None,"
+        "Tensor? rotary_sin = None,"
+        "Tensor? seqlens_rotary = None,"
+        "Tensor? q_descale = None,"
+        "Tensor? k_descale = None,"
+        "Tensor? v_descale = None,"
+        "float? softmax_scale = None,"
+        "bool is_causal = False,"
         "int window_size_left = -1,"
         "int window_size_right = -1,"
         "int attention_chunk = 0,"
@@ -1633,17 +1641,17 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor v,"
         "Tensor out,"
         "Tensor softmax_lse,"
-        "Tensor(dq!)? dq,"
-        "Tensor(dk!)? dk,"
-        "Tensor(dv!)? dv,"
-        "Tensor? cu_seqlens_q,"
-        "Tensor? cu_seqlens_k,"
-        "Tensor? seqused_q,"
-        "Tensor? seqused_k,"
-        "int? max_seqlen_q,"
-        "int? max_seqlen_k,"
-        "float softmax_scale,"
-        "bool is_causal,"
+        "Tensor(dq!)? dq = None,"
+        "Tensor(dk!)? dk = None,"
+        "Tensor(dv!)? dv = None,"
+        "Tensor? cu_seqlens_q = None,"
+        "Tensor? cu_seqlens_k = None,"
+        "Tensor? seqused_q = None,"
+        "Tensor? seqused_k = None,"
+        "int? max_seqlen_q = None,"
+        "int? max_seqlen_k = None,"
+        "float? softmax_scale = None,"
+        "bool is_causal = False,"
         "int window_size_left = -1,"
         "int window_size_right = -1,"
         "float softcap = 0.0,"
@@ -1664,17 +1672,17 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int headdim_v,"
         "ScalarType qkv_dtype,"
         "Tensor seqused_k,"
-        "Tensor? cu_seqlens_q,"
-        "Tensor? cu_seqlens_k,"
-        "Tensor? cu_seqlens_k_new,"
-        "Tensor? seqused_q,"
-        "Tensor? leftpad_k,"
-        "int? page_size,"
-        "int max_seqlen_k_new,"
-        "bool is_causal,"
-        "int window_size_left,"
-        "int window_size_right,"
-        "int attention_chunk,"
+        "Tensor? cu_seqlens_q = None,"
+        "Tensor? cu_seqlens_k = None,"
+        "Tensor? cu_seqlens_k_new = None,"
+        "Tensor? seqused_q = None,"
+        "Tensor? leftpad_k = None,"
+        "int? page_size = None,"
+        "int max_seqlen_k_new = 0,"
+        "bool is_causal = False,"
+        "int window_size_left = -1,"
+        "int window_size_right = -1,"
+        "int attention_chunk = 0,"
         "bool has_softcap = False,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"

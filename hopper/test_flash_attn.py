@@ -5,6 +5,7 @@ import itertools
 import pytest
 import torch
 import torch.nn.functional as F
+from torch._C import parse_schema
 
 from einops import rearrange, repeat
 try:
@@ -1128,3 +1129,16 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     # # pytorch_profiler(torch.sum, lse_partial)
     # pytorch_profiler(flash_attn_combine, out_partial, lse_partial)
     # pytorch_profiler(torch.sum, out_partial)
+
+def test_flash3_bw_compatibility() -> None:
+    # Let's try to always stay backward compatible!
+    # 1/ Instead of removing arguments, error out if their value is no longer supported
+    # 2/ When adding arguments, add them at the end with a default value
+    assert torch.ops.flash_attn_3.fwd.default._schema.is_backward_compatible_with(
+        "aten::_efficient_attention_forward(Tensor query, Tensor key, Tensor value, "
+        "Tensor? bias, Tensor? cu_seqlens_q, Tensor? cu_seqlens_k, SymInt? max_seqlen_q, "
+        "SymInt? max_seqlen_k, float dropout_p, int custom_mask_type, bool compute_log_sumexp=False, *, "
+        "float? scale=None, Tensor? seqlen_k=None, int? window_size=None) -> "
+        "(Tensor output, Tensor logsumexp, Tensor philox_seed, Tensor philox_offset, "
+        "SymInt max_seqlen_batch_q, SymInt max_seqlen_batch_k)"
+    )
