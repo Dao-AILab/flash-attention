@@ -244,7 +244,7 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.deterministic = deterministic;
 }
 
-template <int Arch, int Split, bool PagedKVNonTMA, bool PackGQA_, bool Has_softcap>
+template <int Arch, int Split, bool PagedKVNonTMA, bool PackGQA, bool Has_softcap>
 void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
     if (!params.is_e4m3) {
         if (params.is_bf16) {
@@ -353,7 +353,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                     // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation
                     static constexpr bool PackGQA = PackGQA_ || Arch < 90 || PagedKVNonTMA || Split;
                     SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
-                        run_mha_fwd_constexpr<Arch, Split, PagedKVNonTMA, PackGQA_, Has_softcap>(Flash_fwd_params &params, cudaStream_t stream) {
+                        run_mha_fwd_constexpr<Arch, Split, PagedKVNonTMA, PackGQA, Has_softcap>(Flash_fwd_params &params, cudaStream_t stream) {
                     });
                 });
             });
