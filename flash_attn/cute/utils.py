@@ -85,7 +85,6 @@ def get_smem_store_atom(arch: cutlass.Constexpr[int], element_type: Type[cute.Nu
 
 
 
-@cute.jit
 def max_constexpr(
     a: cutlass.Constexpr[cute.Numeric], b: cutlass.Constexpr[cute.Numeric]
 ) -> cutlass.Constexpr[cute.Numeric]:
@@ -240,3 +239,37 @@ def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
         for rest_k in range(tApA.shape[2]):
             tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
     return tApA
+
+
+@dsl_user_op
+def barrier_sync(barrier_id: int | cutlass.Int32, number_of_threads: int | cutlass.Int32,
+                 *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [cutlass.Int32(barrier_id).ir_value(loc=loc, ip=ip), cutlass.Int32(number_of_threads).ir_value(loc=loc, ip=ip)],
+        "bar.sync $0, $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+# @dsl_user_op
+# def warp_vote_any_lt(a: float | cutlass.Float32, b: float | cutlass.Float32, *, loc=None, ip=None) -> cutlass.Boolean:
+#     mask = cutlass.Int32(-1)
+#     return cutlass.Boolean(
+#         llvm.inline_asm(
+#             T.i32(),
+#             [cutlass.Float32(a).ir_value(loc=loc, ip=ip), cutlass.Float32(b).ir_value(loc=loc, ip=ip), mask.ir_value(loc=loc, ip=ip)],
+#             ".pred p1, p2;\n"
+#             "setp.lt.f32 p1, $1, $2;\n"
+#             "vote.sync.any.pred p2, p1, $3;\n"
+#             "selp.u32 $0, 1, 0, p2;",
+#             # "selp.u32 $0, 1, 0, p1;",
+#             "=r,f,f,r",
+#             has_side_effects=False,
+#             is_align_stack=False,
+#             asm_dialect=llvm.AsmDialect.AD_ATT,
+#         )
+#     )
