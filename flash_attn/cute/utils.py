@@ -255,6 +255,34 @@ def barrier_sync(barrier_id: int | cutlass.Int32, number_of_threads: int | cutla
     )
 
 
+@dsl_user_op
+def barrier_arrive(barrier_id: int | cutlass.Int32, number_of_threads: int | cutlass.Int32, loc=None, ip=None) -> None:
+    """
+    Arrive at a named barrier.
+    """
+    barrier_id = cutlass.Int32(barrier_id).ir_value(loc=loc, ip=ip)
+    number_of_threads = cutlass.Int32(number_of_threads).ir_value(loc=loc, ip=ip)
+    nvvm.barrier_arrive(
+        barrier_id=barrier_id, number_of_threads=number_of_threads, loc=loc, ip=ip
+    )
+    # llvm.inline_asm(
+    #     None,
+    #     [barrier_id, number_of_threads],
+    #     "bar.arrive $0, $1;",
+    #     "r,r",
+    #     has_side_effects=True,
+    #     is_align_stack=False,
+    #     asm_dialect=llvm.AsmDialect.AD_ATT,
+    # )
+
+
+def canonical_warp_group_idx(sync: bool = True) -> cutlass.Int32:
+    warp_group_idx = cute.arch.thread_idx()[0] // 128
+    if cutlass.const_expr(sync):
+        warp_group_idx = cute.arch.make_warp_uniform(warp_group_idx)
+    return warp_group_idx
+
+
 # @dsl_user_op
 # def warp_vote_any_lt(a: float | cutlass.Float32, b: float | cutlass.Float32, *, loc=None, ip=None) -> cutlass.Boolean:
 #     mask = cutlass.Int32(-1)

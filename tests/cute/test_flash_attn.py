@@ -31,8 +31,6 @@ from flash_attn.cute.interface import flash_attn_func
 @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
-# @pytest.mark.parametrize("V_colmajor", [False, True])
-@pytest.mark.parametrize("V_colmajor", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
@@ -68,10 +66,8 @@ from flash_attn.cute.interface import flash_attn_func
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_output(
-    seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv, mha_type, dtype
+    seqlen_q, seqlen_k, d, causal, local, softcap, deterministic, has_qv, mha_type, dtype
 ):
-    if V_colmajor and (seqlen_k % 16 != 0 or dtype != torch.float8_e4m3fn):
-        pytest.skip("V_colmajor requires seqlen_k to be a multiple of 16 and dtype to be float8_e4m3fn")
     if causal and seqlen_k < seqlen_q:
         pytest.skip("Causal attention requires seqlen_k >= seqlen_q")
     device = "cuda"
@@ -109,8 +105,6 @@ def test_flash_attn_output(
             q_descale, k_descale, v_descale = None, None, None
         q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
         qv = qv_ref.detach().to(dtype).requires_grad_() if has_qv else None
-        if V_colmajor:
-            v = rearrange(rearrange(v.detach(), "b s h d -> b h d s").contiguous(), "b h d s -> b s h d").requires_grad_()
         out_ref, attn_ref = attention_ref(
             q_ref,
             k_ref,
@@ -186,7 +180,6 @@ def test_flash_attn_output(
 
         if (
             dtype != torch.float8_e4m3fn
-            and not V_colmajor
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0

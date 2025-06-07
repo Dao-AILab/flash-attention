@@ -259,7 +259,7 @@ class FlashAttentionForwardBase:
         rO = cute.make_fragment_like(acc_O, self.dtype)
         rO.store(acc_O.load().to(self.dtype))
         # Make sure all threads have finished reading V
-        cute.arch.barrier(barrier_id=1, number_of_threads=self.num_mma_threads)
+        cute.arch.barrier(barrier_id=5, number_of_threads=self.num_mma_threads)
         smem_copy_atom_O = utils.get_smem_store_atom(self.arch, self.dtype)
         smem_thr_copy_O = utils.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
         taccOrO = smem_thr_copy_O.retile(rO)
@@ -301,7 +301,7 @@ class FlashAttentionForwardBase:
         tOgO = gmem_thr_copy_O.partition_D(gO)
         tOrO = cute.make_fragment_like(tOgO, self.dtype)
         # sync before all smem stores are done.
-        cute.arch.barrier(barrier_id=1, number_of_threads=self.num_mma_threads)
+        cute.arch.barrier(barrier_id=5, number_of_threads=self.num_mma_threads)
         # load acc O from smem to rmem for wider vectorization
         cute.autovec_copy(tOsO, tOrO)
         tOcO = gmem_thr_copy_O.partition_S(cO)
@@ -996,6 +996,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.num_epilogue_threads = self.num_mma_threads
         self.num_mma_regs = 240
         self.num_producer_regs = 24
+        self.use_scheduler_barrier = self.num_mma_warp_groups == 2
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [cute.make_tensor(t.iterator, cute.select(t.layout, mode=[1, 3, 2, 0])) for t in (mQ, mK, mV, mO)]
@@ -1263,6 +1264,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             #     cute.printf(sP.layout, sP.iterator)
             #     cute.printf(tPsP.layout, tPsP.iterator)
 
+            self.mma_init()
+
             # ///////////////////////////////////////////////////////////////////////////////
             # Softmax intermediate result: row_max and row_sum
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1310,6 +1313,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             smem_pipe_read = cutlass.utils.make_pipeline_state(
                 cutlass.utils.PipelineUserType.Consumer, self.num_stages
             )
+            self.warp_scheduler_barrier_wait()
             compute_one_n_block(
                 n_block, smem_pipe_read, tiled_mma_qk, tiled_mma_pv,
                 is_first_n_block=True, check_inf=True, mask_fn=partial(mask_fn, mask_seqlen=True)
@@ -1336,6 +1340,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     check_inf=False,
                 )
                 smem_pipe_read.advance()
+            self.warp_scheduler_barrier_arrive()
 
             # normalize acc_O by row_sum and calculate the lse
             softmax.normalize(acc_O, row_max, row_sum)
@@ -1351,6 +1356,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 gmem_tiled_copy_O, tiled_mma_pv, tidx, m_block, num_head, batch_size
             )
 
+    @cute.jit
     def compute_one_n_block(
         self,
         n_block: cutlass.Int32,
@@ -1379,8 +1385,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sm90_utils.gemm(
             tiled_mma_qk, acc_S, mma_params.tSrQ,
             mma_params.tSrK[None, None, None, smem_pipe_read.index],
-            zero_init=True, wg_wait=0
+            zero_init=True, wg_wait=-1
         )
+        self.warp_scheduler_barrier_arrive()
+        warpgroup.wait_group(0)
         # pipeline_k.consumer_release(smem_pipe_read)
         pipeline_k.sync_object_array_empty.arrive(smem_pipe_read.index, None)
         scoremod_premask_fn(acc_S)
@@ -1401,6 +1409,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
         cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
         pipeline_v.consumer_wait(smem_pipe_read)
+        self.warp_scheduler_barrier_wait()
         sm90_utils.gemm(
             tiled_mma_pv, mma_params.acc_O, mma_params.tOrP,
             mma_params.tOrVt[None, None, None, smem_pipe_read.index],
@@ -1409,6 +1418,32 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_v.sync_object_array_empty.arrive(smem_pipe_read.index, None)
         # if cute.arch.thread_idx()[0] == 0:
         #     cute.print_tensor(utils.make_acc_tensor_mn_view(mma_params.acc_O))
+
+    @cute.jit
+    def mma_init(self):
+        warp_group_idx = utils.canonical_warp_group_idx(sync=False)
+        if cutlass.const_expr(self.use_scheduler_barrier):
+            if warp_group_idx == 1:
+                utils.barrier_arrive(
+                    barrier_id=1 + 0, number_of_threads=2 * self.num_threads_per_warp_group,
+                )
+
+    def warp_scheduler_barrier_wait(self):
+        if cutlass.const_expr(self.use_scheduler_barrier):
+            cute.arch.barrier(
+                barrier_id=1 - 1 + utils.canonical_warp_group_idx(sync=False),
+                number_of_threads=2 * self.num_threads_per_warp_group
+            )
+
+    def warp_scheduler_barrier_arrive(self):
+        if cutlass.const_expr(self.use_scheduler_barrier):
+            assert self.num_mma_warp_groups in [2, 3]
+            cur_wg = utils.canonical_warp_group_idx(sync=False) - 1
+            next_wg = 1 - cur_wg if self.num_mma_warp_groups == 2 else (cur_wg + 1 if cur_wg < self.num_mma_warp_groups - 1 else 0)
+            utils.barrier_arrive(
+                barrier_id=1 + next_wg,
+                number_of_threads=2 * self.num_threads_per_warp_group,
+            )
 
     # @cute.jit
     def load_K(
