@@ -22,6 +22,7 @@ from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax
 from flash_attn.cute.seqlen_info import SeqlenInfo
+from flash_attn.cute.pipeline import PipelineTmaAsyncNoCluster
 
 
 class FlashAttentionForwardBase:
@@ -888,8 +889,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
     arch = 90
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, intra_wg_overlap: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
+        self.intra_wg_overlap = intra_wg_overlap
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
@@ -996,7 +998,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.num_epilogue_threads = self.num_mma_threads
         self.num_mma_regs = 240
         self.num_producer_regs = 24
-        self.use_scheduler_barrier = self.num_mma_warp_groups == 2
+        self.use_scheduler_barrier = (self.num_mma_warp_groups >= 2 and self.head_dim <= 128) if self.intra_wg_overlap else (self.num_mma_warp_groups == 2)
+        # TODO: rescale_O_before_gemm
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [cute.make_tensor(t.iterator, cute.select(t.layout, mode=[1, 3, 2, 0])) for t in (mQ, mK, mV, mO)]
@@ -1130,25 +1133,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # # We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
         # cute.arch.barrier()
         pipeline_kv_producer_group = cutlass.utils.CooperativeGroup(cutlass.utils.Agent.Thread)
-        pipeline_kv_consumer_group = cutlass.utils.CooperativeGroup(cutlass.utils.Agent.Thread, self.num_mma_threads)
-        pipeline_k = cutlass.utils.PipelineTmaAsync.create(
+        pipeline_kv_consumer_group = cutlass.utils.CooperativeGroup(cutlass.utils.Agent.Thread, self.num_mma_threads // self.num_threads_per_warp_group)
+        pipeline_k = PipelineTmaAsyncNoCluster.create(
             barrier_storage=storage.mbar_ptr_K.data_ptr(),
             num_stages=self.num_stages,
             producer_group=pipeline_kv_producer_group,
             consumer_group=pipeline_kv_consumer_group,
             tx_count=self.tma_copy_k_bytes,
-            cta_layout_vmnk=cute.make_layout((1, 1, 1)),
+            init_wait=False,
         )
-        pipeline_v = cutlass.utils.PipelineTmaAsync.create(
+        pipeline_v = PipelineTmaAsyncNoCluster.create(
             barrier_storage=storage.mbar_ptr_V.data_ptr(),
             num_stages=self.num_stages,
             producer_group=pipeline_kv_producer_group,
             consumer_group=pipeline_kv_consumer_group,
             tx_count=self.tma_copy_v_bytes,
-            cta_layout_vmnk=cute.make_layout((1, 1, 1)),
         )
-        # cute.arch.mbarrier_init_fence()
-        # cute.arch.barrier()
 
         n_block_max = cute.ceil_div(mK.shape[0], self.n_block_size)
         if self.is_causal:
@@ -1309,11 +1309,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
             cute.arch.mbarrier_wait(mbar_ptr_Q, phase=0)
             n_block = n_block_max - 1
-            # First iteration with seqlen masking
             smem_pipe_read = cutlass.utils.make_pipeline_state(
                 cutlass.utils.PipelineUserType.Consumer, self.num_stages
             )
             self.warp_scheduler_barrier_wait()
+            # First iteration with seqlen masking
             compute_one_n_block(
                 n_block, smem_pipe_read, tiled_mma_qk, tiled_mma_pv,
                 is_first_n_block=True, check_inf=True, mask_fn=partial(mask_fn, mask_seqlen=True)
@@ -1389,8 +1389,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(0)
-        # pipeline_k.consumer_release(smem_pipe_read)
-        pipeline_k.sync_object_array_empty.arrive(smem_pipe_read.index, None)
+        pipeline_k.consumer_release(smem_pipe_read)
         scoremod_premask_fn(acc_S)
         if cutlass.const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
@@ -1415,9 +1414,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mma_params.tOrVt[None, None, None, smem_pipe_read.index],
             zero_init=is_first_n_block, wg_wait=0
         )
-        pipeline_v.sync_object_array_empty.arrive(smem_pipe_read.index, None)
-        # if cute.arch.thread_idx()[0] == 0:
-        #     cute.print_tensor(utils.make_acc_tensor_mn_view(mma_params.acc_O))
+        pipeline_v.consumer_release(smem_pipe_read)
 
     @cute.jit
     def mma_init(self):
