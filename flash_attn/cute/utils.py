@@ -256,7 +256,7 @@ def barrier_sync(barrier_id: int | cutlass.Int32, number_of_threads: int | cutla
 
 
 @dsl_user_op
-def barrier_arrive(barrier_id: int | cutlass.Int32, number_of_threads: int | cutlass.Int32, loc=None, ip=None) -> None:
+def barrier_arrive(barrier_id: int | cutlass.Int32, number_of_threads: int | cutlass.Int32, *, loc=None, ip=None) -> None:
     """
     Arrive at a named barrier.
     """

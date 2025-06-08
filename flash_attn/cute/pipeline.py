@@ -19,7 +19,7 @@ class PipelineTmaAsyncNoCluster(PipelineAsync):
         forward pass (especially hdim 128 causal). We instead implement a version of
         PipelineTmaAsync where only 1 out of 128 threads signals the barrier.
 
-        Assumption:
+        Assumptions:
         (1) num_consumers % NumThreadsPerWarpGroup == 0
         (2) all 128 threads in the warp group are sync'ed right before calling consumer_release
     """
