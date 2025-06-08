@@ -1117,6 +1117,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
         m_block, num_head, batch_size = cute.arch.block_idx()
+        if cutlass.const_expr(self.is_causal):  # Longest tile first
+            m_block = cute.arch.grid_dim()[0] - m_block - 1
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -1308,12 +1310,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             smem_pipe_read = cutlass.utils.make_pipeline_state(
                 cutlass.utils.PipelineUserType.Consumer, self.num_stages
             )
+
+            compute_one_n_block_fn = self.compute_one_n_block_intrawg_overlap if cutlass.const_expr(self.intra_wg_overlap) else self.compute_one_n_block
+            compute_one_n_block = partial(
+                compute_one_n_block_fn, pipeline_k=pipeline_k, pipeline_v=pipeline_v,
+                mma_params=mma_params, smem_copy_params=smem_copy_params,
+                softmax_params=softmax_params, scoremod_premask_fn=scoremod_premask_fn,
+            )
+            # First iteration with seqlen masking
             if cutlass.const_expr(self.intra_wg_overlap):
-                compute_one_n_block = partial(
-                    self.compute_one_n_block_intrawg_overlap, pipeline_k=pipeline_k, pipeline_v=pipeline_v,
-                    mma_params=mma_params, smem_copy_params=smem_copy_params,
-                    softmax_params=softmax_params, scoremod_premask_fn=scoremod_premask_fn,
-                )
                 acc_S = cute.make_fragment(
                     tiled_mma_qk.partition_shape_C((self.m_block_size, self.n_block_size)), cutlass.Float32
                 )
@@ -1339,27 +1344,35 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
                 # Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
                 acc_O.fill(0.0)
-                # Couple of iterations with causal masking
-                if self.is_causal:
-                    m_idx_min = m_block * self.m_block_size
-                    n_idx_right = m_idx_min + seqlen.seqlen_k - seqlen.seqlen_q
-                    n_block_min_causal_local_mask = cutlass.max(0, n_idx_right // self.n_block_size)
-                    # Currently we can't do loop with negative step https://github.com/NVIDIA/cutlass/issues/2326
-                    for n_tile in cutlass.range_dynamic(n_block_min_causal_local_mask, n_block_max - 1, unroll=1):
-                        n_block = n_block_max - 2 - n_tile + n_block_min_causal_local_mask
-                        compute_one_n_block(
-                            n_block, smem_pipe_read, tiled_mma_qk_copy, tiled_mma_pv_copy,
-                            check_inf=True, mask_fn=partial(mask_fn, mask_seqlen=False)
-                        )
-                        smem_pipe_read.advance()
-                # The remaining iterations have no masking
-                for n_tile in cutlass.range_dynamic(n_block, unroll=1):
+            else:
+                self.warp_scheduler_barrier_sync()
+                compute_one_n_block(
+                    n_block, smem_pipe_read, tiled_mma_qk, tiled_mma_pv,
+                    is_first_n_block=True, check_inf=True, mask_fn=partial(mask_fn, mask_seqlen=True)
+                )
+                smem_pipe_read.advance()
+            # Next couple of iterations with causal masking
+            if self.is_causal:
+                m_idx_min = m_block * self.m_block_size
+                n_idx_right = m_idx_min + seqlen.seqlen_k - seqlen.seqlen_q
+                n_block_min_causal_local_mask = cutlass.max(0, n_idx_right // self.n_block_size)
+                # Currently we can't do loop with negative step https://github.com/NVIDIA/cutlass/issues/2326
+                for n_tile in cutlass.range_dynamic(n_block_min_causal_local_mask, n_block_max - 1, unroll=1):
+                    n_block = n_block_max - 2 - n_tile + n_block_min_causal_local_mask
                     compute_one_n_block(
-                        n_block - n_tile - 1, smem_pipe_read, tiled_mma_qk_copy1, tiled_mma_pv_copy1,
-                        check_inf=False,
+                        n_block, smem_pipe_read, tiled_mma_qk_copy, tiled_mma_pv_copy,
+                        check_inf=True, mask_fn=partial(mask_fn, mask_seqlen=False)
                     )
                     smem_pipe_read.advance()
-                # Last "half" iteration
+            # The remaining iterations have no masking
+            for n_tile in cutlass.range_dynamic(n_block, unroll=1):
+                compute_one_n_block(
+                    n_block - n_tile - 1, smem_pipe_read, tiled_mma_qk_copy1, tiled_mma_pv_copy1,
+                    check_inf=False,
+                )
+                smem_pipe_read.advance()
+            # Last "half" iteration
+            if cutlass.const_expr(self.intra_wg_overlap):
                 pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
                 sm90_utils.gemm(
                     tiled_mma_pv, mma_params.acc_O, mma_params.tOrP,
@@ -1370,39 +1383,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 pipeline_v.consumer_release(smem_pipe_read)
                 smem_pipe_read.advance()
             else:
-                compute_one_n_block = partial(
-                    self.compute_one_n_block, pipeline_k=pipeline_k, pipeline_v=pipeline_v,
-                    mma_params=mma_params, smem_copy_params=smem_copy_params,
-                    softmax_params=softmax_params, scoremod_premask_fn=scoremod_premask_fn,
-                )
-                self.warp_scheduler_barrier_sync()
-                # First iteration with seqlen masking
-                compute_one_n_block(
-                    n_block, smem_pipe_read, tiled_mma_qk, tiled_mma_pv,
-                    is_first_n_block=True, check_inf=True, mask_fn=partial(mask_fn, mask_seqlen=True)
-                )
-                smem_pipe_read.advance()
-                # Next couple of iterations with causal masking
-                if self.is_causal:
-                    m_idx_min = m_block * self.m_block_size
-                    n_idx_right = m_idx_min + seqlen.seqlen_k - seqlen.seqlen_q
-                    n_block_min_causal_local_mask = cutlass.max(0, n_idx_right // self.n_block_size)
-                    # Currently we can't do loop with negative step
-                    # https://github.com/NVIDIA/cutlass/issues/2326
-                    for n_tile in cutlass.range_dynamic(n_block_min_causal_local_mask, n_block_max - 1, unroll=1):
-                        n_block = n_block_max - 2 - n_tile + n_block_min_causal_local_mask
-                        compute_one_n_block(
-                            n_block, smem_pipe_read, tiled_mma_qk_copy, tiled_mma_pv_copy,
-                            check_inf=True, mask_fn=partial(mask_fn, mask_seqlen=False)
-                        )
-                        smem_pipe_read.advance()
-                # The remaining iterations have no masking
-                for n_tile in cutlass.range_dynamic(n_block, unroll=1):
-                    compute_one_n_block(
-                        n_block - n_tile - 1, smem_pipe_read, tiled_mma_qk_copy1, tiled_mma_pv_copy1,
-                        check_inf=False,
-                    )
-                    smem_pipe_read.advance()
                 self.warp_scheduler_barrier_arrive()
 
             # normalize acc_O by row_sum and calculate the lse
