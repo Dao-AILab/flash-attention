@@ -1381,7 +1381,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         acc_S = cute.make_fragment(
             tiled_mma_qk.partition_shape_C((self.m_block_size, self.n_block_size)), cutlass.Float32
         )
-        pipeline_k.consumer_wait(smem_pipe_read)
+        pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
         sm90_utils.gemm(
             tiled_mma_qk, acc_S, mma_params.tSrQ,
             mma_params.tSrK[None, None, None, smem_pipe_read.index],
@@ -1407,7 +1407,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # Fence and barrier to make sure smem store is visible to WGMMA
         cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
         cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
-        pipeline_v.consumer_wait(smem_pipe_read)
+        pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_wait()
         sm90_utils.gemm(
             tiled_mma_pv, mma_params.acc_O, mma_params.tOrP,
