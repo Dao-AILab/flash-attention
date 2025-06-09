@@ -250,6 +250,7 @@ class FlashAttentionForwardBase:
         mLSE: Optional[cute.Tensor],
         sO: cute.Tensor,
         gmem_tiled_copy_O: cute.TiledCopy,
+        tma_atom_O: Optional[cute.CopyAtom],
         tiled_mma: cute.TiledMma,
         tidx: cutlass.Int32,
         m_block: cutlass.Int32,
@@ -260,7 +261,7 @@ class FlashAttentionForwardBase:
         rO = cute.make_fragment_like(acc_O, self.dtype)
         rO.store(acc_O.load().to(self.dtype))
         # Make sure all threads have finished reading V
-        cute.arch.barrier(barrier_id=5, number_of_threads=self.num_mma_threads)
+        cute.arch.barrier(barrier_id=5, number_of_threads=self.num_epilogue_threads)
         smem_copy_atom_O = utils.get_smem_store_atom(self.arch, self.dtype)
         smem_thr_copy_O = utils.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
         taccOrO = smem_thr_copy_O.retile(rO)
@@ -286,38 +287,53 @@ class FlashAttentionForwardBase:
             # Only the thread corresponding to column 0 writes out the lse to gmem
             if taccOcO[0][1] == 0:
                 for m in cutlass.range_constexpr(cute.size(taccOgLSE.shape[1])):
-                    if cute.elem_less(t0accOcO[m, 0][0], mO.shape[0] - m_block * self.m_block_size - taccOcO[0][0]):
+                    if cute.elem_less(t0accOcO[m, 0][0], mLSE.shape[0] - m_block * self.m_block_size - taccOcO[0][0]):
                         taccOgLSE[m, 0] = lse[m]
 
-        gO = cute.local_tile(
-            mO[None, None, num_head, batch_size],
-            (self.m_block_size, self.head_dim_v_padded),
-            (m_block, 0),
-        )
+        blkO_shape = (self.m_block_size, self.head_dim_v_padded)
+        gO = cute.local_tile(mO[None, None, num_head, batch_size], blkO_shape, (m_block, 0))
         # thr_mma = tiled_mma.get_slice(tidx)
         # taccOgO = thr_mma.partition_C(gO)
         # cute.autovec_copy(rO, taccOgO)
-        gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
-        tOsO = gmem_thr_copy_O.partition_S(sO)
-        tOgO = gmem_thr_copy_O.partition_D(gO)
-        tOrO = cute.make_fragment_like(tOgO, self.dtype)
-        # sync before all smem stores are done.
-        cute.arch.barrier(barrier_id=5, number_of_threads=self.num_mma_threads)
-        # load acc O from smem to rmem for wider vectorization
-        cute.autovec_copy(tOsO, tOrO)
-        tOcO = gmem_thr_copy_O.partition_S(cO)
-        t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
-        tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
-        # copy acc O from rmem to gmem
-        for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
-            # if cute.elem_less(tOcO[0, rest_m, 0][0], mO.shape[1] - m_block * self.m_block_size):
-            if cute.elem_less(t0OcO[0, rest_m, 0][0], mO.shape[0] - m_block * self.m_block_size - tOcO[0][0]):
-                cute.copy(
-                    gmem_tiled_copy_O,
-                    tOrO[None, rest_m, None],
-                    tOgO[None, rest_m, None],
-                    pred=tOpO[None, rest_m, None] if self.check_hdim_v_oob else None,
-                )
+        # sync to make sure all smem stores are done
+        if cutlass.const_expr(self.arch >= 90):  # TODO: self.use_tma_o
+            # ensure smem writes are visible to TMA
+            cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+            utils.barrier_arrive(barrier_id=5, number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE)
+            tOsO, tOgO = cpasync.tma_partition(
+                tma_atom_O,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sO, 0, 2),
+                cute.group_modes(gO, 0, 2),
+            )
+            warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            if warp_idx == 4:
+                cute.arch.barrier(barrier_id=5, number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE)
+                cute.copy(tma_atom_O, tOsO, tOgO)
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+        else:
+            cute.arch.barrier(barrier_id=5, number_of_threads=self.num_epilogue_threads)
+            gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
+            tOsO = gmem_thr_copy_O.partition_S(sO)
+            tOgO = gmem_thr_copy_O.partition_D(gO)
+            tOrO = cute.make_fragment_like(tOgO, self.dtype)
+            # load acc O from smem to rmem for wider vectorization
+            cute.autovec_copy(tOsO, tOrO)
+            tOcO = gmem_thr_copy_O.partition_S(cO)
+            t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
+            tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
+            # copy acc O from rmem to gmem
+            for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
+                # if cute.elem_less(tOcO[0, rest_m, 0][0], mO.shape[1] - m_block * self.m_block_size):
+                if cute.elem_less(t0OcO[0, rest_m, 0][0], mO.shape[0] - m_block * self.m_block_size - tOcO[0][0]):
+                    cute.copy(
+                        gmem_tiled_copy_O,
+                        tOrO[None, rest_m, None],
+                        tOgO[None, rest_m, None],
+                        pred=tOpO[None, rest_m, None] if self.check_hdim_v_oob else None,
+                    )
 
     @cute.jit
     def advance_pipeline(self, pipeline_index):
@@ -806,7 +822,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         sO = cute.make_tensor(sQ.iterator, sO_layout)
         self.epilogue(
             acc_O, row_sum, mO, mLSE, sO,
-            gmem_tiled_copy_O, tiled_mma_pv, tidx, m_block, num_head, batch_size
+            gmem_tiled_copy_O, None, tiled_mma_pv, tidx, m_block, num_head, batch_size
         )
 
     @cute.jit
@@ -1009,11 +1025,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # TMA
         gmem_tiled_copy_Q = cpasync.CopyBulkTensorTileG2SOp()
         gmem_tiled_copy_KV = cpasync.CopyBulkTensorTileG2SOp()  # Might multicast
+        gmem_tiled_copy_O = cpasync.CopyBulkTensorTileS2GOp()
         self.tma_copy_q_bytes = cute.size_in_bytes(mQ.element_type, self.sQ_layout)
         self.tma_copy_k_bytes = cute.size_in_bytes(mK.element_type, cute.select(self.sK_layout, mode=[0, 1]))
         self.tma_copy_v_bytes = cute.size_in_bytes(mV.element_type, cute.select(self.sV_layout, mode=[0, 1]))
         tma_atom_Q, tma_tensor_Q = cpasync.make_tma_tile_atom(
-            gmem_tiled_copy_Q, mQ, self.sQ_layout, (self.m_block_size, self.head_dim_padded), 1  # No mcast
+            gmem_tiled_copy_Q, mQ, self.sQ_layout, (self.m_block_size, self.head_dim_padded), # No mcast
         )
         tma_atom_K, tma_tensor_K = cpasync.make_tma_tile_atom(
             gmem_tiled_copy_KV,
@@ -1028,6 +1045,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cute.select(self.sV_layout, mode=[0, 1]),
             (self.n_block_size, self.head_dim_v_padded),
             1  # No mcast for now
+        )
+        tma_atom_O, tma_tensor_O = cpasync.make_tma_tile_atom(
+            gmem_tiled_copy_O, mO, self.sO_layout, (self.m_block_size, self.head_dim_v_padded), # No mcast
         )
         # grid_dim: (m_block, num_head, batch_size)
         grid_dim = (
@@ -1052,10 +1072,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tma_tensor_K,
             tma_tensor_V,
             mO,
+            tma_tensor_O,
             mLSE,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
+            tma_atom_O,
             softmax_scale_log2,
             softcap_val,
             self.sQ_layout,
@@ -1085,10 +1107,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mK: cute.Tensor,
         mV: cute.Tensor,
         mO: cute.Tensor,
+        mO_tma: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
+        tma_atom_O: Optional[cute.CopyAtom],
         softmax_scale_log2: cutlass.Float32,
         softcap_val: cutlass.Float32,
         sQ_layout: cute.ComposedLayout,
@@ -1113,6 +1137,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cpasync.prefetch_descriptor(tma_atom_Q)
             cpasync.prefetch_descriptor(tma_atom_K)
             cpasync.prefetch_descriptor(tma_atom_V)
+            if cutlass.const_expr(tma_atom_O is not None):
+                cpasync.prefetch_descriptor(tma_atom_O)
 
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -1393,11 +1419,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Epilogue
             # ///////////////////////////////////////////////////////////////////////////////
             # reuse sQ's data iterator
-            sO = cute.make_tensor(sQ.iterator, sO_layout)
-            # sO = cute.make_tensor(cute.recast_ptr(sO.iterator, sO_layout.inner, dtype=sO.element_type), sO_layout.outer)
+            sO_pi = cute.make_tensor(sQ.iterator, sO_layout)
+            # TODO: idk why using not using sO_pi is faster
+            sO = cute.make_tensor(cute.recast_ptr(sO_pi.iterator, sO_layout.inner, dtype=sO_pi.element_type), sO_layout.outer)
             self.epilogue(
-                acc_O, row_sum, mO, mLSE, sO,
-                gmem_tiled_copy_O, tiled_mma_pv, tidx, m_block, num_head, batch_size
+                # acc_O, row_sum, mO, mLSE, sO,
+                acc_O, row_sum, mO_tma, mLSE, sO,
+                gmem_tiled_copy_O, tma_atom_O, tiled_mma_pv, tidx, m_block, num_head, batch_size
             )
 
     @cute.jit
