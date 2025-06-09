@@ -14,32 +14,11 @@ class AttentionMask:
         n_block_size: cutlass.Constexpr[int],
         seqlen_q: cutlass.Int32,
         seqlen_k: cutlass.Int32,
-        *,
-        loc=None,
-        ip=None
     ):
         self.m_block_size = m_block_size
         self.n_block_size = n_block_size
         self.seqlen_q = seqlen_q
         self.seqlen_k = seqlen_k
-        self._loc = loc
-
-    def __extract_mlir_values__(self):
-        values, self._values_pos = [], []
-        for obj in [self.m_block_size, self.n_block_size, self.seqlen_q, self.seqlen_k]:
-            obj_values = cutlass.extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        obj_list = []
-        for obj, n_items in zip(
-            [self.m_block_size, self.n_block_size, self.seqlen_q, self.seqlen_k], self._values_pos
-        ):
-            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
-            values = values[n_items:]
-        return AttentionMask(*(tuple(obj_list)), loc=self._loc)
 
     @cute.jit
     def apply_mask(
@@ -72,7 +51,7 @@ class AttentionMask:
                 row_idx = tScS_mn[r, 0][0] + m_block * self.m_block_size
                 col_limit_right = row_idx + causal_row_offset
                 if cutlass.const_expr(mask_seqlen):
-                    col_idx = cutlass.min(col_limit_right, seqlenk_col_limit)
+                    col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                 # traverse column index.
                 for c in range(cute.size(tScS_mn.shape[1])):
                     # only consider the column index, so the row index sets to 0.

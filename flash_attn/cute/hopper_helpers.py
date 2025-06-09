@@ -15,9 +15,7 @@ def gemm(
     swap_AB: cutlass.Constexpr[bool] = False,
 ) -> None:
     if swap_AB:
-        pass
-        # TODO
-        # gemm(tiled_mma, acc, tCrB, tCrA, zero_init=zero_init, A_in_regs=B_in_regs, swap_AB=False)
+        gemm(tiled_mma, acc, tCrB, tCrA, zero_init=zero_init, wg_wait=wg_wait, swap_AB=False)
     else:
         warpgroup.fence()
         tiled_mma.set(warpgroup.Field.ACCUMULATE, not zero_init)

@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
+# import math
 from typing import Optional
 from dataclasses import dataclass
 
@@ -7,7 +8,90 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Boolean, Int32, if_generate
 from cutlass.utils import PipelineAsync, PipelineState, CooperativeGroup, pipeline_init_wait
+from cutlass.utils.pipeline import PipelineUserType
 from cutlass.utils.pipeline import _PipelineOp
+
+
+class PipelineStateSimple:
+    """
+    Pipeline state contains an index and phase bit corresponding to the current position in the circular buffer.
+    Use a single Int32 to store both the index and phase bit, then we use divmod to get the
+    index and phase. If stages is a power of 2, divmod turns into bit twiddling.
+    """
+
+    def __init__(self, stages: int, phase_index: Int32):
+        # assert stages < 2**16
+        # self._log_stages = int(math.log2(stages))
+        # assert 1 << self._log_stages == stages, "Number of stages must be a power of 2."
+        self._stages = stages
+        self._phase_index = phase_index
+
+    def clone(self) -> "PipelineStateSimple":
+        return PipelineStateSimple(self.stages, self._phase_index)
+
+    @property
+    def stages(self) -> int:
+        # return 1 << self._log_stages
+        return self._stages
+
+    @property
+    def index(self) -> Int32:
+        # return self._phase_index & 0xFFFF
+        # return self._phase_index & ((1 << self._log_stages) - 1)
+        return self._phase_index % self._stages
+
+    @property
+    def phase(self) -> Int32:
+        # return self._phase_index >> 16
+        # PTX docs say that the phase parity needs to be 0 or 1, so by right we need to
+        # take modulo 2. But in practice just passing the phase in without modulo works fine.
+        # return (self._phase_index >> self._log_stages) % 2
+        # return self._phase_index >> self._log_stages
+        return self._phase_index // self._stages
+
+    def advance(self):
+        self._phase_index += 1
+
+        # def then_body(phase_index):
+        #     # XOR the phase bit and set the index to 0
+        #     return (phase_index & 0xFFFF0000) ^ (1 << 16)
+
+        # def else_body(phase_index):
+        #     return phase_index
+
+        # self._phase_index = if_generate(
+        #     (self._phase_index & 0xFFFF) == self.stages,
+        #     then_body,
+        #     else_body,
+        #     [self._phase_index],
+        #     [Int32],
+        # )
+
+    def __get_mlir_types__(self):
+        return [self._phase_index.type]
+
+    def __extract_mlir_values__(self):
+        phase_index = self._phase_index
+        return [phase_index.ir_value()]
+
+    def __new_from_mlir_values__(self, values):
+        return PipelineStateSimple(self.stages, Int32(values[0]))
+
+
+def make_pipeline_state(type: PipelineUserType, stages: int):
+    """
+    Creates a pipeline state. Producers are assumed to start with an empty buffer and have a flipped phase bit of 1.
+    """
+    if type is PipelineUserType.Producer:
+        # return PipelineStateSimple(stages, Int32(1 << 16))
+        return PipelineStateSimple(stages, Int32(stages))
+    elif type is PipelineUserType.Consumer:
+        return PipelineStateSimple(stages, Int32(0))
+    else:
+        assert (
+            False
+        ), "Error: invalid PipelineUserType specified for make_pipeline_state."
+
 
 
 @dataclass(frozen=True)
