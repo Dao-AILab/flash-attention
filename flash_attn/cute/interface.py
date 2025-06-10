@@ -20,6 +20,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.runtime import from_dlpack
 
 from flash_attn.cute import utils
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90
@@ -43,6 +44,11 @@ def _flash_attn_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     softcap: float = 0.0,
@@ -54,14 +60,35 @@ def _flash_attn_fwd(
     num_threads: int = 384,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
-    batch_size, seqlen_q, num_head, head_dim = q.shape
-    _, seqlen_k, num_head_kv, _ = k.shape
-    _, _, _, head_dim_v = v.shape
-    assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
-    assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+    num_head, head_dim = q.shape[-2:]
+    if cu_seqlens_q is None:
+        batch_size, seqlen_q = q.shape[:2]
+        total_q = batch_size * seqlen_q
+    else:
+        batch_size = cu_seqlens_q.shape[0] - 1
+        seqlen_q = max_seqlen_q
+        total_q = q.shape[0]
+    seqlen_k, num_head_kv, _ = k.shape[-3:]
+    head_dim_v = v.shape[-1]
+    if cu_seqlens_k is None:
+        assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
+        assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+    else:
+        assert k.shape == (seqlen_k, num_head_kv, head_dim)
+        assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
+        assert cu_seqlens_k.shape == (batch_size + 1,), "cu_seqlens_k must have shape (batch_size + 1,)"
+    if cu_seqlens_q is not None:
+        assert max_seqlen_q is not None, "max_seqlen_q must be provided if cu_seqlens_q is provided"
+        assert cu_seqlens_q.shape == (batch_size + 1,), "cu_seqlens_q must have shape (batch_size + 1,)"
+    assert seqused_q is None or seqused_q.shape == (batch_size,), "seqused_q must have shape (batch_size,)"
+    assert seqused_k is None or seqused_k.shape == (batch_size,), "seqused_k must have shape (batch_size,)"
     assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
-    assert all(t.is_cuda for t in (q, k, v)), "inputs must be on CUDA device"
+    for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
+        if t is not None:
+            assert t.dtype == torch.int32, "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be int32"
+            assert t.stride(0) == 1, "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be contiguous"
+    assert all(t is None or t.is_cuda for t in (q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
     alignment = 128 // q.element_size()
@@ -73,22 +100,33 @@ def _flash_attn_fwd(
 
     out_torch_dtype = q.dtype
     device = q.device
-    out = torch.empty(batch_size, seqlen_q, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
-    lse = torch.empty(batch_size, num_head, seqlen_q, dtype=torch.float32, device=device)
+    q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
+    out = torch.empty(*q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
+    lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
+    lse = torch.empty(lse_shape, dtype=torch.float32, device=device)
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor = [
         utils.convert_from_dlpack(
-            t.detach(), leading_dim=3, divisibility=128 // dtype.width
+            t.detach(), leading_dim=t.ndim - 1, divisibility=128 // dtype.width
         ) for t in (q, k, v, out)
     ]
-    lse_tensor = utils.convert_from_dlpack(lse, leading_dim=2, alignment=4)
+    lse_tensor = utils.convert_from_dlpack(lse, leading_dim=lse.ndim - 1, alignment=4)
+    cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor = [
+        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None
+        for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+    ]
+    max_seqlen_q = cutlass.Int32(max_seqlen_q) if max_seqlen_q is not None else None
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    compile_key = (dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap != 0.0, m_block_size, n_block_size, num_threads)
+    compile_key = (
+        dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap != 0.0,
+        cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
+        m_block_size, n_block_size, num_threads
+    )
     if compile_key not in _flash_attn_fwd.compile_cache:
-        # fa_fwd_sm80 = FlashAttentionForwardSm80(
-        fa_fwd_sm80 = FlashAttentionForwardSm90(
+        # fa_fwd = FlashAttentionForwardSm80(
+        fa_fwd = FlashAttentionForwardSm90(
             dtype,
             head_dim,
             head_dim_v,
@@ -104,11 +142,14 @@ def _flash_attn_fwd(
         )
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-            fa_fwd_sm80, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor,
-            softmax_scale, softcap, current_stream
+            fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor,
+            cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
+            max_seqlen_q, softmax_scale, softcap, current_stream
         )
     _flash_attn_fwd.compile_cache[compile_key](
-        q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, softcap, current_stream
+        q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor,
+        cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
+        max_seqlen_q, softmax_scale, softcap, current_stream
     )
     return out, lse
 
@@ -317,7 +358,7 @@ class FlashAttnFunc(torch.autograd.Function):
             q,
             k,
             v,
-            softmax_scale,
+            softmax_scale=softmax_scale,
             causal=causal,
             softcap=softcap,
         )
@@ -344,6 +385,51 @@ class FlashAttnFunc(torch.autograd.Function):
         return dq, dk, dv, *((None,) * 3)
 
 
+class FlashAttnVarlenFunc(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: Optional[torch.Tensor],
+        cu_seqlens_k: Optional[torch.Tensor],
+        seqused_q: Optional[torch.Tensor],
+        seqused_k: Optional[torch.Tensor],
+        max_seqlen_q: Optional[int],
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        softcap: float = 0.0,
+    ):
+        out, lse = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            max_seqlen_q,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            softcap=softcap,
+        )
+        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        ctx.max_seqlen_q = max_seqlen_q
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.softcap = softcap
+        return out, lse
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
+        raise NotImplementedError(
+            "Backward pass for FlashAttention with variable length sequences is not implemented yet."
+        )
+
+
 def flash_attn_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -356,6 +442,34 @@ def flash_attn_func(
         q,
         k,
         v,
+        softmax_scale,
+        causal,
+        softcap,
+    )
+
+
+def flash_attn_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    softcap: float = 0.0,
+):
+    return FlashAttnVarlenFunc.apply(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
         softmax_scale,
         causal,
         softcap,
