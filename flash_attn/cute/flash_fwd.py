@@ -319,8 +319,7 @@ class FlashAttentionForwardBase:
         # taccOgO = thr_mma.partition_C(gO)
         # cute.autovec_copy(rO, taccOgO)
         # sync to make sure all smem stores are done
-        # if cutlass.const_expr(self.arch >= 90):  # TODO: self.use_tma_o
-        if False:  # TODO: self.use_tma_o
+        if cutlass.const_expr(self.use_tma_O):
             # ensure smem writes are visible to TMA
             cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
             utils.barrier_arrive(barrier_id=5, number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE)
@@ -541,6 +540,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_mma_threads = tiled_mma_pv.size
         self.num_producer_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
+        # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
+        self.use_tma_O = self.arch >= 90
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [cute.make_tensor(t.iterator, cute.select(t.layout, mode=[1, 3, 2, 0])) for t in (mQ, mK, mV, mO)]
@@ -1042,6 +1043,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.num_mma_regs = 240
         self.num_producer_regs = 24
         self.use_scheduler_barrier = (self.num_mma_warp_groups >= 2 and self.head_dim_padded <= 128) if self.intra_wg_overlap else (self.num_mma_warp_groups == 2)
+        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
         # TODO: rescale_O_before_gemm
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
@@ -1443,8 +1445,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # TODO: idk why using not using sO_pi is faster
                 sO = cute.make_tensor(cute.recast_ptr(sO_pi.iterator, sO_layout.inner, dtype=sO_pi.element_type), sO_layout.outer)
                 self.epilogue(
-                    acc_O, softmax.row_sum, mO, mLSE, sO, seqlen,
-                    # acc_O, softmax.row_sum, mO_tma, mLSE, sO, seqlen,
+                    acc_O, softmax.row_sum, mO if not self.use_tma_O else mO_tma, mLSE, sO, seqlen,
                     gmem_tiled_copy_O, tma_atom_O, tiled_mma_pv, tidx, m_block, head_idx, batch_idx,
                     is_varlen=cutlass.const_expr(mCuSeqlensQ is not None),
                 )
