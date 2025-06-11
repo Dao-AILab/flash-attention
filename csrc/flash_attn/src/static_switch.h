@@ -76,6 +76,16 @@
   #define LOCAL_SWITCH BOOL_SWITCH
 #endif
 
+#ifdef FLASHATTENTION_DISABLE_TREE_ATTENTION
+  #define TREE_ATTENTION_SWITCH(COND, CONST_NAME, ...)   \
+  [&] {                                         \
+    constexpr static bool CONST_NAME = false;    \
+    return __VA_ARGS__();                       \
+  }()
+#else
+  #define TREE_ATTENTION_SWITCH BOOL_SWITCH
+#endif
+
 #define FP16_SWITCH(COND, ...)               \
   [&] {                                      \
     if (COND) {                              \
