@@ -195,6 +195,25 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
+
+    nvcc_flags = [
+    "-O3",
+    "-std=c++17",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--use_fast_math",
+    ]
+
+    compiler_c17_flag=["-O3", "-std=c++17"]
+    # Add Windows-specific flags
+    if sys.platform == "win32" and os.getenv('DISTUTILS_USE_SDK') == '1':
+        nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus"])
+        compiler_c17_flag=["-O2", "/std:c++17", "/Zc:__cplusplus"]
+
     ext_modules.append(
         CUDAExtension(
             name="flash_attn_2_cuda",
@@ -274,30 +293,8 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu",
             ],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
-                "nvcc": append_nvcc_threads(
-                    [
-                        "-O3",
-                        "-std=c++17",
-                        "-U__CUDA_NO_HALF_OPERATORS__",
-                        "-U__CUDA_NO_HALF_CONVERSIONS__",
-                        "-U__CUDA_NO_HALF2_OPERATORS__",
-                        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                        "--expt-relaxed-constexpr",
-                        "--expt-extended-lambda",
-                        "--use_fast_math",
-                        # "--ptxas-options=-v",
-                        # "--ptxas-options=-O2",
-                        # "-lineinfo",
-                        # "-DFLASHATTENTION_DISABLE_BACKWARD",
-                        # "-DFLASHATTENTION_DISABLE_DROPOUT",
-                        # "-DFLASHATTENTION_DISABLE_ALIBI",
-                        # "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                        # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
-                        # "-DFLASHATTENTION_DISABLE_LOCAL",
-                    ]
-                    + cc_flag
-                ),
+                "cxx": compiler_c17_flag,
+                "nvcc": append_nvcc_threads(nvcc_flags + cc_flag),
             },
             include_dirs=[
                 Path(this_dir) / "csrc" / "flash_attn",
