@@ -26,6 +26,7 @@ from flash_attn.cute.softmax import Softmax
 from flash_attn.cute.seqlen_info import SeqlenInfo
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute import pipeline
+from flash_attn.cute.pack_gqa import PackGQA
 
 
 class FlashAttentionForwardBase:
@@ -38,12 +39,13 @@ class FlashAttentionForwardBase:
         head_dim: int,
         head_dim_v: Optional[int] = None,
         qhead_per_kvhead: int = 1,
+        is_causal: bool = False,
+        has_softcap: bool = False,
+        pack_gqa: bool = True,
         m_block_size: int = 128,
         n_block_size: int = 128,
         num_stages: int = 1,
         num_threads: int = 128,
-        is_causal: bool = False,
-        has_softcap: bool = False,
         Q_in_regs: bool = False,
     ):
         """Initializes the configuration for a flash attention kernel.
@@ -72,11 +74,12 @@ class FlashAttentionForwardBase:
         self.check_hdim_oob = head_dim != self.head_dim_padded
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.qhead_per_kvhead = qhead_per_kvhead
+        self.is_causal = is_causal
+        self.has_softcap = has_softcap
+        self.pack_gqa = pack_gqa
         self.m_block_size = m_block_size
         self.n_block_size = n_block_size
         self.num_threads = num_threads
-        self.is_causal = is_causal
-        self.has_softcap = has_softcap
         self.num_stages = num_stages
         self.Q_in_regs = Q_in_regs
 
@@ -198,14 +201,18 @@ class FlashAttentionForwardBase:
         atom_universal_copy = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=universal_copy_bits,
         )
-        # tQK_layout: thread layout for QK load
+        # tQ_layout and tK_layout: thread layout for QK load
         tQK_shape_dim_1 = sQ_layout_atom.outer.shape[1] // async_copy_elems
+        assert self.num_Q_load_threads % tQK_shape_dim_1 == 0, "num_threads must be divisible by tQK_shape_dim_1"
         assert self.num_producer_threads % tQK_shape_dim_1 == 0, "num_threads must be divisible by tQK_shape_dim_1"
-        tQK_layout = cute.make_ordered_layout(
+        tQ_layout = cute.make_ordered_layout(
+            (self.num_Q_load_threads // tQK_shape_dim_1, tQK_shape_dim_1), order=(1, 0),
+        )
+        tK_layout = cute.make_ordered_layout(
             (self.num_producer_threads // tQK_shape_dim_1, tQK_shape_dim_1), order=(1, 0),
         )
         # So that we don't have to check if we overshoot kBlockM when we load Q
-        assert self.m_block_size % tQK_layout.shape[0] == 0
+        assert self.m_block_size % tQ_layout.shape[0] == 0
         tV_shape_dim_1 = sV_layout_atom.outer.shape[1] // async_copy_elems
         tV_layout = cute.make_ordered_layout(
             (self.num_producer_threads // tV_shape_dim_1, tV_shape_dim_1), order=(1, 0),
@@ -222,8 +229,8 @@ class FlashAttentionForwardBase:
         vQKV_layout = cute.make_layout((1, async_copy_elems))
         vO_layout = vQKV_layout
 
-        # gmem_tiled_copy_QK: tiled copy for QK load
-        self.gmem_tiled_copy_QK = cute.make_tiled_copy_tv(atom_async_copy, tQK_layout, vQKV_layout)
+        self.gmem_tiled_copy_Q = cute.make_tiled_copy_tv(atom_async_copy, tQ_layout, vQKV_layout)
+        self.gmem_tiled_copy_K = cute.make_tiled_copy_tv(atom_async_copy, tK_layout, vQKV_layout)
         self.gmem_tiled_copy_V = cute.make_tiled_copy_tv(atom_async_copy, tV_layout, vQKV_layout)
         # gmem_tiled_copy_O: tiled copy for O store
         self.gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
@@ -287,6 +294,7 @@ class FlashAttentionForwardBase:
         cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
 
         cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_v_padded))
+        pack_gqa = PackGQA(self.m_block_size, self.head_dim_padded, self.check_hdim_oob, self.qhead_per_kvhead)
 
         # Write LSE from rmem -> gmem
         if cutlass.const_expr(mLSE is not None):
@@ -294,27 +302,29 @@ class FlashAttentionForwardBase:
                 mLSE_cur = mLSE[None, head_idx, batch_idx]
             else:
                 mLSE_cur = cute.domain_offset((seqlen.offset_q,), mLSE[None, head_idx])
-            gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_block,))
-            gLSE_expanded_layout = cute.append(
-                gLSE.layout, cute.make_layout((self.head_dim_v_padded,), stride=(0,))
-            )
-            gLSE_expanded = cute.make_tensor(gLSE.iterator, gLSE_expanded_layout)
-            thr_mma = tiled_mma.get_slice(tidx)
-            taccOgLSE = utils.make_acc_tensor_mn_view(thr_mma.partition_C(gLSE_expanded))
-            assert cute.size(taccOgLSE, mode=[0]) == cute.size(lse)
-            taccOcO = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cO))
-            t0accOcO = utils.make_acc_tensor_mn_view(thr_mma.get_slice(0).partition_C(cO))
-            # Only the thread corresponding to column 0 writes out the lse to gmem
-            if taccOcO[0][1] == 0:
-                for m in cutlass.range_constexpr(cute.size(taccOgLSE.shape[1])):
-                    if cute.elem_less(t0accOcO[m, 0][0], seqlen.seqlen_q - m_block * self.m_block_size - taccOcO[0][0]):
-                        taccOgLSE[m, 0] = lse[m]
+            if cutlass.const_expr(not self.pack_gqa):
+                gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_block,))
+                gLSE_expanded_layout = cute.append(
+                    gLSE.layout, cute.make_layout((self.head_dim_v_padded,), stride=(0,))
+                )
+                gLSE_expanded = cute.make_tensor(gLSE.iterator, gLSE_expanded_layout)
+                thr_mma = tiled_mma.get_slice(tidx)
+                taccOgLSE = utils.make_acc_tensor_mn_view(thr_mma.partition_C(gLSE_expanded))
+                assert cute.size(taccOgLSE, mode=[0]) == cute.size(lse)
+                taccOcO = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cO))
+                t0accOcO = utils.make_acc_tensor_mn_view(thr_mma.get_slice(0).partition_C(cO))
+                # Only the thread corresponding to column 0 writes out the lse to gmem
+                if taccOcO[0][1] == 0:
+                    for m in cutlass.range_constexpr(cute.size(taccOgLSE.shape[1])):
+                        if cute.elem_less(t0accOcO[m, 0][0], seqlen.seqlen_q - m_block * self.m_block_size - taccOcO[0][0]):
+                            taccOgLSE[m, 0] = lse[m]
+            else:
+                pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
 
         if cutlass.const_expr(not is_varlen):
             mO_cur = mO[None, None, head_idx, batch_idx]
         else:
             mO_cur = cute.domain_offset((seqlen.offset_q, 0), mO[None, None, head_idx])
-        gO = cute.local_tile(mO_cur, (self.m_block_size, self.head_dim_v_padded), (m_block, 0))
         # thr_mma = tiled_mma.get_slice(tidx)
         # taccOgO = thr_mma.partition_C(gO)
         # cute.autovec_copy(rO, taccOgO)
@@ -323,6 +333,7 @@ class FlashAttentionForwardBase:
             # ensure smem writes are visible to TMA
             cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
             utils.barrier_arrive(barrier_id=5, number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE)
+            gO = cute.local_tile(mO_cur, (self.m_block_size, self.head_dim_v_padded), (m_block, 0))
             tOsO, tOgO = cpasync.tma_partition(
                 tma_atom_O,
                 0,
@@ -340,22 +351,26 @@ class FlashAttentionForwardBase:
             cute.arch.barrier(barrier_id=5, number_of_threads=self.num_epilogue_threads)
             gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
             tOsO = gmem_thr_copy_O.partition_S(sO)
-            tOgO = gmem_thr_copy_O.partition_D(gO)
-            tOrO = cute.make_fragment_like(tOgO, self.dtype)
+            tOrO = cute.make_fragment_like(tOsO, self.dtype)
             # load acc O from smem to rmem for wider vectorization
             cute.autovec_copy(tOsO, tOrO)
-            tOcO = gmem_thr_copy_O.partition_S(cO)
-            t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
-            tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
-            # copy acc O from rmem to gmem
-            for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
-                if cute.elem_less(t0OcO[0, rest_m, 0][0], seqlen.seqlen_q - m_block * self.m_block_size - tOcO[0][0]):
-                    cute.copy(
-                        gmem_tiled_copy_O,
-                        tOrO[None, rest_m, None],
-                        tOgO[None, rest_m, None],
-                        pred=tOpO[None, rest_m, None] if self.check_hdim_v_oob else None,
-                    )
+            if cutlass.const_expr(not self.pack_gqa):
+                gO = cute.local_tile(mO_cur, (self.m_block_size, self.head_dim_v_padded), (m_block, 0))
+                tOgO = gmem_thr_copy_O.partition_D(gO)
+                tOcO = gmem_thr_copy_O.partition_S(cO)
+                t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
+                tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
+                # copy acc O from rmem to gmem
+                for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
+                    if cute.elem_less(t0OcO[0, rest_m, 0][0], seqlen.seqlen_q - m_block * self.m_block_size - tOcO[0][0]):
+                        cute.copy(
+                            gmem_tiled_copy_O,
+                            tOrO[None, rest_m, None],
+                            tOgO[None, rest_m, None],
+                            pred=tOpO[None, rest_m, None] if self.check_hdim_v_oob else None,
+                        )
+            else:
+                pack_gqa.store_O(mO_cur, tOrO, gmem_tiled_copy_O, tidx, m_block, seqlen.seqlen_q)
 
     @cute.jit
     def advance_pipeline(self, pipeline_index):
@@ -365,12 +380,13 @@ class FlashAttentionForwardBase:
     def load_Q(
         self,
         gmem_thr_copy: cute.TiledCopy,
-        tQgQ: cute.Tensor,
-        tQsQ: cute.Tensor,
+        gQ: cute.Tensor,
+        sQ: cute.Tensor,
         block: cutlass.Int32,
         seqlen: cutlass.Int32,
         headdim: cutlass.Int32,
     ):
+        tQsQ, tQgQ = gmem_thr_copy.partition_D(sQ), gmem_thr_copy.partition_S(gQ)
         cQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
         tQcQ = gmem_thr_copy.partition_S(cQ)
         t0QcQ = gmem_thr_copy.get_slice(0).partition_S(cQ)
@@ -539,6 +555,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_pv.size
         self.num_producer_threads = self.num_threads
+        self.num_Q_load_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
         # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
         self.use_tma_O = self.arch >= 90
@@ -577,7 +594,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             self.sV_layout,
             self.sO_layout,
             self.sP_layout,
-            self.gmem_tiled_copy_QK,
+            self.gmem_tiled_copy_Q,
+            self.gmem_tiled_copy_K,
             self.gmem_tiled_copy_V,
             self.gmem_tiled_copy_O,
             tiled_mma_qk,
@@ -605,7 +623,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         sV_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
         sP_layout: cute.ComposedLayout | None,
-        gmem_tiled_copy_QK: cute.TiledCopy,
+        gmem_tiled_copy_Q: cute.TiledCopy,
+        gmem_tiled_copy_K: cute.TiledCopy,
         gmem_tiled_copy_V: cute.TiledCopy,
         gmem_tiled_copy_O: cute.TiledCopy,
         tiled_mma_qk: cute.TiledMma,
@@ -616,7 +635,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         tidx, _, _ = cute.arch.thread_idx()
         m_block, num_head, batch_size = cute.arch.block_idx()
 
-        block_info = BlockInfo(self.m_block_size, self.n_block_size, self.is_causal)
+        block_info = BlockInfo(
+            self.m_block_size, self.n_block_size, self.is_causal,
+            self.qhead_per_kvhead if self.pack_gqa else 1,
+        )
         seqlen = SeqlenInfo(seqlen_q=mQ.shape[0], seqlen_k=mK.shape[0])
         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
         # TODO: return early if n_block_max == 0
@@ -650,17 +672,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # Transpose view of V to tensor with layout (head_dim_v, n_block_size) for tiled mma
         sVt = utils.transpose_view(sV)
 
-        gmem_thr_copy_QK = gmem_tiled_copy_QK.get_slice(tidx)
+        gmem_thr_copy_K = gmem_tiled_copy_K.get_slice(tidx)
         gmem_thr_copy_V = gmem_tiled_copy_V.get_slice(tidx)
-        # (CPY_Atom, CPY_M, CPY_K)
-        tQgQ = gmem_thr_copy_QK.partition_S(gQ)
-        tQsQ = gmem_thr_copy_QK.partition_D(sQ)
         # (CPY_Atom, CPY_N, CPY_K, n_block)
-        tKgK = gmem_thr_copy_QK.partition_S(gK)
-        tKsK = gmem_thr_copy_QK.partition_D(sK)
+        tKsK, tKgK = gmem_thr_copy_K.partition_D(sK), gmem_thr_copy_K.partition_S(gK)
         # (CPY_Atom, CPY_N, CPY_K, n_block)
-        tVgV = gmem_thr_copy_V.partition_S(gV)
-        tVsV = gmem_thr_copy_V.partition_D(sV)
+        tVsV, tVgV = gmem_thr_copy_V.partition_D(sV), gmem_thr_copy_V.partition_S(gV)
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Tile MMA compute thread partitions and allocate accumulators
@@ -697,8 +714,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # ///////////////////////////////////////////////////////////////////////////////
         # Construct identity layout for KV
         cK = cute.make_identity_tensor((self.n_block_size, self.head_dim_padded))
-        tKcK = gmem_thr_copy_QK.partition_S(cK)
-        t0KcK = gmem_thr_copy_QK.get_slice(0).partition_S(cK)
+        tKcK = gmem_thr_copy_K.partition_S(cK)
+        t0KcK = gmem_thr_copy_K.get_slice(0).partition_S(cK)
         if cutlass.const_expr(self.head_dim_padded == self.head_dim_v_padded):
             tVcV = tKcK
             t0VcV = t0KcK
@@ -730,7 +747,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             smem_thr_copy_V=smem_thr_copy_V,
             tSsQ=tSsQ, tSsK=tSsK, tOsVt=tOsVt,
         )
-        load_K = partial(self.load_K, gmem_tiled_copy_QK, tKgK, tKsK, tKcK, t0KcK, tKpK,
+        load_K = partial(self.load_K, gmem_tiled_copy_K, tKgK, tKsK, tKcK, t0KcK, tKpK,
                          seqlen=seqlen.seqlen_k)
         load_V = partial(self.load_V, gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV,
                          seqlen=seqlen.seqlen_k)
@@ -749,8 +766,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # Prologue
         # ///////////////////////////////////////////////////////////////////////////////
         # Start async loads of the last mn-tile, where we take care of the mn residue
-        self.load_Q(gmem_thr_copy_QK, tQgQ, tQsQ, m_block, seqlen=seqlen.seqlen_q,
-                    headdim=mQ.shape[1])
+        gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
+        self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q, headdim=mQ.shape[1])
         cute.arch.cp_async_commit_group()
 
         def preprocess_Q():
@@ -789,7 +806,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # those that need masking on S, and those that don't.
         # We need masking on S for the very last block when K and V has length not multiple of n_block_size.
         # We also need masking on S if it's causal, for the last several blocks.
-        mask = AttentionMask(self.m_block_size, self.n_block_size, seqlen.seqlen_q, seqlen.seqlen_k)
+        mask = AttentionMask(
+            self.m_block_size, self.n_block_size, seqlen.seqlen_q, seqlen.seqlen_k,
+            self.qhead_per_kvhead if self.pack_gqa else 1,
+        )
         mask_fn = partial(
             mask.apply_mask, m_block=m_block, thr_mma=thr_mma_qk, mask_causal=self.is_causal
         )
@@ -962,9 +982,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         return tiled_mma_qk, tiled_mma_pv
 
     def _get_shared_storage_cls(self):
+        # If PackGQA, we use cp.async to load Q, so we want sQ to align to 1024 bytes
+        sQ_alignment = 128 if not self.pack_gqa else 1024
+        sK_alignment = 128
+        sV_alignment = 128
         sQ_struct, sK_struct, sV_struct = [
-            cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(layout)], 1024]
-            for layout in (self.sQ_layout, self.sK_layout, self.sV_layout)
+            cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(layout)], alignment]
+            for layout, alignment in zip(
+                    (self.sQ_layout, self.sK_layout, self.sV_layout),
+                    (sQ_alignment, sK_alignment, sV_alignment)
+            )
         ]
         cosize_sQV = utils.max_constexpr(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout))
         sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
@@ -1039,11 +1066,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.num_threads_per_warp_group = 128
         self.num_mma_warp_groups = self.num_mma_threads // self.num_threads_per_warp_group
         self.num_producer_threads = 32
+        self.num_Q_load_threads = self.num_mma_threads  # If PackGQA, MMA threads load Q
         self.num_epilogue_threads = self.num_mma_threads
         self.num_mma_regs = 240
         self.num_producer_regs = 24
         self.use_scheduler_barrier = (self.num_mma_warp_groups >= 2 and self.head_dim_padded <= 128) if self.intra_wg_overlap else (self.num_mma_warp_groups == 2)
-        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
+        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and not self.pack_gqa
         # TODO: rescale_O_before_gemm
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
@@ -1074,19 +1102,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tma_atom_O, tma_tensor_O = cpasync.make_tma_tile_atom(
             gmem_tiled_copy_O, mO, self.sO_layout, (self.m_block_size, self.head_dim_v_padded), # No mcast
         )
+        if cutlass.const_expr(self.pack_gqa):
+            shape_Q_packed = ((self.qhead_per_kvhead, mQ.shape[0]), mQ.shape[1], mK.shape[2], *mQ.shape[3:])
+            stride_Q_packed = ((mQ.stride[2], mQ.stride[0]), mQ.stride[1], mQ.stride[2] * self.qhead_per_kvhead, *mQ.stride[3:])
+            mQ = cute.make_tensor(mQ.iterator, cute.make_layout(shape_Q_packed, stride=stride_Q_packed))
+            shape_O_packed = ((self.qhead_per_kvhead, mO.shape[0]), mK.shape[1], mK.shape[2], *mO.shape[3:])
+            stride_O_packed = ((mO.stride[2], mO.stride[0]), mO.stride[1], mO.stride[2] * self.qhead_per_kvhead, *mO.stride[3:])
+            mO = cute.make_tensor(mO.iterator, cute.make_layout(shape_O_packed, stride=stride_O_packed))
+            shape_LSE_packed = ((self.qhead_per_kvhead, mLSE.shape[0]), mK.shape[2], *mLSE.shape[2:])
+            stride_LSE_packed = ((mLSE.stride[1], mLSE.stride[0]), mLSE.stride[1] * self.qhead_per_kvhead, *mLSE.stride[2:])
+            mLSE = cute.make_tensor(mLSE.iterator, cute.make_layout(shape_LSE_packed, stride=stride_LSE_packed))
         # grid_dim: (m_block, num_head, batch_size)
-        if cutlass.const_expr(mCuSeqlensQ is None):
-            grid_dim = (
-                cute.ceil_div(mQ.shape[0], self.m_block_size),
-                cute.size(mQ.shape[2]),
-                cute.size(mQ.shape[3]),
-            )
-        else:
-            grid_dim = (
-                cute.ceil_div(max_seqlen_q, self.m_block_size),
-                cute.size(mQ.shape[2]),
-                cute.size(mCuSeqlensQ.shape[0] - 1),
-            )
+        grid_dim = (
+            cute.ceil_div(cute.size(mQ.shape[0]) if mCuSeqlensQ is None else max_seqlen_q, self.m_block_size),
+            cute.size(mQ.shape[2]),
+            cute.size(mQ.shape[3] if mCuSeqlensQ is None else mCuSeqlensQ.shape[0] - 1),
+        )
         # If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         # Right after this, we multiply by log2(e) before applying exp2.
         # To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
@@ -1100,7 +1131,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             softmax_scale_log2 = softcap * LOG2_E
             softcap_val = softmax_scale / softcap
         self.kernel(
-            tma_tensor_Q,
+            tma_tensor_Q if not self.pack_gqa else mQ,
             tma_tensor_K,
             tma_tensor_V,
             mO,
@@ -1121,7 +1152,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.sV_layout,
             self.sO_layout,
             self.sP_layout,
-            self.gmem_tiled_copy_QK,
+            self.gmem_tiled_copy_Q,
+            self.gmem_tiled_copy_K,
             self.gmem_tiled_copy_V,
             self.gmem_tiled_copy_O,
             # the compiler is unhappy about us using tiled_mma_qk/pv and setting the ACCUMULATE
@@ -1160,7 +1192,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sV_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
         sP_layout: cute.ComposedLayout | None,
-        gmem_tiled_copy_QK: cute.TiledCopy,
+        gmem_tiled_copy_Q: cute.TiledCopy,
+        gmem_tiled_copy_K: cute.TiledCopy,
         gmem_tiled_copy_V: cute.TiledCopy,
         gmem_tiled_copy_O: cute.TiledCopy,
         tiled_mma_qk: cute.TiledMma,
@@ -1174,10 +1207,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
         if warp_idx == 0:
-            cpasync.prefetch_descriptor(tma_atom_Q)
+            if cutlass.const_expr(not self.pack_gqa):
+                cpasync.prefetch_descriptor(tma_atom_Q)
             cpasync.prefetch_descriptor(tma_atom_K)
             cpasync.prefetch_descriptor(tma_atom_V)
-            if cutlass.const_expr(tma_atom_O is not None):
+            if cutlass.const_expr(self.use_tma_O):
                 cpasync.prefetch_descriptor(tma_atom_O)
 
         smem = cutlass.utils.SmemAllocator()
@@ -1189,11 +1223,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # if tidx < 2:
             #     # barrierO num threads should be self.num_mma_threads
             #     cute.arch.mbarrier_init_arrive_cnt(mbar_ptr_Q + tidx, 1 if tidx == 0 else self.num_mma_threads)
-            cute.arch.mbarrier_init_arrive_cnt(mbar_ptr_Q, 1)
+            cute.arch.mbarrier_init_arrive_cnt(mbar_ptr_Q, 1 if not self.pack_gqa else self.num_Q_load_threads)
             # cute.arch.mbarrier_init_arrive_cnt(mbar_ptr_Q + 1, self.num_mma_threads)
         # We rely on pipeline_k and pipeline_v to initialize the mbarrier fence and sync
         pipeline_kv_producer_group = cutlass.utils.CooperativeGroup(cutlass.utils.Agent.Thread)
-        pipeline_kv_consumer_group = cutlass.utils.CooperativeGroup(cutlass.utils.Agent.Thread, self.num_mma_threads // self.num_threads_per_warp_group)
+        pipeline_kv_consumer_group = cutlass.utils.CooperativeGroup(
+            cutlass.utils.Agent.Thread, self.num_mma_threads // self.num_threads_per_warp_group
+        )
         pipeline_k = pipeline.PipelineTmaAsyncNoCluster.create(
             barrier_storage=storage.mbar_ptr_K.data_ptr(),
             num_stages=self.num_stages,
@@ -1213,6 +1249,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
+        # TODO: how to get sQ_pi for cp.async if pack_gqa?
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         if cutlass.const_expr(not self.Q_in_regs):
@@ -1231,14 +1268,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
         m_block, head_idx, batch_idx = cute.arch.block_idx()
-        block_info = BlockInfo(self.m_block_size, self.n_block_size, self.is_causal)
+        block_info = BlockInfo(
+            self.m_block_size, self.n_block_size, self.is_causal,
+            self.qhead_per_kvhead if self.pack_gqa else 1,
+        )
         seqlen = SeqlenInfo(
-            batch_idx, mQ.shape[0], mK.shape[0], mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK
+            batch_idx, mQ.shape[0] if not self.pack_gqa else mQ.shape[0][1], mK.shape[0], mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK
         )
         # Can't early exit so we have to write it this way (under an if statement)
         if mCuSeqlensQ is None or m_block * self.n_block_size < seqlen.seqlen_q:
             if cutlass.const_expr(self.is_causal):  # Longest tile first
-                m_block = cute.ceil_div(seqlen.seqlen_q, self.m_block_size) - m_block - 1
+                m_block = cute.ceil_div(seqlen.seqlen_q * (self.qhead_per_kvhead if self.pack_gqa else 1), self.m_block_size) - m_block - 1
+            if cutlass.const_expr(mCuSeqlensQ is None):
+                mQ_cur = mQ[None, None, head_idx, batch_idx]
+            else:
+                mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, head_idx])
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
             # TODO: return early if n_block_max == 0
             # if self.is_causal:
@@ -1250,25 +1294,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # ///////////////////////////////////////////////////////////////////////////////
                 # Get the appropriate tiles for this thread block.
                 # ///////////////////////////////////////////////////////////////////////////////
-                if cutlass.const_expr(mCuSeqlensQ is None):
-                    mQ_cur = mQ[None, None, head_idx, batch_idx]
-                else:
-                    mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, head_idx])
-                gQ = cute.local_tile(mQ_cur, (self.m_block_size, self.head_dim_padded), (m_block, 0))
-                head_idx_kv = head_idx // self.qhead_per_kvhead
+                head_idx_kv = head_idx // self.qhead_per_kvhead if not self.pack_gqa else head_idx
                 if cutlass.const_expr(mCuSeqlensK is None):
                     mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
                 else:
                     mK_cur, mV_cur = [cute.domain_offset((seqlen.offset_k, 0), t[None, None, head_idx_kv]) for t in (mK, mV)]
                 gK = cute.local_tile(mK_cur, (self.n_block_size, self.head_dim_padded), (None, 0))
                 gV = cute.local_tile(mV_cur, (self.n_block_size, self.head_dim_v_padded), (None, 0))
-                tQsQ, tQgQ = cpasync.tma_partition(
-                    tma_atom_Q,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sQ, 0, 2),
-                    cute.group_modes(gQ, 0, 2),
-                )
+                if cutlass.const_expr(not self.pack_gqa):
+                    gQ = cute.local_tile(mQ_cur, (self.m_block_size, self.head_dim_padded), (m_block, 0))
+                    tQsQ, tQgQ = cpasync.tma_partition(
+                        tma_atom_Q,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(sQ, 0, 2),
+                        cute.group_modes(gQ, 0, 2),
+                    )
                 tKsK, tKgK = cpasync.tma_partition(
                     tma_atom_K,
                     0,
@@ -1290,9 +1331,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 load_V = partial(self.load_K, tma_atom_V, tVgV, tVsV, pipeline_v)
                 if warp_idx == 0:  # Producer
                     # load_Q
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_init_tx_bytes(mbar_ptr_Q, self.tma_copy_q_bytes)
-                    cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr=mbar_ptr_Q)
+                    if cutlass.const_expr(not self.pack_gqa):
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_init_tx_bytes(mbar_ptr_Q, self.tma_copy_q_bytes)
+                        cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr=mbar_ptr_Q)
                     for n_tile in cutlass.range_dynamic(n_block_max, unroll=2):
                         n_block = n_block_max - n_tile - 1
                         load_K(n_block, smem_pipe_write=smem_pipe_write)
@@ -1347,21 +1389,32 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         acc_S.store(cute.math.tanh(acc_S.load() * softcap_val, fastmath=True))
 
                 mask = AttentionMask(
-                    self.m_block_size, self.n_block_size, seqlen.seqlen_q, seqlen.seqlen_k
+                    self.m_block_size, self.n_block_size, seqlen.seqlen_q, seqlen.seqlen_k,
+                    self.qhead_per_kvhead if self.pack_gqa else 1
                 )
                 mask_fn = partial(
                     mask.apply_mask, m_block=m_block, thr_mma=thr_mma_qk, mask_causal=self.is_causal
                 )
-                n_block = n_block_max - 1
-                smem_pipe_read = pipeline.make_pipeline_state(
-                    cutlass.utils.PipelineUserType.Consumer, self.num_stages
-                )
-
                 compute_one_n_block = partial(
                     self.compute_one_n_block_intrawg_overlap if cutlass.const_expr(self.intra_wg_overlap) else self.compute_one_n_block,
                     pipeline_k=pipeline_k, pipeline_v=pipeline_v,
                     mma_params=mma_params, smem_copy_params=smem_copy_params,
                     softmax=softmax, scoremod_premask_fn=scoremod_premask_fn,
+                )
+
+                # Load Q if PackGQA
+                if cutlass.const_expr(self.pack_gqa):
+                    pack_gqa = PackGQA(self.m_block_size, self.head_dim_padded, self.check_hdim_oob, self.qhead_per_kvhead)
+                    # gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
+                    # gQ = cute.local_tile(mQ_cur, (self.m_block_size, self.head_dim_padded), (m_block, 0))
+                    # self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q,
+                    #             headdim=mQ.shape[1])
+                    pack_gqa.load_Q(mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q)
+                    utils.cp_async_mbarrier_arrive_shared(mbar_ptr_Q, noinc=True)
+
+                n_block = n_block_max - 1
+                smem_pipe_read = pipeline.make_pipeline_state(
+                    cutlass.utils.PipelineUserType.Consumer, self.num_stages
                 )
                 cute.arch.mbarrier_wait(mbar_ptr_Q, phase=0)
                 # For performance reason, we separate out two kinds of iterations:

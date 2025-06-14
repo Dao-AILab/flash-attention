@@ -131,13 +131,13 @@ def _flash_attn_fwd(
             head_dim,
             head_dim_v,
             qhead_per_kvhead,
-            m_block_size,
-            n_block_size,
+            is_causal=causal,
+            has_softcap=softcap != 0.0,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
             # num_stages=1,
             num_stages=2,
             num_threads=num_threads,
-            is_causal=causal,
-            has_softcap=softcap != 0.0,
             Q_in_regs=False,
         )
         # TODO: check @can_implement

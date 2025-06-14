@@ -19,8 +19,8 @@ from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
@@ -30,7 +30,7 @@ from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 # @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
 @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
+# @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
@@ -135,7 +135,8 @@ def test_flash_attn_output(
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
         )
 
-        # qk = torch.einsum('bshd,bthd->bhst', q_ref, k_ref).float()
+        # k_extended = repeat(k_ref, "b s h d -> b s (h k) d", k=nheads // nheads_kv)
+        # qk = torch.einsum('bshd,bthd->bhst', q_ref, k_extended).float()
         # if qv is not None:
         #     qk += torch.einsum('bshd,bthd->bhst', qv_ref, v_ref).float()
         # m = qk.amax(-1, keepdim=True)
