@@ -44,7 +44,7 @@ class AttentionMask:
             if mask_seqlen:
                 # traverse column index.
                 for c in range(cute.size(tScS_mn.shape[1])):
-                    if cute.elem_less(seqlenk_col_limit, t0ScS_mn[0, c][1] + 1):
+                    if t0ScS_mn[0, c][1] >= seqlenk_col_limit:
                         acc_S_mn[None, c].fill(-cutlass.Float32.inf)
         else:  # Causal
             # If PackGQA, we split the work of compute divmod among threads in the same row
@@ -67,5 +67,5 @@ class AttentionMask:
                 # traverse column index.
                 for c in range(cute.size(tScS_mn.shape[1])):
                     # only consider the column index, so the row index sets to 0.
-                    if cute.elem_less(col_limit_right, t0ScS_mn[0, c][1] + 1):
+                    if t0ScS_mn[0, c][1] >= col_limit_right:
                         acc_S_mn[r, c] = -cutlass.Float32.inf

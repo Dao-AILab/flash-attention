@@ -279,7 +279,7 @@ class FlashAttentionBackwardPostprocess:
         tdQcdQ = gmem_thr_copy_dQ.partition_S(cdQ)
         tdQpdQ = utils.predicate_k(tdQcdQ, limit=mdQ.shape[3])
         for rest_m in cutlass.range_constexpr(cute.size(tdQrdQ.shape[1])):
-            if cute.elem_less(tdQcdQ[0, rest_m, 0][0], mdQ.shape[1] - m_block * self.m_block_size):
+            if tdQcdQ[0, rest_m, 0][0] < mdQ.shape[1] - m_block * self.m_block_size:
                 cute.copy(
                     gmem_tiled_copy_dQ,
                     tdQrdQ[None, rest_m, None],

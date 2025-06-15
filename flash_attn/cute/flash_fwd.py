@@ -27,6 +27,7 @@ from flash_attn.cute.seqlen_info import SeqlenInfo
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute import pipeline
 from flash_attn.cute.pack_gqa import PackGQA
+from flash_attn.cute.named_barrier import NamedBarrierFwd
 
 
 class FlashAttentionForwardBase:
@@ -285,7 +286,7 @@ class FlashAttentionForwardBase:
         rO = cute.make_fragment_like(acc_O, self.dtype)
         rO.store(acc_O.load().to(self.dtype))
         # Make sure all threads have finished reading V
-        cute.arch.barrier(barrier_id=5, number_of_threads=self.num_epilogue_threads)
+        cute.arch.barrier(barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads)
         smem_copy_atom_O = utils.get_smem_store_atom(self.arch, self.dtype)
         smem_thr_copy_O = utils.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
         taccOrO = smem_thr_copy_O.retile(rO)
@@ -316,7 +317,7 @@ class FlashAttentionForwardBase:
                 # Only the thread corresponding to column 0 writes out the lse to gmem
                 if taccOcO[0][1] == 0:
                     for m in cutlass.range_constexpr(cute.size(taccOgLSE.shape[1])):
-                        if cute.elem_less(t0accOcO[m, 0][0], seqlen.seqlen_q - m_block * self.m_block_size - taccOcO[0][0]):
+                        if t0accOcO[m, 0][0] < seqlen.seqlen_q - m_block * self.m_block_size - taccOcO[0][0]:
                             taccOgLSE[m, 0] = lse[m]
             else:
                 pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
@@ -332,7 +333,7 @@ class FlashAttentionForwardBase:
         if cutlass.const_expr(self.use_tma_O):
             # ensure smem writes are visible to TMA
             cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
-            utils.barrier_arrive(barrier_id=5, number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE)
+            utils.barrier_arrive(barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE)
             gO = cute.local_tile(mO_cur, (self.m_block_size, self.head_dim_v_padded), (m_block, 0))
             tOsO, tOgO = cpasync.tma_partition(
                 tma_atom_O,
@@ -343,12 +344,12 @@ class FlashAttentionForwardBase:
             )
             warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
             if warp_idx == 4:
-                cute.arch.barrier(barrier_id=5, number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE)
+                cute.arch.barrier(barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE)
                 cute.copy(tma_atom_O, tOsO, tOgO)
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
         else:
-            cute.arch.barrier(barrier_id=5, number_of_threads=self.num_epilogue_threads)
+            cute.arch.barrier(barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads)
             gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
             tOsO = gmem_thr_copy_O.partition_S(sO)
             tOrO = cute.make_fragment_like(tOsO, self.dtype)
@@ -362,7 +363,7 @@ class FlashAttentionForwardBase:
                 tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
                 # copy acc O from rmem to gmem
                 for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
-                    if cute.elem_less(t0OcO[0, rest_m, 0][0], seqlen.seqlen_q - m_block * self.m_block_size - tOcO[0][0]):
+                    if t0OcO[0, rest_m, 0][0] < seqlen.seqlen_q - m_block * self.m_block_size - tOcO[0][0]:
                         cute.copy(
                             gmem_tiled_copy_O,
                             tOrO[None, rest_m, None],
@@ -394,7 +395,7 @@ class FlashAttentionForwardBase:
         for m in range(cute.size(tQsQ.shape[1])):
             # Instead of using tQcQ, we using t0QcQ and subtract the offset from the limit
             # (seqlen - block * kBlockM). This is because the entries of t0QcQ are known at compile time.
-            if cute.elem_less(t0QcQ[0, m, 0][0], seqlen - block * self.m_block_size - tQcQ[0][0]):
+            if t0QcQ[0, m, 0][0] < seqlen - block * self.m_block_size - tQcQ[0][0]:
                 cute.copy(
                     gmem_thr_copy,
                     tQgQ[None, m, None],
@@ -431,7 +432,7 @@ class FlashAttentionForwardBase:
                     seqlen_limit = cutlass.min(seqlen - block * self.n_block_size, self.n_block_size)
             seqlen_limit -= tKcK[0][0]
             for n in range(cute.size(tKsK.shape[1])):
-                if cute.elem_less(t0KcK[0, n, 0][0], seqlen_limit):
+                if t0KcK[0, n, 0][0] < seqlen_limit:
                     cute.copy(
                         gmem_tiled_copy,
                         tKgK[None, n, None, block],
@@ -466,7 +467,7 @@ class FlashAttentionForwardBase:
         if cutlass.const_expr(need_predicates or not is_even_n_smem_v):
             for n in range(cute.size(tVsV.shape[1])):
                 # If kBlockN doesn't evenly divide the tiled copy, only the last `n` needs to be checked
-                if is_even_n_smem_v or n < cute.size(tVsV.shape[1]) - 1 or cute.elem_less(tVcV[0, n, 0][0], self.n_block_size):
+                if is_even_n_smem_v or n < cute.size(tVsV.shape[1]) - 1 or tVcV[0, n, 0][0] < self.n_block_size:
                     predicate = tVpV[None, n, None] if self.check_hdim_v_oob else None
                     if cutlass.const_expr(need_predicates):
                         seqlen_limit = seqlen - block * self.n_block_size - tVcV[0][0]
@@ -1617,13 +1618,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if cutlass.const_expr(self.use_scheduler_barrier):
             if warp_group_idx == 1:
                 utils.barrier_arrive(
-                    barrier_id=1 + 0, number_of_threads=2 * self.num_threads_per_warp_group,
+                    barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1),
+                    number_of_threads=2 * self.num_threads_per_warp_group,
                 )
 
     def warp_scheduler_barrier_sync(self):
         if cutlass.const_expr(self.use_scheduler_barrier):
             cute.arch.barrier(
-                barrier_id=1 - 1 + utils.canonical_warp_group_idx(sync=False),
+                barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1) - 1 + utils.canonical_warp_group_idx(sync=False),
                 number_of_threads=2 * self.num_threads_per_warp_group
             )
 
@@ -1633,7 +1635,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cur_wg = utils.canonical_warp_group_idx(sync=False) - 1
             next_wg = 1 - cur_wg if self.num_mma_warp_groups == 2 else (cur_wg + 1 if cur_wg < self.num_mma_warp_groups - 1 else 0)
             utils.barrier_arrive(
-                barrier_id=1 + next_wg,
+                barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1) + next_wg,
                 number_of_threads=2 * self.num_threads_per_warp_group,
             )
 

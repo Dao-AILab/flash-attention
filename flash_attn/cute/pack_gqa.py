@@ -71,7 +71,7 @@ class PackGQA:
             q_gmem_ptr = cute.make_ptr(
                 mQ.element_type, q_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
             )
-            if cute.elem_less(t0QcQ[0, m, 0][0], seqlen * self.qhead_per_kvhead - block * self.m_block_size - tQcQ_row[0][0]):
+            if t0QcQ[0, m, 0][0] < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tQcQ_row[0][0]:
                 mQ_cur = cute.make_tensor(q_gmem_ptr, (self.head_dim_padded,))
                 elems_per_load = cute.size(tQsQ.shape[0][0])
                 mQ_cur_copy = cute.tiled_divide(mQ_cur, (elems_per_load,))
@@ -145,7 +145,7 @@ class PackGQA:
             o_gmem_ptr = cute.make_ptr(
                 mO.element_type, o_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
             )
-            if cute.elem_less(t0OcO[0, m, 0][0], seqlen * self.qhead_per_kvhead - block * self.m_block_size - tOcO_row[0][0]):
+            if t0OcO[0, m, 0][0] < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tOcO_row[0][0]:
                 mO_cur = cute.make_tensor(o_gmem_ptr, (self.head_dim_padded,))
                 elems_per_load = cute.size(tOrO.shape[0][0])
                 mO_cur_copy = cute.tiled_divide(mO_cur, (elems_per_load,))

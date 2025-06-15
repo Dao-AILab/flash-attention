@@ -954,7 +954,7 @@ class FlashAttentionBackwardSm80:
                 tdVpdV = utils.predicate_k(tdVcdV, limit=mdV.shape[3])
             # copy acc dK and acc_dV from rmem to gmem
             for rest_m in cutlass.range_constexpr(cute.size(tdKrdK.shape[1])):
-                if cute.elem_less(t0dKcdK[0, rest_m, 0][0], mdK.shape[1] - n_block * self.n_block_size - tdKcdK[0][0]):
+                if t0dKcdK[0, rest_m, 0][0] < mdK.shape[1] - n_block * self.n_block_size - tdKcdK[0][0]:
                     cute.copy(
                         gmem_tiled_copy_dK,
                         tdKrdK[None, rest_m, None],
@@ -962,7 +962,7 @@ class FlashAttentionBackwardSm80:
                         pred=tdKpdK[None, rest_m, None] if self.check_hdim_oob else None,
                     )
             for rest_m in cutlass.range_constexpr(cute.size(tdVrdV.shape[1])):
-                if cute.elem_less(t0dVcdV[0, rest_m, 0][0], mdV.shape[1] - n_block * self.n_block_size - tdVcdV[0][0]):
+                if t0dVcdV[0, rest_m, 0][0] < mdV.shape[1] - n_block * self.n_block_size - tdVcdV[0][0]:
                     cute.copy(
                         gmem_tiled_copy_dV,
                         tdVrdV[None, rest_m, None],
@@ -1007,7 +1007,7 @@ class FlashAttentionBackwardSm80:
         tKpK = utils.predicate_k(tKcK, limit=headdim)
         for n in range(cute.size(tKsK.shape[1])):
             # If kBlockN doesn't evenly divide the tiled copy, only the last `n` needs to be checked
-            if self.is_even_n_smem_k or n < cute.size(tKsK.shape[1]) - 1 or cute.elem_less(tKcK[0, n, 0][0], self.n_block_size):
+            if self.is_even_n_smem_k or n < cute.size(tKsK.shape[1]) - 1 or tKcK[0, n, 0][0] < self.n_block_size:
                 # Instead of using tKcK, we using t0KcK and subtract the offset from the limit
                 # (seqlen - block * kBlockN). This is because the entries of t0KcK are known at compile time.
                 predicate_n = t0KcK[0, n, 0][0] < seqlen - block * self.n_block_size - tKcK[0][0]
@@ -1036,7 +1036,7 @@ class FlashAttentionBackwardSm80:
         tVpV = utils.predicate_k(tVcV, limit=headdim)
         for n in range(cute.size(tVsV.shape[1])):
             # If kBlockN doesn't evenly divide the tiled copy, only the last `n` needs to be checked
-            if self.is_even_n_smem_v or n < cute.size(tVsV.shape[1]) - 1 or cute.elem_less(tVcV[0, n, 0][0], self.n_block_size):
+            if self.is_even_n_smem_v or n < cute.size(tVsV.shape[1]) - 1 or tVcV[0, n, 0][0] < self.n_block_size:
                 # Instead of using tVcV, we using t0VcV and subtract the offset from the limit
                 # (seqlen - block * kBlockN). This is because the entries of t0VcV are known at compile time.
                 predicate_n = t0VcV[0, n, 0][0] < seqlen - block * self.n_block_size - tVcV[0][0]
@@ -1067,7 +1067,7 @@ class FlashAttentionBackwardSm80:
     ):
         for m in range(cute.size(tQsQ.shape[1])):
             # If kBlockM doesn't evenly divide the tiled copy, only the last `m` needs to be checked
-            if self.is_even_m_smem_q or m < cute.size(tQsQ.shape[1]) - 1 or cute.elem_less(tQcQ[0, m, 0][0], self.m_block_size):
+            if self.is_even_m_smem_q or m < cute.size(tQsQ.shape[1]) - 1 or tQcQ[0, m, 0][0] < self.m_block_size:
                 # Instead of using tQcQ, we using t0QcQ and subtract the offset from the limit
                 # (seqlen - block * kBlockM). This is because the entries of t0QcQ are known at compile time.
                 predicate_m = t0QcQ[0, m, 0][0] < seqlen - block * self.m_block_size - tQcQ[0][0]
@@ -1085,7 +1085,7 @@ class FlashAttentionBackwardSm80:
         # We made sure LSE length is padded so we read `kBlockM` elements so that all
         # elements in sLSE are filled. Without this we might have uninitialized sLSE values.
         for m in range(cute.size(tLSEsLSE.shape[1])):
-            if cute.elem_less(tLSEcLSE[0, m][0], self.m_block_size):
+            if tLSEcLSE[0, m][0] < self.m_block_size:
                 cute.copy(
                     gmem_tiled_copy_LSE,
                     tLSEgLSE[None, m, block],
@@ -1111,7 +1111,7 @@ class FlashAttentionBackwardSm80:
     ):
         for m in range(cute.size(tdOsdO.shape[1])):
             # If kBlockM doesn't evenly divide the tiled copy, only the last `m` needs to be checked
-            if self.is_even_m_smem_do or m < cute.size(tdOsdO.shape[1]) - 1 or cute.elem_less(tdOcdO[0, m, 0][0], self.m_block_size):
+            if self.is_even_m_smem_do or m < cute.size(tdOsdO.shape[1]) - 1 or tdOcdO[0, m, 0][0] < self.m_block_size:
                 # Instead of using tdOcdO, we using t0dOcdO and subtract the offset from the limit
                 # (seqlen - block * kBlockM). This is because the entries of t0dOcdO are known at compile time.
                 predicate_m = t0dOcdO[0, m, 0][0] < seqlen - block * self.m_block_size - tdOcdO[0][0]
@@ -1129,7 +1129,7 @@ class FlashAttentionBackwardSm80:
         # We made sure LSE length is padded so we read `kBlockM` elements so that all
         # elements in sLSE are filled. Without this we might have uninitialized sLSE values.
         for m in range(cute.size(tdPsumgdPsum.shape[1])):
-            if cute.elem_less(tdPsumcdPsum[0, m][0], self.m_block_size):
+            if tdPsumcdPsum[0, m][0] < self.m_block_size:
                 cute.copy(
                     gmem_tiled_copy_dPsum,
                     tdPsumgdPsum[None, m, block],
