@@ -11,10 +11,16 @@ import flash_attn.cute.utils as utils
 
 class Softmax:
 
-    def __init__(self, scale_log2: cutlass.Float32, num_rows: cutlass.Constexpr[int]):
+    def __init__(
+        self,
+        scale_log2: cutlass.Float32,
+        num_rows: cutlass.Constexpr[int],
+        arch: cutlass.Constexpr[int] = 80,
+    ):
         self.scale_log2 = scale_log2
         self.row_max = cute.make_fragment(num_rows, cutlass.Float32)
         self.row_sum = cute.make_fragment_like(self.row_max)
+        self.arch = arch
 
     def reset(self) -> None:
         self.row_max.fill(-cutlass.Float32.inf)
@@ -40,20 +46,22 @@ class Softmax:
         # Each iteration processes one row of acc_S
         for r in range(cute.size(self.row_max)):
             acc_S_row = acc_S_mn[r, None].load()  # (n_block_size)
-            row_max_cur = acc_S_row.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, 0)
+            row_max_cur = acc_S_row.reduce(
+                cute.ReductionOp.MAX,
+                -cutlass.Float32.inf if cutlass.const_expr(is_first) else self.row_max[r],
+                0
+            )
             row_max_cur = utils.warp_reduce(row_max_cur, cute.arch.fmax, width=4)
+            if cutlass.const_expr(check_inf):
+                if row_max_cur == -cutlass.Float32.inf:
+                    row_max_cur = 0.0
             if cutlass.const_expr(is_first):
-                if check_inf:
-                    row_max_cur = 0.0 if row_max_cur == -cutlass.Float32.inf else row_max_cur
                 row_max_cur_scaled = row_max_cur * self.scale_log2
                 acc_S_row_exp = utils.exp2f(acc_S_row * self.scale_log2 - row_max_cur_scaled)
                 acc_S_row_sum = acc_S_row_exp.reduce(cute.ReductionOp.ADD, cutlass.Float32.zero, 0)
                 row_scale[r] = 1.0
             else:
                 row_max_prev = self.row_max[r]
-                row_max_cur = cute.arch.fmax(row_max_prev, row_max_cur)
-                if check_inf:
-                    row_max_cur = 0.0 if row_max_cur == -cutlass.Float32.inf else row_max_cur
                 row_max_cur_scaled = row_max_cur * self.scale_log2
                 acc_S_row_exp = utils.exp2f(acc_S_row * self.scale_log2 - row_max_cur_scaled)
                 acc_S_row_sum = acc_S_row_exp.reduce(cute.ReductionOp.ADD, cutlass.Float32.zero, 0)

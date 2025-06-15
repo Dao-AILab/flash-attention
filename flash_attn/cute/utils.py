@@ -84,7 +84,6 @@ def get_smem_store_atom(arch: cutlass.Constexpr[int], element_type: Type[cute.Nu
         )
 
 
-
 def max_constexpr(
     a: cutlass.Constexpr[cute.Numeric], b: cutlass.Constexpr[cute.Numeric]
 ) -> cutlass.Constexpr[cute.Numeric]:
