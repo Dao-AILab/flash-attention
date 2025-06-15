@@ -132,7 +132,7 @@ class FlashAttentionBackwardPostprocess:
         self,
         mdQaccum: cute.Tensor,
         mdQ: cute.Tensor,
-        scale: cute.Float32,
+        scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
         # Get the data type and check if it is fp16 or bf16
@@ -185,7 +185,7 @@ class FlashAttentionBackwardPostprocess:
         self,
         mdQaccum: cute.Tensor,
         mdQ: cute.Tensor,
-        scale: cute.Float32,
+        scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
         dQ_swapAB: cutlass.Constexpr,
         sdQaccum_layout: cute.Layout,

@@ -6,6 +6,7 @@ from typing import Type, Callable, Optional
 import cutlass
 import cutlass.cute as cute
 
+from cutlass import Float32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
@@ -160,30 +161,45 @@ def transpose_view(a: cute.Tensor) -> cute.Tensor:
     return cute.composition(a, cute.make_ordered_layout(shape, order=order))
 
 
-def exp2f(x: cute.TensorSSA | cutlass.Float32) -> cute.TensorSSA | cutlass.Float32:
+@dsl_user_op
+def exp2f_asm(a: float | Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "ex2.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def exp2f(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
     """exp2f calculation for both vector and scalar.
 
     :param x: input value
-    :type x: cute.TensorSSA or cutlass.Float32
+    :type x: cute.TensorSSA or Float32
     :return: exp2 value
-    :rtype: cute.TensorSSA or cutlass.Float32
+    :rtype: cute.TensorSSA or Float32
     """
     if isinstance(x, cute.TensorSSA):
-        res = cute.make_fragment(x.shape, cutlass.Float32)
+        res = cute.make_fragment(x.shape, Float32)
         res.store(x)
         for i in range(cute.size(x.shape)):
-            res[i] = cute.arch.exp2(res[i])
+            res[i] = exp2f_asm(res[i])
         return res.load()
     else:
-        return cute.arch.exp2(x)
+        return exp2f_asm(x)
 
 
 @dsl_user_op
-def log2f(a: float | cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
-    return cutlass.Float32(
+def log2f(a: float | Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
         llvm.inline_asm(
             T.f32(),
-            [cutlass.Float32(a).ir_value(loc=loc, ip=ip)],
+            [Float32(a).ir_value(loc=loc, ip=ip)],
             "lg2.approx.ftz.f32 $0, $1;",
             "=f,f",
             has_side_effects=False,
@@ -194,15 +210,109 @@ def log2f(a: float | cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
 
 
 @dsl_user_op
+def max3f(a: float | Float32, b: float | Float32, c: float | Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip), Float32(c).ir_value(loc=loc, ip=ip)],
+            "max.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def fmax_reduce(
+    x: cute.TensorSSA,
+    init_val: float | Float32 = -Float32.inf,
+    arch: cutlass.Constexpr[int] = 80
+) -> Float32:
+    if cutlass.const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
+        return x.reduce(cute.ReductionOp.MAX, init_val, 0)
+    else:
+        # [2025-06-15] x.reduce only seems to use 50% 3-input max and 50% 2-input max
+        # We instead force the 3-input max by calling inline ptx.
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        local_max = [init_val, -Float32.inf, -Float32.inf, -Float32.inf]
+        for i in range(0, cute.size(x.shape), 8):
+            local_max[0] = max3f(local_max[0], res[i], res[i + 1])
+            local_max[1] = max3f(local_max[1], res[i + 2], res[i + 3])
+            local_max[2] = max3f(local_max[2], res[i + 4], res[i + 5])
+            local_max[3] = max3f(local_max[3], res[i + 6], res[i + 7])
+        local_max[0] = cute.arch.fmax(local_max[0], local_max[1])
+        local_max[2] = cute.arch.fmax(local_max[2], local_max[3])
+        return cute.arch.fmax(local_max[0], local_max[2])
+
+        # local_max = [cute.arch.fmax(res[0], res[1]), cute.arch.fmax(res[2], res[3]),
+        #              cute.arch.fmax(res[4], res[5]), cute.arch.fmax(res[6], res[7])]
+        # for i in range(8, cute.size(x.shape), 8):
+        #     local_max[0] = max3f(local_max[0], res[i], res[i + 1])
+        #     local_max[1] = max3f(local_max[1], res[i + 2], res[i + 3])
+        #     local_max[2] = max3f(local_max[2], res[i + 4], res[i + 5])
+        #     local_max[3] = max3f(local_max[3], res[i + 6], res[i + 7])
+        # local_max[0] = max3f(init_val, local_max[0], local_max[1])
+        # local_max[2] = cute.arch.fmax(local_max[2], local_max[3])
+        # return cute.arch.fmax(local_max[0], local_max[2])
+
+        # local_max = [res[0], res[1], res[2], res[3]]
+        # for i in range(4, cute.size(x.shape), 8):
+        #     local_max[0] = max3f(local_max[0], res[i], res[i + 1])
+        #     local_max[1] = max3f(local_max[1], res[i + 2], res[i + 3])
+        #     local_max[2] = max3f(local_max[2], res[i + 4], res[i + 5])
+        #     local_max[3] = max3f(local_max[3], res[i + 6], res[i + 7])
+        # i_f = cutlass.const_expr(cute.size(x.shape) - 4)
+        # # local_max[0] = max3f(local_max[0], res[i_f], res[i_f + 1])
+        # # local_max[1] = max3f(local_max[1], res[i_f + 2], res[i_f + 3])
+        # # local_max[0] = max3f(local_max[0], local_max[1], local_max[2])
+        # # return max3f(local_max[0], local_max[3], init_val)
+        # local_max[0] = cute.arch.fmax(local_max[0], res[i_f])
+        # local_max[1] = cute.arch.fmax(local_max[1], res[i_f + 1])
+        # local_max[2] = cute.arch.fmax(local_max[2], res[i_f + 2])
+        # local_max[3] = cute.arch.fmax(local_max[3], res[i_f + 3])
+        # local_max[0] = max3f(local_max[0], local_max[1], init_val)
+        # local_max[2] = cute.arch.fmax(local_max[2], local_max[3])
+        # return cute.arch.fmax(local_max[0], local_max[2])
+
+        # local_max[0] = max3f(local_max[0], local_max[1], local_max[2])
+        # return cute.arch.fmax(local_max[0], local_max[3])
+
+
+def fadd_reduce(
+    x: cute.TensorSSA,
+    init_val: float | Float32 = Float32.zero,
+    arch: cutlass.Constexpr[int] = 80
+) -> Float32:
+    if cutlass.const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
+        return x.reduce(cute.ReductionOp.ADD, init_val, 0)
+    else:
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        local_sum_0 = cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
+        local_sum = [local_sum_0, (res[2], res[3]), (res[4], res[5]), (res[6], res[7])]
+        for i in range(8, cute.size(x.shape), 8):
+            local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], (res[i], res[i + 1]))
+            local_sum[1] = cute.arch.add_packed_f32x2(local_sum[1], (res[i + 2], res[i + 3]))
+            local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], (res[i + 4], res[i + 5]))
+            local_sum[3] = cute.arch.add_packed_f32x2(local_sum[3], (res[i + 6], res[i + 7]))
+        local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], local_sum[1])
+        local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], local_sum[3])
+        local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], local_sum[2])
+        return local_sum[0][0] + local_sum[0][1]
+
+
+@dsl_user_op
 def atomic_add_fp32(
-    a: float | cutlass.Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None
+    a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None
 ) -> None:
     # gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
     # # cache_hint = cutlass.Int64(0x12F0000000000000)
     # llvm.inline_asm(
     #     None,
-    #     [gmem_ptr_i64, cutlass.Float32(a).ir_value(loc=loc, ip=ip)],
-    #     # [gmem_ptr_i64, cutlass.Float32(a).ir_value(loc=loc, ip=ip), cache_hint.ir_value()],
+    #     [gmem_ptr_i64, Float32(a).ir_value(loc=loc, ip=ip)],
+    #     # [gmem_ptr_i64, Float32(a).ir_value(loc=loc, ip=ip), cache_hint.ir_value()],
     #     "red.global.add.f32 [$0], $1;",
     #     # "red.global.add.L2::cache_hint.f32 [$0], $1, 0x12F0000000000000;",
     #     # "red.global.add.L2::cache_hint.f32 [$0], $1, $2;",
@@ -216,7 +326,7 @@ def atomic_add_fp32(
         res=T.f32(),
         op=nvvm.AtomicOpKind.FADD,
         ptr=gmem_ptr.llvm_ptr,
-        a=cutlass.Float32(a).ir_value()
+        a=Float32(a).ir_value()
     )
 
 
@@ -295,12 +405,12 @@ def canonical_warp_group_idx(sync: bool = True) -> cutlass.Int32:
 
 
 # @dsl_user_op
-# def warp_vote_any_lt(a: float | cutlass.Float32, b: float | cutlass.Float32, *, loc=None, ip=None) -> cutlass.Boolean:
+# def warp_vote_any_lt(a: float | Float32, b: float | Float32, *, loc=None, ip=None) -> cutlass.Boolean:
 #     mask = cutlass.Int32(-1)
 #     return cutlass.Boolean(
 #         llvm.inline_asm(
 #             T.i32(),
-#             [cutlass.Float32(a).ir_value(loc=loc, ip=ip), cutlass.Float32(b).ir_value(loc=loc, ip=ip), mask.ir_value(loc=loc, ip=ip)],
+#             [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip), mask.ir_value(loc=loc, ip=ip)],
 #             ".pred p1, p2;\n"
 #             "setp.lt.f32 p1, $1, $2;\n"
 #             "vote.sync.any.pred p2, p1, $3;\n"
