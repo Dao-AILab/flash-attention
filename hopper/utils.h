@@ -646,6 +646,22 @@ CUTE_DEVICE T warp_prefix_sum(T val) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template<typename T>
+CUTE_DEVICE T warp_shfl_get(T val, int src_lane) {
+    return __shfl_sync(0xffffffff, val, src_lane);
+};
+
+template<typename T>
+CUTE_DEVICE T warp_shfl_get_last(T val) {
+    return __shfl_sync(0xffffffff, val, cutlass::NumThreadsPerWarp - 1);
+};
+
+CUTE_DEVICE int warp_last_true_laneid(bool cond) {
+    return __popc(__ballot_sync(0xffffffff, cond));
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template<class T>
 CUTE_DEVICE T warp_uniform(T a) {
     return __shfl_sync(0xffffffff, a, 0);
