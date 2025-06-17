@@ -18,7 +18,7 @@ int override_num_splits_if_necessary(int batch, int nhead, int max_seqlen_q, int
         return num_splits;
 
     // TODO - tile size should match the TileFmhaShape, hardcode for now
-    const int kM0 = 128;
+    const int kM0 = 64;
     const int kN1 = hdim_v;
 
     const int num_m_blocks = (max_seqlen_q + kM0 - 1) / kM0;
@@ -26,7 +26,7 @@ int override_num_splits_if_necessary(int batch, int nhead, int max_seqlen_q, int
 
     if(num_splits < 1 && p_drop == 0.0f)
         return num_splits_heuristic_ck(
-            batch * nhead * num_m_blocks, props.multiProcessorCount * 2, num_n_blocks, 128);
+            batch * nhead * num_m_blocks, props.multiProcessorCount, num_n_blocks, 16);
 
     return num_splits;
 }
