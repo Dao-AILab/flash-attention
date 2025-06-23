@@ -7,7 +7,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 from einops import rearrange, repeat
-from vllm.vllm_flash_attn.ops.triton.rotary import apply_rotary   # modified from original
+from ..ops.triton.rotary import apply_rotary   # modified from original
 
 
 def rotate_half(x, interleaved=False):
