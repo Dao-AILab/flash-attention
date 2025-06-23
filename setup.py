@@ -363,7 +363,11 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         archs = os.getenv("GPU_ARCHS", "native").split(";")
         validate_and_update_archs(archs)
 
-        cc_flag = [f"--offload-arch={arch}" for arch in archs]
+        if archs != ['native']:
+            cc_flag = [f"--offload-arch={arch}" for arch in archs]
+        else:
+            arch = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
+            cc_flag = [f"--offload-arch={arch}"]
 
         # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
         # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -410,6 +414,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = get_hip_version()
+        if hip_version > Version('5.5.00000'):
+            cc_flag += ["-mllvm", "--lsr-drop-solution=1"]
         if hip_version > Version('5.7.23302'):
             cc_flag += ["-fno-offload-uniform-block"]
         if hip_version > Version('6.1.40090'):

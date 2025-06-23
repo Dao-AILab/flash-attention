@@ -5,6 +5,7 @@ import itertools
 import pytest
 import torch
 import torch.nn.functional as F
+from torch._C import parse_schema
 
 from einops import rearrange, repeat
 try:
@@ -134,7 +135,7 @@ def test_flash_attn_output(
         else:
             qv_ref = None
         # Put window_size after QKV randn so that window_size changes from test to test
-        window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+        window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
         # window_size = (-1, -1) if not local else (16, 0)
         if dtype == torch.float8_e4m3fn:
             q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
@@ -1128,3 +1129,43 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     # # pytorch_profiler(torch.sum, lse_partial)
     # pytorch_profiler(flash_attn_combine, out_partial, lse_partial)
     # pytorch_profiler(torch.sum, out_partial)
+
+def test_flash3_bw_compatibility() -> None:
+    # Let's try to always stay backward compatible! This will make life easier
+    # for downstream libaries, users, and exported models.
+    # 1/ Instead of removing arguments, error out if their value is no longer supported
+    # 2/ When adding arguments, add them at the end with a default value
+    assert torch.ops.flash_attn_3.fwd.default._schema.is_backward_compatible_with(parse_schema(
+        "flash_attn_3::fwd(Tensor q, Tensor k, Tensor v, Tensor(k_new!)? k_new=None, "
+        "Tensor(v_new!)? v_new=None, Tensor? q_v=None, Tensor(out!)? out=None, "
+        "Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_k=None, "
+        "Tensor? cu_seqlens_k_new=None, Tensor? seqused_q=None, Tensor? seqused_k=None, "
+        "int? max_seqlen_q=None, int? max_seqlen_k=None, Tensor? page_table=None, "
+        "Tensor? kv_batch_idx=None, Tensor? leftpad_k=None, Tensor? rotary_cos=None, Tensor? rotary_sin=None, "
+        "Tensor? seqlens_rotary=None, Tensor? q_descale=None, Tensor? k_descale=None, Tensor? v_descale=None, "
+        "float? softmax_scale=None, bool is_causal=False, int window_size_left=-1, int window_size_right=-1, "
+        "int attention_chunk=0, float softcap=0., bool is_rotary_interleaved=False, "
+        "Tensor? scheduler_metadata=None, int num_splits=0, bool? pack_gqa=None, int sm_margin=0) "
+        "-> (Tensor(out!), Tensor, Tensor, Tensor)"
+    ))
+    assert torch.ops.flash_attn_3.bwd.default._schema.is_backward_compatible_with(parse_schema(
+        "flash_attn_3::bwd(Tensor dout, Tensor q, Tensor k, Tensor v, Tensor out, Tensor softmax_lse, "
+        "Tensor(dq!)? dq=None, Tensor(dk!)? dk=None, Tensor(dv!)? dv=None, Tensor? cu_seqlens_q=None, "
+        "Tensor? cu_seqlens_k=None, Tensor? seqused_q=None, Tensor? seqused_k=None, int? max_seqlen_q=None, "
+        "int? max_seqlen_k=None, float? softmax_scale=None, bool is_causal=False, int window_size_left=-1, "
+        "int window_size_right=-1, float softcap=0., bool deterministic=False, int sm_margin=0) "
+        "-> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)"
+    ))
+    assert torch.ops.flash_attn_3.fwd_combine.default._schema.is_backward_compatible_with(parse_schema(
+        "flash_attn_3::fwd_combine(Tensor out_partial, Tensor lse_partial, Tensor(out!)? out=None, "
+        "ScalarType? out_dtype=None) -> (Tensor(out!), Tensor)"
+    ))
+    assert torch.ops.flash_attn_3.get_scheduler_metadata.default._schema.is_backward_compatible_with(parse_schema(
+        "flash_attn_3::get_scheduler_metadata(int batch_size, int max_seqlen_q, int max_seqlen_k, "
+        "int num_heads, int num_heads_k, int headdim, int headdim_v, ScalarType qkv_dtype, Tensor seqused_k, "
+        "Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_k=None, Tensor? cu_seqlens_k_new=None, "
+        "Tensor? seqused_q=None, Tensor? leftpad_k=None, int? page_size=None, int max_seqlen_k_new=0, "
+        "bool is_causal=False, int window_size_left=-1, int window_size_right=-1, "
+        "int attention_chunk=0, bool has_softcap=False, int num_splits=0, bool? pack_gqa=None, "
+        "int sm_margin=0) -> Tensor"
+    ))

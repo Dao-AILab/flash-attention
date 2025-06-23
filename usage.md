@@ -1,8 +1,7 @@
 # FlashAttention adoption
 
 We've been very happy to see FlashAttention being adopted by many organizations
-and research labs to speed up their training / inference (within 6 months after
-FlashAttention's release, at the time of writing).
+and research labs to speed up their training / inference.
 This page contains a partial list of places where FlashAttention is being used.
 If you'd like to add links to your organization / product / codebase, please open a
 PR or email us. We'd very much like to hear from you!
