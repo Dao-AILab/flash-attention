@@ -124,8 +124,9 @@ class Softmax:
 
 class SoftmaxSm100(Softmax):
 
-    def __init__(self, scale_log2: Float32):
+    def __init__(self, scale_log2: Float32, rescale_threshold: cutlass.Constexpr[float] = 0.0):
         super().__init__(scale_log2, num_rows=1, arch=100)
+        self.rescale_threshold = rescale_threshold
 
     @cute.jit
     def update_row_max(self, acc_S_row: cute.TensorSSA) -> Tuple[Float32, Float32]:
@@ -134,12 +135,52 @@ class SoftmaxSm100(Softmax):
         row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
         acc_scale_ = (row_max_old - row_max_safe) * self.scale_log2
         acc_scale = utils.exp2f(acc_scale_)
-        if acc_scale_ >= -8.0:
-            row_max_new = row_max_old
-            row_max_safe = row_max_old
-            acc_scale = 1.0
+        if cutlass.const_expr(self.rescale_threshold > 0.0):
+            if acc_scale_ >= -self.rescale_threshold:
+                row_max_new = row_max_old
+                row_max_safe = row_max_old
+                acc_scale = 1.0
         self.row_max[0] = row_max_new
         return row_max_safe, acc_scale
 
     def update_row_sum(self, acc_S_row_exp: cute.TensorSSA, row_scale: Float32) -> None:
         self.row_sum[0] = self._compute_row_sum(acc_S_row_exp, init_val=self.row_sum[0] * row_scale)
+
+    def scale_apply_exp2_convert(
+        self,
+        acc_S_row: cute.Tensor,
+        row_max: Float32,
+        acc_S_row_converted: cute.Tensor,
+    ):
+        minus_row_max_scaled = -row_max * self.scale_log2
+        # assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
+        # for i in range(0, cute.size(acc_S_row.shape), 2):
+        #     acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
+        #         (acc_S_row[i], acc_S_row[i + 1]),
+        #         (self.scale_log2, self.scale_log2),
+        #         (minus_row_max_scaled, minus_row_max_scaled),
+        #     )
+        #     acc_S_row[i] = cute.arch.exp2(acc_S_row[i])
+        #     acc_S_row[i + 1] = cute.arch.exp2(acc_S_row[i + 1])
+
+        frg_cnt = 4
+        frg_tile = cute.size(acc_S_row) // frg_cnt
+        assert cute.size(acc_S_row) % (frg_cnt * 2) == 0
+        acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
+        acc_S_row_converted_frg = cute.logical_divide(acc_S_row_converted, cute.make_layout(frg_tile))
+        for j in range(frg_cnt):
+            for k in range(0, cute.size(acc_S_row_frg, mode=[0]), 2):
+                acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = (
+                    cute.arch.fma_packed_f32x2(
+                        (acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]),
+                        (self.scale_log2, self.scale_log2),
+                        (minus_row_max_scaled, minus_row_max_scaled),
+                    )
+                )
+                # acc_S_row_frg[k, j] = fa_utils.exp2f(acc_S_row_frg[k, j])
+                # acc_S_row_frg[k + 1, j] = fa_utils.exp2f(acc_S_row_frg[k + 1, j])
+                acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+            acc_S_row_converted_frg[None, j].store(
+                acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+            )

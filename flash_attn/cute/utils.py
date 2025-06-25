@@ -210,16 +210,15 @@ def log2f(a: float | Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def max3f(a: float | Float32, b: float | Float32, c: float | Float32, *, loc=None, ip=None) -> Float32:
+def fmax(a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None) -> Float32:
     return Float32(
-        llvm.inline_asm(
+        nvvm.fmax(
             T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip), Float32(c).ir_value(loc=loc, ip=ip)],
-            "max.f32 $0, $1, $2, $3;",
-            "=f,f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
+            loc=loc,
+            ip=ip,
         )
     )
 
@@ -233,51 +232,22 @@ def fmax_reduce(
         return x.reduce(cute.ReductionOp.MAX, init_val, 0)
     else:
         # [2025-06-15] x.reduce only seems to use 50% 3-input max and 50% 2-input max
-        # We instead force the 3-input max by calling inline ptx.
+        # We instead force the 3-input max.
         res = cute.make_fragment(x.shape, Float32)
         res.store(x)
-        local_max = [init_val, -Float32.inf, -Float32.inf, -Float32.inf]
-        for i in range(0, cute.size(x.shape), 8):
-            local_max[0] = max3f(local_max[0], res[i], res[i + 1])
-            local_max[1] = max3f(local_max[1], res[i + 2], res[i + 3])
-            local_max[2] = max3f(local_max[2], res[i + 4], res[i + 5])
-            local_max[3] = max3f(local_max[3], res[i + 6], res[i + 7])
-        local_max[0] = cute.arch.fmax(local_max[0], local_max[1])
-        local_max[2] = cute.arch.fmax(local_max[2], local_max[3])
-        return cute.arch.fmax(local_max[0], local_max[2])
-
-        # local_max = [cute.arch.fmax(res[0], res[1]), cute.arch.fmax(res[2], res[3]),
-        #              cute.arch.fmax(res[4], res[5]), cute.arch.fmax(res[6], res[7])]
-        # for i in range(8, cute.size(x.shape), 8):
-        #     local_max[0] = max3f(local_max[0], res[i], res[i + 1])
-        #     local_max[1] = max3f(local_max[1], res[i + 2], res[i + 3])
-        #     local_max[2] = max3f(local_max[2], res[i + 4], res[i + 5])
-        #     local_max[3] = max3f(local_max[3], res[i + 6], res[i + 7])
-        # local_max[0] = max3f(init_val, local_max[0], local_max[1])
-        # local_max[2] = cute.arch.fmax(local_max[2], local_max[3])
-        # return cute.arch.fmax(local_max[0], local_max[2])
-
-        # local_max = [res[0], res[1], res[2], res[3]]
-        # for i in range(4, cute.size(x.shape), 8):
-        #     local_max[0] = max3f(local_max[0], res[i], res[i + 1])
-        #     local_max[1] = max3f(local_max[1], res[i + 2], res[i + 3])
-        #     local_max[2] = max3f(local_max[2], res[i + 4], res[i + 5])
-        #     local_max[3] = max3f(local_max[3], res[i + 6], res[i + 7])
-        # i_f = cutlass.const_expr(cute.size(x.shape) - 4)
-        # # local_max[0] = max3f(local_max[0], res[i_f], res[i_f + 1])
-        # # local_max[1] = max3f(local_max[1], res[i_f + 2], res[i_f + 3])
-        # # local_max[0] = max3f(local_max[0], local_max[1], local_max[2])
-        # # return max3f(local_max[0], local_max[3], init_val)
-        # local_max[0] = cute.arch.fmax(local_max[0], res[i_f])
-        # local_max[1] = cute.arch.fmax(local_max[1], res[i_f + 1])
-        # local_max[2] = cute.arch.fmax(local_max[2], res[i_f + 2])
-        # local_max[3] = cute.arch.fmax(local_max[3], res[i_f + 3])
-        # local_max[0] = max3f(local_max[0], local_max[1], init_val)
-        # local_max[2] = cute.arch.fmax(local_max[2], local_max[3])
-        # return cute.arch.fmax(local_max[0], local_max[2])
-
-        # local_max[0] = max3f(local_max[0], local_max[1], local_max[2])
-        # return cute.arch.fmax(local_max[0], local_max[3])
+        local_max = [
+            fmax(init_val, res[0], res[1]),
+            fmax(res[2], res[3]),
+            fmax(res[4], res[5]),
+            fmax(res[6], res[7]),
+        ]
+        for i in range(8, cute.size(x.shape), 8):
+            local_max[0] = fmax(local_max[0], res[i], res[i + 1])
+            local_max[1] = fmax(local_max[1], res[i + 2], res[i + 3])
+            local_max[2] = fmax(local_max[2], res[i + 4], res[i + 5])
+            local_max[3] = fmax(local_max[3], res[i + 6], res[i + 7])
+        local_max[0] = fmax(local_max[0], local_max[1])
+        return fmax(local_max[0], local_max[2], local_max[3])
 
 
 def fadd_reduce(
