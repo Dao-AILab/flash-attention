@@ -26,3 +26,5 @@ class SeqlenInfo:
             self.seqlen_k = mSeqUsedK[batch_idx]
         else:
             self.seqlen_k = seqlen_k_static if cutlass.const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx + 1] - self.offset_k
+        self.has_cu_seqlens_q: int = mCuSeqlensQ is not None
+        self.has_cu_seqlens_k: int = mCuSeqlensK is not None
