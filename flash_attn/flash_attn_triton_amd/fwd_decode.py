@@ -2,7 +2,9 @@ import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional, Union
-from .utils import AUTOTUNE, DEBUG, get_padded_headsize, get_shape_and_strides_from_layout, is_cdna
+from .utils import AUTOTUNE, get_padded_headsize, get_shape_and_strides_from_layout, is_cdna
+
+DEBUG = False
 
 def get_cdna_autotune_configs():
     return [

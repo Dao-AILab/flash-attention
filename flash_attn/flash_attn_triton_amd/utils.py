@@ -45,7 +45,7 @@ class MetaData():
     cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None
     cache_batch_idx = None
     packing: Optional[bool] = None
-    return_scores: bool = False
+    return_softmax: bool = False
     dropout_p: float = 0.0
     philox_seed: Optional[int] = None
     philox_offset : Optional[int]= None # if dropout_p > 0.0 seed the RNG so we get reproducible results for testing.
@@ -72,7 +72,7 @@ class MetaData():
                 f"  cache_seqlens={self.cache_seqlens},\n"
                 f"  cache_batch_idx={self.cache_batch_idx},\n"
                 f"  dropout_p={self.dropout_p},\n"
-                f"  return_scores={self.return_scores}\n"
+                f"  return_softmax={self.return_softmax}\n"
                 f")")
 
     def __init__(self, sm_scale=1.0):
@@ -113,7 +113,7 @@ class MetaData():
         self.rotary_interleaved = rotary_interleaved
         self.rotary_conjunction = rotary_conjunction
 
-    def need_dropout(self, dropout_p, return_softmax = True):
+    def need_dropout(self, dropout_p, return_softmax):
         self.dropout_p = dropout_p
         self.return_softmax = return_softmax
         self.philox_seed, self.philox_offset = 0x1BF58, 0x1D4B49
@@ -129,7 +129,7 @@ class MetaData():
             assert len(self.cu_seqlens_q) == len(self.cu_seqlens_k)
             # TODO: Remove once bias is supported with varlen
             assert self.bias is None
-            # assert not self.return_scores
+            # assert not self.return_softmax
         else:
             assert q.dim() == 4
             assert self.max_seqlens_q > 0 and self.max_seqlens_k > 0
@@ -165,7 +165,7 @@ def generate_varlen_tensor(
     batch_size: Optional[int] = None,
     equal_seqlens: bool = False,
     device: str = "cuda",
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype = torch.float16,
     DEBUG_INPUT: bool = False
 ):
     if DEBUG:
@@ -225,7 +225,7 @@ def generate_varlen_tensor(
         x.requires_grad_()
         return x, cu_seqlens, max_seqlen
 
-def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda", DEBUG_INPUT=False):
+def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype: torch.dtype = torch.float16, device="cuda", DEBUG_INPUT=False):
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
@@ -248,7 +248,7 @@ def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda"
         x.requires_grad_()
         return x
 
-def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype, device="cuda", DEBUG_INPUT=False):
+def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype: torch.dtype = torch.float16, device="cuda", DEBUG_INPUT=False):
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
@@ -272,6 +272,235 @@ def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype, device="cuda"
         x.requires_grad_()
         return x
 
+def generate_bshd_qkv_packed(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype: torch.dtype = torch.float16, device="cuda", DEBUG_INPUT=False):
+    """Generate QKV packed tensor with shape (BATCH, SEQ_LEN, 3, NUM_HEADS, D_HEAD)"""
+    # save fp8 type
+    is_fp8_dtype = is_dtype_fp8(dtype)
+    if is_fp8_dtype:
+        og_fp8_dtype = dtype
+        dtype = torch.float32
+
+    # gen tensor
+    tensor_shape = (BATCH, SEQ_LEN, 3, NUM_HEADS, D_HEAD)
+    if DEBUG_INPUT:
+        x = torch.arange(SEQ_LEN, dtype=dtype, device=device).view(1, SEQ_LEN, 1, 1, 1).expand(*tensor_shape).contiguous()
+    else:
+        x = torch.randn(tensor_shape, dtype=dtype, device=device)
+    
+    if is_fp8_dtype:
+        # cast to fp8 - need to handle the packed dimension
+        raise NotImplementedError("FP8 not supported for QKV packing yet")
+    else:
+        x.requires_grad_()
+        return x
+
+
+def generate_bshd_kv_packed(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype: torch.dtype = torch.float16, device="cuda", DEBUG_INPUT=False):
+    """Generate KV packed tensor with shape (BATCH, SEQ_LEN, 2, NUM_HEADS, D_HEAD)"""
+    # save fp8 type
+    is_fp8_dtype = is_dtype_fp8(dtype)
+    if is_fp8_dtype:
+        og_fp8_dtype = dtype
+        dtype = torch.float32
+
+    # gen tensor
+    tensor_shape = (BATCH, SEQ_LEN, 2, NUM_HEADS, D_HEAD)
+    if DEBUG_INPUT:
+        x = torch.arange(SEQ_LEN, dtype=dtype, device=device).view(1, SEQ_LEN, 1, 1, 1).expand(*tensor_shape).contiguous()
+    else:
+        x = torch.randn(tensor_shape, dtype=dtype, device=device)
+    
+    if is_fp8_dtype:
+        # cast to fp8 - need to handle the packed dimension
+        raise NotImplementedError("FP8 not supported for KV packing yet")
+    else:
+        x.requires_grad_()
+        return x
+
+
+def generate_bhsd_qkv_packed(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype: torch.dtype = torch.float16, device="cuda", DEBUG_INPUT=False):
+    """Generate QKV packed tensor with shape (BATCH, 3, NUM_HEADS, SEQ_LEN, D_HEAD)"""
+    # save fp8 type
+    is_fp8_dtype = is_dtype_fp8(dtype)
+    if is_fp8_dtype:
+        og_fp8_dtype = dtype
+        dtype = torch.float32
+    
+    # gen tensor
+    tensor_shape = (BATCH, 3, NUM_HEADS, SEQ_LEN, D_HEAD)
+    if DEBUG_INPUT:
+        x = torch.arange(SEQ_LEN, dtype=dtype, device=device).view(1, 1, 1, SEQ_LEN, 1).expand(*tensor_shape).contiguous()
+    else:
+        x = torch.randn(tensor_shape, dtype=dtype, device=device)
+    
+    if is_fp8_dtype:
+        # cast to fp8 - need to handle the packed dimension
+        raise NotImplementedError("FP8 not supported for QKV packing yet")
+    else:
+        x.requires_grad_()
+        return x
+
+
+def generate_bhsd_kv_packed(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype: torch.dtype = torch.float16, device="cuda", DEBUG_INPUT=False):
+    """Generate KV packed tensor with shape (BATCH, 2, NUM_HEADS, SEQ_LEN, D_HEAD)"""
+    # save fp8 type
+    is_fp8_dtype = is_dtype_fp8(dtype)
+    if is_fp8_dtype:
+        og_fp8_dtype = dtype
+        dtype = torch.float32
+    
+    # gen tensor
+    tensor_shape = (BATCH, 2, NUM_HEADS, SEQ_LEN, D_HEAD)
+    if DEBUG_INPUT:
+        x = torch.arange(SEQ_LEN, dtype=dtype, device=device).view(1, 1, 1, SEQ_LEN, 1).expand(*tensor_shape).contiguous()
+    else:
+        x = torch.randn(tensor_shape, dtype=dtype, device=device)
+    
+    if is_fp8_dtype:
+        # cast to fp8 - need to handle the packed dimension
+        raise NotImplementedError("FP8 not supported for KV packing yet")
+    else:
+        x.requires_grad_()
+        return x
+
+
+def generate_varlen_qkv_packed(
+    total_seqlen: int,
+    num_heads: int,
+    head_size: int,
+    batch_size: Optional[int] = None,
+    equal_seqlens: bool = False,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.float16,
+    DEBUG_INPUT: bool = False
+):
+    """Generate varlen QKV packed tensor with shape (total_seqlen, 3, num_heads, head_size)"""
+    if DEBUG:
+        print("generate_varlen_qkv_packed")
+        print("total_seqlen", total_seqlen)
+        print("num_heads", num_heads)
+        print("head_size", head_size)
+
+    # save fp8 type
+    is_fp8_dtype = is_dtype_fp8(dtype)
+    if is_fp8_dtype:
+        og_fp8_dtype = dtype
+        dtype = torch.float32
+
+    # get valid batch_size
+    if batch_size is None:
+        valid_batch_sizes = [bs for bs in [1, 2, 4, 8, 16, 32, 64] if bs <= total_seqlen]
+        batch_size = random.choice(valid_batch_sizes)
+    
+    # get seqlens
+    if equal_seqlens:
+        seqlens = torch.full(
+            (batch_size,),
+            total_seqlen // batch_size,
+            dtype=torch.int32,
+            device=device
+        )
+        seqlens[-1] += total_seqlen % batch_size
+    else:
+        seqlens = random_seqlens_composition(total_seqlen, batch_size).to(device=device)
+
+    # create cumulative sequence lengths
+    cu_seqlens = torch.cat([torch.tensor([0], dtype=torch.int32, device=device), seqlens.cumsum(dim=0)]).to(torch.int32).to(device=device)
+    max_seqlen = torch.max(seqlens).to(torch.int32).item()
+
+    # create varlen qkv packed tensor
+    if DEBUG_INPUT:
+        x = torch.zeros(total_seqlen, 3, num_heads, head_size, dtype=dtype, device=device)
+        for i in range(batch_size):
+            start = cu_seqlens[i].item()
+            end = cu_seqlens[i+1].item()
+            length = end - start
+
+            x[start:end, :, :, :] = (
+                torch.arange(length, dtype=dtype, device=device)
+                .view(length, 1, 1, 1)
+                .expand(length, 3, num_heads, head_size)
+            )
+    else:
+        x = torch.randn((total_seqlen, 3, num_heads, head_size), dtype=dtype, device=device)
+
+    if is_fp8_dtype:
+        # cast to fp8 - need to handle the packed dimension
+        raise NotImplementedError("FP8 not supported for QKV packing yet")
+    else:
+        x.requires_grad_()
+        return x, cu_seqlens, max_seqlen
+
+
+def generate_varlen_kv_packed(
+    total_seqlen: int,
+    num_heads: int,
+    head_size: int,
+    batch_size: Optional[int] = None,
+    equal_seqlens: bool = False,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.float16,
+    DEBUG_INPUT: bool = False
+):
+    """Generate varlen KV packed tensor with shape (total_seqlen, 2, num_heads, head_size)"""
+    if DEBUG:
+        print("generate_varlen_kv_packed")
+        print("total_seqlen", total_seqlen)
+        print("num_heads", num_heads)
+        print("head_size", head_size)
+
+    # save fp8 type
+    is_fp8_dtype = is_dtype_fp8(dtype)
+    if is_fp8_dtype:
+        og_fp8_dtype = dtype
+        dtype = torch.float32
+
+    # get valid batch_size
+    if batch_size is None:
+        valid_batch_sizes = [bs for bs in [1, 2, 4, 8, 16, 32, 64] if bs <= total_seqlen]
+        batch_size = random.choice(valid_batch_sizes)
+    
+    # get seqlens
+    if equal_seqlens:
+        seqlens = torch.full(
+            (batch_size,),
+            total_seqlen // batch_size,
+            dtype=torch.int32,
+            device=device
+        )
+        seqlens[-1] += total_seqlen % batch_size
+    else:
+        seqlens = random_seqlens_composition(total_seqlen, batch_size).to(device=device)
+
+    # create cumulative sequence lengths
+    cu_seqlens = torch.cat([torch.tensor([0], dtype=torch.int32, device=device), seqlens.cumsum(dim=0)]).to(torch.int32).to(device=device)
+    max_seqlen = torch.max(seqlens).to(torch.int32).item()
+
+    # create varlen kv packed tensor
+    if DEBUG_INPUT:
+        x = torch.zeros(total_seqlen, 2, num_heads, head_size, dtype=dtype, device=device)
+        for i in range(batch_size):
+            start = cu_seqlens[i].item()
+            end = cu_seqlens[i+1].item()
+            length = end - start
+
+            x[start:end, :, :, :] = (
+                torch.arange(length, dtype=dtype, device=device)
+                .view(length, 1, 1, 1)
+                .expand(length, 2, num_heads, head_size)
+            )
+    else:
+        x = torch.randn((total_seqlen, 2, num_heads, head_size), dtype=dtype, device=device)
+
+    if is_fp8_dtype:
+        # cast to fp8 - need to handle the packed dimension
+        raise NotImplementedError("FP8 not supported for KV packing yet")
+    else:
+        x.requires_grad_()
+        return x, cu_seqlens, max_seqlen
+
+# Replace the existing input_helper function in utils.py with this updated version
+
 def input_helper(
     BATCH: int,
     HQ: int,
@@ -294,20 +523,42 @@ def input_helper(
         # set params
         TOTAL_SEQLENS_Q = BATCH * N_CTX_Q
         TOTAL_SEQLENS_K = BATCH * N_CTX_K
-        equal_seqlens=False
+        equal_seqlens = False
         
-        # gen tensors
-        # TODO: the gen functions should maybe have different gen modes like random, ones, increasing seqlen
-        if is_fp8_dtype:
-            q, cu_seqlens_q, max_seqlen_q, descale_q = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-            k, cu_seqlens_k, max_seqlen_k, descale_k = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-            v, _, _ , descale_v = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-            do, _, _ , descale_do = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
-        else:
-            q, cu_seqlens_q, max_seqlen_q = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-            k, cu_seqlens_k, max_seqlen_k = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-            v, _, _ = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-            do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
+        # deal with packing
+        if packing is None:
+            # gen tensors
+            if is_fp8_dtype:
+                q, cu_seqlens_q, max_seqlen_q, descale_q = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+                k, cu_seqlens_k, max_seqlen_k, descale_k = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+                v, _, _, descale_v = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+                do, _, _, descale_do = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
+            else:
+                q, cu_seqlens_q, max_seqlen_q = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+                k, cu_seqlens_k, max_seqlen_k = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+                v, _, _ = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+                do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
+        elif packing == "kv":
+            # gen tensors with kv packing
+            if is_fp8_dtype:
+                raise ValueError("FP8 not supported for KV packing yet")
+            else:
+                q, cu_seqlens_q, max_seqlen_q = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+                kv, cu_seqlens_k, max_seqlen_k = generate_varlen_kv_packed(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+                do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
+        elif packing == "qkv":
+            # qkv packing - requires same sequence length for q and k
+            assert N_CTX_Q == N_CTX_K, "For QKV packing, Q and K must have same sequence length"
+            assert HQ == HK, "For QKV packing, Q and K must have same number of heads"
+            
+            if is_fp8_dtype:
+                raise ValueError("FP8 not supported for QKV packing yet")
+            else:
+                qkv, cu_seqlens_q, max_seqlen_q = generate_varlen_qkv_packed(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+                cu_seqlens_k = cu_seqlens_q
+                max_seqlen_k = max_seqlen_q
+                # create dummy do for qkv case
+                do = torch.ones((TOTAL_SEQLENS_Q, HQ, D_HEAD), dtype=dtype, device=device) if DEBUG_INPUT else torch.randn((TOTAL_SEQLENS_Q, HQ, D_HEAD), dtype=dtype, device=device)
         
         # setup metadata
         if DEBUG_INPUT:
@@ -317,31 +568,61 @@ def input_helper(
         metadata = MetaData(sm_scale=sm_scale)
         metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
         metadata.need_causal(CAUSAL)
-        metadata.need_dropout(DROPOUT_P)
+        metadata.need_dropout(DROPOUT_P, True)
+        
     elif layout == 'bshd' or layout == "bhsd":
-        # gen tensors
-        if layout == "bshd":
+        # deal with packing
+        if packing is None:
+            # gen tensors
+            if layout == "bshd":
+                if is_fp8_dtype:
+                    q, descale_q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    k, descale_k = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    v, descale_v = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    do, descale_do = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device)
+                else:
+                    q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    k = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    v = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
+            elif layout == "bhsd":
+                if is_fp8_dtype:
+                    q, descale_q = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    k, descale_k = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    v, descale_v = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    do, descale_do = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device)
+                else:
+                    q = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    k = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    v = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
+        elif packing == "kv":
+            # gen tensors with kv packing
             if is_fp8_dtype:
-                q, descale_q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                k, descale_k = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                v, descale_v = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                do, descale_do = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device)
+                raise ValueError("FP8 not supported for KV packing yet")
             else:
-                q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                k = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                v = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
-        elif layout == "bhsd":
+                if layout == "bshd":
+                    q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    kv = generate_bshd_kv_packed(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
+                elif layout == "bhsd":
+                    q = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    kv = generate_bhsd_kv_packed(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
+        elif packing == "qkv":
+            # qkv packing - requires same sequence length for q and k
+            assert N_CTX_Q == N_CTX_K, "For QKV packing, Q and K must have same sequence length"
+            assert HQ == HK, "For QKV packing, Q and K must have same number of heads"
+            
             if is_fp8_dtype:
-                q, descale_q = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                k, descale_k = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                v, descale_v = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                do, descale_do = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device)
+                raise ValueError("FP8 not supported for QKV packing yet")
             else:
-                q = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                k = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                v = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
+                if layout == "bshd":
+                    qkv = generate_bshd_qkv_packed(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    do = torch.ones((BATCH, N_CTX_Q, HQ, D_HEAD), dtype=dtype, device=device) if DEBUG_INPUT else torch.randn((BATCH, N_CTX_Q, HQ, D_HEAD), dtype=dtype, device=device)
+                elif layout == "bhsd":
+                    qkv = generate_bhsd_qkv_packed(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                    do = torch.ones((BATCH, HQ, N_CTX_Q, D_HEAD), dtype=dtype, device=device) if DEBUG_INPUT else torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), dtype=dtype, device=device)
 
         # setup metadata
         if DEBUG_INPUT:
@@ -353,42 +634,22 @@ def input_helper(
         metadata.max_seqlens_k = N_CTX_K
         metadata.layout = layout
         metadata.need_causal(CAUSAL)
-        metadata.need_dropout(DROPOUT_P)
+        metadata.need_dropout(DROPOUT_P, True)
     else:
         raise ValueError(f"Unknown layout: {layout}")
 
-    # deal with packing
+    # return based on packing
     if packing is None:
         if is_fp8_dtype:
             return (q, descale_q), (k, descale_k), (v, descale_v), (do, descale_do), metadata
         else:
             return q, k, v, do, metadata
     elif packing == "kv":
-        # pack k and v
-        if layout in ["bhsd", "thd"]:
-            kv = torch.stack([k, v], dim=1)
-        elif layout == "bshd":
-            kv = torch.stack([k, v], dim=2)
-        else:
-            raise ValueError(f"Unknown layout: {layout}")
-
         if is_fp8_dtype:
             raise ValueError("FP8 not supported kv packing yet")
         else:
             return q, kv, do, metadata
     elif packing == "qkv":
-        # qkv packing - requires same sequence length for q and k
-        assert N_CTX_Q == N_CTX_K, "For QKV packing, Q and K must have same sequence length"
-        assert HQ == HK, "For QKV packing, Q and K must have same number of heads"
-
-        # pack q, k, and v
-        if layout in ["bhsd", "thd"]:
-            qkv = torch.stack([q, k, v], dim=1)
-        elif layout == "bshd":
-            qkv = torch.stack([q, k, v], dim=2)
-        else:
-            raise ValueError(f"Unknown layout: {layout}")
-
         if is_fp8_dtype:
             raise ValueError("FP8 not supported qkv packing yet")
         else:
@@ -692,6 +953,9 @@ def compute_alibi_tensor_ref(alibi_slopes, seqlen_q, seqlen_k):
     k_idx = torch.arange(seqlen_k, dtype=torch.int32, device="cuda").unsqueeze(0)  # (1, N_CTX_K)
     relative_pos = torch.abs(q_idx + seqlen_k - seqlen_q - k_idx)  # (N_CTX_Q, N_CTX_K)
     return -1 * alibi_slopes.unsqueeze(-1).unsqueeze(-1) * relative_pos  # (Z, H, N_CTX_Q, N_CTX_K)
+
+def round_multiple(x, m):
+    return (x + m - 1) // m * m
 
 # -------------------------------
 # Dropouts

@@ -5,6 +5,9 @@ import triton
 import time
 import argparse
 import itertools
+import logging
+import warnings
+import datetime
 import pandas as pd
 from logging import warning
 from typing import Dict, List, Literal, Optional, Tuple
@@ -73,6 +76,10 @@ SUPPORTED_MODES = {
     "flash_attn_with_kvcache": ["fwd"],
 }
 
+
+# Add a global variable for verbose mode
+VERBOSE = False
+
 @dataclass
 class EnvVariableConfig:
     key: str
@@ -80,7 +87,7 @@ class EnvVariableConfig:
     backend: Optional[Literal["triton", "ck"]] = None
 
 ENV_VARIABLE_CONFIGS : List[EnvVariableConfig] = [
-    # EnvVariableConfig(key="BWD_MODE", values=["split", "fused", "jingning"], backend="triton"),
+    # EnvVariableConfig(key="BWD_MODE", values=["split", "fused_atomics", "fused_no_atomics"], backend="triton"),
 ]
 
 class FunctionConfig:
@@ -108,53 +115,6 @@ class FunctionConfig:
     
     def column_name(self):
         return f"{self}_ms"
-
-
-@lru_cache()
-def available_backends():
-    available = []
-    
-    # try to load each backend
-    for backend in ["triton", "ck"]:
-        try:
-            # try loading the module with this backend
-            flash_attn = load_flash_attn_module(backend)
-            
-            # if we got here, the backend loaded successfully
-            available.append(backend)
-        except Exception as e:
-            # backend not available, just continue
-            print(f"Backend {backend} not available. Error: {e}")
-    
-    # if no backends available, default to triton
-    if not available:
-        raise ValueError("No Backends available")
-        
-    return available
-
-@lru_cache()
-def get_fn_params(fn_name):
-    # get params for fn
-    packing = get_packing_type(fn_name)
-    is_varlen = True if "varlen" in fn_name else False
-    is_fp8 = True if "fp8" in fn_name else False
-    supported_dtypes = SUPPORTED_DTYPES.get(fn_name, [torch.float16])  # default to float16 if not found
-    supported_backends = [backend for backend in SUPPORTED_BACKENDS.get(fn_name, ["triton"]) if backend in available_backends()]  # default to triton backend
-    supports_backward = False if fn_name in ["flash_attn_with_kvcache"] else True
-    supported_modes = SUPPORTED_MODES.get(fn_name, ["fwd"])
-    device = "cuda"
-    
-    # get supported env configs for each backend
-    supported_env_configs = {}
-    for backend in supported_backends:
-        supported_env_configs[backend] = get_env_value_combinations(backend)
-
-    # check backward pass support
-    if not supports_backward:
-        warning(f"{fn_name} does not have a backward pass so benching forward pass only.")
-
-    return is_varlen, is_fp8, packing, supported_dtypes, supported_backends, supported_modes, supported_env_configs, device
-
 def generate_fn_inputs(
     fn_name: str,
     BATCH: int,
@@ -858,11 +818,12 @@ def get_packing_type(fn_name: str) -> Optional[Literal["kv", "qkv"]]:
 
     return packing
 
-def load_flash_attn_module(backend: Literal["triton", "ck"], env_configs: Dict = {}, verbose = False):
+def load_flash_attn_module(backend: Literal["triton", "ck"], env_configs: Dict = {}):
     """
     Load the flash_attn module with the specified backend configuration
     """
-
+    global VERBOSE
+    
     # remove any existing env variables first
     for key in ENV_FLAGS:
         if key in os.environ:
@@ -881,7 +842,7 @@ def load_flash_attn_module(backend: Literal["triton", "ck"], env_configs: Dict =
     # add custom env configs
     add_env_configs(env_configs)
     
-    if verbose:
+    if VERBOSE:  # Only print if both local and global verbose are True
         print(f"Loading flash_attn module with {backend} backend.")
     
     # Remove any existing flash_attn modules from sys.modules
@@ -894,6 +855,10 @@ def load_flash_attn_module(backend: Literal["triton", "ck"], env_configs: Dict =
     
     # Import and return the module
     import flash_attn
+
+    # disable triton printing from autotuning
+    if not VERBOSE:
+            os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
     
     return flash_attn
 
@@ -907,11 +872,8 @@ def run_benchmark(func_config: FunctionConfig, input_configs):
     """
     Runs the benchmark for the provided function configuration with the given input configurations.
     """
-    # print new line to seperate benchmark runs
-    print()
-    if DEBUG:
-        print("func_config:", func_config)
-
+    global VERBOSE
+    
     # extract function configuration parameters
     fn_name = func_config.fn_name
     mode = func_config.mode
@@ -919,13 +881,14 @@ def run_benchmark(func_config: FunctionConfig, input_configs):
     backend = func_config.backend
 
     # load flash attention module
-    flash_attn_module = load_flash_attn_module(backend, func_config.env_configs, verbose=True)
+    flash_attn_module = load_flash_attn_module(backend, func_config.env_configs)
  
     # start timing the benchmark
     start_time = time.time()
-
-    # print bench fn
-    print(f"Benchmarking {func_config} ...")
+    if VERBOSE:
+        print(f"Benchmarking {func_config} ...")
+    else:
+        print(f"Running {fn_name} ({mode}, {backend})...", end='', flush=True)
 
     # Setup benchmark configurations
     bench_configs = [
@@ -966,16 +929,15 @@ def run_benchmark(func_config: FunctionConfig, input_configs):
         ms = triton.testing.do_bench(benchmark_fn, warmup=25, rep=100)
         return ms
 
-    df = bench_function.run(save_path=".", print_data=True, return_df=True)[0]
+    df = bench_function.run(return_df=True)[0]
     
     # set the column name to reflect the function configuration
     df = df.rename(columns={"Time (ms)": func_config.column_name()})
     
     # calculate and print elapsed time
     elapsed_time = time.time() - start_time
-    print(f"Total time for benchmarking {fn_name} in {mode} mode with {dtype}: {elapsed_time:.2f} seconds")
 
-    return df
+    return df, elapsed_time
 
 def filter_modes(requested_modes, fn_name, supported_modes_for_fn):
     modes_to_run = []
@@ -1025,26 +987,88 @@ def get_input_config_set(config_type):
     
     return input_configs
 
-def filter_backends(requested_backends, supported_backends, fn_name):
+def available_backends():
+    """Check which backends are available by trying to load them."""
+    available = []
+    
+    for backend in ["triton", "ck"]:
+        try:
+            # try loading the module with this backend
+            load_flash_attn_module(backend)
+            available.append(backend)
+        except Exception as e:
+            # backend not available, just continue
+            if DEBUG:
+                print(f"Backend {backend} not available: {e}")
+    
+    if not available:
+        raise ValueError("No backends are available. Please check your flash_attn installation.")
+        
+    return available
+
+# 2. Simplify get_fn_params to remove the backend filtering logic here
+@lru_cache()
+def get_fn_params(fn_name):
+    # get params for fn
+    packing = get_packing_type(fn_name)
+    is_varlen = True if "varlen" in fn_name else False
+    is_fp8 = True if "fp8" in fn_name else False
+    supported_dtypes = SUPPORTED_DTYPES.get(fn_name, [torch.float16])
+    supported_backends = SUPPORTED_BACKENDS.get(fn_name, ["triton"])  # just get what the function supports
+    supports_backward = False if fn_name in ["flash_attn_with_kvcache"] else True
+    supported_modes = SUPPORTED_MODES.get(fn_name, ["fwd"])
+    device = "cuda"
+    
+    # get supported env configs for each backend
+    supported_env_configs = {}
+    for backend in supported_backends:
+        supported_env_configs[backend] = get_env_value_combinations(backend)
+
+    # check backward pass support
+    if not supports_backward:
+        warning(f"{fn_name} does not have a backward pass so benching forward pass only.")
+
+    return is_varlen, is_fp8, packing, supported_dtypes, supported_backends, supported_modes, supported_env_configs, device
+
+# 3. Create a new simpler function to validate and filter backends
+def validate_backends(requested_backends, supported_backends, fn_name):
+    """Validate that requested backends are available and supported."""
+    # get actually available backends
+    available = available_backends()
+    
+    # determine which backends to use
     if requested_backends:
-        selected = []
-        for be in requested_backends:
-            if be in supported_backends:
-                selected.append(be)
-            else:
-                warning(
-                    f"backend '{be}' requested but not supported by "
-                    f"function '{fn_name}'. skipping this back-end."
-                )
-        return selected
+        # user specified backends - validate them
+        valid_backends = []
+        for backend in requested_backends:
+            if backend not in available:
+                warning(f"Backend '{backend}' is not available on this system. Skipping.")
+                continue
+            if backend not in supported_backends:
+                warning(f"Backend '{backend}' is not supported by function '{fn_name}'. Skipping.")
+                continue
+            valid_backends.append(backend)
+        
+        if not valid_backends:
+            raise ValueError(f"None of the requested backends {requested_backends} are available and supported for {fn_name}")
+        
+        return valid_backends
     else:
-        return supported_backends
+        # no backends specified - use all available and supported
+        valid_backends = [b for b in supported_backends if b in available]
+        
+        if not valid_backends:
+            raise ValueError(f"No available backends found for {fn_name}. Function supports {supported_backends} but only {available} are available.")
+        
+        return valid_backends
 
-
+# 4. Update process_args to use the new validate_backends function
 def process_args():
     """
     Parses command-line arguments and returns function configs and input configs.
     """
+    global VERBOSE
+    
     # create parser
     parser = argparse.ArgumentParser(
         prog="Benchmark FlashAttention",
@@ -1064,16 +1088,35 @@ def process_args():
         type=str,
         nargs='*',
         choices=VALID_MODES,
-        default=None,
-        help=f"Benchmarking mode(s) to run. If omitted, runs all supported modes for each function.",
+        default=["fwd", "bwd"],
+        help=f"Benchmarking mode(s) to run. Default: fwd, bwd",
     )
     parser.add_argument(
         "--backend",
         type=str,
         nargs='*',
         choices=["triton", "ck"],
-        default=None,
-        help="Back-end(s) to run (triton, ck). Omit to run every back-end that is both available and supported by the function.",
+        default=["triton"],
+        help="Backend(s) to run. Default: triton",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        choices=["ms", "tflops"],
+        default="tflops",
+        help="Output metric type: ms (milliseconds) or tflops (TFLOPS). Default: tflops",
+    )
+    parser.add_argument(
+        "--format",
+        type=str,
+        choices=["csv", "markdown"],
+        default="csv",
+        help="Output file format: csv or markdown. Default: csv",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose output (show autotuning details)",
     )
     # config
     parser.add_argument("-b", type=int, default=None, help="Batch size")
@@ -1087,15 +1130,21 @@ def process_args():
 
     # parse args
     args = parser.parse_args()
+    
+    # Set global verbose flag
+    VERBOSE = args.verbose
 
     # parse function args
     benchmark_fns = args.benchmark_fn
     requested_modes = args.mode
     requested_backends = args.backend
+    output_type: Literal["ms", "tflops"] = args.output
+    output_format: Literal["csv", "markdown"] = args.format
 
-    # fenerate function configurations and input configurations separately
+    # generate function configurations and input configurations separately
     all_function_configs = []
     all_input_configs = {}  # Maps function config -> input configs
+    
     for fn_name in benchmark_fns:
         is_varlen, is_fp8, packing, supported_dtypes, supported_backends, supported_modes_for_fn, supported_env_configs, device = get_fn_params(fn_name)
         
@@ -1115,10 +1164,7 @@ def process_args():
             dropout = args.dropout if args.dropout is not None else 0.0
             input_configs = [(batch, hq, hk, sq, sk, d_head, causal, dropout)]
         else:
-            if True:
-                input_configs = get_input_config_set("llama")
-            else:
-                input_configs = generate_benchmark_configs(is_varlen, packing)
+            input_configs = get_input_config_set("llama")
 
         # filter by mode
         modes_to_run = filter_modes(requested_modes, fn_name, supported_modes_for_fn)
@@ -1126,12 +1172,11 @@ def process_args():
             warning(f"No valid modes to run for function '{fn_name}' based on request and function support. Skipping this function.")
             continue
 
-        # filter by backend
-        backends_to_run = filter_backends(requested_backends,
-                                  supported_backends,
-                                  fn_name)
-        if not backends_to_run:
-            warning(f"no valid back-ends left for '{fn_name}'. skipping.")
+        # validate and filter backends
+        try:
+            backends_to_run = validate_backends(requested_backends, supported_backends, fn_name)
+        except ValueError as e:
+            warning(str(e))
             continue
         
         # create a function config for each backend and dtype combination
@@ -1149,7 +1194,7 @@ def process_args():
                         
                         all_input_configs[func_config] = fn_inputs
 
-    return all_function_configs, all_input_configs
+    return all_function_configs, all_input_configs, output_type, output_format
 
 def check_environment_variables():
     for key in ENV_FLAGS:
@@ -1202,10 +1247,24 @@ def add_tflops_columns(df: pd.DataFrame, func_cfg: FunctionConfig) -> pd.DataFra
     df[tf_col] = flops / df[ms_col] * 1e-9
     return df
 
+def generate_output_filename(function_configs, output_type, output_format):
+    # create a timestamp
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # simple filename format
+    base_filename = f"benchmark_{timestamp}"
+    
+    if output_format == "csv":
+        return base_filename + ".csv"
+    else:  # markdown
+        return base_filename + ".md"
+
 def main():
     """
     Main function to run benchmarks.
     """
+    global VERBOSE
+    
     # check environment variables
     check_environment_variables()
 
@@ -1213,19 +1272,37 @@ def main():
     total_start_time = time.time()
 
     # process args to get function configs and input configs
-    function_configs, all_input_configs = process_args()
+    function_configs, all_input_configs, output_type, output_format = process_args()
+    
+    # Print summary of what will be benchmarked (always show this)
+    print(f"\nBenchmarking {len(function_configs)} configuration(s):")
+    unique_fns = set(fc.fn_name for fc in function_configs)
+    print(f"  Functions: {', '.join(unique_fns)}")
+    unique_backends = set(fc.backend for fc in function_configs)
+    print(f"  Backends: {', '.join(unique_backends)}")
+    unique_modes = set(fc.mode for fc in function_configs)
+    print(f"  Modes: {', '.join(unique_modes)}")
+    print()
     
     # run benchmarks for each function configuration
     combined_ms_df  = None
     combined_tf_df  = None
     input_cols = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD", "CAUSAL", "DROPOUT"]
-    for func_config in function_configs:
+    
+    for i, func_config in enumerate(function_configs, 1):
+        # Progress indicator
+        if not VERBOSE:
+            print(f"[{i}/{len(function_configs)}] ", end='')
+        
         # run benchmark with the input configs for this function config
         input_configs = all_input_configs[func_config]
-        df = run_benchmark(func_config, input_configs)
-        df = add_tflops_columns(df, func_config)
+        df, elapsed_time = run_benchmark(func_config, input_configs)
+        
+        if VERBOSE:
+            print(f"Total time for benchmarking {func_config.fn_name} in {func_config.mode} mode with {func_config.dtype}: {elapsed_time:.2f} seconds")
         
         # add to combined table
+        df = add_tflops_columns(df, func_config)
         ms_cols = [c for c in df.columns if c.endswith('_ms')]
         tf_cols = [c for c in df.columns if c.endswith('_tflops')]
 
@@ -1244,7 +1321,7 @@ def main():
 
     # print total time for all benchmarks
     total_elapsed_time = time.time() - total_start_time
-    print(f"Total time for all benchmarks: {total_elapsed_time:.2f} seconds")
+    print(f"Total benchmark time: {total_elapsed_time:.1f} seconds")
 
     # save combined data and make comparisons if we have multiple function configs
     has_multiple_func_configs = False # len(function_configs) > 1
@@ -1282,19 +1359,33 @@ def main():
                 print(f"Comparison Results (triton vs ck):")
                 print(f"Ratio values: values > 1 mean triton is faster (by that factor), values < 1 mean ck is faster")
 
-    if combined_ms_df is not None:
-        print("\nCombined wall‑time (ms) table:")
-        print(combined_ms_df)
-        combined_ms_df.to_csv("benchmark_ms.csv", index=False)
-        with open("benchmark_ms.md", 'w') as f:
-            f.write(combined_ms_df.to_markdown(index=False, floatfmt=".2f"))
-
-    if combined_tf_df is not None:
-        print("\nCombined throughput (TFLOPs) table:")
-        print(combined_tf_df)
-        combined_tf_df.to_csv("benchmark_tflops.csv", index=False)
-        with open("benchmark_tflops.md", 'w') as f:
-            f.write(combined_tf_df.to_markdown(index=False, floatfmt=".2f"))
+    # output based on selected metric
+    if output_type == "ms":
+        if combined_ms_df is not None:
+            filename = generate_output_filename(function_configs, "ms", output_format)
+            print(f"\nCombined wall-time (ms) table:")
+            print(combined_ms_df)
+            
+            if output_format == "csv":
+                combined_ms_df.to_csv(filename, index=False)
+                print(f"Results saved to: {filename}")
+            else:  # markdown
+                with open(filename, 'w') as f:
+                    f.write(combined_ms_df.to_markdown(index=False, floatfmt=".2f"))
+                print(f"Results saved to: {filename}")
+    else:  # output_type == "tflops"
+        if combined_tf_df is not None:
+            filename = generate_output_filename(function_configs, "tflops", output_format)
+            print(f"\nCombined throughput (TFLOPs) table:")
+            print(combined_tf_df)
+            
+            if output_format == "csv":
+                combined_tf_df.to_csv(filename, index=False)
+                print(f"Results saved to: {filename}")
+            else:  # markdown
+                with open(filename, 'w') as f:
+                    f.write(combined_tf_df.to_markdown(index=False, floatfmt=".2f"))
+                print(f"Results saved to: {filename}")
 
 if __name__ == "__main__":
     main()

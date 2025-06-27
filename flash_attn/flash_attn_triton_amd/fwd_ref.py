@@ -1,8 +1,9 @@
 import torch
 import math
 from typing import Literal, Optional
-from .utils import DEBUG, compute_alibi_tensor_ref
+from .utils import compute_alibi_tensor_ref
 
+DEBUG = False
 DEBUG_CORE = False
 
 def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2):
@@ -247,7 +248,7 @@ def attention_varlen_forward_pytorch_ref_impl(
     total_L_k = k.shape[0]
 
     o = torch.zeros((total_L_q, nheads_q, head_dim), dtype=q.dtype, device=q.device)
-    softmax_lse = torch.zeros((total_L_q, nheads_q), dtype=torch.float32, device=q.device)
+    softmax_lse = torch.zeros((nheads_q, total_L_q), dtype=torch.float32, device=q.device)
     sd_mask = torch.zeros((batch_size, nheads_q, max_seqlen_q, max_seqlen_k), dtype=torch.float32, device=q.device)
 
     # Compute group_size for MQA/GQA handling
@@ -318,12 +319,11 @@ def attention_varlen_forward_pytorch_ref_impl(
 
         # Convert back to 'thd' layout
         o_i = o_i.permute(1, 0, 2)  # [L_q_i, nheads_q, head_dim]
-        softmax_lse_i = softmax_lse_i.permute(1, 0)  # [L_q_i, nheads_q]
         sd_mask_i = sd_mask_i # [nheads_q, L_q_i, L_k_i]
 
         # Place outputs in pre-allocated tensors
         o[start_q:end_q, :, :] = o_i
-        softmax_lse[start_q:end_q, :] = softmax_lse_i
+        softmax_lse[:, start_q:end_q] = softmax_lse_i
         sd_mask[i, :, :seqlen_q, :seqlen_k] = sd_mask_i
 
     return o, softmax_lse, sd_mask

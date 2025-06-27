@@ -17,14 +17,17 @@ from flash_attn import (
     flash_attn_varlen_fp8_func,
     flash_attn_varlen_kvpacked_func,
     flash_attn_varlen_qkvpacked_func,
-    flash_attn_varlen_qkvpacked_fp8_func
+    flash_attn_varlen_qkvpacked_fp8_func,
+    flash_attn_with_kvcache
 )
 
-from .utils import DEBUG, input_helper, arch_supports_fp8
+from .utils import generate_bshd_kv_packed, generate_bshd_qkv_packed, generate_bshd_tensor, generate_varlen_kv_packed, generate_varlen_qkv_packed, input_helper, arch_supports_fp8, generate_varlen_tensor
 from .fwd_ref import attention_forward_pytorch_ref_impl
 from .fwd_prefill import attention_prefill_forward_triton_impl
-from .bwd_prefill_onekernel import attention_prefill_backward_triton_split_oneKernel_impl
+from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_split_fused_no_atomics_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
+
+DEBUG = False
 
 # set print options
 # torch.set_printoptions(linewidth=5e5, edgeitems=10, sci_mode=False)
@@ -101,7 +104,7 @@ def test_op_prefill_fwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
         metadata.need_causal(True)
 
     # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
-    metadata.need_dropout(dropout_p)
+    metadata.need_dropout(dropout_p, True)
 
 
     # call Triton's forward implementation directly
@@ -128,7 +131,7 @@ def test_op_prefill_fwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
                                                 metadata.dropout_p,
                                                 metadata.philox_seed, 
                                                 metadata.philox_offset, 
-                                                metadata.return_scores, 
+                                                metadata.return_softmax, 
                                                 use_exp2,
                                                 None,
                                                 None,
@@ -164,7 +167,7 @@ def test_op_prefill_fwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
         print("Compare Triton Impl with refernce Pytorch Impl")
 
     # this can be set to true manually or when using dropout
-    if metadata.return_scores:
+    if metadata.return_softmax:
         if DEBUG:
             print("sd_mask_triton:", sd_mask_triton, sd_mask_triton.shape)
             print("sd_mask_ref:", sd_mask_ref, sd_mask_ref.shape)
@@ -268,7 +271,7 @@ def test_op_prefill_bwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
     q, k, v, do, metadata = input_helper(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, dtype, layout=layout, device=device)
 
     # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
-    metadata.need_dropout(dropout_p)
+    metadata.need_dropout(dropout_p, True)
 
     # =============================================== Reference ==============================================================
     # fwd
@@ -334,7 +337,7 @@ def test_op_prefill_bwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
     dq_triton = torch.zeros_like(q_triton, dtype=q.dtype) # NOTE: the kernel does inplace accumlation on dq so dq has to be zeros
     dk_triton = torch.zeros_like(k_triton, dtype=k.dtype) if DEBUG_INPUT else torch.empty_like(k_triton, dtype=k.dtype)
     dv_triton = torch.zeros_like(v_triton, dtype=v.dtype) if DEBUG_INPUT else torch.empty_like(v_triton, dtype=v.dtype)
-    delta_triton = attention_prefill_backward_triton_split_oneKernel_impl(
+    delta_triton = attention_prefill_backward_triton_split_fused_no_atomics_impl(
         do_triton,
         q_triton,
         k_triton,
@@ -931,3 +934,189 @@ def test_ir(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, 
 
     for file, fp8_found in ttir_files_fp8_found_status.items():
         assert fp8_found, f"{fp8_types} not found in {file}"
+
+
+def clear_compile_cache():
+    """Clear torch compile caches to prevent graph merging"""
+    if hasattr(torch._dynamo, 'reset'):
+        torch._dynamo.reset()
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize(
+    "BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD",
+    [
+        # (4, 8, 8, 128, 128, 64),    # small test
+        (32, 32, 32, 531, 531, 128), # original test
+        # (16, 48, 16, 256, 512, 64),  # MQA test (HQ > HK)
+    ],
+)
+def test_torch_compile(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD):
+    print(f"\n\nTesting with BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}, D_HEAD={D_HEAD}")
+    
+    try:
+        # Test 1: flash_attn_func
+        print("\n1. Testing flash_attn_func...")
+        clear_compile_cache()
+        
+        q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD)
+        k = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD)
+        v = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD)
+        
+        flash_attn_func_compiled = torch.compile(flash_attn_func)
+        o = flash_attn_func_compiled(q, k, v, causal=True)
+        print(f"Output shape: {o.shape}, dtype: {o.dtype}")
+        o.sum().backward()
+        print("✓ flash_attn_func SUCCESS")
+        
+        # cleanup
+        del q, k, v, o
+        torch.cuda.empty_cache()
+        
+        
+        # Test 2: flash_attn_varlen_func
+        print("\n2. Testing flash_attn_varlen_func...")
+        clear_compile_cache()
+        
+        q, cu_seqlens_q, max_seqlen_q = generate_varlen_tensor(BATCH * N_CTX_Q, HQ, D_HEAD, BATCH)
+        k, cu_seqlens_k, max_seqlen_k = generate_varlen_tensor(BATCH * N_CTX_K, HK, D_HEAD, BATCH)
+        v, _, _ = generate_varlen_tensor(BATCH * N_CTX_K, HK, D_HEAD, BATCH)
+        
+        flash_attn_varlen_func_compiled = torch.compile(flash_attn_varlen_func)
+        o = flash_attn_varlen_func_compiled(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, 
+            max_seqlen_q, max_seqlen_k, causal=True
+        )
+        print(f"Output shape: {o.shape}, dtype: {o.dtype}")
+        o.sum().backward()
+        print("✓ flash_attn_varlen_func SUCCESS")
+        
+        # cleanup
+        del q, k, v, o, cu_seqlens_q, cu_seqlens_k
+        torch.cuda.empty_cache()
+        
+        
+        # Test 3: flash_attn_qkvpacked_func
+        print("\n3. Testing flash_attn_qkvpacked_func...")
+        clear_compile_cache()
+        
+        qkv = generate_bshd_qkv_packed(BATCH, N_CTX_Q, HQ, D_HEAD)
+        
+        flash_attn_qkvpacked_func_compiled = torch.compile(flash_attn_qkvpacked_func)
+        o = flash_attn_qkvpacked_func_compiled(qkv, causal=True)
+        print(f"Output shape: {o.shape}, dtype: {o.dtype}")
+        o.sum().backward()
+        print("✓ flash_attn_qkvpacked_func SUCCESS")
+        
+        # cleanup
+        del qkv, o
+        torch.cuda.empty_cache()
+        
+        
+        # Test 4: flash_attn_varlen_qkvpacked_func
+        print("\n4. Testing flash_attn_varlen_qkvpacked_func...")
+        clear_compile_cache()
+        
+        total_q = BATCH * N_CTX_Q
+        qkv, cu_seqlens, max_seqlen = generate_varlen_qkv_packed(total_q, HQ, D_HEAD, BATCH)
+        
+        flash_attn_varlen_qkvpacked_func_compiled = torch.compile(flash_attn_varlen_qkvpacked_func)
+        o = flash_attn_varlen_qkvpacked_func_compiled(
+            qkv, cu_seqlens, max_seqlen, causal=True
+        )
+        print(f"Output shape: {o.shape}, dtype: {o.dtype}")
+        o.sum().backward()
+        print("✓ flash_attn_varlen_qkvpacked_func SUCCESS")
+        
+        # cleanup
+        del qkv, o, cu_seqlens
+        torch.cuda.empty_cache()
+        
+        
+        # Test 5: flash_attn_kvpacked_func
+        print("\n5. Testing flash_attn_kvpacked_func...")
+        clear_compile_cache()
+        
+        q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD)
+        kv = generate_bshd_kv_packed(BATCH, N_CTX_K, HK, D_HEAD)
+        
+        flash_attn_kvpacked_func_compiled = torch.compile(flash_attn_kvpacked_func)
+        o = flash_attn_kvpacked_func_compiled(q, kv, causal=True)
+        print(f"Output shape: {o.shape}, dtype: {o.dtype}")
+        o.sum().backward()
+        print("✓ flash_attn_kvpacked_func SUCCESS")
+        
+        # cleanup
+        del q, kv, o
+        torch.cuda.empty_cache()
+
+        
+        # Test 6: flash_attn_varlen_kvpacked_func
+        print("\n6. Testing flash_attn_varlen_kvpacked_func...")
+        clear_compile_cache()
+        
+        q, cu_seqlens_q, max_seqlen_q = generate_varlen_tensor(BATCH * N_CTX_Q, HQ, D_HEAD, BATCH)
+        kv, cu_seqlens_k, max_seqlen_k = generate_varlen_kv_packed(BATCH * N_CTX_K, HK, D_HEAD, BATCH)
+        
+        flash_attn_varlen_kvpacked_func_compiled = torch.compile(flash_attn_varlen_kvpacked_func)
+        o = flash_attn_varlen_kvpacked_func_compiled(
+            q, kv, cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q, max_seqlen_k, causal=True
+        )
+        print(f"Output shape: {o.shape}, dtype: {o.dtype}")
+        o.sum().backward()
+        print("✓ flash_attn_varlen_kvpacked_func SUCCESS")
+        
+        # cleanup
+        del q, kv, o, cu_seqlens_q, cu_seqlens_k
+        torch.cuda.empty_cache()
+
+
+        # Test 7: flash_attn_with_kvcache
+        print("\n7. Testing flash_attn_with_kvcache...")
+        clear_compile_cache()
+        
+        # setup cache dimensions
+        CACHE_SEQLEN = 1024  # max cache size
+        NEW_SEQLEN = 1       # for incremental decoding, usually 1 token at a time
+        
+        # create query for new tokens
+        q = generate_bshd_tensor(BATCH, NEW_SEQLEN, HQ, D_HEAD, dtype=torch.float16)
+        
+        # create kv cache using generators
+        k_cache = generate_bshd_tensor(BATCH, CACHE_SEQLEN, HK, D_HEAD, dtype=torch.float16)
+        v_cache = generate_bshd_tensor(BATCH, CACHE_SEQLEN, HK, D_HEAD, dtype=torch.float16)
+        
+        # cache sequence lengths
+        cache_seqlens = torch.full((BATCH,), 100, dtype=torch.int32, device='cuda')
+        
+        # new k,v to append to cache (optional)
+        k_new = generate_bshd_tensor(BATCH, NEW_SEQLEN, HK, D_HEAD, dtype=torch.float16)
+        v_new = generate_bshd_tensor(BATCH, NEW_SEQLEN, HK, D_HEAD, dtype=torch.float16)
+        
+        # Note: flash_attn_with_kvcache doesn't support backward pass
+        flash_attn_with_kvcache_compiled = torch.compile(flash_attn_with_kvcache)
+        
+        # Test with new k,v (append to cache and do attention)
+        with torch.no_grad():
+            o = flash_attn_with_kvcache_compiled(
+                q, k_cache, v_cache,
+                k=k_new, v=v_new,
+                cache_seqlens=cache_seqlens,
+                causal=True
+            )
+            print(f"Output shape (with new kv): {o.shape}, dtype: {o.dtype}")
+        
+        print("✓ flash_attn_with_kvcache SUCCESS")
+         
+        print("\n\n✅ ALL TESTS PASSED! ✅")
+        
+    except Exception as e:
+        print(f"\n❌ ERROR: {str(e)}")
+        # ensure we sync even on error to get proper error message
+        torch.cuda.synchronize()
+        raise e
+    finally:
+        # final cleanup
+        torch.cuda.empty_cache()
+        clear_compile_cache()

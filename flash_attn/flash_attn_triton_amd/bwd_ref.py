@@ -1,8 +1,9 @@
 import torch
 import math
 from typing import Literal, Optional
-from .utils import DEBUG, compute_alibi_tensor_ref
+from .utils import compute_alibi_tensor_ref
 
+DEBUG = False
 DEBUG_CORE = False
 
 def attention_backward_core_ref_impl(
@@ -196,8 +197,8 @@ def attention_varlen_backward_pytorch_ref_impl(
     dq = torch.zeros_like(q)
     dk = torch.zeros_like(k)
     dv = torch.zeros_like(v)
-    # delta has the same shape as softmax_lse: [total_L_q, nheads_q]
-    delta = torch.zeros((total_L_q, nheads_q), dtype=torch.float32, device=o.device)
+    # delta has the same shape as softmax_lse
+    delta = torch.zeros_like(softmax_lse)
 
     for i in range(batch_size):
         # Get the start and end indices for the current sequence
@@ -212,7 +213,7 @@ def attention_varlen_backward_pytorch_ref_impl(
         v_i = v[start_k:end_k, :, :]      # [L_k_i, nheads_k, head_dim]
         do_i = do[start_q:end_q, :, :]    # [L_q_i, nheads_q, head_dim]
         o_i = o[start_q:end_q, :, :]      # [L_q_i, nheads_q, head_dim]
-        softmax_lse_i = softmax_lse[start_q:end_q, :] # [L_q_i, nheads_q]
+        softmax_lse_i = softmax_lse[:, start_q:end_q] # [nheads_q, L_q_i]
 
         if group_size != 1:
             # MQA or GQA case
@@ -220,7 +221,7 @@ def attention_varlen_backward_pytorch_ref_impl(
             q_i = q_i.view(q_i.shape[0], nheads_k, group_size, head_dim)
             do_i = do_i.view(do_i.shape[0], nheads_k, group_size, head_dim)
             o_i = o_i.view(o_i.shape[0], nheads_k, group_size, head_dim)
-            softmax_lse_i = softmax_lse_i.view(softmax_lse_i.shape[0], nheads_k, group_size)
+            softmax_lse_i = softmax_lse_i.view(nheads_k, group_size, softmax_lse_i.shape[1])
             # Expand k_i and v_i to match group_size
             k_i = k_i.unsqueeze(2).expand(-1, -1, group_size, -1)
             v_i = v_i.unsqueeze(2).expand(-1, -1, group_size, -1)
@@ -228,16 +229,17 @@ def attention_varlen_backward_pytorch_ref_impl(
             q_i = q_i.reshape(q_i.shape[0], nheads_k * group_size, head_dim)
             do_i = do_i.reshape(do_i.shape[0], nheads_k * group_size, head_dim)
             o_i = o_i.reshape(o_i.shape[0], nheads_k * group_size, head_dim)
-            softmax_lse_i = softmax_lse_i.reshape(softmax_lse_i.shape[0], nheads_k * group_size)
+            softmax_lse_i = softmax_lse_i.reshape(nheads_k * group_size, softmax_lse_i.shape[2])
             k_i = k_i.reshape(k_i.shape[0], nheads_k * group_size, head_dim)
             v_i = v_i.reshape(v_i.shape[0], nheads_k * group_size, head_dim)
+
         # Permute to [nheads_total, L, head_dim]
         q_i = q_i.permute(1, 0, 2)
         k_i = k_i.permute(1, 0, 2)
         v_i = v_i.permute(1, 0, 2)
         do_i = do_i.permute(1, 0, 2)
         o_i = o_i.permute(1, 0, 2)
-        softmax_lse_i = softmax_lse_i.transpose(0, 1)
+
         if alibi_slopes is not None:
             alibi_slopes_i = alibi_slopes[i]
         else:
@@ -264,7 +266,6 @@ def attention_varlen_backward_pytorch_ref_impl(
         dq_i = dq_i.permute(1, 0, 2)  # [L_q_i, nheads_total, head_dim]
         dk_i = dk_i.permute(1, 0, 2)  # [L_k_i, nheads_total, head_dim]
         dv_i = dv_i.permute(1, 0, 2)  # [L_k_i, nheads_total, head_dim]
-        delta_i = delta_i.transpose(1, 0)  # [L_q_i, nheads_total]
 
         if group_size != 1:
             # Reshape dq_i and delta_i back to original shape
@@ -286,7 +287,7 @@ def attention_varlen_backward_pytorch_ref_impl(
         dq[start_q:end_q, :, :] = dq_i
         dk[start_k:end_k, :, :] += dk_i  # Accumulate gradients for shared keys
         dv[start_k:end_k, :, :] += dv_i  # Accumulate gradients for shared values
-        delta[start_q:end_q, :] = delta_i
+        delta[:, start_q:end_q] = delta_i
 
     return dq, dk, dv, delta
 

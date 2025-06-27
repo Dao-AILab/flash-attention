@@ -60,4 +60,6 @@ jobs:
 
       - name: AMD Bench
         run: |
-          python flash_attn/flash_attn_triton_amd/bench.py -benchmark_fn flash_attn_func flash_attn_varlen_func flash_attn_with_kvcache
+          python flash_attn/flash_attn_triton_amd/bench.py -benchmark_fn flash_attn_func
+          python flash_attn/flash_attn_triton_amd/bench.py -benchmark_fn flash_attn_varlen_func
+          python flash_attn/flash_attn_triton_amd/bench.py -benchmark_fn flash_attn_with_kvcache

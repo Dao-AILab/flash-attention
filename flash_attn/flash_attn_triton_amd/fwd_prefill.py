@@ -2,7 +2,9 @@ import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional, Union
-from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, compute_alibi_block, compute_fp8_scaling_factors, get_arch, get_shapes_from_layout, get_strides_from_layout, is_cdna, is_fp8, is_rdna, create_dropout_mask
+from .utils import DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, compute_alibi_block, compute_fp8_scaling_factors, get_arch, is_cdna, is_fp8, is_rdna, create_dropout_mask
+
+DEBUG = False
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
@@ -610,7 +612,7 @@ def attention_prefill_forward_triton_impl(
         stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = stride_descale_o_z = None
 
     # check flags
-    is_varlen = layout == "thd"
+    IS_VARLEN = layout == "thd"
     use_alibi, (stride_az, stride_ah) = (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
     is_inference = False if cache_seqlens is None else True
     if is_inference:
@@ -622,8 +624,36 @@ def attention_prefill_forward_triton_impl(
     if (bias is not None):
         assert (bias.numel() < 2**31)
 
-    batch, nheads_q, nheads_k, head_size, seqlen_q, seqlen_k = get_shapes_from_layout(q, k, layout, cu_seqlens_q, cu_seqlens_k, max_seqlens_q, max_seqlens_k)
-    q_strides, k_strides, v_strides, o_strides = get_strides_from_layout(q, k, v, o, layout)
+    # get shape and strides
+    if IS_VARLEN:  # thd layout
+        # shape
+        total_q, nheads_q, head_size = q.shape
+        _, nheads_k, _ = k.shape
+        batch = len(cu_seqlens_q) - 1
+
+        # softmax_lse is the log of the normalization constant / sum of expoential score(unnormalzied probablities)
+        softmax_lse = torch.zeros((nheads_q, total_q), device=q.device, dtype=torch.float32)
+
+        # strides
+        stride_qb, stride_qh, stride_qm, stride_qd = 0, q.stride(1), q.stride(0), q.stride(2)
+        stride_kb, stride_kh, stride_kn, stride_kd = 0, k.stride(1), k.stride(0), k.stride(2)
+        stride_vb, stride_vh, stride_vn, stride_vd = 0, v.stride(1), v.stride(0), v.stride(2)
+        stride_ob, stride_oh, stride_om, stride_od = 0, o.stride(1), o.stride(0), o.stride(2)
+        stride_lse_z, stride_lse_h, stride_lse_m = 0, softmax_lse.stride(0), softmax_lse.stride(1)
+    else:  # bshd layout
+        # shape
+        batch, seqlen_q, nheads_q, head_size = q.shape
+        _, _, nheads_k, _ = k.shape
+
+        # softmax_lse is the log of the normalization constant / sum of expoential score(unnormalzied probablities)
+        softmax_lse = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
+
+        # strides
+        stride_qb, stride_qh, stride_qm, stride_qd = q.stride(0), q.stride(2), q.stride(1), q.stride(3)
+        stride_kb, stride_kh, stride_kn, stride_kd = k.stride(0), k.stride(2), k.stride(1), k.stride(3)
+        stride_vb, stride_vh, stride_vn, stride_vd = v.stride(0), v.stride(2), v.stride(1), v.stride(3)
+        stride_ob, stride_oh, stride_om, stride_od = o.stride(0), o.stride(2), o.stride(1), o.stride(3)
+        stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
 
     # Get closest power of 2 over or equal to 32.
     padded_d_model = 1 << (head_size - 1).bit_length()
@@ -650,35 +680,34 @@ def attention_prefill_forward_triton_impl(
         else:
             dropout_mask = torch.zeros((batch, nheads_q, max_seqlens_q, max_seqlens_k), device=q.device,
                                         dtype=torch.float32)
-        scores_strides = (sd_mask.stride(0), sd_mask.stride(1), sd_mask.stride(2), sd_mask.stride(3))
+        stride_sz, stride_sh, stride_sm, stride_sn = (sd_mask.stride(0), sd_mask.stride(1), sd_mask.stride(2), sd_mask.stride(3))
     else:
         sd_mask = None
         dropout_mask = None
-        scores_strides = (0, 0, 0, 0)
+        stride_sz, stride_sh, stride_sm, stride_sn = (0, 0, 0, 0)
 
-    # stores LSE the log of the normalization constant / sum of expoential score(unnormalzied probablities)
-    if is_varlen:
-        total_seqlen_q, _, _ = q.shape
-        softmax_lse = torch.zeros((nheads_q, total_seqlen_q), device=q.device, dtype=torch.float32)
-        stride_lse_h, stride_lse_m = softmax_lse.stride()
-        stride_lse_z = 0
-    else:
-        softmax_lse = torch.zeros((batch, nheads_q, max_seqlens_q), device=q.device, dtype=torch.float32)
-        stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
 
     if bias is not None:
-        bias_strides = (bias.stride(0), bias.stride(1),bias.stride(2),
+        stride_bz, stride_bh, stride_bm, stride_bn = (bias.stride(0), bias.stride(1),bias.stride(2),
                         bias.stride(3))
     else:
-        bias_strides = (0, 0, 0, 0)
+        stride_bz, stride_bh, stride_bm, stride_bn = (0, 0, 0, 0)
 
     attn_fwd[grid](q, k, v, bias, cache_seqlens, cache_batch_idx,
                     descale_q, descale_k, descale_v, descale_o, stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_o_z,
-                    sm_scale, softmax_lse, o, *q_strides, *k_strides, *v_strides, *o_strides,
-                    *bias_strides, stride_az, stride_ah, *scores_strides, stride_lse_z, stride_lse_h, stride_lse_m, cu_seqlens_q, cu_seqlens_k,
+                    sm_scale, softmax_lse, o, 
+                    stride_qb, stride_qh, stride_qm, stride_qd, 
+                    stride_kb, stride_kh, stride_kn, stride_kd,
+                    stride_vb, stride_vh, stride_vn, stride_vd,
+                    stride_ob, stride_oh, stride_om, stride_od,
+                    stride_bz, stride_bh, stride_bm, stride_bn, 
+                    stride_az, stride_ah, 
+                    stride_sz, stride_sh, stride_sm, stride_sn, 
+                    stride_lse_z, stride_lse_h, stride_lse_m, 
+                    cu_seqlens_q, cu_seqlens_k,
                     dropout_p=dropout_p, philox_seed=philox_seed, philox_offset_base=philox_offset, sd_mask=sd_mask, dropout_mask=dropout_mask, alibi_slopes=alibi_slopes, 
                     HQ=nheads_q, HK=nheads_k, ACTUAL_BLOCK_DMODEL=head_size, MAX_SEQLENS_Q=max_seqlens_q,
-                    MAX_SEQLENS_K=max_seqlens_k, IS_CAUSAL=causal, IS_VARLEN=is_varlen, IS_INFERENCE=is_inference,
+                    MAX_SEQLENS_K=max_seqlens_k, IS_CAUSAL=causal, IS_VARLEN=IS_VARLEN, IS_INFERENCE=is_inference,
                     BLOCK_DMODEL=padded_d_model, USE_BIAS=False if bias is None else True,
                     USE_ALIBI=use_alibi, ENABLE_DROPOUT=dropout_p
                     > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_softmax, IS_FP8=IS_FP8, FP8_MAX=FP8_MAX, FP8_OUTPUT=FP8_OUTPUT, FLIP_GRID=FLIP_GRID)

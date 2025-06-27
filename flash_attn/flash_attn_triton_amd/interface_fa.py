@@ -1,21 +1,20 @@
 import torch
 import os
 from .fwd_prefill import attention_prefill_forward_triton_impl
-from .bwd_prefill import attention_prefill_backward_triton_impl
 from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
-from .bwd_prefill_fused import _flash_attn_backward as attention_prefill_backward_triton_fused_impl
-from .bwd_prefill_onekernel import attention_prefill_backward_triton_split_oneKernel_impl
+from .bwd_prefill_fused_atomics import attention_prefill_backward_triton_fused_atomics_impl
+from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_split_fused_no_atomics_impl
 from .fwd_decode import attention_decode_forward_triton_impl
 from .fwd_ref import attention_forward_pytorch_ref_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
-from .utils import DEBUG, USE_REF, MetaData, get_shapes_from_layout, is_fp8
+from .utils import DEBUG, USE_REF, MetaData, is_fp8
 from einops import rearrange, repeat
 from flash_attn.layers.rotary import apply_rotary_emb
 from typing import Literal, Optional, Union
 
 
 USE_EXP2 = True
-BWD_MODE = os.environ.get('BWD_MODE', 'jingning').lower()
+BWD_MODE = os.environ.get('BWD_MODE', 'fused_no_atomics').lower()
 
 def fwd(q: torch.Tensor,
         k: torch.Tensor,
@@ -67,8 +66,6 @@ def fwd(q: torch.Tensor,
     metadata.max_seqlens_q = q.shape[1]
     metadata.max_seqlens_k = k.shape[1]
     metadata.layout = "bshd"
-    if return_softmax:
-        metadata.return_scores = True
 
     # get shape
     batch, _ , nheads_q, _= q.shape
@@ -137,7 +134,7 @@ def fwd(q: torch.Tensor,
                                                 metadata.dropout_p,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
-                                                metadata.return_scores,
+                                                metadata.return_softmax,
                                                 USE_EXP2,
                                                 descale_q,
                                                 descale_k,
@@ -153,6 +150,7 @@ def fwd(q: torch.Tensor,
             print("descale_o:", descale_o, descale_o.shape if descale_o is not None else None)
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
         print("sd_mask:", sd_mask, sd_mask.shape if sd_mask is not None else None )
+        print("rng_state:", rng_state)
 
     return out, softmax_lse, sd_mask, rng_state
 
@@ -302,8 +300,8 @@ def bwd(
                 descale_dv,
             )
             delta = delta_triton
-        elif BWD_MODE == "fused":
-            delta_triton = attention_prefill_backward_triton_fused_impl(
+        elif BWD_MODE == "fused_atomics":
+            delta_triton = attention_prefill_backward_triton_fused_atomics_impl(
                 dout,
                 q,
                 k,
@@ -330,8 +328,8 @@ def bwd(
                 True,
             )
             delta = delta_triton
-        elif BWD_MODE == "jingning":
-            delta_triton = attention_prefill_backward_triton_split_oneKernel_impl(
+        elif BWD_MODE == "fused_no_atomics":
+            delta_triton = attention_prefill_backward_triton_split_fused_no_atomics_impl(
                 dout,
                 q,
                 k,
@@ -436,8 +434,6 @@ def varlen_fwd(
 
     # Setup metadata
     metadata = MetaData(sm_scale=softmax_scale)
-    if return_softmax:
-        metadata.return_scores = True
     metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)  # set layout to "thd" and other metdata
     assert metadata.layout is not None
 
@@ -509,7 +505,7 @@ def varlen_fwd(
                                                             metadata.dropout_p,
                                                             metadata.philox_seed,
                                                             metadata.philox_offset,
-                                                            metadata.return_scores,
+                                                            metadata.return_softmax,
                                                             USE_EXP2,
                                                             descale_q,
                                                             descale_k,
@@ -677,8 +673,8 @@ def varlen_bwd(
                 descale_dv,
             )
             delta = delta_triton
-        elif BWD_MODE == "fused":
-            delta_triton = attention_prefill_backward_triton_fused_impl(
+        elif BWD_MODE == "fused_atomics":
+            delta_triton = attention_prefill_backward_triton_fused_atomics_impl(
                 dout,
                 q,
                 k,
@@ -705,8 +701,8 @@ def varlen_bwd(
                 True,
             )
             delta = delta_triton
-        elif BWD_MODE == "jingning":
-            delta_triton = attention_prefill_backward_triton_split_oneKernel_impl(
+        elif BWD_MODE == "fused_no_atomics":
+            delta_triton = attention_prefill_backward_triton_split_fused_no_atomics_impl(
                 dout,
                 q,
                 k,
@@ -900,7 +896,7 @@ def fwd_kvcache(
                                                 metadata.dropout_p,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
-                                                metadata.return_scores,
+                                                metadata.return_softmax,
                                                 USE_EXP2,
                                                 None,
                                                 None,
