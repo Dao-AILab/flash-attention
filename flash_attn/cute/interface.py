@@ -148,9 +148,8 @@ def _flash_attn_fwd(
             )
         else:
             fa_fwd = FlashAttentionForwardSm100(
-                cutlass.Float32,
-                cutlass.Float32,
-                (128, 128, head_dim),
+                head_dim,
+                head_dim_v,
                 is_causal=causal,
                 qhead_per_kvhead=qhead_per_kvhead,
                 is_persistent=True,

@@ -38,7 +38,7 @@ from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 # @pytest.mark.parametrize("d", [64, 128, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
-@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -79,7 +79,8 @@ def test_flash_attn_output(
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    dv_vals = [d]
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if not DISABLE_LOCAL else [0]
