@@ -91,8 +91,8 @@ class AttentionMask:
                 for i in range(cute.size(tScS_t2r.shape)):
                     # if tScS_t2r[i][1] >= seqlenk_col_limit:
                     #     acc_S[i] = -cutlass.Float32.inf
-                    # For some reason the 2 lines above generate really bad SASS, so we just call ptx directly
-                    acc_S[i] = utils.neg_inf_if_ge(acc_S[i], tScS_t2r[i][1], seqlenk_col_limit)
+                    # For some reason the 2 lines above generate really bad SASS
+                    acc_S[i] = -cutlass.Float32.inf if tScS_t2r[i][1] >= seqlenk_col_limit else acc_S[i]
         else:  # Causal
             assert self.qhead_per_kvhead_packgqa == 1, "PackGQA not supported for SM100 yet"
             causal_row_offset = 1 + self.seqlen_k - n_block * self.n_block_size - self.seqlen_q
@@ -105,5 +105,5 @@ class AttentionMask:
             for i in range(cute.size(tScS_t2r.shape)):
                 # if tScS_t2r[i][1] >= col_limit_right:
                 #    acc_S[i] = -cutlass.Float32.inf
-                # For some reason the 2 lines above generate really bad SASS, so we just call ptx directly
-                acc_S[i] = utils.neg_inf_if_ge(acc_S[i], tScS_t2r[i][1], col_limit_right)
+                # For some reason the 2 lines above generate really bad SASS
+                acc_S[i] = -cutlass.Float32.inf if tScS_t2r[i][1] >= col_limit_right else acc_S[i]

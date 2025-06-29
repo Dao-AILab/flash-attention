@@ -434,22 +434,3 @@ def noop_asm(val: cutlass.Int32, *, loc=None, ip=None) -> cute.Numeric:
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
-
-
-@dsl_user_op
-def neg_inf_if_ge(val: cutlass.Float32, idx: int, limit: cutlass.Int32, *, loc=None, ip=None) -> cutlass.Float32:
-    return cutlass.Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [cutlass.Float32(val).ir_value(loc=loc, ip=ip), cutlass.Int32(limit).ir_value(loc=loc, ip=ip)],
-            "{\n\t"
-            ".reg .pred p;\n\t"
-            f"setp.ge.s32 p, {idx}, $2;\n\t"
-            "selp.f32 $0, 0fFF800000, $1, p;"
-            "}\n",
-            "=f,f,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
