@@ -69,3 +69,41 @@ class AttentionMask:
                     # only consider the column index, so the row index sets to 0.
                     if t0ScS_mn[0, c][1] >= col_limit_right:
                         acc_S_mn[r, c] = -cutlass.Float32.inf
+
+    @cute.jit
+    def apply_mask_sm100(
+        self,
+        acc_S: cute.Tensor,
+        m_block: cutlass.Int32,
+        n_block: cutlass.Int32,
+        m_stage: cutlass.Int32,
+        thr_mma: cute.TiledMma,
+        thr_tmem_load: cute.TiledCopy,
+        mask_seqlen: cutlass.Constexpr,
+        mask_causal: cutlass.Constexpr,
+    ) -> None:
+        cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
+        tScS = thr_mma.partition_C(cS)
+        tScS_t2r = thr_tmem_load.partition_D(tScS)
+        seqlenk_col_limit = self.seqlen_k - n_block * self.n_block_size
+        if not mask_causal:
+            if mask_seqlen:
+                for i in range(cute.size(tScS_t2r.shape)):
+                    # if tScS_t2r[i][1] >= seqlenk_col_limit:
+                    #     acc_S[i] = -cutlass.Float32.inf
+                    # For some reason the 2 lines above generate really bad SASS, so we just call ptx directly
+                    acc_S[i] = utils.neg_inf_if_ge(acc_S[i], tScS_t2r[i][1], seqlenk_col_limit)
+        else:  # Causal
+            assert self.qhead_per_kvhead_packgqa == 1, "PackGQA not supported for SM100 yet"
+            causal_row_offset = 1 + self.seqlen_k - n_block * self.n_block_size - self.seqlen_q
+            row_idx = tScS_t2r[0][0] + (m_block * 2 + m_stage) * self.m_block_size
+            col_limit_right = row_idx + causal_row_offset
+            if cutlass.const_expr(mask_seqlen):
+                col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
+            # if cute.arch.thread_idx()[0] % 32 == 0:
+            #     cute.printf("tidx = %d, tidx tmem = %d, row_idx = %d, col_limit_right = %d, causal_row_offset = %d\n", cute.arch.thread_idx()[0], thr_tmem_load.thr_idx, row_idx, col_limit_right, causal_row_offset)
+            for i in range(cute.size(tScS_t2r.shape)):
+                # if tScS_t2r[i][1] >= col_limit_right:
+                #    acc_S[i] = -cutlass.Float32.inf
+                # For some reason the 2 lines above generate really bad SASS, so we just call ptx directly
+                acc_S[i] = utils.neg_inf_if_ge(acc_S[i], tScS_t2r[i][1], col_limit_right)

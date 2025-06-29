@@ -225,10 +225,12 @@ def fmax(a: float | Float32, b: float | Float32, c: float | Float32 | None = Non
 
 def fmax_reduce(
     x: cute.TensorSSA,
-    init_val: float | Float32 = -Float32.inf,
+    init_val: float | Float32 | None = None,
     arch: cutlass.Constexpr[int] = 80
 ) -> Float32:
     if cutlass.const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
+        if cutlass.const_expr(init_val is None):
+            init_val = -cutlass.Float32.inf
         return x.reduce(cute.ReductionOp.MAX, init_val, 0)
     else:
         # [2025-06-15] x.reduce only seems to use 50% 3-input max and 50% 2-input max
@@ -236,7 +238,7 @@ def fmax_reduce(
         res = cute.make_fragment(x.shape, Float32)
         res.store(x)
         local_max = [
-            fmax(init_val, res[0], res[1]),
+            fmax(init_val, res[0], res[1]) if cutlass.const_expr(init_val is not None) else fmax(res[0], res[1]),
             fmax(res[2], res[3]),
             fmax(res[4], res[5]),
             fmax(res[6], res[7]),
@@ -252,18 +254,20 @@ def fmax_reduce(
 
 def fadd_reduce(
     x: cute.TensorSSA,
-    init_val: float | Float32 = Float32.zero,
+    init_val: float | Float32 | None = None,
     arch: cutlass.Constexpr[int] = 80
 ) -> Float32:
     if cutlass.const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
+        if cutlass.const_expr(init_val is None):
+            init_val = Float32.zero
         return x.reduce(cute.ReductionOp.ADD, init_val, 0)
     else:
         res = cute.make_fragment(x.shape, Float32)
         res.store(x)
-        local_sum_0 = cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
+        local_sum_0 = cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1])) if cutlass.const_expr(init_val is not None) else (res[0], res[1])
         local_sum = [local_sum_0, (res[2], res[3]), (res[4], res[5]), (res[6], res[7])]
         for i in range(8, cute.size(x.shape), 8):
-            local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], (res[i], res[i + 1]))
+            local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], (res[i + 0], res[i + 1]))
             local_sum[1] = cute.arch.add_packed_f32x2(local_sum[1], (res[i + 2], res[i + 3]))
             local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], (res[i + 4], res[i + 5]))
             local_sum[3] = cute.arch.add_packed_f32x2(local_sum[3], (res[i + 6], res[i + 7]))
@@ -414,3 +418,38 @@ def shuffle_sync(
     for i in range(cute.size(val_i32)):
         val_i32[i] = cute.arch.shuffle_sync(val_i32[i], offset, mask_and_clamp=mask_and_clamp)
     return val[0]
+
+
+@dsl_user_op
+def noop_asm(val: cutlass.Int32, *, loc=None, ip=None) -> cute.Numeric:
+    assert val.width == 32, "noop_asm only supports 32-bit types"
+    return type(val)(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Int32(val).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def neg_inf_if_ge(val: cutlass.Float32, idx: int, limit: cutlass.Int32, *, loc=None, ip=None) -> cutlass.Float32:
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Float32(val).ir_value(loc=loc, ip=ip), cutlass.Int32(limit).ir_value(loc=loc, ip=ip)],
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            f"setp.ge.s32 p, {idx}, $2;\n\t"
+            "selp.f32 $0, 0fFF800000, $1, p;"
+            "}\n",
+            "=f,f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )

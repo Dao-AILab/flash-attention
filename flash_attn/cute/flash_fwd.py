@@ -829,8 +829,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             )
             # Currently we can't do loop with negative step
             # https://github.com/NVIDIA/cutlass/issues/2326
-            for n_tile in cutlass.range_dynamic(n_block_min_causal_local_mask, n_block_max - 1, unroll=1):
-                n_block = n_block_max - 2 - n_tile + n_block_min_causal_local_mask
+            for n_tile in cutlass.range_dynamic(n_block_max - 1 - n_block_min_causal_local_mask, unroll=1):
+                n_block = n_block_max - 2 - n_tile
                 compute_one_n_block(n_block, smem_pipe_read, smem_pipe_write, check_inf=True,
                                     mask_fn=partial(mask_fn, mask_seqlen=False))
                 smem_pipe_read = self.advance_pipeline(smem_pipe_read)
@@ -1371,7 +1371,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
     ):
-        warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx() % 4)
+        warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         m_block, head_idx, batch_idx = cute.arch.block_idx()
         seqlen = SeqlenInfoCls(batch_idx)
         if cutlass.const_expr(self.is_causal):  # Longest tile first
@@ -1570,8 +1570,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 seqlen, m_block, n_block_min
             )
             # Currently we can't do loop with negative step https://github.com/NVIDIA/cutlass/issues/2326
-            for n_tile in cutlass.range_dynamic(n_block_min_causal_local_mask, n_block_max - 1, unroll=1):
-                n_block = n_block_max - 2 - n_tile + n_block_min_causal_local_mask
+            for n_tile in cutlass.range_dynamic(n_block_max - 1 - n_block_min_causal_local_mask, unroll=1):
+                n_block = n_block_max - 2 - n_tile
                 consumer_state = mma_one_n_block(
                     n_block, consumer_state, tiled_mma_qk_copy, tiled_mma_pv_copy,
                     check_inf=True, mask_fn=partial(mask_fn, mask_seqlen=False)

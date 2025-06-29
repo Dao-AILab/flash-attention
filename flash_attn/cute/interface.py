@@ -24,6 +24,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from flash_attn.cute import utils
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90
+from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
@@ -58,6 +59,7 @@ def _flash_attn_fwd(
     m_block_size: int = 128,
     n_block_size: int = 128,
     num_threads: int = 384,
+    _compute_capability: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
@@ -119,27 +121,40 @@ def _flash_attn_fwd(
     max_seqlen_q = cutlass.Int32(max_seqlen_q) if max_seqlen_q is not None else None
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
+    compute_capability = torch.cuda.get_device_capability()[0] if _compute_capability is None else _compute_capability
+    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap != 0.0,
         cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
-        m_block_size, n_block_size, num_threads
+        m_block_size, n_block_size, num_threads,
+        compute_capability,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
-        # fa_fwd = FlashAttentionForwardSm80(
-        fa_fwd = FlashAttentionForwardSm90(
-            dtype,
-            head_dim,
-            head_dim_v,
-            qhead_per_kvhead,
-            is_causal=causal,
-            has_softcap=softcap != 0.0,
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
-            # num_stages=1,
-            num_stages=2,
-            num_threads=num_threads,
-            Q_in_regs=False,
-        )
+        if compute_capability == 9:
+            # fa_fwd = FlashAttentionForwardSm80(
+            fa_fwd = FlashAttentionForwardSm90(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead,
+                is_causal=causal,
+                has_softcap=softcap != 0.0,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
+                # num_stages=1,
+                num_stages=2,
+                num_threads=num_threads,
+                Q_in_regs=False,
+            )
+        else:
+            fa_fwd = FlashAttentionForwardSm100(
+                cutlass.Float32,
+                cutlass.Float32,
+                (128, 128, head_dim),
+                is_causal=causal,
+                qhead_per_kvhead=qhead_per_kvhead,
+                is_persistent=True,
+            )
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor,
