@@ -177,6 +177,12 @@ jobs:
           asset_name: ${{env.wheel_name}}
           asset_content_type: application/*
 
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.wheel_name }}
+          path: dist/${{ env.wheel_name }}
+
   publish_package:
     name: Publish package
     needs: [build_wheels]
@@ -198,6 +204,12 @@ jobs:
           # We don't want to download anything CUDA-related here
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: wheelhouse
+          merge-multiple: true
+
       - name: Build core package
         env:
           FLASH_ATTENTION_SKIP_CUDA_BUILD: "TRUE"
@@ -209,4 +221,4 @@ jobs:
           TWINE_USERNAME: "__token__"
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
-          python -m twine upload dist/*
+          python -m twine upload wheelhouse/*.whl dist/*
