@@ -1,7 +1,8 @@
-# Supported features, currently only tested for hdim 64 and 128.
+# Supported features:
 # - BF16 & FP16 dtype
 # - noncausal & causal attention
 # - MHA, GQA, MQA
+# - hdim 64, 96, 128.
 # Unsupported features that will be added later:
 # - varlen
 # - writing out lse
@@ -214,7 +215,7 @@ class FlashAttentionForwardSm100:
         self.is_causal = is_causal
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pack_gqa = False
-        self.s0_s1_barrier = head_dim == 64  # Does S1 need to wait for S0 to finish
+        self.s0_s1_barrier = self.head_dim_padded in [64, 96]  # Does S1 need to wait for S0 to finish
 
         self.softmax0_warp_ids = (0, 1, 2, 3)
         self.softmax1_warp_ids = (4, 5, 6, 7)
