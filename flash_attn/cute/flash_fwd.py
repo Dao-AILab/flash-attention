@@ -280,7 +280,6 @@ class FlashAttentionForwardBase:
         m_block: cutlass.Int32,
         head_idx: cutlass.Int32,
         batch_idx: cutlass.Int32,
-        is_varlen: cutlass.Constexpr[bool] = False,
     ):
         # store acc_O
         rO = cute.make_fragment_like(acc_O, self.dtype)
@@ -299,7 +298,7 @@ class FlashAttentionForwardBase:
 
         # Write LSE from rmem -> gmem
         if cutlass.const_expr(mLSE is not None):
-            if cutlass.const_expr(not is_varlen):
+            if cutlass.const_expr(not seqlen.has_cu_seqlens_q):
                 mLSE_cur = mLSE[None, head_idx, batch_idx]
             else:
                 mLSE_cur = cute.domain_offset((seqlen.offset_q,), mLSE[None, head_idx])
@@ -1061,7 +1060,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             for t in (mK, mV)
         ]
         LSE_layout_transpose = [2, 1, 0] if cutlass.const_expr(mCuSeqlensQ is None) else [1, 0]
-        mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
+        mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose)) if mLSE is not None else None
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_qk.size
         self.num_threads_per_warp_group = 128
@@ -1350,7 +1349,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 self.epilogue(
                     acc_O, softmax.row_sum, mO if not self.use_tma_O else mO_tma, mLSE, sO, seqlen,
                     gmem_tiled_copy_O, tma_atom_O, tiled_mma_pv, tidx, m_block, head_idx, batch_idx,
-                    is_varlen=cutlass.const_expr(mCuSeqlensQ is not None),
                 )
 
     @cute.jit
