@@ -5,8 +5,9 @@
 # - hdim 64, 96, 128.
 # Unsupported features that will be added later:
 # - varlen
+# - sliding window
 # - split-kv (optimizing for inference)
-# - testing more hdim (64, 256, etc)
+# - more hdim (192, 256)
 # Based on the cutlass example and cute-dsl example:
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py

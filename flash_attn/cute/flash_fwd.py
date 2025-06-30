@@ -321,7 +321,7 @@ class FlashAttentionForwardBase:
             else:
                 pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
 
-        if cutlass.const_expr(not is_varlen):
+        if cutlass.const_expr(not seqlen.has_cu_seqlens_q):
             mO_cur = mO[None, None, head_idx, batch_idx]
         else:
             mO_cur = cute.domain_offset((seqlen.offset_q, 0), mO[None, None, head_idx])
@@ -1071,7 +1071,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.num_mma_regs = 240
         self.num_producer_regs = 24
         self.use_scheduler_barrier = (self.num_mma_warp_groups >= 2 and self.head_dim_padded <= 128) if self.intra_wg_overlap else (self.num_mma_warp_groups == 2)
-        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and not self.pack_gqa
+        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None and not self.pack_gqa
         # TODO: rescale_O_before_gemm
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
@@ -1099,9 +1099,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             (self.n_block_size, self.head_dim_v_padded),
             1  # No mcast for now
         )
-        tma_atom_O, tma_tensor_O = cpasync.make_tma_tile_atom(
-            gmem_tiled_copy_O, mO, self.sO_layout, (self.m_block_size, self.head_dim_v_padded), # No mcast
-        )
+        if cutlass.const_expr(self.use_tma_O):
+            tma_atom_O, mO = cpasync.make_tma_tile_atom(
+                gmem_tiled_copy_O, mO, self.sO_layout, (self.m_block_size, self.head_dim_v_padded), # No mcast
+            )
+        else:
+            tma_atom_O = None
         if cutlass.const_expr(self.pack_gqa):
             shape_Q_packed = ((self.qhead_per_kvhead, mQ.shape[0]), mQ.shape[1], mK.shape[2], *mQ.shape[3:])
             stride_Q_packed = ((mQ.stride[2], mQ.stride[0]), mQ.stride[1], mQ.stride[2] * self.qhead_per_kvhead, *mQ.stride[3:])
@@ -1109,9 +1112,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             shape_O_packed = ((self.qhead_per_kvhead, mO.shape[0]), mK.shape[1], mK.shape[2], *mO.shape[3:])
             stride_O_packed = ((mO.stride[2], mO.stride[0]), mO.stride[1], mO.stride[2] * self.qhead_per_kvhead, *mO.stride[3:])
             mO = cute.make_tensor(mO.iterator, cute.make_layout(shape_O_packed, stride=stride_O_packed))
-            shape_LSE_packed = ((self.qhead_per_kvhead, mLSE.shape[0]), mK.shape[2], *mLSE.shape[2:])
-            stride_LSE_packed = ((mLSE.stride[1], mLSE.stride[0]), mLSE.stride[1] * self.qhead_per_kvhead, *mLSE.stride[2:])
-            mLSE = cute.make_tensor(mLSE.iterator, cute.make_layout(shape_LSE_packed, stride=stride_LSE_packed))
+            if cutlass.const_expr(mLSE is not None):
+                shape_LSE_packed = ((self.qhead_per_kvhead, mLSE.shape[0]), mK.shape[2], *mLSE.shape[2:])
+                stride_LSE_packed = ((mLSE.stride[1], mLSE.stride[0]), mLSE.stride[1] * self.qhead_per_kvhead, *mLSE.stride[2:])
+                mLSE = cute.make_tensor(mLSE.iterator, cute.make_layout(shape_LSE_packed, stride=stride_LSE_packed))
         # grid_dim: (m_block, num_head, batch_size)
         grid_dim = (
             cute.ceil_div(cute.size(mQ.shape[0]) if mCuSeqlensQ is None else max_seqlen_q, self.m_block_size),
@@ -1135,7 +1139,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tma_tensor_K,
             tma_tensor_V,
             mO,
-            tma_tensor_O,
             mLSE,
             mCuSeqlensQ,
             mCuSeqlensK,
@@ -1175,7 +1178,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mK: cute.Tensor,
         mV: cute.Tensor,
         mO: cute.Tensor,
-        mO_tma: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
@@ -1347,7 +1349,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # TODO: idk why not using sO_pi is faster
                 sO = cute.make_tensor(cute.recast_ptr(sO_pi.iterator, sO_layout.inner, dtype=sO_pi.element_type), sO_layout.outer)
                 self.epilogue(
-                    acc_O, softmax.row_sum, mO if not self.use_tma_O else mO_tma, mLSE, sO, seqlen,
+                    acc_O, softmax.row_sum, mO, mLSE, sO, seqlen,
                     gmem_tiled_copy_O, tma_atom_O, tiled_mma_pv, tidx, m_block, head_idx, batch_idx,
                 )
 
