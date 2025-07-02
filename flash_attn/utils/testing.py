@@ -158,7 +158,7 @@ def generate_qkv(
 def construct_local_mask(
     seqlen_q,
     seqlen_k,
-    window_size=(-1, -1),  # -1 means infinite window size
+    window_size=(None, None),
     sink_token_length=0,
     query_padding_mask=None,
     key_padding_mask=None,
@@ -181,7 +181,7 @@ def construct_local_mask(
         if query_padding_mask is None
         else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
     )
-    if window_size[0] < 0:
+    if window_size[0] is None:
         return col_idx > row_idx + sk - sq + window_size[1]
     else:
         sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
@@ -237,7 +237,7 @@ def attention_ref(
     causal=False,
     qv=None,
     q_descale=None, k_descale=None, v_descale=None,
-    window_size=(-1, -1),  # -1 means infinite window size
+    window_size=(None, None),
     attention_chunk=0,
     sink_token_length=0,
     softcap=0.0,
@@ -297,7 +297,7 @@ def attention_ref(
     if key_padding_mask is not None:
         scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
     local_mask = None
-    if window_size[0] >= 0 or window_size[1] >= 0:
+    if window_size[0] is not None or window_size[1] is not None:
         local_mask = construct_local_mask(
             seqlen_q,
             seqlen_k,

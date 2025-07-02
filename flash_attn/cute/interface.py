@@ -4,7 +4,6 @@
 # Lightly tested with headdim 128.
 # Features not supported yet:
 # - varlen
-# - sliding window
 # - split (i.e. FlashDecoding)
 # - tuned block sizes
 # - paged KV
@@ -52,7 +51,9 @@ def _flash_attn_fwd(
     max_seqlen_q: Optional[int] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
-    softcap: float = 0.0,
+    softcap: Optional[float] = None,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
     # m_block_size: int = 128,
     # n_block_size: int = 64,
     # num_threads: int = 128,
@@ -98,6 +99,8 @@ def _flash_attn_fwd(
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
+    if softcap == 0.0:
+        softcap = None
     qhead_per_kvhead = num_head // num_head_kv
 
     out_torch_dtype = q.dtype
@@ -120,13 +123,22 @@ def _flash_attn_fwd(
         for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
     ]
     max_seqlen_q = cutlass.Int32(max_seqlen_q) if max_seqlen_q is not None else None
+    if causal:
+        window_size_right = 0
+    local = window_size_left is not None or window_size_right is not None
+    if window_size_left is not None or window_size_right is not None:
+        if window_size_left is None and window_size_right == 0:
+            causal, local = True, False
+        else:
+            causal, local = False, True
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compute_capability = torch.cuda.get_device_capability()[0] if _compute_capability is None else _compute_capability
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
     compile_key = (
-        dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap != 0.0,
+        dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,
         lse is None, cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
+        window_size_left is not None, window_size_right is not None,
         m_block_size, n_block_size, num_threads,
         compute_capability,
     )
@@ -139,7 +151,7 @@ def _flash_attn_fwd(
                 head_dim_v,
                 qhead_per_kvhead,
                 is_causal=causal,
-                has_softcap=softcap != 0.0,
+                is_local=local,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
                 # num_stages=1,
@@ -152,19 +164,20 @@ def _flash_attn_fwd(
                 head_dim,
                 head_dim_v,
                 is_causal=causal,
+                is_local=local,
                 qhead_per_kvhead=qhead_per_kvhead,
                 is_persistent=True,
             )
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-            fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor,
+            fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
             cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
-            max_seqlen_q, softmax_scale, softcap, current_stream
+            max_seqlen_q, softcap, window_size_left, window_size_right,
         )
     _flash_attn_fwd.compile_cache[compile_key](
-        q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor,
+        q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
         cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
-        max_seqlen_q, softmax_scale, softcap, current_stream
+        max_seqlen_q, softcap, window_size_left, window_size_right,
     )
     return out, lse
 
@@ -367,6 +380,7 @@ class FlashAttnFunc(torch.autograd.Function):
         v: torch.Tensor,
         softmax_scale: Optional[float] = None,
         causal: bool = False,
+        window_size: Tuple[Optional[int], Optional[int]] = (None, None),
         softcap: float = 0.0,
     ):
         out, lse = _flash_attn_fwd(
@@ -375,11 +389,14 @@ class FlashAttnFunc(torch.autograd.Function):
             v,
             softmax_scale=softmax_scale,
             causal=causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
             softcap=softcap,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.window_size = window_size
         ctx.softcap = softcap
         return out, lse
 
@@ -397,7 +414,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.softcap,
         )
-        return dq, dk, dv, *((None,) * 3)
+        return dq, dk, dv, *((None,) * 4)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -415,6 +432,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         max_seqlen_q: Optional[int],
         softmax_scale: Optional[float] = None,
         causal: bool = False,
+        window_size: Tuple[Optional[int], Optional[int]] = (None, None),
         softcap: float = 0.0,
     ):
         out, lse = _flash_attn_fwd(
@@ -428,12 +446,15 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_q,
             softmax_scale=softmax_scale,
             causal=causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
             softcap=softcap,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.max_seqlen_q = max_seqlen_q
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.window_size = window_size
         ctx.softcap = softcap
         return out, lse
 
@@ -451,6 +472,7 @@ def flash_attn_func(
     v: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     softcap: float = 0.0,
 ):
     return FlashAttnFunc.apply(
@@ -459,6 +481,7 @@ def flash_attn_func(
         v,
         softmax_scale,
         causal,
+        window_size,
         softcap,
     )
 
@@ -474,6 +497,7 @@ def flash_attn_varlen_func(
     max_seqlen_q: Optional[int] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     softcap: float = 0.0,
 ):
     return FlashAttnVarlenFunc.apply(
@@ -487,5 +511,6 @@ def flash_attn_varlen_func(
         max_seqlen_q,
         softmax_scale,
         causal,
+        window_size,
         softcap,
     )
