@@ -12,7 +12,6 @@ import flash_attn.cute.utils as utils
 
 
 class Softmax:
-
     def __init__(
         self,
         scale_log2: Float32,
@@ -29,16 +28,12 @@ class Softmax:
         self.row_sum.fill(0.0)
 
     def _compute_row_max(
-        self,
-        acc_S_row: cute.TensorSSA,
-        init_val: float | Float32 = -Float32.inf
+        self, acc_S_row: cute.TensorSSA, init_val: float | Float32 = -Float32.inf
     ) -> Float32:
         return utils.fmax_reduce(acc_S_row, init_val, arch=self.arch)
 
     def _compute_row_sum(
-        self,
-        acc_S_row_exp: cute.TensorSSA,
-        init_val: float | Float32 = Float32.zero
+        self, acc_S_row_exp: cute.TensorSSA, init_val: float | Float32 = Float32.zero
     ) -> Float32:
         return utils.fadd_reduce(acc_S_row_exp, init_val, arch=self.arch)
 
@@ -81,7 +76,9 @@ class Softmax:
                 acc_S_row_exp = utils.exp2f(acc_S_row * self.scale_log2 - row_max_cur_scaled)
                 # row_scale[r] = utils.exp2f(row_max_prev * self.scale_log2 - row_max_cur_scaled)
                 row_scale[r] = utils.exp2f((row_max_prev - row_max_cur) * self.scale_log2)
-                acc_S_row_sum = self._compute_row_sum(acc_S_row_exp) + self.row_sum[r] * row_scale[r]
+                acc_S_row_sum = (
+                    self._compute_row_sum(acc_S_row_exp) + self.row_sum[r] * row_scale[r]
+                )
             self.row_max[r] = row_max_cur
             self.row_sum[r] = acc_S_row_sum
             acc_S_mn[r, None].store(acc_S_row_exp)
@@ -89,14 +86,15 @@ class Softmax:
 
     @cute.jit
     def finalize(self, final_scale: Float32 = 1.0) -> cute.Tensor:
-        """Finalize the online softmax by computing the scale and logsumexp.
-        """
+        """Finalize the online softmax by computing the scale and logsumexp."""
         # quad reduction for row_sum as we didn't do it during each iteration of online softmax
         self.row_sum.store(utils.warp_reduce(self.row_sum.load(), operator.add, width=4))
         row_scale = cute.make_fragment_like(self.row_max, Float32)
         for r in range(cute.size(self.row_sum)):
             # if row_sum is zero or nan, set acc_O_mn_row to 1.0
-            acc_O_mn_row_is_zero_or_nan = self.row_sum[r] == 0.0 or self.row_sum[r] != self.row_sum[r]
+            acc_O_mn_row_is_zero_or_nan = (
+                self.row_sum[r] == 0.0 or self.row_sum[r] != self.row_sum[r]
+            )
             row_scale[r] = (
                 cute.arch.rcp_approx(self.row_sum[r] if not acc_O_mn_row_is_zero_or_nan else 1.0)
             ) * final_scale
@@ -104,7 +102,8 @@ class Softmax:
             LN2 = math.log(2.0)
             self.row_sum[r] = (
                 (self.row_max[r] * self.scale_log2 + utils.log2f(row_sum_cur)) * LN2
-                if not acc_O_mn_row_is_zero_or_nan else -Float32.inf
+                if not acc_O_mn_row_is_zero_or_nan
+                else -Float32.inf
             )
         return row_scale
 
@@ -123,7 +122,6 @@ class Softmax:
 
 
 class SoftmaxSm100(Softmax):
-
     def __init__(self, scale_log2: Float32, rescale_threshold: cutlass.Constexpr[float] = 0.0):
         super().__init__(scale_log2, num_rows=1, arch=100)
         self.rescale_threshold = rescale_threshold
@@ -149,7 +147,9 @@ class SoftmaxSm100(Softmax):
         self.row_max[0] = row_max_new
         return row_max_safe, acc_scale
 
-    def update_row_sum(self, acc_S_row_exp: cute.TensorSSA, row_scale: Float32, is_first: int = False) -> None:
+    def update_row_sum(
+        self, acc_S_row_exp: cute.TensorSSA, row_scale: Float32, is_first: int = False
+    ) -> None:
         init_val = self.row_sum[0] * row_scale if cutlass.const_expr(not is_first) else None
         # self.row_sum[0] = self._compute_row_sum(acc_S_row_exp, init_val=self.row_sum[0] * row_scale)
         self.row_sum[0] = self._compute_row_sum(acc_S_row_exp, init_val=init_val)
@@ -181,7 +181,9 @@ class SoftmaxSm100(Softmax):
         frg_cnt = cute.size(acc_S_row) // frg_tile
         assert cute.size(acc_S_row) % frg_tile == 0
         acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
-        acc_S_row_converted_frg = cute.logical_divide(acc_S_row_converted, cute.make_layout(frg_tile))
+        acc_S_row_converted_frg = cute.logical_divide(
+            acc_S_row_converted, cute.make_layout(frg_tile)
+        )
         for j in range(frg_cnt):
             for k in range(0, cute.size(acc_S_row_frg, mode=[0]), 2):
                 # acc_S_row_frg[k, j] = utils.exp2f(acc_S_row_frg[k, j])
@@ -221,7 +223,9 @@ class SoftmaxSm100(Softmax):
         frg_cnt = cute.size(acc_S_row) // frg_tile
         assert cute.size(acc_S_row) % frg_tile == 0
         acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
-        acc_S_row_converted_frg = cute.logical_divide(acc_S_row_converted, cute.make_layout(frg_tile))
+        acc_S_row_converted_frg = cute.logical_divide(
+            acc_S_row_converted, cute.make_layout(frg_tile)
+        )
         for j in range(frg_cnt):
             for k in range(0, cute.size(acc_S_row_frg, mode=[0]), 2):
                 # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = (

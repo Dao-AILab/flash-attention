@@ -88,24 +88,20 @@ def make_pipeline_state(type: PipelineUserType, stages: int):
     elif type is PipelineUserType.Consumer:
         return PipelineStateSimple(stages, Int32(0))
     else:
-        assert (
-            False
-        ), "Error: invalid PipelineUserType specified for make_pipeline_state."
-
+        assert False, "Error: invalid PipelineUserType specified for make_pipeline_state."
 
 
 @dataclass(frozen=True)
 class PipelineTmaAsyncNoCluster(PipelineAsync):
-
     """
-        If size(ClusterShape) == 1, PipelineTmaAsync has all threads
-        signaling the barrier during consumer_release. This causes a perf regression in FA3
-        forward pass (especially hdim 128 causal). We instead implement a version of
-        PipelineTmaAsync where only 1 out of 128 threads signals the barrier.
+    If size(ClusterShape) == 1, PipelineTmaAsync has all threads
+    signaling the barrier during consumer_release. This causes a perf regression in FA3
+    forward pass (especially hdim 128 causal). We instead implement a version of
+    PipelineTmaAsync where only 1 out of 128 threads signals the barrier.
 
-        Assumptions:
-        (1) num_consumers % NumThreadsPerWarpGroup == 0
-        (2) all 128 threads in the warp group are sync'ed right before calling consumer_release
+    Assumptions:
+    (1) num_consumers % NumThreadsPerWarpGroup == 0
+    (2) all 128 threads in the warp group are sync'ed right before calling consumer_release
     """
 
     @staticmethod
@@ -152,9 +148,7 @@ class PipelineTmaAsyncNoCluster(PipelineAsync):
             dst_rank,
         )
 
-    def producer_acquire(
-        self, state: PipelineState, try_acquire_token: Optional[Boolean] = None
-    ):
+    def producer_acquire(self, state: PipelineState, try_acquire_token: Optional[Boolean] = None):
         """
         TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
         """

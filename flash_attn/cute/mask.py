@@ -150,7 +150,9 @@ class AttentionMask:
                 # if cute.arch.thread_idx()[0] % 32 == 0:
                 #     cute.printf("tidx = %d, tidx tmem = %d, row_idx = %d, col_limit_right = %d, causal_row_offset = %d\n", cute.arch.thread_idx()[0], thr_tmem_load.thr_idx, row_idx, col_limit_right, causal_row_offset)
                 for i in range(cute.size(tScS_t2r.shape)):
-                    acc_S[i] = -cutlass.Float32.inf if tScS_t2r[i][1] >= col_limit_right else acc_S[i]
+                    acc_S[i] = (
+                        -cutlass.Float32.inf if tScS_t2r[i][1] >= col_limit_right else acc_S[i]
+                    )
 
             else:
                 local_row_offset_right = (
@@ -175,4 +177,8 @@ class AttentionMask:
                 # if cute.arch.thread_idx()[0] == 0 or cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block = {}, row_idx = {}, causal_row_offset = {}, col_limit_right = {}, col_limit_left = {}", m_block, n_block, row_idx, causal_row_offset, col_limit_right, col_limit_left)
                 for i in range(cute.size(tScS_t2r.shape)):
                     col_idx = tScS_t2r[i][1]
-                    acc_S[i] = -cutlass.Float32.inf if col_idx >= col_limit_right or col_idx < col_limit_left else acc_S[i]
+                    acc_S[i] = (
+                        -cutlass.Float32.inf
+                        if col_idx >= col_limit_right or col_idx < col_limit_left
+                        else acc_S[i]
+                    )

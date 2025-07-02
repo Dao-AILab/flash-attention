@@ -13,36 +13,36 @@ import cutlass.cute as cute
 # ---------------------------------------------------------------------------
 
 
-class Major(IntEnum):     # matrix “layout” in the ISA docs
-    K  = 0
+class Major(IntEnum):  # matrix “layout” in the ISA docs
+    K = 0
     MN = 1
 
 
-class ScaleIn(IntEnum):   # negate flags
+class ScaleIn(IntEnum):  # negate flags
     One = 0
     Neg = 1
 
 
 class Saturate(IntEnum):
     False_ = 0
-    True_  = 1
+    True_ = 1
 
 
-class CFormat(IntEnum):   # 2-bit field (bits 4-5)
+class CFormat(IntEnum):  # 2-bit field (bits 4-5)
     F16 = 0
     F32 = 1
     S32 = 2
 
 
-class F16F32Format(IntEnum):      # 3-bit field (A/B element type)
-    F16  = 0
+class F16F32Format(IntEnum):  # 3-bit field (A/B element type)
+    F16 = 0
     BF16 = 1
     TF32 = 2
 
 
 class S8Format(IntEnum):
     UINT8 = 0
-    INT8  = 1
+    INT8 = 1
 
 
 class MXF8F6F4Format(IntEnum):
@@ -54,8 +54,8 @@ class MXF8F6F4Format(IntEnum):
 
 
 class MaxShift(IntEnum):
-    NoShift    = 0
-    MaxShift8  = 1
+    NoShift = 0
+    MaxShift8 = 1
     MaxShift16 = 2
     MaxShift32 = 3
 
@@ -63,6 +63,7 @@ class MaxShift(IntEnum):
 # ---------------------------------------------------------------------------
 # CUTLASS-type → encoding helpers
 # ---------------------------------------------------------------------------
+
 
 def to_UMMA_format(cutlass_type) -> int:
     """
@@ -106,18 +107,19 @@ def to_C_format(cutlass_type) -> int:
 # The constructor – accepts only CUTLASS scalar classes
 # ---------------------------------------------------------------------------
 
+
 def make_instr_desc(
-    a_type,                    # CUTLASS scalar class, e.g. cutlass.Int8
+    a_type,  # CUTLASS scalar class, e.g. cutlass.Int8
     b_type,
     c_type,
-    M: int,                    # 64, 128 or 256
-    N: int,                    # 8 … 256 (multiple of 8)
-    a_major:  Major,
-    b_major:  Major,
-    a_neg:    ScaleIn  = ScaleIn.One,
-    b_neg:    ScaleIn  = ScaleIn.One,
-    c_sat:    Saturate = Saturate.False_,
-    is_sparse: bool    = False,
+    M: int,  # 64, 128 or 256
+    N: int,  # 8 … 256 (multiple of 8)
+    a_major: Major,
+    b_major: Major,
+    a_neg: ScaleIn = ScaleIn.One,
+    b_neg: ScaleIn = ScaleIn.One,
+    c_sat: Saturate = Saturate.False_,
+    is_sparse: bool = False,
     max_shift: MaxShift = MaxShift.NoShift,
 ) -> int:
     """
@@ -170,26 +172,28 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
     )
 
 
-class LayoutType(IntEnum):         # occupies the top-3 bits [61:64)
-    SWIZZLE_NONE          = 0   # (a.k.a. “INTERLEAVE” in older docs)
-    SWIZZLE_128B_BASE32B  = 1
-    SWIZZLE_128B          = 2
-    SWIZZLE_64B           = 4
-    SWIZZLE_32B           = 6
+class LayoutType(IntEnum):  # occupies the top-3 bits [61:64)
+    SWIZZLE_NONE = 0  # (a.k.a. “INTERLEAVE” in older docs)
+    SWIZZLE_128B_BASE32B = 1
+    SWIZZLE_128B = 2
+    SWIZZLE_64B = 4
+    SWIZZLE_32B = 6
     # values 3,5,7 are reserved / illegal for UMMA
+
 
 # ---------------------------------------------------------------------------
 #  Helpers – figure out the SWIZZLE_* family from the tensor layout
 # ---------------------------------------------------------------------------
 
+
 def _layout_type(swizzle: cute.Swizzle) -> LayoutType:
     # No idea what the right way to get B, M, S is – so we're just parsing it from the __str__
     # Swizzle string has the form "S<B,M,S>"
     swz_str = str(swizzle)
-    inside = swz_str[swz_str.index('<') + 1 : swz_str.index('>')]  # '3,4,3'
-    B, M, S = [int(x) for x in inside.split(',')]   # [3, 4, 3]
+    inside = swz_str[swz_str.index("<") + 1 : swz_str.index(">")]  # '3,4,3'
+    B, M, S = [int(x) for x in inside.split(",")]  # [3, 4, 3]
 
-    if M == 4:          # Swizzle<*,4,3>
+    if M == 4:  # Swizzle<*,4,3>
         if S != 3:
             raise ValueError("Unexpected swizzle shift – want S==3 for M==4")
         return {
@@ -197,8 +201,8 @@ def _layout_type(swizzle: cute.Swizzle) -> LayoutType:
             1: LayoutType.SWIZZLE_32B,
             2: LayoutType.SWIZZLE_64B,
             3: LayoutType.SWIZZLE_128B,
-        }[B]                          # KeyError ⇒ invalid B→ raise
-    if M == 5:          # Swizzle<2,5,2> (the only legal triple for M==5)
+        }[B]  # KeyError ⇒ invalid B→ raise
+    if M == 5:  # Swizzle<2,5,2> (the only legal triple for M==5)
         if (B, S) != (2, 2):
             raise ValueError("Only Swizzle<2,5,2> supported for 128B_BASE32B")
         return LayoutType.SWIZZLE_128B_BASE32B
@@ -214,11 +218,11 @@ def make_smem_desc_base(layout: cute.Layout, swizzle: cute.Swizzle, major: Major
     layout must correspond to layout of an uint128 tensor.
     """
     # ------------------------------------------------------------------ meta
-    layout_type = _layout_type(swizzle)           # resolve SWIZZLE_* family
+    layout_type = _layout_type(swizzle)  # resolve SWIZZLE_* family
 
-    VERSION      = 1               # bits 46–47
-    LBO_MODE     = 0               # bit  52
-    BASE_OFFSET  = 0               # bits 49–51   (CUTLASS always 0)
+    VERSION = 1  # bits 46–47
+    LBO_MODE = 0  # bit  52
+    BASE_OFFSET = 0  # bits 49–51   (CUTLASS always 0)
 
     # ---------------------------------------------------------- strides  (units: uint128_t = 16 B)
     swizzle_atom_mn_size = {
@@ -263,21 +267,21 @@ def make_smem_desc_base(layout: cute.Layout, swizzle: cute.Swizzle, major: Major
         stride_byte_offset, leading_byte_offset = stride_01, stride_10
 
     # ------------------------------------------------------------------ pack
-    desc  = 0
+    desc = 0
     # leading_byte_offset_  [16:30)
     desc |= (leading_byte_offset & 0x3FFF) << 16
     # stride_byte_offset_   [32:46)
-    desc |= (stride_byte_offset  & 0x3FFF) << 32
+    desc |= (stride_byte_offset & 0x3FFF) << 32
     # version_             [46:48)
-    desc |= (VERSION      & 0x3)    << 46
+    desc |= (VERSION & 0x3) << 46
     # base_offset_         [49:52)
-    desc |= (BASE_OFFSET  & 0x7)    << 49
+    desc |= (BASE_OFFSET & 0x7) << 49
     # lbo_mode_            [52:53)
-    desc |= (LBO_MODE     & 0x1)    << 52
+    desc |= (LBO_MODE & 0x1) << 52
     # layout_type_         [61:64)
-    desc |= (int(layout_type)      & 0x7)    << 61
+    desc |= (int(layout_type) & 0x7) << 61
 
-    return desc & 0xFFFF_FFFF_FFFF_FFFF   # force 64-bit width
+    return desc & 0xFFFF_FFFF_FFFF_FFFF  # force 64-bit width
 
 
 def make_smem_desc_start_addr(start_addr: cute.Pointer) -> cutlass.Int32:

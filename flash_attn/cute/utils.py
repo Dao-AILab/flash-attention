@@ -74,14 +74,19 @@ def mma_make_fragment_B(
         return thr_mma.make_fragment_B(thr_mma.partition_B(smem))
 
 
-def get_smem_store_atom(arch: cutlass.Constexpr[int], element_type: Type[cute.Numeric]) -> cute.CopyAtom:
+def get_smem_store_atom(
+    arch: cutlass.Constexpr[int], element_type: Type[cute.Numeric]
+) -> cute.CopyAtom:
     if arch < 90:
         return cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), element_type, num_bits_per_copy=2 * element_type.width,
+            cute.nvgpu.CopyUniversalOp(),
+            element_type,
+            num_bits_per_copy=2 * element_type.width,
         )
     else:
         return cute.make_copy_atom(
-            cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), element_type,
+            cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            element_type,
         )
 
 
@@ -94,7 +99,7 @@ def max_constexpr(
 def warp_reduce(
     val: cute.TensorSSA | cute.Numeric,
     op: Callable,
-    width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE
+    width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
 ) -> cute.TensorSSA | cute.Numeric:
     if isinstance(val, cute.TensorSSA):
         res = cute.make_fragment(val.shape, val.dtype)
@@ -117,12 +122,20 @@ def convert_layout_acc_mn(acc_layout: cute.Layout) -> cute.Layout:
     acc_layout_mn = cute.make_layout(
         (
             (acc_layout_col_major.shape[0][1], acc_layout_col_major.shape[1]),  # MMA_M
-            (acc_layout_col_major.shape[0][0], *acc_layout_col_major.shape[0][2:], acc_layout_col_major.shape[2]),  # MMA_N
+            (
+                acc_layout_col_major.shape[0][0],
+                *acc_layout_col_major.shape[0][2:],
+                acc_layout_col_major.shape[2],
+            ),  # MMA_N
             *acc_layout_col_major.shape[3:],
         ),
         stride=(
             (acc_layout_col_major.stride[0][1], acc_layout_col_major.stride[1]),  # MMA_M
-            (acc_layout_col_major.stride[0][0], *acc_layout_col_major.stride[0][2:], acc_layout_col_major.stride[2]),  # MMA_N
+            (
+                acc_layout_col_major.stride[0][0],
+                *acc_layout_col_major.stride[0][2:],
+                acc_layout_col_major.stride[2],
+            ),  # MMA_N
             *acc_layout_col_major.stride[3:],
         ),
     )
@@ -154,8 +167,7 @@ def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
 
 
 def transpose_view(a: cute.Tensor) -> cute.Tensor:
-    """Transpose the first two dimensions of a tensor on smem.
-    """
+    """Transpose the first two dimensions of a tensor on smem."""
     shape = (a.shape[1], a.shape[0], *a.shape[2:])
     order = (1, 0, *range(2, cute.rank(a)))
     return cute.composition(a, cute.make_ordered_layout(shape, order=order))
@@ -210,7 +222,9 @@ def log2f(a: float | Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def fmax(a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None) -> Float32:
+def fmax(
+    a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None
+) -> Float32:
     return Float32(
         nvvm.fmax(
             T.f32(),
@@ -224,9 +238,7 @@ def fmax(a: float | Float32, b: float | Float32, c: float | Float32 | None = Non
 
 
 def fmax_reduce(
-    x: cute.TensorSSA,
-    init_val: float | Float32 | None = None,
-    arch: cutlass.Constexpr[int] = 80
+    x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
 ) -> Float32:
     if cutlass.const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
         if cutlass.const_expr(init_val is None):
@@ -238,7 +250,9 @@ def fmax_reduce(
         res = cute.make_fragment(x.shape, Float32)
         res.store(x)
         local_max = [
-            fmax(init_val, res[0], res[1]) if cutlass.const_expr(init_val is not None) else fmax(res[0], res[1]),
+            fmax(init_val, res[0], res[1])
+            if cutlass.const_expr(init_val is not None)
+            else fmax(res[0], res[1]),
             fmax(res[2], res[3]),
             fmax(res[4], res[5]),
             fmax(res[6], res[7]),
@@ -253,9 +267,7 @@ def fmax_reduce(
 
 
 def fadd_reduce(
-    x: cute.TensorSSA,
-    init_val: float | Float32 | None = None,
-    arch: cutlass.Constexpr[int] = 80
+    x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
 ) -> Float32:
     if cutlass.const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
         if cutlass.const_expr(init_val is None):
@@ -264,7 +276,11 @@ def fadd_reduce(
     else:
         res = cute.make_fragment(x.shape, Float32)
         res.store(x)
-        local_sum_0 = cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1])) if cutlass.const_expr(init_val is not None) else (res[0], res[1])
+        local_sum_0 = (
+            cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
+            if cutlass.const_expr(init_val is not None)
+            else (res[0], res[1])
+        )
         local_sum = [local_sum_0, (res[2], res[3]), (res[4], res[5]), (res[6], res[7])]
         for i in range(8, cute.size(x.shape), 8):
             local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], (res[i + 0], res[i + 1]))
@@ -278,9 +294,7 @@ def fadd_reduce(
 
 
 @dsl_user_op
-def atomic_add_fp32(
-    a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None
-) -> None:
+def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
     # gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
     # # cache_hint = cutlass.Int64(0x12F0000000000000)
     # llvm.inline_asm(
@@ -297,10 +311,7 @@ def atomic_add_fp32(
     #     asm_dialect=llvm.AsmDialect.AD_ATT,
     # )
     nvvm.atomicrmw(
-        res=T.f32(),
-        op=nvvm.AtomicOpKind.FADD,
-        ptr=gmem_ptr.llvm_ptr,
-        a=Float32(a).ir_value()
+        res=T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value()
     )
 
 
@@ -325,11 +336,15 @@ def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
 
 
 @dsl_user_op
-def barrier_sync(barrier_id: int | cutlass.Int32, number_of_threads: int | cutlass.Int32,
-                 *, loc=None, ip=None) -> None:
+def barrier_sync(
+    barrier_id: int | cutlass.Int32, number_of_threads: int | cutlass.Int32, *, loc=None, ip=None
+) -> None:
     llvm.inline_asm(
         None,
-        [cutlass.Int32(barrier_id).ir_value(loc=loc, ip=ip), cutlass.Int32(number_of_threads).ir_value(loc=loc, ip=ip)],
+        [
+            cutlass.Int32(barrier_id).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(number_of_threads).ir_value(loc=loc, ip=ip),
+        ],
         "bar.sync $0, $1;",
         "r,r",
         has_side_effects=True,
@@ -339,15 +354,15 @@ def barrier_sync(barrier_id: int | cutlass.Int32, number_of_threads: int | cutla
 
 
 @dsl_user_op
-def barrier_arrive(barrier_id: int | cutlass.Int32, number_of_threads: int | cutlass.Int32, *, loc=None, ip=None) -> None:
+def barrier_arrive(
+    barrier_id: int | cutlass.Int32, number_of_threads: int | cutlass.Int32, *, loc=None, ip=None
+) -> None:
     """
     Arrive at a named barrier.
     """
     barrier_id = cutlass.Int32(barrier_id).ir_value(loc=loc, ip=ip)
     number_of_threads = cutlass.Int32(number_of_threads).ir_value(loc=loc, ip=ip)
-    nvvm.barrier_arrive(
-        barrier_id=barrier_id, number_of_threads=number_of_threads, loc=loc, ip=ip
-    )
+    nvvm.barrier_arrive(barrier_id=barrier_id, number_of_threads=number_of_threads, loc=loc, ip=ip)
     # llvm.inline_asm(
     #     None,
     #     [barrier_id, number_of_threads],
@@ -405,7 +420,7 @@ def shuffle_sync(
     width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
     *,
     loc=None,
-    ip=None
+    ip=None,
 ) -> cute.Numeric:
     assert value.width % 32 == 0, "value type must be a multiple of 32 bits"
     # 1 -> 0b11111, 2 -> 0b11110, 4 -> 0b11100, 8 -> 0b11000, 16 -> 0b10000, 32 -> 0b00000
