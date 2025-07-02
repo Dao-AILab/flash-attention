@@ -73,33 +73,52 @@ class FlashAttentionBackwardPreprocess:
         # Thread layouts for copies
         # We want kBlockKGmem to be a power of 2 so that when we do the summing,
         # it's just between threads in the same warp
-        gmem_k_block_size = 128 if self.head_dim_padded % 128 == 0 else (64 if self.head_dim_padded % 64 == 0 else (32 if self.head_dim_padded % 32 == 0 else 16))
+        gmem_k_block_size = (
+            128
+            if self.head_dim_padded % 128 == 0
+            else (
+                64
+                if self.head_dim_padded % 64 == 0
+                else (32 if self.head_dim_padded % 32 == 0 else 16)
+            )
+        )
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // self.dtype.width
         # atom_universal_copy: universal copy atom for O & dO load
         atom_universal_copy = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=universal_copy_bits,
+            cute.nvgpu.CopyUniversalOp(),
+            self.dtype,
+            num_bits_per_copy=universal_copy_bits,
         )
         # tOdO_layout: thread layout for O & dO load
         self.gmem_threads_per_row = gmem_k_block_size // async_copy_elems
         assert self.num_threads % self.gmem_threads_per_row == 0
         tOdO_layout = cute.make_ordered_layout(
-            (self.num_threads // self.gmem_threads_per_row, self.gmem_threads_per_row), order=(1, 0),
+            (self.num_threads // self.gmem_threads_per_row, self.gmem_threads_per_row),
+            order=(1, 0),
         )
         # Value layouts for copies
         vOdO_layout = cute.make_layout((1, async_copy_elems))
-        self.gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tOdO_layout, vOdO_layout)
-        self.gmem_tiled_copy_dO = cute.make_tiled_copy_tv(atom_universal_copy, tOdO_layout, vOdO_layout)
+        self.gmem_tiled_copy_O = cute.make_tiled_copy_tv(
+            atom_universal_copy, tOdO_layout, vOdO_layout
+        )
+        self.gmem_tiled_copy_dO = cute.make_tiled_copy_tv(
+            atom_universal_copy, tOdO_layout, vOdO_layout
+        )
 
         async_copy_elems_accum = universal_copy_bits // cutlass.Float32.width
         atom_universal_copy_accum = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=universal_copy_bits,
+            cute.nvgpu.CopyUniversalOp(),
+            cutlass.Float32,
+            num_bits_per_copy=universal_copy_bits,
         )
-        assert (self.m_block_size * self.head_dim_padded // async_copy_elems_accum) % self.num_threads == 0
+        assert (
+            self.m_block_size * self.head_dim_padded // async_copy_elems_accum
+        ) % self.num_threads == 0
         self.gmem_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
             atom_universal_copy_accum,
             cute.make_layout(self.num_threads),
-            cute.make_layout(async_copy_elems_accum)
+            cute.make_layout(async_copy_elems_accum),
         )
 
     @cute.jit
@@ -202,7 +221,9 @@ class FlashAttentionBackwardPreprocess:
         seqlen_q_rounded = cute.round_up(seqlen_q, self.m_block_size)
 
         if cutlass.const_expr(mLSE is not None):
-            gLSE = cute.local_tile(mLSE[batch_size, num_head, None], (self.m_block_size,), (m_block,))
+            gLSE = cute.local_tile(
+                mLSE[batch_size, num_head, None], (self.m_block_size,), (m_block,)
+            )
             lse = cutlass.Float32.inf
             if tidx < seqlen_q - m_block * self.m_block_size:
                 lse = gLSE[tidx]
@@ -229,15 +250,17 @@ class FlashAttentionBackwardPreprocess:
                     pred=tOpdO[None, m, None] if self.check_hdim_oob else None,
                 )
         # Sum across the "k" dimension
-        dpsum = (
-            tOrO.load().to(cutlass.Float32) * tOrdO.load().to(cutlass.Float32)
-        ).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1))
+        dpsum = (tOrO.load().to(cutlass.Float32) * tOrdO.load().to(cutlass.Float32)).reduce(
+            cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1)
+        )
         dpsum = utils.warp_reduce(dpsum, operator.add, width=self.gmem_threads_per_row)
         dP_sum = cute.make_fragment(cute.size(tOrO, mode=[1]), cutlass.Float32)
         dP_sum.store(dpsum)
 
         # Write dPsum from rmem -> gmem
-        gdPsum = cute.local_tile(mdPsum[batch_size, num_head, None], (self.m_block_size,), (m_block,))
+        gdPsum = cute.local_tile(
+            mdPsum[batch_size, num_head, None], (self.m_block_size,), (m_block,)
+        )
         # Only the thread corresponding to column 0 writes out the lse to gmem
         if tOcO[0, 0, 0][1] == 0:
             for m in cutlass.range_constexpr(cute.size(dP_sum)):
@@ -247,7 +270,9 @@ class FlashAttentionBackwardPreprocess:
         # Clear dQaccum
         if cutlass.const_expr(mdQaccum is not None):
             blkdQaccum_shape = (self.m_block_size * self.head_dim_padded,)
-            gdQaccum = cute.local_tile(mdQaccum[batch_size, num_head, None], blkdQaccum_shape, (m_block,))
+            gdQaccum = cute.local_tile(
+                mdQaccum[batch_size, num_head, None], blkdQaccum_shape, (m_block,)
+            )
             gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
             tQgQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)
             zero = cute.make_fragment_like(tQgQaccum)
@@ -255,7 +280,9 @@ class FlashAttentionBackwardPreprocess:
             cute.copy(gmem_tiled_copy_dQaccum, zero, tQgQaccum)
 
         if cutlass.const_expr(mLSE is not None):
-            gLSElog2 = cute.local_tile(mLSElog2[batch_size, num_head, None], (self.m_block_size,), (m_block,))
+            gLSElog2 = cute.local_tile(
+                mLSElog2[batch_size, num_head, None], (self.m_block_size,), (m_block,)
+            )
             LOG2_E = math.log2(math.e)
             if tidx < seqlen_q_rounded - m_block * self.m_block_size:
                 gLSElog2[tidx] = lse * LOG2_E if lse != -cutlass.Float32.inf else 0.0
