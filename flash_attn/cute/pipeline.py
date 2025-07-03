@@ -67,9 +67,6 @@ class PipelineStateSimple:
         #     [Int32],
         # )
 
-    def __get_mlir_types__(self):
-        return [self._phase_index.type]
-
     def __extract_mlir_values__(self):
         phase_index = self._phase_index
         return [phase_index.ir_value()]

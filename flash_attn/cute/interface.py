@@ -166,7 +166,7 @@ def _flash_attn_fwd(
                 is_causal=causal,
                 is_local=local,
                 qhead_per_kvhead=qhead_per_kvhead,
-                is_persistent=True,
+                is_persistent=not causal and not local and cu_seqlens_q is None and seqused_q is None,
             )
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(

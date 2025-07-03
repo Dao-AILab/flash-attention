@@ -28,7 +28,7 @@ from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local", [False, True])
-# @pytest.mark.parametrize("local", [True])
+# @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -238,10 +238,10 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-# @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
+# @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
 @pytest.mark.parametrize("add_unused_qkv", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -306,7 +306,7 @@ def test_flash_attn_varlen_output(
         else:
             qv_ref = None
         # Put window_size after QKV randn so that window_size changes from test to test
-        window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+        window_size = (None, None) if not local else torch.randint(0, seqlen_k, (2,))
         if dtype == torch.float8_e4m3fn:
             q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
         else:
@@ -423,7 +423,7 @@ def test_flash_attn_varlen_output(
                 # qv=qv_unpad,
                 # q_descale=q_descale,
                 # k_descale=k_descale, v_descale=v_descale,
-                # window_size=window_size,
+                window_size=window_size,
                 # attention_chunk=attention_chunk,
                 softcap=softcap,
             )

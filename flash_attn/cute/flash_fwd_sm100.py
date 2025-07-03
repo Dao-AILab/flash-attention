@@ -33,6 +33,7 @@ from flash_attn.cute.seqlen_info import SeqlenInfo
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
+from flash_attn.cute.tile_scheduler import TileSchedulerParams, SingleTileScheduler, StaticPersistentTileScheduler
 
 
 # class NamedBarrierFwd(enum.IntEnum):
@@ -43,143 +44,19 @@ from flash_attn.cute import blackwell_helpers as sm100_utils
 #     PFull = enum.auto()
 #     PEmpty = enum.auto()
 
-class FmhaStaticTileSchedulerParams:
-    def __init__(
-        self,
-        is_persistent: bool,
-        problem_shape_mbh: cute.Shape,
-        *,
-        loc=None,
-        ip=None,
-    ):
-        self.is_persistent = is_persistent
-        self.problem_shape_mbh = problem_shape_mbh
-        self._loc = loc
-        self._ip = ip
 
-    def __extract_mlir_values__(self):
-        values, self._values_pos = [], []
-        for obj in [self.is_persistent, self.problem_shape_mbh]:
-            obj_values = cutlass.extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        obj_list = []
-        for obj, n_items in zip(
-            [self.is_persistent, self.problem_shape_mbh], self._values_pos
-        ):
-            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
-            values = values[n_items:]
-        return FmhaStaticTileSchedulerParams(*(tuple(obj_list)), loc=self._loc)
+def get_tile_scheduler_cls(params: TileSchedulerParams) -> Callable:
+    """Returns the appropriate tile scheduler class based on the parameters."""
+    if cutlass.const_expr(params.is_persistent):
+        return StaticPersistentTileScheduler
+    else:
+        return SingleTileScheduler
 
 
-def create_fmha_static_tile_scheduler_params(
-    is_persistent: bool,
-    problem_shape_mbh: cute.Shape,
-) -> FmhaStaticTileSchedulerParams:
-    return FmhaStaticTileSchedulerParams(is_persistent, problem_shape_mbh)
-
-
-class FmhaStaticTileScheduler:
-
-    def __init__(
-        self,
-        params: FmhaStaticTileSchedulerParams,
-        current_work_linear_idx: cutlass.Int32,
-        blk_coord: cute.Coord,
-        grid_shape: cute.Shape,
-        *,
-        loc=None,
-        ip=None,
-    ):
-        self._params = params
-        self._blk_coord = blk_coord
-        self._grid_shape = grid_shape
-        self._is_persistent = params.is_persistent
-        self._current_work_linear_idx = current_work_linear_idx
-        self._problem_shape_mbh = cute.make_layout(
-            params.problem_shape_mbh, loc=loc, ip=ip
-        )
-        self._num_blocks = cute.size(self._problem_shape_mbh, loc=loc, ip=ip)
-        self._is_first_block = True
-        self.num_persistent_sm = cute.size(grid_shape, loc=loc, ip=ip)
-        self._loc = loc
-        self._ip = ip
-
-    # called by host
-    @staticmethod
-    def get_grid_shape(
-        params: FmhaStaticTileSchedulerParams,
-        *,
-        loc=None,
-        ip=None,
-    ) -> cute.Shape:
-        if params.is_persistent:
-            hardware_info = cutlass.utils.HardwareInfo()
-            sm_count = hardware_info.get_device_multiprocessor_count()
-            return (
-                cutlass.min(
-                    sm_count, cute.size(params.problem_shape_mbh, loc=loc, ip=ip)
-                ),
-                1,
-                1,
-            )
-        else:
-            return params.problem_shape_mbh
-
-    def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
-        is_valid = (
-            self._current_work_linear_idx < self._num_blocks
-            if self._is_persistent
-            else self._is_first_block
-        )
-
-        blk_coord = (0, 0, 0)
-        if self._is_persistent:
-            blk_coord = self._problem_shape_mbh.get_hier_coord(
-                self._current_work_linear_idx, loc=loc, ip=ip
-            )
-        else:
-            blk_coord = self._blk_coord
-
-        return cutlass.utils.WorkTileInfo(blk_coord, is_valid)
-
-    def initial_work_tile_info(self, *, loc=None, ip=None):
-        return self.get_current_work(loc=loc, ip=ip)
-
-    def advance_to_next_work(self, *, advance_count=1, loc=None, ip=None):
-        if self._is_persistent:
-            self._current_work_linear_idx += advance_count * self.num_persistent_sm
-        self._is_first_block = False
-
-    def __extract_mlir_values__(self):
-        values = cutlass.extract_mlir_values(self._params)
-        values.extend(cutlass.extract_mlir_values(self._current_work_linear_idx))
-        values.extend(cutlass.extract_mlir_values(self._blk_coord))
-        values.extend(cutlass.extract_mlir_values(self._grid_shape))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        assert len(values) == 10
-        new_params = cutlass.new_from_mlir_values(self._params, values[0:3])
-        new_current_work_linear_idx = cutlass.new_from_mlir_values(
-            self._current_work_linear_idx, [values[3]]
-        )
-        new_blk_coord = cutlass.new_from_mlir_values(self._blk_coord, values[4:7])
-        new_grid_shape = cutlass.new_from_mlir_values(self._grid_shape, values[7:])
-        return FmhaStaticTileScheduler(
-            new_params, new_current_work_linear_idx, new_blk_coord, new_grid_shape
-        )
-
-
-def create_fmha_static_tile_scheduler(
-    params: FmhaStaticTileSchedulerParams,
-    blk_coord: cute.Coord,
-    grid_shape: cute.Shape,
-) -> FmhaStaticTileScheduler:
-    return FmhaStaticTileScheduler(params, blk_coord[0], blk_coord, grid_shape)
+def create_tile_scheduler(
+    params: TileSchedulerParams,
+) -> SingleTileScheduler | StaticPersistentTileScheduler:
+    return get_tile_scheduler_cls(params).create(params)
 
 
 class FlashAttentionForwardSm100:
@@ -223,7 +100,6 @@ class FlashAttentionForwardSm100:
         self.is_local = is_local
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pack_gqa = False
-        self.use_tma_O = True
         self.s0_s1_barrier = self.head_dim_padded in [64, 96]  # Does S1 need to wait for S0 to finish
 
         self.softmax0_warp_ids = (0, 1, 2, 3)
@@ -232,7 +108,7 @@ class FlashAttentionForwardSm100:
         self.mma_warp_id = 12
         self.load_warp_id = 13
         self.epilogue_warp_ids = (14,)
-        self.empty_warp_id = 15
+        self.empty_warp_ids = (15,)
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -244,7 +120,7 @@ class FlashAttentionForwardSm100:
                 self.mma_warp_id,
                 self.load_warp_id,
                 *self.epilogue_warp_ids,
-                self.empty_warp_id,
+                *self.empty_warp_ids,
             )
         )
 
@@ -366,7 +242,7 @@ class FlashAttentionForwardSm100:
         if cutlass.const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
-        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None and not self.pack_gqa
+        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None and not self.pack_gqa and False
 
         cta_group = tcgen05.CtaGroup.ONE
         # the intermediate tensor p is from tmem & mK-major
@@ -398,19 +274,19 @@ class FlashAttentionForwardSm100:
 
         self.epi_tile = self.pv_mma_tiler[:2]
 
-        sQ_layout_staged = sm100_utils_basic.make_smem_layout_a(
+        sQ_layout = sm100_utils_basic.make_smem_layout_a(
             tiled_mma_qk, self.mma_tiler_qk, self.q_dtype, self.q_stage,
         )
-        sK_layout_staged = sm100_utils_basic.make_smem_layout_b(
+        sK_layout = sm100_utils_basic.make_smem_layout_b(
             tiled_mma_qk, self.mma_tiler_qk, self.k_dtype, self.kv_stage,
         )
-        tP_layout_staged = sm100_utils_basic.make_smem_layout_a(
+        tP_layout = sm100_utils_basic.make_smem_layout_a(
             tiled_mma_pv, self.pv_mma_tiler, self.q_dtype, self.acc_stage,
         )
-        sV_layout_staged = sm100_utils_basic.make_smem_layout_b(
+        sV_layout = sm100_utils_basic.make_smem_layout_b(
             tiled_mma_pv, self.pv_mma_tiler, self.v_dtype, self.kv_stage,
         )
-        sO_layout_staged = sm100_utils_basic.make_smem_layout_epi(
+        sO_layout = sm100_utils_basic.make_smem_layout_epi(
             self.o_dtype, self.o_layout, self.epi_tile, self.epi_stage,
         )
 
@@ -418,50 +294,46 @@ class FlashAttentionForwardSm100:
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
 
-        sQ_layout = cute.select(sQ_layout_staged, mode=[0, 1, 2])
         tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tma_tile_atom_A(
             tma_load_op,
             mQ,
-            sQ_layout,
+            cute.select(sQ_layout, mode=[0, 1, 2]),
             self.mma_tiler_qk,
             tiled_mma_qk,
             self.cluster_layout_vmnk.shape,
         )
 
         # TMA load for K
-        sK_layout = cute.select(sK_layout_staged, mode=[0, 1, 2])
         tma_atom_K, tma_tensor_K = cute.nvgpu.make_tma_tile_atom_B(
             tma_load_op,
             mK,
-            sK_layout,
+            cute.select(sK_layout, mode=[0, 1, 2]),
             self.mma_tiler_qk,
             tiled_mma_qk,
             self.cluster_layout_vmnk.shape,
         )
         # TMA load for V
-        sV_layout = cute.select(sV_layout_staged, mode=[0, 1, 2])
         tma_atom_V, tma_tensor_V = cute.nvgpu.make_tma_tile_atom_B(
             tma_load_op,
             mV,
-            sV_layout,
+            cute.select(sV_layout, mode=[0, 1, 2]),
             self.pv_mma_tiler,
             tiled_mma_pv,
             self.cluster_layout_vmnk.shape,
         )
 
-        o_cta_v_layout = cute.composition(
-            cute.make_identity_layout(mO.shape), self.epi_tile
-        )
-        sO_layout = cute.select(sO_layout_staged, mode=[0, 1])
+        o_cta_v_layout = cute.composition(cute.make_identity_layout(mO.shape), self.epi_tile)
 
         # print(sO_layout.outer)
-        self.epilogue_warp_ids = (14,) if self.use_tma_O else (14, 15)
+        if not self.use_tma_O:
+            self.epilogue_warp_ids = (14, 15)
+            self.empty_warp_ids = ()
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
         if cutlass.const_expr(self.use_tma_O):
             tma_atom_O, mO = cpasync.make_tma_tile_atom(
                 tma_store_op,
                 mO,
-                sO_layout,
+                cute.select(sO_layout, mode=[0, 1]),
                 o_cta_v_layout,
             )
             gmem_tiled_copy_O = None
@@ -481,8 +353,8 @@ class FlashAttentionForwardSm100:
             vO_layout = cute.make_layout((1, async_copy_elems))
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
-        self.tma_copy_q_bytes = cute.size_in_bytes(self.q_dtype, sQ_layout)
-        self.tma_copy_kv_bytes = cute.size_in_bytes(self.k_dtype, sK_layout)
+        self.tma_copy_q_bytes = cute.size_in_bytes(self.q_dtype, cute.select(sQ_layout, mode=[0, 1, 2]))
+        self.tma_copy_kv_bytes = cute.size_in_bytes(self.k_dtype, cute.select(sK_layout, mode=[0, 1, 2]))
 
         self.tile_sched_params, grid = self._compute_grid(mO, self.cta_tiler, self.is_persistent)
 
@@ -511,15 +383,15 @@ class FlashAttentionForwardSm100:
             # Smem tensors
             sScale: cute.struct.MemRange[cutlass.Float32, 2 * self.m_block_size * (1 if mLSE is None else 2)]
             sO: cute.struct.Align[
-                cute.struct.MemRange[self.o_dtype, cute.cosize(sO_layout_staged)],
+                cute.struct.MemRange[self.o_dtype, cute.cosize(sO_layout)],
                 self.buffer_align_bytes,
             ]
             sQ: cute.struct.Align[
-                cute.struct.MemRange[self.q_dtype, cute.cosize(sQ_layout_staged)],
+                cute.struct.MemRange[self.q_dtype, cute.cosize(sQ_layout)],
                 self.buffer_align_bytes,
             ]
             sK: cute.struct.Align[
-                cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout_staged)],
+                cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
                 self.buffer_align_bytes,
             ]
 
@@ -560,11 +432,11 @@ class FlashAttentionForwardSm100:
             softcap_val,
             window_size_left,
             window_size_right,
-            sQ_layout_staged,
-            sK_layout_staged,
-            tP_layout_staged,
-            sV_layout_staged,
-            sO_layout_staged,
+            sQ_layout,
+            sK_layout,
+            tP_layout,
+            sV_layout,
+            sO_layout,
             gmem_tiled_copy_O,
             tiled_mma_qk,
             tiled_mma_pv,
@@ -599,15 +471,15 @@ class FlashAttentionForwardSm100:
         softcap_val: Optional[cutlass.Float32],
         window_size_left: Optional[cutlass.Int32],
         window_size_right: Optional[cutlass.Int32],
-        sQ_layout_staged: cute.ComposedLayout,
-        sK_layout_staged: cute.ComposedLayout,
-        tP_layout_staged: cute.ComposedLayout,
-        sV_layout_staged: cute.ComposedLayout,
-        sO_layout_staged: cute.ComposedLayout,
+        sQ_layout: cute.ComposedLayout,
+        sK_layout: cute.ComposedLayout,
+        tP_layout: cute.ComposedLayout,
+        sV_layout: cute.ComposedLayout,
+        sO_layout: cute.ComposedLayout,
         gmem_tiled_copy_O: Optional[cute.TiledCopy],
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
-        tile_sched_params: FmhaStaticTileSchedulerParams,
+        tile_sched_params: TileSchedulerParams,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -667,7 +539,7 @@ class FlashAttentionForwardSm100:
                 cute.arch.WARP_SIZE
                 * len(
                     (
-                        self.empty_warp_id,
+                        *self.empty_warp_ids,
                         self.load_warp_id,
                         self.mma_warp_id,
                         *self.epilogue_warp_ids,
@@ -692,15 +564,15 @@ class FlashAttentionForwardSm100:
 
         #  Generate smem tensor Q/K/V/O
         # (MMA, MMA_Q, MMA_D, PIPE)
-        sQ = storage.sQ.get_tensor(sQ_layout_staged.outer, swizzle=sQ_layout_staged.inner)
-        # sQ_pi = storage.sQ.get_tensor(sQ_layout_staged)
+        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
+        # sQ_pi = storage.sQ.get_tensor(sQ_layout)
         # (MMA, MMA_K, MMA_D, PIPE)
-        sK = storage.sK.get_tensor(sK_layout_staged.outer, swizzle=sK_layout_staged.inner)
-        # sK_pi = storage.sK.get_tensor(sK_layout_staged)
+        sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
+        # sK_pi = storage.sK.get_tensor(sK_layout)
         # (MMA, MMA_K, MMA_D, PIPE)
         # Strip swizzle info to reuse smem
-        sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout_staged.inner), sV_layout_staged.outer)
-        sO = storage.sO.get_tensor(sO_layout_staged.outer, swizzle=sO_layout_staged.inner)
+        sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
+        sO = storage.sO.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
 
         sScale = storage.sScale.get_tensor(cute.make_layout(256))
 
@@ -723,7 +595,7 @@ class FlashAttentionForwardSm100:
         tOtO0 = cute.make_tensor(tOtO.iterator + self.tmem_o0_offset, tOtO.layout)
         tOtO1 = cute.make_tensor(tOtO.iterator + self.tmem_o1_offset, tOtO.layout)
 
-        tP = cute.make_tensor(tStS.iterator, tP_layout_staged.outer)
+        tP = cute.make_tensor(tStS.iterator, tP_layout.outer)
         tOrP = thr_mma_pv.make_fragment_A(tP)[None, None, None, 0]
 
         tOrP0 = cute.make_tensor(
@@ -762,9 +634,7 @@ class FlashAttentionForwardSm100:
             #  LOAD
             # ///////////////////////////////////////////////////////////////////////////////
             if warp_idx == self.load_warp_id:
-                tile_scheduler = create_fmha_static_tile_scheduler(
-                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-                )
+                tile_scheduler = create_tile_scheduler(tile_sched_params)
                 self.load(
                     tile_scheduler,
                     thr_mma_qk,
@@ -787,18 +657,14 @@ class FlashAttentionForwardSm100:
             #  MMA
             # ///////////////////////////////////////////////////////////////////////////////
             if warp_idx == self.mma_warp_id:
-            # if warp_idx == self.mma_warp_id or warp_idx == self.empty_warp_id:
+            # if warp_idx == self.mma_warp_id or warp_idx == self.empty_warp_ids:
                 # Alloc tmem buffer
                 tmem_alloc_cols = cutlass.Int32(self.tmem_alloc_cols)
                 if warp_idx == self.mma_warp_id:
                     cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf)
                     cute.arch.sync_warp()
-                # tile_scheduler = create_fmha_static_tile_scheduler(
-                #     tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-                # )
 
                 self.mma(
-                    # tile_scheduler,
                     tiled_mma_qk,
                     tiled_mma_pv,
                     sQ,
@@ -806,9 +672,9 @@ class FlashAttentionForwardSm100:
                     sV,
                     # sQ_pi.iterator,
                     # sK_pi.iterator,
-                    sQ_layout_staged.inner,
-                    sK_layout_staged.inner,
-                    sV_layout_staged.inner,
+                    sQ_layout.inner,
+                    sK_layout.inner,
+                    sV_layout.inner,
                     tStS0,
                     tStS1,
                     tOtO0,
@@ -838,9 +704,7 @@ class FlashAttentionForwardSm100:
             #  Epilogue
             # ///////////////////////////////////////////////////////////////////////////////
             if warp_idx >= self.epilogue_warp_ids[0] and warp_idx <= self.epilogue_warp_ids[-1]:
-                tile_scheduler = create_fmha_static_tile_scheduler(
-                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-                )
+                tile_scheduler = create_tile_scheduler(tile_sched_params)
                 self.epilogue_s2g(tile_scheduler, mO, sO, gmem_tiled_copy_O, tma_atom_O, mbar_ptr, SeqlenInfoCls)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -851,9 +715,7 @@ class FlashAttentionForwardSm100:
             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_max_reg_setting_offset, 0)
             cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
 
-            tile_scheduler = create_fmha_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
+            tile_scheduler = create_tile_scheduler(tile_sched_params)
             softmax_loop = partial(
                 self.softmax_loop,
                 softmax_scale_log2=softmax_scale_log2,
@@ -1000,6 +862,7 @@ class FlashAttentionForwardSm100:
                 kv_producer_state.advance()
                 load_V(n_block, kv_producer_state)  # Vi
                 kv_producer_state.advance()
+            tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
             # End of persistent scheduler loop
@@ -1025,7 +888,6 @@ class FlashAttentionForwardSm100:
         tOrP1: cute.Tensor,
         pipeline_kv: cutlass.utils.PipelineAsync,
         mbar_ptr: cute.Pointer,
-        # tile_scheduler,
         tile_sched_params,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
@@ -1071,9 +933,7 @@ class FlashAttentionForwardSm100:
         )
         P_full_O_rescaled_phase = cutlass.Int32(0)
 
-        tile_scheduler = create_fmha_static_tile_scheduler(
-            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-        )
+        tile_scheduler = create_tile_scheduler(tile_sched_params)
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
@@ -1480,7 +1340,6 @@ class FlashAttentionForwardSm100:
         tma_atom_O: cute.CopyAtom,
         mbar_ptr: cute.Pointer,
         softmax_scale_log2: cutlass.Float32,
-        # tile_scheduler,
         tile_sched_params,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
@@ -1513,9 +1372,7 @@ class FlashAttentionForwardSm100:
         o_corr_consumer_phase = cutlass.Int32(0)
         corr_epi_producer_phase = cutlass.Int32(1)
 
-        tile_scheduler = create_fmha_static_tile_scheduler(
-            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-        )
+        tile_scheduler = create_tile_scheduler(tile_sched_params)
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
@@ -1817,10 +1674,9 @@ class FlashAttentionForwardSm100:
                     cute.arch.cp_async_bulk_wait_group(1 - stage, read=True)
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_empty_offset + stage)
             else:
-                tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.epi_warp_ids))
+                tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.epilogue_warp_ids))
                 gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
                 tOsO = gmem_thr_copy_O.partition_S(sO)
-                tOrO = cute.make_fragment_like(tOsO, self.dtype)
                 cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_v_padded))
                 tOgO = gmem_thr_copy_O.partition_D(gO)
                 tOcO = gmem_thr_copy_O.partition_S(cO)
@@ -1832,15 +1688,15 @@ class FlashAttentionForwardSm100:
                     cute.arch.mbarrier_wait(mbar_ptr + self.mbar_corr_epi_full_offset + stage, epi_consumer_phase)
                     # 2. copy O0 / O1 to gmem
                     # load acc O from smem to rmem for wider vectorization
-                    # TODO: need stage
-                    cute.autovec_copy(tOsO, tOrO)
+                    tOrO = cute.make_fragment_like(tOsO[None, None, None, 0], self.o_dtype)
+                    cute.autovec_copy(tOsO[None, None, None, stage], tOrO)
                     # copy acc O from rmem to gmem
                     for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
-                        if t0OcO[0, rest_m, 0][0] < seqlen.seqlen_q - m_block * self.m_block_size - tOcO[0][0]:
+                        if t0OcO[0, rest_m, 0][0] < seqlen.seqlen_q - (m_block * 2 + stage) * self.m_block_size - tOcO[0][0]:
                             cute.copy(
                                 gmem_tiled_copy_O,
                                 tOrO[None, rest_m, None],
-                                tOgO[None, rest_m, None],
+                                tOgO[None, rest_m, None, 2 * m_block + stage],
                                 pred=tOpO[None, rest_m, None] if self.check_hdim_v_oob else None,
                             )
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_empty_offset + stage)
@@ -1906,15 +1762,13 @@ class FlashAttentionForwardSm100:
         mO: cute.Tensor,
         cta_tiler: Tuple[int, int, int],
         is_persistent: bool,
-    ) -> Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
+    ) -> Tuple[TileSchedulerParams, Tuple[int, int, int]]:
         o_shape = mO.shape
-        tile_sched_params = create_fmha_static_tile_scheduler_params(
+        tile_sched_params = TileSchedulerParams(
+            cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]),
+            cute.size(o_shape[2]),
+            cute.size(o_shape[3]),
             is_persistent,
-            (
-                cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]),
-                cute.size(o_shape[2]),
-                cute.size(o_shape[3]),
-            ),
         )
-        grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
+        grid = get_tile_scheduler_cls(tile_sched_params).get_grid_shape(tile_sched_params)
         return tile_sched_params, grid

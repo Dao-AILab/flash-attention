@@ -1283,9 +1283,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         else:
             sV = storage.sQ.get_tensor(sV_layout.outer, swizzle=sV_layout.inner, dtype=mV.element_type)
         if cutlass.const_expr(sP_layout is not None):
-            # sP_pi = storage.sP.get_tensor(sP_layout)
+            sP_pi = storage.sP.get_tensor(sP_layout)
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
-            sP_pi = cute.make_tensor(sP.iterator, sP_layout)
         else:
             sP, sP_pi = None
         # Transpose view of V to tensor with layout (head_dim_v, n_block_size) for tiled mma
