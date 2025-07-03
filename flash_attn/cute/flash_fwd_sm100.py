@@ -33,6 +33,7 @@ from flash_attn.cute.seqlen_info import SeqlenInfo
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
+from flash_attn.cute.fast_math import FastDivmod
 from flash_attn.cute.tile_scheduler import TileSchedulerParams, SingleTileScheduler, StaticPersistentTileScheduler
 
 
@@ -242,7 +243,7 @@ class FlashAttentionForwardSm100:
         if cutlass.const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
-        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None and not self.pack_gqa and False
+        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None and not self.pack_gqa
 
         cta_group = tcgen05.CtaGroup.ONE
         # the intermediate tensor p is from tmem & mK-major
@@ -1764,7 +1765,7 @@ class FlashAttentionForwardSm100:
         is_persistent: bool,
     ) -> Tuple[TileSchedulerParams, Tuple[int, int, int]]:
         o_shape = mO.shape
-        tile_sched_params = TileSchedulerParams(
+        tile_sched_params = TileSchedulerParams.create(
             cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]),
             cute.size(o_shape[2]),
             cute.size(o_shape[3]),
