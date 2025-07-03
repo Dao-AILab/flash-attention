@@ -34,7 +34,7 @@ from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
 from flash_attn.cute.fast_math import FastDivmod
-from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileScheduler, StaticPersistentTileScheduler, ParamsBase
+from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileScheduler, StaticPersistentTileScheduler, SingleTileLPTScheduler, ParamsBase
 
 
 # class NamedBarrierFwd(enum.IntEnum):
@@ -51,7 +51,8 @@ def get_tile_scheduler_cls(args: TileSchedulerArguments) -> Callable:
     if cutlass.const_expr(args.is_persistent):
         return StaticPersistentTileScheduler
     else:
-        return SingleTileScheduler
+        # return SingleTileScheduler
+        return SingleTileLPTScheduler
 
 
 class FlashAttentionForwardSm100:
@@ -1764,6 +1765,10 @@ class FlashAttentionForwardSm100:
             cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]),
             cute.size(o_shape[2]),
             cute.size(o_shape[3]),
+            cute.size(o_shape[0]), # TODO
+            o_shape[1],
+            o_shape[1],
+            2,  # TODO
             is_persistent,
         )
         tile_scheduler_cls = get_tile_scheduler_cls(tile_sched_args)
