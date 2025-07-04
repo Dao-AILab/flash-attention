@@ -1,7 +1,5 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# [2025-06-01] Initial version in Cute-DSL.
-# Only support basic forward and backward pass for FlashAttention, optimized for Ampere.
-# Lightly tested with headdim 128.
+# [2025-06-01] Version in Cute-DSL, for Hopper and Blackwell. You'd need to install nvidia-cutlass-dsl.
 # Features not supported yet:
 # - varlen
 # - split (i.e. FlashDecoding)
