@@ -233,7 +233,7 @@ class FlashAttentionBackwardPreprocess:
         assert cute.size(tOgO, mode=[0]) == cute.size(tOgdO, mode=[0])
         assert cute.size(tOgO, mode=[1]) == cute.size(tOgdO, mode=[1])
         assert cute.size(tOgO, mode=[2]) == cute.size(tOgdO, mode=[2])
-        for m in range(cute.size(tOrO.shape[1])):
+        for m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
             # Instead of using tOcO, we using t0OcO and subtract the offset from the limit
             # (seqlen_q - m_block * kBlockM). This is because the entries of t0OcO are known at compile time.
             if t0OcO[0, m, 0][0] < seqlen_q - m_block * self.m_block_size - tOcO[0][0]:
@@ -241,13 +241,13 @@ class FlashAttentionBackwardPreprocess:
                     gmem_thr_copy_O,
                     tOgO[None, m, None],
                     tOrO[None, m, None],
-                    pred=tOpO[None, m, None] if self.check_hdim_oob else None,
+                    pred=tOpO[None, m, None] if cutlass.const_expr(self.check_hdim_oob) else None,
                 )
                 cute.copy(
                     gmem_thr_copy_dO,
                     tOgdO[None, m, None],
                     tOrdO[None, m, None],
-                    pred=tOpdO[None, m, None] if self.check_hdim_oob else None,
+                    pred=tOpdO[None, m, None] if cutlass.const_expr(self.check_hdim_oob) else None,
                 )
         # Sum across the "k" dimension
         dpsum = (tOrO.load().to(cutlass.Float32) * tOrdO.load().to(cutlass.Float32)).reduce(

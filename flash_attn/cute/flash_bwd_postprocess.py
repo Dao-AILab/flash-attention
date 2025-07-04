@@ -154,7 +154,7 @@ class FlashAttentionBackwardPostprocess:
         num_mma_warps = self.num_threads // 32
         AtomLayoutdQ = (
             (self.AtomLayoutMdQ, num_mma_warps // self.AtomLayoutMdQ, 1)
-            if not self.dQ_swapAB
+            if cutlass.const_expr(not self.dQ_swapAB)
             else (num_mma_warps // self.AtomLayoutMdQ, self.AtomLayoutMdQ, 1)
         )
         tiled_mma = cute.make_tiled_mma(
@@ -253,7 +253,7 @@ class FlashAttentionBackwardPostprocess:
         # print(tiled_mma)
         acc_shape = tiled_mma.partition_shape_C(
             (self.m_block_size, self.head_dim_padded)
-            if not dQ_swapAB
+            if cutlass.const_expr(not dQ_swapAB)
             else (self.head_dim_padded, self.m_block_size)
         )
         acc = cute.make_fragment(acc_shape, cutlass.Float32)
@@ -265,7 +265,7 @@ class FlashAttentionBackwardPostprocess:
         # print(acc)
         # print(tdQsdQaccum)  # ((1, 1), 64)
         # print(tdQrdQaccum)  # ((1, 4), 4, 4)
-        for i in range(cute.size(tdQsdQaccum)):
+        for i in cutlass.range_constexpr(cute.size(tdQsdQaccum)):
             tdQrdQaccum[i] = tdQsdQaccum[i]
         # Convert tdQrdQaccum from fp32 to fp16/bf16
         rdQ = cute.make_fragment_like(acc, self.dtype)

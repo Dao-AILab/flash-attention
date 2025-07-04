@@ -63,7 +63,7 @@ class PackGQA:
         assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
         num_threads = gmem_tiled_copy.size
         tPrQPtr = self.compute_ptr(mQ[None, 0], tQcQ_row, tidx, block, threads_per_row, num_threads)
-        for m in range(cute.size(tQsQ.shape[1])):
+        for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
             q_ptr_i64 = utils.shuffle_sync(
                 tPrQPtr[m // threads_per_row], m % threads_per_row, width=threads_per_row
             )
@@ -77,13 +77,13 @@ class PackGQA:
                 mQ_cur = cute.make_tensor(q_gmem_ptr, (self.head_dim_padded,))
                 elems_per_load = cute.size(tQsQ.shape[0][0])
                 mQ_cur_copy = cute.tiled_divide(mQ_cur, (elems_per_load,))
-                for k in range(cute.size(tQsQ.shape[2])):
+                for k in cutlass.range_constexpr(cute.size(tQsQ.shape[2])):
                     ki = tQcQ[0, 0, k][1] // elems_per_load
                     cute.copy(
                         gmem_thr_copy,
                         mQ_cur_copy[None, ki],
                         tQsQ[None, m, k],
-                        pred=tQpQ[None, m, k] if self.check_hdim_oob else None,
+                        pred=tQpQ[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
                     )
             # We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
 
@@ -107,7 +107,7 @@ class PackGQA:
         assert cute.size(tLSErLSE) <= threads_per_row
         num_threads = tiled_mma.size
         tPrLSEPtr = self.compute_ptr(mLSE, taccOcO_row, tidx, block, threads_per_row, num_threads)
-        for m in range(cute.size(tLSErLSE)):
+        for m in cutlass.range_constexpr(cute.size(tLSErLSE)):
             lse_ptr_i64 = utils.shuffle_sync(
                 tPrLSEPtr[m // threads_per_row],
                 m % threads_per_row,
@@ -142,7 +142,7 @@ class PackGQA:
         assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
         num_threads = gmem_tiled_copy.size
         tPrOPtr = self.compute_ptr(mO[None, 0], tOcO_row, tidx, block, threads_per_row, num_threads)
-        for m in range(cute.size(tOrO.shape[1])):
+        for m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
             o_ptr_i64 = utils.shuffle_sync(
                 tPrOPtr[m // threads_per_row], m % threads_per_row, width=threads_per_row
             )
@@ -156,11 +156,11 @@ class PackGQA:
                 mO_cur = cute.make_tensor(o_gmem_ptr, (self.head_dim_padded,))
                 elems_per_load = cute.size(tOrO.shape[0][0])
                 mO_cur_copy = cute.tiled_divide(mO_cur, (elems_per_load,))
-                for k in range(cute.size(tOrO.shape[2])):
+                for k in cutlass.range_constexpr(cute.size(tOrO.shape[2])):
                     ki = tOcO[0, 0, k][1] // elems_per_load
                     cute.copy(
                         gmem_thr_copy,
                         tOrO[None, m, k],
                         mO_cur_copy[None, ki],
-                        pred=tOpO[None, m, k] if self.check_hdim_oob else None,
+                        pred=tOpO[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
                     )

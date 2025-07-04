@@ -42,7 +42,7 @@ class AttentionMask:
         if cutlass.const_expr(not mask_causal and not mask_local):
             if cutlass.const_expr(mask_seqlen):
                 # traverse column index.
-                for c in range(cute.size(tScS_mn.shape[1])):
+                for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                     if t0ScS_mn[0, c][1] >= seqlenk_col_limit:
                         acc_S_mn[None, c].fill(-cutlass.Float32.inf)
         else:  # Causal or local
@@ -61,7 +61,7 @@ class AttentionMask:
                 1 + self.seqlen_k - n_block * self.n_block_size - self.seqlen_q - thr_col_offset
             )
             if cutlass.const_expr(mask_causal):
-                for r in range(cute.size(tScS_mn.shape[0])):
+                for r in cutlass.range_constexpr(cute.size(tScS_mn.shape[0])):
                     # get the column index limit based on current row. Only consider the row index, so the column index sets to 0.
                     if cutlass.const_expr(self.qhead_per_kvhead_packgqa == 1):
                         row_idx = tScS_mn[r, 0][0] + m_block * self.m_block_size
@@ -73,22 +73,22 @@ class AttentionMask:
                     if cutlass.const_expr(mask_seqlen):
                         col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                     # traverse column index.
-                    for c in range(cute.size(tScS_mn.shape[1])):
+                    for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                         # only consider the column index, so the row index sets to 0.
                         if t0ScS_mn[0, c][1] >= col_limit_right:
                             acc_S_mn[r, c] = -cutlass.Float32.inf
             else:  # Local
                 local_row_offset_right = (
                     causal_row_offset + self.window_size_right
-                    if self.window_size_right is not None
+                    if cutlass.const_expr(self.window_size_right is not None)
                     else None
                 )
                 local_row_offset_left = (
                     causal_row_offset - 1 - self.window_size_left
-                    if self.window_size_left is not None
+                    if cutlass.const_expr(self.window_size_left is not None)
                     else None
                 )
-                for r in range(cute.size(tScS_mn.shape[0])):
+                for r in cutlass.range_constexpr(cute.size(tScS_mn.shape[0])):
                     if cutlass.const_expr(self.qhead_per_kvhead_packgqa == 1):
                         row_idx = tScS_mn[r, 0][0] + m_block * self.m_block_size
                     else:
@@ -102,11 +102,11 @@ class AttentionMask:
                     else:
                         col_limit_right = self.n_block_size
                     col_limit_left = (
-                        row_idx + local_row_offset_left if self.window_size_left is not None else 0
+                        row_idx + local_row_offset_left if cutlass.const_expr(self.window_size_left is not None) else 0
                     )
                     # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block = {}, r = {}, row_idx = {}, causal_row_offset = {}, col_limit_right = {}, col_limit_left = {}", n_block, r, row_idx, causal_row_offset, col_limit_right, col_limit_left)
                     # traverse column index.
-                    for c in range(cute.size(tScS_mn.shape[1])):
+                    for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                         col_idx = t0ScS_mn[0, c][1]
                         # only consider the column index, so the row index sets to 0.
                         if col_idx >= col_limit_right or col_idx < col_limit_left:
@@ -131,7 +131,7 @@ class AttentionMask:
         seqlenk_col_limit = self.seqlen_k - n_block * self.n_block_size
         if cutlass.const_expr(not mask_causal and not mask_local):
             if cutlass.const_expr(mask_seqlen):
-                for i in range(cute.size(tScS_t2r.shape)):
+                for i in cutlass.range_constexpr(cute.size(tScS_t2r.shape)):
                     # if tScS_t2r[i][1] >= seqlenk_col_limit:
                     #     acc_S[i] = -cutlass.Float32.inf
                     # For some reason the 2 lines above generate really bad SASS
@@ -149,7 +149,7 @@ class AttentionMask:
                     col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                 # if cute.arch.thread_idx()[0] % 32 == 0:
                 #     cute.printf("tidx = %d, tidx tmem = %d, row_idx = %d, col_limit_right = %d, causal_row_offset = %d\n", cute.arch.thread_idx()[0], thr_tmem_load.thr_idx, row_idx, col_limit_right, causal_row_offset)
-                for i in range(cute.size(tScS_t2r.shape)):
+                for i in cutlass.range_constexpr(cute.size(tScS_t2r.shape)):
                     acc_S[i] = (
                         -cutlass.Float32.inf if tScS_t2r[i][1] >= col_limit_right else acc_S[i]
                     )
@@ -157,12 +157,12 @@ class AttentionMask:
             else:
                 local_row_offset_right = (
                     causal_row_offset + self.window_size_right
-                    if self.window_size_right is not None
+                    if cutlass.const_expr(self.window_size_right is not None)
                     else None
                 )
                 local_row_offset_left = (
                     causal_row_offset - 1 - self.window_size_left
-                    if self.window_size_left is not None
+                    if cutlass.const_expr(self.window_size_left is not None)
                     else None
                 )
                 if cutlass.const_expr(self.window_size_right is not None):
@@ -172,10 +172,10 @@ class AttentionMask:
                 else:
                     col_limit_right = self.n_block_size
                 col_limit_left = (
-                    row_idx + local_row_offset_left if self.window_size_left is not None else 0
+                    row_idx + local_row_offset_left if cutlass.const_expr(self.window_size_left is not None) else 0
                 )
                 # if cute.arch.thread_idx()[0] == 0 or cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block = {}, row_idx = {}, causal_row_offset = {}, col_limit_right = {}, col_limit_left = {}", m_block, n_block, row_idx, causal_row_offset, col_limit_right, col_limit_left)
-                for i in range(cute.size(tScS_t2r.shape)):
+                for i in cutlass.range_constexpr(cute.size(tScS_t2r.shape)):
                     col_idx = tScS_t2r[i][1]
                     acc_S[i] = (
                         -cutlass.Float32.inf

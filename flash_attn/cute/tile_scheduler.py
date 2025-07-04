@@ -319,7 +319,6 @@ class SingleTileLPTScheduler:
             block, bidhb_residual = self.l2_minor_divmod.divmod(l2_mod)
         else:
             block, bidhb_residual = self.l2_minor_residual_divmod.divmod(l2_mod)
-        # TODO: should this be l2_minor or l2_minor_residual?
         bidhb_actual = bidhb * self.l2_minor_divmod.divisor + bidhb_residual
         batch_idx, head_idx = self.num_head_divmod.divmod(bidhb_actual)
         # Longest-processing-time-first

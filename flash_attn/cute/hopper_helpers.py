@@ -4,6 +4,7 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import warpgroup
 
 
+@cute.jit
 def gemm(
     tiled_mma: cute.TiledMma,
     acc: cute.Tensor,
@@ -14,7 +15,7 @@ def gemm(
     # A_in_regs: cutlass.Constexpr[bool] = False,
     swap_AB: cutlass.Constexpr[bool] = False,
 ) -> None:
-    if swap_AB:
+    if cutlass.const_expr(swap_AB):
         gemm(tiled_mma, acc, tCrB, tCrA, zero_init=zero_init, wg_wait=wg_wait, swap_AB=False)
     else:
         warpgroup.fence()
