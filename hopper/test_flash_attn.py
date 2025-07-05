@@ -57,8 +57,8 @@ COMPILED_HDIMS = (
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
-# @pytest.mark.parametrize("deterministic", [False, True])
-@pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("deterministic", [False, True])
+# @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 # @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
@@ -204,6 +204,7 @@ def test_flash_attn_output(
                 attention_chunk=attention_chunk,
                 softcap=softcap,
                 pack_gqa=pack_gqa,
+                deterministic=deterministic,
                 num_splits=num_splits
             )
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
@@ -223,6 +224,10 @@ def test_flash_attn_output(
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
+            and not (
+                deterministic == True
+                and (dv >= 256 or dv == 64)
+            )
         ):
             g = torch.randn_like(out)
             do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
@@ -288,8 +293,8 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
-# @pytest.mark.parametrize("deterministic", [False, True])
-@pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("deterministic", [False, True])
+# @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 # @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
@@ -476,6 +481,7 @@ def test_flash_attn_varlen_output(
                 k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
                 attention_chunk=attention_chunk,
+                deterministic=deterministic,
                 softcap=softcap,
             )
             out = output_pad_fn(out_unpad)
@@ -498,6 +504,10 @@ def test_flash_attn_varlen_output(
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
+            and not (
+                deterministic == True
+                and (dv >= 256 or local == True or seqused_k is None)
+            )
         ):
             g_unpad = torch.randn_like(out_unpad)
             do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
