@@ -1258,6 +1258,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     }
     // This is what we will template on
     bool const is_varlen = is_varlen_q || is_varlen_k || seqused_q_.has_value() || seqused_k_.has_value();
+    TORCH_CHECK(!(seqused_q_.has_value() && deterministic), "FlashAttention backward does not support 'seqused_q' parameter when deterministic is true.");
+
     #ifdef FLASHATTENTION_DISABLE_VARLEN
         TORCH_CHECK(!is_varlen, "This flash attention build does not support varlen.");
     #endif
@@ -1274,6 +1276,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     int const num_heads_k = k.size(-2);
     TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
     TORCH_CHECK(head_size_v % 8 == 0, "head_size_v should be a multiple of 8");
+    TORCH_CHECK((head_size_v < 256 && head_size < 256) || !deterministic, "FlashAttention backward only supports deterministic when head dimension less than 256");
     int const max_headdim = get_max_headdim();
     TORCH_CHECK(std::max(head_size, head_size_v) <= max_headdim, "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
@@ -1291,6 +1294,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     int const head_size_v_rounded = head_size_rounded;
     // Very important that these match the kernel configs
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    TORCH_CHECK(
+        !deterministic || !is_local || !cu_seqlens_q_.has_value() || torch::equal(cu_seqlens_q_.value(), cu_seqlens_k_.value()), 
+        "FlashAttention backward only supports deterministic when local is false"
+    );
     int const kBlockM_sm90 = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
         : (head_size_rounded <= 96 ? 64
            : (head_size_rounded <= 128 ? (is_causal || is_local || softcap > 0.0 ? 64 : 80)
