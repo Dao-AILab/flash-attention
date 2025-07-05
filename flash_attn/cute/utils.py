@@ -425,3 +425,18 @@ def noop_asm(val: cutlass.Int32, *, loc=None, ip=None) -> cute.Numeric:
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
+
+
+@cute.jit
+def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) -> cutlass.Int32:
+    if cutlass.const_expr(lane is None):
+        lane = cute.arch.lane_idx()
+    # if cute.arch.thread_idx()[0] >= 128 and cute.arch.thread_idx()[0] < 128 + 32 and cute.arch.block_idx()[0] == 0: cute.printf("tidx = %d, val = %d", cute.arch.thread_idx()[0] % 32, val)
+    for i in cutlass.range_constexpr(int(math.log2(cute.arch.WARP_SIZE))):
+        offset = 1 << i
+        # Very important that we set mask_and_clamp to 0
+        partial_sum = cute.arch.shuffle_sync_up(val, offset=offset, mask_and_clamp=0)
+        if lane >= offset:
+            val += partial_sum
+        # if cute.arch.thread_idx()[0] >= 128 and cute.arch.thread_idx()[0] < 128 + 32 and cute.arch.block_idx()[0] == 0: cute.printf("tidx = %d, partial_sum = %d, val = %d", cute.arch.thread_idx()[0] % 32, partial_sum, val)
+    return val

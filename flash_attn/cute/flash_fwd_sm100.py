@@ -35,7 +35,7 @@ from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
 from flash_attn.cute.fast_math import FastDivmod
-from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileScheduler, StaticPersistentTileScheduler, SingleTileLPTScheduler, ParamsBase
+from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileScheduler, StaticPersistentTileScheduler, SingleTileLPTScheduler, SingleTileVarlenScheduler, ParamsBase
 
 
 # class NamedBarrierFwd(enum.IntEnum):
@@ -45,15 +45,6 @@ from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileSch
 #     WarpSchedulerWG3 = enum.auto()
 #     PFull = enum.auto()
 #     PEmpty = enum.auto()
-
-
-def get_tile_scheduler_cls(args: TileSchedulerArguments) -> Callable:
-    """Returns the appropriate tile scheduler class based on the parameters."""
-    if const_expr(args.is_persistent):
-        return StaticPersistentTileScheduler
-    else:
-        # return SingleTileScheduler
-        return SingleTileLPTScheduler
 
 
 class FlashAttentionForwardSm100:
@@ -353,7 +344,31 @@ class FlashAttentionForwardSm100:
         self.tma_copy_q_bytes = cute.size_in_bytes(self.q_dtype, cute.select(sQ_layout, mode=[0, 1, 2]))
         self.tma_copy_kv_bytes = cute.size_in_bytes(self.k_dtype, cute.select(sK_layout, mode=[0, 1, 2]))
 
-        self.tile_scheduler_cls, self.tile_sched_params, grid = self._compute_grid(mO, self.cta_tiler, self.is_persistent)
+        if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
+            TileScheduler = SingleTileVarlenScheduler
+        else:
+            if const_expr(self.is_causal or self.is_local):
+                TileScheduler = SingleTileLPTScheduler
+            else:
+                TileScheduler = SingleTileScheduler if const_expr(not self.is_persistent) else StaticPersistentTileScheduler
+        tile_sched_args = TileSchedulerArguments(
+            cute.ceil_div(cute.size(mQ.shape[0]), self.cta_tiler[0]),
+            cute.size(mQ.shape[2]),
+            cute.size(mQ.shape[3]) if const_expr(mCuSeqlensQ is None) else cute.size(mCuSeqlensQ.shape[0] - 1),
+            cute.size(mK.shape[0]),
+            mQ.shape[1],
+            mV.shape[0],  # Note that this is different from Sm90 since we transpose mV in Sm100
+            total_q=cute.size(mQ.shape[0]) if const_expr(mCuSeqlensQ is not None) else cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
+            block_size=self.cta_tiler[0],
+            mCuSeqlensQ=mCuSeqlensQ,
+            mSeqUsedQ=mSeqUsedQ,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            element_size=self.k_dtype.width // 8,
+            is_persistent=self.is_persistent,
+        )
+        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        self.tile_scheduler_cls = TileScheduler
+        grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
         self.mbar_load_q_full_offset = 0
         self.mbar_load_q_empty_offset = self.mbar_load_q_full_offset + self.q_stage
@@ -437,9 +452,9 @@ class FlashAttentionForwardSm100:
             gmem_tiled_copy_O,
             tiled_mma_qk,
             tiled_mma_pv,
-            self.tile_sched_params,
+            tile_sched_params,
         ).launch(
-            grid=grid,
+            grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
             smem=self.shared_storage.size_in_bytes(),
@@ -1754,25 +1769,3 @@ class FlashAttentionForwardSm100:
     #     cute.arch.barrier_arrive(
     #         barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1) + next_wg, number_of_threads=2 * 128,
     #     )
-
-    @staticmethod
-    def _compute_grid(
-        mO: cute.Tensor,
-        cta_tiler: Tuple[int, int, int],
-        is_persistent: bool,
-    ) -> Tuple[TileSchedulerArguments, Tuple[int, int, int]]:
-        o_shape = mO.shape
-        tile_sched_args = TileSchedulerArguments(
-            cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]),
-            cute.size(o_shape[2]),
-            cute.size(o_shape[3]),
-            cute.size(o_shape[0]), # TODO
-            o_shape[1],
-            o_shape[1],
-            2,  # TODO
-            is_persistent,
-        )
-        tile_scheduler_cls = get_tile_scheduler_cls(tile_sched_args)
-        tile_sched_params = tile_scheduler_cls.to_underlying_arguments(tile_sched_args)
-        grid = tile_scheduler_cls.get_grid_shape(tile_sched_params)
-        return tile_scheduler_cls, tile_sched_params, grid

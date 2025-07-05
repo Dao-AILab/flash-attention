@@ -230,8 +230,8 @@ def test_flash_attn_output(
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
@@ -241,7 +241,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
 @pytest.mark.parametrize("add_unused_qkv", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -282,7 +282,7 @@ def test_flash_attn_varlen_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
-    batch_size = 9 if seqlen_q <= 2048 else 2
+    batch_size = 49 if seqlen_q <= 2048 else 2
     nheads = 6
     # batch_size = 1
     # nheads = 1

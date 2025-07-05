@@ -135,7 +135,7 @@ def _flash_attn_fwd(
 
     # if compute_capability == 9:  # TODO: tune block size according to hdim
     #     if not causal and not local:
-    #         n_block_size = 128
+    #         n_block_size = 176
 
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,

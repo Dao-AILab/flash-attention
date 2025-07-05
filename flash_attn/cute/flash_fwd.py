@@ -29,7 +29,7 @@ from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute import pipeline
 from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute.named_barrier import NamedBarrierFwd
-from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileScheduler, SingleTileLPTScheduler, ParamsBase
+from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileScheduler, SingleTileLPTScheduler, SingleTileVarlenScheduler, ParamsBase
 
 
 class FlashAttentionForwardBase:
@@ -303,7 +303,8 @@ class FlashAttentionForwardBase:
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mLSE_cur = mLSE[None, head_idx, batch_idx]
             else:
-                mLSE_cur = cute.domain_offset((seqlen.offset_q,), mLSE[None, head_idx])
+                offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
             if const_expr(not self.pack_gqa):
                 gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_block,))
                 gLSE_expanded_layout = cute.append(
@@ -326,7 +327,8 @@ class FlashAttentionForwardBase:
         if const_expr(not seqlen.has_cu_seqlens_q):
             mO_cur = mO[None, None, head_idx, batch_idx]
         else:
-            mO_cur = cute.domain_offset((seqlen.offset_q, 0), mO[None, None, head_idx])
+            offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+            mO_cur = cute.domain_offset((offset, 0), mO[None, None, head_idx])
         # thr_mma = tiled_mma.get_slice(tidx)
         # taccOgO = thr_mma.partition_C(gO)
         # cute.autovec_copy(rO, taccOgO)
@@ -1146,19 +1148,26 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 stride_LSE_packed = ((mLSE.stride[1], mLSE.stride[0]), mLSE.stride[1] * self.qhead_per_kvhead, *mLSE.stride[2:])
                 mLSE = cute.make_tensor(mLSE.iterator, cute.make_layout(shape_LSE_packed, stride=stride_LSE_packed))
 
-        TileScheduler = SingleTileScheduler if const_expr(not self.is_causal or self.is_local) else SingleTileLPTScheduler
+        if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
+            TileScheduler = SingleTileVarlenScheduler
+        else:
+            TileScheduler = SingleTileScheduler if const_expr(not self.is_causal or self.is_local) else SingleTileLPTScheduler
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), self.m_block_size),
             cute.size(mQ.shape[2]),
-            cute.size(mQ.shape[3]),
+            cute.size(mQ.shape[3]) if const_expr(mCuSeqlensQ is None) else cute.size(mCuSeqlensQ.shape[0] - 1),
             cute.size(mK.shape[0]),
             mQ.shape[1],
             mV.shape[1],
-            self.dtype.width // 8,
+            total_q=cute.size(mQ.shape[0]) if const_expr(mCuSeqlensQ is not None) else cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
+            block_size=self.m_block_size,
+            mCuSeqlensQ=mCuSeqlensQ,
+            mSeqUsedQ=mSeqUsedQ,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            element_size=self.dtype.width // 8,
             is_persistent=False,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
-        # TODO: deal with PackGQA and varlen
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
         # grid_dim = (
         #     cute.ceil_div(cute.size(mQ.shape[0]) if const_expr(mCuSeqlensQ is None) else max_seqlen_q, self.m_block_size),
@@ -1422,12 +1431,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tile_scheduler = TileSchedulerCls()
             work_tile = tile_scheduler.initial_work_tile_info()
             while work_tile.is_valid_tile:
+            # if work_tile.is_valid_tile:
                 m_block, head_idx, batch_idx = work_tile.tile_idx
                 seqlen = SeqlenInfoCls(batch_idx)
                 if const_expr(not seqlen.has_cu_seqlens_q):
                     mQ_cur = mQ[None, None, head_idx, batch_idx]
                 else:
-                    mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, head_idx])
+                    offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                    mQ_cur = cute.domain_offset((offset, 0), mQ[None, None, head_idx])
                 head_idx_kv = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
                 if const_expr(not seqlen.has_cu_seqlens_k):
                     mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
@@ -1522,8 +1533,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tSrK = tiled_mma_qk.make_fragment_B(wg_mma_qk.partition_B(sK))
         if const_expr(self.mma_pv_is_rs):
             acc_S_shape = tiled_mma_qk.partition_shape_C((self.m_block_size, self.n_block_size))
-            acc_S_layout = cute.make_layout(acc_S_shape)
-            tOrP = cute.make_fragment(utils.convert_layout_acc_frgA(acc_S_layout), self.dtype)
+            tOrP = cute.make_fragment(
+                utils.convert_layout_acc_frgA(cute.make_layout(acc_S_shape)), self.dtype
+            )
         else:
             tOrP = tiled_mma_pv.make_fragment_A(wg_mma_pv.partition_A(sP))
         tOrVt = tiled_mma_pv.make_fragment_B(wg_mma_pv.partition_B(sVt))
@@ -1564,6 +1576,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
+        # if work_tile.is_valid_tile:
             # Softcapping needs to happen before masking since if we apply after masking, softcapping can turn
             # -inf to e.g. -50.0, which can affect the attention softmax.
             def scoremod_premask_fn(acc_S):
@@ -1590,7 +1603,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(not seqlen.has_cu_seqlens_q):
                     mQ_cur = mQ[None, None, head_idx, batch_idx]
                 else:
-                    mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, head_idx])
+                    offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                    mQ_cur = cute.domain_offset((offset, 0), mQ[None, None, head_idx])
                 # gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
                 # gQ = cute.local_tile(mQ_cur, (self.m_block_size, self.head_dim_padded), (m_block, 0))
                 # self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q,
