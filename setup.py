@@ -69,7 +69,6 @@ SKIP_CK_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CK_BUILD", "TRUE") == "TRUE" if 
 def cuda_archs() -> str:
     return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;120").split(";")
 
-
 def get_platform():
     """
     Returns the platform name as used in wheel filenames.
@@ -290,8 +289,8 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                         # "--ptxas-options=-O2",
                         # "-lineinfo",
                         # "-DFLASHATTENTION_DISABLE_BACKWARD",
-                        # "-DFLASHATTENTION_DISABLE_DROPOUT",
-                        # "-DFLASHATTENTION_DISABLE_ALIBI",
+                        "-DFLASHATTENTION_DISABLE_DROPOUT",
+                        "-DFLASHATTENTION_DISABLE_ALIBI",
                         # "-DFLASHATTENTION_DISABLE_SOFTCAP",
                         # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
                         # "-DFLASHATTENTION_DISABLE_LOCAL",
