@@ -141,23 +141,43 @@ def make_acc_tensor_mn_view(acc: cute.Tensor) -> cute.Tensor:
     return cute.make_tensor(acc.iterator, convert_layout_acc_mn(acc.layout))
 
 
+@cute.jit
 def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
     # For back to back gemm, convert layout of acc0 to gemm 1 accept layout.
-    # Due to the mma instruction shape is 16x8x16, we need to convert from (4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
-    # (4, MMA_M, MMA_N) -> (4, MMA_M, (2, MMA_N / 2))
-    acc_layout_divided = cute.logical_divide(acc_layout, (None, None, 2))
-    rA_mma_view = cute.make_layout(
-        (
-            (acc_layout_divided.shape[0], acc_layout_divided.shape[2][0]),
-            acc_layout_divided.shape[1],
-            acc_layout_divided.shape[2][1],
-        ),
-        stride=(
-            (acc_layout_divided.stride[0], acc_layout_divided.stride[2][0]),
-            acc_layout_divided.stride[1],
-            acc_layout_divided.stride[2][1],
-        ),
-    )
+    # For Sm80, as the mma instruction shape is 16x8x16, we need to convert from (4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
+    # For Sm90, FP16/BF16, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((2, 2, 2), MMA_M, (N / 16, MMA_N))
+    # TODO: Sm90 FP8
+    if cutlass.const_expr(cute.rank(acc_layout.shape[0]) == 3):  # Sm90
+        l = cute.logical_divide(
+            acc_layout, ((None, None, 2), None, None)
+        )  # ((2, 2, (2, N / 16)), MMA_M, MMA_N)
+        rA_mma_view = cute.make_layout(
+            (
+                (l.shape[0][0], l.shape[0][1], l.shape[0][2][0]),
+                l.shape[1],
+                (l.shape[0][2][1], l.shape[2]),
+            ),
+            stride=(
+                (l.stride[0][0], l.stride[0][1], l.stride[0][2][0]),
+                l.stride[1],
+                (l.stride[0][2][1], l.stride[2]),
+            ),
+        )
+    else:  # Sm80
+        # (4, MMA_M, MMA_N) -> (4, MMA_M, (2, MMA_N / 2))
+        l = cute.logical_divide(acc_layout, (None, None, 2))
+        rA_mma_view = cute.make_layout(
+            (
+                (l.shape[0], l.shape[2][0]),
+                l.shape[1],
+                l.shape[2][1],
+            ),
+            stride=(
+                (l.stride[0], l.stride[2][0]),
+                l.stride[1],
+                l.stride[2][1],
+            ),
+        )
     return rA_mma_view
 
 

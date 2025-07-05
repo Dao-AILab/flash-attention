@@ -43,8 +43,11 @@ class AttentionMask:
             if cutlass.const_expr(mask_seqlen):
                 # traverse column index.
                 for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
-                    if t0ScS_mn[0, c][1] >= seqlenk_col_limit:
-                        acc_S_mn[None, c].fill(-cutlass.Float32.inf)
+                    # if t0ScS_mn[0, c][1] >= seqlenk_col_limit:
+                    #     acc_S_mn[None, c].fill(-cutlass.Float32.inf)
+                    oob = t0ScS_mn[0, c][1] >= seqlenk_col_limit
+                    for r in cutlass.range_constexpr(cute.size(tScS_mn.shape[0])):
+                        acc_S_mn[r, c] = -cutlass.Float32.inf if oob else acc_S_mn[r, c]
         else:  # Causal or local
             # If PackGQA, we split the work of compute divmod among threads in the same row
             threads_per_row = thr_mma.tv_layout_C.shape[0][0]
@@ -75,8 +78,9 @@ class AttentionMask:
                     # traverse column index.
                     for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                         # only consider the column index, so the row index sets to 0.
-                        if t0ScS_mn[0, c][1] >= col_limit_right:
-                            acc_S_mn[r, c] = -cutlass.Float32.inf
+                        # if t0ScS_mn[0, c][1] >= col_limit_right:
+                            # acc_S_mn[r, c] = -cutlass.Float32.inf
+                        acc_S_mn[r, c] = -cutlass.Float32.inf if t0ScS_mn[0, c][1] >= col_limit_right else acc_S_mn[r, c]
             else:  # Local
                 local_row_offset_right = (
                     causal_row_offset + self.window_size_right
