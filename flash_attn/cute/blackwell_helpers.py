@@ -278,6 +278,8 @@ def gemm_ptx_partial(
     sB: cute.Tensor,
     sA_swizzle: Optional[cute.Swizzle],
     sB_swizzle: cute.Swizzle,
+    mbar_ptr: Optional[cutlass.Pointer] = None,
+    mbar_phase: Optional[cutlass.Int32] = None,
     zero_init: bool | cutlass.Boolean = False,
 ) -> None:
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
@@ -321,6 +323,7 @@ def gemm_ptx_partial(
     smem_desc_start_b_lo = cutlass.Int32(smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator))
     pred_str = "p" if isinstance(zero_init, cutlass.Boolean) else "0" if zero_init else "1"
     if cutlass.const_expr(not is_ts):
+        assert mbar_ptr is None, "mbar_ptr must be None when a_src is not TMEM"
         llvm.inline_asm(
             None,
             [
@@ -365,14 +368,34 @@ def gemm_ptx_partial(
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     else:
+        input_args = [
+            cutlass.Int32(tCrA[None, None, 0].iterator.toint()).ir_value(),
+            cutlass.Int32(smem_desc_start_b_lo).ir_value(),
+            cutlass.Int32(not zero_init).ir_value(),
+        ]
+        if cutlass.const_expr(mbar_ptr is not None):
+            assert mbar_phase is not None, "mbar_phase must be provided when mbar_ptr is not None"
+            input_args.append(mbar_ptr.toint().ir_value())
+            input_args.append(cutlass.Int32(mbar_phase).ir_value())
+            mbar_wait_str = (
+                ".reg .pred P1; \n\t"
+                "LAB_WAIT: \n\t"
+                "mbarrier.try_wait.parity.shared::cta.b64 P1, [$3], $4, 10000000; \n\t"
+                "@P1 bra DONE; \n\t"
+                "bra     LAB_WAIT; \n\t"
+                "DONE: \n\t"
+            )
+        else:
+            mbar_wait_str = ""
         llvm.inline_asm(
             None,
-            [
-                # acc.iterator.toint().ir_value(),
-                cutlass.Int32(tCrA[None, None, 0].iterator.toint()).ir_value(),
-                cutlass.Int32(smem_desc_start_b_lo).ir_value(),
-                cutlass.Int32(not zero_init).ir_value(),
-            ],
+            # [
+            #     # acc.iterator.toint().ir_value(),
+            #     cutlass.Int32(tCrA[None, None, 0].iterator.toint()).ir_value(),
+            #     cutlass.Int32(smem_desc_start_b_lo).ir_value(),
+            #     cutlass.Int32(not zero_init).ir_value(),
+            # ],
+            input_args,
             "{\n\t"
             ".reg .pred leader_thread;\n\t"
             ".reg .pred p;\n\t"
@@ -399,10 +422,20 @@ def gemm_ptx_partial(
                     # f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, 1;\n\t"
                     f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
                 )
-                for k in range(1, cute.size(tCrA.shape[2]))
+                for k in range(1, cute.size(tCrA.shape[2]) if cutlass.const_expr(mbar_ptr is None) else cute.size(tCrA.shape[2]) // 2)
             )
+            + mbar_wait_str
+            + ("".join(
+                (
+                    f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                    f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                    f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                )
+                for k in range(cute.size(tCrA.shape[2]) // 2, cute.size(tCrA.shape[2]))
+            ) if cutlass.const_expr(mbar_ptr is not None) else "")
             + "}\n",
-            "r,r,r",
+            # "r,r,r",
+            "r,r,r" if cutlass.const_expr(mbar_ptr is None) else "r,r,r,r,r",
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,

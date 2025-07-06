@@ -262,6 +262,12 @@ def fmax_reduce(
         # return x.reduce(cute.ReductionOp.MAX, init_val, 0)
         res = cute.make_fragment(x.shape, Float32)
         res.store(x)
+        # local_max = [res[0], res[1]]
+        # for i in cutlass.range_constexpr(2, cute.size(x.shape), 2):
+        #     local_max[0] = fmax(local_max[0], res[i + 0])
+        #     local_max[1] = fmax(local_max[1], res[i + 1])
+        # local_max[0] = fmax(local_max[0], local_max[1])
+        # return local_max[0] if cutlass.const_expr(init_val is None) else fmax(local_max[0], init_val)
         local_max = [res[0], res[1], res[2], res[3]]
         for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
             local_max[0] = fmax(local_max[0], res[i + 0])
@@ -319,6 +325,7 @@ def fadd_reduce(
         res.store(x)
         local_sum_0 = (
             cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
+            # cute.arch.add_packed_f32x2((init_val / 2, init_val / 2), (res[0], res[1]))
             if cutlass.const_expr(init_val is not None)
             else (res[0], res[1])
         )

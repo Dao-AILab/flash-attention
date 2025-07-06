@@ -28,12 +28,12 @@ class Softmax:
         self.row_sum.fill(0.0)
 
     def _compute_row_max(
-        self, acc_S_row: cute.TensorSSA, init_val: float | Float32 = -Float32.inf
+        self, acc_S_row: cute.TensorSSA, init_val: float | Float32 | None = None
     ) -> Float32:
         return utils.fmax_reduce(acc_S_row, init_val, arch=self.arch)
 
     def _compute_row_sum(
-        self, acc_S_row_exp: cute.TensorSSA, init_val: float | Float32 = Float32.zero
+        self, acc_S_row_exp: cute.TensorSSA, init_val: float | Float32 | None = None
     ) -> Float32:
         return utils.fadd_reduce(acc_S_row_exp, init_val, arch=self.arch)
 
@@ -59,7 +59,7 @@ class Softmax:
             acc_S_row = acc_S_mn[r, None].load()  # (n_block_size)
             row_max_cur = self._compute_row_max(
                 acc_S_row,
-                init_val=-Float32.inf if cutlass.const_expr(is_first) else self.row_max[r],
+                init_val=self.row_max[r] if cutlass.const_expr(not is_first) else None,
             )
             row_max_cur = utils.warp_reduce(row_max_cur, cute.arch.fmax, width=4)
             if cutlass.const_expr(check_inf):
@@ -76,7 +76,7 @@ class Softmax:
                 # row_scale[r] = utils.exp2f(row_max_prev * self.scale_log2 - row_max_cur_scaled)
                 row_scale[r] = utils.exp2f((row_max_prev - row_max_cur) * self.scale_log2)
                 acc_S_row_sum = (
-                    self._compute_row_sum(acc_S_row_exp) + self.row_sum[r] * row_scale[r]
+                    self._compute_row_sum(acc_S_row_exp, init_val=self.row_sum[r] * row_scale[r])
                 )
             self.row_max[r] = row_max_cur
             self.row_sum[r] = acc_S_row_sum
@@ -128,7 +128,6 @@ class SoftmaxSm100(Softmax):
     @cute.jit
     def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
         if cutlass.const_expr(is_first):
-            # row_max_new = self._compute_row_max(acc_S_row, init_val=-Float32.inf)
             row_max_new = self._compute_row_max(acc_S_row)
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
             acc_scale = 0.0
@@ -137,12 +136,12 @@ class SoftmaxSm100(Softmax):
             row_max_new = self._compute_row_max(acc_S_row, init_val=row_max_old)
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
             acc_scale_ = (row_max_old - row_max_safe) * self.scale_log2
+            acc_scale = utils.exp2f(acc_scale_)
             if cutlass.const_expr(self.rescale_threshold > 0.0):
                 if acc_scale_ >= -self.rescale_threshold:
                     row_max_new = row_max_old
                     row_max_safe = row_max_old
-                    acc_scale_ = 0.0
-            acc_scale = utils.exp2f(acc_scale_)
+                    acc_scale = 1.0
         self.row_max[0] = row_max_new
         return row_max_safe, acc_scale
 
@@ -162,12 +161,12 @@ class SoftmaxSm100(Softmax):
         row_max: Float32,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
-        minus_row_max_scaled = -row_max * self.scale_log2
+        row_max_scaled = row_max * self.scale_log2
         for i in cutlass.range_constexpr(0, cute.size(acc_S_row.shape), 2):
             acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
                 (acc_S_row[i], acc_S_row[i + 1]),
                 (self.scale_log2, self.scale_log2),
-                (minus_row_max_scaled, minus_row_max_scaled),
+                (-row_max_scaled, -row_max_scaled),
             )
 
     @cute.jit

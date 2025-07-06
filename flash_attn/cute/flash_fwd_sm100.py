@@ -83,7 +83,6 @@ class FlashAttentionForwardSm100:
         self.pv_acc_dtype = cutlass.Float32
         self.cluster_shape_mn = (1, 1)
         self.is_persistent = is_persistent
-        self.is_even_N = False
         self.is_causal = is_causal
         self.is_local = is_local
         self.qhead_per_kvhead = qhead_per_kvhead
@@ -384,7 +383,9 @@ class FlashAttentionForwardSm100:
         self.mbar_s0_s1_sequence_offset = self.mbar_corr_epi_empty_offset + 2
         self.mbar_max_reg_setting_offset = self.mbar_s0_s1_sequence_offset + 8
         self.mbar_tmem_dealloc_offset = self.mbar_max_reg_setting_offset + 1
-        self.mbar_total = self.mbar_tmem_dealloc_offset + 1
+        # self.mbar_total = self.mbar_tmem_dealloc_offset + 1
+        self.mbar_P_full_2_offset = self.mbar_tmem_dealloc_offset + 1
+        self.mbar_total = self.mbar_P_full_2_offset + 2
 
         @cute.struct
         class SharedStorage:
@@ -546,6 +547,9 @@ class FlashAttentionForwardSm100:
                 cute.arch.mbarrier_init(mbar_ptr + self.mbar_P_full_O_rescaled_offset + i, cute.arch.WARP_SIZE * (len(self.softmax0_warp_ids) + len(self.correction_warp_ids)))
                 cute.arch.mbarrier_init(mbar_ptr + self.mbar_S_full_offset + i, len([self.mma_warp_id]))
                 cute.arch.mbarrier_init(mbar_ptr + self.mbar_O_full_offset + i, len([self.mma_warp_id]))
+        if warp_idx == 8:
+            for i in cutlass.range_constexpr(2):
+                cute.arch.mbarrier_init(mbar_ptr + self.mbar_P_full_2_offset + i, cute.arch.WARP_SIZE * len(self.softmax0_warp_ids))
         if warp_idx == 6:
             cute.arch.mbarrier_init(
                 mbar_ptr + self.mbar_max_reg_setting_offset,
@@ -1003,7 +1007,8 @@ class FlashAttentionForwardSm100:
                     cute.arch.mbarrier_wait(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage, P_full_O_rescaled_phase)
                     # 3. gemm
                     # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
-                    gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
+                    # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
+                    gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage, mbar_phase= P_full_O_rescaled_phase)
                     # 4. release accumulated O0_partial / O1_partial
                     # Don't need to signal O_full to the correction warps anymore since the
                     # correction warps wait for the softmax warps anyway. By the time the softmax
@@ -1055,7 +1060,8 @@ class FlashAttentionForwardSm100:
                 cute.arch.mbarrier_wait(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage, P_full_O_rescaled_phase)
                 # 3. gemm
                 # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
-                gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
+                # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
+                gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage, mbar_phase=P_full_O_rescaled_phase)
                 # 4. release accumulated O0_partial
                 # We do need O_full here since for the last tile, by the time the softmax warp
                 # has signaled to the correction warp, the softmax warp has just finished compute
@@ -1136,7 +1142,7 @@ class FlashAttentionForwardSm100:
         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
         tSrScale_r2t_shape = thr_tmem_store_scale.partition_S(tScS_vec).shape
         tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), cutlass.Float32,
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), cutlass.Float32,
         )
         tiled_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP)
         thr_tmem_store = tiled_tmem_store.get_slice(tidx)
@@ -1183,16 +1189,13 @@ class FlashAttentionForwardSm100:
             si_corr_producer_phase ^= 1
 
             # 1 masking iter
-            if const_expr(not self.is_even_N):
-                # mask_trip_count = 1 if seqlen.seqlen_k % self.mma_tiler_qk[1] == 0 else 0
-                mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block_max - 1, is_first=False, mask_fn=partial(mask_fn, mask_seqlen=True))
-                n_block_max -= 1
+            mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block_max - 1, is_first=True, mask_fn=partial(mask_fn, mask_seqlen=True))
+            n_block_max -= 1
             # Next couple of iterations with causal masking
             if const_expr(self.is_causal or self.is_local):
                 n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
                     seqlen, m_block, n_block_min
                 )
-                # Currently we can't do loop with negative step https://github.com/NVIDIA/cutlass/issues/2326
                 for n_tile in cutlass.range(n_block_max - n_block_min_causal_local_mask, unroll=1):
                     n_block = n_block_max - 1 - n_tile
                     mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_seqlen=False))
@@ -1329,10 +1332,16 @@ class FlashAttentionForwardSm100:
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
         # print(tSrP_r2t_f32, tStP_r2t)
-        cute.copy(thr_tmem_store, tSrP_r2t_f32, tStP_r2t)
+        # cute.copy(thr_tmem_store, tSrP_r2t_f32, tStP_r2t)
+        for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 2):
+            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
         cute.arch.fence_view_async_tmem_store()
         # Notify mma warp that P is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
+        for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 2, cute.size(tStP_r2t.shape[2])):
+            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
+        # Notify mma warp that the 2nd half of P is ready
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase)
         softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         # acc_scale = cute.arch.exp2(acc_scale_)
