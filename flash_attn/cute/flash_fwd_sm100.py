@@ -132,13 +132,13 @@ class FlashAttentionForwardSm100:
         self.num_regs_softmax = 176
         # self.num_regs_correction = 104
         # self.num_regs_correction = 96
-        self.num_regs_correction = 80
-        # self.num_regs_correction = 64
+        # self.num_regs_correction = 80
+        self.num_regs_correction = 64 if self.is_causal or self.is_local else 80
         # self.num_regs_other = 24
         # self.num_regs_other = 32
         # self.num_regs_other = 64
-        self.num_regs_other = 80
-        # self.num_regs_other = 96
+        # self.num_regs_other = 80
+        self.num_regs_other = 96 if self.is_causal or self.is_local else 80
         # self.num_regs_other = 48
 
         self.buffer_align_bytes = 1024
