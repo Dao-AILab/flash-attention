@@ -308,15 +308,10 @@ def gemm_ptx_partial(
     smem_desc_base_b_lo = cutlass.const_expr(smem_desc_base_b_lo)
     smem_desc_b_hi = cutlass.const_expr(smem_desc_b_hi)
 
-    if cutlass.const_expr(not is_ts):
-        offset_a = [(cute.crd2idx((0, 0, k), sA_layout) * op.a_dtype.width // 8) >> 4
-                    for k in range(cute.size(tCrA.shape[2]))]
-    else:
-        offset_a = [cute.crd2idx((0, 0, k), sA_layout) * op.a_dtype.width // 32
-                    for k in range(cute.size(tCrA.shape[2]))]
+    tCrA_layout = tCrA.layout if cutlass.const_expr(not is_ts) else cute.recast_layout(32, tCrA.element_type.width, tCrA.layout)
+    offset_a = [cute.crd2idx((0, 0, k), tCrA_layout) for k in range(cute.size(tCrA.shape[2]))]
     offset_a_diff = [offset_a[k] - offset_a[k - 1] for k in range(1, cute.size(tCrA.shape[2]))]
-    offset_b = [(cute.crd2idx((0, 0, k), sB_layout) * sB.element_type.width // 8) >> 4
-                for k in range(cute.size(tCrB.shape[2]))]
+    offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(cute.size(tCrB.shape[2]))]
     offset_b_diff = [offset_b[k] - offset_b[k - 1] for k in range(1, cute.size(tCrB.shape[2]))]
 
     if cutlass.const_expr(not is_ts):
@@ -330,8 +325,8 @@ def gemm_ptx_partial(
             None,
             [
                 # acc.iterator.toint().ir_value(),
-                cutlass.Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
-                cutlass.Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+                cutlass.Int32(smem_desc_start_a_lo).ir_value(),
+                cutlass.Int32(smem_desc_start_b_lo).ir_value(),
                 cutlass.Int32(not zero_init).ir_value(),
             ],
             "{\n\t"

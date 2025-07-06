@@ -1637,7 +1637,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 softmax.online_softmax(acc_S, is_first=True)
                 tOrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
                 tOrP = mma_params.tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
-                tOrP.store(tOrP_acc.load().to(self.dtype))
+                # tOrP.store(tOrP_acc.load().to(self.dtype))
+                # the "to(self.dtype)" conversion fails to vectorize for block sizes other
+                # than 128 x 128, i.e. it calls convert on 1 fp32 element at a time instead of
+                # 2 elements. So we just call ptx directly.
+                utils.cvt_f16(tOrP_acc, tOrP)
                 if const_expr(not self.mma_pv_is_rs):
                     tPrP = smem_thr_copy_P.retile(tOrP)
                     cute.copy(smem_thr_copy_P, tPrP, tPsP)
@@ -1749,7 +1753,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
         tOrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
         tOrP = mma_params.tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
-        tOrP.store(tOrP_acc.load().to(self.dtype))
+        # tOrP.store(tOrP_acc.load().to(self.dtype))
+        utils.cvt_f16(tOrP_acc, tOrP)
         if const_expr(not self.mma_pv_is_rs):
             tPrP = smem_copy_params.smem_thr_copy_P.retile(mma_params.tOrP)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
@@ -1817,7 +1822,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_v.consumer_release(smem_pipe_read_v)
         tOrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
         tOrP = mma_params.tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
-        tOrP.store(tOrP_acc.load().to(self.dtype))
+        # tOrP.store(tOrP_acc.load().to(self.dtype))
+        utils.cvt_f16(tOrP_acc, tOrP)
         if const_expr(not self.mma_pv_is_rs):
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)

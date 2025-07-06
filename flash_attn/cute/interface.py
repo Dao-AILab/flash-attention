@@ -133,9 +133,9 @@ def _flash_attn_fwd(
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    # if compute_capability == 9:  # TODO: tune block size according to hdim
-    #     if not causal and not local:
-    #         n_block_size = 176
+    if compute_capability == 9:  # TODO: tune block size according to hdim
+        if not causal and not local:
+            n_block_size = 192
 
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,
@@ -154,6 +154,7 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                pack_gqa=False,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
                 # num_stages=1,

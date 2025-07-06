@@ -257,9 +257,21 @@ def fmax_reduce(
     x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
 ) -> Float32:
     if cutlass.const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
-        if cutlass.const_expr(init_val is None):
-            init_val = -cutlass.Float32.inf
-        return x.reduce(cute.ReductionOp.MAX, init_val, 0)
+        # if cutlass.const_expr(init_val is None):
+        #     init_val = -cutlass.Float32.if
+        # return x.reduce(cute.ReductionOp.MAX, init_val, 0)
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        local_max = [res[0], res[1], res[2], res[3]]
+        for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
+            local_max[0] = fmax(local_max[0], res[i + 0])
+            local_max[1] = fmax(local_max[1], res[i + 1])
+            local_max[2] = fmax(local_max[2], res[i + 2])
+            local_max[3] = fmax(local_max[3], res[i + 3])
+        local_max[0] = fmax(local_max[0], local_max[1])
+        local_max[2] = fmax(local_max[2], local_max[3])
+        local_max[0] = fmax(local_max[0], local_max[2])
+        return local_max[0] if cutlass.const_expr(init_val is None) else fmax(local_max[0], init_val)
     else:
         # [2025-06-15] x.reduce only seems to use 50% 3-input max and 50% 2-input max
         # We instead force the 3-input max.
@@ -290,6 +302,18 @@ def fadd_reduce(
         if cutlass.const_expr(init_val is None):
             init_val = Float32.zero
         return x.reduce(cute.ReductionOp.ADD, init_val, 0)
+        # res = cute.make_fragment(x.shape, Float32)
+        # res.store(x)
+        # local_sum = [res[0], res[1], res[2], res[3]]
+        # for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
+        #     local_sum[0] += res[i + 0]
+        #     local_sum[1] += res[i + 1]
+        #     local_sum[2] += res[i + 2]
+        #     local_sum[3] += res[i + 3]
+        # local_sum[0] += local_sum[1]
+        # local_sum[2] += local_sum[3]
+        # local_sum[0] += local_sum[2]
+        # return local_sum[0] if cutlass.const_expr(init_val is None) else local_sum[0] + init_val
     else:
         res = cute.make_fragment(x.shape, Float32)
         res.store(x)
@@ -440,3 +464,31 @@ def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) ->
             val += partial_sum
         # if cute.arch.thread_idx()[0] >= 128 and cute.arch.thread_idx()[0] < 128 + 32 and cute.arch.block_idx()[0] == 0: cute.printf("tidx = %d, partial_sum = %d, val = %d", cute.arch.thread_idx()[0] % 32, partial_sum, val)
     return val
+
+
+@dsl_user_op
+def cvt_f16x2_f32(a: float | Float32, b: float | Float32, to_dtype: Type, *, loc=None, ip=None) -> cutlass.Int32:
+    assert to_dtype in [cutlass.BFloat16, cutlass.Float16], "to_dtype must be BFloat16 or Float16"
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            f"cvt.rn.{'bf16x2' if to_dtype is cutlass.BFloat16 else 'f16x2'}.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def cvt_f16(src: cute.Tensor, dst: cute.Tensor):
+    assert cute.size(dst.shape) == cute.size(src.shape), "dst and src must have the same size"
+    assert cute.size(src.shape) % 2 == 0, "src must have an even number of elements"
+    assert dst.element_type in [cutlass.BFloat16, cutlass.Float16], "dst must be BFloat16 or Float16"
+    assert src.element_type is Float32, "src must be Float32"
+    dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
+    assert cute.size(dst_i32.shape) * 2 == cute.size(src.shape)
+    for i in cutlass.range_constexpr(cute.size(dst_i32)):
+        dst_i32[i] = cvt_f16x2_f32(src[2 * i], src[2 * i + 1], dst.element_type)
