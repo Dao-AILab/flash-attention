@@ -1340,6 +1340,7 @@ class FlashAttentionForwardSm100:
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
         for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 3, cute.size(tStP_r2t.shape[2])):
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
+        cute.arch.fence_view_async_tmem_store()
         # Notify mma warp that the 2nd half of P is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase)
