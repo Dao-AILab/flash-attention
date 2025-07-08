@@ -1296,7 +1296,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
     TORCH_CHECK(
         !deterministic || !is_local || !cu_seqlens_q_.has_value() || torch::equal(cu_seqlens_q_.value(), cu_seqlens_k_.value()), 
-        "FlashAttention backward only supports deterministic when local is false"
+        "For varlen case, cu_seqlens_q_ must match cu_seqlens_k_ for deterministic execution unless local is false."
     );
     int const kBlockM_sm90 = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
         : (head_size_rounded <= 96 ? 64
