@@ -532,8 +532,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int window_size_right,
                const float softcap,
                const bool return_softmax,
-               std::optional<at::Generator> gen_) {
-
+               std::optional<at::Generator> gen_, 
+               std::optional<const at::Tensor> &tree_dfs_order_end_k_,
+               std::optional<const at::Tensor> &tree_dfs_order_start_q_) {
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
 
@@ -567,6 +568,23 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     CHECK_CONTIGUOUS(cu_seqlens_q);
     CHECK_CONTIGUOUS(cu_seqlens_k);
+
+    TORCH_CHECK(tree_dfs_order_start_q_.has_value() == tree_dfs_order_end_k_.has_value(), "tree_start_position_id and tree_end_position_id must be passed together");
+    if (tree_dfs_order_end_k_.has_value()) {
+        const at::Tensor tree_dfs_order_end_k = tree_dfs_order_end_k_.value(), tree_dfs_order_start_q = tree_dfs_order_start_q_.value();
+        TORCH_CHECK(is_causal, "In tree attention, is_causal must be True");
+        if (window_size_left < max_seqlen_k)
+            TORCH_CHECK(window_size_left == -1 && window_size_right == -1, "In tree attention, is_local must be False");
+        TORCH_CHECK(!alibi_slopes_.has_value(), "tree attention does not support alibi");
+        TORCH_CHECK(tree_dfs_order_start_q.dtype() == torch::kInt32, "tree_dfs_order_start_q must have dtype int32");
+        TORCH_CHECK(tree_dfs_order_end_k.dtype() == torch::kInt32, "tree_dfs_order_end_k must have dtype int32");
+        TORCH_CHECK(tree_dfs_order_start_q.sizes().size() == 1, "tree_dfs_order_start_q must be 1D tensor");
+        TORCH_CHECK(tree_dfs_order_end_k.sizes().size() == 1, "tree_dfs_order_end_k must be 1D tensor");
+        TORCH_CHECK(tree_dfs_order_start_q.sizes()[0] == q.sizes()[0], "tree_dfs_order_start_q and q must have the same length");
+        TORCH_CHECK(tree_dfs_order_end_k.sizes()[0] == k.sizes()[0], "tree_dfs_order_end_k and k must have the same length");
+        CHECK_DEVICE(tree_dfs_order_start_q);
+        CHECK_DEVICE(tree_dfs_order_end_k);
+    }
 
     const auto sizes = q.sizes();
 
@@ -733,6 +751,16 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+
+    if (tree_dfs_order_end_k_.has_value()) {
+        params.is_tree_attention = true;
+        params.tree_dfs_order_end_k = static_cast<int *>(tree_dfs_order_end_k_.value().data_ptr());
+        params.tree_dfs_order_start_q = static_cast<int *>(tree_dfs_order_start_q_.value().data_ptr());
+    } else {
+        params.is_tree_attention = false;
+        params.tree_dfs_order_end_k = nullptr;
+        params.tree_dfs_order_start_q = nullptr;
+    }
 
     if (max_seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -994,7 +1022,9 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const float softcap,
                const bool deterministic,
                std::optional<at::Generator> gen_,
-               std::optional<at::Tensor> &rng_state) {
+               std::optional<at::Tensor> &rng_state,
+               std::optional<const at::Tensor> &tree_dfs_order_end_k_,
+               std::optional<const at::Tensor> &tree_dfs_order_start_q_) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -1032,6 +1062,20 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     TORCH_CHECK(dout.stride(-1) == 1, "dout tensor must have contiguous last dimension");
     CHECK_CONTIGUOUS(cu_seqlens_q);
     CHECK_CONTIGUOUS(cu_seqlens_k);
+
+    TORCH_CHECK(tree_dfs_order_start_q_.has_value() == tree_dfs_order_end_k_.has_value(), "tree_start_position_id and tree_end_position_id must be passed together");
+    if (tree_dfs_order_end_k_.has_value()) {
+        const at::Tensor tree_dfs_order_end_k = tree_dfs_order_end_k_.value(), tree_dfs_order_start_q = tree_dfs_order_start_q_.value();
+        TORCH_CHECK(is_causal, "In tree attention, is_causal must be True");
+        TORCH_CHECK(tree_dfs_order_start_q.dtype() == torch::kInt32, "tree_dfs_order_start_q must have dtype int32");
+        TORCH_CHECK(tree_dfs_order_end_k.dtype() == torch::kInt32, "tree_dfs_order_end_k must have dtype int32");
+        TORCH_CHECK(tree_dfs_order_start_q.sizes().size() == 1, "tree_dfs_order_start_q must be 1D tensor");
+        TORCH_CHECK(tree_dfs_order_end_k.sizes().size() == 1, "tree_dfs_order_end_k must be 1D tensor");
+        TORCH_CHECK(tree_dfs_order_start_q.sizes()[0] == q.sizes()[0], "tree_dfs_order_start_q and q must have the same length");
+        TORCH_CHECK(tree_dfs_order_end_k.sizes()[0] == k.sizes()[0], "tree_dfs_order_end_k and k must have the same length");
+        CHECK_DEVICE(tree_dfs_order_start_q);
+        CHECK_DEVICE(tree_dfs_order_end_k);
+    }
 
     const auto sizes = q.sizes();
 
@@ -1180,6 +1224,16 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+
+    if (tree_dfs_order_end_k_.has_value()) {
+        params.is_tree_attention = true;
+        params.tree_dfs_order_end_k = static_cast<int *>(tree_dfs_order_end_k_.value().data_ptr());
+        params.tree_dfs_order_start_q = static_cast<int *>(tree_dfs_order_start_q_.value().data_ptr());
+    } else {
+        params.is_tree_attention = false;
+        params.tree_dfs_order_end_k = nullptr;
+        params.tree_dfs_order_start_q = nullptr;
+    }
 
     if (max_seqlen_q > 0) {
         launch(params, stream);
