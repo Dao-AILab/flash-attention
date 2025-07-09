@@ -162,7 +162,7 @@ def _flash_attn_fwd(
                 num_threads=num_threads,
                 Q_in_regs=False,
             )
-        else:
+        elif compute_capability == 10:
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
@@ -171,6 +171,8 @@ def _flash_attn_fwd(
                 qhead_per_kvhead=qhead_per_kvhead,
                 is_persistent=not causal and not local and cu_seqlens_q is None and seqused_q is None,
             )
+        else:
+            raise ValueError(f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x")
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
