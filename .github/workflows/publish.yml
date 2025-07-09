@@ -45,7 +45,7 @@ jobs:
           os: [ubuntu-22.04]
           python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
           torch-version: ['2.4.0', '2.5.1', '2.6.0', '2.7.1']
-          cuda-version: ['12.9.0']
+          cuda-version: ['12.9.1']
           # We need separate wheels that either uses C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI) or not.
           # Pytorch wheels currently don't use it, but nvcr images have Pytorch compiled with C++11 ABI.
           # Without this we get import error (undefined symbol: _ZN3c105ErrorC2ENS_14SourceLocationESs)
@@ -90,7 +90,7 @@ jobs:
 
       - name: Install CUDA ${{ matrix.cuda-version }}
         if: ${{ matrix.cuda-version != 'cpu' }}
-        uses: Jimver/cuda-toolkit@v0.2.25
+        uses: Jimver/cuda-toolkit@v0.2.26
         id: cuda-toolkit
         with:
           cuda: ${{ matrix.cuda-version }}
