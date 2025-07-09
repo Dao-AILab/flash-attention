@@ -1,0 +1,8 @@
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+ignore = [
+    "E731",  # do not assign a lambda expression, use a def
+    "F841",  # local variable is assigned to but never used
+]

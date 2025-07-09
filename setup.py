@@ -206,6 +206,18 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     "--expt-relaxed-constexpr",
     "--expt-extended-lambda",
     "--use_fast_math",
+    "-Xfatbin",
+    "-compress-all",
+    "-compress-mode=size",
+    # "--ptxas-options=-v",
+    # "--ptxas-options=-O2",
+    # "-lineinfo",
+    # "-DFLASHATTENTION_DISABLE_BACKWARD",
+    # "-DFLASHATTENTION_DISABLE_DROPOUT",
+    # "-DFLASHATTENTION_DISABLE_ALIBI",
+    # "-DFLASHATTENTION_DISABLE_SOFTCAP",
+    # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+    # "-DFLASHATTENTION_DISABLE_LOCAL",
     ]
 
     compiler_c17_flag=["-O3", "-std=c++17"]

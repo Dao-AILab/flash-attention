@@ -81,38 +81,48 @@ class FlashAttentionBackwardPostprocess:
             num_bits_per_copy=universal_copy_bits,
         )
         # We don't do bound checking for the gmem -> smem load so we just assert here.
-        assert (self.m_block_size * self.head_dim_padded // async_copy_elems_accum) % self.tiled_mma.size == 0
+        assert (
+            self.m_block_size * self.head_dim_padded // async_copy_elems_accum
+        ) % self.tiled_mma.size == 0
         self.g2s_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
             atom_async_copy_accum,
             cute.make_layout(self.tiled_mma.size),
-            cute.make_layout(async_copy_elems_accum)
+            cute.make_layout(async_copy_elems_accum),
         )
         atom_universal_copy_accum = cute.make_copy_atom(
             # multiply by 4 for Sm90
-            cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=cutlass.Float32.width,
+            cute.nvgpu.CopyUniversalOp(),
+            cutlass.Float32,
+            num_bits_per_copy=cutlass.Float32.width,
         )
         self.s2r_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
             atom_universal_copy_accum,
             cute.make_layout(self.tiled_mma.size),
-            cute.make_layout(1)  # 4 for Sm90
+            cute.make_layout(1),  # 4 for Sm90
         )
 
         async_copy_elems = universal_copy_bits // self.dtype.width
         # atom_universal_copy: universal copy atom for dQ store
         atom_universal_copy = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=universal_copy_bits,
+            cute.nvgpu.CopyUniversalOp(),
+            self.dtype,
+            num_bits_per_copy=universal_copy_bits,
         )
         # tdQ_layout: thread layout for dQ store
         assert self.head_dim_padded % async_copy_elems == 0
-        gmem_threads_per_row = math.gcd(self.head_dim_padded // async_copy_elems,
-                                        self.tiled_mma.size)
+        gmem_threads_per_row = math.gcd(
+            self.head_dim_padded // async_copy_elems, self.tiled_mma.size
+        )
         assert self.tiled_mma.size % gmem_threads_per_row == 0
         tdQ_layout = cute.make_ordered_layout(
-            (self.tiled_mma.size // gmem_threads_per_row, gmem_threads_per_row), order=(1, 0),
+            (self.tiled_mma.size // gmem_threads_per_row, gmem_threads_per_row),
+            order=(1, 0),
         )
         # Value layouts for copies
         vdQ_layout = cute.make_layout((1, async_copy_elems))
-        self.gmem_tiled_copy_dQ = cute.make_tiled_copy_tv(atom_universal_copy, tdQ_layout, vdQ_layout)
+        self.gmem_tiled_copy_dQ = cute.make_tiled_copy_tv(
+            atom_universal_copy, tdQ_layout, vdQ_layout
+        )
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: dQaccum / dQ
         # ///////////////////////////////////////////////////////////////////////////////
@@ -126,13 +136,12 @@ class FlashAttentionBackwardPostprocess:
             sdQ_layout_atom, (self.m_block_size, self.head_dim_padded), (0, 1)
         )
 
-
     @cute.jit
     def __call__(
         self,
         mdQaccum: cute.Tensor,
         mdQ: cute.Tensor,
-        scale: cute.Float32,
+        scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
         # Get the data type and check if it is fp16 or bf16
@@ -143,7 +152,11 @@ class FlashAttentionBackwardPostprocess:
                 raise TypeError("dQaccum tensor must be Float32")
 
         num_mma_warps = self.num_threads // 32
-        AtomLayoutdQ = (self.AtomLayoutMdQ, num_mma_warps // self.AtomLayoutMdQ, 1) if not self.dQ_swapAB else (num_mma_warps // self.AtomLayoutMdQ, self.AtomLayoutMdQ, 1)
+        AtomLayoutdQ = (
+            (self.AtomLayoutMdQ, num_mma_warps // self.AtomLayoutMdQ, 1)
+            if cutlass.const_expr(not self.dQ_swapAB)
+            else (num_mma_warps // self.AtomLayoutMdQ, self.AtomLayoutMdQ, 1)
+        )
         tiled_mma = cute.make_tiled_mma(
             warp.MmaF16BF16Op(self.dtype, cutlass.Float32, (16, 8, 16)),
             AtomLayoutdQ,
@@ -153,8 +166,10 @@ class FlashAttentionBackwardPostprocess:
 
         self._setup_attributes()
 
-        smem_size = max(cute.size_in_bytes(cutlass.Float32, self.sdQaccum_layout),
-                        cute.size_in_bytes(self.dtype, self.sdQ_layout))
+        smem_size = max(
+            cute.size_in_bytes(cutlass.Float32, self.sdQaccum_layout),
+            cute.size_in_bytes(self.dtype, self.sdQ_layout),
+        )
 
         # grid_dim: (m_block, num_head, batch_size)
         grid_dim = (
@@ -185,7 +200,7 @@ class FlashAttentionBackwardPostprocess:
         self,
         mdQaccum: cute.Tensor,
         mdQ: cute.Tensor,
-        scale: cute.Float32,
+        scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
         dQ_swapAB: cutlass.Constexpr,
         sdQaccum_layout: cute.Layout,
@@ -202,7 +217,9 @@ class FlashAttentionBackwardPostprocess:
         # Get the appropriate tiles for this thread block.
         # ///////////////////////////////////////////////////////////////////////////////
         blkdQaccum_shape = (self.m_block_size * self.head_dim_padded,)
-        gdQaccum = cute.local_tile(mdQaccum[batch_size, num_head, None], blkdQaccum_shape, (m_block,))
+        gdQaccum = cute.local_tile(
+            mdQaccum[batch_size, num_head, None], blkdQaccum_shape, (m_block,)
+        )
         blkdQ_shape = (self.m_block_size, self.head_dim_padded)
         gdQ = cute.local_tile(mdQ[batch_size, None, num_head, None], blkdQ_shape, (m_block, 0))
 
@@ -235,7 +252,8 @@ class FlashAttentionBackwardPostprocess:
         # thr_mma = tiled_mma.get_slice(tidx)
         # print(tiled_mma)
         acc_shape = tiled_mma.partition_shape_C(
-            (self.m_block_size, self.head_dim_padded) if not dQ_swapAB
+            (self.m_block_size, self.head_dim_padded)
+            if cutlass.const_expr(not dQ_swapAB)
             else (self.head_dim_padded, self.m_block_size)
         )
         acc = cute.make_fragment(acc_shape, cutlass.Float32)
@@ -247,7 +265,7 @@ class FlashAttentionBackwardPostprocess:
         # print(acc)
         # print(tdQsdQaccum)  # ((1, 1), 64)
         # print(tdQrdQaccum)  # ((1, 4), 4, 4)
-        for i in range(cute.size(tdQsdQaccum)):
+        for i in cutlass.range_constexpr(cute.size(tdQsdQaccum)):
             tdQrdQaccum[i] = tdQsdQaccum[i]
         # Convert tdQrdQaccum from fp32 to fp16/bf16
         rdQ = cute.make_fragment_like(acc, self.dtype)
@@ -279,7 +297,7 @@ class FlashAttentionBackwardPostprocess:
         tdQcdQ = gmem_thr_copy_dQ.partition_S(cdQ)
         tdQpdQ = utils.predicate_k(tdQcdQ, limit=mdQ.shape[3])
         for rest_m in cutlass.range_constexpr(cute.size(tdQrdQ.shape[1])):
-            if cute.elem_less(tdQcdQ[0, rest_m, 0][0], mdQ.shape[1] - m_block * self.m_block_size):
+            if tdQcdQ[0, rest_m, 0][0] < mdQ.shape[1] - m_block * self.m_block_size:
                 cute.copy(
                     gmem_tiled_copy_dQ,
                     tdQrdQ[None, rest_m, None],

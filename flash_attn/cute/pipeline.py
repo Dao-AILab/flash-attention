@@ -7,9 +7,8 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Boolean, Int32, if_generate
-from cutlass.utils import PipelineAsync, PipelineState, CooperativeGroup, pipeline_init_wait
-from cutlass.utils.pipeline import PipelineUserType
-from cutlass.utils.pipeline import _PipelineOp
+from cutlass.pipeline import PipelineAsync, PipelineState, CooperativeGroup, pipeline_init_wait
+from cutlass.pipeline import PipelineUserType, PipelineOp
 
 
 class PipelineStateSimple:
@@ -67,9 +66,6 @@ class PipelineStateSimple:
         #     [Int32],
         # )
 
-    def __get_mlir_types__(self):
-        return [self._phase_index.type]
-
     def __extract_mlir_values__(self):
         phase_index = self._phase_index
         return [phase_index.ir_value()]
@@ -88,24 +84,20 @@ def make_pipeline_state(type: PipelineUserType, stages: int):
     elif type is PipelineUserType.Consumer:
         return PipelineStateSimple(stages, Int32(0))
     else:
-        assert (
-            False
-        ), "Error: invalid PipelineUserType specified for make_pipeline_state."
-
+        assert False, "Error: invalid PipelineUserType specified for make_pipeline_state."
 
 
 @dataclass(frozen=True)
 class PipelineTmaAsyncNoCluster(PipelineAsync):
-
     """
-        If size(ClusterShape) == 1, PipelineTmaAsync has all threads
-        signaling the barrier during consumer_release. This causes a perf regression in FA3
-        forward pass (especially hdim 128 causal). We instead implement a version of
-        PipelineTmaAsync where only 1 out of 128 threads signals the barrier.
+    If size(ClusterShape) == 1, PipelineTmaAsync has all threads
+    signaling the barrier during consumer_release. This causes a perf regression in FA3
+    forward pass (especially hdim 128 causal). We instead implement a version of
+    PipelineTmaAsync where only 1 out of 128 threads signals the barrier.
 
-        Assumptions:
-        (1) num_consumers % NumThreadsPerWarpGroup == 0
-        (2) all 128 threads in the warp group are sync'ed right before calling consumer_release
+    Assumptions:
+    (1) num_consumers % NumThreadsPerWarpGroup == 0
+    (2) all 128 threads in the warp group are sync'ed right before calling consumer_release
     """
 
     @staticmethod
@@ -115,7 +107,7 @@ class PipelineTmaAsyncNoCluster(PipelineAsync):
         producer_group: CooperativeGroup,
         consumer_group: CooperativeGroup,
         tx_count: int,
-        init_wait: bool = True,
+        init_wait: cutlass.Constexpr[bool] = True,
     ):
         """
         This helper function computes any necessary attributes and returns an instance of PipelineTmaAsync.
@@ -130,39 +122,37 @@ class PipelineTmaAsyncNoCluster(PipelineAsync):
         :param tx_count: Number of bytes expected to be written to the transaction barrier for one stage
         :type tx_count: int
         """
-        producer_type = _PipelineOp.TmaLoad
-        consumer_type = _PipelineOp.AsyncThread
+        producer_type = PipelineOp.TmaLoad
+        consumer_type = PipelineOp.AsyncThread
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
-        sync_object_array_full = PipelineAsync._make_sync_object_array(
+        sync_object_full = PipelineAsync._make_sync_object(
             barrier_storage.align(min_align=8), num_stages, producer, tx_count
         )
-        sync_object_array_empty = PipelineAsync._make_sync_object_array(
+        sync_object_empty = PipelineAsync._make_sync_object(
             barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
         )
         dst_rank = None
         producer_mask = None
-        if init_wait:
+        if cutlass.const_expr(init_wait):
             pipeline_init_wait()
         return PipelineTmaAsyncNoCluster(
-            sync_object_array_full,
-            sync_object_array_empty,
+            sync_object_full,
+            sync_object_empty,
             num_stages,
             producer_mask,
             dst_rank,
         )
 
-    def producer_acquire(
-        self, state: PipelineState, try_acquire_token: Optional[Boolean] = None
-    ):
+    def producer_acquire(self, state: PipelineState, try_acquire_token: Optional[Boolean] = None):
         """
         TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_array_empty.wait(state.index, state.phase),
+            lambda: self.sync_object_empty.wait(state.index, state.phase),
         )
-        self.sync_object_array_full.arrive(state.index, self.producer_mask)
+        self.sync_object_full.arrive(state.index, self.producer_mask)
 
     def producer_commit(self, state: PipelineState):
         """
@@ -177,5 +167,5 @@ class PipelineTmaAsyncNoCluster(PipelineAsync):
         # Only 1 thread per warp group signals the empty buffer.
         if_generate(
             cute.arch.thread_idx()[0] % 128 == 0,
-            lambda: self.sync_object_array_empty.arrive(state.index, self.consumer_mask),
+            lambda: self.sync_object_empty.arrive(state.index, self.consumer_mask),
         )

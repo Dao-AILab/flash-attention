@@ -524,6 +524,9 @@ if not SKIP_CUDA_BUILD:
         "-DCUTLASS_ENABLE_GDC_FOR_SM90",  # For PDL
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
         "-DNDEBUG",  # Important, otherwise performance is severely impacted
+        "-Xfatbin",  # compress all binary sections
+        "-compress-all",
+        "-compress-mode=size",  # compress with CUDA fatbin more aggressively
     ]
     if get_platform() == "win_amd64":
         nvcc_flags.extend(
