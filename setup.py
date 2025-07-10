@@ -562,7 +562,7 @@ setup(
         "Operating System :: Unix",
     ],
     ext_modules=ext_modules,
-    cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": NinjaBuildExtension.with_options(use_ninja=True, verbose=True)}
+    cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": NinjaBuildExtension}
     if ext_modules
     else {
         "bdist_wheel": CachedWheelsCommand,
