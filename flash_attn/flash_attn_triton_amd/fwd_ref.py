@@ -381,7 +381,7 @@ def attention_forward_pytorch_ref_impl(
                                                        alibi_slopes,
                                                        use_exp2)
 
-    # copy back to ouput tensor
+    # copy back to output tensor
     out.copy_(o_ref.to(out.dtype))
     
     return softmax_lse_ref, sd_mask_ref
