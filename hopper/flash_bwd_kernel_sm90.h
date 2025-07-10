@@ -35,8 +35,10 @@ public:
     // Mainloop derived types
     using CollectiveMainloop = CollectiveMainloop_;
     using TileShape_MNK = typename CollectiveMainloop::TileShape_MNK;
-    using TiledMmaSdP = typename CollectiveMainloop::TiledMmaSdP;
-    using TiledMmadKV = typename CollectiveMainloop::TiledMmadKV;
+    using TileShapeV_MNK = typename CollectiveMainloop::TileShapeV_MNK;
+    using TiledMmaS = typename CollectiveMainloop::TiledMmaS;
+    using TiledMmadK = typename CollectiveMainloop::TiledMmadK;
+    using TiledMmadV = typename CollectiveMainloop::TiledMmadV;
     using ArchTag = typename CollectiveMainloop::ArchTag;
     using ClusterShape = typename CollectiveMainloop::ClusterShape;
     using MainloopArguments = typename CollectiveMainloop::Arguments;
@@ -55,8 +57,8 @@ public:
     using TileSchedulerParams = typename TileScheduler::Params;
 
     static constexpr uint32_t NumLoadWarpGroups = 1;
-    static constexpr uint32_t NumMmaWarpGroups = CUTE_STATIC_V(size(TiledMmaSdP{})) / cutlass::NumThreadsPerWarpGroup;
-    static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMmaSdP{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup);
+    static constexpr uint32_t NumMmaWarpGroups = CUTE_STATIC_V(size(TiledMmaS{})) / cutlass::NumThreadsPerWarpGroup;
+    static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMmaS{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup);
     static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
     static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
 
@@ -193,6 +195,7 @@ public:
             ? MainloopPipeline_dO::ThreadCategory::Producer
             : MainloopPipeline_dO::ThreadCategory::Consumer;
         PipelineParams_dO pipeline_params_dO {pipeline_params.transaction_bytes, role_dO, pipeline_params.is_leader, pipeline_params.num_consumers};
+        pipeline_params_dO.transaction_bytes = CollectiveMainloop::TmaTransactionBytesdO + CollectiveMainloop::TmaTransactionBytesLSE;
         MainloopPipeline_dO pipeline_do(shared_storage.pipelines.pipeline_do, cute::conditional_return<Q_dO_same_stages>(pipeline_params, pipeline_params_dO), ClusterShape{});
 
         CollectiveMainloop mainloop;
@@ -241,7 +244,8 @@ public:
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
             // Initialize matmul objects.
-            TiledMmadKV tiled_mma_dKV;
+            TiledMmadK tiled_mma_dK;
+            TiledMmadV tiled_mma_dV;
 
             PipelineState smem_pipe_read;
             PipelineState_dO smem_pipe_read_do;
@@ -259,13 +263,13 @@ public:
                 cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
 
                 // dK and dV output accumulator.
-                Tensor tdKrdK = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
-                Tensor tdVrdV = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
+                Tensor tdKrdK = partition_fragment_C(tiled_mma_dK, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
+                Tensor tdVrdV = partition_fragment_C(tiled_mma_dV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShapeV_MNK{}));
                 bool tile_valid = mainloop.mma(
                     params.mainloop, pipeline_q, pipeline_do, smem_pipe_read, smem_pipe_read_do,
                     tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage);
                 if (tile_valid) {
-                    epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
+                    epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dK, tiled_mma_dV,
                                    threadIdx.x - NumCopyThreads, block_coord);
                 } else {
                     epilogue.store_zero(params.epilogue, threadIdx.x - NumCopyThreads, block_coord);
