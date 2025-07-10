@@ -1,12 +1,16 @@
 import torch
 import math
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 from .utils import compute_alibi_tensor_ref
 
 DEBUG = False
 DEBUG_CORE = False
 
-def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2):
+def attention_forward_core_ref_impl(
+    q, k, v, sm_scale, causal, window_size_left, window_size_right, 
+    dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2,
+    cache_seqlens=None
+):
     if DEBUG_CORE:
         print()
         print("attention_forward_core_ref_impl")
@@ -15,15 +19,21 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
         print("v:", v, v.shape)
         print("sm_scale:", sm_scale)
         print("causal:", causal)
+        print("window_size_left:", window_size_left)
+        print("window_size_right:", window_size_right)
         print("dropout_p:", dropout_p)
         print("philox_seed:", philox_seed)
         print("philox_offset:", philox_offset)
         print("use_exp2:", use_exp2)
+        print("cache_seqlens:", cache_seqlens)
 
     # cast to float32
     q = q.to(torch.float32)
     k = k.to(torch.float32)
     v = v.to(torch.float32)
+
+    # get seqlens
+    L_q, L_k = q.shape[1], k.shape[1]
     
     # Compute attention scores
     attention_scores = torch.matmul(q, k.transpose(-2, -1))
@@ -37,47 +47,146 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
 
     # Apply ALiBi if slopes are provided
     if alibi_slopes is not None:
-        L_q, L_k = q.shape[1], k.shape[1]
-        if DEBUG_CORE:
-            print("alibi_slopes:", alibi_slopes, alibi_slopes.shape)
-        alibi_bias = compute_alibi_tensor_ref(alibi_slopes, L_q, L_k)
-        if DEBUG_CORE:
-            print("alibi_bias:", alibi_bias, alibi_bias.shape)
-        alibi_bias = alibi_bias.reshape(-1, L_q, L_k)
-        if DEBUG_CORE:
-            print("alibi_bias_flat:", alibi_bias, alibi_bias.shape)
+        if cache_seqlens is not None:
+            # DECODE MODE: Special ALiBi handling
+            # In decode mode, k has shape [nheads, max_cache_len, head_dim]
+            # but only cache_seqlens positions are valid
+            
+            # The test's attn_bias_from_alibi_slopes uses this formula:
+            # relative_pos = torch.abs(row_idx + sk - sq - col_idx)
+            # where sk = actual valid key length, sq = query length
+            
+            row_idx = torch.arange(L_q, device=q.device, dtype=torch.float32).unsqueeze(1)
+            col_idx = torch.arange(L_k, device=q.device, dtype=torch.float32).unsqueeze(0)
+            
+            # Compute relative positions
+            # cache_seqlens is the actual number of valid keys (sk in the test)
+            # L_q is the query sequence length (sq in the test)
+            relative_pos = torch.abs(row_idx + cache_seqlens - L_q - col_idx)
+            
+            # Apply slopes
+            if alibi_slopes.dim() == 1:
+                # Shape: [nheads] -> [nheads, 1, 1]
+                alibi_slopes_expanded = alibi_slopes.view(-1, 1, 1)
+            else:
+                # Already has batch dimension
+                alibi_slopes_expanded = alibi_slopes
+            
+            alibi_bias = -alibi_slopes_expanded * relative_pos
+            
+            if DEBUG_CORE:
+                print(f"Decode ALiBi: cache_seqlens={cache_seqlens}, L_q={L_q}, L_k={L_k}")
+                print(f"relative_pos shape: {relative_pos.shape}")
+                print(f"alibi_bias shape: {alibi_bias.shape}")
+        else:
+            if DEBUG_CORE:
+                print("alibi_slopes:", alibi_slopes, alibi_slopes.shape)
+            alibi_bias = compute_alibi_tensor_ref(alibi_slopes, L_q, L_k)
+            if DEBUG_CORE:
+                print("alibi_bias:", alibi_bias, alibi_bias.shape)
+            alibi_bias = alibi_bias.reshape(-1, L_q, L_k)
+            if DEBUG_CORE:
+                print("alibi_bias_flat:", alibi_bias, alibi_bias.shape)
+
         attention_scaled_scores = attention_scaled_scores + alibi_bias
         if DEBUG_CORE:
             print("attention_scaled_scores after alibi:", attention_scaled_scores, attention_scaled_scores.shape)
 
-
-    # Apply causal mask if necessary
-    if causal:
-        L_q, L_k = q.shape[1], k.shape[1]
-        row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
-        col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
-        col_offset = L_q-L_k
-        causal_mask = row_idx >= (col_offset + col_idx)
+    # Apply masks
+    row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
+    col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
+    
+    if cache_seqlens is not None:
+        # We're in decode mode with a KV cache
+        # k and v are full allocated size, but only cache_seqlens positions are valid
+        
+        # Create a mask for valid cache positions
+        cache_mask = col_idx < cache_seqlens
+        
+        # Use cache_seqlens for offset calculation to match test's construct_local_mask
+        # which uses key_padding_mask.sum() as the sequence length
+        col_offset = cache_seqlens - L_q
+        
         if DEBUG_CORE:
-            print("causal_mask:", causal_mask)
-        # set -inf to places the causal mask is false
+            print(f"Cache mode: valid_len={cache_seqlens}, L_k={L_k}")
+            print(f"Using col_offset={col_offset} based on valid cache length")
+    else:
+        # Calculate offset for when seqlen_q != seqlen_k
+        # This offset aligns query positions to key positions
+        # When L_q < L_k, offset is positive, meaning query i maps to key position (i + offset)
+        # This is consistent with construct_local_mask in the tests which uses (sk - sq)
+        col_offset = L_k - L_q
+        cache_mask = None
+
+    mask_applied = False
+    if causal and (window_size_left, window_size_right) == (-1, -1):
+        # Pure causal: ensure query doesn't attend to future keys
+        # With offset, query i can attend to keys up to position (i + col_offset)
+        mask = row_idx >= (col_idx - col_offset)
+        mask_applied = True
+        if DEBUG_CORE:
+            print("causal_mask:", mask)
+    elif (window_size_left, window_size_right) != (-1, -1):
+        # Handle the case where window sizes exceed sequence length
+        if window_size_left >= L_k:
+            window_size_left = -1  # No left limit
+        if window_size_right >= L_k:
+            window_size_right = -1  # No right limit
+        
+        if causal:
+            # Causal + sliding window: ensure we don't attend to future
+            window_size_right = min(window_size_right, 0) if window_size_right != -1 else 0
+        
+        # Create sliding window mask
+        # Each query at position i attends to keys in [i + offset - left, i + offset + right]
+        if window_size_left == -1 and window_size_right == -1:
+            # No window restriction
+            mask = torch.ones((L_q, L_k), dtype=torch.bool, device=q.device)
+        else:
+            mask = torch.ones((L_q, L_k), dtype=torch.bool, device=q.device)
+            if window_size_left != -1:
+                # Each query at position i attends to keys from position (i - left) accounting for offset
+                mask = mask & (col_idx >= (row_idx + col_offset - window_size_left))
+            if window_size_right != -1:
+                # Each query at position i attends to keys up to position (i + right) accounting for offset
+                mask = mask & (col_idx <= (row_idx + col_offset + window_size_right))
+        
+        # Apply causal constraint
+        if causal:
+            causal_mask = row_idx >= (col_idx - col_offset)
+            mask = mask & causal_mask
+        
+        mask_applied = True
+        if DEBUG_CORE:
+            print(f"sliding_window_mask (left={window_size_left}, right={window_size_right}):", mask)
+        
+    # Apply cache mask if needed
+    if cache_mask is not None:
+        if mask_applied:
+            mask = mask & cache_mask
+        else:
+            mask = cache_mask
+            mask_applied = True
+    
+    # Apply the mask if created
+    if mask_applied:
         attention_scaled_scores = attention_scaled_scores.masked_fill(
-             torch.logical_not(causal_mask.unsqueeze(0)), float('-inf')
+            torch.logical_not(mask.unsqueeze(0)), float('-inf')
         )
         if DEBUG_CORE:
-            print("attention_scaled_scores after causal:", attention_scaled_scores, attention_scaled_scores.shape)
+            print("attention_scaled_scores after masking:", attention_scaled_scores, attention_scaled_scores.shape)
 
     # Compute max for numerical stability
     max_scores = torch.max(attention_scaled_scores, dim=-1, keepdim=True)[0]
     if DEBUG_CORE:
         print("max_scores:", max_scores, max_scores.shape)
-    if causal:
+    if mask_applied:
         # Replace -inf in max_scores with zeros to avoid NaN in subtraction
         max_scores = torch.where(
             torch.isinf(max_scores), torch.zeros_like(max_scores), max_scores
         )
-        if DEBUG:
-            print("max_scores if causal:", max_scores, max_scores.shape)
+        if DEBUG_CORE:
+            print("max_scores after mask handling:", max_scores, max_scores.shape)
 
     # Shift scores
     attention_shifted_scaled_scores = attention_scaled_scores - max_scores
@@ -98,7 +207,7 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
     sum_exp_scores = torch.sum(exp_scores, dim=-1, keepdim=True)
     if DEBUG_CORE:
         print("sum_exp_scores:", sum_exp_scores, sum_exp_scores.shape)
-    if causal:
+    if mask_applied:
         # if sum of exp scores is 0.0 it means scores where -inf, we cannot compute softmax and softmax_lse. Setting to 1 deals with -inf case cleanly 
         sum_exp_scores = torch.where(
         sum_exp_scores == 0,
@@ -158,7 +267,7 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
 
     return o, softmax_lse, sd_mask
 
-def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2):
+def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, window_size_left, window_size_right, layout, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2):
     """Compute reference output and softmax_lse using PyTorch's built-in function"""
 
     # Ensure the layout is 'bhsd'
@@ -194,7 +303,7 @@ def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout
 
     # Call the core attention function
     o, softmax_lse, sd_mask = attention_forward_core_ref_impl(
-        q, k, v, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2
+        q, k, v, sm_scale, causal, window_size_left, window_size_right, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2
     )
 
     if group_size != 1:
@@ -224,6 +333,8 @@ def attention_varlen_forward_pytorch_ref_impl(
     v,
     sm_scale,
     causal,
+    window_size_left,
+    window_size_right,
     layout,
     cu_seqlens_q,
     cu_seqlens_k,
@@ -302,7 +413,7 @@ def attention_varlen_forward_pytorch_ref_impl(
             alibi_slopes_i = None
 
         # Call the core attention function for this sequence
-        o_i, softmax_lse_i, sd_mask_i = attention_forward_core_ref_impl(q_i, k_i, v_i, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes_i, use_exp2)
+        o_i, softmax_lse_i, sd_mask_i = attention_forward_core_ref_impl(q_i, k_i, v_i, sm_scale, causal, window_size_left, window_size_right, dropout_p, philox_seed, philox_offset, alibi_slopes_i, use_exp2)
 
         # Reshape outputs back to original dimensions
         if group_size != 1:
@@ -328,8 +439,6 @@ def attention_varlen_forward_pytorch_ref_impl(
 
     return o, softmax_lse, sd_mask
 
-
-
 def attention_forward_pytorch_ref_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -338,6 +447,8 @@ def attention_forward_pytorch_ref_impl(
     sm_scale: float,
     alibi_slopes: Optional[torch.Tensor],
     causal: bool,
+    window_size_left: int,
+    window_size_right: int,
     layout: Literal["bshd", "bhsd", "thd"],
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
@@ -356,6 +467,8 @@ def attention_forward_pytorch_ref_impl(
             v.clone(), 
             sm_scale, 
             causal,
+            window_size_left,
+            window_size_right,
             layout,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -374,6 +487,8 @@ def attention_forward_pytorch_ref_impl(
                                                        v.clone(),
                                                        sm_scale,
                                                        causal,
+                                                       window_size_left,
+                                                        window_size_right,
                                                        layout,
                                                        dropout_p,
                                                        philox_seed,
@@ -385,3 +500,152 @@ def attention_forward_pytorch_ref_impl(
     out.copy_(o_ref.to(out.dtype))
     
     return softmax_lse_ref, sd_mask_ref
+
+def attention_decode_forward_ref_impl(
+        q: torch.Tensor, 
+        k_cache: torch.Tensor, 
+        v_cache: torch.Tensor,
+        k_new: Optional[torch.Tensor],
+        v_new: Optional[torch.Tensor],
+        out: torch.Tensor,
+        sm_scale: float, 
+        causal: bool,
+        window_size_left: int, 
+        window_size_right: int,
+        alibi_slopes: Optional[torch.Tensor], 
+        layout: Literal["bshd"], 
+        cache_seqlens: Optional[torch.Tensor], 
+        cache_batch_idx: Optional[torch.Tensor],
+):
+    """Compute reference output for decode attention using PyTorch's built-in functions"""
+    
+    # get batch size before any layout conversion
+    batch_size = q.shape[0]
+    
+    # handle cache_batch_idx
+    if cache_batch_idx is not None:
+        # remap batch indices for cache access
+        batch_indices = cache_batch_idx
+    else:
+        batch_indices = torch.arange(batch_size, device=q.device)
+    
+    # copy new keys and values into cache if provided (before any layout conversion)
+    if k_new is not None and v_new is not None:
+        _, seq_len_new, _, _ = k_new.shape  # shape is [batch, seq_len, nheads, head_dim] for bshd layout
+        
+        for b in range(batch_size):
+            cache_idx = batch_indices[b].item() if torch.is_tensor(batch_indices) else batch_indices
+            
+            # determine where to place new k/v in cache
+            if cache_seqlens is not None:
+                if torch.is_tensor(cache_seqlens):
+                    start_pos = cache_seqlens[b].item()
+                else:
+                    start_pos = cache_seqlens
+            else:
+                # if no cache_seqlens, assume we're filling from the beginning
+                start_pos = 0
+            
+            end_pos = start_pos + seq_len_new
+            
+            # copy new keys and values into cache (both are in bshd layout)
+            k_cache[cache_idx, start_pos:end_pos, :, :] = k_new[b, :, :, :]
+            v_cache[cache_idx, start_pos:end_pos, :, :] = v_new[b, :, :, :]
+    
+    # ensure the layout is 'bhsd'
+    if layout == "bshd":
+        q = q.transpose(1, 2).contiguous()
+        k_cache = k_cache.transpose(1, 2).contiguous()
+        v_cache = v_cache.transpose(1, 2).contiguous()
+    elif layout != "bhsd":
+        raise ValueError(f"Unknown layout {layout}")
+    
+    # prepare tensors
+    batch_size_q, nheads_q, seq_len_q, head_dim = q.shape
+    batch_size_cache, nheads_k, max_cache_len, head_dim_k = k_cache.shape
+    _, nheads_v, _, head_dim_v = v_cache.shape
+    
+    # validate dimensions
+    assert head_dim == head_dim_k == head_dim_v, f"Head dimensions must match: {head_dim}, {head_dim_k}, {head_dim_v}"
+    
+    # handle MQA/GQA
+    group_size = nheads_q // nheads_k
+    if nheads_q % nheads_k != 0:
+        raise ValueError("nheads_q must be divisible by nheads_k")
+    
+    # handle cache_batch_idx
+    if cache_batch_idx is not None:
+        # remap batch indices for cache access
+        batch_indices = cache_batch_idx
+    else:
+        batch_indices = torch.arange(batch_size, device=q.device)
+    
+    # prepare outputs
+    o = torch.zeros_like(q)
+    softmax_lse = torch.zeros((batch_size, nheads_q, seq_len_q), dtype=torch.float32, device=q.device)
+    
+    # process each batch element
+    for b in range(batch_size):
+        cache_idx = batch_indices[b].item() if torch.is_tensor(batch_indices) else batch_indices
+        
+        # determine valid cache length for this batch element
+        if cache_seqlens is not None:
+            if torch.is_tensor(cache_seqlens):
+                cache_len = cache_seqlens[b].item()
+                if k_new is not None:
+                    _, seq_len_new, _, _ = k_new.shape
+                    cache_len += seq_len_new
+            else:
+                cache_len = cache_seqlens
+                if k_new is not None:
+                    _, seq_len_new, _, _ = k_new.shape
+                    cache_len += seq_len_new
+        else:
+            cache_len = max_cache_len
+        
+        # CHANGE: Extract the full cache, not just valid portion
+        # This matches what the test does - it uses full k_cache_rep/v_cache_rep
+        k_b = k_cache[cache_idx, :, :, :]  # [nheads_k, max_cache_len, head_dim]
+        v_b = v_cache[cache_idx, :, :, :]  # [nheads_v, max_cache_len, head_dim]
+        q_b = q[b:b+1, :, :, :]  # [1, nheads_q, seq_len_q, head_dim]
+        
+        # handle MQA/GQA by expanding k and v
+        if group_size != 1:
+            # expand k and v to match q's number of heads
+            k_b = k_b.unsqueeze(1).expand(-1, group_size, -1, -1)
+            k_b = k_b.reshape(nheads_q, max_cache_len, head_dim)
+            
+            v_b = v_b.unsqueeze(1).expand(-1, group_size, -1, -1)
+            v_b = v_b.reshape(nheads_q, max_cache_len, head_dim)
+        
+        # reshape for attention_forward_core_ref_impl
+        q_b = q_b.reshape(nheads_q, seq_len_q, head_dim)
+        
+        # handle alibi slopes for this batch
+        alibi_slopes_b = None
+        if alibi_slopes is not None:
+            if alibi_slopes.dim() == 2:
+                alibi_slopes_b = alibi_slopes[b]
+            else:
+                alibi_slopes_b = alibi_slopes
+        
+        # call core attention function with cache information
+        o_b, softmax_lse_b, _ = attention_forward_core_ref_impl(
+            q_b, k_b, v_b, sm_scale, causal, window_size_left, window_size_right,
+            dropout_p=0.0, philox_seed=None, philox_offset=None, 
+            alibi_slopes=alibi_slopes_b, use_exp2=True,
+            cache_seqlens=cache_len,      # Pass valid cache length
+        )
+        
+        # store outputs
+        o[b, :, :, :] = o_b.reshape(nheads_q, seq_len_q, head_dim)
+        softmax_lse[b, :, :] = softmax_lse_b.reshape(nheads_q, seq_len_q)
+    
+    # restore original layout if necessary
+    if layout == "bshd":
+        o = o.transpose(1, 2)
+    
+    # copy output to the provided tensor
+    out.copy_(o.to(out.dtype))
+    
+    return softmax_lse

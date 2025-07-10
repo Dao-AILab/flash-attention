@@ -133,6 +133,9 @@ def _fwd_kernel_splitK(
     USE_ALIBI: tl.constexpr,
     PADDED_HEAD: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    USE_SLIDING_WINDOW: tl.constexpr,
+    WINDOW_SIZE_LEFT: tl.constexpr,
+    WINDOW_SIZE_RIGHT: tl.constexpr,
 ):
     # get program ids
     pid_m = tl.program_id(0)
@@ -297,35 +300,62 @@ def _fwd_kernel_splitK(
             alibi_bias = -1 * alibi_slope * relative_pos
             qk += (alibi_bias * 1.44269504)
 
-        # Apply causal mask if IS_CAUSAL is True
-        if IS_CAUSAL:
-            row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            col_idx = start_n + tl.arange(0, BLOCK_N)
-            
-            # create a N_CTX_Q x kv_len causal mask
-            col_offset = N_CTX_Q - N_CTX_K_FINAL
-            causal_mask = row_idx[:, None] >= (col_offset + col_idx[None, :])
+        # ------------------------------------------------------------------
+        # masking
+        # ------------------------------------------------------------------
+        if USE_SLIDING_WINDOW:
+            row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)        # q positions
+            col_idx = start_n + tl.arange(0, BLOCK_N)                # k positions
+            row = row_idx[:, None]                                   # [M,1]
+            col = col_idx[None, :]                                   # [1,N]
+    
+            if IS_CAUSAL:
+                # -------- causal + window --------
+                diag      = N_CTX_K_FINAL - N_CTX_Q                  # sk-sq
+                causal_ok = col <= row + diag
+                if WINDOW_SIZE_LEFT < 0:                             # only right window
+                    win_ok = col <= row + diag + WINDOW_SIZE_RIGHT
+                else:                                                # both sides
+                    win_ok = ((col >= row + diag - WINDOW_SIZE_LEFT) &
+                                (col <= row + diag + WINDOW_SIZE_RIGHT))
+                mask = ~(causal_ok & win_ok)                         # True ⇒ -inf
+            else:
+                # -------- non-causal window --------
+                sk, sq = N_CTX_K_FINAL, N_CTX_Q
+                if WINDOW_SIZE_LEFT < 0:
+                    mask = col > row + (sk - sq) + WINDOW_SIZE_RIGHT
+                else:
+                    right = tl.minimum(row + (sk - sq) + WINDOW_SIZE_RIGHT, sk)
+                    left  = row + (sk - sq) - WINDOW_SIZE_LEFT
+                    mask  = (col > right) | (col < left)
+            qk = tl.where(mask, float("-inf"), qk)
+        else:
+            if IS_CAUSAL:
+                row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+                col_idx = start_n + tl.arange(0, BLOCK_N)
 
-            # Apply the mask
-            qk = tl.where(causal_mask, qk, float("-inf"))
+                # create a N_CTX_Q x kv_len causal mask
+                col_offset = N_CTX_Q - N_CTX_K_FINAL
+                causal_mask = row_idx[:, None] >= (col_offset + col_idx[None, :])
+
+                # Apply the mask
+                qk = tl.where(causal_mask, qk, float("-inf"))
 
         # TODO: This is slow, and only needed at the last iteration.
         # Maybe we can unroll the last iteration instead?
         if BOUNDS_CHECKS_N:
             qk = tl.where(tl.arange(0, BLOCK_N) < hi - start_n, qk, float("-inf"))
 
-        # -- compute scaling constant ---
-        m_i_new = tl.maximum(m_i, tl.max(qk, 1))
-        if IS_CAUSAL:
-            alpha = tl.math.exp2(tl.where(m_i > float("-inf"), m_i - m_i_new, float("-inf")))
-        else:
-            alpha = tl.math.exp2(m_i - m_i_new)
-        # cause of nan because subtracting infs
-        if IS_CAUSAL:
-            qk = tl.where(qk > float("-inf"), qk - m_i_new[:, None], float("-inf"))
-        else:
-            qk = qk - m_i_new[:, None] 
-        
+        m_i_new = tl.maximum(m_i, tl.max(qk, 1))           # per-row max so far
+
+        # rows that are *all* -inf after masking
+        valid   = m_i_new > float("-inf")
+
+        # scale previous partial sums safely
+        alpha   = tl.where(valid, tl.math.exp2(m_i - m_i_new), 0.0)
+
+        # subtract the row max only on valid rows
+        qk      = tl.where(valid[:, None], qk - m_i_new[:, None], float("-inf"))
         p = tl.math.exp2(qk)
 
         # -- update m_i and l_i --
@@ -387,7 +417,6 @@ def _splitK_reduce(
     split_k: tl.constexpr,
     splitK_pow2: tl.constexpr,
     MASK_SPLITK: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
     PADDED_HEAD: tl.constexpr,
 ):
     # get pids
@@ -426,23 +455,15 @@ def _splitK_reduce(
 
     g_m = tl.max(l_m, axis=0)
     
-    if IS_CAUSAL:
-        l_m_offset = l_m - g_m
-        alpha = tl.where(l_m_offset > float("-inf"), tl.math.exp2(l_m_offset), 0.0)
-    else:
-        alpha = tl.math.exp2(l_m - g_m)
+    alpha = tl.where(l_m > float("-inf"), tl.math.exp2(l_m - g_m), 0.0)
 
     # read sum
     l_sum *= alpha
     g_sum = tl.sum(l_sum, axis=0)
     acc = acc * alpha[:, None]
 
-    if IS_CAUSAL:
-        # Avoid division by zero
-        g_sum_safe = tl.where(g_sum > 0, g_sum, 1.0)
-        acc_out = tl.sum(acc, axis=0) / g_sum_safe
-    else:
-        acc_out = tl.sum(acc, axis=0) / g_sum
+    g_sum_safe = tl.where(g_sum > 0, g_sum, 1.0)
+    acc_out    = tl.sum(acc, axis=0) / g_sum_safe
 
     # Store output
     z_id = pid_zhg // (H * G)
@@ -454,11 +475,10 @@ def _splitK_reduce(
 
     # Store lse
     l_ptrs = LSE + pid_zhg * stride_lse_zhg + pid_m
-    if IS_CAUSAL:
-        lse = tl.where(g_sum > 0, (g_m + tl.math.log2(g_sum)) / 1.44269504, g_m)
-        tl.store(l_ptrs, lse)
-    else:
-        tl.store(l_ptrs, (g_m + tl.math.log2(g_sum)) / 1.44269504)
+    lse_val = tl.where(g_sum > 0,
+                       (g_m + tl.math.log2(g_sum)) / 1.44269504,
+                       g_m)
+    tl.store(l_ptrs, lse_val)
 
 
 @triton.jit
@@ -571,10 +591,12 @@ def attention_decode_forward_triton_impl(
         v_new: Optional[torch.Tensor],
         out: torch.Tensor,
         sm_scale: float, 
-        causal: bool, 
+        causal: bool,
+        window_size_left: int, 
+        window_size_right: int,
         alibi_slopes: Optional[torch.Tensor], 
         layout: Literal["bshd"], 
-        cache_seqlens: Optional[Union[(int, torch.Tensor)]], 
+        cache_seqlens: Optional[torch.Tensor], 
         cache_batch_idx: Optional[torch.Tensor],
 ):
     # triton configs
@@ -586,8 +608,9 @@ def attention_decode_forward_triton_impl(
         
     # kernel_configs
     is_new_kv = True if k_new is not None and v_new is not None else False
-    use_alibi = False if alibi_slopes is None else True
+    use_alibi, (stride_az, stride_ah) = True if alibi_slopes is not None else False,  alibi_slopes.stride() if alibi_slopes is not None else (None, None)
     use_cache_seqlens = cache_seqlens is not None
+    use_sliding_window = window_size_left != -1 or window_size_right != -1
     SPLIT_K = None
     NUM_QUANT_GROUPS = 1
 
@@ -602,11 +625,6 @@ def attention_decode_forward_triton_impl(
         ( _, seqlen_kn, nheads_kn, dim_kn), (stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d) = (None, None, None, None), (None, None, None, None)
         (_, seqlen_vn, nheads_vn, dim_vn), (stride_vn_z, stride_vn_h, stride_vn_n, stride_vn_d) = (None, None, None, None), (None, None, None, None)
     (_, seqlen_o, nheads_o, dim_o), (stride_oz, stride_oh, stride_om, stride_od) = get_shape_and_strides_from_layout(out, layout)
-    if use_alibi:
-        stride_az, stride_ah = alibi_slopes.stride()
-    else:
-        stride_az, stride_ah = (None, None)
-
     assert dim_q == dim_kc == dim_vc, f"Dimensions must match: {dim_q}, {dim_kc}, {dim_vc}"
 
     # add extra information needed by the kernels
@@ -656,7 +674,7 @@ def attention_decode_forward_triton_impl(
     stride_mzhg, stride_m2, stride_ms, stride_mm = metadata.stride()
     stride_lse_zhg, stride_lse_m = lse.stride()
 
-    if False:
+    if DEBUG:
         print("batch_size, seqlen_q, nheads_q, dim_q", (batch_size, seqlen_q, nheads_q, dim_q))
         print("_, seqlen_kc, nheads_kc, dim_kc", (_, seqlen_kc, nheads_kc, dim_kc))
         print("dim_padded:", dim_padded)
@@ -748,6 +766,9 @@ def attention_decode_forward_triton_impl(
         USE_ALIBI=use_alibi,
         PADDED_HEAD=is_padded_head,
         GROUP_SIZE=group_size,
+        USE_SLIDING_WINDOW=use_sliding_window,
+        WINDOW_SIZE_LEFT=window_size_left,
+        WINDOW_SIZE_RIGHT=window_size_right,
         num_warps=num_warps_fwd,
         num_stages=num_stages,
     )
@@ -809,7 +830,6 @@ def attention_decode_forward_triton_impl(
         split_k=split_k, 
         splitK_pow2=splitK_pow2, 
         MASK_SPLITK=mask_split_k,
-        IS_CAUSAL=causal,
         PADDED_HEAD=is_padded_head,
         num_warps=num_warps_reduce)
 

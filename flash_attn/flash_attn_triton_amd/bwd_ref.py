@@ -7,7 +7,8 @@ DEBUG = False
 DEBUG_CORE = False
 
 def attention_backward_core_ref_impl(
-    do, q, k, v, o, softmax_lse, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2
+    do, q, k, v, o, softmax_lse, sm_scale, causal, window_size_left, window_size_right, 
+    dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2
 ):
     if DEBUG_CORE:
         print()
@@ -16,10 +17,12 @@ def attention_backward_core_ref_impl(
         print("q:", q, q.shape)
         print("k:", k, k.shape)
         print("v:", v, v.shape)
-        print("o:", o, o.shape) # is a bad number
+        print("o:", o, o.shape)
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
         print("sm_scale:", sm_scale)
         print("causal:", causal)
+        print("window_size_left:", window_size_left)
+        print("window_size_right:", window_size_right)
         print("dropout_p:", dropout_p)
         print("philox_seed:", philox_seed)
         print("philox_offset:", philox_offset)
@@ -32,7 +35,6 @@ def attention_backward_core_ref_impl(
     v = v.to(torch.float32)
     o = o.to(torch.float32)
     softmax_lse = softmax_lse.to(torch.float32)
-
 
     # recompute attention_scores. Make sure it matches the forward impl. i.e. It use float32
     attention_scores = torch.matmul(q, k.transpose(-2, -1))
@@ -50,51 +52,95 @@ def attention_backward_core_ref_impl(
             print("alibi_slopes:", alibi_slopes, alibi_slopes.shape)
         alibi_bias = compute_alibi_tensor_ref(alibi_slopes, L_q, L_k)
         alibi_bias = alibi_bias.reshape(-1, L_q, L_k)
-        if True:
+        if DEBUG_CORE:
             print("alibi_bias:", alibi_bias, alibi_bias.shape)
         attention_scaled_scores = attention_scaled_scores + alibi_bias
         if DEBUG_CORE:
             print("attention_scaled_scores after alibi:", attention_scaled_scores, attention_scaled_scores.shape)
 
-    # Apply causal mask if necessary
-    if causal:
-        L_q, L_k = q.shape[1], k.shape[1]
-        row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
-        col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
-        col_offset = L_q-L_k
-        causal_mask = row_idx >= (col_offset + col_idx)
+    # Apply masks
+    L_q, L_k = q.shape[1], k.shape[1]
+    row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
+    col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
+    col_offset = L_k - L_q
+    
+    mask_applied = False
+    if causal and (window_size_left, window_size_right) == (-1, -1):
+        # Pure causal: ensure query doesn't attend to future keys
+        mask = row_idx >= (col_idx - col_offset)
+        mask_applied = True
         if DEBUG_CORE:
-            print("causal_mask:", causal_mask)
-        # set -inf to places the causal mask is false
+            print("causal_mask:", mask)
+    elif (window_size_left, window_size_right) != (-1, -1):
+        # Handle the case where window sizes exceed sequence length
+        if window_size_left >= L_k:
+            window_size_left = -1  # No left limit
+        if window_size_right >= L_k:
+            window_size_right = -1  # No right limit
+        
+        if causal:
+            # Causal + sliding window: ensure we don't attend to future
+            window_size_right = min(window_size_right, 0) if window_size_right != -1 else 0
+        
+        # Create sliding window mask
+        # Each query at position i attends to keys in [i + offset - left, i + offset + right]
+        if window_size_left == -1 and window_size_right == -1:
+            # No window restriction
+            mask = torch.ones((L_q, L_k), dtype=torch.bool, device=q.device)
+        else:
+            mask = torch.ones((L_q, L_k), dtype=torch.bool, device=q.device)
+            if window_size_left != -1:
+                # Each query at position i attends to keys from position (i - left) accounting for offset
+                mask = mask & (col_idx >= (row_idx + col_offset - window_size_left))
+            if window_size_right != -1:
+                # Each query at position i attends to keys up to position (i + right) accounting for offset
+                mask = mask & (col_idx <= (row_idx + col_offset + window_size_right))
+        
+        # Apply causal constraint
+        if causal:
+            causal_mask = row_idx >= (col_idx - col_offset)
+            mask = mask & causal_mask
+        
+        mask_applied = True
+        if DEBUG_CORE:
+            print(f"sliding_window_mask (left={window_size_left}, right={window_size_right}):", mask)
+    
+    # Apply the mask if created
+    if mask_applied:
         attention_scaled_scores = attention_scaled_scores.masked_fill(
-             torch.logical_not(causal_mask.unsqueeze(0)), float('-inf')
+            torch.logical_not(mask.unsqueeze(0)), float('-inf')
         )
         if DEBUG_CORE:
-            print("attention_scaled_scores after causal:", attention_scaled_scores, attention_scaled_scores.shape)
+            print("attention_scaled_scores after masking:", attention_scaled_scores, attention_scaled_scores.shape)
 
     # compute probabilities using softmax_lse
     if use_exp2:
         RCP_LN = 1 / math.log(2)
         attention_scaled_scores_base2 = attention_scaled_scores * RCP_LN
         softmax_lse_base2 = softmax_lse * RCP_LN
-        softmax_lse_3d =  softmax_lse_base2.unsqueeze(-1)
+        softmax_lse_3d = softmax_lse_base2.unsqueeze(-1)
         p = torch.exp2(attention_scaled_scores_base2 - softmax_lse_3d)
     else:
-        softmax_lse_3d =  softmax_lse.unsqueeze(-1)
+        softmax_lse_3d = softmax_lse.unsqueeze(-1)
         p = torch.exp(attention_scaled_scores - softmax_lse_3d)
+    
+    # Zero out positions outside the mask
+    if mask_applied:
+        p = p.masked_fill(torch.logical_not(mask.unsqueeze(0)), 0.0)
+    
     if DEBUG_CORE:
         print("softmax_lse_3d:", softmax_lse_3d, softmax_lse_3d.shape)
         print("p:", p, p.shape)
 
     if dropout_p > 0.0:
         rand_vals = torch.rand(p.shape, generator=torch.Generator(device=p.device).manual_seed(philox_seed), device=p.device, dtype=p.dtype)
-        dropout_mask, dropout_scale = rand_vals > dropout_p,  (1.0 / (1 - dropout_p))
-        if DEBUG:
+        dropout_mask, dropout_scale = rand_vals > dropout_p, (1.0 / (1 - dropout_p))
+        if DEBUG_CORE:
             print("dropout_scale:", dropout_scale)
             print("dropout_mask:", dropout_mask)
             
         p_drop = torch.where(dropout_mask, p, torch.zeros_like(p))
-        p_drop_scaled =  p_drop * dropout_scale
+        p_drop_scaled = p_drop * dropout_scale
         if DEBUG_CORE:
             print("dropout_scale:", dropout_scale)
             print("p_drop:", p_drop, p_drop.shape)
@@ -107,7 +153,7 @@ def attention_backward_core_ref_impl(
 
         # compute dp
         dp_dropout = torch.matmul(do, v.transpose(-2, -1))
-        dp = torch.where(dropout_mask, dp_dropout , torch.zeros_like(dp_dropout)) * dropout_scale
+        dp = torch.where(dropout_mask, dp_dropout, torch.zeros_like(dp_dropout)) * dropout_scale
         if DEBUG_CORE:
             print("dp_dropout:", dp_dropout, dp_dropout.shape)
             print("dp:", dp, dp.shape)
@@ -127,9 +173,14 @@ def attention_backward_core_ref_impl(
         delta = torch.sum(o * do, axis=-1).unsqueeze(-1)
     else:
         delta = torch.sum(p * dp, axis=-1).unsqueeze(-1)
-    if DEBUG:
+    if DEBUG_CORE:
         print("delta:", delta, delta.shape)
     dscores_scaled = p * (dp - delta)
+    
+    # Zero out gradients for positions outside the mask
+    if mask_applied:
+        dscores_scaled = dscores_scaled.masked_fill(torch.logical_not(mask.unsqueeze(0)), 0.0)
+    
     ds = dscores_scaled * sm_scale
     if DEBUG_CORE:
         print("dscores_scaled:", dscores_scaled, dscores_scaled.shape)
@@ -167,6 +218,8 @@ def attention_varlen_backward_pytorch_ref_impl(
     softmax_lse,
     sm_scale,
     causal,
+    window_size_left,
+    window_size_right,
     layout,
     cu_seqlens_q,
     cu_seqlens_k,
@@ -255,6 +308,8 @@ def attention_varlen_backward_pytorch_ref_impl(
             softmax_lse_i,
             sm_scale,
             causal,
+            window_size_left,
+            window_size_right,
             dropout_p, 
             philox_seed, 
             philox_offset,
@@ -270,7 +325,8 @@ def attention_varlen_backward_pytorch_ref_impl(
         if group_size != 1:
             # Reshape dq_i and delta_i back to original shape
             dq_i = dq_i.view(dq_i.shape[0], nheads_k, group_size, head_dim)
-            delta_i = delta_i.view(delta_i.shape[0], nheads_k, group_size)
+            L_q_i = delta_i.shape[1]
+            delta_i = delta_i.view(nheads_k, group_size, L_q_i)
             # Sum dk_i and dv_i over group dimension
             dk_i = dk_i.view(dk_i.shape[0], nheads_k, group_size, head_dim)
             dv_i = dv_i.view(dv_i.shape[0], nheads_k, group_size, head_dim)
@@ -278,7 +334,7 @@ def attention_varlen_backward_pytorch_ref_impl(
             dv_i = dv_i.sum(dim=2)
             # Reshape dq_i back to [L_q_i, nheads_q, head_dim]
             dq_i = dq_i.reshape(dq_i.shape[0], nheads_q, head_dim)
-            delta_i = delta_i.reshape(delta_i.shape[0], nheads_q)
+            delta_i = delta_i.reshape(nheads_q, L_q_i)
         else:
             # No need to reshape
             pass
@@ -300,6 +356,8 @@ def attention_vanilla_backward_pytorch_ref_impl(
     softmax_lse,
     sm_scale,
     causal,
+    window_size_left,
+    window_size_right,
     layout,
     dropout_p,
     philox_seed,
@@ -366,6 +424,8 @@ def attention_vanilla_backward_pytorch_ref_impl(
         softmax_lse,
         sm_scale,
         causal,
+        window_size_left,
+        window_size_right,
         dropout_p, 
         philox_seed, 
         philox_offset,
@@ -421,6 +481,8 @@ def attention_backward_pytorch_ref_impl(
     sm_scale: float,
     alibi_slopes: Optional[torch.Tensor],
     causal: bool,
+    window_size_left: int,
+    window_size_right: int,
     layout: Literal["bshd", "bhsd", "thd"],
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
@@ -441,6 +503,8 @@ def attention_backward_pytorch_ref_impl(
             softmax_lse,
             sm_scale,
             causal,
+            window_size_left,
+            window_size_right,
             layout,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -462,6 +526,8 @@ def attention_backward_pytorch_ref_impl(
             softmax_lse,
             sm_scale,
             causal,
+            window_size_left,
+            window_size_right,
             layout,
             dropout_p, 
             philox_seed, 

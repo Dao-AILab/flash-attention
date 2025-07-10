@@ -5,7 +5,7 @@ from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
 from .bwd_prefill_fused_atomics import attention_prefill_backward_triton_fused_atomics_impl
 from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_split_fused_no_atomics_impl
 from .fwd_decode import attention_decode_forward_triton_impl
-from .fwd_ref import attention_forward_pytorch_ref_impl
+from .fwd_ref import attention_forward_pytorch_ref_impl, attention_decode_forward_ref_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
 from .utils import DEBUG, USE_REF, MetaData, is_fp8
 from einops import rearrange, repeat
@@ -101,6 +101,8 @@ def fwd(q: torch.Tensor,
                                                 metadata.sm_scale,
                                                 metadata.alibi_slopes,
                                                 metadata.causal,
+                                                window_size_left, 
+                                                window_size_right,
                                                 metadata.layout,
                                                 metadata.cu_seqlens_q,
                                                 metadata.cu_seqlens_k,
@@ -123,6 +125,8 @@ def fwd(q: torch.Tensor,
                                                 metadata.sm_scale,
                                                 metadata.alibi_slopes,
                                                 metadata.causal,
+                                                window_size_left,
+                                                window_size_right,
                                                 None,
                                                 metadata.layout,
                                                 metadata.cu_seqlens_q,
@@ -253,6 +257,8 @@ def bwd(
             softmax_scale,
             alibi_slopes,
             causal,
+            window_size_left,
+            window_size_right,
             "bshd",
             None,
             None,
@@ -472,6 +478,8 @@ def varlen_fwd(
                                                 metadata.sm_scale,
                                                 metadata.alibi_slopes,
                                                 metadata.causal,
+                                                window_size_left, 
+                                                window_size_right,
                                                 metadata.layout,
                                                 metadata.cu_seqlens_q,
                                                 metadata.cu_seqlens_k,
@@ -494,6 +502,8 @@ def varlen_fwd(
                                                             metadata.sm_scale,
                                                             metadata.alibi_slopes,
                                                             metadata.causal,
+                                                            window_size_left, 
+                                                            window_size_right,
                                                             None,
                                                             metadata.layout,
                                                             metadata.cu_seqlens_q,
@@ -626,6 +636,8 @@ def varlen_bwd(
             softmax_scale,
             alibi_slopes,
             causal,
+            window_size_left,
+            window_size_right,
             "thd",
             cu_seqlens_q,
             cu_seqlens_k,
@@ -801,8 +813,21 @@ def fwd_kvcache(
     metadata.layout = "bshd"
     metadata.max_seqlens_q = q.shape[1]
     metadata.max_seqlens_k = k_cache.shape[1]
-    metadata.cache_seqlens = cache_seqlens
     metadata.cache_batch_idx = cache_batch_idx
+    if isinstance(cache_seqlens, int):
+        metadata.cache_seqlens = torch.tensor(cache_seqlens, device=q.device)
+    else:
+        metadata.cache_seqlens = cache_seqlens
+
+    # window_size can be a tensor sometimes
+    if isinstance(window_size_left, torch.Tensor):
+        metadata.window_size_left = int(window_size_left.item())
+    else:
+        metadata.window_size_left = window_size_left
+    if isinstance(window_size_right, torch.Tensor):
+        metadata.window_size_right = int(window_size_right.item())
+    else:
+        metadata.window_size_right = window_size_right
 
     k_new = k
     v_new = v
@@ -829,7 +854,7 @@ def fwd_kvcache(
 
     # Rotary Embedding Implementation
     if apply_rotary:
-        if metadata.causal:     # NOTE: when support is added. Add `or metadata.local`
+        if metadata.causal or (window_size_left != -1 or window_size_right !=-1):     # NOTE: when support is added. Add `or metadata.local`
             q_ro = apply_rotary_emb(
                 q,
                 metadata.rotary_cos,
@@ -860,8 +885,29 @@ def fwd_kvcache(
         q, k_new = q_ro.to(q.dtype), k_ro.to(q.dtype)
 
     # launch kernel
-    DECODE_KERNEL= True # os.environ.get('DECODE_KERNEL', '0').lower() in ('1', 'true', 'yes')
-    if DECODE_KERNEL:
+    if USE_REF:
+        if DEBUG:
+            print("Using reference implementation")
+        softmax_lse_ref = attention_decode_forward_ref_impl(
+                q,
+                k_cache,
+                v_cache,
+                k_new,
+                v_new,
+                out,
+                metadata.sm_scale,
+                metadata.causal,
+                metadata.window_size_left, 
+                metadata.window_size_right,
+                metadata.alibi_slopes,
+                metadata.layout,
+                metadata.cache_seqlens,
+                metadata.cache_batch_idx,
+            )
+        softmax_lse=softmax_lse_ref
+    else:
+        if DEBUG:
+            print("Using Triton implementation") 
         softmax_lse_triton = attention_decode_forward_triton_impl(
             q,
             k_cache,
@@ -871,38 +917,14 @@ def fwd_kvcache(
             out,
             metadata.sm_scale,
             metadata.causal,
+            metadata.window_size_left, 
+            metadata.window_size_right,
             metadata.alibi_slopes,
             metadata.layout,
             metadata.cache_seqlens,
             metadata.cache_batch_idx,
         )
-    else:
-        softmax_lse_triton, sd_mask_triton = attention_prefill_forward_triton_impl(
-                                                q,
-                                                k_cache,
-                                                v_cache,
-                                                out,
-                                                metadata.sm_scale,
-                                                metadata.alibi_slopes,
-                                                metadata.causal,
-                                                None,
-                                                metadata.layout,
-                                                metadata.cu_seqlens_q,
-                                                metadata.cu_seqlens_k,
-                                                metadata.max_seqlens_q,
-                                                metadata.max_seqlens_k,
-                                                metadata.cache_seqlens,
-                                                metadata.cache_batch_idx,
-                                                metadata.dropout_p,
-                                                metadata.philox_seed,
-                                                metadata.philox_offset,
-                                                metadata.return_softmax,
-                                                USE_EXP2,
-                                                None,
-                                                None,
-                                                None,
-                                                None)
-    softmax_lse = softmax_lse_triton
+        softmax_lse = softmax_lse_triton
     
     if DEBUG:
         print("out:", out, out.shape)
