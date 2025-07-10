@@ -972,7 +972,10 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             tile_count_semaphore.zero_();  // If varlen we'll manually do the zero-ing
         }
         params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() : nullptr;
-        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
+
+        params.num_splits_dynamic_ptr = use_dynamic_split ?
+                                        tile_count_semaphore.data_ptr<int>() + int(scheduler_needs_semaphore)
+                                        : nullptr;
     }
 
     if (q_v_.has_value()) {
