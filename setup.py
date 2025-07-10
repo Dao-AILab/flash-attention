@@ -22,6 +22,7 @@ from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 import torch
 from torch.utils.cpp_extension import (
     BuildExtension,
+    COMMON_NVCC_FLAGS,
     CppExtension,
     CUDAExtension,
     CUDA_HOME,
@@ -223,7 +224,16 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     compiler_c17_flag=["-O3", "-std=c++17"]
     # Add Windows-specific flags
     if sys.platform == "win32" and os.getenv('DISTUTILS_USE_SDK') == '1':
-        nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus"])
+        remove_flags = [    
+        "-D__CUDA_NO_HALF_OPERATORS__",
+        "-D__CUDA_NO_HALF_CONVERSIONS__",
+        "-D__CUDA_NO_HALF2_OPERATORS__",
+        "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "--expt-relaxed-constexpr",]
+        for flag in remove_flags:
+            if flag in COMMON_NVCC_FLAGS:
+                COMMON_NVCC_FLAGS.remove(flag)
+        nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus", "-Xcudafe", "--diag_suppress=221", "-Xcudafe", "--diag_suppress=177"])
         compiler_c17_flag=["-O2", "/std:c++17", "/Zc:__cplusplus"]
 
     ext_modules.append(
@@ -552,7 +562,7 @@ setup(
         "Operating System :: Unix",
     ],
     ext_modules=ext_modules,
-    cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": NinjaBuildExtension}
+    cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": NinjaBuildExtension.with_options(use_ninja=True, verbose=True)}
     if ext_modules
     else {
         "bdist_wheel": CachedWheelsCommand,
