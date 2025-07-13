@@ -1064,7 +1064,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
-        max_seqlen_q: Optional[cutlass.Int32] = None,
         softcap: cutlass.Float32 | float | None = None,
         window_size_left: cutlass.Int32 | int | None = None,
         window_size_right: cutlass.Int32 | int | None = None,

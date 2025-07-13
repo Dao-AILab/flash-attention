@@ -423,7 +423,6 @@ def test_flash_attn_varlen_output(
                 # max_seqlen_k,
                 seqused_q=seqused_q,
                 seqused_k=seqused_k,
-                max_seqlen_q=max_seqlen_q,
                 causal=causal,
                 # qv=qv_unpad,
                 # q_descale=q_descale,

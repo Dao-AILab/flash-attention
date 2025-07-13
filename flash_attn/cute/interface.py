@@ -56,7 +56,6 @@ def _flash_attn_fwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
-    max_seqlen_q: Optional[int] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     softcap: Optional[float] = None,
@@ -77,7 +76,7 @@ def _flash_attn_fwd(
         total_q = batch_size * seqlen_q
     else:
         batch_size = cu_seqlens_q.shape[0] - 1
-        seqlen_q = max_seqlen_q
+        seqlen_q = None
         total_q = q.shape[0]
     seqlen_k, num_head_kv, _ = k.shape[-3:]
     head_dim_v = v.shape[-1]
@@ -89,7 +88,6 @@ def _flash_attn_fwd(
         assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
         assert cu_seqlens_k.shape == (batch_size + 1,), "cu_seqlens_k must have shape (batch_size + 1,)"
     if cu_seqlens_q is not None:
-        assert max_seqlen_q is not None, "max_seqlen_q must be provided if cu_seqlens_q is provided"
         assert cu_seqlens_q.shape == (batch_size + 1,), "cu_seqlens_q must have shape (batch_size + 1,)"
     assert seqused_q is None or seqused_q.shape == (batch_size,), "seqused_q must have shape (batch_size,)"
     assert seqused_k is None or seqused_k.shape == (batch_size,), "seqused_k must have shape (batch_size,)"
@@ -130,7 +128,6 @@ def _flash_attn_fwd(
         from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None
         for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
     ]
-    max_seqlen_q = cutlass.Int32(max_seqlen_q) if max_seqlen_q is not None else None
     if causal:
         window_size_right = 0
     local = window_size_left is not None or window_size_right is not None
@@ -187,12 +184,12 @@ def _flash_attn_fwd(
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
             cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
-            max_seqlen_q, softcap, window_size_left, window_size_right,
+            softcap, window_size_left, window_size_right,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
         cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
-        max_seqlen_q, softcap, window_size_left, window_size_right,
+        softcap, window_size_left, window_size_right,
     )
     return out, lse
 
@@ -444,7 +441,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         cu_seqlens_k: Optional[torch.Tensor],
         seqused_q: Optional[torch.Tensor],
         seqused_k: Optional[torch.Tensor],
-        max_seqlen_q: Optional[int],
         softmax_scale: Optional[float] = None,
         causal: bool = False,
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
@@ -458,7 +454,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             cu_seqlens_k,
             seqused_q,
             seqused_k,
-            max_seqlen_q,
             softmax_scale=softmax_scale,
             causal=causal,
             window_size_left=window_size[0],
@@ -466,7 +461,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             softcap=softcap,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
-        ctx.max_seqlen_q = max_seqlen_q
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -509,7 +503,6 @@ def flash_attn_varlen_func(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
-    max_seqlen_q: Optional[int] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
@@ -523,7 +516,6 @@ def flash_attn_varlen_func(
         cu_seqlens_k,
         seqused_q,
         seqused_k,
-        max_seqlen_q,
         softmax_scale,
         causal,
         window_size,
