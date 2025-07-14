@@ -526,19 +526,14 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
              USE_SLIDING_WINDOW: tl.constexpr, WINDOW_SIZE_LEFT: tl.constexpr, WINDOW_SIZE_RIGHT: tl.constexpr, BLOCK_M: tl.constexpr,
              BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr, PRE_LOAD_V: tl.constexpr, USE_BIAS: tl.constexpr,
              ENABLE_DROPOUT: tl.constexpr, RETURN_SCORES: tl.constexpr, USE_ALIBI: tl.constexpr, USE_EXP2: tl.constexpr, 
-             IS_FP8: tl.constexpr, FP8_MAX: tl.constexpr, FP8_OUTPUT: tl.constexpr, FLIP_GRID: tl.constexpr):
+             IS_FP8: tl.constexpr, FP8_MAX: tl.constexpr, FP8_OUTPUT: tl.constexpr):
     # set params
     ACCUMULATOR_TYPE = tl.float32
 
     # compute offsets
-    if FLIP_GRID:
-        off_z = tl.program_id(0)
-        off_h_q = tl.program_id(1)
-        start_m = tl.program_id(2)
-    else:
-        start_m = tl.program_id(0)
-        off_h_q = tl.program_id(1)
-        off_z = tl.program_id(2)
+    off_z = tl.program_id(0)
+    off_h_q = tl.program_id(1)
+    start_m = tl.program_id(2)
     # If MQA / GQA, set the K and V head offsets appropriately.
     GROUP_SIZE: tl.constexpr = HQ // HK
     if GROUP_SIZE != 1:
@@ -899,19 +894,116 @@ def attention_prefill_forward_triton_impl(
                                         descale_v: Optional[torch.Tensor],
                                         descale_o: Optional[torch.Tensor],
 ):
+    # get params, strides and shape
+    IS_VARLEN = layout == "thd"
+
+    # common assertions
+    assert 0.0 <= dropout_p <= 1.0, f"dropout_p must be between 0 and 1, got {dropout_p}"
+    assert q.device == k.device == v.device == o.device, \
+        f"All tensors must be on the same device. Got: q={q.device}, k={k.device}, v={v.device}, o={o.device}"
+    assert q.dtype == k.dtype == v.dtype, "q, k, v must have the same dtype"
+    current_device = torch.cuda.current_device()
+    assert q.is_cuda and q.device.index == current_device, f"Device mismatch: Kernel will launch on cuda:{current_device}, but tensors are on {q.device}"
+    
+    # get shapes and strides
+    if IS_VARLEN:
+        # shape
+        total_seqlen_q, nheads_q, head_size_q = q.shape
+        total_seqlen_k, nheads_k, head_size_k = k.shape
+        total_seqlen_v, nheads_v, head_size_v = v.shape
+        
+        # assert shapes
+        assert cu_seqlens_q is not None, "cu_seqlens_q must be provided for varlen layout"
+        assert cu_seqlens_k is not None, "cu_seqlens_k must be provided for varlen layout"
+        assert max_seqlens_q is not None and max_seqlens_q > 0, "max_seqlens_q must be provided and positive for varlen layout"
+        assert max_seqlens_k is not None and max_seqlens_k > 0, "max_seqlens_k must be provided and positive for varlen layout"
+        
+        # assert head dimensions
+        assert head_size_q == head_size_k == head_size_v, f"head sizes must match: q={head_size_q}, k={head_size_k}, v={head_size_v}"
+        assert nheads_k == nheads_v, f"k and v must have same number of heads: k={nheads_k}, v={nheads_v}"
+        assert nheads_q % nheads_k == 0, f"nheads_q {nheads_q} must be divisible by nheads_k {nheads_k} for GQA/MQA"
+        
+        # assert output shapes
+        assert o.shape == (total_seqlen_q, nheads_q, head_size_q), f"o shape {o.shape} != expected {(total_seqlen_q, nheads_q, head_size_q)}"
+        
+        # assert cu_seqlens
+        assert cu_seqlens_q.dtype == torch.int32, f"cu_seqlens_q must be int32, got {cu_seqlens_q.dtype}"
+        assert cu_seqlens_k.dtype == torch.int32, f"cu_seqlens_k must be int32, got {cu_seqlens_k.dtype}"
+        assert cu_seqlens_q[0] == 0, "cu_seqlens_q must start with 0"
+        assert cu_seqlens_k[0] == 0, "cu_seqlens_k must start with 0"
+        assert cu_seqlens_q[-1] == total_seqlen_q, f"cu_seqlens_q[-1] {cu_seqlens_q[-1]} != total_seqlen_q {total_seqlen_q}"
+        assert cu_seqlens_k[-1] == total_seqlen_k, f"cu_seqlens_k[-1] {cu_seqlens_k[-1]} != total_seqlen_k {total_seqlen_k}"
+        
+        # set vars
+        batch = len(cu_seqlens_q) - 1
+        head_size = head_size_q
+        
+        # softmax_lse shape
+        softmax_lse = torch.zeros((nheads_q, total_seqlen_q), device=q.device, dtype=torch.float32)
+        
+        # strides
+        stride_qb, stride_qh, stride_qm, stride_qd = 0, q.stride(1), q.stride(0), q.stride(2)
+        stride_kb, stride_kh, stride_kn, stride_kd = 0, k.stride(1), k.stride(0), k.stride(2)
+        stride_vb, stride_vh, stride_vn, stride_vd = 0, v.stride(1), v.stride(0), v.stride(2)
+        stride_ob, stride_oh, stride_om, stride_od = 0, o.stride(1), o.stride(0), o.stride(2)
+        stride_lse_z, stride_lse_h, stride_lse_m = 0, softmax_lse.stride(0), softmax_lse.stride(1)
+    else:
+        # shapes
+        batch_q, seqlen_q, nheads_q, head_size_q = q.shape
+        batch_k, seqlen_k, nheads_k, head_size_k = k.shape
+        batch_v, seqlen_v, nheads_v, head_size_v = v.shape
+        
+        # assert batch dimensions
+        assert batch_q == batch_k == batch_v, f"batch sizes must match: q={batch_q}, k={batch_k}, v={batch_v}"
+        
+        # assert head dimensions
+        assert head_size_q == head_size_k == head_size_v, f"head sizes must match: q={head_size_q}, k={head_size_k}, v={head_size_v}"
+        assert nheads_k == nheads_v, f"k and v must have same number of heads: k={nheads_k}, v={nheads_v}"
+        assert nheads_q % nheads_k == 0, f"nheads_q {nheads_q} must be divisible by nheads_k {nheads_k} for GQA/MQA"
+        
+        # assert sequence lengths
+        assert seqlen_k == seqlen_v, f"k and v sequence lengths must match: k={seqlen_k}, v={seqlen_v}"
+        
+        # assert output shapes
+        assert o.shape == (batch_q, seqlen_q, nheads_q, head_size_q), f"o shape {o.shape} != expected {(batch_q, seqlen_q, nheads_q, head_size_q)}"
+        
+        # set vars
+        batch = batch_q
+        head_size = head_size_q
+        max_seqlens_q = seqlen_q
+        max_seqlens_k = seqlen_k
+        
+        # softmax_lse shape
+        softmax_lse = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
+        
+        # strides
+        stride_qb, stride_qh, stride_qm, stride_qd = q.stride(0), q.stride(2), q.stride(1), q.stride(3)
+        stride_kb, stride_kh, stride_kn, stride_kd = k.stride(0), k.stride(2), k.stride(1), k.stride(3)
+        stride_vb, stride_vh, stride_vn, stride_vd = v.stride(0), v.stride(2), v.stride(1), v.stride(3)
+        stride_ob, stride_oh, stride_om, stride_od = o.stride(0), o.stride(2), o.stride(1), o.stride(3)
+        stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
+
+    # fp8 setup and assertions
     IS_FP8 = is_fp8(q)
     if IS_FP8:
-        FP8_MAX: tl.constexpr = torch.finfo(q.dtype).max
+        # we already asserted that q, k, v all have the same dtype, so no need to check each one
 
-        assert is_fp8(q) and is_fp8(k) and is_fp8(v), f"Non fp8 type found: q.dtype={q.dtype}, k.dtype={k.dtype}, v.dtype={v.dtype}. All tensors must be fp8."
+        FP8_MAX = torch.finfo(q.dtype).max
 
+        # Check descale tensors
+        assert descale_q is not None, "descale_q must be provided when using fp8"
+        assert descale_k is not None, "descale_k must be provided when using fp8"
+        assert descale_v is not None, "descale_v must be provided when using fp8"
+        
         if is_fp8(o):
             FP8_OUTPUT = True
-            assert descale_o is not None, f"descale_o is None. In fp8, you need to pass a tensor for descale_o along with a tensor for the output."
+            assert descale_o is not None, f"descale_o is None. In fp8, you need to pass a tensor for descale_o along with a tensor o."
         else:
             FP8_OUTPUT = False
+            # o should be fp32 or fp16/bf16
+            assert o.dtype in [torch.float16, torch.bfloat16, torch.float32], \
+                f"Output tensor o must be fp16, bf16, or fp32 when using fp8, got {o.dtype}"
 
-        # Get strides for the kernel
         stride_descale_q_z = descale_q.stride(0) if descale_q is not None else None
         stride_descale_k_z = descale_k.stride(0) if descale_k is not None else None
         stride_descale_v_z = descale_v.stride(0) if descale_v is not None else None
@@ -921,64 +1013,22 @@ def attention_prefill_forward_triton_impl(
         FP8_OUTPUT = False
         descale_q = descale_k = descale_v = descale_o = None
         stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = stride_descale_o_z = None
-
-    # check flags
-    IS_VARLEN = layout == "thd"
+        
+        # check output dtype matches input dtype when not using fp8
+        assert o.dtype == q.dtype, f"Output dtype {o.dtype} must match input dtype {q.dtype} when not using fp8"
+    
+    # check features
     use_sliding_window = window_size_left != -1 or window_size_right!= -1
     use_alibi, (stride_az, stride_ah) = (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
-    is_inference = False if cache_seqlens is None else True
-    if is_inference:
-        assert layout == "bshd", f"{layout} layout is not supported with inference. Use bshd layout"
-    if DEBUG:
-        print(f"is_inference:", is_inference)
-
     # NOTE: a large bias tensor leads to overflow during pointer arithmetic
     if (bias is not None):
         assert (bias.numel() < 2**31)
-
-    # get shape and strides
-    if IS_VARLEN:  # thd layout
-        # shape
-        total_q, nheads_q, head_size = q.shape
-        _, nheads_k, _ = k.shape
-        assert cu_seqlens_q is not None
-        batch = len(cu_seqlens_q) - 1
-
-        # softmax_lse is the log of the normalization constant / sum of expoential score(unnormalzied probablities)
-        softmax_lse = torch.zeros((nheads_q, total_q), device=q.device, dtype=torch.float32)
-
-        # strides
-        stride_qb, stride_qh, stride_qm, stride_qd = 0, q.stride(1), q.stride(0), q.stride(2)
-        stride_kb, stride_kh, stride_kn, stride_kd = 0, k.stride(1), k.stride(0), k.stride(2)
-        stride_vb, stride_vh, stride_vn, stride_vd = 0, v.stride(1), v.stride(0), v.stride(2)
-        stride_ob, stride_oh, stride_om, stride_od = 0, o.stride(1), o.stride(0), o.stride(2)
-        stride_lse_z, stride_lse_h, stride_lse_m = 0, softmax_lse.stride(0), softmax_lse.stride(1)
-    else:  # bshd layout
-        # shape
-        batch, seqlen_q, nheads_q, head_size = q.shape
-        _, _, nheads_k, _ = k.shape
-
-        # softmax_lse is the log of the normalization constant / sum of expoential score(unnormalzied probablities)
-        softmax_lse = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
-
-        # strides
-        stride_qb, stride_qh, stride_qm, stride_qd = q.stride(0), q.stride(2), q.stride(1), q.stride(3)
-        stride_kb, stride_kh, stride_kn, stride_kd = k.stride(0), k.stride(2), k.stride(1), k.stride(3)
-        stride_vb, stride_vh, stride_vn, stride_vd = v.stride(0), v.stride(2), v.stride(1), v.stride(3)
-        stride_ob, stride_oh, stride_om, stride_od = o.stride(0), o.stride(2), o.stride(1), o.stride(3)
-        stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
 
     # Get closest power of 2 over or equal to 32.
     padded_d_model = 1 << (head_size - 1).bit_length()
     # Smallest head_dim supported is 16. If smaller, the tile in the
     # kernel is padded - there is no padding in memory for any dims.
     padded_d_model = max(padded_d_model, 16)
-
-    FLIP_GRID = True
-    if FLIP_GRID:
-        grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META['BLOCK_M']))
-    else:
-        grid = lambda META: (triton.cdiv(max_seqlens_q, META['BLOCK_M']), nheads_q, batch)
 
     # sd_mask is used to validate dropout behavior vs the PyTorch SDPA math backend reference.  We zero this out
     # to give a consistent starting point and then populate it with the output of softmax with the sign bit set according
@@ -999,13 +1049,14 @@ def attention_prefill_forward_triton_impl(
         dropout_mask = None
         stride_sz, stride_sh, stride_sm, stride_sn = (0, 0, 0, 0)
 
-
     if bias is not None:
         stride_bz, stride_bh, stride_bm, stride_bn = (bias.stride(0), bias.stride(1),bias.stride(2),
                         bias.stride(3))
     else:
         stride_bz, stride_bh, stride_bm, stride_bn = (0, 0, 0, 0)
 
+    # launch kernel
+    grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META['BLOCK_M']))
     attn_fwd[grid](q, k, v, bias, cache_seqlens, cache_batch_idx,
                     descale_q, descale_k, descale_v, descale_o, stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_o_z,
                     sm_scale, softmax_lse, o,
@@ -1025,6 +1076,6 @@ def attention_prefill_forward_triton_impl(
                     IS_VARLEN=IS_VARLEN,
                     BLOCK_DMODEL=padded_d_model, USE_BIAS=False if bias is None else True,
                     USE_ALIBI=use_alibi, ENABLE_DROPOUT=dropout_p > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_softmax, 
-                    IS_FP8=IS_FP8, FP8_MAX=FP8_MAX, FP8_OUTPUT=FP8_OUTPUT, FLIP_GRID=FLIP_GRID)
+                    IS_FP8=IS_FP8, FP8_MAX=FP8_MAX, FP8_OUTPUT=FP8_OUTPUT)
 
     return softmax_lse, sd_mask if return_softmax else None
