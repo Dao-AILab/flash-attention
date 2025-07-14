@@ -1165,6 +1165,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             element_size=self.dtype.width // 8,
             is_persistent=False,
+            lpt=self.is_causal or self.is_local,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)

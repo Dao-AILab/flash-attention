@@ -365,6 +365,7 @@ class FlashAttentionForwardSm100:
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,
+            lpt=self.is_causal or self.is_local,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler
