@@ -270,7 +270,7 @@ def test_flash_attn_varlen_output_sparse(
             assert not pack_gqa
             assert num_splits == 1
 
-            out_unpad, lse = flash_attn_varlen_func(
+            out_unpad = flash_attn_varlen_func(
                 q_unpad,
                 k_unpad,
                 v_unpad,

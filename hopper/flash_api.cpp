@@ -1738,6 +1738,8 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int window_size_right = -1,"
         "int attention_chunk = 0,"
         "bool has_softcap = False,"
+        "int sparse_block_q = 0,"
+        "int sparse_block_k = 0,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
         "int sm_margin = 0) -> Tensor");
