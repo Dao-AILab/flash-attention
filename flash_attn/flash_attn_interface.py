@@ -320,7 +320,7 @@ def _flash_attn_backward_fake(
         dv = torch.empty_like(v)
     batch_size, seqlen_q, num_heads, _ = q.shape
     if torch.cuda.is_available() and torch.version.hip:
-        softmax_d = torch.empty((batch_size, num_heads, seqlen_q, 128), device=q.device, dtype=torch.float32)
+        softmax_d = torch.empty((batch_size, num_heads, seqlen_q), device=q.device, dtype=torch.float32)
     else:
         softmax_d = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128)), device=q.device, dtype=torch.float32)
     
