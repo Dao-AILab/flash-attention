@@ -133,16 +133,18 @@ class FlashAttentionForwardSm100:
             self.num_regs_correction = 64
             self.num_regs_other = 64
         else:
-            # self.num_regs_softmax = 184
-            self.num_regs_softmax = 176
+            self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
+            # self.num_regs_softmax = 176
             # self.num_regs_correction = 96
             # self.num_regs_correction = 80
-            self.num_regs_correction = 64 if self.is_causal or self.is_local else 80
+            # self.num_regs_correction = 64 if self.is_causal or self.is_local else 80
+            self.num_regs_correction = 64
             # self.num_regs_other = 32
             # self.num_regs_other = 64
             # self.num_regs_other = 80
             # self.num_regs_other = 48
-            self.num_regs_other = 96 if self.is_causal or self.is_local else 80
+            # self.num_regs_other = 96 if self.is_causal or self.is_local else 80
+            self.num_regs_other = 64 if self.is_causal or self.is_local else 80
         self.num_regs_empty = 24
 
         self.buffer_align_bytes = 1024
@@ -1311,7 +1313,7 @@ class FlashAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout,
         )
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
-        softmax.apply_exp2_convert(tSrS_t2r, tSrP_r2t, e2e=mask_fn is None, e2e_freq=16 if self.head_dim_padded <= 64 else 32)
+        softmax.apply_exp2_convert(tSrS_t2r, tSrP_r2t, e2e=mask_fn is None, e2e_freq=16 if self.head_dim_padded <= 64 else 16)
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
