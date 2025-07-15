@@ -88,7 +88,8 @@ class FlashAttentionForwardSm100:
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pack_gqa = False
         # Does S1 need to wait for S0 to finish
-        self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
+        # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
+        self.s0_s1_barrier = False
 
         self.softmax0_warp_ids = (0, 1, 2, 3)
         self.softmax1_warp_ids = (4, 5, 6, 7)
@@ -129,9 +130,9 @@ class FlashAttentionForwardSm100:
         self.tmem_vec1_offset = self.tmem_vec0_offset + self.n_block_size
 
         if self.head_dim_padded < 96:
-            self.num_regs_softmax = 192
+            self.num_regs_softmax = 200
             self.num_regs_correction = 64
-            self.num_regs_other = 64
+            self.num_regs_other = 48
         else:
             self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
             # self.num_regs_softmax = 176
