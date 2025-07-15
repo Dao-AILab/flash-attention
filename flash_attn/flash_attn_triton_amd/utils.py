@@ -112,7 +112,7 @@ class MetaData():
         self.rotary_interleaved = rotary_interleaved
         self.rotary_conjunction = rotary_conjunction
 
-    def need_dropout(self, dropout_p, return_softmax):
+    def need_dropout(self, dropout_p, return_softmax = True):
         self.dropout_p = dropout_p
         self.return_softmax = return_softmax
         self.philox_seed, self.philox_offset = 0x1BF58, 0x1D4B49
