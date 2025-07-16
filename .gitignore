@@ -1,6 +1,7 @@
 *.ncu-rep
 .DS_store
 .vscode
+flash_attn_config.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -27,6 +28,7 @@ var/
 
 # IDE-related
 .idea/
+.vscode/
 
 # Dev
 venv
