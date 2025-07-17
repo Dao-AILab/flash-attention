@@ -514,7 +514,7 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
     use_cuda_graph=True,
 )
 @triton.jit
-def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
+def attn_fwd(Q, K, V, bias,
              Descale_Q, Descale_K, Descale_V, Descale_O, stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_o_z,
              SM_SCALE: tl.constexpr, LSE, Out, stride_qz, stride_qh, stride_qm, stride_qk,
              stride_kz, stride_kh, stride_kn, stride_kk, stride_vz, stride_vh, stride_vk, stride_vn,
@@ -525,7 +525,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
              MAX_SEQLENS_K: tl.constexpr, IS_VARLEN: tl.constexpr, IS_CAUSAL: tl.constexpr,
              USE_SLIDING_WINDOW: tl.constexpr, WINDOW_SIZE_LEFT: tl.constexpr, WINDOW_SIZE_RIGHT: tl.constexpr, BLOCK_M: tl.constexpr,
              BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr, PRE_LOAD_V: tl.constexpr, USE_BIAS: tl.constexpr,
-             ENABLE_DROPOUT: tl.constexpr, RETURN_SCORES: tl.constexpr, USE_ALIBI: tl.constexpr, USE_EXP2: tl.constexpr, 
+             ENABLE_DROPOUT: tl.constexpr, RETURN_SCORES: tl.constexpr, NEEDS_SDMASK : tl.constexpr, USE_ALIBI: tl.constexpr, USE_EXP2: tl.constexpr, 
              IS_FP8: tl.constexpr, FP8_MAX: tl.constexpr, FP8_OUTPUT: tl.constexpr):
     # set params
     ACCUMULATOR_TYPE = tl.float32
@@ -630,7 +630,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     else:
         alibi_slope = None
 
-    if RETURN_SCORES:
+    if NEEDS_SDMASK:
         sd_mask_offset = sd_mask + off_z * stride_sz + off_h_q * stride_sh #+ cu_seqlens_q_start * stride_sm
         sd_mask_ptrs = sd_mask_offset + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
     else:
@@ -758,7 +758,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         l_i_safe = tl.where(invalid_mask, 1.0, l_i)
         l_recip = 1 / l_i_safe[:, None]
     else:
-        # Original code path
+        invalid_mask = None
         l_recip = 1 / l_i[:, None]
     acc = acc * l_recip
     if ENABLE_DROPOUT:
@@ -878,9 +878,6 @@ def attention_prefill_forward_triton_impl(
                                         cu_seqlens_k: Optional[torch.Tensor],
                                         max_seqlens_q: int, 
                                         max_seqlens_k: int,
-                                        # inference
-                                        cache_seqlens: Optional[Union[(int, torch.Tensor)]],
-                                        cache_batch_idx: Optional[torch.Tensor],
                                         # dropout
                                         dropout_p: float,
                                         philox_seed: Optional[int],
@@ -1034,8 +1031,8 @@ def attention_prefill_forward_triton_impl(
     # to give a consistent starting point and then populate it with the output of softmax with the sign bit set according
     # to the dropout mask. The resulting return allows this mask to be fed into the reference implementation for testing
     # only. This return holds no useful output aside from debugging.
-    use_dropout = (dropout_p > 0.0)
-    if use_dropout or return_softmax:
+    NEEDS_SDMASK = (dropout_p > 0.0) or return_softmax
+    if NEEDS_SDMASK:
         sd_mask = torch.zeros((batch, nheads_q, max_seqlens_q, max_seqlens_k), device=q.device,
                                         dtype=torch.float32)
         if DROPOUT_USE_PYTORCH:
@@ -1057,7 +1054,7 @@ def attention_prefill_forward_triton_impl(
 
     # launch kernel
     grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META['BLOCK_M']))
-    attn_fwd[grid](q, k, v, bias, cache_seqlens, cache_batch_idx,
+    attn_fwd[grid](q, k, v, bias,
                     descale_q, descale_k, descale_v, descale_o, stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_o_z,
                     sm_scale, softmax_lse, o,
                     stride_qb, stride_qh, stride_qm, stride_qd, 
@@ -1075,7 +1072,7 @@ def attention_prefill_forward_triton_impl(
                     USE_SLIDING_WINDOW=use_sliding_window, WINDOW_SIZE_LEFT=window_size_left, WINDOW_SIZE_RIGHT=window_size_right, 
                     IS_VARLEN=IS_VARLEN,
                     BLOCK_DMODEL=padded_d_model, USE_BIAS=False if bias is None else True,
-                    USE_ALIBI=use_alibi, ENABLE_DROPOUT=dropout_p > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_softmax, 
+                    USE_ALIBI=use_alibi, ENABLE_DROPOUT=dropout_p > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_softmax, NEEDS_SDMASK=NEEDS_SDMASK,
                     IS_FP8=IS_FP8, FP8_MAX=FP8_MAX, FP8_OUTPUT=FP8_OUTPUT)
 
     return softmax_lse, sd_mask if return_softmax else None
