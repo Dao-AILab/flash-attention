@@ -7,27 +7,16 @@ import pytest
 import logging
 import numpy as np
 from pathlib import Path
-from flash_attn import (
-    flash_attn_func,
-    flash_attn_fp8_func,
-    flash_attn_kvpacked_func, 
-    flash_attn_qkvpacked_func,
-    flash_attn_qkvpacked_fp8_func,
-    flash_attn_varlen_func,
-    flash_attn_varlen_fp8_func,
-    flash_attn_varlen_kvpacked_func,
-    flash_attn_varlen_qkvpacked_func,
-    flash_attn_varlen_qkvpacked_fp8_func,
-    flash_attn_with_kvcache
-)
+import triton
+import flash_attn
 
 from .utils import generate_bshd_kv_packed, generate_bshd_qkv_packed, generate_bshd_tensor, generate_varlen_kv_packed, generate_varlen_qkv_packed, input_helper, arch_supports_fp8, generate_varlen_tensor
 
-DEBUG = False
+# debugging
 
-# set print options
-# torch.set_printoptions(linewidth=5e5, edgeitems=10, sci_mode=False)
-# np.set_printoptions(linewidth=5000, threshold=1e4, suppress=True, precision=4)
+logging.basicConfig(level=logging.INFO, format='%(message)s', force=True)
+logger = logging.getLogger(__name__)
+DEBUG = False
 
 # defailt fp16 tolerance is ATOL, RTOL = 1e-5, 1e-3. See table https://pytorch.org/docs/stable/testing.html
 ATOL, RTOL = 1e-2, 1e-2 # old standard. maybe to lose. 
@@ -179,7 +168,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
         do_fp8= do.clone()
 
         if is_varlen:
-            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_varlen_qkvpacked_fp8_func(
+            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn.flash_attn_varlen_qkvpacked_fp8_func(
                 qkv_fp8,
                 metadata.cu_seqlens_q,
                 metadata.max_seqlens_q,
@@ -192,7 +181,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
                 return_attn_probs=True,
             )
         else:
-            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_qkvpacked_fp8_func(
+            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn.flash_attn_qkvpacked_fp8_func(
                 qkv_fp8,
                 dropout_p,
                 causal=causal,
@@ -211,7 +200,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
         do_ref= do.clone()
 
         if is_varlen:
-            out_ref, lse_ref, S_dmask_ref = flash_attn_varlen_qkvpacked_func(
+            out_ref, lse_ref, S_dmask_ref = flash_attn.flash_attn_varlen_qkvpacked_func(
                 qkv_ref,
                 metadata.cu_seqlens_q,
                 metadata.max_seqlens_q,
@@ -224,7 +213,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
                 return_attn_probs=True,
             )
         else:
-            out_ref, lse_ref, S_dmask_ref = flash_attn_qkvpacked_func(
+            out_ref, lse_ref, S_dmask_ref = flash_attn.flash_attn_qkvpacked_func(
                 qkv_ref,
                 dropout_p,
                 causal=causal,
@@ -292,7 +281,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
         do_fp8= do.clone()
 
         if is_varlen:
-            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_varlen_fp8_func(
+            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn.flash_attn_varlen_fp8_func(
                 q_fp8,
                 k_fp8,
                 v_fp8,
@@ -309,7 +298,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
                 return_attn_probs=True,
             )
         else:
-            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_fp8_func(
+            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn.flash_attn_fp8_func(
                 q_fp8,
                 k_fp8,
                 v_fp8,
@@ -335,7 +324,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
         do_ref = do.clone()
 
         if is_varlen:
-            out_ref, lse_ref, S_dmask_ref = flash_attn_varlen_func(
+            out_ref, lse_ref, S_dmask_ref = flash_attn.flash_attn_varlen_func(
                 q_ref,
                 k_ref,
                 v_ref,
@@ -352,7 +341,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
                 return_attn_probs=True,
             )
         else:
-            out_ref, lse_ref, S_dmask_ref = flash_attn_func(
+            out_ref, lse_ref, S_dmask_ref = flash_attn.flash_attn_func(
                 q_ref,
                 k_ref,
                 v_ref,
@@ -463,7 +452,7 @@ def test_ir(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, 
     if packing == None:
         # fp8 forward pass
         if is_varlen:
-            out, lse, S_dmask = flash_attn_varlen_fp8_func(
+            out, lse, S_dmask = flash_attn.flash_attn_varlen_fp8_func(
                 q,
                 k,
                 v,
@@ -480,7 +469,7 @@ def test_ir(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, 
                 return_attn_probs=True,
             )
         else:
-            out, lse, S_dmask = flash_attn_fp8_func(
+            out, lse, S_dmask = flash_attn.flash_attn_fp8_func(
                     q,
                     k,
                     v,
@@ -506,7 +495,7 @@ def test_ir(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, 
 
         # fp8 forward pass for qkv-packed input
         if is_varlen:
-            out, lse, S_dmask = flash_attn_varlen_qkvpacked_fp8_func(
+            out, lse, S_dmask = flash_attn.flash_attn_varlen_qkvpacked_fp8_func(
                 qkv,
                 metadata.cu_seqlens_q,
                 metadata.max_seqlens_q,
@@ -519,7 +508,7 @@ def test_ir(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, 
                 return_attn_probs=True,
             )
         else:
-            out, lse, S_dmask = flash_attn_qkvpacked_fp8_func(
+            out, lse, S_dmask = flash_attn.flash_attn_qkvpacked_fp8_func(
                 qkv,
                 dropout_p,
                 causal=causal,
@@ -611,7 +600,7 @@ def test_torch_compile(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD):
         k = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD)
         v = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD)
         
-        flash_attn_func_compiled = torch.compile(flash_attn_func)
+        flash_attn_func_compiled = torch.compile(flash_attn.flash_attn_func)
         o = flash_attn_func_compiled(q, k, v, causal=True)
         print(f"Output shape: {o.shape}, dtype: {o.dtype}")
         o.sum().backward()
@@ -630,7 +619,7 @@ def test_torch_compile(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD):
         k, cu_seqlens_k, max_seqlen_k = generate_varlen_tensor(BATCH * N_CTX_K, HK, D_HEAD, BATCH)
         v, _, _ = generate_varlen_tensor(BATCH * N_CTX_K, HK, D_HEAD, BATCH)
         
-        flash_attn_varlen_func_compiled = torch.compile(flash_attn_varlen_func)
+        flash_attn_varlen_func_compiled = torch.compile(flash_attn.flash_attn_varlen_func)
         o = flash_attn_varlen_func_compiled(
             q, k, v, cu_seqlens_q, cu_seqlens_k, 
             max_seqlen_q, max_seqlen_k, causal=True
@@ -650,7 +639,7 @@ def test_torch_compile(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD):
         
         qkv = generate_bshd_qkv_packed(BATCH, N_CTX_Q, HQ, D_HEAD)
         
-        flash_attn_qkvpacked_func_compiled = torch.compile(flash_attn_qkvpacked_func)
+        flash_attn_qkvpacked_func_compiled = torch.compile(flash_attn.flash_attn_qkvpacked_func)
         o = flash_attn_qkvpacked_func_compiled(qkv, causal=True)
         print(f"Output shape: {o.shape}, dtype: {o.dtype}")
         o.sum().backward()
@@ -668,7 +657,7 @@ def test_torch_compile(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD):
         total_q = BATCH * N_CTX_Q
         qkv, cu_seqlens, max_seqlen = generate_varlen_qkv_packed(total_q, HQ, D_HEAD, BATCH)
         
-        flash_attn_varlen_qkvpacked_func_compiled = torch.compile(flash_attn_varlen_qkvpacked_func)
+        flash_attn_varlen_qkvpacked_func_compiled = torch.compile(flash_attn.flash_attn_varlen_qkvpacked_func)
         o = flash_attn_varlen_qkvpacked_func_compiled(
             qkv, cu_seqlens, max_seqlen, causal=True
         )
@@ -688,7 +677,7 @@ def test_torch_compile(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD):
         q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD)
         kv = generate_bshd_kv_packed(BATCH, N_CTX_K, HK, D_HEAD)
         
-        flash_attn_kvpacked_func_compiled = torch.compile(flash_attn_kvpacked_func)
+        flash_attn_kvpacked_func_compiled = torch.compile(flash_attn.flash_attn_kvpacked_func)
         o = flash_attn_kvpacked_func_compiled(q, kv, causal=True)
         print(f"Output shape: {o.shape}, dtype: {o.dtype}")
         o.sum().backward()
@@ -706,7 +695,7 @@ def test_torch_compile(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD):
         q, cu_seqlens_q, max_seqlen_q = generate_varlen_tensor(BATCH * N_CTX_Q, HQ, D_HEAD, BATCH)
         kv, cu_seqlens_k, max_seqlen_k = generate_varlen_kv_packed(BATCH * N_CTX_K, HK, D_HEAD, BATCH)
         
-        flash_attn_varlen_kvpacked_func_compiled = torch.compile(flash_attn_varlen_kvpacked_func)
+        flash_attn_varlen_kvpacked_func_compiled = torch.compile(flash_attn.flash_attn_varlen_kvpacked_func)
         o = flash_attn_varlen_kvpacked_func_compiled(
             q, kv, cu_seqlens_q, cu_seqlens_k,
             max_seqlen_q, max_seqlen_k, causal=True
@@ -743,7 +732,7 @@ def test_torch_compile(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD):
         v_new = generate_bshd_tensor(BATCH, NEW_SEQLEN, HK, D_HEAD, dtype=torch.float16)
         
         # Note: flash_attn_with_kvcache doesn't support backward pass
-        flash_attn_with_kvcache_compiled = torch.compile(flash_attn_with_kvcache)
+        flash_attn_with_kvcache_compiled = torch.compile(flash_attn.flash_attn_with_kvcache)
         
         # Test with new k,v (append to cache and do attention)
         with torch.no_grad():
@@ -768,3 +757,20 @@ def test_torch_compile(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD):
         # final cleanup
         torch.cuda.empty_cache()
         clear_compile_cache()
+
+# log env
+if os.environ.get('PYTEST_XDIST_WORKER') in (None, 'gw0'):    
+    logger.info("\n" + "="*80)
+    logger.info("ENVIRONMENT INFORMATION") 
+    logger.info("="*80)
+
+    # triton
+    logger.info(f" Triton Version: {triton.__version__}")
+
+    # torch
+    logger.info(f" PyTorch Version: {torch.__version__}")
+
+    # flash attention
+    logger.info(f" Flash Attention Version: {flash_attn.__version__}")
+
+    logger.info("="*80 + "\n")
