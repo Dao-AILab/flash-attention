@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
 
 import math
+import hashlib
 from typing import Type, Callable, Optional, Tuple
 from functools import partial
 
@@ -676,3 +677,31 @@ def coord_offset_i64(
     )
     new_layout = cute.slice_(tensor.layout, (*[None] * dim, 0, *[None] * (cute.rank(tensor) - dim - 1)))
     return cute.make_tensor(new_ptr, new_layout)
+
+
+@cute.jit
+def broadcast_to(a: cute.Tensor, b: cute.Tensor) -> cute.Tensor:
+    """ Take a single element a cute tensor and broadcast to b layout.shape """
+    stride_zero = cute.repeat_like(0, b.layout.shape)
+    a_broadcasted = cute.make_tensor(
+        a.iterator,
+        cute.make_layout(b.layout.shape, stride=stride_zero)
+    )
+    return a_broadcasted
+
+
+@cute.jit
+def broadcast_scalar_to_vec(scalar_value: cutlass.Numeric, b: cute.Tensor, dtype) -> cute.Tensor:
+    """Create a fragment of vec_size elements, all set to scalar_value.
+    
+    Args:
+        scalar_value: The value to broadcast
+        vec_size: Number of elements in the output fragment  
+        dtype: Data type of the fragment elements
+    
+    Returns:
+        A cute fragment with all elements set to scalar_value
+    """
+    vec = cute.make_fragment(1, dtype)
+    vec[0] = scalar_value
+    return broadcast_to(vec, b)

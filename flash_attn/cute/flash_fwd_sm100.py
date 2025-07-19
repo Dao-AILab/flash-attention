@@ -20,6 +20,7 @@ from functools import partial
 import cuda.bindings.driver as cuda
 
 import cutlass
+from cutlass._mlir.dialects.llvm import intr_prefetch
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync
@@ -64,6 +65,7 @@ class FlashAttentionForwardSm100:
         m_block_size: int = 128,
         n_block_size: int = 128,
         is_persistent: bool = True,
+        score_mod: cutlass.Constexpr | None = None,
     ):
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -94,6 +96,7 @@ class FlashAttentionForwardSm100:
         self.pack_gqa = pack_gqa
         if pack_gqa:
             assert m_block_size % self.qhead_per_kvhead == 0, "For PackGQA, m_block_size must be divisible by qhead_per_kvhead"
+        self.score_mod = score_mod
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         self.s0_s1_barrier = False
@@ -195,7 +198,6 @@ class FlashAttentionForwardSm100:
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,  # (b_k, max_num_pages_per_seq)
-        softcap: Float32 | float | None = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
@@ -465,18 +467,17 @@ class FlashAttentionForwardSm100:
 
         self.shared_storage = SharedStorage
 
-        # If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
-        # Right after this, we multiply by log2(e) before applying exp2.
-        # To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
-        # (assigning it to softcap_val) and pre-multiply softcap_val * log2(e)
-        # (assigning it to softmax_scale_log2).
         LOG2_E = math.log2(math.e)
-        if const_expr(softcap is None):
+        if const_expr(self.score_mod is None):
             softmax_scale_log2 = softmax_scale * LOG2_E
-            softcap_val = None
+            softmax_scale = None
         else:
-            softmax_scale_log2 = softcap * LOG2_E
-            softcap_val = Float32(softmax_scale / softcap)
+            # NB: If a users passes in a score mod, we want to apply the score-mod in the sm_scaled qk
+            # But in the original base 10. We hijack softmax_scale_log2 to just be the change of base
+            # and correctly apply the softmax_scale prior to score_mod in the softmax step
+            softmax_scale_log2 = LOG2_E
+            softmax_scale = softmax_scale
+
         if const_expr(window_size_left is not None):
             window_size_left = Int32(window_size_left)
         if const_expr(window_size_right is not None):
@@ -498,7 +499,7 @@ class FlashAttentionForwardSm100:
             tma_atom_V,
             tma_atom_O,
             softmax_scale_log2,
-            softcap_val,
+            softmax_scale,
             window_size_left,
             window_size_right,
             learnable_sink,
@@ -539,7 +540,7 @@ class FlashAttentionForwardSm100:
         tma_atom_V: cute.CopyAtom,
         tma_atom_O: Optional[cute.CopyAtom],
         softmax_scale_log2: Float32,
-        softcap_val: Optional[Float32],
+        softmax_scale: Float32 | None,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
@@ -582,6 +583,7 @@ class FlashAttentionForwardSm100:
         storage = smem.allocate(self.shared_storage)
 
         mbar_ptr = storage.mbar_ptr.data_ptr()
+        # Use the first N warps to initialize barriers
         if warp_idx == 1:
             # Init "full" barrier with number of producers, "empty" barrier with number of consumers
             for i in cutlass.range_constexpr(self.q_stage):
@@ -779,6 +781,7 @@ class FlashAttentionForwardSm100:
             softmax_loop = partial(
                 self.softmax_loop,
                 softmax_scale_log2=softmax_scale_log2,
+                softmax_scale=softmax_scale,
                 thr_mma_qk=thr_mma_qk,
                 sScale=sScale,
                 mLSE=mLSE,
@@ -1146,6 +1149,7 @@ class FlashAttentionForwardSm100:
         self,
         stage: int | Int32,
         softmax_scale_log2: Float32,
+        softmax_scale: Float32,
         thr_mma_qk: cute.core.ThrMma,
         tStSi: cute.Tensor,
         sScale: cute.Tensor,
@@ -1226,7 +1230,7 @@ class FlashAttentionForwardSm100:
             mask_fn = partial(
                 mask.apply_mask_sm100, m_block=m_block * 2 + stage, thr_mma=thr_mma_qk, thr_tmem_load=thr_tmem_load, mask_causal=self.is_causal, mask_local=self.is_local
             )
-            softmax = SoftmaxSm100(softmax_scale_log2, rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0)
+            softmax = SoftmaxSm100(softmax_scale_log2, rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0, softmax_scale=softmax_scale)
             softmax.reset()
 
             softmax_step = partial(
@@ -1243,6 +1247,9 @@ class FlashAttentionForwardSm100:
                 tStP_r2t=tStP_r2t,
                 sScale=sScale,
                 stage=stage,
+                batch_idx=batch_idx,
+                head_idx=head_idx,
+                m_block=m_block * 2 + stage,
             )
 
             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase)
@@ -1330,6 +1337,9 @@ class FlashAttentionForwardSm100:
         tStP_r2t: cute.Tensor,
         sScale: cute.Tensor,
         stage: int | Int32,
+        batch_idx: Int32,
+        head_idx: Int32,
+        m_block: Int32,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
@@ -1355,12 +1365,25 @@ class FlashAttentionForwardSm100:
 
         tScP_layout = cute.composition(tScS.layout, cute.make_layout((self.m_block_size, tilePlikeFP32)))
         tScP = cute.make_tensor(tScS.iterator, tScP_layout)
+
         tScS_t2r_shape = thr_tmem_load.partition_D(tScS).shape
 
         # Wait for Si
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
         tSrS_t2r = cute.make_fragment(tScS_t2r_shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+        if cutlass.const_expr(self.score_mod is not None):
+            self.apply_score_mod(
+                tSrS_t2r,
+                thr_tmem_load,
+                thr_mma_qk,
+                batch_idx,
+                head_idx,
+                m_block,
+                n_block,
+                softmax,
+            )
+
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
@@ -1907,3 +1930,91 @@ class FlashAttentionForwardSm100:
     #     cute.arch.barrier_arrive(
     #         barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1) + next_wg, number_of_threads=2 * 128,
     #     )
+
+    @cute.jit
+    def apply_score_mod(
+        self,
+        tSrS_t2r,
+        thr_tmem_load,
+        thr_mma_qk,
+        batch_idx,
+        head_idx,
+        m_block,
+        n_block,
+        softmax,
+        VEC_SIZE: cutlass.Constexpr[int] = 4,
+    ):
+        """Apply score modification function to attention scores.
+        
+        Args:
+            tSrS_t2r: Score tensor to modify
+            thr_tmem_load: Thread memory load partition
+            thr_mma_qk: Thread MMA QK partition
+            batch_idx: Batch index
+            head_idx: Head index
+            m_block: M block index
+            n_block: N block index
+            softmax: Softmax module containing scale
+        """
+        # Get M, N index tensor + layout like accum
+        cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
+        cS = cute.domain_offset((m_block * self.m_block_size, n_block * self.n_block_size), cS)
+        tScS = thr_mma_qk.partition_C(cS)
+        tScS_t2r = thr_tmem_load.partition_D(tScS)
+
+        # Build index + score fragments
+        n_vals = cutlass.const_expr(cute.size(tSrS_t2r.shape))
+        score_vec = cute.make_fragment(VEC_SIZE, self.qk_acc_dtype)
+        kv_idx_vec = cute.make_fragment(VEC_SIZE, cutlass.Int32)
+        
+        # Create broadcasted fragments for constant values
+        batch_idx_vec = utils.broadcast_scalar_to_vec(batch_idx, kv_idx_vec, cutlass.Int32)
+        head_idx_vec = utils.broadcast_scalar_to_vec(head_idx, kv_idx_vec, cutlass.Int32)
+        q_idx_vec = utils.broadcast_scalar_to_vec(tScS_t2r[0][0], kv_idx_vec, cutlass.Int32)
+        
+        # Load SSA values once
+        batch_idx_ssa = batch_idx_vec.load()
+        head_idx_ssa = head_idx_vec.load()
+        q_idx_ssa = q_idx_vec.load()
+
+        # Build SSA slices and call into scoremod / writeback
+        for i in cutlass.range(0, n_vals, VEC_SIZE, unroll_full=True):
+            for j in cutlass.range(VEC_SIZE, unroll_full=True):
+                score_vec[j] = tSrS_t2r[i + j] * softmax.softmax_scale
+                kv_idx_vec[j] = tScS_t2r[i + j][1]
+            score_ssa = score_vec.load()
+            kv_idx_ssa = kv_idx_vec.load()
+
+            post_mod_scores = self.score_mod(
+                score_ssa,
+                batch_idx_ssa,
+                head_idx_ssa,
+                q_idx=q_idx_ssa,
+                kv_idx=kv_idx_ssa
+            )
+
+            score_vec.store(post_mod_scores)
+            for j in cutlass.range(VEC_SIZE, unroll_full=True):
+                tSrS_t2r[i + j] = score_vec[j]
+
+
+
+### Grave yard
+
+# PRETTY WAY but uses to much rmem
+
+# # TODO: We need to not materialize all of kv_idx
+# tSrKV_idx = cute.make_fragment(tSrS_t2r.shape, cutlass.Int32)
+# n_vals = cutlass.const_expr(cute.size(tSrS_t2r.shape))
+# for i in cutlass.range(n_vals, unroll_full=True):
+#     tSrKV_idx[i] = tScS_t2r[i][1]
+
+# # Create broadcasted q_idx
+# tSrQ_idx = cute.make_fragment(1, cutlass.Int32)
+# tSrQ_idx[0] = tScS_t2r[0][0]
+# tSrQ_idx_broadcasted = utils.broadcast_to(tSrQ_idx, tSrKV_idx).load()
+
+# tSrS_t2r_ssa = tSrS_t2r.load()
+# tSrS_t2r_ssa = tSrS_t2r_ssa * softmax.softmax_scale
+# post_mod_scores = self.score_mod(tSrS_t2r_ssa, batch_idx, head_idx, q_idx=tSrQ_idx_broadcasted, kv_idx=tSrKV_idx.load())
+# tSrS_t2r.store(post_mod_scores)

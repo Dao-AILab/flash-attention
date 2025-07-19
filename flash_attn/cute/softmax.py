@@ -18,15 +18,17 @@ class Softmax:
         scale_log2: Float32,
         num_rows: cutlass.Constexpr[int],
         arch: cutlass.Constexpr[int] = 80,
+        softmax_scale: Float32 | None = None
     ):
         self.scale_log2 = scale_log2
         self.num_rows = num_rows
         self.arch = arch
+        self.softmax_scale = softmax_scale
         self.row_max = cute.make_fragment(num_rows, Float32)
         self.row_sum = cute.make_fragment_like(self.row_max)
 
     def __extract_mlir_values__(self):
-        non_constexpr_fields = [self.scale_log2, self.row_max, self.row_sum]
+        non_constexpr_fields = [self.scale_log2, self.row_max, self.row_sum, self.softmax_scale]
         values, self._values_pos = [], []
         for obj in non_constexpr_fields:
             obj_values = cutlass.extract_mlir_values(obj)
@@ -35,7 +37,7 @@ class Softmax:
         return values
 
     def __new_from_mlir_values__(self, values):
-        field_names = ['scale_log2', 'row_max', 'row_sum']
+        field_names = ['scale_log2', 'row_max', 'row_sum', 'softmax_scale']
         reconstructed_fields = {}
         for name, n_items in zip(field_names, self._values_pos):
             original_field = getattr(self, name)
@@ -45,6 +47,7 @@ class Softmax:
         new_obj = self.__class__(reconstructed_fields['scale_log2'], self.num_rows, self.arch)
         new_obj.row_max = reconstructed_fields['row_max']
         new_obj.row_sum = reconstructed_fields['row_sum']
+        new_obj.softmax_scale = reconstructed_fields['softmax_scale']
         return new_obj
 
     def reset(self) -> None:
@@ -151,8 +154,8 @@ class Softmax:
 
 
 class SoftmaxSm100(Softmax):
-    def __init__(self, scale_log2: Float32, rescale_threshold: cutlass.Constexpr[float] = 0.0):
-        super().__init__(scale_log2, num_rows=1, arch=100)
+    def __init__(self, scale_log2: Float32, rescale_threshold: cutlass.Constexpr[float] = 0.0, softmax_scale: Float32 | None = None):
+        super().__init__(scale_log2, num_rows=1, arch=100, softmax_scale=softmax_scale)
         self.rescale_threshold = rescale_threshold
 
     def __new_from_mlir_values__(self, values):
