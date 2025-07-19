@@ -9,6 +9,7 @@ import numpy as np
 from pathlib import Path
 import triton
 import flash_attn
+import flash_attn.flash_attn_triton_amd.fp8
 
 from .utils import generate_bshd_kv_packed, generate_bshd_qkv_packed, generate_bshd_tensor, generate_varlen_kv_packed, generate_varlen_qkv_packed, input_helper, arch_supports_fp8, generate_varlen_tensor
 
@@ -168,7 +169,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
         do_fp8= do.clone()
 
         if is_varlen:
-            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn.flash_attn_varlen_qkvpacked_fp8_func(
+            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn.flash_attn_triton_amd.fp8.flash_attn_varlen_qkvpacked_fp8_func(
                 qkv_fp8,
                 metadata.cu_seqlens_q,
                 metadata.max_seqlens_q,
@@ -181,7 +182,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
                 return_attn_probs=True,
             )
         else:
-            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn.flash_attn_qkvpacked_fp8_func(
+            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn.flash_attn_triton_amd.fp8.flash_attn_qkvpacked_fp8_func(
                 qkv_fp8,
                 dropout_p,
                 causal=causal,
@@ -281,7 +282,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
         do_fp8= do.clone()
 
         if is_varlen:
-            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn.flash_attn_varlen_fp8_func(
+            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn.flash_attn_triton_amd.fp8.flash_attn_varlen_fp8_func(
                 q_fp8,
                 k_fp8,
                 v_fp8,
@@ -298,7 +299,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
                 return_attn_probs=True,
             )
         else:
-            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn.flash_attn_fp8_func(
+            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn.flash_attn_triton_amd.fp8.flash_attn_fp8_func(
                 q_fp8,
                 k_fp8,
                 v_fp8,
@@ -452,7 +453,7 @@ def test_ir(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, 
     if packing == None:
         # fp8 forward pass
         if is_varlen:
-            out, lse, S_dmask = flash_attn.flash_attn_varlen_fp8_func(
+            out, lse, S_dmask = flash_attn.flash_attn_triton_amd.fp8.flash_attn_varlen_fp8_func(
                 q,
                 k,
                 v,
@@ -469,7 +470,7 @@ def test_ir(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, 
                 return_attn_probs=True,
             )
         else:
-            out, lse, S_dmask = flash_attn.flash_attn_fp8_func(
+            out, lse, S_dmask = flash_attn.flash_attn_triton_amd.fp8.flash_attn_fp8_func(
                     q,
                     k,
                     v,
@@ -495,7 +496,7 @@ def test_ir(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, 
 
         # fp8 forward pass for qkv-packed input
         if is_varlen:
-            out, lse, S_dmask = flash_attn.flash_attn_varlen_qkvpacked_fp8_func(
+            out, lse, S_dmask = flash_attn.flash_attn_triton_amd.fp8.flash_attn_varlen_qkvpacked_fp8_func(
                 qkv,
                 metadata.cu_seqlens_q,
                 metadata.max_seqlens_q,
@@ -508,7 +509,7 @@ def test_ir(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, 
                 return_attn_probs=True,
             )
         else:
-            out, lse, S_dmask = flash_attn.flash_attn_qkvpacked_fp8_func(
+            out, lse, S_dmask = flash_attn.flash_attn_triton_amd.fp8.flash_attn_qkvpacked_fp8_func(
                 qkv,
                 dropout_p,
                 causal=causal,

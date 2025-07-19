@@ -7,7 +7,8 @@ import pandas as pd
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from datasets import load_dataset
-from flash_attn import flash_attn_qkvpacked_func, flash_attn_qkvpacked_fp8_func, flash_attn_varlen_qkvpacked_func, flash_attn_varlen_qkvpacked_fp8_func
+import flash_attn
+import flash_attn.flash_attn_triton_amd.fp8
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"using device: {device}")
@@ -40,13 +41,13 @@ class FlashAttention(nn.Module):
         
         # use the appropriate flash attention function
         if self.use_fp8:
-            context = flash_attn_qkvpacked_fp8_func(
+            context = flash_attn.flash_attn_triton_amd.fp8.flash_attn_qkvpacked_fp8_func(
                 qkv_packed,
                 dropout_p=self.dropout_p,
                 causal=self.causal
             )
         else:
-            context = flash_attn_qkvpacked_func(
+            context = flash_attn.flash_attn_qkvpacked_func(
                 qkv_packed, 
                 dropout_p=self.dropout_p,
                 causal=self.causal
