@@ -27,8 +27,10 @@ from flash_attn.cute.interface import flash_attn_func as flash_attn_func_python
 from flash_attn.cute.interface import flash_attn_varlen_func as flash_attn_varlen_func_python
 try:
     from flash_attn_interface import flash_attn_func as flash_attn_func_v3
+    from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_v3
 except ImportError:
     flash_attn_func_v3 = None
+    flash_attn_varlen_func_v3 = None
 
 if torch.cuda.get_device_capability()[0] != 9:
     flash_attn_func_v3 = None
@@ -355,7 +357,7 @@ for headdim in [128]:
                     m1 = time_fwd(flash_attn_func_v3, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, causal=causal, window_size=window_size_fa, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3')
                     # pytorch_profiler(flash_attn_func_v3, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, page_table=page_table, causal=causal, window_size=window_size, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa)
                 else:
-                    m1 = time_fwd(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, window_size=window_size, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3')
+                    m1 = time_fwd(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, window_size=window_size_fa, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3')
                     # pytorch_profiler(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, window_size=window_size, softcap=softcap, num_splits=num_splits)
                 time_f[(causal, headdim, batch_size, seqlen), "Flash3"] = m1.mean
             if flash_attn_func_python is not None:
