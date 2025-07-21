@@ -127,19 +127,21 @@ class FlashAttentionForwardSm100:
         self.tmem_vec0_offset = 0
         self.tmem_vec1_offset = self.tmem_vec0_offset + self.n_block_size
 
-        # self.num_regs_softmax = 192
-        # self.num_regs_softmax = 184
-        self.num_regs_softmax = 176
-        # self.num_regs_correction = 104
-        # self.num_regs_correction = 96
-        # self.num_regs_correction = 80
-        self.num_regs_correction = 64 if self.is_causal or self.is_local else 80
-        # self.num_regs_other = 24
-        # self.num_regs_other = 32
-        # self.num_regs_other = 64
-        # self.num_regs_other = 80
-        self.num_regs_other = 96 if self.is_causal or self.is_local else 80
-        # self.num_regs_other = 48
+        if self.head_dim_padded < 96:
+            self.num_regs_softmax = 192
+            self.num_regs_correction = 64
+            self.num_regs_other = 64
+        else:
+            # self.num_regs_softmax = 184
+            self.num_regs_softmax = 176
+            # self.num_regs_correction = 96
+            # self.num_regs_correction = 80
+            self.num_regs_correction = 64 if self.is_causal or self.is_local else 80
+            # self.num_regs_other = 32
+            # self.num_regs_other = 64
+            # self.num_regs_other = 80
+            # self.num_regs_other = 48
+            self.num_regs_other = 96 if self.is_causal or self.is_local else 80
         self.num_regs_empty = 24
 
         self.buffer_align_bytes = 1024

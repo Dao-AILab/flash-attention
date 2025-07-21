@@ -443,14 +443,13 @@ def shuffle_sync(
 
 
 @dsl_user_op
-def noop_asm(val: cutlass.Int32, *, loc=None, ip=None) -> cute.Numeric:
-    assert val.width == 32, "noop_asm only supports 32-bit types"
-    return type(val)(
+def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+    return cutlass.Uint32(
         llvm.inline_asm(
             T.i32(),
-            [cutlass.Int32(val).ir_value(loc=loc, ip=ip)],
-            "mov.b32 $0, $1;",
-            "=r,r",
+            [cutlass.Uint32(val).ir_value(loc=loc, ip=ip), cutlass.Uint32(shift).ir_value(loc=loc, ip=ip)],
+            "shr.s32 $0, $1, $2;",
+            "=r,r,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,

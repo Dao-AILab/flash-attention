@@ -194,6 +194,7 @@ class SoftmaxSm100(Softmax):
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
             )
 
+    @cute.jit
     def scale_apply_exp2_convert(
         self,
         acc_S_row: cute.Tensor,
