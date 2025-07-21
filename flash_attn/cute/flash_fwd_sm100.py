@@ -3,9 +3,9 @@
 # - noncausal & causal attention
 # - MHA, GQA, MQA
 # - hdim 64, 96, 128.
+# - varlen
 # - sliding window
 # Unsupported features that will be added later:
-# - varlen
 # - split-kv (optimizing for inference)
 # - more hdim (192, 256)
 # Based on the cutlass example and cute-dsl example:
@@ -210,7 +210,8 @@ class FlashAttentionForwardSm100:
         LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
         mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose)) if const_expr(mLSE is not None) else None
         # (s, d, h, b) -> (d, s, h, b)
-        mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=[1, 0, 2, 3]))
+        V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
+        mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
 
         self.q_major_mode = cutlass.utils.LayoutEnum.from_tensor(mQ).mma_major_mode()
         self.k_major_mode = cutlass.utils.LayoutEnum.from_tensor(mK).mma_major_mode()
@@ -796,36 +797,6 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
-        # (bM, bK, loopM, loopL)
-        gQ_qdhb = cute.local_tile(mQ, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0, None, None))
-        tSgQ_qdhb = thr_mma_qk.partition_A(gQ_qdhb)
-        # (bN, bK, loopN, loopL)
-        gK_kdhb = cute.local_tile(mK, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0, None, None))
-        tSgK_kdhb = thr_mma_qk.partition_B(gK_kdhb)
-        # (bK, bN, loopN, loopL)
-        gV_dkhb = cute.local_tile(mV, cute.select(self.pv_mma_tiler, mode=[1, 2]), (0, None, None, None))
-        tOgV_dkhb = thr_mma_pv.partition_B(gV_dkhb)
-        tQsQ, tQgQ_qdhb = cpasync.tma_partition(
-            tma_atom_Q,
-            0,  # no multicast
-            cute.make_layout(1),
-            cute.group_modes(sQ, 0, 3),
-            cute.group_modes(tSgQ_qdhb, 0, 3),
-        )
-        tKsK, tKgK_kdhb = cpasync.tma_partition(
-            tma_atom_K,
-            0,  # no multicast
-            cute.make_layout(1),
-            cute.group_modes(sK, 0, 3),
-            cute.group_modes(tSgK_kdhb, 0, 3),
-        )
-        tVsV, tVgV_dkl = cpasync.tma_partition(
-            tma_atom_V,
-            0,  # no multicast
-            cute.make_layout(1),
-            cute.group_modes(sV, 0, 3),
-            cute.group_modes(tOgV_dkhb, 0, 3),
-        )
 
         q_producer_phase = Int32(1)
         kv_producer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.kv_stage)
@@ -833,9 +804,46 @@ class FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
-            tQgQ = tQgQ_qdhb[None, None, head_idx, batch_idx]
-            head_idx_kv = head_idx // self.qhead_per_kvhead
-            tKgK, tVgV = [t[None, None, head_idx_kv, batch_idx] for t in (tKgK_kdhb, tVgV_dkl)]
+            seqlen = SeqlenInfoCls(batch_idx)
+            if const_expr(not seqlen.has_cu_seqlens_q):
+                mQ_cur = mQ[None, None, head_idx, batch_idx]
+            else:
+                offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                mQ_cur = cute.domain_offset((offset, 0), mQ[None, None, head_idx])
+            head_idx_kv = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
+            if const_expr(not seqlen.has_cu_seqlens_k):
+                mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
+            else:
+                mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, head_idx_kv])
+                mV_cur = cute.domain_offset((0, seqlen.offset_k), mV[None, None, head_idx_kv])
+
+            gQ = cute.local_tile(mQ_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
+            tSgQ = thr_mma_qk.partition_A(gQ)
+            gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
+            tSgK = thr_mma_qk.partition_B(gK)
+            gV = cute.local_tile(mV_cur, cute.select(self.pv_mma_tiler, mode=[1, 2]), (0, None))
+            tOgV = thr_mma_pv.partition_B(gV)
+            tQsQ, tQgQ = cpasync.tma_partition(
+                tma_atom_Q,
+                0,  # no multicast
+                cute.make_layout(1),
+                cute.group_modes(sQ, 0, 3),
+                cute.group_modes(tSgQ, 0, 3),
+            )
+            tKsK, tKgK = cpasync.tma_partition(
+                tma_atom_K,
+                0,  # no multicast
+                cute.make_layout(1),
+                cute.group_modes(sK, 0, 3),
+                cute.group_modes(tSgK, 0, 3),
+            )
+            tVsV, tVgV = cpasync.tma_partition(
+                tma_atom_V,
+                0,  # no multicast
+                cute.make_layout(1),
+                cute.group_modes(sV, 0, 3),
+                cute.group_modes(tOgV, 0, 3),
+            )
 
             def load_Q(stage: int):
                 cute.arch.mbarrier_wait(mbar_ptr + self.mbar_load_q_empty_offset + stage, q_producer_phase)
@@ -851,7 +859,6 @@ class FlashAttentionForwardSm100:
             load_K = partial(self.load_K, tma_atom_K, tKgK, tKsK, pipeline_kv)
             load_V = partial(self.load_K, tma_atom_V, tVgV, tVsV, pipeline_kv)
 
-            seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
             load_Q(0)  # Q0
             load_K(n_block_max - 1, kv_producer_state)  # K0
@@ -1435,7 +1442,8 @@ class FlashAttentionForwardSm100:
                 if const_expr(not seqlen.has_cu_seqlens_q):
                     mLSE_cur = mLSE[None, head_idx, batch_idx]
                 else:
-                    mLSE_cur = cute.domain_offset((seqlen.offset_q,), mLSE[None, head_idx])
+                    offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                    mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
                 gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_block * 2,))
                 for stage in cutlass.range_constexpr(2):
                     row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
@@ -1649,7 +1657,8 @@ class FlashAttentionForwardSm100:
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mO_cur = mO[None, None, head_idx, batch_idx]
             else:
-                mO_cur = cute.domain_offset((seqlen.offset_q, 0), mO[None, None, head_idx])
+                offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                mO_cur = cute.domain_offset((offset, 0), mO[None, None, head_idx])
             gO = cute.local_tile(mO_cur, (self.m_block_size, self.head_dim_v_padded), (None, 0))
             if const_expr(self.use_tma_O):
                 tOsO, tOgO = cpasync.tma_partition(
