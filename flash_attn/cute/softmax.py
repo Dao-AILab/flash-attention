@@ -175,9 +175,9 @@ class SoftmaxSm100(Softmax):
         acc_S_row: cute.Tensor,
         acc_S_row_converted: cute.Tensor,
         e2e: cutlass.Constexpr[bool] = False,
-        e2e_freq: cutlass.Constexpr[bool] = 32,
-        e2e_res: cutlass.Constexpr[bool] = 4,
-        e2e_frg_limit: cutlass.Constexpr[bool] = 1,
+        e2e_freq: cutlass.Constexpr[int] = 16,
+        e2e_res: cutlass.Constexpr[int] = 4,
+        e2e_frg_limit: cutlass.Constexpr[int] = 1,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         frg_tile = 32

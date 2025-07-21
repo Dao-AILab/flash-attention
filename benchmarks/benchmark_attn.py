@@ -240,10 +240,10 @@ dim = 2048
 headdim = 256
 # for headdim in [64, 128, 256]:
 # bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
-# bs_seqlen_vals = [(16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
+bs_seqlen_vals = [(32, 1024), (16, 2048), (8, 4096), (4, 8192), (2, 16384), (1, 32768)]
 # bs_seqlen_vals = [(32, 512), (16, 1024)]
 # bs_seqlen_vals = [(2, 64 * 132)]
-bs_seqlen_vals = [(4, 8192)]
+# bs_seqlen_vals = [(4, 8192)]
 # bs_seqlen_vals = [(1, 16 * 1024)]
 time_f = {}
 time_b = {}
@@ -254,7 +254,7 @@ time_b = {}
 # for headdim in [64, 96, 128]:
 # for headdim in [64, 128, 256]:
 # for headdim in [64, 96, 128, 192, 256]:
-for headdim in [64, 128]:
+for headdim in [128]:
     nheads = dim // headdim
     # nheads = 128
     # headdim = 64
@@ -312,8 +312,8 @@ for headdim in [64, 128]:
         else:
             page_table = None
 
-        for causal in [False, True]:
-        # for causal in [False]:
+        # for causal in [False, True]:
+        for causal in [True]:
             print(f"\n### {headdim = }, {causal = }, {seqlen = } ###")
             nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen, headdim if not has_qv else headdim + headdim_v, headdim_v, causal=causal, window_size=window_size)
             if cudnn is not None:
