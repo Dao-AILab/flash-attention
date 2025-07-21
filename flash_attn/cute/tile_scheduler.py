@@ -480,10 +480,9 @@ class SingleTileVarlenScheduler:
         else:
             assert self.mCuSeqlensQ is not None
             cur_cu_seqlen = Int32(0)
-            if batch_idx < self.num_batch:
+            if batch_idx <= self.num_batch:
                 cur_cu_seqlen = self.mCuSeqlensQ[batch_idx]
-            # Very important that we set mask_and_clamp to 0
-            next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1, mask_and_clamp=0)
+            next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1)
             seqlen = next_cu_seqlen - cur_cu_seqlen
         if cutlass.const_expr(self.qhead_per_kvhead_packgqa > 1):
             seqlen *= self.qhead_per_kvhead_packgqa
