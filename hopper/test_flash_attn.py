@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch._C import parse_schema
+from torch.testing._internal.optests import fake_check
 
 from einops import rearrange, repeat
 try:
@@ -38,6 +39,7 @@ DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
+DISABLE_FAKE_CHECK = os.getenv("FLASH_ATTENTION_DISABLE_FAKE_CHECK", "FALSE") == "TRUE"
 
 COMPILED_HDIMS = (
     []
@@ -47,6 +49,18 @@ COMPILED_HDIMS = (
     + ([192] if not DISABLE_HDIM192 else [])
     + ([256] if not DISABLE_HDIM256 else [])
 )
+
+
+def run_fake_check(fn):
+    def wrapper(*args, **kwargs):
+        fake_check(fn, args, kwargs)
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+if not DISABLE_FAKE_CHECK:
+    flash_attn_func = run_fake_check(flash_attn_func)
+    flash_attn_varlen_func = run_fake_check(flash_attn_varlen_func)
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
