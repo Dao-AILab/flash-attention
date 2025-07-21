@@ -1171,20 +1171,17 @@ class FlashAttentionForwardSm100:
             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase)
             si_corr_producer_phase ^= 1
 
-            if const_expr(not (self.is_causal or self.is_local)):
-                # 1 masking iter
-                mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block_max - 1, is_first=True, mask_fn=partial(mask_fn, mask_seqlen=True))
-                n_block_max -= 1
-            else:
-                # Next couple of iterations with causal masking
-                # Careful, we're not setting is_first=True for any iteration here.
-                # Currently this doesn't matter, but we might change the synchronization later
+            # 1 masking iter
+            mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block_max - 1, is_first=True, mask_fn=partial(mask_fn, mask_seqlen=True))
+            n_block_max -= 1
+            # Next couple of iterations with causal masking
+            if const_expr(self.is_causal or self.is_local):
                 n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
                     seqlen, m_block, n_block_min
                 )
                 for n_tile in cutlass.range(n_block_max - n_block_min_causal_local_mask, unroll=1):
                     n_block = n_block_max - 1 - n_tile
-                    mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_seqlen=True))
+                    mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_seqlen=False))
                 n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
             # The remaining iterations have no masking
             n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
@@ -1198,7 +1195,7 @@ class FlashAttentionForwardSm100:
                 n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
                 for n_tile in cutlass.range(0, n_block_max - n_block_min, unroll=1):
                     n_block = n_block_max - 1 - n_tile
-                    mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_seqlen=True))
+                    mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_seqlen=False))
                     # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
             # tSrScale_r2t = cute.make_fragment(tSrScale_r2t_shape, Float32)
