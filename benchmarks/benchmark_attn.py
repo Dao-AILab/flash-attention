@@ -254,7 +254,7 @@ time_b = {}
 # for headdim in [64, 96, 128]:
 # for headdim in [64, 128, 256]:
 # for headdim in [64, 96, 128, 192, 256]:
-for headdim in [64]:
+for headdim in [64, 128]:
     nheads = dim // headdim
     # nheads = 128
     # headdim = 64
