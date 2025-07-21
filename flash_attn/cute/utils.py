@@ -545,9 +545,9 @@ def e2e_asm2(x: Float32, y: Float32) -> Tuple[Float32, Float32]:
             "mov.b64 {r1, r2}, l7;\n\t"
             "mov.b64 {r3, r4}, l10;\n\t"
             "shl.b32 r5, r1, 23;\n\t"
-            "add.u32 r7, r5, r3;\n\t"
+            "add.s32 r7, r5, r3;\n\t"
             "shl.b32 r6, r2, 23;\n\t"
-            "add.u32 r8, r6, r4;\n\t"
+            "add.s32 r8, r6, r4;\n\t"
             "mov.b64 $0, {r7, r8};\n\t"
             "}\n",
             "=l,f,f",
