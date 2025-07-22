@@ -238,10 +238,10 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-# @pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("local", [False])
-# @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("local", [False, True])
+# @pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
 @pytest.mark.parametrize("add_unused_qkv", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -279,6 +279,8 @@ def test_flash_attn_output(
 def test_flash_attn_varlen_output(
         seqlen_q, seqlen_k, d, add_unused_qkv, causal, local, softcap, deterministic, has_qv, mha_type, dtype
 ):
+    if (causal or local):  # Right now we only support causal attention with seqlen_k == seqlen_q
+        seqlen_k = seqlen_q
     device = "cuda"
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
@@ -306,7 +308,7 @@ def test_flash_attn_varlen_output(
         else:
             qv_ref = None
         # Put window_size after QKV randn so that window_size changes from test to test
-        window_size = (None, None) if not local else torch.randint(0, seqlen_k, (2,))
+        window_size = (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
         if dtype == torch.float8_e4m3fn:
             q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
         else:
@@ -342,6 +344,9 @@ def test_flash_attn_varlen_output(
         key_padding_mask, key_unused_mask = _gen_unused_masks(
             key_padding_mask, add_unused_qkv, seqlen_k, batch_size, k.device
         )
+
+        if causal or local:
+            key_padding_mask = query_padding_mask
 
         (
             q_unpad,
@@ -416,9 +421,8 @@ def test_flash_attn_varlen_output(
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 # max_seqlen_k,
-                seqused_q=seqused_q,
-                seqused_k=seqused_k,
-                max_seqlen_q=max_seqlen_q,
+                # seqused_q=seqused_q,
+                # seqused_k=seqused_k,
                 causal=causal,
                 # qv=qv_unpad,
                 # q_descale=q_descale,

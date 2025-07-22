@@ -1064,7 +1064,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
-        max_seqlen_q: Optional[cutlass.Int32] = None,
         softcap: cutlass.Float32 | float | None = None,
         window_size_left: cutlass.Int32 | int | None = None,
         window_size_right: cutlass.Int32 | int | None = None,
@@ -1166,14 +1165,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             element_size=self.dtype.width // 8,
             is_persistent=False,
+            lpt=self.is_causal or self.is_local,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
-        # grid_dim = (
-        #     cute.ceil_div(cute.size(mQ.shape[0]) if const_expr(mCuSeqlensQ is None) else max_seqlen_q, self.m_block_size),
-        #     cute.size(mQ.shape[2]),
-        #     cute.size(mQ.shape[3] if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ.shape[0] - 1),
-        # )
         # If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         # Right after this, we multiply by log2(e) before applying exp2.
         # To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
@@ -1228,6 +1223,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             block=[self.num_threads, 1, 1],
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
+            min_blocks_per_mp=1,
         )
 
     @cute.kernel
@@ -1330,8 +1326,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # TODO: idk why not using sO_pi is faster
         sO = cute.make_tensor(cute.recast_ptr(sO_pi.iterator, sO_layout.inner, dtype=sO_pi.element_type), sO_layout.outer)
 
-        # Thread index, block index
-        tidx, _, _ = cute.arch.thread_idx()
         block_info = BlockInfo(
             self.m_block_size, self.n_block_size, self.is_causal, self.is_local,
             window_size_left, window_size_right,
@@ -1375,6 +1369,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # ///////////////////////////////////////////////////////////////////////////////
             # Tile MMA compute thread partitions and allocate accumulators
             # ///////////////////////////////////////////////////////////////////////////////
+            tidx, _, _ = cute.arch.thread_idx()
             tidx = tidx - 128
             self.mma(
                 tiled_mma_qk,
@@ -1619,6 +1614,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # those that need masking on S, and those that don't.
             # We need masking on S for the very last block when K and V has length not multiple of n_block_size.
             # We also need masking on S if it's causal, for the last several blocks.
+            O_should_accumulate = False
             # First iteration with seqlen masking
             if const_expr(self.intra_wg_overlap):
                 acc_S = cute.make_fragment(
@@ -1649,13 +1645,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
                     cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
                 # Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
-                acc_O.fill(0.0)
+                # acc_O.fill(0.0)
             else:
                 self.warp_scheduler_barrier_sync()
                 kv_consumer_state = mma_one_n_block(
                     n_block_max - 1, kv_consumer_state,
-                    is_first_n_block=True, mask_fn=partial(mask_fn, mask_seqlen=True)
+                    is_first_n_block=True, mask_fn=partial(mask_fn, mask_seqlen=True),
+                    O_should_accumulate=False
                 )
+                O_should_accumulate = True
             # if cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block_max = {}, n_block_min = {}", m_block, n_block_max, n_block_min)
             n_block_max -= 1
             # Next couple of iterations with causal masking
@@ -1667,8 +1665,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 for n_tile in cutlass.range(n_block_max - n_block_min_causal_local_mask, unroll=1):
                     n_block = n_block_max - 1 - n_tile
                     kv_consumer_state = mma_one_n_block(
-                        n_block, kv_consumer_state, mask_fn=partial(mask_fn, mask_seqlen=False)
+                        n_block, kv_consumer_state, mask_fn=partial(mask_fn, mask_seqlen=False),
+                        O_should_accumulate=O_should_accumulate
                     )
+                    O_should_accumulate = True
                 n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
             # The remaining iterations have no masking
             n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
@@ -1677,7 +1677,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block_min_before_local_mask = {}, n_block_min = {}", n_block_min_before_local_mask, n_block_min)
             for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
                 n_block = n_block_max - 1 - n_tile
-                kv_consumer_state = mma_one_n_block(n_block, kv_consumer_state, check_inf=True)
+                kv_consumer_state = mma_one_n_block(n_block, kv_consumer_state, check_inf=True, O_should_accumulate=O_should_accumulate)
+                O_should_accumulate = True
             # Separate iterations with local masking on the left
             if const_expr(self.is_local and block_info.window_size_left is not None):
                 n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
@@ -1685,15 +1686,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     n_block = n_block_max - 1 - n_tile
                     kv_consumer_state = mma_one_n_block(
                         n_block, kv_consumer_state,
-                        check_inf=True, mask_fn=partial(mask_fn, mask_seqlen=False)
+                        check_inf=True, mask_fn=partial(mask_fn, mask_seqlen=False),
+                        O_should_accumulate=O_should_accumulate
                     )
+                    O_should_accumulate = True
             # Last "half" iteration
             if const_expr(self.intra_wg_overlap):
                 pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
                 sm90_utils.gemm(
                     tiled_mma_pv, mma_params.acc_O, mma_params.tOrP,
                     mma_params.tOrVt[None, None, None, kv_consumer_state.index],
-                    zero_init=False, wg_wait=-1
+                    zero_init=not O_should_accumulate, wg_wait=-1
                 )
                 warpgroup.wait_group(0)
                 pipeline_v.consumer_release(kv_consumer_state)
@@ -1733,6 +1736,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
+        O_should_accumulate: cutlass.Boolean = True,
     ):
         acc_S = cute.make_fragment(
             tiled_mma_qk.partition_shape_C((self.m_block_size, self.n_block_size)), cutlass.Float32
@@ -1768,7 +1772,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sm90_utils.gemm(
             tiled_mma_pv, mma_params.acc_O, mma_params.tOrP,
             mma_params.tOrVt[None, None, None, smem_pipe_read.index],
-            zero_init=is_first_n_block, wg_wait=0
+            zero_init=not O_should_accumulate, wg_wait=0
         )
         pipeline_v.consumer_release(smem_pipe_read)
         smem_pipe_read.advance()
@@ -1790,6 +1794,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         scoremod_premask_fn: Callable,
         mask_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
+        O_should_accumulate: cutlass.Boolean = True,
     ):
         smem_pipe_read_v = smem_pipe_read.clone()
         smem_pipe_read.advance()
@@ -1807,7 +1812,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sm90_utils.gemm(
             tiled_mma_pv, mma_params.acc_O, mma_params.tOrP,
             mma_params.tOrVt[None, None, None, smem_pipe_read_v.index],
-            zero_init=False, wg_wait=-1
+            zero_init=not O_should_accumulate, wg_wait=-1
         )
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(1)

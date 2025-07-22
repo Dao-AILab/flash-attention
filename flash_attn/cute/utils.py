@@ -1,14 +1,14 @@
 # Copyright (c) 2025, Tri Dao.
 
 import math
-from typing import Type, Callable, Optional
+from typing import Type, Callable, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
 
-from cutlass import Float32
+from cutlass import Float32, Int32
 from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import nvvm, llvm
+from cutlass._mlir.dialects import nvvm, llvm, arith, vector
 from cutlass.cute.runtime import from_dlpack
 
 
@@ -443,14 +443,13 @@ def shuffle_sync(
 
 
 @dsl_user_op
-def noop_asm(val: cutlass.Int32, *, loc=None, ip=None) -> cute.Numeric:
-    assert val.width == 32, "noop_asm only supports 32-bit types"
-    return type(val)(
+def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+    return cutlass.Uint32(
         llvm.inline_asm(
             T.i32(),
-            [cutlass.Int32(val).ir_value(loc=loc, ip=ip)],
-            "mov.b32 $0, $1;",
-            "=r,r",
+            [cutlass.Uint32(val).ir_value(loc=loc, ip=ip), cutlass.Uint32(shift).ir_value(loc=loc, ip=ip)],
+            "shr.s32 $0, $1, $2;",
+            "=r,r,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -499,3 +498,62 @@ def cvt_f16(src: cute.Tensor, dst: cute.Tensor):
     assert cute.size(dst_i32.shape) * 2 == cute.size(src.shape)
     for i in cutlass.range_constexpr(cute.size(dst_i32)):
         dst_i32[i] = cvt_f16x2_f32(src[2 * i], src[2 * i + 1], dst.element_type)
+
+
+@dsl_user_op
+def i64_to_f32x2(c: cutlass.Int64, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    vec_i64x1 = vector.from_elements(T.vector(1, T.i64()), (c.ir_value(),), loc=loc, ip=ip)
+    vec_f32x2 = vector.bitcast(T.vector(2, T.f32()), vec_i64x1)
+    res0 = Float32(
+        vector.extract(vec_f32x2, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
+    )
+    res1 = Float32(
+        vector.extract(vec_f32x2, dynamic_position=[], static_position=[1], loc=loc, ip=ip)
+    )
+    return res0, res1
+
+
+@cute.jit
+def e2e_asm2(x: Float32, y: Float32) -> Tuple[Float32, Float32]:
+    out_i64 = cutlass.Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [Float32(x).ir_value(), Float32(y).ir_value()],
+            "{\n\t"
+            ".reg .f32 f1, f2, f3, f4, f5, f6, f7;\n\t"
+            ".reg .b64 l1, l2, l3, l4, l5, l6, l7, l8, l9, l10;\n\t"
+            ".reg .s32 r1, r2, r3, r4, r5, r6, r7, r8;\n\t"
+            "max.ftz.f32 f1, $1, 0fC2FE0000;\n\t"
+            "max.ftz.f32 f2, $2, 0fC2FE0000;\n\t"
+            "mov.b64 l1, {f1, f2};\n\t"
+            "mov.f32 f3, 0f4B400000;\n\t"
+            "mov.b64 l2, {f3, f3};\n\t"
+            "add.rm.ftz.f32x2 l7, l1, l2;\n\t"
+            "sub.rn.ftz.f32x2 l8, l7, l2;\n\t"
+            "sub.rn.ftz.f32x2 l9, l1, l8;\n\t"
+            "mov.f32 f7, 0f3D9DF09D;\n\t"
+            "mov.b64 l6, {f7, f7};\n\t"
+            "mov.f32 f6, 0f3E6906A4;\n\t"
+            "mov.b64 l5, {f6, f6};\n\t"
+            "mov.f32 f5, 0f3F31F519;\n\t"
+            "mov.b64 l4, {f5, f5};\n\t"
+            "mov.f32 f4, 0f3F800000;\n\t"
+            "mov.b64 l3, {f4, f4};\n\t"
+            "fma.rn.ftz.f32x2 l10, l9, l6, l5;\n\t"
+            "fma.rn.ftz.f32x2 l10, l10, l9, l4;\n\t"
+            "fma.rn.ftz.f32x2 l10, l10, l9, l3;\n\t"
+            "mov.b64 {r1, r2}, l7;\n\t"
+            "mov.b64 {r3, r4}, l10;\n\t"
+            "shl.b32 r5, r1, 23;\n\t"
+            "add.s32 r7, r5, r3;\n\t"
+            "shl.b32 r6, r2, 23;\n\t"
+            "add.s32 r8, r6, r4;\n\t"
+            "mov.b64 $0, {r7, r8};\n\t"
+            "}\n",
+            "=l,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+    return i64_to_f32x2(out_i64)

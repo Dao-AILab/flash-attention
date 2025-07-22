@@ -50,6 +50,7 @@ class TileSchedulerArguments(ParamsBase):
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
     element_size: cutlass.Constexpr[int] = 2
     is_persistent: cutlass.Constexpr[bool] = False
+    lpt: cutlass.Constexpr[bool] = False
 
 
 class SingleTileScheduler:
@@ -391,41 +392,50 @@ class SingleTileVarlenScheduler:
         num_head: Int32
         num_batch: Int32
         total_q: Int32
+        max_kvblock_in_l2: Int32
         block_size: cutlass.Constexpr[int]
         mCuSeqlensQ: Optional[cute.Tensor] = None
         mSeqUsedQ: Optional[cute.Tensor] = None
         qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+        lpt: cutlass.Constexpr[bool] = False
 
         @staticmethod
         @cute.jit
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileVarlenScheduler.Params":
+            size_l2 = 50 * 1024 * 1024  # 50 MB for K & V
+            max_kvblock_in_l2 = size_l2 // ((args.headdim + args.headdim_v) * args.element_size * args.block_size)
             return SingleTileVarlenScheduler.Params(
                 num_head=args.num_head,
                 num_batch=args.num_batch,
                 total_q=args.total_q,
+                max_kvblock_in_l2=max_kvblock_in_l2,
                 block_size=args.block_size,
                 mCuSeqlensQ=args.mCuSeqlensQ,
                 mSeqUsedQ=args.mSeqUsedQ,
                 qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
+                lpt=args.lpt,
             )
 
     def __init__(
         self,
         num_head: Int32,
         num_batch: Int32,
+        max_kvblock_in_l2: Int32,
         tile_idx: Int32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         block_size: cutlass.Constexpr[int] = 128,
         qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1,
+        lpt: cutlass.Constexpr[bool] = False,
         *,
         loc=None,
         ip=None,
     ):
         self.num_head = num_head
         self.num_batch = num_batch
+        self.max_kvblock_in_l2 = max_kvblock_in_l2
         self.mCuSeqlensQ = mCuSeqlensQ
         self.mSeqUsedQ = mSeqUsedQ
         assert self.mCuSeqlensQ is not None or self.mSeqUsedQ is not None, (
@@ -433,6 +443,7 @@ class SingleTileVarlenScheduler:
         )
         self.block_size = block_size
         self.qhead_per_kvhead_packgqa = qhead_per_kvhead_packgqa
+        self.lpt = lpt
         self._tile_idx = tile_idx
         self._is_first_block = True
         self._loc = loc
@@ -448,11 +459,13 @@ class SingleTileVarlenScheduler:
         return SingleTileVarlenScheduler(
             params.num_head,
             params.num_batch,
+            params.max_kvblock_in_l2,
             tile_idx,
             mCuSeqlensQ=params.mCuSeqlensQ,
             mSeqUsedQ=params.mSeqUsedQ,
             block_size=params.block_size,
             qhead_per_kvhead_packgqa=params.qhead_per_kvhead_packgqa,
+            lpt=params.lpt,
             loc=loc,
             ip=ip,
         )
@@ -480,10 +493,9 @@ class SingleTileVarlenScheduler:
         else:
             assert self.mCuSeqlensQ is not None
             cur_cu_seqlen = Int32(0)
-            if batch_idx < self.num_batch:
+            if batch_idx <= self.num_batch:
                 cur_cu_seqlen = self.mCuSeqlensQ[batch_idx]
-            # Very important that we set mask_and_clamp to 0
-            next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1, mask_and_clamp=0)
+            next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1)
             seqlen = next_cu_seqlen - cur_cu_seqlen
         if cutlass.const_expr(self.qhead_per_kvhead_packgqa > 1):
             seqlen *= self.qhead_per_kvhead_packgqa
@@ -538,8 +550,27 @@ class SingleTileVarlenScheduler:
             )
             num_m_blocks = cute.arch.shuffle_sync(num_m_blocks, batch_idx_in_group)
             mh_block = next_tile_idx - group_start_tile - num_m_blocks_prev_lane * self.num_head
-            head_idx = mh_block // num_m_blocks
-            block = mh_block - head_idx * num_m_blocks
+            if cutlass.const_expr(self.lpt):
+                # This is a version of the SingleTileLPTScheduler, complicated by the fact that
+                # the seqlen can vary per batch.
+                # TODO: is there any case where num_m_blocks is 0?
+                # TODO: by right we should read the seqlen_kv but we're assuming seqlen_q == seqlen_k here
+                # nheads_in_l2 = min(max(self.max_kvblock_in_l2 // num_m_blocks, 1), self.num_head)
+                # Seems faster to have this be a power of 2
+                nheads_in_l2 = 16 if num_m_blocks * 16 <= self.max_kvblock_in_l2 else (8 if num_m_blocks * 8 <= self.max_kvblock_in_l2 else (4 if num_m_blocks * 4 <= self.max_kvblock_in_l2 else (2 if num_m_blocks * 2 <= self.max_kvblock_in_l2 else 1)))
+                nheads_in_l2 = min(nheads_in_l2, self.num_head)
+                mh_in_l2 = nheads_in_l2 * num_m_blocks
+                section_idx = mh_block // mh_in_l2
+                l2_mod = mh_block - section_idx * mh_in_l2
+                # Deal with tail section
+                nheads_in_this_section = nheads_in_l2 if nheads_in_l2 * (section_idx + 1) <= self.num_head else self.num_head - section_idx * nheads_in_l2
+                block = l2_mod // nheads_in_this_section
+                head_idx_residual = l2_mod - block * nheads_in_this_section
+                head_idx = section_idx * nheads_in_l2 + head_idx_residual
+                block = num_m_blocks - 1 - block
+            else:
+                head_idx = mh_block // num_m_blocks
+                block = mh_block - head_idx * num_m_blocks
             is_valid = self._is_first_block and batch_idx < self.num_batch
         # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d", self._tile_idx, batch_idx, head_idx, block, is_valid)
         return cutlass.utils.WorkTileInfo(
@@ -561,6 +592,7 @@ class SingleTileVarlenScheduler:
         for obj in [
             self.num_head,
             self.num_batch,
+            self.max_kvblock_in_l2,
             self._tile_idx,
             self.mCuSeqlensQ,
             self.mSeqUsedQ,
@@ -576,6 +608,7 @@ class SingleTileVarlenScheduler:
             [
                 self.num_head,
                 self.num_batch,
+                self.max_kvblock_in_l2,
                 self._tile_idx,
                 self.mCuSeqlensQ,
                 self.mSeqUsedQ,
@@ -588,5 +621,6 @@ class SingleTileVarlenScheduler:
             *(tuple(obj_list)),
             block_size=self.block_size,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead_packgqa,
+            lpt=self.lpt,
             loc=self._loc,
         )
