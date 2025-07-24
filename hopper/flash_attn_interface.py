@@ -278,10 +278,11 @@ def _flash_attn_backward(
         softcap: float = 0.0,
         deterministic: bool = False,
         sm_margin: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    dq, dk, dv, softmax_d, *rest = flash_attn_3_cuda.bwd(
+    print('aqui2')
+    softmax_d, *rest = flash_attn_3_cuda.bwd(
         dout,
         q,
         k,
@@ -305,7 +306,7 @@ def _flash_attn_backward(
         deterministic,
         sm_margin,
     )
-    return dq, dk, dv, softmax_d
+    return softmax_d
 
 
 @_torch_register_fake_wrapper("flash_attn::_flash_attn_backward")
@@ -398,7 +399,7 @@ def _flash_attn_backward_fake(
     else:
         softmax_d = torch.empty((num_heads, total_q_padded_rounded), dtype=torch.float32, device=q.device)
 
-    return dq, dk, dv, softmax_d
+    return softmax_d
 
 
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
@@ -563,6 +564,7 @@ class FlashAttnFunc(torch.autograd.Function):
         q, k, v, out, softmax_lse = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        print('aqui1')
         _flash_attn_backward(
             dout,
             q,
