@@ -41,30 +41,8 @@ def round_up_headdim(head_size: int) -> int:
             return 256
     return 256
 
-# torch.compile() support is only enabled for pytorch >= 2.4
-# The reason for this is that we are using the new custom_op and register_fake
-# APIs, which support inplace modification of inputs in the function itself
-if torch.__version__ >= "2.4.0":
-    _torch_custom_op_wrapper = torch.library.custom_op
-    _torch_register_fake_wrapper = torch.library.register_fake
-else:
-    def noop_custom_op_wrapper(name, fn=None, /, *, mutates_args, device_types=None, schema=None):
-        def wrap(func):
-            return func
-        if fn is None:
-            return wrap
-        return fn
-    def noop_register_fake_wrapper(op, fn=None, /, *, lib=None, _stacklevel=1):
-        def wrap(func):
-            return func
-        if fn is None:
-            return wrap
-        return fn
-    _torch_custom_op_wrapper = noop_custom_op_wrapper
-    _torch_register_fake_wrapper = noop_register_fake_wrapper
 
-
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_forward", mutates_args=(), device_types="cuda")
+@torch.library.custom_op("flash_attn::_flash_attn_forward", mutates_args=(), device_types="cuda")
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -151,7 +129,7 @@ def _flash_attn_forward(
     return out, softmax_lse, *rest
 
 
-@_torch_register_fake_wrapper("flash_attn::_flash_attn_forward")
+@torch.library.register_fake("flash_attn::_flash_attn_forward")
 def _flash_attn_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -254,7 +232,7 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, out_accum, softmax_lse_accum
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
+@torch.library.custom_op("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
 def _flash_attn_backward(
         dout: torch.Tensor,
         q: torch.Tensor,
@@ -309,7 +287,7 @@ def _flash_attn_backward(
     return softmax_d
 
 
-@_torch_register_fake_wrapper("flash_attn::_flash_attn_backward")
+@torch.library.register_fake("flash_attn::_flash_attn_backward")
 def _flash_attn_backward_fake(
         dout: torch.Tensor,
         q: torch.Tensor,
