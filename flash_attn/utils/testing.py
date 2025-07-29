@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 import math
+from typing import Optional
 
 import torch
 from einops import rearrange, repeat
@@ -240,6 +241,7 @@ def attention_ref(
     window_size=(None, None),
     attention_chunk=0,
     sink_token_length=0,
+    additive_sink: Optional[torch.Tensor] = None,
     softcap=0.0,
     upcast=True,
     reorder_ops=False,
@@ -323,7 +325,14 @@ def attention_ref(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
-    attention = torch.softmax(scores, dim=-1).to(v.dtype)
+    if additive_sink is None:
+        attention = torch.softmax(scores, dim=-1).to(v.dtype)
+    else:
+        scores_fp32 = scores.to(torch.float32)
+        row_max = torch.amax(scores, dim=-1, keepdim=True)
+        numerator = torch.exp(scores_fp32 - row_max)
+        row_sum = torch.sum(numerator, dim=-1, keepdim=True) + rearrange(additive_sink, "h -> h 1 1") * torch.exp(-row_max)
+        attention = (numerator / row_sum).to(v.dtype)
     # We want to mask here so that the attention matrix doesn't have any NaNs
     # Otherwise we'll get NaN in dV
     if query_padding_mask is not None:

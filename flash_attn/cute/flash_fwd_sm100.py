@@ -193,6 +193,7 @@ class FlashAttentionForwardSm100:
         softcap: Float32 | float | None = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
+        additive_sink: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -473,6 +474,7 @@ class FlashAttentionForwardSm100:
             softcap_val,
             window_size_left,
             window_size_right,
+            additive_sink,
             sQ_layout,
             sK_layout,
             tP_layout,
@@ -512,6 +514,7 @@ class FlashAttentionForwardSm100:
         softcap_val: Optional[Float32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        additive_sink: Optional[cute.Tensor],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         tP_layout: cute.ComposedLayout,
@@ -790,6 +793,7 @@ class FlashAttentionForwardSm100:
                 mO,
                 mLSE,
                 sO,
+                additive_sink,
                 tma_atom_O,
                 mbar_ptr,
                 softmax_scale_log2,
@@ -1377,6 +1381,7 @@ class FlashAttentionForwardSm100:
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         sO: cute.Tensor,
+        additive_sink: Optional[cute.Tensor],
         tma_atom_O: cute.CopyAtom,
         mbar_ptr: cute.Pointer,
         softmax_scale_log2: Float32,
@@ -1452,17 +1457,20 @@ class FlashAttentionForwardSm100:
             # additional sync because the MMA in the top half must have been done.
             # Similarly we can write to stage 1 of sO without additional sync.
             stats = [None] * self.q_stage
+            add_sink_val = additive_sink[head_idx] if const_expr(additive_sink is not None) else None
             for stage in cutlass.range_constexpr(self.q_stage):
                 cute.arch.mbarrier_wait(mbar_ptr + self.mbar_softmax_corr_full_offset + stage, softmax_corr_consumer_phase)
                 # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                 # cute.arch.fence_view_async_tmem_load()
                 # scale = tSrScale_t2r[0]
                 row_sum = sScale[tidx + stage * self.m_block_size]
-                if const_expr(mLSE is not None):
+                if const_expr(mLSE is not None or additive_sink is not None):
                     row_max = sScale[tidx + stage * self.m_block_size + self.m_block_size * 2]
                 else:
                     row_max = None
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + stage)
+                if const_expr(additive_sink is not None):
+                    row_sum += add_sink_val * utils.exp2f(-row_max * softmax_scale_log2)
                 acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                 stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                 scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
