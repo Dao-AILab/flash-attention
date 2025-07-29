@@ -1457,7 +1457,7 @@ class FlashAttentionForwardSm100:
             # additional sync because the MMA in the top half must have been done.
             # Similarly we can write to stage 1 of sO without additional sync.
             stats = [None] * self.q_stage
-            add_sink_val = additive_sink[head_idx] if const_expr(additive_sink is not None) else None
+            add_sink_val = Float32(additive_sink[head_idx]) if const_expr(additive_sink is not None) else None
             for stage in cutlass.range_constexpr(self.q_stage):
                 cute.arch.mbarrier_wait(mbar_ptr + self.mbar_softmax_corr_full_offset + stage, softmax_corr_consumer_phase)
                 # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)

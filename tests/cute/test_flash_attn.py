@@ -105,7 +105,7 @@ def test_flash_attn_output(
         # window_size = (-1, -1) if not local else (16, 0)
         if has_additive_sink:
             # We don't want negative here
-            additive_sink = torch.rand(nheads, dtype=torch.float32, device=device) * 5.0
+            additive_sink = torch.rand(nheads, dtype=torch.bfloat16, device=device) * 5.0
         else:
             additive_sink = None
         if dtype == torch.float8_e4m3fn:
@@ -326,7 +326,7 @@ def test_flash_attn_varlen_output(
         window_size = (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
         if has_additive_sink:
             # We don't want negative here
-            additive_sink = torch.rand(nheads, dtype=torch.float32, device=device) * 5.0
+            additive_sink = torch.rand(nheads, dtype=torch.bfloat16, device=device) * 5.0
         else:
             additive_sink = None
         if dtype == torch.float8_e4m3fn:

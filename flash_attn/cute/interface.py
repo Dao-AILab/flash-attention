@@ -101,7 +101,7 @@ def _flash_attn_fwd(
             assert t.stride(0) == 1, "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be contiguous"
     if additive_sink is not None:
         assert additive_sink.shape == (num_head,)
-        assert additive_sink.dtype == torch.float32
+        assert additive_sink.dtype == torch.bfloat16, "additive_sink must be bfloat16"
     assert all(t is None or t.is_cuda for t in (q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, additive_sink)), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
