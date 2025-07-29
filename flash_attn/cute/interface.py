@@ -48,6 +48,7 @@ torch2cute_dtype_map = {
 }
 
 
+@torch.library.custom_op("flash_attn::_flash_attn_fwd", mutates_args=())
 def _flash_attn_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -197,6 +198,7 @@ def _flash_attn_fwd(
 _flash_attn_fwd.compile_cache = {}
 
 
+@torch.library.custom_op("flash_attn::_flash_attn_bwd", mutates_args=())
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -521,3 +523,81 @@ def flash_attn_varlen_func(
         window_size,
         softcap,
     )
+
+
+# Fake implementations for custom_op + torch.compile compatibility
+
+@_flash_attn_fwd.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    softcap: Optional[float] = None,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    m_block_size: int = 128,
+    n_block_size: int = 128,
+    num_threads: int = 384,
+    _compute_capability: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_head, head_dim = q.shape[-2:]
+    if cu_seqlens_q is None:
+        batch_size, seqlen_q = q.shape[:2]
+        total_q = batch_size * seqlen_q
+    else:
+        batch_size = cu_seqlens_q.shape[0] - 1
+        seqlen_q = None
+        total_q = q.shape[0]
+    
+    num_head_kv = k.shape[-2]
+    head_dim_v = v.shape[-1]
+    
+    device = q.device
+    out_torch_dtype = q.dtype
+    q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
+    out = q.new_empty(*q_batch_seqlen_shape, num_head, head_dim_v)
+    
+    requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
+    if requires_grad:
+        lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
+        lse = q.new_empty(lse_shape, dtype=torch.float32)
+    else:
+        lse = None
+    
+    return out, lse
+
+
+@_flash_attn_bwd.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    softcap: float = 0.0,
+    m_block_size: int = 64,
+    n_block_size: int = 128,
+    num_threads: int = 256,
+    num_stages_Q: int = 2,
+    num_stages_dO: int = 2,
+    SdP_swapAB: bool = False,
+    dKV_swapAB: bool = False,
+    dQ_swapAB: bool = False,
+    AtomLayoutMSdP: int = 2,
+    AtomLayoutNdKV: int = 2,
+    AtomLayoutMdQ: int = 2,
+    V_in_regs: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    return dq, dk, dv
