@@ -173,8 +173,7 @@ def _flash_attn_forward_fake(
 
     # Determine if we're in varlen mode
     is_varlen_q = cu_seqlens_q is not None
-    is_varlen_k = cu_seqlens_k is not None
-    
+
     # Get dimensions from query tensor
     if is_varlen_q:
         # varlen mode: q is (total_q, num_heads, head_size)
@@ -190,7 +189,7 @@ def _flash_attn_forward_fake(
         total_q = batch_size * q.shape[1]
     # Get value head dimension
     head_size_v = v.shape[-1]
-    
+
     # Determine output dtype (FP8 inputs produce BF16 outputs)
     q_type = q.dtype
     if q_type == torch.float8_e4m3fn:
@@ -215,7 +214,7 @@ def _flash_attn_forward_fake(
     # There's an heuristic to compute num_splits when "num_splits <= 0"
     # assert that num_splits is > 0 for now
     if num_splits <= 0:
-        raise ValueError(f"{num_splits=} is not supported yet. Please set a value greater than 0")
+        raise ValueError(f"tracing (torch.compile/torch.export) with num_splits <= 0 not supported. Got {num_splits=}")
 
     if num_splits > 1:
         if is_varlen_q:
@@ -259,7 +258,6 @@ def _flash_attn_backward(
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    print('aqui2')
     softmax_d, *rest = flash_attn_3_cuda.bwd(
         dout,
         q,
@@ -542,7 +540,6 @@ class FlashAttnFunc(torch.autograd.Function):
         q, k, v, out, softmax_lse = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        print('aqui1')
         _flash_attn_backward(
             dout,
             q,
