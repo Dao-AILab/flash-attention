@@ -1592,7 +1592,7 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
     // Cast to char to avoid compiler warning about narrowing
     at::cuda::CUDAGuard device_guard{(char)out_partial.get_device()};
 
-    auto softmax_lse = torch::stable::new_empty(out_partial, {batch_size, num_heads, seqlen}, std::make_optional(out_type));
+    auto softmax_lse = torch::stable::new_empty(out_partial, {batch_size, num_heads, seqlen}, std::make_optional(c10::kFloat));
     softmax_lse = torch::stable::transpose(softmax_lse, 1, 2);
 
     Flash_fwd_params params {};  // Need to reset the params to set everything to zero
