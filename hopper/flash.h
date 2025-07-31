@@ -137,6 +137,12 @@ struct Flash_fwd_params : public Qkv_params {
     int window_size_left, window_size_right;
     int attention_chunk;
 
+    uint32_t const* sparse_masks;
+    int sparse_block_q;
+    int sparse_block_k;
+    int max_seqlen_q;
+    int max_seqlen_k;
+
     // Pointer to the RNG seed (idx 0) and offset (idx 1).
     uint64_t * rng_state;
 
