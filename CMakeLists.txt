@@ -230,7 +230,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
             hopper/flash_api_torch_lib.cpp
             ${FA3_GEN_SRCS}
         COMPILE_FLAGS ${VLLM_FA_GPU_FLAGS}
-        ARCHITECTURES ${VLLM_FA_GPU_ARCHES}
+        ARCHITECTURES "" # LucasW: this is ignored for cuda and set on a per-file basis
         USE_SABI 3
         WITH_SOABI)
 
