@@ -19,7 +19,7 @@
 # - bwd pass optimized for Hopper/Blackwell
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
 
 import torch
 
@@ -47,8 +47,8 @@ torch2cute_dtype_map = {
     torch.float32: cutlass.Float32,
 }
 
-
-@torch.library.custom_op("flash_attn::_flash_attn_fwd", mutates_args=())
+# TODO THIS AINT GUNNA WORK NEED TO PROBABLY MAKE A CUSTOM THANG
+# @torch.library.custom_op("flash_attn::_flash_attn_fwd", mutates_args=())
 def _flash_attn_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -69,6 +69,7 @@ def _flash_attn_fwd(
     n_block_size: int = 128,
     num_threads: int = 384,
     _compute_capability: Optional[int] = None,
+    score_mod: Callable | None = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
@@ -145,6 +146,8 @@ def _flash_attn_fwd(
         if not causal and not local:
             n_block_size = 192
 
+    # TODO: Hash on Callable
+
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,
         lse is None, cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
@@ -169,6 +172,7 @@ def _flash_attn_fwd(
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
+                score_mod=score_mod,
             )
         elif compute_capability == 10:
             fa_fwd = FlashAttentionForwardSm100(
@@ -197,8 +201,8 @@ def _flash_attn_fwd(
 
 _flash_attn_fwd.compile_cache = {}
 
-
-@torch.library.custom_op("flash_attn::_flash_attn_bwd", mutates_args=())
+# TODO THIS AINT GUNNA WORK NEED TO PROBABLY MAKE A CUSTOM THANG
+# @torch.library.custom_op("flash_attn::_flash_attn_bwd", mutates_args=())
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -527,7 +531,7 @@ def flash_attn_varlen_func(
 
 # Fake implementations for custom_op + torch.compile compatibility
 
-@_flash_attn_fwd.register_fake
+# @_flash_attn_fwd.register_fake
 def _(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -554,26 +558,26 @@ def _(
         batch_size = cu_seqlens_q.shape[0] - 1
         seqlen_q = None
         total_q = q.shape[0]
-    
+
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
-    
+
     device = q.device
     out_torch_dtype = q.dtype
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     out = q.new_empty(*q_batch_seqlen_shape, num_head, head_dim_v)
-    
+
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
     if requires_grad:
         lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
         lse = q.new_empty(lse_shape, dtype=torch.float32)
     else:
         lse = None
-    
+
     return out, lse
 
 
-@_flash_attn_bwd.register_fake
+# @_flash_attn_bwd.register_fake
 def _(
     q: torch.Tensor,
     k: torch.Tensor,
