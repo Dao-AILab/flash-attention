@@ -155,6 +155,10 @@ def _flash_attn_fwd(
         m_block_size, n_block_size, num_threads,
         compute_capability,
     )
+
+    # def score_mod(acc_S, softcap_val):
+    #     acc_S.store(cute.math.sin(acc_S.load()))
+
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
             # fa_fwd = FlashAttentionForwardSm80(

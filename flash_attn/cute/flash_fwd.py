@@ -91,7 +91,7 @@ class FlashAttentionForwardBase:
         self.num_threads = num_threads
         self.num_stages = num_stages
         self.Q_in_regs = Q_in_regs
-        self.score_mod = scoremod_premask_fn
+        self.score_mod = score_mod
 
     @staticmethod
     def can_implement(
@@ -1629,7 +1629,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     zero_init=True, wg_wait=0
                 )
                 pipeline_k.consumer_release(kv_consumer_state)
-                self.score_mod(acc_S, softcap_val)
+                score_mod(acc_S)
                 # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
                 mask_fn(acc_S, n_block=n_block_max - 1, mask_seqlen=True)
                 # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
