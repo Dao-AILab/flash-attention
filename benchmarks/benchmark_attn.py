@@ -93,10 +93,11 @@ def convert_to_cudnn_type(torch_type):
 def cudnn_spda_setup(q, k, v, causal=False, window_size_left=None):
     b, nheads, seqlen_q, headdim = q.shape
     _, nheads_k, seqlen_k, _ = k.shape
-    assert v.shape == (b, nheads_k, seqlen_k, headdim)
+    headdim_v = v.shape[-1]
+    assert v.shape == (b, nheads_k, seqlen_k, headdim_v)
     assert cudnn is not None, 'CUDNN is not available'
     q_gpu, k_gpu, v_gpu = q, k, v
-    o_gpu = torch.empty_like(q_gpu)
+    o_gpu = torch.empty((b, nheads, seqlen_q, headdim_v), dtype=q.dtype, device=q.device)
     stats_gpu = torch.empty(b, nheads, seqlen_q, 1, dtype=torch.float32, device=q.device)
     graph = cudnn.pygraph(
         io_data_type=convert_to_cudnn_type(q.dtype),
@@ -148,9 +149,10 @@ def cudnn_spda_setup(q, k, v, causal=False, window_size_left=None):
 def cudnn_spda_bwd_setup(q, k, v, o, g, lse, causal=False, window_size_left=None):
     b, nheads, seqlen_q, headdim = q.shape
     _, nheads_k, seqlen_k, _ = k.shape
-    assert v.shape == (b, nheads_k, seqlen_k, headdim)
-    assert g.shape == (b, nheads, seqlen_q, headdim)
-    assert o.shape == (b, nheads, seqlen_q, headdim)
+    headdim_v = v.shape[-1]
+    assert v.shape == (b, nheads_k, seqlen_k, headdim_v)
+    assert g.shape == (b, nheads, seqlen_q, headdim_v)
+    assert o.shape == (b, nheads, seqlen_q, headdim_v)
     assert lse.shape == (b, nheads, seqlen_q, 1)
     assert cudnn is not None, 'CUDNN is not available'
     q_gpu, k_gpu, v_gpu, o_gpu, g_gpu = q, k, v, o, g
@@ -265,7 +267,8 @@ for headdim in [128]:
     nheads_kv = nheads
     # nheads_kv = nheads // 4
     # nheads_kv = 1
-    headdim_v = headdim
+    # headdim_v = headdim
+    headdim_v = 128 if headdim == 192 else headdim
     # headdim_v = 512
     has_qv = headdim == 64 and headdim_v == 512
     # has_qv = False
@@ -318,9 +321,10 @@ for headdim in [128]:
             nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen, headdim if not has_qv else headdim + headdim_v, headdim_v, causal=causal, window_size=window_size)
             if cudnn is not None:
             # if False:
-                if headdim <= 256 and dtype != torch.float8_e4m3fn and headdim == headdim_v:
+                if headdim <= 256 and dtype != torch.float8_e4m3fn:
                     cudnn_spda = cudnn_spda_setup(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=causal, window_size_left=window_size[0])
-                    cudnn_spda_bwd = cudnn_spda_bwd_setup(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), o.transpose(1, 2), g.transpose(1, 2), stats.transpose(1, 2), causal=causal, window_size_left=window_size[0])
+                    if has_backward and headdim == headdim_v:
+                        cudnn_spda_bwd = cudnn_spda_bwd_setup(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), o.transpose(1, 2), g.transpose(1, 2), stats.transpose(1, 2), causal=causal, window_size_left=window_size[0])
             if dtype != torch.float8_e4m3fn and headdim == headdim_v and flash_attn_func is not None:
             # if False:
                 if not varlen:
@@ -341,13 +345,14 @@ for headdim in [128]:
 
             if cudnn is not None:
             # if False:
-                if headdim <= 256 and dtype != torch.float8_e4m3fn and headdim == headdim_v:
+                if headdim <= 256 and dtype != torch.float8_e4m3fn:
                     time.sleep(1) # Sleep to avoid residual power throttling from the previous benchmark
                     m2 = time_fwd(cudnn_spda, repeats=repeats, verbose=verbose, desc='CuDNN')
                     time_f[(causal, headdim, batch_size, seqlen), "cuDNN"] = m2.mean
-                    time.sleep(1)
-                    m2b = time_fwd(cudnn_spda_bwd, repeats=repeats, verbose=verbose, desc='CuDNN')
-                    time_b[(causal, headdim, batch_size, seqlen), "cuDNN"] = m2b.mean
+                    if has_backward:
+                        time.sleep(1)
+                        m2b = time_fwd(cudnn_spda_bwd, repeats=repeats, verbose=verbose, desc='CuDNN')
+                        time_b[(causal, headdim, batch_size, seqlen), "cuDNN"] = m2b.mean
                 # pytorch_profiler(cudnn_spda, backward=False)
                 # pytorch_profiler(cudnn_spda_bwd, backward=False)
             time.sleep(1)
@@ -387,7 +392,7 @@ for headdim in [128]:
                 print(f'FAv2 fwd: {m0.mean * 1e3:.3f}ms, {(nFLOPS / m0.mean * 1e-12):.1f} TFLOPS')
                 if has_backward:
                     print(f'FAv2 bwd: {m0b.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m0b.mean * 1e-12):.1f} TFLOPS')
-            if cudnn is not None and headdim == headdim_v:
+            if cudnn is not None:
                 print(f'CuDNN fwd: {m2.mean * 1e3:.3f}ms, {(nFLOPS / m2.mean * 1e-12):.1f} TFLOPS')
                 if has_backward:
                     print(f'CuDNN bwd: {m2b.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m2b.mean * 1e-12):.1f} TFLOPS')

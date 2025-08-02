@@ -166,13 +166,10 @@ class FlashAttentionForwardSm100:
 
         self.q_stage = 2
         self.kv_stage = 4 if self.q_dtype.width == 8 else 3
-        # TODO: temp solution to get this to run as uneven_kv_smem isn't working yet
-        if self.head_dim_padded == 192 and self.head_dim_v_padded == 128:
-            self.kv_stage = 2
         self.acc_stage = 1
         self.epi_stage = 2
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
-        # 128 x 192 x 2 bytes x 3 stages = 144KB, as we need 64KB for Q and 64 KB for O.
+        # 128 x 192 x 2 bytes x 3 stages = 144KB, and we need 96KB for Q.
         # Instead we store smem as [smem_large, smem_small, smem_large], where smem_large is
         # 128 x 192 and smem_small is 128 x 128. We set the stride between the stages to be
         # 128 * 160, so that indexing the 0th and 2nd stages will get the right address,
@@ -884,7 +881,6 @@ class FlashAttentionForwardSm100:
             load_Q = partial(
                 self.load_Q, tma_atom_Q, tQgQ, tQsQ,
                 mbar_ptr + self.mbar_load_q_full_offset, mbar_ptr + self.mbar_load_q_empty_offset,
-                self.tma_copy_q_bytes,
                 phase=q_producer_phase,
             )
             # We have to use mbarrier directly in the load for KV instead of replying on
@@ -892,12 +888,12 @@ class FlashAttentionForwardSm100:
             load_K = partial(
                 self.load_KV, tma_atom_K, tKgK, tKsK,
                 mbar_ptr + self.mbar_load_kv_full_offset, mbar_ptr + self.mbar_load_kv_empty_offset,
-                self.tma_copy_k_bytes
+                K_or_V="K",
             )
             load_V = partial(
                 self.load_KV, tma_atom_V, tVgV, tVsV,
                 mbar_ptr + self.mbar_load_kv_full_offset, mbar_ptr + self.mbar_load_kv_empty_offset,
-                self.tma_copy_v_bytes
+                K_or_V="V",
             )
 
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
@@ -1361,7 +1357,8 @@ class FlashAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout,
         )
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
-        softmax.apply_exp2_convert(tSrS_t2r, tSrP_r2t, e2e=mask_fn is None, e2e_freq=16 if self.head_dim_padded <= 64 else 16)
+        softmax.apply_exp2_convert(tSrS_t2r, tSrP_r2t, e2e=mask_fn is None and self.head_dim_padded <= 128,
+                                   e2e_freq=16 if self.head_dim_padded <= 64 else 16)
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
@@ -1776,14 +1773,13 @@ class FlashAttentionForwardSm100:
         tQsQ: cute.Tensor,
         mbar_full_ptr: cute.Pointer,
         mbar_empty_ptr: cute.Pointer,
-        tma_copy_bytes: int,
         block: Int32,
         stage: int,
         phase: int,
     ):
         cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
         with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive_and_expect_tx(mbar_full_ptr + stage, tma_copy_bytes)
+            cute.arch.mbarrier_arrive_and_expect_tx(mbar_full_ptr + stage, self.tma_copy_q_bytes)
         cute.copy(
             tma_atom, tQgQ[None, block], tQsQ[None, stage], tma_bar_ptr=mbar_full_ptr + stage
         )
@@ -1796,33 +1792,35 @@ class FlashAttentionForwardSm100:
         tXsX: cute.Tensor,
         mbar_full_ptr: cute.Pointer,
         mbar_empty_ptr: cute.Pointer,
-        tma_copy_bytes: int,
         block: Int32,
         producer_state: cutlass.pipeline.PipelineState,
+        K_or_V: str,
     ):
+        assert K_or_V in ("K", "V")
+        tma_copy_bytes = self.tma_copy_k_bytes if const_expr(K_or_V == "K") else self.tma_copy_v_bytes
         stage, phase = producer_state.index, producer_state.phase
         cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
+        if const_expr(K_or_V == "K" and self.uneven_kv_smem):
+            # Before this round, the smem location was occupied by V, which is smaller than
+            # K. So we need to wait for the stage after that (stage 1) to be empty as well.
+            if stage == 0:
+                cute.arch.mbarrier_wait(mbar_empty_ptr + 1, phase)
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(mbar_full_ptr + stage, tma_copy_bytes)
         tXsX_cur = tXsX[None, stage]
-        # print(tXsX_cur)
         if const_expr(self.uneven_kv_smem):
-            tXsX_cur = self.offset_kv_smem(tXsX_cur, stage, phase)
-            # print(tXsX_cur)
+            # Since this is the producer_state, the phase starts at 1, so we have to invert it
+            tXsX_cur = self.offset_kv_smem(tXsX_cur, stage, phase ^ 1)
         cute.copy(tma_atom, tXgX[None, block], tXsX_cur, tma_bar_ptr=mbar_full_ptr + stage)
 
     @cute.jit
-    # def offset_kv_smem(self, sX: cute.Tensor, state: cutlass.pipeline.PipelineState):
     def offset_kv_smem(self, sX: cute.Tensor, stage: Int32, phase: Int32):
         if const_expr(self.uneven_kv_smem):
             # smem layout is [smem_large, smem_small, smem_large], and the current stride is
             # (smem_large + smem_small) // 2. So for stage == 1, move right by offset if
             # phase == 0, or left by offset if phase == 1.
-            # stage, phase = state.index, state.phase
             offset = 0 if stage != 1 else self.uneven_kv_smem_offset * (1 - 2 * phase)
             return cute.make_tensor(sX.iterator + offset, sX.layout)
-            # new_ptr = utils.ptr_offset_aligned(tXsX_cur.iterator, offset)
-            # tXsX_cur = cute.make_tensor(new_ptr, tXsX_cur.layout)
         else:
             return sX
 
