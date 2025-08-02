@@ -65,6 +65,16 @@ FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 SKIP_CK_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CK_BUILD", "TRUE") == "TRUE" if USE_TRITON_ROCM else False
 
+def install_requires():
+    DEFAULT_REQUIRES = ["torch", "einops"]
+    built_torch_version = os.getenv("MATRIX_TORCH_VERSION", "")
+    if built_torch_version:
+        major_ver, minor_ver, *_ = built_torch_version.split(".")
+        torch_ver = f"torch>={major_ver}.{minor_ver}.0,<{major_ver}.{int(minor_ver) + 1}.0"
+        return [torch_ver, *DEFAULT_REQUIRES[1:]]
+    return DEFAULT_REQUIRES
+
+
 @functools.lru_cache(maxsize=None)
 def cuda_archs() -> str:
     return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;120").split(";")
@@ -556,10 +566,7 @@ setup(
         "bdist_wheel": CachedWheelsCommand,
     },
     python_requires=">=3.9",
-    install_requires=[
-        "torch",
-        "einops",
-    ],
+    install_requires=install_requires(),
     setup_requires=[
         "packaging",
         "psutil",
