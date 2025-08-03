@@ -26,34 +26,18 @@ def make_tiled_copy_A(
     copy_atom: cute.CopyAtom, tiled_mma: cute.TiledMma, swapAB: cutlass.Constexpr[bool] = False
 ) -> cute.TiledCopy:
     if cutlass.const_expr(swapAB):
-        return make_tiled_copy_B(copy_atom, tiled_mma)
+        return cute.make_tiled_copy_B(copy_atom, tiled_mma)
     else:
-        return cute.make_tiled_copy(
-            copy_atom,
-            layout_tv=tiled_mma.tv_layout_A_tiled,
-            tiler_mn=(tiled_mma.get_tile_size(0), tiled_mma.get_tile_size(2)),
-        )
+        return cute.make_tiled_copy_A(copy_atom, tiled_mma)
 
 
 def make_tiled_copy_B(
     copy_atom: cute.CopyAtom, tiled_mma: cute.TiledMma, swapAB: cutlass.Constexpr[bool] = False
 ) -> cute.TiledCopy:
     if cutlass.const_expr(swapAB):
-        return make_tiled_copy_A(copy_atom, tiled_mma)
+        return cute.make_tiled_copy_A(copy_atom, tiled_mma)
     else:
-        return cute.make_tiled_copy(
-            copy_atom,
-            layout_tv=tiled_mma.tv_layout_B_tiled,
-            tiler_mn=(tiled_mma.get_tile_size(1), tiled_mma.get_tile_size(2)),
-        )
-
-
-def make_tiled_copy_C(copy_atom: cute.CopyAtom, tiled_mma: cute.TiledMma) -> cute.TiledCopy:
-    return cute.make_tiled_copy(
-        copy_atom,
-        layout_tv=tiled_mma.tv_layout_C_tiled,
-        tiler_mn=(tiled_mma.get_tile_size(0), tiled_mma.get_tile_size(1)),
-    )
+        return cute.make_tiled_copy_B(copy_atom, tiled_mma)
 
 
 def mma_make_fragment_A(

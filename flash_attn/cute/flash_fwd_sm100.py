@@ -126,12 +126,11 @@ class FlashAttentionForwardSm100:
         self.tmem_o_offset = [self.tmem_s_offset[-1] + self.n_block_size + i * self.head_dim_v_padded for i in range(self.q_stage)]  # e.g., 256, 384
         self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded
         assert self.tmem_total <= SM100_TMEM_CAPACITY_COLUMNS
-        self.tmem_s_to_p_offset = 0
+        self.tmem_s_to_p_offset = self.n_block_size // 2
         self.tmem_p_offset = [self.tmem_s_offset[i] + self.tmem_s_to_p_offset for i in range(2)]  # 0, 128
 
         # vec buffer for row_max & row_sum
-        self.tmem_vec0_offset = 0
-        self.tmem_vec1_offset = self.tmem_vec0_offset + self.n_block_size
+        self.tmem_vec_offset = self.tmem_s_offset
 
         if self.head_dim_padded < 96:
             self.num_regs_softmax = 200
@@ -1323,11 +1322,11 @@ class FlashAttentionForwardSm100:
             mask_fn(tSrS_t2r, n_block=n_block)
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
-        # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScS_vec).shape, Float32)
-        # tSrScale_r2t[0] = acc_scale
-        # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
-        # cute.arch.fence_view_async_tmem_store()
         if const_expr(not is_first):
+            # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScS_vec).shape, Float32)
+            # tSrScale_r2t[0] = acc_scale
+            # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
+            # cute.arch.fence_view_async_tmem_store()
             thread_idx = thr_tmem_load.thr_idx
             sScale[thread_idx + stage * self.m_block_size] = acc_scale
             # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
@@ -1387,22 +1386,19 @@ class FlashAttentionForwardSm100:
     ):
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor((self.mma_tiler_qk[0], self.mma_tiler_qk[1])))
         tStS_scale_layout = cute.composition(tStS.layout, cute.make_layout((self.m_block_size, 1)))
-        tStScale_0 = cute.make_tensor(tStS.iterator + self.tmem_vec0_offset, tStS_scale_layout)
-        tStScale_1 = cute.make_tensor(tStS.iterator + self.tmem_vec1_offset, tStS_scale_layout)
+        tStScales = tuple(cute.make_tensor(tStS.iterator + self.tmem_vec_offset[stage], tStS_scale_layout)
+                          for stage in range(2))
         tScS_vec_layout = cute.composition(tScS.layout, cute.make_layout((self.m_block_size, 1)))
         tScS_vec = cute.make_tensor(tScS.iterator, tScS_vec_layout)
         tmem_load_v_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)), self.qk_acc_dtype,
         )
-        tiled_tmem_load_vec = tcgen05.make_tmem_copy(tmem_load_v_atom, tStScale_0)
+        tiled_tmem_load_vec = tcgen05.make_tmem_copy(tmem_load_v_atom, tStScales[0])
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         thr_tmem_load_vec = tiled_tmem_load_vec.get_slice(tidx)
 
-        tStScale_0_t2r = thr_tmem_load_vec.partition_S(tStScale_0)
-        tStScale_1_t2r = thr_tmem_load_vec.partition_S(tStScale_1)
+        tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(2)]
         tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScS_vec).shape
-
-        tStScales_t2r = [tStScale_0_t2r, tStScale_1_t2r]
 
         # First iter: no correction is required
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + 0)
@@ -1430,9 +1426,9 @@ class FlashAttentionForwardSm100:
                 for stage in cutlass.range_constexpr(2):
                     # wait for S0 / S1
                     cute.arch.mbarrier_wait(mbar_ptr + self.mbar_softmax_corr_full_offset + stage, softmax_corr_consumer_phase)
-                    # cute.copy(tiled_tmem_load_vec, tStScale_1_t2r, tSrScale_t2r)
+                    # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                     # cute.arch.fence_view_async_tmem_load()
-                    # scale = tSrScale_t2r[stage]
+                    # scale = tSrScale_t2r[0]
                     scale = sScale[tidx + stage * self.m_block_size]
                     should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                     # should_rescale = True
