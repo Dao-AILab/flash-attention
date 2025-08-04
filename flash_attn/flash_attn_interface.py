@@ -91,7 +91,7 @@ def _flash_attn_varlen_forward(
         cu_seqlens_q,
         cu_seqlens_k,
         None,
-        block_table,
+        None,
         alibi_slopes,
         max_seqlen_q,
         max_seqlen_k,
@@ -178,6 +178,7 @@ def _flash_attn_varlen_backward(
     alibi_slopes,
     deterministic,
     rng_state=None,
+    softmax_d=None,
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
@@ -189,6 +190,7 @@ def _flash_attn_varlen_backward(
         v,
         out,
         softmax_lse,
+        softmax_d,
         dq,
         dk,
         dv,

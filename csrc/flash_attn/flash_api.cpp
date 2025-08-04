@@ -994,6 +994,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const at::Tensor &v,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                const at::Tensor &out,   // total_q x num_heads x head_size
                const at::Tensor &softmax_lse,     // b x h x s   softmax logsumexp
+               c10::optional<at::Tensor> &softmax_d_,     // b x h x seqlen_q
                c10::optional<at::Tensor> &dq_,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                c10::optional<at::Tensor> &dk_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                c10::optional<at::Tensor> &dv_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
@@ -1070,10 +1071,12 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
+
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size_rounded = round_multiple(head_size, 32);
     const int seqlen_q_rounded = round_multiple(max_seqlen_q, 128);
     const int seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
+
 
     TORCH_CHECK(head_size == round_multiple(head_size_og, 8), "head_size must be head_size_og rounded to a multiple of 8");
 
@@ -1133,7 +1136,17 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
-    auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
+    bool has_softmax_d = softmax_d_.has_value();
+    at::Tensor softmax_d;
+    if (! has_softmax_d){
+        softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
+    } else{
+        softmax_d = softmax_d_.value();
+        TORCH_CHECK(softmax_d.dtype() == torch::kFloat32, "softmax_d must have dtype float32");
+        CHECK_DEVICE(softmax_d);
+        TORCH_CHECK(softmax_d.stride(-1) == 1, "softmax_d must have contiguous last dimension");
+        CHECK_SHAPE(softmax_d, batch_size, num_heads, seqlen_q_rounded);
+    }
     at::Tensor dq_accum;
     if (loop) {
         // We don't want to allocate dq_accum of size (batch, seqlen_q_rounded, num_heads, head_size_rounded)
@@ -1190,6 +1203,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      window_size_left,
                      window_size_right,
                      deterministic);
+    params.has_softmax_d = has_softmax_d;
     params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
 
     auto launch = &run_mha_bwd;

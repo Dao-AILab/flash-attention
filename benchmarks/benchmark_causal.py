@@ -22,6 +22,17 @@ try:
 except ImportError:
     scaled_upper_triang_masked_softmax = None
 
+def time_fwd_bwd(func, *args, **kwargs):
+    time_f, time_b = benchmark_fwd_bwd(func, *args, **kwargs)
+    return time_f[1].mean, time_b[1].mean
+
+def flops(batch, seqlen, headdim, nheads, causal, mode="fwd"):
+    assert mode in ["fwd", "bwd", "fwd_bwd"]
+    f = 4 * batch * seqlen**2 * nheads * headdim // (2 if causal else 1)
+    return f if mode == "fwd" else (2.5 * f if mode == "bwd" else 3.5 * f)
+
+def efficiency(flop, time):
+    return (flop / time / 10**12) if not math.isnan(time) else 0.0
 
 def attention_pytorch(qkv, dropout_p=0.0, causal=True):
     """
@@ -90,18 +101,35 @@ causal = True
 dtype = torch.float16
 device = 'cuda'
 
-qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, device=device, dtype=dtype,
-                  requires_grad=True)
-cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32,
-                          device=qkv.device)
+def time2tflops(time, b, s, d, n, causal, mode="fwd"):
+    v = flops(b, s, d, n, causal, mode)
+    return efficiency(v, time)
 
-qkv_unpad = rearrange(qkv, 'b s ... -> (b s) ...').detach().requires_grad_(True)
-# benchmark_all(flash_attn_varlen_qkvpacked_func, qkv_unpad,
-#               cu_seqlens, seqlen, dropout_p, causal=causal, repeats=repeats, desc='FlashAttention')
-# pytorch_profiler(flash_attn_varlen_qkvpacked_func, qkv_unpad,
-#                  cu_seqlens, seqlen, dropout_p, causal=causal, backward=True)
-benchmark_forward(flash_attn_qkvpacked_func, qkv, dropout_p, causal=causal, repeats=repeats, desc='Fav2')
-pytorch_profiler(flash_attn_qkvpacked_func, qkv, dropout_p, causal=causal, backward=False)
+
+def benchmark(seqlen):
+    qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, device=device, dtype=dtype,
+                      requires_grad=True)
+    cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32,
+                              device=qkv.device)
+
+    qkv_unpad = rearrange(qkv, 'b s ... -> (b s) ...').detach().requires_grad_(True)
+    fwd, bwd = time_fwd_bwd(flash_attn_varlen_qkvpacked_func, qkv_unpad,
+                  cu_seqlens, seqlen, dropout_p, causal=causal, repeats=repeats, desc='FlashAttention Varlen')
+
+    fwd_tflops, bwd_tflops = flops(batch_size, seqlen, headdim, nheads, causal, mode="fwd"), flops(batch_size, seqlen, headdim, nheads, causal, mode="bwd")
+    fwd_tflops = time2tflops(fwd, batch_size, seqlen, headdim, nheads, causal, mode="fwd")
+    bwd_tflops = time2tflops(bwd, batch_size, seqlen, headdim, nheads, causal, mode="bwd")
+    print(f"### Varlen fwd {fwd_tflops  }, bwd {bwd_tflops  } ###")
+
+    fwd, bwd = time_fwd_bwd(flash_attn_qkvpacked_func, qkv, dropout_p, causal=causal, repeats=repeats, desc='FlashAttention Batched')
+
+    fwd_tflops = time2tflops(fwd, batch_size, seqlen, headdim, nheads, causal, mode="fwd")
+    bwd_tflops = time2tflops(bwd, batch_size, seqlen, headdim, nheads, causal, mode="bwd")
+    print(f"### Packed fwd {fwd_tflops  }, bwd {bwd_tflops  } ###")
+for seqlen in [2048, 4096, 8192, 16384, 32768]:
+    print(f"### {seqlen = } ###")
+    benchmark(seqlen)
+# pytorch_profiler(flash_attn_qkvpacked_func, qkv, dropout_p, causal=causal, backward=False)
 
 # for dropout_p in [0.1, 0.0]:
 #     for causal in [False, True]:
