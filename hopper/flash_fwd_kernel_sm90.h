@@ -52,6 +52,8 @@ public:
     static_assert(CollectiveMainloop::LargeHeadDimV == CollectiveEpilogue::LargeHeadDimV);
     using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
 
+    using SmemLayoutSAux = typename CollectiveMainloop::SmemLayoutSAux;
+
     // Mainloop derived types
     using TileShape_MNK_PV = typename CollectiveMainloop::TileShape_MNK_PV;
     using TiledMmaPV = typename CollectiveMainloop::TiledMmaPV;
@@ -294,6 +296,14 @@ public:
 
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
+
+        const int num_heads = get<2>(params.mainloop.shape_Q);
+        Tensor gS_aux = make_tensor(make_gmem_ptr(params.mainloop.ptr_S_aux), make_shape(num_heads));
+        Tensor sS_aux = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_s_aux.data()), SmemLayoutSAux{});
+
+        if(params.mainloop.ptr_S_aux && threadIdx.x < num_heads) {
+            sS_aux(threadIdx.x) = gS_aux(threadIdx.x);
+        }
 
         // We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
         if constexpr (size(ClusterShape{}) > 1) {

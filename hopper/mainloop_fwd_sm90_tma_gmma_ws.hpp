@@ -30,7 +30,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSAux_>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -40,6 +40,7 @@ struct CollectiveMainloopFwdSm90 {
     using TileShape_MNK_QV = Shape<decltype(get<0>(TileShape_MNK{})), decltype(get<1>(TileShape_MNK{})), Int<kHeadDimV>>;
     using Element = Element_;
     using ElementAccum = ElementAccum_;
+    using ElementSAux = ElementSAux_;
     using ArchTag = ArchTag_;
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;;
     static constexpr bool Is_causal = Is_causal_;
@@ -173,6 +174,9 @@ struct CollectiveMainloopFwdSm90 {
     using SmemLayoutScale = cute::Layout<cute::Shape<Int<kBlockM>, Int<kStages>>>;
 
     using SmemCopyAtomP = Copy_Atom<cute::SM90_U32x4_STSM_N, Element>;
+
+    // Hardcoded to be at most 64 query heads
+    using SmemLayoutSAux = Layout<Shape<_64>>;
 
     // Use LDSM.T and STSM to transpose V in the case of FP8 and V being row-major.
     // For FP16/BF16 we don't do any transposing.
@@ -310,6 +314,7 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
         SmemQv_t smem_qv;
+        cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
     };
 
     struct TensorStorageWithPNoTranspose : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose, SmemAlignmentP), _0> {
@@ -318,6 +323,7 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
         SmemQv_t smem_qv;
         SmemP_t smem_p;
+        cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
     };
     struct TensorStorageWithPScaleNoTranspose : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose, SmemAlignmentP), _0> {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVtNoTranspose> smem_v;
@@ -326,6 +332,7 @@ struct CollectiveMainloopFwdSm90 {
         SmemQv_t smem_qv;
         SmemP_t smem_p;
         SmemScale_t smem_scale;
+        cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
     };
 
     using TensorStorageNoTranspose = std::conditional_t<
@@ -344,6 +351,7 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
         SmemQv_t smem_qv;
         SmemScale_t smem_scale;
+        cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
     };
 
     using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose, TensorStorageTransposeV>;
@@ -396,6 +404,7 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        ElementSAux const* const ptr_S_aux = nullptr;
     };
 
     // Device side kernel params
@@ -451,7 +460,8 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
-        int const *const seqlens_rotary = nullptr;
+        int const* const seqlens_rotary = nullptr;
+        ElementSAux const* const ptr_S_aux = nullptr;
     };
 
     static Params
@@ -560,7 +570,8 @@ struct CollectiveMainloopFwdSm90 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.ptr_S_aux};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -1084,6 +1095,39 @@ struct CollectiveMainloopFwdSm90 {
             }
         };
 
+        using TensorT = typename Softmax::TensorT;
+        using LayoutT = typename TensorT::layout_type;
+        auto finalize_dispatch = [&](TensorT& scores_scale, float const v_descale) {
+            if (params.ptr_S_aux && (!Split || (split_idx & 0x0000FFFF) == 0)) {
+                Tensor sS_aux = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_s_aux.data()), SmemLayoutSAux{});
+                Tensor tSrS_aux = make_tensor_like(scores_scale);
+                static_assert(is_static<decltype(layout(tSrS_aux))>::value);
+                static_assert(size(tSrS_aux) == size(LayoutT{}));
+                if constexpr(!PackGQA) {
+                    #pragma unroll
+                    for(int mi = 0; mi < size(tSrS_aux); ++mi) {
+                        tSrS_aux(mi) = static_cast<float>(sS_aux(bidh));
+                    }
+                } else {
+                    Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
+                    auto thread_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
+                    Tensor tScS = thread_mma_qk.partition_C(cS);
+                    Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tScS.layout()));
+                    static_assert(size<0>(tScS_rowcol) == size(tSrS_aux));
+                    int const qhead_per_khead = params.qhead_per_khead_divmod.divisor;
+                    #pragma unroll
+                    for(int mi = 0; mi < size(tSrS_aux); ++mi) {
+                        int row = m_block * kBlockM + get<0>(tScS_rowcol(mi, _0{}));
+                        int bidh_mi = (row % qhead_per_khead) + bidh_kv * qhead_per_khead;
+                        tSrS_aux(mi) = static_cast<float>(sS_aux(bidh_mi));
+                    }
+                }
+                cute::copy(softmax.finalize_aux(tSrS_aux, v_descale), scores_scale);
+            } else {
+                cute::copy(softmax.finalize(v_descale), scores_scale);
+            }
+        };
+
         auto &barrier_Q = shared_storage.pipelines.barrier_Q;
         if constexpr (!AppendKV) {
             barrier_Q.wait(work_idx % 2);
@@ -1234,7 +1278,8 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
             flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
-            cute::copy(softmax.finalize(v_descale), scores_scale);
+            // cute::copy(softmax.finalize(v_descale), scores_scale);
+            finalize_dispatch(scores_scale, v_descale);
             if constexpr (LargeHeadDimV) {
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
                 store_scales(scores_scale, smem_pipe_read.index());
@@ -1334,7 +1379,10 @@ struct CollectiveMainloopFwdSm90 {
             // Tell producers that smem_q is ready
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
-            Tensor scores_scale = softmax.finalize(v_descale);
+            // Tensor scores_scale = softmax.finalize(v_descale);
+            Tensor scores_scale = make_tensor_like(softmax.row_max);
+            finalize_dispatch(scores_scale, v_descale);
+            
             if constexpr (LargeHeadDimV) {
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
                 store_scales(scores_scale, smem_pipe_read.index());

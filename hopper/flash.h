@@ -158,6 +158,9 @@ struct Flash_fwd_params : public Qkv_params {
 
     int arch;
     int num_sm;
+
+    // The S extra matrix, (num_heads)
+    void *__restrict__ s_aux_ptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
