@@ -289,7 +289,7 @@ class FlashAttentionForwardBase:
         # Make sure all threads have finished reading V
         cute.arch.barrier(barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads)
         smem_copy_atom_O = utils.get_smem_store_atom(self.arch, self.dtype)
-        smem_thr_copy_O = utils.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
+        smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
         taccOrO = smem_thr_copy_O.retile(rO)
         taccOsO = smem_thr_copy_O.partition_D(sO)
         # copy acc O from rmem to smem with the smem copy atom
@@ -1539,7 +1539,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # Smem copy atom tiling
         # ///////////////////////////////////////////////////////////////////////////////
         smem_copy_atom_P = utils.get_smem_store_atom(self.arch, self.dtype)
-        smem_thr_copy_P = utils.make_tiled_copy_C(smem_copy_atom_P, tiled_mma_qk).get_slice(tidx)
+        smem_thr_copy_P = cute.make_tiled_copy_C(smem_copy_atom_P, tiled_mma_qk).get_slice(tidx)
         # tPsP = smem_thr_copy_P.partition_D(sP_pi) if const_expr(sP_pi is not None) else None
         tPsP = smem_thr_copy_P.partition_D(sP) if const_expr(sP is not None) else None
         # if cute.arch.thread_idx()[0] == 0:

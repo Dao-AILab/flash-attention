@@ -265,7 +265,7 @@ class FlashAttentionBackwardPostprocess:
         # print(acc)
         # print(tdQsdQaccum)  # ((1, 1), 64)
         # print(tdQrdQaccum)  # ((1, 4), 4, 4)
-        for i in cutlass.range_constexpr(cute.size(tdQsdQaccum)):
+        for i in cutlass.range(cute.size(tdQsdQaccum), unroll_full=True):
             tdQrdQaccum[i] = tdQsdQaccum[i]
         # Convert tdQrdQaccum from fp32 to fp16/bf16
         rdQ = cute.make_fragment_like(acc, self.dtype)
@@ -276,7 +276,7 @@ class FlashAttentionBackwardPostprocess:
         smem_copy_atom_dQ = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=cutlass.Float32.width
         )
-        smem_thr_copy_dQ = utils.make_tiled_copy_C(smem_copy_atom_dQ, tiled_mma).get_slice(tidx)
+        smem_thr_copy_dQ = cute.make_tiled_copy_C(smem_copy_atom_dQ, tiled_mma).get_slice(tidx)
         taccdQrdQ = smem_thr_copy_dQ.retile(rdQ)
         taccdQsdQ = smem_thr_copy_dQ.partition_D(sdQ)
         cute.copy(smem_copy_atom_dQ, taccdQrdQ, taccdQsdQ)
@@ -296,7 +296,7 @@ class FlashAttentionBackwardPostprocess:
         cdQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
         tdQcdQ = gmem_thr_copy_dQ.partition_S(cdQ)
         tdQpdQ = utils.predicate_k(tdQcdQ, limit=mdQ.shape[3])
-        for rest_m in cutlass.range_constexpr(cute.size(tdQrdQ.shape[1])):
+        for rest_m in cutlass.range(cute.size(tdQrdQ.shape[1]), unroll_full=True):
             if tdQcdQ[0, rest_m, 0][0] < mdQ.shape[1] - m_block * self.m_block_size:
                 cute.copy(
                     gmem_tiled_copy_dQ,

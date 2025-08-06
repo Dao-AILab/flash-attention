@@ -21,6 +21,8 @@ from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
+# @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
@@ -39,7 +41,7 @@ from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
 # @pytest.mark.parametrize("d", [64, 128])
-@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [128, 192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -67,7 +69,7 @@ from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_output(
-    seqlen_q, seqlen_k, d, causal, local, softcap, deterministic, has_qv, mha_type, dtype
+    seqlen_q, seqlen_k, d, causal, local, softcap, deterministic, has_qv, has_learnable_sink, mha_type, dtype
 ):
     if (causal or local) and seqlen_k < seqlen_q:
         pytest.skip("Causal attention requires seqlen_k >= seqlen_q")
@@ -81,7 +83,7 @@ def test_flash_attn_output(
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
-    dv_vals = [d]
+    dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if not DISABLE_LOCAL else [0]
@@ -101,6 +103,10 @@ def test_flash_attn_output(
         # Put window_size after QKV randn so that window_size changes from test to test
         window_size = (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
         # window_size = (-1, -1) if not local else (16, 0)
+        if has_learnable_sink:
+            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
+        else:
+            learnable_sink = None
         if dtype == torch.float8_e4m3fn:
             q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
         else:
@@ -118,6 +124,7 @@ def test_flash_attn_output(
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
             attention_chunk=attention_chunk,
+            learnable_sink=learnable_sink,
             softcap=softcap
         )
         out_pt, attn_pt = attention_ref(
@@ -131,6 +138,7 @@ def test_flash_attn_output(
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
             attention_chunk=attention_chunk,
+            learnable_sink=learnable_sink,
             softcap=softcap,
             upcast=False,
             reorder_ops=True,
@@ -168,6 +176,7 @@ def test_flash_attn_output(
                 window_size=window_size,
                 # attention_chunk=attention_chunk,
                 softcap=softcap,
+                learnable_sink=learnable_sink,
                 # pack_gqa=pack_gqa,
                 # num_splits=num_splits
             )
@@ -188,6 +197,8 @@ def test_flash_attn_output(
             and not attention_chunk != 0
             and softcap == 0.0
             and not local
+            and dv == d
+            and learnable_sink is None
             # and False
         ):
             g = torch.randn_like(out)
@@ -232,6 +243,8 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
+# @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
@@ -250,7 +263,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
-@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [128, 192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -277,7 +290,7 @@ def test_flash_attn_output(
     ],
 )
 def test_flash_attn_varlen_output(
-        seqlen_q, seqlen_k, d, add_unused_qkv, causal, local, softcap, deterministic, has_qv, mha_type, dtype
+    seqlen_q, seqlen_k, d, add_unused_qkv, causal, local, softcap, deterministic, has_qv, has_learnable_sink, mha_type, dtype
 ):
     if (causal or local):  # Right now we only support causal attention with seqlen_k == seqlen_q
         seqlen_k = seqlen_q
@@ -290,7 +303,8 @@ def test_flash_attn_varlen_output(
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k and not DISABLE_LOCAL else [0]
@@ -309,6 +323,10 @@ def test_flash_attn_varlen_output(
             qv_ref = None
         # Put window_size after QKV randn so that window_size changes from test to test
         window_size = (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
+        if has_learnable_sink:
+            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
+        else:
+            learnable_sink = None
         if dtype == torch.float8_e4m3fn:
             q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
         else:
@@ -380,6 +398,7 @@ def test_flash_attn_varlen_output(
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
             attention_chunk=attention_chunk,
+            learnable_sink=learnable_sink,
             softcap=softcap
         )
         out_pt, attn_pt = attention_ref(
@@ -393,6 +412,7 @@ def test_flash_attn_varlen_output(
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
             attention_chunk=attention_chunk,
+            learnable_sink=learnable_sink,
             softcap=softcap,
             upcast=False,
             reorder_ops=True,
@@ -429,6 +449,7 @@ def test_flash_attn_varlen_output(
                 # k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
                 # attention_chunk=attention_chunk,
+                learnable_sink=learnable_sink,
                 softcap=softcap,
             )
             out = output_pad_fn(out_unpad)
@@ -450,6 +471,8 @@ def test_flash_attn_varlen_output(
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
+            and dv == d
+            and not has_learnable_sink
             and False
         ):
             g_unpad = torch.randn_like(out_unpad)

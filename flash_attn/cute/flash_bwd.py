@@ -559,7 +559,7 @@ class FlashAttentionBackwardSm80:
             smem_copy_atom_transposed, tiled_mma_dq, swapAB=self.dQ_swapAB
         ).get_slice(tidx)
         # TODO: what's the number of bits? What if SdP_swapAB
-        r2s_thr_copy_PdS = utils.make_tiled_copy_C(
+        r2s_thr_copy_PdS = cute.make_tiled_copy_C(
             cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=2 * self.dtype.width
             ),
@@ -774,7 +774,7 @@ class FlashAttentionBackwardSm80:
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_S_mn)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == 1: cute.print_tensor(tLSErLSE)
         assert cute.size(acc_S_mn, mode=[0]) == cute.size(tLSErLSE)
-        for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
+        for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
             acc_S_mn[r, None].store(utils.exp2f(acc_S_mn[r, None].load() * softmax_scale_log2 - tLSErLSE[r]))
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_S_mn)
 
@@ -798,7 +798,7 @@ class FlashAttentionBackwardSm80:
         acc_dP_mn = utils.make_acc_tensor_mn_view(acc_dP)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         assert cute.size(acc_dP_mn, mode=[0]) == cute.size(tLSErdPsum)
-        for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
+        for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
             acc_dP_mn[r, None].store(acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r]))
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         rP = cute.make_fragment_like(acc_S, self.dtype)
@@ -850,7 +850,7 @@ class FlashAttentionBackwardSm80:
             tdQgdQaccum_atomic = gmem_copy_params.tdQgdQaccum[None, None, m_block]
             assert cute.size(acc_dQ_atomic) == cute.size(tdQgdQaccum_atomic)
             # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(acc_dQ)
-            for i in cutlass.range_constexpr(cute.size(acc_dQ_atomic)):
+            for i in cutlass.range(cute.size(acc_dQ_atomic), unroll_full=True):
                 utils.atomic_add_fp32(acc_dQ_atomic[i], utils.elem_pointer(tdQgdQaccum_atomic, i))
                 # utils.atomic_add_fp32(acc_dQ[i], tdQgdQaccum_atomic.iterator + i * tdQgdQaccum_atomic.stride[1])
             # if cute.arch.thread_idx()[0] == 64 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dQ)
@@ -910,7 +910,7 @@ class FlashAttentionBackwardSm80:
             smem_copy_atom_dKV = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=2 * self.dtype.width
             )
-            smem_thr_copy_dKV = utils.make_tiled_copy_C(smem_copy_atom_dKV, tiled_mma).get_slice(tidx)
+            smem_thr_copy_dKV = cute.make_tiled_copy_C(smem_copy_atom_dKV, tiled_mma).get_slice(tidx)
             taccdVrdV = smem_thr_copy_dKV.retile(rdV)
             taccdKrdK = smem_thr_copy_dKV.retile(rdK)
             taccdVsdV = smem_thr_copy_dKV.partition_D(sdV)
@@ -982,9 +982,9 @@ class FlashAttentionBackwardSm80:
             acc_dK_atomic = gmem_thr_copy_dK.retile(acc_dK)
             assert cute.size(acc_dV_atomic) == cute.size(tdVgdVaccum)
             assert cute.size(acc_dK_atomic) == cute.size(tdKgdKaccum)
-            for i in cutlass.range_constexpr(cute.size(acc_dV_atomic)):
+            for i in cutlass.range(cute.size(acc_dV_atomic), unroll_full=True):
                 utils.atomic_add_fp32(acc_dV_atomic[i], utils.elem_pointer(tdVgdVaccum, i))
-            for i in cutlass.range_constexpr(cute.size(acc_dK_atomic)):
+            for i in cutlass.range(cute.size(acc_dK_atomic), unroll_full=True):
                 utils.atomic_add_fp32(acc_dK_atomic[i], utils.elem_pointer(tdKgdKaccum, i))
 
     @cute.jit
