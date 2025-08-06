@@ -24,19 +24,19 @@ def round_multiple(x, m):
 def round_up_headdim(head_size: int) -> int:
     from flash_attn_config import CONFIG
 
-    if CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM64"]:
+    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM64"]:
         if head_size <= 64:
             return 64
-    if CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM96"]:
+    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM96"]:
         if head_size <= 96:
             return 96
-    if CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM128"]:
+    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM128"]:
         if head_size <= 128:
             return 128
-    if CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM192"]:
+    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM192"]:
         if head_size <= 192:
             return 192
-    if CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM256"]:
+    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM256"]:
         if head_size <= 256:
             return 256
     return 256
@@ -47,28 +47,28 @@ def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    k_new: Optional[torch.Tensor],
-    v_new: Optional[torch.Tensor],
-    qv: Optional[torch.Tensor],
-    out: Optional[torch.Tensor],
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
-    cu_seqlens_k_new: Optional[torch.Tensor],
-    seqused_q: Optional[torch.Tensor],
-    seqused_k: Optional[torch.Tensor],
-    max_seqlen_q: Optional[int],
-    max_seqlen_k: Optional[int],
-    page_table: Optional[torch.Tensor],
-    kv_batch_idx: Optional[torch.Tensor],
-    leftpad_k: Optional[torch.Tensor],
-    rotary_cos: Optional[torch.Tensor],
-    rotary_sin: Optional[torch.Tensor],
-    seqlens_rotary: Optional[torch.Tensor],
-    q_descale: Optional[torch.Tensor],
-    k_descale: Optional[torch.Tensor],
-    v_descale: Optional[torch.Tensor],
-    softmax_scale: Optional[float],
-    causal: bool,
+    k_new: Optional[torch.Tensor] = None,
+    v_new: Optional[torch.Tensor] = None,
+    qv: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    page_table: Optional[torch.Tensor] = None,
+    kv_batch_idx: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    seqlens_rotary: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
     window_size_left: int = -1,
     window_size_right: int = -1,
     attention_chunk: int = 0,
@@ -134,28 +134,28 @@ def _flash_attn_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    k_new: Optional[torch.Tensor],
-    v_new: Optional[torch.Tensor],
-    qv: Optional[torch.Tensor],
-    out: Optional[torch.Tensor],
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
-    cu_seqlens_k_new: Optional[torch.Tensor],
-    seqused_q: Optional[torch.Tensor],
-    seqused_k: Optional[torch.Tensor],
-    max_seqlen_q: Optional[int],
-    max_seqlen_k: Optional[int],
-    page_table: Optional[torch.Tensor],
-    kv_batch_idx: Optional[torch.Tensor],
-    leftpad_k: Optional[torch.Tensor],
-    rotary_cos: Optional[torch.Tensor],
-    rotary_sin: Optional[torch.Tensor],
-    seqlens_rotary: Optional[torch.Tensor],
-    q_descale: Optional[torch.Tensor],
-    k_descale: Optional[torch.Tensor],
-    v_descale: Optional[torch.Tensor],
-    softmax_scale: Optional[float],
-    causal: bool,
+    k_new: Optional[torch.Tensor] = None,
+    v_new: Optional[torch.Tensor] = None,
+    qv: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    page_table: Optional[torch.Tensor] = None,
+    kv_batch_idx: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    seqlens_rotary: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
     window_size_left: int = -1,
     window_size_right: int = -1,
     attention_chunk: int = 0,
@@ -233,28 +233,28 @@ def _flash_attn_forward_fake(
 
 @torch.library.custom_op("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
 def _flash_attn_backward(
-        dout: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        out: torch.Tensor,
-        softmax_lse: torch.Tensor,
-        cu_seqlens_q: Optional[torch.Tensor],
-        cu_seqlens_k: Optional[torch.Tensor],
-        sequed_q: Optional[torch.Tensor],
-        sequed_k: Optional[torch.Tensor],
-        max_seqlen_q: Optional[int],
-        max_seqlen_k: Optional[int],
-        dq: Optional[torch.Tensor],
-        dk: Optional[torch.Tensor],
-        dv: Optional[torch.Tensor],
-        softmax_scale: Optional[float],
-        is_causal: bool,
-        window_size_left: int = -1,
-        window_size_right: int = -1,
-        softcap: float = 0.0,
-        deterministic: bool = False,
-        sm_margin: int = 0,
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    sequed_q: Optional[torch.Tensor] = None,
+    sequed_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    is_causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    deterministic: bool = False,
+    sm_margin: int = 0,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -287,42 +287,42 @@ def _flash_attn_backward(
 
 @torch.library.register_fake("flash_attn::_flash_attn_backward")
 def _flash_attn_backward_fake(
-        dout: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        out: torch.Tensor,
-        softmax_lse: torch.Tensor,
-        cu_seqlens_q: Optional[torch.Tensor],
-        cu_seqlens_k: Optional[torch.Tensor],
-        sequed_q: Optional[torch.Tensor],
-        sequed_k: Optional[torch.Tensor],
-        max_seqlen_q: Optional[int],
-        max_seqlen_k: Optional[int],
-        dq: Optional[torch.Tensor],
-        dk: Optional[torch.Tensor],
-        dv: Optional[torch.Tensor],
-        softmax_scale: Optional[float],
-        is_causal: bool,
-        window_size_left: int = -1,
-        window_size_right: int = -1,
-        softcap: float = 0.0,
-        deterministic: bool = False,
-        sm_margin: int = 0,
-):
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    sequed_q: Optional[torch.Tensor] = None,
+    sequed_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    is_causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    deterministic: bool = False,
+    sm_margin: int = 0,
+) -> torch.Tensor:
 
     is_varlen_q = bool(cu_seqlens_q)
     is_varlen_k = bool(cu_seqlens_k)
     is_varlen = is_varlen_q or is_varlen_k or bool(sequed_q) or bool(sequed_k)
 
     if not is_varlen_q:
-        batch_size = q.size()[0]
-        seqlen_q = q.size()[1]
-        seqlen_k = k.size()[1]
-        total_q = batch_size * q.size()[1]
+        batch_size = q.size(0)
+        seqlen_q = q.size(1)
+        seqlen_k = k.size(1)
+        total_q = batch_size * q.size(1)
     else:
         batch_size = cu_seqlens_q.size(0) - 1
-        total_q = q.size()[0]
+        total_q = q.size(0)
         seqlen_q = max_seqlen_q
         seqlen_k = max_seqlen_k
 
