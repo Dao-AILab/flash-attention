@@ -755,6 +755,7 @@ class FlashAttentionForwardSm100:
                 thr_mma_qk=thr_mma_qk,
                 sScale=sScale,
                 mLSE=mLSE,
+                learnable_sink=learnable_sink,
                 mbar_ptr=mbar_ptr,
                 block_info=block_info,
                 SeqlenInfoCls=SeqlenInfoCls,
@@ -1112,6 +1113,7 @@ class FlashAttentionForwardSm100:
         tStSi: cute.Tensor,
         sScale: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        learnable_sink: Optional[cute.Tensor],
         mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
@@ -1241,7 +1243,7 @@ class FlashAttentionForwardSm100:
             # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
             # cute.arch.fence_view_async_tmem_store()
             sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
-            if const_expr(mLSE is not None):
+            if const_expr(mLSE is not None or learnable_sink is not None):
                 sScale[tidx + stage * self.m_block_size + self.m_block_size * 2] = softmax.row_max[0]
             # if tidx == 0:
             #     cute.printf("softmax row sum stage %d: %f, row_max = %f\n", stage, softmax.row_sum[0], softmax.row_max[0])
