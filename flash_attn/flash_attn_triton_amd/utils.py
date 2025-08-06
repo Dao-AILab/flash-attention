@@ -112,11 +112,10 @@ class MetaData():
         self.rotary_interleaved = rotary_interleaved
         self.rotary_conjunction = rotary_conjunction
 
-    def need_dropout(self, dropout_p, return_scores = True):
-        if dropout_p > 0.0:
-            self.dropout_p = dropout_p
-            self.return_scores = return_scores
-            self.philox_seed, self.philox_offset = 0x1BF58, 0x1D4B49
+    def need_dropout(self, dropout_p, return_softmax = True):
+        self.dropout_p = dropout_p
+        self.return_softmax = return_softmax
+        self.philox_seed, self.philox_offset = 0x1BF58, 0x1D4B49
 
     def check_args(self, q, k, v, o):
         assert q.dim() == k.dim() and q.dim() == v.dim()
