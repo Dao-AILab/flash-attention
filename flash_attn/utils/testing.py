@@ -241,7 +241,7 @@ def attention_ref(
     window_size=(None, None),
     attention_chunk=0,
     sink_token_length=0,
-    additive_sink: Optional[torch.Tensor] = None,
+    learnable_sink: Optional[torch.Tensor] = None,
     softcap=0.0,
     upcast=True,
     reorder_ops=False,
@@ -325,14 +325,16 @@ def attention_ref(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
-    if additive_sink is None:
+    if learnable_sink is None:
         attention = torch.softmax(scores, dim=-1).to(v.dtype)
     else:
         scores_fp32 = scores.to(torch.float32)
-        row_max = torch.amax(scores, dim=-1, keepdim=True)
-        numerator = torch.exp(scores_fp32 - row_max)
-        row_sum = torch.sum(numerator, dim=-1, keepdim=True) + rearrange(additive_sink, "h -> h 1 1") * torch.exp(-row_max)
-        attention = (numerator / row_sum).to(v.dtype)
+        logits_max = torch.amax(scores_fp32, dim=-1, keepdim=True)
+        learnable_sink = rearrange(learnable_sink, "h -> h 1 1")
+        logits_or_sinks_max = torch.maximum(learnable_sink, logits_max)
+        unnormalized_scores = torch.exp(scores_fp32 - logits_or_sinks_max)
+        normalizer = unnormalized_scores.sum(dim=-1, keepdim=True) + torch.exp(learnable_sink - logits_or_sinks_max)
+        attention = (unnormalized_scores / normalizer).to(v.dtype)
     # We want to mask here so that the attention matrix doesn't have any NaNs
     # Otherwise we'll get NaN in dV
     if query_padding_mask is not None:
