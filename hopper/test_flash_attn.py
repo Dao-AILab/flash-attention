@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch._C import parse_schema
-from torch.testing._internal.optests import fake_check
+from torch.testing._internal.optests.generate_tests import safe_fake_check, safe_schema_check
 
 from einops import rearrange, repeat
 try:
@@ -51,16 +51,17 @@ COMPILED_HDIMS = (
 )
 
 
-def run_fake_check(fn):
+def run_opcheck(fn):
     def wrapper(*args, **kwargs):
-        fake_check(fn, args, kwargs)
+        safe_schema_check(fn, args, kwargs)
+        safe_fake_check(fn, args, kwargs)
         return fn(*args, **kwargs)
     return wrapper
 
 
 if ENABLE_FAKE_CHECK:
-    flash_attn_func = run_fake_check(flash_attn_func)
-    flash_attn_varlen_func = run_fake_check(flash_attn_varlen_func)
+    flash_attn_func = run_opcheck(flash_attn_func)
+    flash_attn_varlen_func = run_opcheck(flash_attn_varlen_func)
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
