@@ -629,6 +629,9 @@ public:
         int mh_block = next_tile_idx - group_start_tile - (batch_idx_in_group == 0 ? 0 : __shfl_sync(0xffffffff, num_m_blocks_cumulative, batch_idx_in_group - 1)) * params.num_head;
         int bidh = mh_block / num_m_blocks;
         int block = mh_block - bidh * num_m_blocks;
+        // Longest-processing-time-first
+        next_tile_idx += num_m_blocks - 1 - 2 * block;
+        block = num_m_blocks - 1 - block;
         if constexpr (Split) {
             int bidh_actual = bidh / num_splits;
             int split_idx = bidh - bidh_actual * num_splits;
