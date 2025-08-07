@@ -6,7 +6,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch._C import parse_schema
-from torch.testing._internal.optests.generate_tests import safe_fake_check, safe_schema_check
+from torch.testing._internal.optests.generate_tests import (
+    safe_fake_check,
+    safe_schema_check,
+    safe_aot_autograd_check,
+)
 
 from einops import rearrange, repeat
 try:
@@ -40,6 +44,7 @@ DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
 ENABLE_FAKE_CHECK = os.getenv("FLASH_ATTENTION_ENABLE_FAKE_CHECK", "FALSE") == "TRUE"
+ENABLE_AUTOGRAD_CHECK = os.getenv("FLASH_ATTENTION_ENABLE_FAKE_CHECK", "FALSE") == "TRUE"
 
 COMPILED_HDIMS = (
     []
@@ -50,11 +55,35 @@ COMPILED_HDIMS = (
     + ([256] if not DISABLE_HDIM256 else [])
 )
 
+def should_test_backward(args, kwargs):
+    v = args[2]
+    dtype = v.dtype
+    has_qv = V_colmajor = False  # no test runs this with V_colmajor or has_qv == True
+    attention_chunk = kwargs.get("attention_chunk")
+    dv = v.size(-1)
+
+    if (
+        ENABLE_AUTOGRAD_CHECK
+        and not DISABLE_BACKWARD 
+        and dtype != torch.float8_e4m3fn 
+        and not V_colmajor 
+        and not has_qv
+        and not dv > 256
+        and not attention_chunk != 0
+    ):
+        return True
+    return False
+
 
 def run_opcheck(fn):
     def wrapper(*args, **kwargs):
         safe_schema_check(fn, args, kwargs)
         safe_fake_check(fn, args, kwargs)
+
+        if should_test_backward(args, kwargs):
+            # Expensive check
+            safe_aot_autograd_check(fn, args, kwargs, dynamic=False)
+            safe_aot_autograd_check(fn, args, kwargs, dynamic=True)
         return fn(*args, **kwargs)
     return wrapper
 
