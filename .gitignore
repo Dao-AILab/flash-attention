@@ -53,4 +53,4 @@ training/data
 # ck modules
 csrc/composable_kernel
 csrc/cutlass
-.analysis
+.amd
