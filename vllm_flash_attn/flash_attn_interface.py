@@ -315,6 +315,7 @@ def flash_attn_with_kvcache(
     v_descale=None,
     # Version selector
     fa_version: int = DEFAULT_FA_VERSION,
+    s_aux=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -422,6 +423,8 @@ def flash_attn_with_kvcache(
                     "FA2 does not support scheduler_metadata, q_descale, "
                     "k_descale, v_descale"
                 )
+        if s_aux is not None:
+            raise NotImplementedError("FA2 does not support s_aux")
         out, softmax_lse = torch.ops._vllm_fa2_C.fwd_kvcache(
             q, k_cache, v_cache,
             k, v,             # k_new, v_new
@@ -466,6 +469,7 @@ def flash_attn_with_kvcache(
             num_splits,          # num_splits
             None,                # pack_gqa
             0,                   # sm_margin
+            s_aux,               # s_aux
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")
