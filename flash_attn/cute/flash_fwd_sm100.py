@@ -425,7 +425,8 @@ class FlashAttentionForwardSm100:
             # Tmem holding buffer
             tmem_holding_buf: Int32
             # Smem tensors
-            sScale: cute.struct.MemRange[Float32, 2 * self.m_block_size * (1 if const_expr(mLSE is None) else 2)]
+            # store row max and row sum
+            sScale: cute.struct.MemRange[Float32, self.q_stage * self.m_block_size * 2]
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.o_dtype, sO_size],
                 self.buffer_align_bytes,
@@ -613,9 +614,7 @@ class FlashAttentionForwardSm100:
         else:
             sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, sO_layout.inner), sO_layout.outer)
 
-        sScale = storage.sScale.get_tensor(cute.make_layout(
-            2 * self.m_block_size * (1 if const_expr(mLSE is None) else 2)
-        ))
+        sScale = storage.sScale.get_tensor(cute.make_layout(self.q_stage * self.m_block_size * 2))
 
         thr_mma_qk = tiled_mma_qk.get_slice(0)  # default 1SM
         thr_mma_pv = tiled_mma_pv.get_slice(0)  # default 1SM
