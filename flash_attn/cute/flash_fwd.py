@@ -551,12 +551,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         softcap: Optional[cutlass.Float32] = None,
         window_size_left: Optional[cutlass.Int32] = None,
         window_size_right: Optional[cutlass.Int32] = None,
+        learnable_sink: Optional[cute.Tensor] = None,
     ):
         """Configures and launches the flash attention kernel.
 
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
+        assert learnable_sink is None, "Learnable sink is not supported in this kernel"
         self._check_type(*(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE)))
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_pv.size
@@ -567,6 +569,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.use_tma_O = self.arch >= 90
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
+        # Assume all strides are divisible by 128 bits except the last stride
+        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
+        mQ, mK, mV, mO = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mQ, mK, mV, mO)]
         mQ, mK, mV, mO = [cute.make_tensor(t.iterator, cute.select(t.layout, mode=[1, 3, 2, 0])) for t in (mQ, mK, mV, mO)]
         mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=[2, 1, 0]))
         # grid_dim: (m_block, num_head, batch_size)
@@ -1067,16 +1072,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         softcap: cutlass.Float32 | float | None = None,
         window_size_left: cutlass.Int32 | int | None = None,
         window_size_right: cutlass.Int32 | int | None = None,
+        learnable_sink: Optional[cute.Tensor] = None,
     ):
         """Configures and launches the flash attention kernel.
 
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
+        assert learnable_sink is None, "Learnable sink is not supported in this kernel"
         self._check_type(
             *(t.element_type if t is not None else None
               for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
         )
+        # Assume all strides are divisible by 128 bits except the last stride
+        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
+        mQ, mK, mV, mO = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mQ, mK, mV, mO)]
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ, mO = [
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=QO_layout_transpose))

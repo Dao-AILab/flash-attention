@@ -124,11 +124,10 @@ def _flash_attn_fwd(
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor = [
-        utils.convert_from_dlpack(
-            t.detach(), leading_dim=t.ndim - 1, divisibility=128 // dtype.width
-        ) for t in (q, k, v, out)
+        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        for t in (q, k, v, out)
     ]
-    lse_tensor = utils.convert_from_dlpack(lse, leading_dim=lse.ndim - 1, alignment=4) if lse is not None else None
+    lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1) if lse is not None else None
     cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor, additive_sink_tensor = [
         from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None
         for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
@@ -267,18 +266,17 @@ def _flash_attn_bwd(
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
-        utils.convert_from_dlpack(
-            t.detach(), leading_dim=3, divisibility=128 // dtype.width
-        ) for t in (q, k, v, out, dout, dq, dk, dv)
+        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        for t in (q, k, v, out, dout, dq, dk, dv)
     ]
-    lse_tensor = utils.convert_from_dlpack(lse.detach(), leading_dim=2, alignment=4)
+    lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=2)
     dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [
-        utils.convert_from_dlpack(t.detach(), leading_dim=2, divisibility=128 // cutlass.Float32.width)
+        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=2)
         for t in (dq_accum, dpsum, lse_log2)
     ]
     if qhead_per_kvhead > 1:
         dk_accum_tensor, dv_accum_tensor = [
-            utils.convert_from_dlpack(t.detach(), leading_dim=2, divisibility=128 // cutlass.Float32.width)
+            from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=2)
             for t in (dk_accum, dv_accum)
         ]
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
