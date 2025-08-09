@@ -272,6 +272,8 @@ for headdim in [128]:
     # headdim_v = 512
     has_qv = headdim == 64 and headdim_v == 512
     # has_qv = False
+    # sinks = torch.randn(nheads, dtype=torch.bfloat16, device=device)
+    sinks = None
 
     for batch_size, seqlen in bs_seqlen_vals:
         num_splits = 0
@@ -367,7 +369,7 @@ for headdim in [128]:
                 time_f[(causal, headdim, batch_size, seqlen), "Flash3"] = m1.mean
             if flash_attn_func_python is not None:
                 if not varlen:
-                    m1_py = time_fwd(flash_attn_func_python, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, causal=causal, window_size=window_size, softcap=softcap, repeats=repeats, verbose=verbose, desc='Fav3 python')
+                    m1_py = time_fwd(flash_attn_func_python, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, causal=causal, window_size=window_size, learnable_sink=sinks, softcap=softcap, repeats=repeats, verbose=verbose, desc='Fav3 python')
                 else:
                     m1_py = time_fwd(flash_attn_varlen_func_python, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, causal=causal, window_size=window_size, softcap=softcap, repeats=repeats, verbose=verbose, desc='Fav3 python')
             if dtype != torch.float8_e4m3fn and headdim == headdim_v and flash_attn_func_v3 is not None and has_backward:
