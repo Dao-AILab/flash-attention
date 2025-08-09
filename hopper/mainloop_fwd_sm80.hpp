@@ -329,6 +329,7 @@ struct CollectiveMainloopFwdSm80 {
             params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
         int const n_block_min = get<0>(n_block_min_max);
         int const n_block_max = get<1>(n_block_min_max);
+        int const n_offset = get<2>(n_block_min_max);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -345,9 +346,9 @@ struct CollectiveMainloopFwdSm80 {
         int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
         Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor gQ = local_tile(mQ, select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
-        Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K + seqlen_info.offset_k * get<0>(params.stride_K)), params.shape_K, params.stride_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
+        Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K + (seqlen_info.offset_k + n_offset) * get<0>(params.stride_K)), params.shape_K, params.stride_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor gK = local_tile(mK, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
-        Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V + seqlen_info.offset_k * get<0>(params.stride_V)), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
+        Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V + (seqlen_info.offset_k + n_offset) * get<0>(params.stride_V)), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor gV = local_tile(mV, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
 
         GmemTiledCopyQKV gmem_tiled_copy_QKV;
@@ -385,7 +386,7 @@ struct CollectiveMainloopFwdSm80 {
         for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(_0{}, _0{}, k)) < get<1>(params.shape_K); }
 
         int const seqlen_q = seqlen_info.seqlen_q;
-        int const seqlen_k = seqlen_info.seqlen_k;
+        int const seqlen_k = seqlen_info.seqlen_k - n_offset;
         int n_block = n_block_max - 1;
 
         // Prologue: load Q, K, V
@@ -423,7 +424,7 @@ struct CollectiveMainloopFwdSm80 {
             params.ptr_V, params.headdim_v, params.stride_V,
             params.page_size_divmod,
             params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
-            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k,
+            bidb_kv, bidh_kv, thread_idx, seqlen_k, seqlen_info.leftpad_k + n_offset,
             0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
         );
 
@@ -436,8 +437,8 @@ struct CollectiveMainloopFwdSm80 {
                 // Instead of passing in tKVcKV, we pass in t0KVcKV and subtract the offset from the limit
                 // (seqlen_k - n_block * kBlockN). This is because the entries of t0KVcKV are known at compile time.
                 int const seqlenk_row_limit = -int(get<0>(tKVcKV(_0{}, _0{}, _0{}))) + (EvenN
-                    ? seqlen_info.seqlen_k - n_block * kBlockN
-                    : (!Seqlenk_mask ? kBlockN : std::min(seqlen_info.seqlen_k - n_block * kBlockN, kBlockN)));
+                    ? seqlen_k - n_block * kBlockN
+                    : (!Seqlenk_mask ? kBlockN : std::min(seqlen_k - n_block * kBlockN, kBlockN)));
                 // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
                 flash::copy</*Is_even_MN=*/!Seqlenk_mask && EvenN, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
                     gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK_cur, t0KVcKV, tKVpKV, seqlenk_row_limit);
@@ -456,7 +457,7 @@ struct CollectiveMainloopFwdSm80 {
                 // We don't call flash::copy since it doesn't support bound checking
                 // to not overshot kBlockN when writing to smem.
                 Tensor tVgV_cur = tVgV(_, _, _, n_block);
-                int const seqlenk_row_limit = seqlen_info.seqlen_k - n_block * kBlockN - get<0>(tKVcKV(_0{}, _0{}, _0{}));
+                int const seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tKVcKV(_0{}, _0{}, _0{}));
                 #pragma unroll
                 for (int m = 0; m < size<1>(tVsV); ++m) {
                     // If kBlockN doesn't evenly divide the tiled copy, only the last `m` needs to be checked

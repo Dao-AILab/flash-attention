@@ -8,8 +8,9 @@
 #include "flash.h"
 
 inline bool use_one_mma_wg(Flash_fwd_params const& params) {
-    return params.arch >= 90 && params.d == 128 && 
-        params.seqlen_q * (!params.pack_gqa ? 1 : params.h / params.h_k) <= 64;
+    // assume pack_gqa for seqlen calculation
+    return params.arch >= 90 && (params.d == 128 || params.d == 64) && 
+        params.seqlen_q * (params.h / params.h_k) <= 64;
 };
 
 inline bool should_pack_gqa(bool varlen_q, int seqlen_q, int qhead_per_khead, int blockM) {

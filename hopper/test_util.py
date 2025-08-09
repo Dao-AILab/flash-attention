@@ -209,12 +209,13 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     intermediate_dtype=None,
+    s_aux=None
 ):
     """
     Arguments:
         q: (batch_size, seqlen_q, nheads, head_dim)
-        k: (batch_size, seqlen_k, nheads, head_dim)
-        v: (batch_size, seqlen_k, nheads, head_dim_v)
+        k: (batch_size, seqlen_k, nheads_kv, head_dim)
+        v: (batch_size, seqlen_k, nheads_kv, head_dim_v)
         qv: (batch_size, seqlen_q, nheads, head_dim_v)
         query_padding_mask: (batch_size, seqlen_q)
         key_padding_mask: (batch_size, seqlen_k)
@@ -227,16 +228,21 @@ def attention_ref(
         reorder_ops: whether to change the order of operations (scaling k instead of scaling k, etc.)
             without changing the math. This is to estimate the numerical error from operation
             reordering.
+        s_aux: (nheads)
     Output:
         output: (batch_size, seqlen_q, nheads, head_dim_v)
         attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
     """
+    batch_size = q.shape[0]
+    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    nheads = q.shape[2]
     if causal:
         window_size = (window_size[0], 0)
     dtype_og = q.dtype
     if upcast:
         q, k, v = q.float(), k.float(), v.float()
         qv = qv.float() if qv is not None else None
+        s_aux = s_aux.float() if s_aux is not None else None
     if q_descale is not None:
         q_descale = repeat(q_descale, "b h -> b 1 (h g) 1", g=q.shape[2] // k.shape[2])
         q = (q.float() * q_descale).to(q.dtype)
@@ -245,7 +251,6 @@ def attention_ref(
         k = (k.float() * rearrange(k_descale, "b h -> b 1 h 1")).to(dtype=k.dtype)
     if v_descale is not None:
         v = (v.float() * rearrange(v_descale, "b h -> b 1 h 1")).to(dtype=v.dtype)
-    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
     k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
     d = q.shape[-1]
@@ -275,7 +280,14 @@ def attention_ref(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
+    if s_aux is not None:
+        # concatenate sink column before softmax
+        s_aux = s_aux.reshape(1, nheads, 1, 1).expand(batch_size, -1, seqlen_q, -1)
+        scores = torch.cat([scores, s_aux], dim=-1)
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
+    if s_aux is not None:
+        # remove sink column
+        attention = attention[..., :-1]
     # We want to mask here so that the attention matrix doesn't have any NaNs
     # Otherwise we'll get NaN in dV
     if query_padding_mask is not None:
