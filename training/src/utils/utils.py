@@ -134,7 +134,7 @@ def finish(
     datamodule: pl.LightningDataModule,
     trainer: pl.Trainer,
     callbacks: List[pl.Callback],
-    logger: List[pl.loggers.LightningLoggerBase],
+    logger: List[pl.loggers.Logger],
 ) -> None:
     """Makes sure everything closed properly."""
 
