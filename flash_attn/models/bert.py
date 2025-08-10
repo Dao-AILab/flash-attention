@@ -296,7 +296,7 @@ class BertPreTrainingHeads(nn.Module):
 
 class BertPreTrainedModel(nn.Module):
     """An abstract class to handle weights initialization and
-    a simple interface for dowloading and loading pretrained models.
+    a simple interface for downloading and loading pretrained models.
     """
 
     def __init__(self, config, *inputs, **kwargs):
