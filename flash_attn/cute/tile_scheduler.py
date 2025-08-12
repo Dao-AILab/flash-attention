@@ -44,7 +44,7 @@ class TileSchedulerArguments(ParamsBase):
     headdim: Int32
     headdim_v: Int32
     total_q: Int32
-    block_size: cutlass.Constexpr[int]
+    tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
     mCuSeqlensQ: Optional[cute.Tensor] = None
     mSeqUsedQ: Optional[cute.Tensor] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
@@ -235,7 +235,7 @@ class SingleTileLPTScheduler:
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileLPTScheduler.Params":
-            # cute.printf(args.num_block, args.num_head, args.num_batch, args.seqlen_k, args.headdim, args.headdim_v, args.total_q, args.block_size, args.qhead_per_kvhead_packgqa, args.element_size)
+            # cute.printf(args.num_block, args.num_head, args.num_batch, args.seqlen_k, args.headdim, args.headdim_v, args.total_q, args.tile_shape_mn, args.qhead_per_kvhead_packgqa, args.element_size)
             size_one_kv_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size
             size_one_head = size_one_kv_head
             size_l2 = 50 * 1024 * 1024  # 40 MB for K & V
@@ -393,7 +393,7 @@ class SingleTileVarlenScheduler:
         num_batch: Int32
         total_q: Int32
         max_kvblock_in_l2: Int32
-        block_size: cutlass.Constexpr[int]
+        tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
         mCuSeqlensQ: Optional[cute.Tensor] = None
         mSeqUsedQ: Optional[cute.Tensor] = None
         qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
@@ -405,13 +405,13 @@ class SingleTileVarlenScheduler:
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileVarlenScheduler.Params":
             size_l2 = 50 * 1024 * 1024  # 50 MB for K & V
-            max_kvblock_in_l2 = size_l2 // ((args.headdim + args.headdim_v) * args.element_size * args.block_size)
+            max_kvblock_in_l2 = size_l2 // ((args.headdim + args.headdim_v) * args.element_size * args.tile_shape_mn[1])
             return SingleTileVarlenScheduler.Params(
                 num_head=args.num_head,
                 num_batch=args.num_batch,
                 total_q=args.total_q,
                 max_kvblock_in_l2=max_kvblock_in_l2,
-                block_size=args.block_size,
+                tile_shape_mn=args.tile_shape_mn,
                 mCuSeqlensQ=args.mCuSeqlensQ,
                 mSeqUsedQ=args.mSeqUsedQ,
                 qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
@@ -426,7 +426,7 @@ class SingleTileVarlenScheduler:
         tile_idx: Int32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
-        block_size: cutlass.Constexpr[int] = 128,
+        tile_shape_mn: cutlass.Constexpr[[int, int]] = (128, 128),
         qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1,
         lpt: cutlass.Constexpr[bool] = False,
         *,
@@ -441,7 +441,7 @@ class SingleTileVarlenScheduler:
         assert self.mCuSeqlensQ is not None or self.mSeqUsedQ is not None, (
             "At least one of mCuSeqlensQ or mSeqUsedQ must be provided"
         )
-        self.block_size = block_size
+        self.tile_shape_mn = tile_shape_mn
         self.qhead_per_kvhead_packgqa = qhead_per_kvhead_packgqa
         self.lpt = lpt
         self._tile_idx = tile_idx
@@ -463,7 +463,7 @@ class SingleTileVarlenScheduler:
             tile_idx,
             mCuSeqlensQ=params.mCuSeqlensQ,
             mSeqUsedQ=params.mSeqUsedQ,
-            block_size=params.block_size,
+            tile_shape_mn=params.tile_shape_mn,
             qhead_per_kvhead_packgqa=params.qhead_per_kvhead_packgqa,
             lpt=params.lpt,
             loc=loc,
@@ -479,8 +479,8 @@ class SingleTileVarlenScheduler:
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
         total_blocks_max = (
-            params.total_q + params.num_batch * (params.block_size - 1)
-        ) // params.block_size
+            params.total_q + params.num_batch * (params.tile_shape_mn[0] - 1)
+        ) // params.tile_shape_mn[0]
         return (total_blocks_max * params.num_head, Int32(1), Int32(1))
 
     @cute.jit
@@ -500,7 +500,7 @@ class SingleTileVarlenScheduler:
         if cutlass.const_expr(self.qhead_per_kvhead_packgqa > 1):
             seqlen *= self.qhead_per_kvhead_packgqa
         return (
-            cute.ceil_div(seqlen, self.block_size)
+            cute.ceil_div(seqlen, self.tile_shape_mn[0])
             if batch_idx < self.num_batch and lane < cute.arch.WARP_SIZE - 1
             else Int32(0)
         )
@@ -555,9 +555,10 @@ class SingleTileVarlenScheduler:
                 # the seqlen can vary per batch.
                 # TODO: is there any case where num_m_blocks is 0?
                 # TODO: by right we should read the seqlen_kv but we're assuming seqlen_q == seqlen_k here
-                # nheads_in_l2 = min(max(self.max_kvblock_in_l2 // num_m_blocks, 1), self.num_head)
+                num_n_blocks = num_m_blocks * self.tile_shape_mn[0] // self.tile_shape_mn[1]
+                # nheads_in_l2 = min(max(self.max_kvblock_in_l2 // num_n_blocks, 1), self.num_head)
                 # Seems faster to have this be a power of 2
-                nheads_in_l2 = 16 if num_m_blocks * 16 <= self.max_kvblock_in_l2 else (8 if num_m_blocks * 8 <= self.max_kvblock_in_l2 else (4 if num_m_blocks * 4 <= self.max_kvblock_in_l2 else (2 if num_m_blocks * 2 <= self.max_kvblock_in_l2 else 1)))
+                nheads_in_l2 = 16 if num_n_blocks * 16 <= self.max_kvblock_in_l2 else (8 if num_n_blocks * 8 <= self.max_kvblock_in_l2 else (4 if num_n_blocks * 4 <= self.max_kvblock_in_l2 else (2 if num_n_blocks * 2 <= self.max_kvblock_in_l2 else 1)))
                 nheads_in_l2 = min(nheads_in_l2, self.num_head)
                 mh_in_l2 = nheads_in_l2 * num_m_blocks
                 section_idx = mh_block // mh_in_l2
@@ -619,7 +620,7 @@ class SingleTileVarlenScheduler:
             values = values[n_items:]
         return SingleTileVarlenScheduler(
             *(tuple(obj_list)),
-            block_size=self.block_size,
+            tile_shape_mn=self.tile_shape_mn,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead_packgqa,
             lpt=self.lpt,
             loc=self._loc,

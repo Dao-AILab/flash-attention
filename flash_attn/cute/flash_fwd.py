@@ -1058,10 +1058,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,
-        mK: cute.Tensor,
-        mV: cute.Tensor,
-        mO: cute.Tensor,
+        mQ: cute.Tensor,  # (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+        mK: cute.Tensor,  # (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table
+        mV: cute.Tensor,  # (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table
+        mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
         mLSE: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
@@ -1069,6 +1069,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
+        mPageTable: Optional[cute.Tensor] = None,  # (b_k, max_num_pages_per_seq)
         softcap: cutlass.Float32 | float | None = None,
         window_size_left: cutlass.Int32 | int | None = None,
         window_size_right: cutlass.Int32 | int | None = None,
@@ -1169,7 +1170,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mQ.shape[1],
             mV.shape[1],
             total_q=cute.size(mQ.shape[0]) if const_expr(mCuSeqlensQ is not None) else cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
-            block_size=self.m_block_size,
+            tile_shape_mn=(self.m_block_size, self.n_block_size),
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
