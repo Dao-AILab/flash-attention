@@ -4,6 +4,7 @@
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
 #include <torch/all.h>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -14,6 +15,28 @@
 #include "tile_size.h"
 #include "heuristics.h"
 #include "cuda_check.h"
+
+#include <torch/extension.h>
+#include <Python.h>
+
+extern "C" {
+    /* Creates a dummy empty _C module that can be imported from Python.
+        The import from Python will load the .so consisting of this file
+        in this extension, so that the TORCH_LIBRARY static initializers
+        below are run. */
+    PyObject* PyInit__C(void)
+    {
+        static struct PyModuleDef module_def = {
+            PyModuleDef_HEAD_INIT,
+            "_C",   /* name of module */
+            NULL,   /* module documentation, may be NULL */
+            -1,     /* size of per-interpreter state of the module,
+                        or -1 if the module keeps state in global variables. */
+            NULL,   /* methods */
+        };
+        return PyModule_Create(&module_def);
+    }
+}
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
