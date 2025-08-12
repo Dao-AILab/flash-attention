@@ -513,6 +513,11 @@ public:
     }
 
     struct WorkTileInfo {
+        // for LPT scheduling:
+        // 1) tile_idx is offset by (reverse_block - block)
+        // 2) block <- reverse_block = num_m_blocks[bidb] - 1 - block
+        // NOTE: we only use tile_idx in tile_idx_to_work_tile to compute (tile_idx - block),
+        // so just need tile_idx' = tile_idx + block' - block for any block' replacing block
         int tile_idx, block, bidh, bidb;
 
         CUTLASS_DEVICE
@@ -630,7 +635,7 @@ public:
         int bidh = mh_block / num_m_blocks;
         int block = mh_block - bidh * num_m_blocks;
         // Longest-processing-time-first
-        next_tile_idx += num_m_blocks - 1 - 2 * block;
+        next_tile_idx += num_m_blocks - 1 - 2 * block; // add (reverse_block - block) to linear tile_idx
         block = num_m_blocks - 1 - block;
         if constexpr (Split) {
             int bidh_actual = bidh / num_splits;

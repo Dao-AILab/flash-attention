@@ -808,6 +808,7 @@ def get_scheduler_metadata(
     num_splits=0,    # Can be tuned for speed
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
+    sort_batches=False,
 ):
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
@@ -829,6 +830,7 @@ def get_scheduler_metadata(
         has_softcap,
         num_splits,
         pack_gqa,
+        sort_batches,
         sm_margin,
     )
     return scheduler_metadata
