@@ -25,7 +25,7 @@ using namespace cute;
 
 template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
-        bool PackGQA_, bool Split_>
+        bool PackGQA_, bool Split_, class ElementSink_>
 struct CollectiveMainloopFwdSm80 {
 
     static constexpr int kStages = Stages;
@@ -34,6 +34,7 @@ struct CollectiveMainloopFwdSm80 {
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
     using Element = Element_;
     using ElementAccum = ElementAccum_;
+    using ElementSink = ElementSink_;
     using ArchTag = ArchTag_;
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;;
     static constexpr bool Is_causal = Is_causal_;
@@ -213,6 +214,7 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        ElementSink const* const ptr_sink = nullptr;
     };
 
     // Device side kernel params
@@ -258,6 +260,7 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        ElementSink const* const ptr_sink = nullptr;
     };
 
     static Params
@@ -297,7 +300,7 @@ struct CollectiveMainloopFwdSm80 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary, args.ptr_sink};
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>

@@ -19,6 +19,7 @@
 #include "seqlen.h"
 #include "utils.h"
 #include "softmax.h"
+#include "tile_scheduler.hpp"
 
 namespace flash {
 
@@ -53,6 +54,8 @@ public:
     using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
 
     // Mainloop derived types
+    using TiledMmaQK = typename CollectiveMainloop::TiledMmaQK;
+    using TileShape_MNK = typename CollectiveMainloop::TileShape_MNK;
     using TileShape_MNK_PV = typename CollectiveMainloop::TileShape_MNK_PV;
     using TiledMmaPV = typename CollectiveMainloop::TiledMmaPV;
     using ArchTag = typename CollectiveMainloop::ArchTag;
@@ -60,6 +63,7 @@ public:
     using MainloopArguments = typename CollectiveMainloop::Arguments;
     using MainloopParams = typename CollectiveMainloop::Params;
     using BarrierQ = std::conditional_t<Use_TMA_Q, cutlass::arch::ClusterTransactionBarrier, cutlass::arch::ClusterBarrier>;
+    using SmemLayoutSink = typename CollectiveMainloop::SmemLayoutSink;
 
     // Epilogue derived types
     using EpilogueArguments = typename CollectiveEpilogue::Arguments;
@@ -295,6 +299,18 @@ public:
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
 
+        // Load sinks [H_q] to smem
+        const bool has_sink = params.mainloop.ptr_sink != nullptr;
+        const int num_heads = get<2>(params.mainloop.shape_Q);
+        Tensor gSink = make_tensor(make_gmem_ptr(params.mainloop.ptr_sink), make_shape(num_heads));
+        Tensor sSink = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_sink.data()), SmemLayoutSink{});
+        if (has_sink) {
+            #pragma unroll
+            for (int i = threadIdx.x; i < num_heads; i += blockDim.x) {
+                sSink(i) = gSink(i);
+            }
+        }
+
         // We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
         if constexpr (size(ClusterShape{}) > 1) {
             cute::cluster_arrive_relaxed();
@@ -413,7 +429,33 @@ public:
                     float const k_descale = params.mainloop.ptr_k_descale == nullptr ? 1.0f : params.mainloop.ptr_k_descale[bidb * get<0>(params.mainloop.stride_k_descale) + bidh_kv * get<1>(params.mainloop.stride_k_descale)];
                     softmax_scale_log2 *= q_descale * k_descale;
                 }
+                
                 flash::Softmax<!LargeHeadDimV ? 2 * (2 * kBlockM / NumMmaThreads) : 2, /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
+
+                if (has_sink) {
+                    int const split_idx = get<3>(block_coord);
+                    if (!Split || (split_idx & 0x0000FFFF) == 0) {
+                        int const bidh = get<1>(block_coord);
+                        if (!PackGQA) {
+                            softmax.template set_row_sink</*Is_packGQA=*/PackGQA>(sSink, bidh);
+                        } {
+                            int const m_block = get<0>(block_coord);
+                            int const qhead_per_khead = params.mainloop.qhead_per_khead_divmod.divisor;
+                            TiledMmaQK tiled_mma_qk;
+                            auto thread_mma_qk = tiled_mma_qk.get_thread_slice(threadIdx.x - MmaThreadOffset);
+                            Tensor coord_S = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
+                            Tensor tCoord_S = thread_mma_qk.partition_C(coord_S);
+                            auto tCoord_rowcol = make_tensor(
+                                tCoord_S.data(),
+                                flash::convert_layout_acc_rowcol</*Transposed=*/false>(tCoord_S.layout())
+                            );
+                            const int row_start = m_block * kBlockM + get<0>(tCoord_rowcol(_0{}, _0{}));
+                            const int row_step = get<0>(tCoord_rowcol(_1{}, _0{})) - get<0>(tCoord_rowcol(_0{}, _0{}));
+                            softmax.template set_row_sink</*Is_packGQA=*/PackGQA>(sSink, bidh, qhead_per_khead, row_start, row_step);
+                        }
+                    }
+                }
+
                 // Attention output (GEMM-II) accumulator.
                 Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
                 bool tile_valid;

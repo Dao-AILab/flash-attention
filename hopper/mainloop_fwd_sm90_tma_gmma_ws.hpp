@@ -30,7 +30,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSink_>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -40,6 +40,7 @@ struct CollectiveMainloopFwdSm90 {
     using TileShape_MNK_QV = Shape<decltype(get<0>(TileShape_MNK{})), decltype(get<1>(TileShape_MNK{})), Int<kHeadDimV>>;
     using Element = Element_;
     using ElementAccum = ElementAccum_;
+    using ElementSink = ElementSink_;
     using ArchTag = ArchTag_;
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;;
     static constexpr bool Is_causal = Is_causal_;
@@ -173,6 +174,8 @@ struct CollectiveMainloopFwdSm90 {
     using SmemLayoutScale = cute::Layout<cute::Shape<Int<kBlockM>, Int<kStages>>>;
 
     using SmemCopyAtomP = Copy_Atom<cute::SM90_U32x4_STSM_N, Element>;
+
+    using SmemLayoutSink = Layout<Shape<_64>>;
 
     // Use LDSM.T and STSM to transpose V in the case of FP8 and V being row-major.
     // For FP16/BF16 we don't do any transposing.
@@ -310,6 +313,7 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
         SmemQv_t smem_qv;
+        cute::array_aligned<ElementSink, cute::cosize_v<SmemLayoutSink>, 128> smem_sink;
     };
 
     struct TensorStorageWithPNoTranspose : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose, SmemAlignmentP), _0> {
@@ -318,6 +322,7 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
         SmemQv_t smem_qv;
         SmemP_t smem_p;
+        cute::array_aligned<ElementSink, cute::cosize_v<SmemLayoutSink>, 128> smem_sink;
     };
     struct TensorStorageWithPScaleNoTranspose : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose, SmemAlignmentP), _0> {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVtNoTranspose> smem_v;
@@ -326,6 +331,7 @@ struct CollectiveMainloopFwdSm90 {
         SmemQv_t smem_qv;
         SmemP_t smem_p;
         SmemScale_t smem_scale;
+        cute::array_aligned<ElementSink, cute::cosize_v<SmemLayoutSink>, 128> smem_sink;
     };
 
     using TensorStorageNoTranspose = std::conditional_t<
@@ -344,6 +350,7 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
         SmemQv_t smem_qv;
         SmemScale_t smem_scale;
+        cute::array_aligned<ElementSink, cute::cosize_v<SmemLayoutSink>, 128> smem_sink;
     };
 
     using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose, TensorStorageTransposeV>;
@@ -396,6 +403,7 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        ElementSink const* const ptr_sink = nullptr;
     };
 
     // Device side kernel params
@@ -452,6 +460,7 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const *const seqlens_rotary = nullptr;
+        ElementSink const* const ptr_sink = nullptr;
     };
 
     static Params
@@ -560,7 +569,7 @@ struct CollectiveMainloopFwdSm90 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary, args.ptr_sink};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance

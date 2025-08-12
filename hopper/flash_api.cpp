@@ -624,7 +624,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<at::Tensor> &scheduler_metadata_,  // (b + 1)
         int num_splits,
         std::optional<bool> pack_gqa_,
-        int const sm_margin
+        int const sm_margin,
+        std::optional<const at::Tensor> &sinks_ // (h)
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1045,6 +1046,18 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         } else {
             params.v_descale_ptr = nullptr;
         }
+    }
+
+    if(sinks_.has_value()) {
+        auto sinks = sinks_.value();
+        TORCH_CHECK(sinks.scalar_type() == at::ScalarType::BFloat16,
+            "sinks must have dtype bfloat16");
+        CHECK_DEVICE(sinks);
+        CHECK_SHAPE(sinks, num_heads);
+        CHECK_CONTIGUOUS(sinks);
+        params.sink_ptr = sinks.data_ptr();
+    } else {
+        params.sink_ptr = nullptr;
     }
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
@@ -1549,4 +1562,13 @@ mha_combine(const at::Tensor &out_partial,         // num_splits x batch_size x 
     }
 
     return {out, softmax_lse};
+}
+
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.doc() = "FlashAttention";
+    m.def("fwd", &mha_fwd, "Forward pass");
+    m.def("bwd", &mha_bwd, "Backward pass");
+    m.def("fwd_combine", &mha_combine, "Combine partial attention outputs");
+    m.def("get_scheduler_metadata", &mha_fwd_get_scheduler_metadata, "Get scheduler metadata for varlen forward pass");
 }
