@@ -4,8 +4,8 @@
 
 #include <Python.h>
 // #include <torch/nn/functional/padding.h>
-#include <ATen/cuda/CUDAContextLight.h>
-#include <c10/cuda/CUDAGuard.h>
+// #include <ATen/cuda/CUDAContextLight.h>
+// #include <c10/cuda/CUDAGuard.h>
 
 #include <cutlass/numeric_types.h>
 
@@ -17,11 +17,36 @@
 
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/accelerator.h>
 
-#include <c10/core/ScalarType.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
 
+#include <cuda_runtime.h>
+#include <string.h>
 
 using torch::stable::Tensor;
+
+namespace {
+// Helper function to get device properties using raw CUDA APIs
+cudaDeviceProp get_device_prop() {
+  int device;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err != cudaSuccess) {
+    STD_TORCH_CHECK(false, "cudaGetDevice failed: " +
+                               std::string(cudaGetErrorString(err)));
+  }
+
+  cudaDeviceProp prop;
+  err = cudaGetDeviceProperties(&prop, device);
+  if (err != cudaSuccess) {
+    STD_TORCH_CHECK(false, "cudaGetDeviceProperties failed: " +
+                               std::string(cudaGetErrorString(err)));
+  }
+
+  return prop;
+}
+} // anonymous namespace
 
 
 extern "C" {
@@ -81,8 +106,8 @@ void set_params_fprop(Flash_fwd_params &params,
     // Reset the parameters
     params = {};
 
-    params.is_bf16 = q.dtype() == c10::kBFloat16;
-    params.is_e4m3 = q.dtype() == c10::kFloat8_e4m3fn;
+    params.is_bf16 = q.scalar_type() == c10::ScalarType::BFloat16;
+    params.is_e4m3 = q.scalar_type() == c10::ScalarType::Float8_e4m3fn;
 
     // Set the pointers and strides.
     params.q_ptr = q.data_ptr();
@@ -161,8 +186,9 @@ void set_params_fprop(Flash_fwd_params &params,
     params.window_size_right = window_size_right;
     params.attention_chunk = attention_chunk;
 
-    params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
-    params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
+    auto dprops = get_device_prop();
+    params.arch = dprops.major * 10 + dprops.minor;
+    params.num_sm = dprops.multiProcessorCount - sm_margin;
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
         STD_TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
@@ -588,8 +614,9 @@ mha_fwd_get_scheduler_metadata(
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
     params.attention_chunk = attention_chunk;
-    params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
-    params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
+    auto dprops = get_device_prop();
+    params.arch = dprops.major * 10 + dprops.minor;
+    params.num_sm = dprops.multiProcessorCount - sm_margin;
     params.softcap = has_softcap ? 1.0f : 0.0f;
 
     params.page_size = page_size.has_value() ? page_size.value() : 1;
@@ -607,13 +634,13 @@ mha_fwd_get_scheduler_metadata(
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)seqused_k.get_device()};
+    torch::stable::accelerator::DeviceGuard device_guard{(char)seqused_k.get_device()};
 
     // This needs to be set after get_num_splits
     Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
     bool const scheduler_needs_semaphore = params.arch >= 90 || params.num_splits > 1;
     if (scheduler_needs_semaphore || use_dynamic_split) {
-        tile_count_semaphore = torch::stable::new_empty(seqused_k, {int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b}, std::make_optional(c10::kInt));
+        tile_count_semaphore = torch::stable::new_empty(seqused_k, {int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b}, std::make_optional(c10::ScalarType::Int));
         if (scheduler_needs_semaphore) {
             if (!use_dynamic_split) { torch::stable::zero_(tile_count_semaphore); }  // If varlen we'll manually do the zero-ing
             params.tile_count_semaphore = static_cast<int*>(tile_count_semaphore.data_ptr());
@@ -628,7 +655,8 @@ mha_fwd_get_scheduler_metadata(
         auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        auto device_idx = torch::stable::accelerator::getCurrentDevice();
+        auto stream = (cudaStream_t)torch::stable::accelerator::getCurrentStream(device_idx).id();
         prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
@@ -681,14 +709,14 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         int64_t sm_margin
         ) {
 
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_sm8x = dprops->major >= 8;
+    auto dprops = get_device_prop();
+    bool is_sm8x = dprops.major >= 8;
     STD_TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
 
     auto q_type = q.scalar_type();
     STD_TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16 || q_type == at::ScalarType::Float8_e4m3fn,
                 "FlashAttention only supports fp16, bf16, and fp8_e4m3 data type");
-    if (dprops->major < 9) {
+    if (dprops.major < 9) {
         STD_TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
                     "FlashAttention on Ampere/Ada cards only supports fp16 and bf16 data type");
     }
@@ -706,7 +734,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     if (paged_KV) {
         page_table = page_table_.value();
         CHECK_DEVICE(page_table);
-        STD_TORCH_CHECK(page_table.dtype() == c10::kInt, "page_table must have dtype torch.int32");
+        STD_TORCH_CHECK(page_table.scalar_type() == c10::ScalarType::Int, "page_table must have dtype torch.int32");
         STD_TORCH_CHECK(page_table.stride(-1) == 1, "page_table must have contiguous last dimension");
     }
 
@@ -715,7 +743,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     if (is_varlen_q) {
         cu_seqlens_q = cu_seqlens_q_.value();
         CHECK_DEVICE(cu_seqlens_q); CHECK_CONTIGUOUS(cu_seqlens_q);
-        STD_TORCH_CHECK(cu_seqlens_q.dtype() == c10::kInt, "cu_seqlens_q must have dtype torch.int32");
+        STD_TORCH_CHECK(cu_seqlens_q.scalar_type() == c10::ScalarType::Int, "cu_seqlens_q must have dtype torch.int32");
         STD_TORCH_CHECK(max_seqlen_q_.has_value(), "max_seqlen_q must be provided if cu_seqlens_q is provided");
     }
     Tensor cu_seqlens_k;
@@ -723,7 +751,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     if (is_varlen_k) {
         cu_seqlens_k = cu_seqlens_k_.value();
         CHECK_DEVICE(cu_seqlens_k); CHECK_CONTIGUOUS(cu_seqlens_k);
-        STD_TORCH_CHECK(cu_seqlens_k.dtype() == c10::kInt, "cu_seqlens_k must have dtype torch.int32");
+        STD_TORCH_CHECK(cu_seqlens_k.scalar_type() == c10::ScalarType::Int, "cu_seqlens_k must have dtype torch.int32");
         STD_TORCH_CHECK(max_seqlen_k_.has_value(), "max_seqlen_k must be provided if cu_seqlens_k is provided");
         STD_TORCH_CHECK(!paged_KV, "If cu_seqlens_k is passed in, then page table is not supported");
         STD_TORCH_CHECK(!kv_batch_idx_.has_value(), "If cu_seqlens_k is passed in, then page table is not supported");
@@ -758,7 +786,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
                    (head_size <= 64 && head_size_v <= 512),
                    "If V headdim is different from Q/K dim, we only support Q/K headdim in (128, 192] and V headdim in (96, 128], "
                    "or (Q/K <= 64 and V <= 512).");
-        STD_TORCH_CHECK(dprops->major == 9, "Only Hopper supports different V headdim");
+        STD_TORCH_CHECK(dprops.major == 9, "Only Hopper supports different V headdim");
         if (head_size_v > 256) {
             STD_TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
                         "HeaddimV > 256 requires fp16 and bf16 data type");
@@ -801,20 +829,20 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
 
     if (seqused_q_.has_value()){
         auto seqused_q = seqused_q_.value();
-        STD_TORCH_CHECK(seqused_q.dtype() == c10::kInt, "seqused_q must have dtype int32");
+        STD_TORCH_CHECK(seqused_q.scalar_type() == c10::ScalarType::Int, "seqused_q must have dtype int32");
         CHECK_DEVICE(seqused_q); CHECK_CONTIGUOUS(seqused_q);
         CHECK_SHAPE(seqused_q, batch_size);
     }
     if (seqused_k_.has_value()) {
         auto seqused_k = seqused_k_.value();
-        STD_TORCH_CHECK(seqused_k.dtype() == c10::kInt, "seqused_k must have dtype int32");
+        STD_TORCH_CHECK(seqused_k.scalar_type() == c10::ScalarType::Int, "seqused_k must have dtype int32");
         CHECK_DEVICE(seqused_k); CHECK_CONTIGUOUS(seqused_k);
         CHECK_SHAPE(seqused_k, batch_size);
     }
 
     if (leftpad_k_.has_value()) {
         auto leftpad_k = leftpad_k_.value();
-        STD_TORCH_CHECK(leftpad_k.dtype() == c10::kInt, "leftpad_k must have dtype int32");
+        STD_TORCH_CHECK(leftpad_k.scalar_type() == c10::ScalarType::Int, "leftpad_k must have dtype int32");
         CHECK_DEVICE(leftpad_k); CHECK_CONTIGUOUS(leftpad_k);
         CHECK_SHAPE(leftpad_k, batch_size);
     }
@@ -825,7 +853,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         STD_TORCH_CHECK(!is_varlen, "This flash attention build does not support varlen.");
     #endif
 
-    int const alignment = q_type == c10::kFloat8_e4m3fn ? 16 : 8;
+    int const alignment = q_type == c10::ScalarType::Float8_e4m3fn ? 16 : 8;
     STD_TORCH_CHECK(head_size % alignment == 0, "head_size should be a multiple of " + std::to_string(alignment));
     STD_TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
@@ -856,13 +884,13 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    torch::stable::accelerator::DeviceGuard device_guard{(char)q.get_device()};
 
     Tensor softmax_lse;
     if (!is_varlen_q) {
-        softmax_lse = torch::stable::new_empty(q, {batch_size, num_heads, seqlen_q}, std::make_optional(at::kFloat));
+        softmax_lse = torch::stable::new_empty(q, {batch_size, num_heads, seqlen_q}, std::make_optional(c10::ScalarType::Float));
     } else {
-        softmax_lse = torch::stable::new_empty(q, {num_heads, total_q}, std::make_optional(at::kFloat));
+        softmax_lse = torch::stable::new_empty(q, {num_heads, total_q}, std::make_optional(c10::ScalarType::Float));
     }
 
     Flash_fwd_params params;
@@ -910,12 +938,12 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         if (is_varlen_k_new) {
             cu_seqlens_k_new = cu_seqlens_k_new_.value();
             CHECK_DEVICE(cu_seqlens_k_new); CHECK_CONTIGUOUS(cu_seqlens_k_new);
-            STD_TORCH_CHECK(cu_seqlens_k_new.dtype() == c10::kInt, "cu_seqlens_k_new must have dtype torch.int32");
+            STD_TORCH_CHECK(cu_seqlens_k_new.scalar_type() == c10::ScalarType::Int, "cu_seqlens_k_new must have dtype torch.int32");
         }
         k_new = k_new_.value();
         v_new = v_new_.value();
-        STD_TORCH_CHECK(k_new.dtype() == q_type, "k_new must have the same dtype as query");
-        STD_TORCH_CHECK(v_new.dtype() == q_type, "v_new must have the same dtype as query");
+        STD_TORCH_CHECK(k_new.scalar_type() == q_type, "k_new must have the same dtype as query");
+        STD_TORCH_CHECK(v_new.scalar_type() == q_type, "v_new must have the same dtype as query");
         CHECK_DEVICE(k_new); CHECK_DEVICE(v_new);
         STD_TORCH_CHECK(k_new.stride(-1) == 1, "k_new tensor must have contiguous last dimension");
         STD_TORCH_CHECK(v_new.stride(-1) == 1, "v_new tensor must have contiguous last dimension");
@@ -972,10 +1000,10 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
             CHECK_DEVICE(scheduler_metadata);
             CHECK_SHAPE(scheduler_metadata, metadata_size);
             CHECK_CONTIGUOUS(scheduler_metadata);
-            STD_TORCH_CHECK(scheduler_metadata.dtype() == c10::kInt, "scheduler_metadata must have dtype int32");
+            STD_TORCH_CHECK(scheduler_metadata.scalar_type() == c10::ScalarType::Int, "scheduler_metadata must have dtype int32");
             tile_count_semaphore = scheduler_metadata;
         } else {
-            tile_count_semaphore = torch::stable::new_empty(q, {metadata_size}, c10::kInt);
+            tile_count_semaphore = torch::stable::new_empty(q, {metadata_size}, c10::ScalarType::Int);
         }
         if (scheduler_needs_semaphore && !use_dynamic_split) {
             torch::stable::zero_(tile_count_semaphore);  // If varlen we'll manually do the zero-ing
@@ -990,7 +1018,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
                     "q_v is only supported for fp16 and bf16 data type");
         STD_TORCH_CHECK(params.arch == 90, "q_v is only supported for Hopper GPUs");
         Tensor q_v = q_v_.value();
-        STD_TORCH_CHECK(q_v.dtype() == q_type, "q_v must have the same dtype as query");
+        STD_TORCH_CHECK(q_v.scalar_type() == q_type, "q_v must have the same dtype as query");
         CHECK_DEVICE(q_v);
         STD_TORCH_CHECK(q_v.stride(-1) == 1, "q_v tensor must have contiguous last dimension");
         if (!is_varlen_q) {
@@ -1032,7 +1060,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         if (seqlens_rotary_.has_value()) {
             Tensor seqlens_rotary = seqlens_rotary_.value();
             CHECK_DEVICE(seqlens_rotary); CHECK_CONTIGUOUS(seqlens_rotary);
-            STD_TORCH_CHECK(seqlens_rotary.dtype() == c10::kInt, "seqlens_rotary must have dtype torch.int32");
+            STD_TORCH_CHECK(seqlens_rotary.scalar_type() == c10::ScalarType::Int, "seqlens_rotary must have dtype torch.int32");
             CHECK_SHAPE(seqlens_rotary, batch_size);
             params.seqlens_rotary = static_cast<int*>(seqlens_rotary.data_ptr());
         }
@@ -1043,7 +1071,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     if (kv_batch_idx_.has_value()) {
         auto kv_batch_idx = kv_batch_idx_.value();
         CHECK_DEVICE(kv_batch_idx); CHECK_CONTIGUOUS(kv_batch_idx);
-        STD_TORCH_CHECK(kv_batch_idx.scalar_type() == c10::kInt, "kv_batch_idx must have dtype int32");
+        STD_TORCH_CHECK(kv_batch_idx.scalar_type() == c10::ScalarType::Int, "kv_batch_idx must have dtype int32");
         params.kv_batch_idx = reinterpret_cast<int *>(kv_batch_idx.data_ptr());
     }
 
@@ -1053,12 +1081,12 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         STD_TORCH_CHECK(params.num_splits <= 256, "num_splits > 256 not supported");
         if (!is_varlen_q) {
             out_accum = torch::stable::new_empty(q, {params.num_splits, batch_size, num_heads, seqlen_q, head_size_v}, std::make_optional(outaccum_type));
-            softmax_lse_accum = torch::stable::new_empty(q, {params.num_splits, batch_size, num_heads, seqlen_q}, std::make_optional(at::kFloat));
+            softmax_lse_accum = torch::stable::new_empty(q, {params.num_splits, batch_size, num_heads, seqlen_q}, std::make_optional(c10::ScalarType::Float));
             params.oaccum_batch_stride = out_accum.stride(1);
             params.lseaccum_batch_stride = softmax_lse_accum.stride(1);
         } else {
             out_accum = torch::stable::new_empty(q, {params.num_splits, num_heads, total_q, head_size_v}, std::make_optional(outaccum_type));
-            softmax_lse_accum = torch::stable::new_empty(q, {params.num_splits, num_heads, total_q}, std::make_optional(at::kFloat));
+            softmax_lse_accum = torch::stable::new_empty(q, {params.num_splits, num_heads, total_q}, std::make_optional(c10::ScalarType::Float));
         }
         params.is_fp32 = false;
         params.oaccum_ptr = out_accum.data_ptr();
@@ -1123,7 +1151,8 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     #endif
 
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        auto device_idx = torch::stable::accelerator::getCurrentDevice();
+        auto stream = (cudaStream_t)torch::stable::accelerator::getCurrentStream(device_idx).id();
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
             if (out_type == at::ScalarType::BFloat16) {
@@ -1253,17 +1282,17 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
         STD_TORCH_CHECK(false, "This flash attention build does not support backward.");
     #endif
 
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_sm8x = dprops->major >= 8;
+    auto dprops = get_device_prop();
+    bool is_sm8x = dprops.major >= 8;
     STD_TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
 
-    auto q_type = q.dtype();
-    STD_TORCH_CHECK(q_type == c10::kHalf || q_type == c10::kBFloat16,
+    auto q_type = q.scalar_type();
+    STD_TORCH_CHECK(q_type == c10::ScalarType::Half || q_type == c10::ScalarType::BFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
-    STD_TORCH_CHECK(k.dtype() == q_type, "query and key must have the same dtype");
-    STD_TORCH_CHECK(v.dtype() == q_type, "query and value must have the same dtype");
-    STD_TORCH_CHECK(out.dtype() == q_type, "query and out must have the same dtype");
-    STD_TORCH_CHECK(dout.dtype() == q_type, "query and dout must have the same dtype");
+    STD_TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
+    STD_TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
+    STD_TORCH_CHECK(out.scalar_type() == q_type, "query and out must have the same dtype");
+    STD_TORCH_CHECK(dout.scalar_type() == q_type, "query and dout must have the same dtype");
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(out); CHECK_DEVICE(dout); CHECK_DEVICE(softmax_lse);
@@ -1279,7 +1308,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     if (is_varlen_q) {
         cu_seqlens_q = cu_seqlens_q_.value();
         CHECK_DEVICE(cu_seqlens_q); CHECK_CONTIGUOUS(cu_seqlens_q);
-        STD_TORCH_CHECK(cu_seqlens_q.dtype() == c10::kInt, "cu_seqlens_q must have dtype torch.int32");
+        STD_TORCH_CHECK(cu_seqlens_q.scalar_type() == c10::ScalarType::Int, "cu_seqlens_q must have dtype torch.int32");
         STD_TORCH_CHECK(max_seqlen_q_.has_value(), "max_seqlen_q must be provided if cu_seqlens_q is provided");
     }
     Tensor cu_seqlens_k;
@@ -1287,7 +1316,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     if (is_varlen_k) {
         cu_seqlens_k = cu_seqlens_k_.value();
         CHECK_DEVICE(cu_seqlens_k); CHECK_CONTIGUOUS(cu_seqlens_k);
-        STD_TORCH_CHECK(cu_seqlens_k.dtype() == c10::kInt, "cu_seqlens_k must have dtype torch.int32");
+        STD_TORCH_CHECK(cu_seqlens_k.scalar_type() == c10::ScalarType::Int, "cu_seqlens_k must have dtype torch.int32");
         STD_TORCH_CHECK(max_seqlen_k_.has_value(), "max_seqlen_k must be provided if cu_seqlens_k is provided");
     }
     // This is what we will template on
@@ -1324,7 +1353,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM (and cause IMA).
     is_causal = window_size_left < 0 && window_size_right == 0;
 
-    int const arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
+    int const arch = dprops.major * 10 + dprops.minor;
     int const head_size_rounded = round_up_headdim(std::max(head_size, head_size_v));
     int const head_size_v_rounded = head_size_rounded;
     // Very important that these match the kernel configs
@@ -1374,13 +1403,13 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
 
     if (seqused_q_.has_value()){
         auto seqused_q = seqused_q_.value();
-        STD_TORCH_CHECK(seqused_q.dtype() == c10::kInt, "seqused_q must have dtype int32");
+        STD_TORCH_CHECK(seqused_q.scalar_type() == c10::ScalarType::Int, "seqused_q must have dtype int32");
         CHECK_DEVICE(seqused_q); CHECK_CONTIGUOUS(seqused_q);
         CHECK_SHAPE(seqused_q, batch_size);
     }
     if (seqused_k_.has_value()){
         auto seqused_k = seqused_k_.value();
-        STD_TORCH_CHECK(seqused_k.dtype() == c10::kInt, "seqused_k must have dtype int32");
+        STD_TORCH_CHECK(seqused_k.scalar_type() == c10::ScalarType::Int, "seqused_k must have dtype int32");
         CHECK_DEVICE(seqused_k); CHECK_CONTIGUOUS(seqused_k);
         CHECK_SHAPE(seqused_k, batch_size);
     }
@@ -1388,7 +1417,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     Tensor dq, dk, dv;
     if (dq_.has_value()) {
         dq = dq_.value();
-        STD_TORCH_CHECK(dq.dtype() == q_type, "dq must have the same dtype as q");
+        STD_TORCH_CHECK(dq.scalar_type() == q_type, "dq must have the same dtype as q");
         CHECK_DEVICE(dq);
         STD_TORCH_CHECK(dq.stride(-1) == 1, "dq must have contiguous last dimension");
         if (!is_varlen_q) {
@@ -1401,7 +1430,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     }
     if (dk_.has_value()) {
         dk = dk_.value();
-        STD_TORCH_CHECK(dk.dtype() == q_type, "dk must have the same dtype as q");
+        STD_TORCH_CHECK(dk.scalar_type() == q_type, "dk must have the same dtype as q");
         CHECK_DEVICE(dk);
         STD_TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
         if (!is_varlen_k) {
@@ -1414,7 +1443,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     }
     if (dv_.has_value()) {
         dv = dv_.value();
-        STD_TORCH_CHECK(dv.dtype() == q_type, "dv must have the same dtype as q");
+        STD_TORCH_CHECK(dv.scalar_type() == q_type, "dv must have the same dtype as q");
         CHECK_DEVICE(dv);
         STD_TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
         if (!is_varlen_k) {
@@ -1428,35 +1457,35 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    torch::stable::accelerator::DeviceGuard device_guard{(char)q.get_device()};
 
     // auto opts = q.options();
     // Need softmax_d to have total_q_padded_rounded since we want its address to be aligned by 16/8 bytes for TMA / LDG.64
     Tensor softmax_d, softmax_lse_log2;
     if (!is_varlen) {
         // Need softmax_d to have seqlen_q_rounded since we want its address to be aligned by 16/8 bytes for TMA / LDG.64
-        softmax_d = torch::stable::new_empty(q, {batch_size, num_heads, seqlen_q_rounded}, std::make_optional(at::kFloat));
-        softmax_lse_log2 = torch::stable::new_empty(q, {batch_size, num_heads, seqlen_q_rounded}, std::make_optional(at::kFloat));
+        softmax_d = torch::stable::new_empty(q, {batch_size, num_heads, seqlen_q_rounded}, std::make_optional(c10::ScalarType::Float));
+        softmax_lse_log2 = torch::stable::new_empty(q, {batch_size, num_heads, seqlen_q_rounded}, std::make_optional(c10::ScalarType::Float));
     } else {
-        softmax_d = torch::stable::new_empty(q, {num_heads, total_q_padded_rounded}, std::make_optional(at::kFloat));
-        softmax_lse_log2 = torch::stable::new_empty(q, {num_heads, total_q_padded_rounded}, std::make_optional(at::kFloat));
+        softmax_d = torch::stable::new_empty(q, {num_heads, total_q_padded_rounded}, std::make_optional(c10::ScalarType::Float));
+        softmax_lse_log2 = torch::stable::new_empty(q, {num_heads, total_q_padded_rounded}, std::make_optional(c10::ScalarType::Float));
     }
     Tensor dq_accum, dk_accum, dv_accum;
     if (!is_varlen) {
-        dq_accum = torch::stable::new_empty(q, {batch_size, num_heads, seqlen_q_rounded * head_size_rounded}, std::make_optional(at::kFloat));
+        dq_accum = torch::stable::new_empty(q, {batch_size, num_heads, seqlen_q_rounded * head_size_rounded}, std::make_optional(c10::ScalarType::Float));
     } else {
-        dq_accum = torch::stable::new_empty(q, {num_heads, total_q_padded_rounded * head_size_rounded}, std::make_optional(at::kFloat));
+        dq_accum = torch::stable::new_empty(q, {num_heads, total_q_padded_rounded * head_size_rounded}, std::make_optional(c10::ScalarType::Float));
     }
     if (num_heads_k != num_heads) {  // MQA / GQA
         if (!is_varlen) {
-            dk_accum = torch::stable::new_empty(q, {batch_size, num_heads_k, seqlen_k_rounded * head_size_rounded}, std::make_optional(at::kFloat));
+            dk_accum = torch::stable::new_empty(q, {batch_size, num_heads_k, seqlen_k_rounded * head_size_rounded}, std::make_optional(c10::ScalarType::Float));
             dk_accum = torch::stable::fill_(dk_accum, 0.0);
-            dv_accum = torch::stable::new_empty(q, {batch_size, num_heads_k, seqlen_k_rounded * head_size_v_rounded}, std::make_optional(at::kFloat));
+            dv_accum = torch::stable::new_empty(q, {batch_size, num_heads_k, seqlen_k_rounded * head_size_v_rounded}, std::make_optional(c10::ScalarType::Float));
             dv_accum = torch::stable::fill_(dv_accum, 0.0);
         } else {
-            dk_accum = torch::stable::new_empty(q, {num_heads_k, total_k_padded_rounded, head_size_rounded}, std::make_optional(at::kFloat));
+            dk_accum = torch::stable::new_empty(q, {num_heads_k, total_k_padded_rounded, head_size_rounded}, std::make_optional(c10::ScalarType::Float));
             dk_accum = torch::stable::fill_(dk_accum, 0.0);
-            dv_accum = torch::stable::new_empty(q, {num_heads_k, total_k_padded_rounded, head_size_v_rounded}, std::make_optional(at::kFloat));
+            dv_accum = torch::stable::new_empty(q, {num_heads_k, total_k_padded_rounded, head_size_v_rounded}, std::make_optional(c10::ScalarType::Float));
             dv_accum = torch::stable::fill_(dv_accum, 0.0);
         }
     }
@@ -1493,15 +1522,15 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     params.dv = head_size_v;
     params.dv_rounded = head_size_v_rounded;
 
-    // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(c10::kInt)) : torch::empty({1}, opts.dtype(c10::kInt));
+    // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(c10::ScalarType::Int)) : torch::empty({1}, opts.dtype(c10::ScalarType::Int));
     // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
     // Will be zero'ed out in the backward preprocess kernel
-    Tensor dq_semaphore = torch::stable::new_empty(q, {(seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, std::make_optional(at::kInt));
+    Tensor dq_semaphore = torch::stable::new_empty(q, {(seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, std::make_optional(c10::ScalarType::Int));
     params.dq_semaphore = static_cast<int*>(dq_semaphore.data_ptr());
     if (num_heads_k != num_heads && params.deterministic) {
         // TODO: do we need to zero them out?
-        Tensor dk_semaphore = torch::stable::new_empty(q, {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(at::kInt));
-        Tensor dv_semaphore = torch::stable::new_empty(q, {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(at::kInt));
+        Tensor dk_semaphore = torch::stable::new_empty(q, {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(c10::ScalarType::Int));
+        Tensor dv_semaphore = torch::stable::new_empty(q, {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(c10::ScalarType::Int));
         params.dk_semaphore = static_cast<int*>(dk_semaphore.data_ptr());
         params.dv_semaphore = static_cast<int*>(dv_semaphore.data_ptr());
     }
@@ -1514,7 +1543,8 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     #endif
 
     if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        auto device_idx = torch::stable::accelerator::getCurrentDevice();
+        auto stream = (cudaStream_t)torch::stable::accelerator::getCurrentStream(device_idx).id();
         run_mha_bwd(params, stream);
     } else if (total_k > 0 && num_heads_k > 0) {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
@@ -1536,8 +1566,8 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
             std::optional<at::ScalarType> out_dtype_
             ) {
 
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_sm8x = dprops->major >= 8;
+    auto dprops = get_device_prop();
+    bool is_sm8x = dprops.major >= 8;
     STD_TORCH_CHECK(is_sm8x, "Attention combine function only supports Ampere GPUs or newer.");
 
     auto out_partial_type = out_partial.scalar_type();
@@ -1590,9 +1620,9 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)out_partial.get_device()};
+    torch::stable::accelerator::DeviceGuard device_guard{(char)out_partial.get_device()};
 
-    auto softmax_lse = torch::stable::new_empty(out_partial, {batch_size, num_heads, seqlen}, std::make_optional(c10::kFloat));
+    auto softmax_lse = torch::stable::new_empty(out_partial, {batch_size, num_heads, seqlen}, std::make_optional(c10::ScalarType::Float));
     softmax_lse = torch::stable::transpose(softmax_lse, 1, 2);
 
     Flash_fwd_params params {};  // Need to reset the params to set everything to zero
@@ -1617,10 +1647,11 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
     params.o_row_stride = out.stride(1);
     params.o_head_stride = out.stride(2);
     params.o_batch_stride = out.stride(0);
-    params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
+    params.arch = dprops.major * 10 + dprops.minor;
 
     if (seqlen > 0 && batch_size > 0) {
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        auto device_idx = torch::stable::accelerator::getCurrentDevice();
+        auto stream = (cudaStream_t)torch::stable::accelerator::getCurrentStream(device_idx).id();
         run_mha_fwd_combine(params, stream, false /*enable_pdl*/);
     }
 
