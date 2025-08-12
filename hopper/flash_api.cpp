@@ -525,8 +525,8 @@ mha_fwd_get_scheduler_metadata(
         bool has_softcap,
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int64_t sm_margin
-        ) {
+        bool sort_batches,
+        int64_t sm_margin) {
 
     TORCH_CHECK(qkv_dtype == at::ScalarType::Half || qkv_dtype == at::ScalarType::BFloat16 || qkv_dtype == at::ScalarType::Float8_e4m3fn,
                 "FlashAttention only supports fp16, bf16, and fp8_e4m3 data type");
@@ -604,7 +604,10 @@ mha_fwd_get_scheduler_metadata(
     at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
     bool const scheduler_needs_semaphore = params.arch >= 90 || params.num_splits > 1;
     if (scheduler_needs_semaphore || use_dynamic_split) {
-        tile_count_semaphore = torch::empty({int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b}, opts.dtype(torch::kInt32));
+        int num_metadata_batch_vectors = sort_batches ? 3 : 1;
+        tile_count_semaphore = torch::empty(
+            {int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b * num_metadata_batch_vectors},
+            opts.dtype(torch::kInt32));
         if (scheduler_needs_semaphore) {
             if (!use_dynamic_split) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
             params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
@@ -612,6 +615,8 @@ mha_fwd_get_scheduler_metadata(
             params.tile_count_semaphore = nullptr;
         }
         params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
+        params.num_m_blocks_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + 1 + params.b : nullptr;
+        params.batch_idx_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + 1 + params.b * 2 : nullptr;
     }
 
     if (params.num_splits_dynamic_ptr) {
@@ -620,7 +625,7 @@ mha_fwd_get_scheduler_metadata(
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
         auto stream = at::cuda::getCurrentCUDAStream().stream();
-        prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
+        prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/, sort_batches);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
     return tile_count_semaphore;
@@ -956,7 +961,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
         : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
     if (scheduler_needs_semaphore || use_dynamic_split) {
-        int metadata_size = int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b;
+        int metadata_size = int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b * 3;
         params.skip_scheduler_metadata_computation = scheduler_metadata_.has_value();
         if (scheduler_metadata_.has_value()) {
             at::Tensor scheduler_metadata = scheduler_metadata_.value();
@@ -973,6 +978,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         }
         params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() : nullptr;
         params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
+        params.num_m_blocks_ptr =  use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 + params.b : nullptr;
+        params.batch_idx_ptr =  use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 + params.b * 2 : nullptr;
     }
 
     if (q_v_.has_value()) {
@@ -1705,6 +1712,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "bool has_softcap = False,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
+        "bool sort_batches = False,"
         "int sm_margin = 0) -> Tensor");
 }
 
