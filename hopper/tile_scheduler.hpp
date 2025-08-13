@@ -24,8 +24,9 @@ struct TileSchedulerArguments {
     int* const tile_count_semaphore = nullptr;
     int const* const cu_seqlens = nullptr;
     int const* const seqused = nullptr;
-    // int const* const num_m_blocks_ptr = nullptr;
     int const* const num_splits_dynamic_ptr = nullptr;
+    int const* const num_m_blocks_ptr = nullptr;
+    int const* const varlen_batch_idx_ptr = nullptr;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -487,8 +488,9 @@ public:
         int* const tile_count_semaphore;
         int const* const cu_seqlens;
         int const* const seqused;
-        // int* const num_m_blocks_ptr;
         int const* const num_splits_dynamic_ptr;
+        int const* const num_m_blocks_ptr;
+        int const* const varlen_batch_idx_ptr;
     };
 
     static Params
@@ -503,8 +505,9 @@ public:
                 cutlass::FastDivmod(args.num_head),
                 cutlass::FastDivmod(!Split ? 1 : args.num_splits),
                 args.tile_count_semaphore, args.cu_seqlens, args.seqused,
-                // args.num_m_blocks_ptr,
-                args.num_splits_dynamic_ptr};
+                args.num_splits_dynamic_ptr,
+                args.num_m_blocks_ptr,
+                args.varlen_batch_idx_ptr};
     }
 
     static dim3
@@ -530,8 +533,9 @@ public:
         CUTLASS_DEVICE
         cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
+            int actual_bidb = params.varlen_batch_idx_ptr ? params.varlen_batch_idx_ptr[bidb] : bidb;
             if constexpr (!Split) {
-                return {block, bidh, bidb, 0 /*split_idx*/};
+                return {block, bidh, actual_bidb, 0 /*split_idx*/};
             } else {
                 // the top 8 bits of bidh store num_splits and the next 8 bits store split_idx
                 // reinterpret_cast to uint32_t to make sure we're not doing sign extension when we shift
@@ -545,7 +549,7 @@ public:
                 // if (threadIdx.x == 128) {
                 //     printf("blockIdx.x = %d, bidb = %d, bidh = %d, bidh_actual = %d, split_idx = %d\n", blockIdx.x, bidb, bidh, bidh_actual, split_idx);
                 // }
-                return {block, bidh_actual, bidb, split_idx};
+                return {block, bidh_actual, actual_bidb, split_idx};
             }
         }
     };
@@ -559,22 +563,27 @@ public:
         int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
         auto get_num_m_blocks = [&] (int bidb_start) {
             int batch_idx = lane + bidb_start;
-            int seqlen = params.seqlen * (!PackGQA ? 1 : params.qhead_per_khead);
-            if (seqlen > kBlock) {
-                if (params.seqused) {
-                    seqlen = batch_idx < params.num_batch ? params.seqused[batch_idx] : 0;
-                } else if (params.cu_seqlens) {
-                    int cur_cu_seqlen = batch_idx <= params.num_batch ? params.cu_seqlens[batch_idx] : 0;
-                    int next_cu_seqlen = __shfl_down_sync(0xffffffff, cur_cu_seqlen, 1);
-                    seqlen = next_cu_seqlen - cur_cu_seqlen;
-                } else {
-                    seqlen = params.seqlen;
+            if (params.num_m_blocks_ptr) {
+                int num_m_blocks = batch_idx < params.num_batch ? params.num_m_blocks_ptr[batch_idx] : 0;
+                return lane < cutlass::NumThreadsPerWarp - 1 ? num_m_blocks : 0;
+            } else {
+                int seqlen = params.seqlen * (!PackGQA ? 1 : params.qhead_per_khead);
+                if (seqlen > kBlock) {
+                    if (params.seqused) {
+                        seqlen = batch_idx < params.num_batch ? params.seqused[batch_idx] : 0;
+                    } else if (params.cu_seqlens) {
+                        int cur_cu_seqlen = batch_idx <= params.num_batch ? params.cu_seqlens[batch_idx] : 0;
+                        int next_cu_seqlen = __shfl_down_sync(0xffffffff, cur_cu_seqlen, 1);
+                        seqlen = next_cu_seqlen - cur_cu_seqlen;
+                    } else {
+                        seqlen = params.seqlen;
+                    }
+                    if constexpr (PackGQA) { seqlen *= params.qhead_per_khead; }
                 }
-                if constexpr (PackGQA) { seqlen *= params.qhead_per_khead; }
+                return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
+                    ? cute::ceil_div(seqlen, kBlock) : 0;
+                    // ? params.num_m_blocks_ptr[batch_idx] : 0;
             }
-            return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
-                ? cute::ceil_div(seqlen, kBlock) : 0;
-                // ? params.num_m_blocks_ptr[batch_idx] : 0;
         };
 
         auto get_num_splits = [&] (int bidb_start) {

@@ -151,12 +151,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.seqlen_q,
         params.seqlen_k, params.d, params.dv, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q,
-        // params.num_m_blocks_ptr,
         params.num_splits_dynamic_ptr,
+        params.num_m_blocks_ptr,
+        params.varlen_batch_idx_ptr
     };
 
     if (Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation) {
-        prepare_varlen_num_blocks(params, stream, PackGQA, kBlockM, kBlockN, Arch >= 90 /*enable_pdl*/, false /*sort_batches*/);
+        prepare_varlen_num_blocks(params, stream, PackGQA, kBlockM, kBlockN, Arch >= 90 /*enable_pdl*/, params.varlen_sort_batches);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
 

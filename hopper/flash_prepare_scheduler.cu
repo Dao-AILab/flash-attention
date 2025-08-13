@@ -16,7 +16,7 @@
 namespace flash {
 
 // needs (tensor size = batches):
-// 1. batch_idx_ptr: virtual_batch_idx -> batch_idx
+// 1. varlen_batch_idx_ptr: virtual_batch_idx -> batch_idx
 // 2. num_m_blocks_ptr: virtual_batch_idx -> num_m_blocks[batch_idx]
 // 3. num_splits_dynamic_ptr: virtual_batch_idx -> num_splits[batch_idx]
 
@@ -46,7 +46,7 @@ struct CustomMore<int4> {
     }
 };
 
-template <bool Sort>
+template <int NumWarps, bool Sort>
 __global__ void prepare_varlen_num_blocks_kernel(
         int seqlen_q_static, int seqlen_k_static, int seqlen_k_new_static,
         int const* const cu_seqlens_q, int const* const cu_seqlens_k, int const* const cu_seqlens_k_new,
@@ -56,15 +56,15 @@ __global__ void prepare_varlen_num_blocks_kernel(
         int* const tile_count_semaphore,
         int* const num_m_blocks_ptr, // virtual_batch_idx -> num_m_blocks[batch_idx]
         int* const num_splits_dynamic_ptr,
-        int* const batch_idx_ptr,
+        int* const varlen_batch_idx_ptr,
         bool enable_pdl) {
 
     static constexpr int kNumBatchPerWarp = cutlass::NumThreadsPerWarp - 1;
     static constexpr int kSmemSize = 1;
-    static constexpr int BLOCK_THREADS = 1024;
+    static constexpr int BLOCK_DIM_X = NumWarps * 32;
     static constexpr int ITEMS_PER_THREAD = 1;
-    static_assert(BLOCK_THREADS * ITEMS_PER_THREAD == 1024);
-    using BlockMergeSort = cub::BlockMergeSort<int4, BLOCK_THREADS, ITEMS_PER_THREAD>;
+    static_assert(BLOCK_DIM_X * ITEMS_PER_THREAD == NumWarps * 32);
+    using BlockMergeSort = cub::BlockMergeSort<int4, BLOCK_DIM_X, ITEMS_PER_THREAD>;
 
     // Assume that there's only one block in the grid
     __shared__ int total_blocks_smem[kSmemSize];
@@ -129,7 +129,6 @@ __global__ void prepare_varlen_num_blocks_kernel(
     int batch_idx = lane + bidb_start;
     int num_m_blocks = get_num_m_blocks(batch_idx);
     int num_n_blocks = get_num_n_blocks(batch_idx);
-
     int total_blocks = num_m_blocks * num_n_blocks;
     // Warp sum
     #pragma unroll
@@ -145,28 +144,36 @@ __global__ void prepare_varlen_num_blocks_kernel(
     int num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
 
     if constexpr(Sort) {
-        num_n_blocks = cute::ceil_div(num_n_blocks, num_splits_dynamic); // num_n_blocks per batch accounting for splits
-
-        // At this point, I have total blocks in shared memory, and each thread has its num_m_blocks, num_n_blocks, and num_splits
-        // thread batch_idx = bidb_start + lane, lane 31 is a dummy.
-
-        // Goal: sort batches by num_n_blocks
-        if(lane == kNumBatchPerWarp) {
+        // num_n_blocks per work tile for the batch
+        num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic); 
+        
+        if(lane == kNumBatchPerWarp || batch_idx >= num_batch) {
             num_n_blocks = -1; // sort last
         }
-        int4 thread_keys[ITEMS_PER_THREAD]; // 1 item per thread for now
-        thread_keys[0] = make_int4(num_n_blocks, num_m_blocks, num_splits_dynamic, batch_idx);
+        int4 batch_coords[ITEMS_PER_THREAD]; // 1 item per thread
+        batch_coords[0] = make_int4(num_n_blocks, num_splits_dynamic, num_m_blocks, batch_idx);
 
-        BlockMergeSort(temp_storage).Sort(thread_keys, CustomMore<int4>());
+        // if (threadIdx.x == 0) {
+        //     printf("Unsorted: num_n_blocks = %d, num_splits = %d, num_m_blocks = %d, batch_idx = %d.\n", 
+        //         batch_coords[0].x, batch_coords[0].y, batch_coords[0].z, batch_coords[0].w);
+        // } __syncthreads();
+
+        // Sort batches by num_n_blocks in descending order
+        BlockMergeSort(temp_storage).Sort(batch_coords, CustomMore<int4>());
+
+        // if (threadIdx.x == 0) {
+        //     printf("Sorted: num_n_blocks = %d, num_splits = %d, num_m_blocks = %d, batch_idx = %d.\n", 
+        //         batch_coords[0].x, batch_coords[0].y, batch_coords[0].z, batch_coords[0].w);
+        // } __syncthreads();
 
         if (threadIdx.x < num_batch) {
-            num_m_blocks_ptr[threadIdx.x] = thread_keys[0].y;
-            num_splits_dynamic_ptr[threadIdx.x] = thread_keys[0].z;
-            batch_idx_ptr[threadIdx.x] = thread_keys[0].w;
+            num_splits_dynamic_ptr[threadIdx.x] = batch_coords[0].y;
+            num_m_blocks_ptr[threadIdx.x] = batch_coords[0].z;
+            varlen_batch_idx_ptr[threadIdx.x] = batch_coords[0].w;
         }
     } else {
-        if (bidb_start + lane < num_batch && lane < kNumBatchPerWarp) {
-            num_splits_dynamic_ptr[bidb_start + lane] = num_splits_dynamic;
+        if (batch_idx < num_batch && lane < kNumBatchPerWarp) {
+            num_splits_dynamic_ptr[batch_idx] = num_splits_dynamic;
             // printf("idx = %d, num_m_blocks = %d, num_n_blocks = %d, num_split_static = %d, num_splits_dynamic = %d\n", bidb_start + lane, num_m_blocks_ptr[bidb_start + lane], num_n_blocks, num_splits_static, num_splits_dynamic);
         }
     }
@@ -178,23 +185,20 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
                                int blockM, int blockN, bool enable_pdl, bool sort_batches) {
     // Only support batch <= 992 (32 warps, each with 31 batches)
     int qhead_per_khead = !packgqa ? 1 : cutlass::ceil_div(params.h, params.h_k);
-    printf("sort_batches = %d.\n", sort_batches);
+    int num_warps = cutlass::ceil_div(params.b, 31);
     BOOL_SWITCH(sort_batches, Sort, [&] {
-        if constexpr(Sort) {
-            printf("Sorting it!.\n");
-        } else {
-            printf("No sorting.\n");
-        }
-        flash::prepare_varlen_num_blocks_kernel<Sort><<<1 /*grid*/, 1024 /*block*/, 0, stream>>>(
-            params.seqlen_q, params.seqlen_k, params.seqlen_knew,
-            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
-            params.seqused_q, params.seqused_k, params.leftpad_k,
-            params.b, !packgqa ? params.h : params.h_k, qhead_per_khead, params.num_sm, params.num_splits,
-            cutlass::FastDivmod(blockM), cutlass::FastDivmod(blockN),
-            params.tile_count_semaphore,
-            params.num_m_blocks_ptr,
-            params.num_splits_dynamic_ptr,
-            params.batch_idx_ptr,
-            enable_pdl);
+        NUM_WARP_SWITCH(num_warps, NumWarps, [&] {
+            flash::prepare_varlen_num_blocks_kernel<NumWarps, Sort><<<1 /*grid*/, 32 * NumWarps /*block*/, 0, stream>>>(
+                params.seqlen_q, params.seqlen_k, params.seqlen_knew,
+                params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
+                params.seqused_q, params.seqused_k, params.leftpad_k,
+                params.b, !packgqa ? params.h : params.h_k, qhead_per_khead, params.num_sm, params.num_splits,
+                cutlass::FastDivmod(blockM), cutlass::FastDivmod(blockN),
+                params.tile_count_semaphore,
+                params.num_m_blocks_ptr,
+                params.num_splits_dynamic_ptr,
+                params.varlen_batch_idx_ptr,
+                enable_pdl);
+        });
     });
 }
