@@ -39,6 +39,8 @@ PyObject* PyInit__C(void)
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+#define PREPARE_VARLEN_MAX_BATCHES 992
+
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
                       const size_t b,
@@ -585,7 +587,7 @@ mha_fwd_get_scheduler_metadata(
     params.page_size = page_size.has_value() ? page_size.value() : 1;
     params.page_table = !page_size.has_value() ? nullptr : reinterpret_cast<int*>(1);
 
-    bool const use_dynamic_split = params.b <= 992;
+    bool const use_dynamic_split = params.b <= PREPARE_VARLEN_MAX_BATCHES;
     params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
 
     params.pagedkv_tma = get_pagedkv_tma(params);
@@ -603,20 +605,27 @@ mha_fwd_get_scheduler_metadata(
     // This needs to be set after get_num_splits
     at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
     bool const scheduler_needs_semaphore = params.arch >= 90 || params.num_splits > 1;
-    if (scheduler_needs_semaphore || use_dynamic_split) {
-        int num_metadata_batch_vectors = sort_batches ? 3 : 1;
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    params.varlen_sort_batches = sort_batches;
+    if (scheduler_needs_semaphore || use_dynamic_split) {   
+        int b_rounded = round_multiple(params.b, 4); // for 16 byte alignment of pointers 
+        int num_prepare_batch_vectors = use_dynamic_split ? 1 : 0;
+        if(sort_batches) { num_prepare_batch_vectors += 2; }
+        int tile_count_semaphore_offset = b_rounded * num_prepare_batch_vectors;
+        // printf("(Metadata) num prepare batch vectors = %d.\n", num_prepare_batch_vectors);
         tile_count_semaphore = torch::empty(
-            {int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b * num_metadata_batch_vectors},
+            {int(scheduler_needs_semaphore) + tile_count_semaphore_offset},
             opts.dtype(torch::kInt32));
+        // {num_splits_dynamic, num_m_blocks, virtual_batch_indices, tile_count_semaphore}
+        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() : nullptr;
+        params.num_m_blocks_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
+        params.varlen_batch_idx_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 2 : nullptr;
         if (scheduler_needs_semaphore) {
             if (!use_dynamic_split) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
-            params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+            params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>() + tile_count_semaphore_offset;
         } else {
             params.tile_count_semaphore = nullptr;
         }
-        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
-        params.num_m_blocks_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + 1 + params.b : nullptr;
-        params.batch_idx_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + 1 + params.b * 2 : nullptr;
     }
 
     if (params.num_splits_dynamic_ptr) {
@@ -674,6 +683,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
+        bool sort_batches,
         int64_t sm_margin
         ) {
 
@@ -945,7 +955,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     }
 
     // 992 = 32 * 31 is the max supported batch in prepare_varlen_num_blocks kernel
-    bool const use_dynamic_split = is_varlen && params.b <= 992;
+    bool const use_dynamic_split = is_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES;
     // Temporarily set num_splits_dynamic_ptr to 1 since get_num_splits checks it
     params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
 
@@ -960,8 +970,14 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     bool const scheduler_needs_semaphore = params.arch >= 90
         ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
         : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
+    params.varlen_sort_batches = sort_batches;
     if (scheduler_needs_semaphore || use_dynamic_split) {
-        int metadata_size = int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b * 3;
+        int b_rounded = round_multiple(params.b, 4); // for 16 byte alignment of pointers
+        int num_prepare_batch_vectors = use_dynamic_split ? 1 : 0;
+        if(sort_batches) { num_prepare_batch_vectors += 2; }
+        int tile_count_semaphore_offset = b_rounded * num_prepare_batch_vectors;
+        int metadata_size = int(scheduler_needs_semaphore) + tile_count_semaphore_offset;
+        // printf("Num prepare batch vectors = %d, metadata_size = %d.\n", num_prepare_batch_vectors, metadata_size);
         params.skip_scheduler_metadata_computation = scheduler_metadata_.has_value();
         if (scheduler_metadata_.has_value()) {
             at::Tensor scheduler_metadata = scheduler_metadata_.value();
@@ -976,10 +992,12 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         if (scheduler_needs_semaphore && !use_dynamic_split) {
             tile_count_semaphore.zero_();  // If varlen we'll manually do the zero-ing
         }
-        params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() : nullptr;
-        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
-        params.num_m_blocks_ptr =  use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 + params.b : nullptr;
-        params.batch_idx_ptr =  use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 + params.b * 2 : nullptr;
+        // {num_splits_dynamic, num_m_blocks, virtual_batch_indices, tile_count_semaphore}
+        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() : nullptr;
+        params.num_m_blocks_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
+        params.varlen_batch_idx_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 2 : nullptr;
+        params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() + tile_count_semaphore_offset : nullptr;
+        params.tile_count_semaphore_offset = tile_count_semaphore_offset; // might need to zero out semaphore later
     }
 
     if (q_v_.has_value()) {
@@ -1141,7 +1159,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             run_mha_fwd_combine(params, stream, true /*enable_pdl*/);
         } else if (scheduler_needs_semaphore && params.skip_scheduler_metadata_computation) {
             // need to zero out the semaphore in this case
-            tile_count_semaphore.index({torch::indexing::Slice(0, 1)}).zero_();
+            tile_count_semaphore.index({torch::indexing::Slice(params.tile_count_semaphore_offset, params.tile_count_semaphore_offset + 1)}).zero_();
         }
     } else if (total_q > 0 && num_heads_k > 0) {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
@@ -1659,6 +1677,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
+        "bool sort_batches = False,"
         "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
