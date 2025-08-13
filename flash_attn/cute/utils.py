@@ -532,6 +532,3 @@ def e2e_asm2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Flo
         vector.extract(out_f32x2, dynamic_position=[], static_position=[1], loc=loc, ip=ip)
     )
     return out0, out1
-
-
-    )
