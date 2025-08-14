@@ -32,7 +32,7 @@ from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 @pytest.mark.parametrize("local", [False, True])
 # @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
+# @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
@@ -81,13 +81,13 @@ def test_flash_attn_output(
     # batch_size = 1
     nheads = 6
     # nheads = 1
-    nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
-    # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if not DISABLE_LOCAL else [0]
+    # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
     attention_chunk_vals = [0]
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
         q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
@@ -162,9 +162,8 @@ def test_flash_attn_output(
 
         print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
         print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-        # pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
-        # num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
-        pack_gqa_vals = [False]
+        # num_splits_vals = [1, 3]
+        pack_gqa_vals = [False, True, None]
         num_splits_vals = [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             out, lse = flash_attn_func(
@@ -243,7 +242,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mha"])
+# @pytest.mark.parametrize("mha_type", ["mqa"])
 @pytest.mark.parametrize("has_learnable_sink", [False, True])
 # @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
@@ -265,7 +264,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
 @pytest.mark.parametrize("d", [128, 192])
-# @pytest.mark.parametrize("d", [128])
+# @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -299,17 +298,17 @@ def test_flash_attn_varlen_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
-    batch_size = 49 if seqlen_q <= 2048 else 2
+    batch_size = 49 if seqlen_q <= 1024 else 7
     nheads = 6
     # batch_size = 1
     # nheads = 1
-    nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
-    # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k and not DISABLE_LOCAL else [0]
+    # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k else [0]
     attention_chunk_vals = [0]
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
         q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
@@ -431,9 +430,8 @@ def test_flash_attn_varlen_output(
         fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
         rtol = 2 if softcap == 0.0 else 3
 
-        # pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
-        # num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
-        pack_gqa_vals = [False]
+        pack_gqa_vals = [False, True, None]
+        # num_splits_vals = [1, 3]
         num_splits_vals = [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             out_unpad, lse = flash_attn_varlen_func(
@@ -453,6 +451,7 @@ def test_flash_attn_varlen_output(
                 # attention_chunk=attention_chunk,
                 learnable_sink=learnable_sink,
                 softcap=softcap,
+                pack_gqa=pack_gqa,
             )
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:

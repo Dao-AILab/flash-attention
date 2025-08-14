@@ -70,6 +70,7 @@ def _flash_attn_fwd(
     m_block_size: int = 128,
     n_block_size: int = 128,
     num_threads: int = 384,
+    pack_gqa: Optional[bool] = None,
     _compute_capability: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
@@ -129,6 +130,8 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
+    if pack_gqa is None:
+        pack_gqa = qhead_per_kvhead > 1
 
     out_torch_dtype = q.dtype
     device = q.device
@@ -164,6 +167,10 @@ def _flash_attn_fwd(
     if compute_capability == 9:  # TODO: tune block size according to hdim
         if not causal and not local:
             n_block_size = 192
+    if compute_capability == 10:
+        # TODO: fix the varlen case
+        if pack_gqa and (128 % qhead_per_kvhead != 0) or (cu_seqlens_q is not None or seqused_q is not None):
+            pack_gqa = False
 
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,
@@ -171,7 +178,7 @@ def _flash_attn_fwd(
         page_table is not None,
         window_size_left is not None, window_size_right is not None,
         learnable_sink is not None,
-        m_block_size, n_block_size, num_threads,
+        m_block_size, n_block_size, num_threads, pack_gqa,
         compute_capability,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -186,7 +193,7 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
-                pack_gqa=False,
+                pack_gqa=pack_gqa,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
                 # num_stages=1,
@@ -199,9 +206,10 @@ def _flash_attn_fwd(
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
+                qhead_per_kvhead=qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
-                qhead_per_kvhead=qhead_per_kvhead,
+                pack_gqa=pack_gqa,
                 is_persistent=not causal and not local and cu_seqlens_q is None and seqused_q is None,
             )
         else:
@@ -422,6 +430,7 @@ class FlashAttnFunc(torch.autograd.Function):
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
+        pack_gqa: Optional[bool] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -433,6 +442,7 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             learnable_sink=learnable_sink,
             softcap=softcap,
+            pack_gqa=pack_gqa,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -476,6 +486,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
+        pack_gqa: Optional[bool] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -492,6 +503,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             learnable_sink=learnable_sink,
             softcap=softcap,
+            pack_gqa=pack_gqa,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
@@ -517,6 +529,7 @@ def flash_attn_func(
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
+    pack_gqa: Optional[bool] = None,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -527,6 +540,7 @@ def flash_attn_func(
         window_size,
         learnable_sink,
         softcap,
+        pack_gqa,
     )
 
 
@@ -544,6 +558,7 @@ def flash_attn_varlen_func(
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
+    pack_gqa: Optional[bool] = None,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -559,4 +574,5 @@ def flash_attn_varlen_func(
         window_size,
         learnable_sink,
         softcap,
+        pack_gqa,
     )

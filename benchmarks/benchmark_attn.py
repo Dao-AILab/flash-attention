@@ -228,6 +228,7 @@ verbose = True
 varlen = False
 has_backward = False
 page_size = None
+# page_size = 128
 softcap = 0.0
 V_colmajor = False
 deterministic = False
@@ -257,15 +258,16 @@ time_b = {}
 # for headdim in [64, 128, 256]:
 # for headdim in [64, 96, 128, 192, 256]:
 for headdim in [128]:
-    nheads = dim // headdim
+    # nheads = dim // headdim
+    nheads = 32 if headdim <= 64 else 16 if headdim <= 192 else 8
     # nheads = 128
     # headdim = 64
     # batch_size = 64
     # seqlen = 512
     # nheads = 8
     # headdim = 128
-    nheads_kv = nheads
-    # nheads_kv = nheads // 4
+    # nheads_kv = nheads
+    nheads_kv = nheads // 8
     # nheads_kv = 1
     # headdim_v = headdim
     headdim_v = 128 if headdim == 192 else headdim
@@ -302,7 +304,7 @@ for headdim in [128]:
         if varlen:
             q_unpad, k_unpad, v_unpad = [rearrange(x.detach(), "b s h d -> (b s) h d").requires_grad_(has_backward) for x in [q, k, v]]
             cu_seqlens_q = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen_q
-            cu_seqlens_k = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen
+            cu_seqlens_k = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen if page_size is None else None
             # cu_seqlens_q = torch.tensor([0, 248, 249, 250, 251, 252, 253, 254, 255, 256], device=device, dtype=torch.int32)
             # q_unpad = q_unpad[:256]
             # seqlen_q = 256
@@ -369,9 +371,9 @@ for headdim in [128]:
                 time_f[(causal, headdim, batch_size, seqlen), "Flash3"] = m1.mean
             if flash_attn_func_python is not None:
                 if not varlen:
-                    m1_py = time_fwd(flash_attn_func_python, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, causal=causal, window_size=window_size, learnable_sink=sinks, softcap=softcap, repeats=repeats, verbose=verbose, desc='Fav3 python')
+                    m1_py = time_fwd(flash_attn_func_python, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, causal=causal, window_size=window_size, learnable_sink=sinks, softcap=softcap, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3 python')
                 else:
-                    m1_py = time_fwd(flash_attn_varlen_func_python, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, causal=causal, window_size=window_size, softcap=softcap, repeats=repeats, verbose=verbose, desc='Fav3 python')
+                    m1_py = time_fwd(flash_attn_varlen_func_python, q_unpad, k_unpad if page_size is None else k_paged, v_unpad if page_size is None else v_paged, cu_seqlens_q, cu_seqlens_k, page_table=page_table, causal=causal, window_size=window_size, softcap=softcap, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3 python')
             if dtype != torch.float8_e4m3fn and headdim == headdim_v and flash_attn_func_v3 is not None and has_backward:
                 time.sleep(1)
                 if not varlen:

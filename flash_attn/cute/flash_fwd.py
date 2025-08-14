@@ -296,7 +296,7 @@ class FlashAttentionForwardBase:
         cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
 
         cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_v_padded))
-        pack_gqa = PackGQA(self.m_block_size, self.head_dim_padded, self.check_hdim_oob, self.qhead_per_kvhead)
+        pack_gqa = PackGQA(self.m_block_size, self.head_dim_v_padded, self.check_hdim_v_oob, self.qhead_per_kvhead)
 
         # Write LSE from rmem -> gmem
         if const_expr(mLSE is not None):
