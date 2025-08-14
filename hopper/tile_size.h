@@ -6,6 +6,11 @@
 
 #include <tuple>
 
+template<int SparseBlockQ, int SparseBlockK>
+constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90_blocksparse() {
+    return {SparseBlockQ, SparseBlockK, true, true};
+}
+
 // Return {kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap}
 constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         int headdim, int headdim_v, bool is_causal, bool is_local, int element_size=2,
