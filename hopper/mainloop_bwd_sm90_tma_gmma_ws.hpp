@@ -264,7 +264,9 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr bool dQacc_use_TMA = kHeadDim < 256;
     // For hdim256, we want to slice the dQ MMA (64 x 256 on 2 WGs) into two (64 x 128 on 2 WGs) so that we can
     // do atomic add on one half before doing the other half of the MMA, to reduce register pressure.
-    static constexpr bool Slice_dQKV_Mma = kHeadDim == 256 && !dQacc_use_TMA && dQ_swapAB && AtomLayoutMdQ == 1 && NumMmaWarpGroups == 2;
+    static constexpr bool Slice_dQKV_Mma =
+        (kHeadDim == 256 && !dQacc_use_TMA && dQ_swapAB && AtomLayoutMdQ == 1 &&
+         NumMmaWarpGroups == 2 && !Deterministic);
     static_assert(!(Deterministic && Slice_dQKV_Mma), "Deterministic mode not supported with Slice_dQKV_Mma");
 
     static constexpr size_t SmemAlignmentP = cutlass::detail::alignment_for_swizzle(SmemLayoutPdS{});
@@ -607,7 +609,7 @@ struct CollectiveMainloopBwdSm90 {
             seqlen_info, n_block, bidb, params.window_size_left,
             params.window_size_right, 0 /*sink_token_length*/);
         // It's possible to have m_block_max <= m_block_min. Exit early
-        if constexpr (Is_causal || Is_local || Varlen) {
+        if constexpr ((Is_causal || Is_local || Varlen) && !Deterministic) {
             if (m_block_max <= m_block_min) { return; }
         }
 
