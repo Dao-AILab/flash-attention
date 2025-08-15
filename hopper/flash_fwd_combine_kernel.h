@@ -292,7 +292,6 @@ public:
 
             switch (choose_scheduling_algo(args)) {
             case SchedulingAlgo::STANDARD: {
-                unsigned int num_blocks_k = cute::ceil_div(args.dv, kBlockK);
                 unsigned int num_blocks_m = cute::ceil_div(args.seqlen_q * args.num_heads, kBlockM);
                 return {num_blocks_m, num_blocks_k, static_cast<unsigned int>(args.b)};
             }
@@ -426,15 +425,13 @@ public:
             *params.semaphore_to_reset = 0;
         }
 
+        if (batch >= params.b) { return; }
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
         int const offset = seqlen_info.offset;
         int const seqlen = seqlen_info.seqlen;
         int max_idx = seqlen * get<2>(params.shape_LSE_partial);
 
-        bool block_coord_valid = 
-            block_coord.block_m < cute::ceil_div(max_idx, Int<kBlockM>{}) &&
-            block_coord.bidb < params.b;
-        if (!block_coord_valid) { return; }
+        if (m_block >= cute::ceil_div(max_idx, Int<kBlockM>{})) { return; }
 
         int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[batch] : get<1>(params.shape_LSE_partial);
         if (num_splits <= 1) { return; }
