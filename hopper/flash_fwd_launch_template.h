@@ -58,7 +58,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
     static constexpr int NumProducerThreads = Arch >= 90 ? CollectiveMainloop::NumProducerThreads : CollectiveMainloop::NumMmaThreads;
     using SchedulerPersistent = std::conditional_t<Varlen,
-        flash::VarlenDynamicPersistentTileScheduler<kBlockM, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/>,
+        flash::VarlenDynamicPersistentTileScheduler<kBlockM, kBlockN, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/, Is_causal /*LPT*/>,
         std::conditional_t<!Is_causal && !Is_local,
             flash::StaticPersistentTileScheduler<Split>,
             flash::DynamicPersistentTileScheduler<CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/>
@@ -149,11 +149,12 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         num_blocks_m, !PackGQA ? params.h : params.h_k, params.b, params.num_splits,
         params.h / params.h_k,
         params.seqlen_q,
-        params.seqlen_k, params.d, params.dv, sizeof(Element),
+        params.seqlen_k, params.d, params.dv, sizeof(Element), 
         params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q,
         params.num_splits_dynamic_ptr,
         params.num_m_blocks_ptr,
-        params.varlen_batch_idx_ptr
+        params.varlen_batch_idx_ptr,
+        params.num_nheads_in_l2_ptr
     };
 
     if (Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation) {

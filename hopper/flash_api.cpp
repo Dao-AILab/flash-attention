@@ -609,7 +609,7 @@ mha_fwd_get_scheduler_metadata(
     params.varlen_sort_batches = sort_batches;
     if (scheduler_needs_semaphore || use_dynamic_split) {   
         int b_rounded = round_multiple(params.b, 4); // for 16 byte alignment of pointers 
-        int num_prepare_batch_vectors = use_dynamic_split ? 1 : 0;
+        int num_prepare_batch_vectors = use_dynamic_split ? 2 : 0;
         if(sort_batches) { num_prepare_batch_vectors += 2; }
         int tile_count_semaphore_offset = b_rounded * num_prepare_batch_vectors;
         // printf("(Metadata) num prepare batch vectors = %d.\n", num_prepare_batch_vectors);
@@ -618,8 +618,10 @@ mha_fwd_get_scheduler_metadata(
             opts.dtype(torch::kInt32));
         // {num_splits_dynamic, num_m_blocks, virtual_batch_indices, tile_count_semaphore}
         params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() : nullptr;
-        params.num_m_blocks_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
-        params.varlen_batch_idx_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 2 : nullptr;
+        // params.num_n_blocks_ptr =  use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
+        params.num_nheads_in_l2_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
+        params.num_m_blocks_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 2 : nullptr;
+        params.varlen_batch_idx_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 3 : nullptr;
         if (scheduler_needs_semaphore) {
             if (!use_dynamic_split) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
             params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>() + tile_count_semaphore_offset;
@@ -973,7 +975,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     params.varlen_sort_batches = sort_batches;
     if (scheduler_needs_semaphore || use_dynamic_split) {
         int b_rounded = round_multiple(params.b, 4); // for 16 byte alignment of pointers
-        int num_prepare_batch_vectors = use_dynamic_split ? 1 : 0;
+        int num_prepare_batch_vectors = use_dynamic_split ? 2 : 0;
         if(sort_batches) { num_prepare_batch_vectors += 2; }
         int tile_count_semaphore_offset = b_rounded * num_prepare_batch_vectors;
         int metadata_size = int(scheduler_needs_semaphore) + tile_count_semaphore_offset;
@@ -994,8 +996,10 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         }
         // {num_splits_dynamic, num_m_blocks, virtual_batch_indices, tile_count_semaphore}
         params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() : nullptr;
-        params.num_m_blocks_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
-        params.varlen_batch_idx_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 2 : nullptr;
+        // params.num_n_blocks_ptr =  use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
+        params.num_nheads_in_l2_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
+        params.num_m_blocks_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 2 : nullptr;
+        params.varlen_batch_idx_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 3 : nullptr;
         params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() + tile_count_semaphore_offset : nullptr;
         params.tile_count_semaphore_offset = tile_count_semaphore_offset; // might need to zero out semaphore later
     }
