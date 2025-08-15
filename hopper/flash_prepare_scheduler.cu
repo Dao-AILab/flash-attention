@@ -57,7 +57,11 @@ __global__ void prepare_varlen_num_blocks_kernel(
         int* const num_m_blocks_ptr, // virtual_batch_idx -> num_m_blocks[batch_idx]
         int* const num_splits_dynamic_ptr,
         int* const varlen_batch_idx_ptr,
-        bool enable_pdl) {
+        // int* const num_n_blocks_ptr,
+        int* const num_nheads_in_l2_ptr,
+        bool enable_pdl,
+        bool packgqa,
+        int max_kvblocks_in_l2) {
 
     static constexpr int kNumBatchPerWarp = cutlass::NumThreadsPerWarp - 1;
     static constexpr int kSmemSize = 1;
@@ -93,7 +97,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
         } else {
             seqlen = seqlen_q_static;
         }
-        seqlen *= qhead_per_khead;
+        if(packgqa) { seqlen *= qhead_per_khead; }
         return batch_idx < num_batch && lane < kNumBatchPerWarp
             ? blockm_divmod.div(seqlen + blockm_divmod.divisor - 1) : 0;
     };
@@ -142,11 +146,20 @@ __global__ void prepare_varlen_num_blocks_kernel(
     int blocks_per_sm = static_cast<int>(ceilf(float(total_blocks) * 1.1f * float(num_head) / float(num_sm)));
     // blocks_per_sm = std::max(1, blocks_per_sm);  // 1 is the minimum number of blocks per SM
     int num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
+    // num_n_blocks per work tile for the batch
+    num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic); 
+
+    auto get_nheads_in_l2 = [&](int n_blocks) {
+        int nheads_in_l2 = n_blocks * 16 <= max_kvblocks_in_l2 ? 16
+            : n_blocks * 8 <= max_kvblocks_in_l2 ? 8
+            : n_blocks * 4 <= max_kvblocks_in_l2 ? 4
+            : n_blocks * 2 <= max_kvblocks_in_l2 ? 2
+            : 1;
+        if(!packgqa) { nheads_in_l2 *= qhead_per_khead; }
+        return min(nheads_in_l2, num_head);
+    };
 
     if constexpr(Sort) {
-        // num_n_blocks per work tile for the batch
-        num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic); 
-        
         if(lane == kNumBatchPerWarp || batch_idx >= num_batch) {
             num_n_blocks = -1; // sort last
         }
@@ -164,15 +177,19 @@ __global__ void prepare_varlen_num_blocks_kernel(
         // if (threadIdx.x == 0) {
         //     printf("Sorted: num_n_blocks = %d, num_splits = %d, num_m_blocks = %d, batch_idx = %d.\n", 
         //         batch_coords[0].x, batch_coords[0].y, batch_coords[0].z, batch_coords[0].w);
-        // } __syncthreads();
+        // } __syncthreads();        
 
         if (threadIdx.x < num_batch) {
+            // num_n_blocks_ptr[threadIdx.x] = max(batch_coords[0].x, 1);
+            num_nheads_in_l2_ptr[threadIdx.x] = get_nheads_in_l2(max(batch_coords[0].x, 1));
             num_splits_dynamic_ptr[threadIdx.x] = batch_coords[0].y;
             num_m_blocks_ptr[threadIdx.x] = batch_coords[0].z;
             varlen_batch_idx_ptr[threadIdx.x] = batch_coords[0].w;
         }
     } else {
         if (batch_idx < num_batch && lane < kNumBatchPerWarp) {
+            // num_n_blocks_ptr[batch_idx] = max(num_n_blocks, 1);
+            num_nheads_in_l2_ptr[batch_idx] = get_nheads_in_l2(max(num_n_blocks, 1));
             num_splits_dynamic_ptr[batch_idx] = num_splits_dynamic;
             // printf("idx = %d, num_m_blocks = %d, num_n_blocks = %d, num_split_static = %d, num_splits_dynamic = %d\n", bidb_start + lane, num_m_blocks_ptr[bidb_start + lane], num_n_blocks, num_splits_static, num_splits_dynamic);
         }
@@ -184,8 +201,13 @@ __global__ void prepare_varlen_num_blocks_kernel(
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa,
                                int blockM, int blockN, bool enable_pdl, bool sort_batches) {
     // Only support batch <= 992 (32 warps, each with 31 batches)
-    int qhead_per_khead = !packgqa ? 1 : cutlass::ceil_div(params.h, params.h_k);
+    // int qhead_per_khead = !packgqa ? 1 : cutlass::ceil_div(params.h, params.h_k);
+    int qhead_per_khead = cutlass::ceil_div(params.h, params.h_k);
     int num_warps = cutlass::ceil_div(params.b, 31);
+    int const size_l2 = 50 * 1024 * 1024; // 50 MB
+    int const element_size = params.is_e4m3 ? 1 : 2;
+    int const size_one_kvblock = blockN * (params.d + params.dv) * element_size;
+    int const max_kvblocks_in_l2 = size_l2 / size_one_kvblock;
     BOOL_SWITCH(sort_batches, Sort, [&] {
         NUM_WARP_SWITCH(num_warps, NumWarps, [&] {
             flash::prepare_varlen_num_blocks_kernel<NumWarps, Sort><<<1 /*grid*/, 32 * NumWarps /*block*/, 0, stream>>>(
@@ -198,7 +220,11 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
                 params.num_m_blocks_ptr,
                 params.num_splits_dynamic_ptr,
                 params.varlen_batch_idx_ptr,
-                enable_pdl);
+                // params.num_n_blocks_ptr,
+                params.num_nheads_in_l2_ptr,
+                enable_pdl,
+                packgqa,
+                max_kvblocks_in_l2);
         });
     });
 }
