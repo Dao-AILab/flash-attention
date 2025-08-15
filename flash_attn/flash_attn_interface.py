@@ -133,7 +133,7 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, p, rng_state
 
 
-if torch.__version__ >= "2.4.0":
+if torch.__version__ >= "12.4.0":
     _wrapped_flash_attn_forward = torch.ops.flash_attn._flash_attn_forward
 else:
     _wrapped_flash_attn_forward = _flash_attn_forward
@@ -888,6 +888,188 @@ class FlashAttnFunc(torch.autograd.Function):
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None
+    
+@_torch_custom_op_wrapper("flash_attn::_flash_attn_sink_forward", mutates_args=(), device_types="cuda")
+def _flash_attn_sink_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sink: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    alibi_slopes: Optional[torch.Tensor],
+    return_softmax: bool
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    q, k, v, sink = [maybe_contiguous(x) for x in (q, k, v, sink)]
+    out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.sink_fwd(
+        q,
+        k,
+        v,
+        sink,
+        None,
+        alibi_slopes,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        return_softmax,
+        None,
+    )
+    return out, softmax_lse, S_dmask, rng_state
+
+@_torch_custom_op_wrapper("flash_attn::_flash_attn_sink_backward", mutates_args=("dq", "dk", "dv", "dsink"), device_types="cuda")
+def _flash_attn_sink_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sink: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: Optional[torch.Tensor],
+    dk: Optional[torch.Tensor],
+    dv: Optional[torch.Tensor],
+    dsink: Optional[torch.Tensor],
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    alibi_slopes: Optional[torch.Tensor],
+    deterministic: bool,
+    rng_state: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    # dq, dk, dv are allocated by us so they should already be contiguous
+    dout, q, k, v, sink, out = [maybe_contiguous(x) for x in (dout, q, k, v, sink, out)]
+    (
+        dq,
+        dk,
+        dv,
+        dsink,
+        softmax_d,
+    ) = flash_attn_gpu.sink_bwd(
+        dout,
+        q,
+        k,
+        v,
+        sink,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        dsink,
+        alibi_slopes,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        deterministic,
+        None,
+        rng_state,
+    )
+    return softmax_d
+
+_wrapped_flash_attn_sink_forward = _flash_attn_sink_forward
+_wrapped_flash_attn_sink_backward = _flash_attn_sink_backward
+
+class FlashAttnSinkFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        sink,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_softmax,
+        is_grad_enabled,
+    ):
+        is_grad = is_grad_enabled and any(
+            x.requires_grad for x in [q, k, v]
+        )
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        head_size_og = q.size(3)
+        if head_size_og % 8 != 0:
+            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
+            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
+            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_sink_forward(
+            q,
+            k,
+            v,
+            sink,
+            dropout_p,
+            softmax_scale,
+            causal=causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            return_softmax=return_softmax and dropout_p > 0,
+        )
+        if is_grad:
+            ctx.save_for_backward(q, k, v, sink, out_padded, softmax_lse, rng_state)
+            ctx.dropout_p = dropout_p
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.softcap = softcap
+            ctx.alibi_slopes = alibi_slopes
+            ctx.deterministic = deterministic
+        out = out_padded[..., :head_size_og]
+        return out if not return_softmax else (out, softmax_lse, S_dmask)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, sink, out, softmax_lse, rng_state = ctx.saved_tensors
+        dq, dk, dv, dsink = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v), torch.empty_like(sink)
+        head_size_og = dout.size(3)
+        dout_padded = dout
+        if head_size_og % 8 != 0:
+            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
+        _wrapped_flash_attn_sink_backward(
+            dout_padded,
+            q,
+            k,
+            v,
+            sink,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            dsink,
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.window_size[0],
+            ctx.window_size[1],
+            ctx.softcap,
+            ctx.alibi_slopes,
+            ctx.deterministic,
+            rng_state=rng_state,
+        )
+        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
+        dk = dk[..., : dout.shape[-1]]
+        dv = dv[..., : dout.shape[-1]]
+        return dq, dk, dv, dsink, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -1197,6 +1379,37 @@ def flash_attn_func(
         q,
         k,
         v,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
+        torch.is_grad_enabled(),
+    )
+
+
+def flash_attn_sink_func(
+    q,
+    k,
+    v,
+    sink,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0, # 0.0 means deactivated
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+):
+    return FlashAttnSinkFunc.apply(
+        q,
+        k,
+        v,
+        sink,
         dropout_p,
         softmax_scale,
         causal,
