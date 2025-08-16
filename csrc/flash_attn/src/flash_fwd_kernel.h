@@ -51,12 +51,15 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
+    constexpr bool Has_sink = true;
+
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
 
     // Shared memory.
     extern __shared__ char smem_[];
+    __shared__ float shared_sink_val;
 
     // The thread index.
     const int tidx = threadIdx.x;
@@ -127,6 +130,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         return;
     }
     // if (tidx == 0) { printf("m_block = %d, n_block_min = %d, n_block_max = %d\n", m_block, n_block_min, n_block_max); }
+
+    if (Has_sink) {
+        shared_sink_val = (params.sink_ptr != nullptr) ? static_cast<float>(reinterpret_cast<Element*>(params.sink_ptr)[bidh]) : -INFINITY;
+    }
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
@@ -282,7 +289,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     clear(acc_o);
 
-    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
+    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax(shared_sink_val);
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
@@ -340,7 +347,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
         masking_step == 0
-            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
+            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local, Has_sink>(acc_s, acc_o, params.scale_softmax_log2)
             : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
         // Convert acc_s from fp32 to fp16/bf16
@@ -430,7 +437,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // Epilogue
 
-    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
+    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout, /*Split=*/false, Has_sink>(acc_o, params.scale_softmax, params.rp_dropout);
 
     // Convert acc_o from fp32 to fp16/bf16
     Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
