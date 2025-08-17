@@ -166,7 +166,7 @@ def _flash_attn_fwd(
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if compute_capability == 9:  # TODO: tune block size according to hdim
-        if not causal and not local:
+        if head_dim == head_dim_v == 128 and not causal and not local:
             n_block_size = 192
     if compute_capability == 10:
         # TODO: fix the varlen case
