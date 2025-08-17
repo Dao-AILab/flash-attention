@@ -48,10 +48,8 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
 }
 
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool Has_sink, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
-
-    constexpr bool Has_sink = true;
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -131,8 +129,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
     // if (tidx == 0) { printf("m_block = %d, n_block_min = %d, n_block_max = %d\n", m_block, n_block_min, n_block_max); }
 
-    if (Has_sink) {
-        shared_sink_val = (params.sink_ptr != nullptr) ? static_cast<float>(reinterpret_cast<ElementAccum*>(params.sink_ptr)[bidh]) : -INFINITY;
+    if constexpr (Has_sink) {
+        if (tidx == 0) { shared_sink_val = static_cast<float>(reinterpret_cast<ElementAccum*>(params.sink_ptr)[bidh]); }
     }
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
@@ -1079,7 +1077,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool Has_sink, typename Params>
 inline __device__ void compute_attn(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1095,7 +1093,7 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
+    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, Has_sink>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

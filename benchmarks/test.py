@@ -105,6 +105,7 @@ if __name__ == "__main__":
     print(eager_output[0, 0, :5, :5])
     print("\nFlash output sample (first 5x5 elements):")
     print(flash_output[0, 0, :5, :5])
+    print("eager_output / flash_output:\n", eager_output[0, 0, :8, :8] / flash_output[0, 0, :8, :8])
 
     # Test backward pass
     print("\n" + "=" * 50)

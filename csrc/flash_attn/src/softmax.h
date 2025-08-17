@@ -146,7 +146,7 @@ struct Softmax {
         Tensor scores = make_tensor(acc_s.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
         if (Is_first) {
-            if (Has_sink) {
+            if constexpr (Has_sink) {
                 #pragma unroll
                 for (int mi = 0; mi < size(row_max); ++mi) { row_max(mi) = sink_val; }
                 FLASH_NAMESPACE::template reduce_max</*zero_init=*/false>(scores, row_max);

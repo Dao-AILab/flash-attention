@@ -27,13 +27,6 @@ if __name__ == "__main__":
         device="cuda",
         requires_grad=True,
     )
-    # with torch.no_grad():
-    #     for h in range(len(key[0])):
-    #         for s in range(len(key[0][h])):
-    #             for d in range(len(key[0][h][s])):
-    #                 key[0][h][s][d] = s * 0.1
-    print("key = ", key)
-    # exit()
     value = torch.randn(
         (batch, num_key_value_heads, seq_len, head_dim),
         dtype=torch.bfloat16,
@@ -46,15 +39,6 @@ if __name__ == "__main__":
         device="cuda",
         requires_grad=True,
     )
-    # sink = torch.full(
-    #     (num_attention_heads,),
-    #     0.5,
-    #     dtype=torch.bfloat16,
-    #     device="cuda",
-    #     requires_grad=True,
-    # )
-    # sink = torch.linspace(0, 1, num_attention_heads, dtype=torch.bfloat16, device="cuda", requires_grad=True)
-    print("sink = ", sink)
 
     # Create causal attention mask
     # The mask should be of shape (batch, num_heads, seq_len, seq_len)
@@ -122,15 +106,6 @@ if __name__ == "__main__":
     print("\nFlash output sample (first 8x8 elements):")
     print(flash_output[0, 0, :8, :8])
     print("eager_output / flash_output:\n", eager_output[0, 0, :8, :8] / flash_output[0, 0, :8, :8])
-
-    # print("query[0, 0] = ", query[0, 0].shape, query[0, 0])
-    # print("key[0, 0] = ", key[0, 0].shape, key[0, 0])
-    q_tile = q_flash[0, :, 0, :]
-    k_tile = k_flash[0, :, 0, :]
-    # print("query * key = ", torch.matmul(q_tile, k_tile.transpose(-2, -1)))
-    # print("query * key = ", torch.matmul(q_tile, k_tile.transpose(-2, -1))[0])
-    # print("query1 * key1 = ", torch.matmul(q_flash[0, :, 1, :], k_flash[0, :, 1, :].transpose(-2, -1)))
-    # exit()
 
     # Test backward pass
     print("\n" + "=" * 50)
@@ -259,6 +234,3 @@ if __name__ == "__main__":
             print("  - Some gradients don't match between eager and flash attention")
         if not all_grads_nonzero:
             print("  - Some gradients are zero")
-    
-    print("sink = ", sink.dtype, sink)
-

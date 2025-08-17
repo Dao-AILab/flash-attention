@@ -13,8 +13,8 @@ from flash_attn.utils.benchmark import benchmark_fwd_bwd, benchmark_combined
 
 from flash_attn import flash_attn_qkvpacked_func
 from flash_attn import flash_attn_func
+from flash_attn import flash_attn_sink_func
 from flash_attn_with_sink import flash_attn_with_sink_func
-from flash_attn_with_sink_fused import flash_attn_with_sink_fused_func
 
 try:
     from triton.ops.flash_attention import attention as attention_triton
@@ -132,7 +132,7 @@ for causal in causal_vals:
                 sink = torch.randn((nheads,), dtype=dtype, device=device, requires_grad=True)
                 
                 f, b = time_fwd_bwd(
-                    flash_attn_with_sink_fused_func, q, k, v, sink, softmax_scale=scaling, dropout_p=dropout_p, causal=causal, repeats=repeats, verbose=False
+                    flash_attn_sink_func, q, k, v, sink, softmax_scale=scaling, dropout_p=dropout_p, causal=causal, repeats=repeats, verbose=False
                 )
             except:  # Skip if OOM
                 f, b = float('nan'), float('nan')
