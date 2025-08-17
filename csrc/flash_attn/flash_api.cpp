@@ -1254,12 +1254,12 @@ mha_sink_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x mu
     }
     if (dsink_.has_value()) {
         dsink = dsink_.value();
-        TORCH_CHECK(dsink.dtype() == sink.dtype(), "dsink must have the same dtype as sink");
+        TORCH_CHECK(dsink.dtype() == at::kFloat, "dsink must have the dtype float32");
         CHECK_DEVICE(dsink);
         TORCH_CHECK(dsink.stride(-1) == 1, "dsink must have contiguous last dimension");
         CHECK_SHAPE(dsink, num_heads);
     } else {
-        dsink = torch::empty_like(sink);
+        dsink = torch::empty_like(sink, sink.options().dtype(at::kFloat));
     }
 
     // bool loop = seqlen_k > blocksize_c;

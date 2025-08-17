@@ -79,6 +79,7 @@ make_tiled_copy_C_warpcontiguousN(Copy_Atom<Args...> const& copy_atom,
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
 inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
+    constexpr bool Has_sink = true;
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -86,6 +87,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     // Shared memory.
     extern __shared__ char smem_[];
+    __shared__ float shared_sink_val;
+    float dsink_val = 0.f;
 
     // The thread index.
     const int tidx = threadIdx.x;
@@ -103,6 +106,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
     if (Is_local) {
         m_block_max = std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k + params.window_size_left, kBlockM));
+    }
+
+    if (Has_sink) {
+        shared_sink_val = (params.sink_ptr != nullptr) ? static_cast<float>(reinterpret_cast<ElementAccum*>(params.sink_ptr)[bidh]) : -INFINITY;
     }
 
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
@@ -577,6 +584,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV
         );
 
+        // Has dP acc_dp
+        // Has P scores
+        // Has lse
+ 
         // Reshape acc_dp from (MMA=4, MMA_N, MMA_N) to (row=(2, MMA_N), col=(2, MMA_N))
         Tensor dS = make_tensor(acc_dp.data(), scores.layout());
         auto pointwise_mult = [](float p, float dp, float d) {
@@ -584,12 +595,15 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         };
         #pragma unroll
         for (int mi = 0; mi < size<0>(dS); ++mi) {
+            float dsink_val_temp = 0.f;
             #pragma unroll
             for (int ni = 0; ni < size<1>(dS); ++ni) {
+                dsink_val_temp += dS(mi, ni) * scores(mi, ni);
                 float scaled_ds = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi));
                 if constexpr (Is_softcap) { scaled_ds *= dtanh(mi, ni); }
                 dS(mi, ni) = scaled_ds;
             }
+            dsink_val += dsink_val_temp / expf(lse(mi));
         }
         // if (cute::thread0()) { print(dS); }
 
@@ -789,6 +803,23 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_dKV, tdVrdV, tdVgdV, tdKVcdKV, tdKVpdKV, binfo.actual_seqlen_k - n_block * kBlockN
     );
+
+    if (Has_sink) {
+        dsink_val = warpReduceSum(dsink_val);
+        float* dsink_ptr = reinterpret_cast<float*>(params.dsink_ptr);
+   
+        if (tidx % 32 == 0) {
+            float val = -dsink_val * expf(shared_sink_val);
+            atomicAdd(dsink_ptr + bidh, val);
+            printf("tidx: %d, bidh: %d, dsink_val: %f, shared_sink_val: %f, add_val: %f\n", tidx, bidh, dsink_val, shared_sink_val, val);
+        }
+        // if (tidx % 32 == 0) {
+        //     atomicAdd(reinterpret_cast<ElementAccum*>(params.dsink_ptr) + bidh, static_cast<ElementAccum>(-dsink_val * expf(shared_sink_val)));
+        //     printf("tidx: %d, bidh: %d, dsink_val: %f, shared_sink_val: %f\n", tidx, bidh, dsink_val, shared_sink_val);
+        // }
+        // reinterpret_cast<ElementAccum*>(params.dsink_ptr)[bidh] += static_cast<ElementAccum>(-dsink_val * expf(shared_sink_val));
+        // 
+    }
 
 }
 

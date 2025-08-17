@@ -132,7 +132,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // if (tidx == 0) { printf("m_block = %d, n_block_min = %d, n_block_max = %d\n", m_block, n_block_min, n_block_max); }
 
     if (Has_sink) {
-        shared_sink_val = (params.sink_ptr != nullptr) ? static_cast<float>(reinterpret_cast<Element*>(params.sink_ptr)[bidh]) : -INFINITY;
+        shared_sink_val = (params.sink_ptr != nullptr) ? static_cast<float>(reinterpret_cast<ElementAccum*>(params.sink_ptr)[bidh]) : -INFINITY;
     }
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one

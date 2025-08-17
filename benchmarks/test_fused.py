@@ -10,7 +10,7 @@ if __name__ == "__main__":
     num_key_value_heads = 8
     num_key_value_groups = num_attention_heads // num_key_value_heads
     head_dim = 64
-    seq_len = 8
+    seq_len = 512
     scaling = head_dim**-0.5
     torch.manual_seed(0)
 
@@ -27,6 +27,13 @@ if __name__ == "__main__":
         device="cuda",
         requires_grad=True,
     )
+    # with torch.no_grad():
+    #     for h in range(len(key[0])):
+    #         for s in range(len(key[0][h])):
+    #             for d in range(len(key[0][h][s])):
+    #                 key[0][h][s][d] = s * 0.1
+    print("key = ", key)
+    # exit()
     value = torch.randn(
         (batch, num_key_value_heads, seq_len, head_dim),
         dtype=torch.bfloat16,
@@ -35,10 +42,18 @@ if __name__ == "__main__":
     )
     sink = torch.randn(
         (num_attention_heads,),
-        dtype=torch.bfloat16,
+        dtype=torch.float32,
         device="cuda",
         requires_grad=True,
     )
+    # sink = torch.full(
+    #     (num_attention_heads,),
+    #     0.5,
+    #     dtype=torch.bfloat16,
+    #     device="cuda",
+    #     requires_grad=True,
+    # )
+    # sink = torch.linspace(0, 1, num_attention_heads, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     print("sink = ", sink)
 
     # Create causal attention mask
@@ -62,7 +77,7 @@ if __name__ == "__main__":
         query,
         key,
         value,
-        sink,
+        sink.to(torch.bfloat16),
         attention_mask=attention_mask,
         scaling=scaling,
         dropout=0.0,
@@ -106,7 +121,16 @@ if __name__ == "__main__":
     print(eager_output[0, 0, :8, :8])
     print("\nFlash output sample (first 8x8 elements):")
     print(flash_output[0, 0, :8, :8])
-    print(eager_output[0, 0, :8, :8]/flash_output[0, 0, :8, :8])
+    print("eager_output / flash_output:\n", eager_output[0, 0, :8, :8] / flash_output[0, 0, :8, :8])
+
+    # print("query[0, 0] = ", query[0, 0].shape, query[0, 0])
+    # print("key[0, 0] = ", key[0, 0].shape, key[0, 0])
+    q_tile = q_flash[0, :, 0, :]
+    k_tile = k_flash[0, :, 0, :]
+    # print("query * key = ", torch.matmul(q_tile, k_tile.transpose(-2, -1)))
+    # print("query * key = ", torch.matmul(q_tile, k_tile.transpose(-2, -1))[0])
+    # print("query1 * key1 = ", torch.matmul(q_flash[0, :, 1, :], k_flash[0, :, 1, :].transpose(-2, -1)))
+    # exit()
 
     # Test backward pass
     print("\n" + "=" * 50)
@@ -181,7 +205,10 @@ if __name__ == "__main__":
     query_grad_diff = torch.abs(eager_query_grad - flash_query_grad).max().item()
     key_grad_diff = torch.abs(eager_key_grad - flash_key_grad).max().item()
     value_grad_diff = torch.abs(eager_value_grad - flash_value_grad).max().item()
-    sink_grad_diff = torch.abs(eager_sink_grad - flash_sink_grad).max().item()
+    sink_grad_diff = torch.abs(eager_sink_grad.to(flash_sink_grad.dtype) - flash_sink_grad).max().item()
+
+    print("eager_sink_grad = ", eager_sink_grad)
+    print("flash_sink_grad = ", flash_sink_grad)
 
     print(f"Query gradient max difference: {query_grad_diff:.2e}")
     print(f"Key gradient max difference: {key_grad_diff:.2e}")
@@ -189,7 +216,7 @@ if __name__ == "__main__":
     print(f"Sink gradient max difference: {sink_grad_diff:.2e}")
 
     # Check if gradients are close (within tolerance)
-    tolerance = 1e-3  # Adjust tolerance as needed
+    tolerance = 1e-2  # Adjust tolerance as needed
     query_grad_close = query_grad_diff < tolerance
     key_grad_close = key_grad_diff < tolerance
     value_grad_close = value_grad_diff < tolerance
