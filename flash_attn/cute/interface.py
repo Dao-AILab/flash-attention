@@ -148,7 +148,7 @@ def _flash_attn_fwd(
         for t in (q, k, v, out)
     ]
     lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1) if lse is not None else None
-    cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor, additive_sink_tensor = [
+    cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor, learnable_sink_tensor = [
         from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None
         for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
     ]
@@ -185,7 +185,6 @@ def _flash_attn_fwd(
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
-            assert learnable_sink is None, "Sm90 doesn't support additive sink"
             # fa_fwd = FlashAttentionForwardSm80(
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,
@@ -220,13 +219,13 @@ def _flash_attn_fwd(
             fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
             cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
             page_table_tensor,
-            softcap, window_size_left, window_size_right, additive_sink_tensor,
+            softcap, window_size_left, window_size_right, learnable_sink_tensor,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
         cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
         page_table_tensor,
-        softcap, window_size_left, window_size_right, additive_sink_tensor,
+        softcap, window_size_left, window_size_right, learnable_sink_tensor,
     )
     return out, lse
 
