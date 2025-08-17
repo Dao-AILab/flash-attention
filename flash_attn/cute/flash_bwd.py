@@ -16,7 +16,7 @@ import cutlass.utils.ampere_helpers as sm80_utils_basic
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.seqlen_info import SeqlenInfo
+from flash_attn.cute.seqlen_info import SeqlenInfoQK
 
 
 class FlashAttentionBackwardSm80:
@@ -631,7 +631,7 @@ class FlashAttentionBackwardSm80:
         gmem_copy_params = SimpleNamespace(
             gmem_thr_copy_dQaccum=gmem_thr_copy_dQaccum, tdQgdQaccum=tdQgdQaccum
         )
-        seqlen = SeqlenInfo(batch_idx, mQ.shape[1], mK.shape[1])
+        seqlen = SeqlenInfoQK(batch_idx, mQ.shape[1], mK.shape[1])
         load_Q_LSE = partial(
             self.load_Q_LSE, gmem_tiled_copy_QK, gmem_tiled_copy_LSE,
             tQgQ, tQsQ, tQcQ, t0QcQ, tQpQ,

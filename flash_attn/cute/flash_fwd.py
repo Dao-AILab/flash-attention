@@ -24,7 +24,7 @@ from flash_attn.cute import hopper_helpers as sm90_utils
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax
-from flash_attn.cute.seqlen_info import SeqlenInfo
+from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute import pipeline
 from flash_attn.cute.pack_gqa import PackGQA
@@ -274,7 +274,7 @@ class FlashAttentionForwardBase:
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         sO: cute.Tensor,
-        seqlen: SeqlenInfo,
+        seqlen: SeqlenInfoQK,
         gmem_tiled_copy_O: cute.TiledCopy,
         tma_atom_O: Optional[cute.CopyAtom],
         tiled_mma: cute.TiledMma,
@@ -655,7 +655,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             window_size_left, window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
-        seqlen = SeqlenInfo(seqlen_q=mQ.shape[0], seqlen_k=mK.shape[0])
+        seqlen = SeqlenInfoQK(seqlen_q=mQ.shape[0], seqlen_k=mK.shape[0])
         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
         # TODO: return early if n_block_max == 0
         # if self.is_causal:
@@ -1343,7 +1343,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         SeqlenInfoCls = partial(
-            SeqlenInfo, seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
+            SeqlenInfoQK, seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
             seqlen_k_static=mK.shape[0],
             mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ, mSeqUsedK=mSeqUsedK,

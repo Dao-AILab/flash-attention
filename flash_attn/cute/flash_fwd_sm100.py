@@ -30,7 +30,7 @@ import flash_attn.cute.utils as utils
 # import flash_attn.cute.pipeline as pipeline
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import SoftmaxSm100
-from flash_attn.cute.seqlen_info import SeqlenInfo
+from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute import mma_sm100_desc as sm100_desc
@@ -674,7 +674,7 @@ class FlashAttentionForwardSm100:
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         SeqlenInfoCls = partial(
-            SeqlenInfo,
+            SeqlenInfoQK,
             seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
             seqlen_k_static=mK.shape[0] if const_expr(mPageTable is None) else mK.shape[0] * mPageTable.shape[1],
             mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK,

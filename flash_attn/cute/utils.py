@@ -219,6 +219,10 @@ def log2f(a: float | Float32, *, loc=None, ip=None) -> Float32:
         )
     )
 
+@dsl_user_op
+def logf(a: float | Float32, *, loc=None, ip=None) -> Float32:
+    return log2f(a, loc=loc, ip=ip) * math.log(2.0)
+
 
 @dsl_user_op
 def fmax(
@@ -349,6 +353,15 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
 
 @dsl_user_op
 def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+    return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def elem_pointer_i64(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+    flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
+    flat_stride = cute.flatten_to_tuple(x.stride)
+    assert len(flat_coord_i64) == len(flat_stride), "Coordinate and stride must have the same length"
+    offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 
@@ -529,3 +542,50 @@ def e2e_asm2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Flo
     out0 = Float32(llvm.extractvalue(T.f32(), out_f32x2, [0], loc=loc, ip=ip))
     out1 = Float32(llvm.extractvalue(T.f32(), out_f32x2, [1], loc=loc, ip=ip))
     return out0, out1
+@dsl_user_op
+def domain_offset_aligned(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    assert isinstance(tensor.iterator, cute.Pointer)
+    # We assume that applying the offset does not change the pointer alignment
+    new_ptr = cute.make_ptr(
+        tensor.element_type,
+        elem_pointer(tensor, coord).toint(),
+        tensor.memspace,
+        assumed_align=tensor.iterator.alignment,
+    )
+    return cute.make_tensor(new_ptr, tensor.layout)
+
+
+@dsl_user_op
+def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
+    flat_stride = cute.flatten_to_tuple(tensor.stride)
+    assert len(flat_coord_i64) == len(
+        flat_stride
+    ), "Coordinate and stride must have the same length"
+    offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
+    assert isinstance(tensor.iterator, cute.Pointer)
+    # HACK: we assume that applying the offset does not change the pointer alignment
+    new_ptr = cute.make_ptr(
+        tensor.element_type,
+        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
+        tensor.memspace,
+        assumed_align=tensor.iterator.max_alignment,
+    )
+    return cute.make_tensor(new_ptr, tensor.layout)
+
+
+@dsl_user_op
+def coord_offset_i64(
+    tensor: cute.Tensor, idx: cute.typing.Int, dim: int, *, loc=None, ip=None
+) -> cute.Tensor:
+    offset = cutlass.Int64(idx) * cute.size(tensor.stride[dim])
+    assert isinstance(tensor.iterator, cute.Pointer)
+    # HACK: we assume that applying the offset does not change the pointer alignment
+    new_ptr = cute.make_ptr(
+        tensor.element_type,
+        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
+        tensor.memspace,
+        assumed_align=tensor.iterator.max_alignment,
+    )
+    new_layout = cute.slice_(tensor.layout, (*[None] * dim, 0, *[None] * (cute.rank(tensor) - dim - 1)))
+    return cute.make_tensor(new_ptr, new_layout)

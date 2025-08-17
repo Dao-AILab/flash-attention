@@ -14,7 +14,7 @@ except ImportError:
 
 from flash_attn.bert_padding import pad_input, unpad_input
 from flash_attn.utils.testing import attention_ref, generate_qkv, generate_random_padding_mask
-from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
+from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func, flash_attn_combine
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
@@ -976,3 +976,63 @@ def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, de
         b=batch_size,
     )[:, :seqlen_k]
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
+
+
+def attention_combine_ref(out_partial, lse_partial):
+    """
+    out_partial: (num_splits, batch_size, seqlen, nheads, d)
+    lse_partial: (num_splits, batch_size, seqlen, nheads)
+    """
+    lse = torch.logsumexp(lse_partial, dim=0)
+    scale = torch.exp(lse_partial - lse)
+    scale = torch.where(torch.isinf(scale) | torch.isnan(scale), torch.zeros_like(scale), scale)
+    out = (scale.unsqueeze(-1) * out_partial).sum(0)
+    return out, lse
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+# @pytest.mark.parametrize("dtype", [torch.float32])
+# @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
+@pytest.mark.parametrize("d", [64, 96, 128, 192, 256, 512])
+# @pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("seqlen", [1, 2, 3, 32, 64, 256, 113, 108, 640, 1024])
+# @pytest.mark.parametrize("seqlen", [12, 32, 64, 256, 112, 108, 640, 1024, 2048, 8192])
+# @pytest.mark.parametrize("seqlen", [15])
+@pytest.mark.parametrize("num_splits", [1, 2, 3, 5, 17, 32, 55, 97, 133])
+# @pytest.mark.parametrize("num_splits", [1, 2, 3, 5, 11])
+# @pytest.mark.parametrize("num_splits", [11])
+def test_flash_attn_combine(num_splits, seqlen, d, dtype):
+    device = "cuda"
+    # set seed
+    torch.random.manual_seed(1)
+    batch_size = 5
+    nheads = 16
+    # batch_size = 1
+    # nheads = 1
+    # Create tensors in the expected format: (num_splits, batch_size, seqlen, nheads, d) and (num_splits, batch_size, seqlen, nheads)
+    out_partial = torch.randn(num_splits * 2, batch_size, nheads, seqlen, d, device=device, dtype=torch.float32).transpose(2, 3)[:num_splits]  # To test non-contiguous tensor
+    lse_partial = torch.randn(num_splits, batch_size, nheads * 2, seqlen, device=device, dtype=torch.float32).transpose(-1, -2)[:, :, :, :nheads]  # To test non-contiguous tensor
+    # To test short-circuiting based on num_splits
+    lse_partial[num_splits // 2:, :batch_size // 3] = -float("inf")
+
+    # Test with LSE returned (default behavior)
+    out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=dtype, return_lse=True)
+    out_ref, lse_ref = attention_combine_ref(out_partial, lse_partial)
+    out_pt = out_ref.to(dtype)
+
+    print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+    print(f"LSE mean diff: {(lse - lse_ref).abs().mean().item()}")
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+    # breakpoint()
+
+    assert torch.allclose(lse, lse_ref, atol=1e-5, rtol=1e-5)
+    multiple = 2
+    assert ((out - out_ref).abs().max().item() <= multiple * (out_pt - out_ref).abs().max().item()) or torch.allclose(out, out_pt, atol=1e-5, rtol=1e-5)
+
+    # Test with LSE not returned
+    out_no_lse, lse_no_lse = flash_attn_combine(out_partial, lse_partial, out_dtype=dtype, return_lse=False)
+    assert lse_no_lse is None, "LSE should be None when return_lse=False"
+    assert torch.allclose(out_no_lse, out, atol=1e-5, rtol=1e-5), "Output should be the same regardless of return_lse"

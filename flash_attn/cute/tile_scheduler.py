@@ -555,7 +555,7 @@ class SingleTileVarlenScheduler:
                 # the seqlen can vary per batch.
                 # TODO: is there any case where num_m_blocks is 0?
                 # TODO: by right we should read the seqlen_kv but we're assuming seqlen_q == seqlen_k here
-                num_n_blocks = num_m_blocks * self.tile_shape_mn[0] // self.tile_shape_mn[1]
+                num_n_blocks = num_m_blocks * self.tile_shape_mn[0] // self.qhead_per_kvhead_packgqa // self.tile_shape_mn[1]
                 # nheads_in_l2 = min(max(self.max_kvblock_in_l2 // num_n_blocks, 1), self.num_head)
                 # Seems faster to have this be a power of 2
                 nheads_in_l2 = 16 if num_n_blocks * 16 <= self.max_kvblock_in_l2 else (8 if num_n_blocks * 8 <= self.max_kvblock_in_l2 else (4 if num_n_blocks * 4 <= self.max_kvblock_in_l2 else (2 if num_n_blocks * 2 <= self.max_kvblock_in_l2 else 1)))
