@@ -34,31 +34,20 @@ def eager_attention_forward(
 ):
     key_states = repeat_kv(key, num_key_value_groups)
     value_states = repeat_kv(value, num_key_value_groups)
-    print("==== sink: ", sink.shape, sink)
-    print("==== query shape: ", query.shape)
-    print("==== key_states shape: ", key_states.shape)
-    print("==== value_states shape: ", value_states.shape)
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    print("==== attn_weights shape: ", attn_weights.shape)
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        print("==== causal_mask shape: ", causal_mask.shape)
         attn_weights = attn_weights + causal_mask
 
     sinks = sink.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
-    print("==== sinks shape: ", sinks.shape)
     combined_logits = torch.cat([attn_weights, sinks], dim=-1)
-    print("==== combined_logits shape: ", combined_logits.shape)
     # This was not in the original implementation and slightly affect results;
     # it prevents overflow in BF16/FP16 when training with bsz>1 we clamp max values.
     combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
     
     probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
-    print("==== probs shape: ", probs.shape)
     scores = probs[..., :-1]  # we drop the sink here
-    print("==== scores shape: ", scores.shape)
     attn_weights = nn.functional.dropout(scores, p=dropout, training=True)
     attn_output = torch.matmul(attn_weights, value_states)
-    print("==== attn_output shape: ", attn_output.shape)
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, attn_weights

@@ -583,10 +583,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV
         );
 
-        // Has dP acc_dp
-        // Has P scores
-        // Has lse
- 
         // Reshape acc_dp from (MMA=4, MMA_N, MMA_N) to (row=(2, MMA_N), col=(2, MMA_N))
         Tensor dS = make_tensor(acc_dp.data(), scores.layout());
         auto pointwise_mult = [](float p, float dp, float d) {
@@ -805,7 +801,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     if constexpr (Has_sink) {
         SumOp<float> sum_op;
-        dsink_val = Allreduce<4>::run(dsink_val, sum_op);
+        dsink_val = Allreduce<32>::run(dsink_val, sum_op);
         if (tidx % 32 == 0) {
             float* dsink_ptr = reinterpret_cast<float*>(params.dsink_ptr);
             float val = -dsink_val * exp2f(shared_sink_val * float(M_LOG2E));

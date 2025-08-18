@@ -53,7 +53,6 @@ class FlashAttentionWithSink(torch.autograd.Function):
             deterministic=deterministic,
             return_attn_probs=True,
         )
-        print("==== lse shape: ", lse.shape)
 
         origin_dtype = out.dtype
 
