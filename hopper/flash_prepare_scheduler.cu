@@ -60,6 +60,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
         // int* const num_n_blocks_ptr,
         int* const num_nheads_in_l2_ptr,
         bool enable_pdl,
+        bool is_causal,
         bool packgqa,
         int max_kvblocks_in_l2) {
 
@@ -161,13 +162,16 @@ __global__ void prepare_varlen_num_blocks_kernel(
 
     if constexpr(Sort) {
         if(lane == kNumBatchPerWarp || batch_idx >= num_batch) {
-            num_n_blocks = -1; // sort last
+            num_n_blocks = INT_MIN; // sort last
+        } else if (is_causal) {
+            // sort by shortest member to process
+            num_n_blocks = num_n_blocks * blockn_divmod.divisor - num_m_blocks * blockm_divmod.divisor;
         }
         int4 batch_coords[ITEMS_PER_THREAD]; // 1 item per thread
-        batch_coords[0] = make_int4(num_n_blocks, num_splits_dynamic, num_m_blocks, batch_idx);
+        batch_coords[0] = make_int4(num_n_blocks, num_m_blocks, num_splits_dynamic, batch_idx);
 
         // if (threadIdx.x == 0) {
-        //     printf("Unsorted: num_n_blocks = %d, num_splits = %d, num_m_blocks = %d, batch_idx = %d.\n", 
+        //     printf("Unsorted: num_n_blocks - num_m_blocks = %d, num_m_blocks = %d, num_splits = %d, batch_idx = %d.\n", 
         //         batch_coords[0].x, batch_coords[0].y, batch_coords[0].z, batch_coords[0].w);
         // } __syncthreads();
 
@@ -175,21 +179,26 @@ __global__ void prepare_varlen_num_blocks_kernel(
         BlockMergeSort(temp_storage).Sort(batch_coords, CustomMore<int4>());
 
         // if (threadIdx.x == 0) {
-        //     printf("Sorted: num_n_blocks = %d, num_splits = %d, num_m_blocks = %d, batch_idx = %d.\n", 
+        //     printf("Sorted: num_n_blocks - num_m_blocks = %d, num_m_blocks = %d, num_splits = %d, batch_idx = %d.\n", 
         //         batch_coords[0].x, batch_coords[0].y, batch_coords[0].z, batch_coords[0].w);
-        // } __syncthreads();        
+        // } __syncthreads();
+
+        if (is_causal) {
+            // reset value to num_n_blocks
+            batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + batch_coords[0].y * blockm_divmod.divisor);
+        }
 
         if (threadIdx.x < num_batch) {
             // num_n_blocks_ptr[threadIdx.x] = max(batch_coords[0].x, 1);
-            num_nheads_in_l2_ptr[threadIdx.x] = get_nheads_in_l2(max(batch_coords[0].x, 1));
-            num_splits_dynamic_ptr[threadIdx.x] = batch_coords[0].y;
-            num_m_blocks_ptr[threadIdx.x] = batch_coords[0].z;
+            if(num_nheads_in_l2_ptr) { num_nheads_in_l2_ptr[threadIdx.x] = get_nheads_in_l2(max(batch_coords[0].x, 1)); }
+            num_m_blocks_ptr[threadIdx.x] = batch_coords[0].y;
+            num_splits_dynamic_ptr[threadIdx.x] = batch_coords[0].z;
             varlen_batch_idx_ptr[threadIdx.x] = batch_coords[0].w;
         }
     } else {
         if (batch_idx < num_batch && lane < kNumBatchPerWarp) {
             // num_n_blocks_ptr[batch_idx] = max(num_n_blocks, 1);
-            num_nheads_in_l2_ptr[batch_idx] = get_nheads_in_l2(max(num_n_blocks, 1));
+            if(num_nheads_in_l2_ptr) { num_nheads_in_l2_ptr[batch_idx] = get_nheads_in_l2(max(num_n_blocks, 1)); }
             num_splits_dynamic_ptr[batch_idx] = num_splits_dynamic;
             // printf("idx = %d, num_m_blocks = %d, num_n_blocks = %d, num_split_static = %d, num_splits_dynamic = %d\n", bidb_start + lane, num_m_blocks_ptr[bidb_start + lane], num_n_blocks, num_splits_static, num_splits_dynamic);
         }
@@ -199,7 +208,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
 } // flash
 
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa,
-                               int blockM, int blockN, bool enable_pdl, bool sort_batches) {
+                               int blockM, int blockN, bool enable_pdl) {
     // Only support batch <= 992 (32 warps, each with 31 batches)
     // int qhead_per_khead = !packgqa ? 1 : cutlass::ceil_div(params.h, params.h_k);
     int qhead_per_khead = cutlass::ceil_div(params.h, params.h_k);
@@ -210,7 +219,7 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
     int const size_one_kvblock = blockN * (params.d + params.dv) * element_size;
     // printf("block size = %d, element size = %d, headdim = %d, headdim_v = %d, size 1 kblock = %d.\n", blockN, element_size, params.d, params.dv, size_one_kvblock);
     int const max_kvblocks_in_l2 = size_l2 / size_one_kvblock;
-    BOOL_SWITCH(sort_batches, Sort, [&] {
+    BOOL_SWITCH(params.varlen_sort_batches, Sort, [&] {
         NUM_WARP_SWITCH(num_warps, NumWarps, [&] {
             flash::prepare_varlen_num_blocks_kernel<NumWarps, Sort><<<1 /*grid*/, 32 * NumWarps /*block*/, 0, stream>>>(
                 params.seqlen_q, params.seqlen_k, params.seqlen_knew,
@@ -225,6 +234,7 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
                 // params.num_n_blocks_ptr,
                 params.num_nheads_in_l2_ptr,
                 enable_pdl,
+                params.is_causal,
                 packgqa,
                 max_kvblocks_in_l2);
         });

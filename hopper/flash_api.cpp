@@ -587,8 +587,8 @@ mha_fwd_get_scheduler_metadata(
     params.page_size = page_size.has_value() ? page_size.value() : 1;
     params.page_table = !page_size.has_value() ? nullptr : reinterpret_cast<int*>(1);
 
-    bool const use_dynamic_split = params.b <= PREPARE_VARLEN_MAX_BATCHES;
-    params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
+    bool const use_prepare_varlen = params.b <= PREPARE_VARLEN_MAX_BATCHES;
+    params.num_splits_dynamic_ptr = !use_prepare_varlen ? nullptr : reinterpret_cast<int*>(1);
 
     params.pagedkv_tma = get_pagedkv_tma(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
@@ -607,23 +607,26 @@ mha_fwd_get_scheduler_metadata(
     bool const scheduler_needs_semaphore = params.arch >= 90 || params.num_splits > 1;
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     params.varlen_sort_batches = sort_batches;
-    if (scheduler_needs_semaphore || use_dynamic_split) {   
+    params.head_swizzle = params.is_causal || params.is_local;
+    if (scheduler_needs_semaphore || use_prepare_varlen) {   
         int b_rounded = round_multiple(params.b, 4); // for 16 byte alignment of pointers 
-        int num_prepare_batch_vectors = use_dynamic_split ? 2 : 0;
-        if(sort_batches) { num_prepare_batch_vectors += 2; }
+        int num_prepare_batch_vectors = use_prepare_varlen ? 1 : 0;
+        if(params.varlen_sort_batches) { num_prepare_batch_vectors += 2; }
+        if(params.head_swizzle) { num_prepare_batch_vectors += 1; }
+        int head_swizzle_offset = b_rounded * (params.varlen_sort_batches ? 3 : 1);
         int tile_count_semaphore_offset = b_rounded * num_prepare_batch_vectors;
         // printf("(Metadata) num prepare batch vectors = %d.\n", num_prepare_batch_vectors);
         tile_count_semaphore = torch::empty(
             {int(scheduler_needs_semaphore) + tile_count_semaphore_offset},
             opts.dtype(torch::kInt32));
-        // {num_splits_dynamic, num_m_blocks, virtual_batch_indices, tile_count_semaphore}
-        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() : nullptr;
-        // params.num_n_blocks_ptr =  use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
-        params.num_nheads_in_l2_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
-        params.num_m_blocks_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 2 : nullptr;
-        params.varlen_batch_idx_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 3 : nullptr;
+        // {num_splits_dynamic, num_m_blocks, varlen_batch_idx, num_nheads_in_l2}
+        params.num_splits_dynamic_ptr = use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() : nullptr;
+        params.num_m_blocks_ptr =  use_prepare_varlen && params.varlen_sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
+        params.varlen_batch_idx_ptr =  use_prepare_varlen && params.varlen_sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 2 : nullptr;
+        // params.num_n_blocks_ptr  = use_prepare_varlen && params.head_swizzle ? tile_count_semaphore.data_ptr<int>() + head_swizzle_offset : nullptr;
+        params.num_nheads_in_l2_ptr = use_prepare_varlen && params.head_swizzle ? tile_count_semaphore.data_ptr<int>() + head_swizzle_offset : nullptr;
         if (scheduler_needs_semaphore) {
-            if (!use_dynamic_split) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
+            if (!use_prepare_varlen) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
             params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>() + tile_count_semaphore_offset;
         } else {
             params.tile_count_semaphore = nullptr;
@@ -636,7 +639,7 @@ mha_fwd_get_scheduler_metadata(
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
         auto stream = at::cuda::getCurrentCUDAStream().stream();
-        prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/, sort_batches);
+        prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
     return tile_count_semaphore;
@@ -958,9 +961,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     }
 
     // 992 = 32 * 31 is the max supported batch in prepare_varlen_num_blocks kernel
-    bool const use_dynamic_split = is_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES;
+    bool const use_prepare_varlen = is_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES;
     // Temporarily set num_splits_dynamic_ptr to 1 since get_num_splits checks it
-    params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
+    params.num_splits_dynamic_ptr = !use_prepare_varlen ? nullptr : reinterpret_cast<int*>(1);
 
     params.pagedkv_tma = get_pagedkv_tma(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
@@ -974,10 +977,13 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
         : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
     params.varlen_sort_batches = sort_batches;
-    if (scheduler_needs_semaphore || use_dynamic_split) {
+    params.head_swizzle = head_swizzle;
+    if (scheduler_needs_semaphore || use_prepare_varlen) {
         int b_rounded = round_multiple(params.b, 4); // for 16 byte alignment of pointers
-        int num_prepare_batch_vectors = use_dynamic_split ? 2 : 0;
-        if(sort_batches) { num_prepare_batch_vectors += 2; }
+        int num_prepare_batch_vectors = use_prepare_varlen ? 1 : 0;
+        if(params.varlen_sort_batches) { num_prepare_batch_vectors += 2; }
+        if(params.head_swizzle) { num_prepare_batch_vectors += 1; }
+        int head_swizzle_offset = b_rounded * (params.varlen_sort_batches ? 3 : 1);
         int tile_count_semaphore_offset = b_rounded * num_prepare_batch_vectors;
         int metadata_size = int(scheduler_needs_semaphore) + tile_count_semaphore_offset;
         // printf("Num prepare batch vectors = %d, metadata_size = %d.\n", num_prepare_batch_vectors, metadata_size);
@@ -992,19 +998,18 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         } else {
             tile_count_semaphore = torch::empty({metadata_size}, opts.dtype(torch::kInt32));
         }
-        if (scheduler_needs_semaphore && !use_dynamic_split) {
+        if (scheduler_needs_semaphore && !use_prepare_varlen) {
             tile_count_semaphore.zero_();  // If varlen we'll manually do the zero-ing
         }
-        // {num_splits_dynamic, num_m_blocks, virtual_batch_indices, tile_count_semaphore}
-        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() : nullptr;
-        // params.num_n_blocks_ptr =  use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
-        params.num_nheads_in_l2_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
-        params.num_m_blocks_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 2 : nullptr;
-        params.varlen_batch_idx_ptr =  use_dynamic_split && sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 3 : nullptr;
+        // {num_splits_dynamic, num_m_blocks, varlen_batch_idx, num_nheads_in_l2}
+        params.num_splits_dynamic_ptr = use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() : nullptr;
+        params.num_m_blocks_ptr =  use_prepare_varlen && params.varlen_sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
+        params.varlen_batch_idx_ptr =  use_prepare_varlen && params.varlen_sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 2 : nullptr;
+        // params.num_n_blocks_ptr  = use_prepare_varlen && params.head_swizzle ? tile_count_semaphore.data_ptr<int>() + head_swizzle_offset : nullptr;
+        params.num_nheads_in_l2_ptr = use_prepare_varlen && params.head_swizzle ? tile_count_semaphore.data_ptr<int>() + head_swizzle_offset : nullptr;
         params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() + tile_count_semaphore_offset : nullptr;
         params.tile_count_semaphore_offset = tile_count_semaphore_offset; // might need to zero out semaphore later
     }
-    params.head_swizzle = head_swizzle;
 
     if (q_v_.has_value()) {
         TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
