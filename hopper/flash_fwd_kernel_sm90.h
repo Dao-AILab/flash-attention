@@ -20,6 +20,8 @@
 #include "utils.h"
 #include "softmax.h"
 
+#include "debug.hpp"
+
 namespace flash {
 
 using namespace cute;
@@ -101,6 +103,7 @@ public:
                 // We want smem_o to line up with the start of smem_v
                 typename CollectiveEpilogue::TensorStorage epilogue;
             };
+            cute::array_aligned<uint32_t, 512> sparse_masks;  // supports up to 1M context with blocksize 64
         } tensors;
         struct PipelineStorage : cute::aligned_struct<16, _1> {
             alignas(16) BarrierQ barrier_Q;
@@ -306,7 +309,9 @@ public:
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
         if (warp_group_idx == 0) {  // Producer
+            #if !defined(DEBUG_PRINT) || !DEBUG_PRINT
             cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+            #endif
 
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
             // might use cp.async to load KV (if PagedKVNonTMA) while AppendKV always uses TMA to load
@@ -330,6 +335,7 @@ public:
                  work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
 
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
+                PRODUCER_DPRINTF0("Producer: work on q_block_idx=%d head_idx=%d batch_idx=%d split_idx=%d 0x%p\n", get<0>(block_coord), get<1>(block_coord), get<2>(block_coord), get<3>(block_coord), params.mainloop.sparse_masks);
                 SeqlenInfo_t seqlen_info{
                     get<2>(block_coord) /*bidb*/,
                     get<0>(params.mainloop.shape_Q),
@@ -358,7 +364,9 @@ public:
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
+            #if !defined(DEBUG_PRINT) || !DEBUG_PRINT
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+            #endif
 
             // Initialize matmul objects.
             TiledMmaPV tiled_mma_pv;
@@ -378,6 +386,8 @@ public:
                  // get_next_work will be called before the epilogue
                  ) {
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
+                CONSUMER_DPRINTF0("Consumer: work on q_block_idx=%d head_idx=%d batch_idx=%d split_idx=%d 0x%p\n", get<0>(block_coord), get<1>(block_coord), get<2>(block_coord), get<3>(block_coord), params.mainloop.sparse_masks);
+
                 int const bidb = get<2>(block_coord);
                 SeqlenInfo_t seqlen_info{
                     bidb,

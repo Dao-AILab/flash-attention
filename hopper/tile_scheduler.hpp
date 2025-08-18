@@ -10,6 +10,8 @@
 #include "named_barrier.hpp"
 #include "utils.h"
 
+#include "debug.hpp"
+
 namespace flash {
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -692,12 +694,14 @@ public:
             if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                 *work_info_smem = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
             }
+            PRODUCER_DPRINTF0("get_next_work workinfo { tile_idx:%d block:%d bidh:%d bidb:%d }\n", work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
             flash::named_barrier_arrive(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1 /*id*/);  // TileCountSmemFull
             return work_info;
         } else {
             flash::named_barrier_sync(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1 /*id*/);  // TileCountSmemFull
             int4 work_info = *work_info_smem;
             flash::named_barrier_arrive(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0 /*id*/);  // TileCountSmemEmpty
+            CONSUMER_DPRINTF0("get_next_work workinfo { tile_idx:%d block:%d bidh:%d bidb:%d }\n", work_info.x, work_info.y, work_info.z, work_info.w);
             return WorkTileInfo{work_info.x, work_info.y, work_info.z, work_info.w};
         }
     }
