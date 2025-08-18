@@ -65,9 +65,9 @@ DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 # DISABLE_BACKWARD = True
 # DISABLE_SPLIT = True
 # DISABLE_PAGEDKV = True
-DISABLE_APPENDKV = True
+# DISABLE_APPENDKV = True
 # DISABLE_LOCAL = True
-DISABLE_SOFTCAP = True
+# DISABLE_SOFTCAP = True
 # DISABLE_PACKGQA = True
 DISABLE_FP16 = True
 # DISABLE_FP8 = True
@@ -419,7 +419,8 @@ if not SKIP_CUDA_BUILD:
     # ptxas 12.8 gives the best perf currently
     # We want to use the nvcc front end from 12.6 however, since if we use nvcc 12.8
     # Cutlass 3.8 will expect the new data types in cuda.h from CTK 12.8, which we don't have.
-    if bare_metal_version != Version("12.8"):
+    if bare_metal_version != Version("12.8") and bare_metal_version != Version("12.9"):
+        print("Bare Metal Version is: ", bare_metal_version)
         download_and_copy(
             name="nvcc",
             src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin",

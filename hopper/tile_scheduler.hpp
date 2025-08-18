@@ -652,17 +652,15 @@ public:
         int mh_block = next_tile_idx - group_start_tile;
         int block, bidh;
         if constexpr (LPT) {
-            // if constexpr(!Split) {
-            if (!Split || num_splits == 1) {
-                // NOTE: code for computing nheads_in_l2 directly left as demonstration
+            if ((!Split || num_splits == 1) && params.num_nheads_in_l2_ptr) {
+                // NOTE: code for computing nheads_in_l2 directly left as reference
                 // int num_n_blocks = params.num_n_blocks_ptr ? params.num_n_blocks_ptr[bidb] : num_m_blocks;
                 // auto find_log2_floor = [&](int n) { return 31 - cutlass::clz(n); };
                 // int nheads_in_l2 = params.max_kvblocks_in_l2 < num_n_blocks
                 //     ? 1 : 1 << find_log2_floor(params.max_kvblocks_in_l2 / num_n_blocks);
                 // if constexpr (!PackGQA) { nheads_in_l2 *= params.qhead_per_khead; }
                 // nheads_in_l2 = min(nheads_in_l2, params.num_head);
-
-                int nheads_in_l2 = params.num_nheads_in_l2_ptr ? params.num_nheads_in_l2_ptr[bidb] : params.num_head;
+                int nheads_in_l2 = params.num_nheads_in_l2_ptr[bidb];
                 int mh_in_l2 = nheads_in_l2 * num_m_blocks;
                 int section_idx = mh_block / mh_in_l2;
                 int l2_mod = mh_block - section_idx * mh_in_l2;
@@ -672,27 +670,26 @@ public:
                 block = l2_mod / nheads_in_this_section;
                 int bidh_residual = l2_mod - block * nheads_in_this_section;
                 bidh = section_idx * nheads_in_l2 + bidh_residual;
-                
                 if constexpr(Split) {
                     // remember to set num_splits = 1 in work tile
                     uint32_t bidh_packed = reinterpret_cast<uint32_t&>(bidh) + (reinterpret_cast<uint32_t&>(num_splits) << 24);
                     bidh = reinterpret_cast<int&>(bidh_packed);
                 }
             } else {
-                // bidh = mh_block / num_m_blocks;
-                // block = mh_block - bidh * num_m_blocks;
+                // NOTE: leave traverse heads first version for reference
+                // block = params.head_divmod.divmod(bidh, mh_block);
                 // if constexpr (Split) {
-                //     int bidh_actual = bidh / num_splits;
-                //     int split_idx = bidh - bidh_actual * num_splits;
-                //     uint32_t bidh_packed = reinterpret_cast<uint32_t&>(bidh_actual) + (reinterpret_cast<uint32_t&>(split_idx) << 16) + (reinterpret_cast<uint32_t&>(num_splits) << 24);
+                //     int split_idx = block / num_m_blocks;
+                //     block = block - split_idx * num_m_blocks;
+                //     uint32_t bidh_packed = reinterpret_cast<uint32_t&>(bidh) + (reinterpret_cast<uint32_t&>(split_idx) << 16) + (reinterpret_cast<uint32_t&>(num_splits) << 24);
                 //     bidh = reinterpret_cast<int&>(bidh_packed);
                 // }
-                // assume enough space in L2 cache if split
-                block = params.head_divmod.divmod(bidh, mh_block);
+                bidh = mh_block / num_m_blocks;
+                block = mh_block - bidh * num_m_blocks;
                 if constexpr (Split) {
-                    int split_idx = block / num_m_blocks;
-                    block = block - split_idx * num_m_blocks;
-                    uint32_t bidh_packed = reinterpret_cast<uint32_t&>(bidh) + (reinterpret_cast<uint32_t&>(split_idx) << 16) + (reinterpret_cast<uint32_t&>(num_splits) << 24);
+                    int bidh_actual = bidh / num_splits;
+                    int split_idx = bidh - bidh_actual * num_splits;
+                    uint32_t bidh_packed = reinterpret_cast<uint32_t&>(bidh_actual) + (reinterpret_cast<uint32_t&>(split_idx) << 16) + (reinterpret_cast<uint32_t&>(num_splits) << 24);
                     bidh = reinterpret_cast<int&>(bidh_packed);
                 }
             }

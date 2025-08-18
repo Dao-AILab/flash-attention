@@ -154,7 +154,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.num_splits_dynamic_ptr,
         params.num_m_blocks_ptr,
         params.varlen_batch_idx_ptr,
-        params.num_nheads_in_l2_ptr
+        params.head_swizzle ? params.num_nheads_in_l2_ptr : nullptr // can toggle for swizzle ablation testing
     };
 
     if (Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation) {

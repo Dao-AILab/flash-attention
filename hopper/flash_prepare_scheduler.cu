@@ -204,9 +204,11 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
     // int qhead_per_khead = !packgqa ? 1 : cutlass::ceil_div(params.h, params.h_k);
     int qhead_per_khead = cutlass::ceil_div(params.h, params.h_k);
     int num_warps = cutlass::ceil_div(params.b, 31);
-    int const size_l2 = 50 * 1024 * 1024; // 50 MB
+    // int const size_l2 = 50 * 1024 * 1024; // 50 MB
+    int const size_l2 = 8 * 1024 * 1024; // underestimate seems better in practice
     int const element_size = params.is_e4m3 ? 1 : 2;
     int const size_one_kvblock = blockN * (params.d + params.dv) * element_size;
+    // printf("block size = %d, element size = %d, headdim = %d, headdim_v = %d, size 1 kblock = %d.\n", blockN, element_size, params.d, params.dv, size_one_kvblock);
     int const max_kvblocks_in_l2 = size_l2 / size_one_kvblock;
     BOOL_SWITCH(sort_batches, Sort, [&] {
         NUM_WARP_SWITCH(num_warps, NumWarps, [&] {

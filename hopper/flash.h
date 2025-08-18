@@ -160,6 +160,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool skip_scheduler_metadata_computation;
     bool varlen_sort_batches;
     int tile_count_semaphore_offset;
+    bool head_swizzle;
 
     int arch;
     int num_sm;

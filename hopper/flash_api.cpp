@@ -686,7 +686,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
         bool sort_batches,
-        int64_t sm_margin
+        int64_t sm_margin,
+        bool head_swizzle
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1003,6 +1004,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() + tile_count_semaphore_offset : nullptr;
         params.tile_count_semaphore_offset = tile_count_semaphore_offset; // might need to zero out semaphore later
     }
+    params.head_swizzle = head_swizzle;
 
     if (q_v_.has_value()) {
         TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
@@ -1682,7 +1684,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
         "bool sort_batches = False,"
-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int sm_margin = 0, bool head_swizzle = False) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"

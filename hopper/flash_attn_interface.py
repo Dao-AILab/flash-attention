@@ -52,6 +52,7 @@ def _flash_attn_forward(
         pack_gqa=None,
         sm_margin=0,
         varlen_sort_batches=False,
+        head_swizzle=False,
     ):
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -100,6 +101,7 @@ def _flash_attn_forward(
         pack_gqa,
         varlen_sort_batches,
         sm_margin,
+        head_swizzle,
     )
     return out, softmax_lse, *rest
 
@@ -366,6 +368,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic=False,
         sm_margin=0,
         varlen_sort_batches=False,
+        head_swizzle=False,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -396,6 +399,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
             varlen_sort_batches=varlen_sort_batches,
+            head_swizzle=head_swizzle,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -441,7 +445,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -605,6 +609,7 @@ def flash_attn_varlen_func(
     deterministic=False,
     sm_margin=0,
     varlen_sort_batches=False,
+    head_swizzle=False,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -628,6 +633,7 @@ def flash_attn_varlen_func(
         deterministic,
         sm_margin,
         varlen_sort_batches,
+        head_swizzle
     )
 
 
@@ -667,6 +673,7 @@ def flash_attn_with_kvcache(
     sm_margin=0,     # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     varlen_sort_batches=False,
+    head_swizzle=False,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -795,6 +802,7 @@ def flash_attn_with_kvcache(
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
         varlen_sort_batches=varlen_sort_batches,
+        head_swizzle=head_swizzle,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
