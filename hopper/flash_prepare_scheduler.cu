@@ -47,7 +47,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
         int num_batch, int num_head, int qhead_per_khead, int num_sm, int num_splits_static,
         cutlass::FastDivmod blockm_divmod, cutlass::FastDivmod blockn_divmod,
         int* const tile_count_semaphore,
-        int* const num_m_blocks_ptr, // virtual_batch_idx -> num_m_blocks[batch_idx]
+        int* const num_m_blocks_ptr,
         int* const num_splits_dynamic_ptr,
         int* const varlen_batch_idx_ptr,
         // int* const num_n_blocks_ptr,
