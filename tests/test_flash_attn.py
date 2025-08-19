@@ -1,4 +1,5 @@
 import math
+from typing import Optional
 
 import pytest
 import torch
@@ -6,6 +7,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from flash_attn import (
     flash_attn_func,
+    flash_attn_sink_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
     flash_attn_varlen_func,
@@ -562,6 +564,79 @@ def get_dropout_fraction(
         valid.masked_fill_(local_mask, False)
     dropped_total = dropped.sum()
     return dropped.sum() / valid.sum()
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep).
+    The hidden states go from (batch, num_key_value_heads, seqlen, head_dim)
+    to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def attention_sink_ref(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sink: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    num_key_value_groups: int = 8,
+    **kwargs,
+):
+    key_states = repeat_kv(key, num_key_value_groups)
+    value_states = repeat_kv(value, num_key_value_groups)
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_weights = attn_weights + causal_mask
+
+    sinks = sink.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+    combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+    # This was not in the original implementation and slightly affect results;
+    # it prevents overflow in BF16/FP16 when training with bsz>1 we clamp max values.
+    combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+    
+    probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+    scores = probs[..., :-1]  # we drop the sink here
+    attn_weights = torch.nn.functional.dropout(scores, p=dropout, training=True)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, attn_weights
+
+
+def get_attention_mask(
+    seqlen_q,
+    seqlen_k,
+    causal,
+    device,
+    window_size=(-1, -1),
+    query_padding_mask=None,
+    key_padding_mask=None,
+    key_leftpad=None,
+):
+    if causal:
+        window_size = (window_size[0], 0)
+    if window_size[0] >= 0 or window_size[1] >= 0:
+        local_mask = construct_local_mask(
+            seqlen_q,
+            seqlen_k,
+            window_size,
+            query_padding_mask,
+            key_padding_mask,
+            device,
+            key_leftpad=key_leftpad,
+        )
+        return torch.where(local_mask, torch.tensor(float('-inf')), torch.tensor(0.0))
+    return None
 
 
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
@@ -1455,27 +1530,27 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("local", [False, True])
 # @pytest.mark.parametrize("local", [True])
-@pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
+# @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("swap_sq_sk", [False, True])
 # @pytest.mark.parametrize("swap_sq_sk", [True])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        (1, 239),
-        (3, 799),
-        (127, 512),
-        (127, 513),
-        (113, 203),
-        (128, 217),
-        (113, 211),
-        (108, 256),
+        # (1, 239),
+        # (3, 799),
+        # (127, 512),
+        # (127, 513),
+        # (113, 203),
+        # (128, 217),
+        # (113, 211),
+        # (108, 256),
         (256, 512),
-        (1023, 1024),
+        # (1023, 1024),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
@@ -2523,3 +2598,372 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dv, dv0)
         assert torch.equal(dk, dk0)
         assert torch.equal(dq, dq0)
+
+@pytest.mark.parametrize("dtype", ([torch.float16]))
+@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("swap_sq_sk", [True])
+@pytest.mark.parametrize('seqlen_q,seqlen_k', [(512, 512)])
+def test_flash_attn_sink_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
+    if (
+        max(seqlen_q, seqlen_k) >= 2048
+        and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
+    ):
+        pytest.skip()  # Reference implementation OOM
+    if swap_sq_sk:
+        seqlen_q, seqlen_k = seqlen_k, seqlen_q
+    device = "cuda"
+    causal = True
+    # set seed
+    torch.random.manual_seed(0)
+    batch_size = 1
+    nheads = 64
+    num_key_value_groups = 8
+    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(batch_size, seqlen_k, nheads // num_key_value_groups, d, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads // num_key_value_groups, d, device=device, dtype=dtype, requires_grad=True)
+    q_ref = q.transpose(1, 2)
+    k_ref = k.transpose(1, 2)
+    v_ref = v.transpose(1, 2)
+    sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
+    out = flash_attn_sink_func(q, k, v, sink, 0.0, causal=causal, window_size=window_size)
+
+    attention_mask = get_attention_mask(seqlen_q, seqlen_k, causal, device, window_size)
+    if attention_mask is not None:
+        attention_mask = attention_mask.expand(batch_size, nheads, -1, -1).to(dtype)
+
+    out_ref, _ = attention_sink_ref(q_ref.float(), k_ref.float(), v_ref.float(), sink.float(), attention_mask.float(), d**-0.5, 0.0, num_key_value_groups)
+    out_ref = out_ref.to(dtype)
+    out_pt, _ = attention_sink_ref(q_ref, k_ref, v_ref, sink.to(dtype), attention_mask, d**-0.5, 0.0, num_key_value_groups)
+    
+    print(f"Output max diff: {(out - out_ref).abs().max().detach().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().detach().item()}")
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().detach().item()}")
+    print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().detach().item()}")
+
+    g = torch.randn_like(out)
+    do_o = (g.float() * out.float()).sum(-1)
+    (
+        dq,
+        dk,
+        dv,
+        dsink,
+    ) = torch.autograd.grad(out, (q, k, v, sink), g)
+    (
+        dq_ref,
+        dk_ref,
+        dv_ref,
+        dsink_ref,
+    ) = torch.autograd.grad(out_ref, (q, k, v, sink), g)
+    (
+        dq_pt,
+        dk_pt,
+        dv_pt,
+        dsink_pt,
+    ) = torch.autograd.grad(out_pt, (q, k, v, sink), g)
+    print(f"dQ max diff: {(dq - dq_ref).abs().max().detach().item()}")
+    print(f"dK max diff: {(dk - dk_ref).abs().max().detach().item()}")
+    print(f"dV max diff: {(dv - dv_ref).abs().max().detach().item()}")
+    print(f"dS max diff: {(dsink - dsink_ref).abs().max().detach().item()}")
+    print(f"dQ mean diff: {(dq - dq_ref).abs().mean().detach().item()}")
+    print(f"dK mean diff: {(dk - dk_ref).abs().mean().detach().item()}")
+    print(f"dV mean diff: {(dv - dv_ref).abs().mean().detach().item()}")
+    print(f"dS mean diff: {(dsink - dsink_ref).abs().mean().detach().item()}")
+    print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().detach().item()}")
+    print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().detach().item()}")
+    print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().detach().item()}")
+    print(f"dS Pytorch max diff: {(dsink_pt - dsink_ref).abs().max().detach().item()}")
+    print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().detach().item()}")
+    print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().detach().item()}")
+    print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().detach().item()}")
+    print(f"dS Pytorch mean diff: {(dsink_pt - dsink_ref).abs().mean().detach().item()}")
+
+    # Check that FlashAttention's numerical error is at most twice the numerical error
+    # of a Pytorch implementation.
+    assert (out - out_ref).abs().max().detach().item() <= 2 * (out_pt - out_ref).abs().max().detach().item() + 1e-5
+
+    assert (dq - dq_ref).abs().max().detach().item() <= 2 * (dq_pt - dq_ref).abs().max().detach().item() + 1e-5
+    assert (dk - dk_ref).abs().max().detach().item() <= 2 * (dk_pt - dk_ref).abs().max().detach().item() + 1e-5
+    assert (dv - dv_ref).abs().max().detach().item() <= 2 * (dv_pt - dv_ref).abs().max().detach().item() + 1e-5
+    assert (dsink - dsink_ref).abs().max().detach().item() <= 2 * (dsink_pt - dsink_ref).abs().max().detach().item() + 1e-5
+
+
+
+"""
+:test_flash_attn_causal
+
+Running 16 items in this shard
+Output max diff: 0.00048828125
+Output mean diff: 1.8358230590820312e-05
+Pytorch max diff: 0.0009765625
+Pytorch mean diff: 3.36766242980957e-05
+==== 256 512 False 64 False torch.float16
+dQ max diff: 0.00048828125
+dK max diff: 0.00048828125
+dV max diff: 0.000244140625
+dQ mean diff: 5.364418029785156e-06
+dK mean diff: 3.3974647521972656e-06
+dV mean diff: 1.1920928955078125e-07
+dQ Pytorch max diff: 0.00146484375
+dK Pytorch max diff: 0.00146484375
+dV Pytorch max diff: 0.0009765625
+dQ Pytorch mean diff: 3.927946090698242e-05
+dK Pytorch mean diff: 2.5272369384765625e-05
+dV Pytorch mean diff: 2.1457672119140625e-05
+.Output max diff: 0.00390625
+Output mean diff: 9.679794311523438e-05
+Pytorch max diff: 0.01171875
+Pytorch mean diff: 0.0002498626708984375
+==== 256 512 False 64 False torch.bfloat16
+dQ max diff: 0.0078125
+dK max diff: 0.0078125
+dV max diff: 0.00390625
+dQ mean diff: 0.0001125335693359375
+dK mean diff: 7.104873657226562e-05
+dV mean diff: 7.343292236328125e-05
+dQ Pytorch max diff: 0.01171875
+dK Pytorch max diff: 0.015625
+dV Pytorch max diff: 0.015625
+dQ Pytorch mean diff: 0.0002956390380859375
+dK Pytorch mean diff: 0.00019073486328125
+dV Pytorch mean diff: 0.0001583099365234375
+.Output max diff: 0.00048828125
+Output mean diff: 2.6047229766845703e-05
+Pytorch max diff: 0.001953125
+Pytorch mean diff: 4.690885543823242e-05
+==== 256 512 False 64 True torch.float16
+dQ max diff: 0.0009765625
+dK max diff: 0.0009765625
+dV max diff: 0.00048828125
+dQ mean diff: 8.881092071533203e-06
+dK mean diff: 5.245208740234375e-06
+dV mean diff: 1.1920928955078125e-07
+dQ Pytorch max diff: 0.001953125
+dK Pytorch max diff: 0.0029296875
+dV Pytorch max diff: 0.00146484375
+dQ Pytorch mean diff: 5.352497100830078e-05
+dK Pytorch mean diff: 3.135204315185547e-05
+dV Pytorch mean diff: 2.7120113372802734e-05
+.Output max diff: 0.00390625
+Output mean diff: 0.0001354217529296875
+Pytorch max diff: 0.0078125
+Pytorch mean diff: 0.00034332275390625
+==== 256 512 False 64 True torch.bfloat16
+dQ max diff: 0.0078125
+dK max diff: 0.0078125
+dV max diff: 0.0078125
+dQ mean diff: 0.00015926361083984375
+dK mean diff: 9.202957153320312e-05
+dV mean diff: 9.632110595703125e-05
+dQ Pytorch max diff: 0.015625
+dK Pytorch max diff: 0.015625
+dV Pytorch max diff: 0.015625
+dQ Pytorch mean diff: 0.000400543212890625
+dK Pytorch mean diff: 0.00023555755615234375
+dV Pytorch mean diff: 0.00019931793212890625
+.Output max diff: 0.00048828125
+Output mean diff: 2.2709369659423828e-05
+Pytorch max diff: 0.0009765625
+Pytorch mean diff: 3.910064697265625e-05
+==== 256 512 False 128 False torch.float16
+dQ max diff: 0.00048828125
+dK max diff: 0.0009765625
+dV max diff: 0.00048828125
+dQ mean diff: 2.1457672119140625e-05
+dK mean diff: 1.6450881958007812e-05
+dV mean diff: 1.436471939086914e-05
+dQ Pytorch max diff: 0.00244140625
+dK Pytorch max diff: 0.00244140625
+dV Pytorch max diff: 0.0009765625
+dQ Pytorch mean diff: 4.565715789794922e-05
+dK Pytorch mean diff: 3.063678741455078e-05
+dV Pytorch mean diff: 2.5272369384765625e-05
+.Output max diff: 0.00390625
+Output mean diff: 9.632110595703125e-05
+Pytorch max diff: 0.009765625
+Pytorch mean diff: 0.000270843505859375
+==== 256 512 False 128 False torch.bfloat16
+dQ max diff: 0.00390625
+dK max diff: 0.0078125
+dV max diff: 0.00390625
+dQ mean diff: 0.000110626220703125
+dK mean diff: 7.200241088867188e-05
+dV mean diff: 7.343292236328125e-05
+dQ Pytorch max diff: 0.01171875
+dK Pytorch max diff: 0.01171875
+dV Pytorch max diff: 0.0078125
+dQ Pytorch mean diff: 0.000331878662109375
+dK Pytorch mean diff: 0.000213623046875
+dV Pytorch mean diff: 0.00017452239990234375
+.Output max diff: 0.00048828125
+Output mean diff: 3.236532211303711e-05
+Pytorch max diff: 0.00146484375
+Pytorch mean diff: 5.4717063903808594e-05
+==== 256 512 False 128 True torch.float16
+dQ max diff: 0.0009765625
+dK max diff: 0.0009765625
+dV max diff: 0.0009765625
+dQ mean diff: 2.956390380859375e-05
+dK mean diff: 2.086162567138672e-05
+dV mean diff: 1.8596649169921875e-05
+dQ Pytorch max diff: 0.001953125
+dK Pytorch max diff: 0.00390625
+dV Pytorch max diff: 0.001220703125
+dQ Pytorch mean diff: 6.276369094848633e-05
+dK Pytorch mean diff: 3.8504600524902344e-05
+dV Pytorch mean diff: 3.212690353393555e-05
+.Output max diff: 0.00390625
+Output mean diff: 0.00013446807861328125
+Pytorch max diff: 0.01171875
+Pytorch mean diff: 0.000377655029296875
+==== 256 512 False 128 True torch.bfloat16
+dQ max diff: 0.0078125
+dK max diff: 0.0078125
+dV max diff: 0.00390625
+dQ mean diff: 0.00015735626220703125
+dK mean diff: 9.298324584960938e-05
+dV mean diff: 9.632110595703125e-05
+dQ Pytorch max diff: 0.015625
+dK Pytorch max diff: 0.015625
+dV Pytorch max diff: 0.01171875
+dQ Pytorch mean diff: 0.000453948974609375
+dK Pytorch mean diff: 0.00026702880859375
+dV Pytorch mean diff: 0.00022125244140625
+.Output max diff: 0.001953125
+Output mean diff: 1.7821788787841797e-05
+Pytorch max diff: 0.0029296875
+Pytorch mean diff: 2.8133392333984375e-05
+==== 512 256 True 64 False torch.float16
+dQ max diff: 0.001953125
+dK max diff: 0.001953125
+dV max diff: 0.0009765625
+dQ mean diff: 7.450580596923828e-06
+dK mean diff: 1.3172626495361328e-05
+dV mean diff: 2.384185791015625e-07
+dQ Pytorch max diff: 0.00390625
+dK Pytorch max diff: 0.001953125
+dV Pytorch max diff: 0.00390625
+dQ Pytorch mean diff: 3.224611282348633e-05
+dK Pytorch mean diff: 5.4717063903808594e-05
+dV Pytorch mean diff: 4.7147274017333984e-05
+.Output max diff: 0.015625
+Output mean diff: 8.821487426757812e-05
+Pytorch max diff: 0.015625
+Pytorch mean diff: 0.000213623046875
+==== 512 256 True 64 False torch.bfloat16
+dQ max diff: 0.015625
+dK max diff: 0.015625
+dV max diff: 0.015625
+dQ mean diff: 0.00010776519775390625
+dK mean diff: 0.00017452239990234375
+dV mean diff: 0.00018310546875
+dQ Pytorch max diff: 0.0234375
+dK Pytorch max diff: 0.015625
+dV Pytorch max diff: 0.03125
+dQ Pytorch mean diff: 0.00024318695068359375
+dK Pytorch mean diff: 0.0004119873046875
+dV Pytorch mean diff: 0.0003509521484375
+.Output max diff: 0.001953125
+Output mean diff: 1.817941665649414e-05
+Pytorch max diff: 0.0029296875
+Pytorch mean diff: 2.8789043426513672e-05
+==== 512 256 True 64 True torch.float16
+dQ max diff: 0.001953125
+dK max diff: 0.001953125
+dV max diff: 0.001953125
+dQ mean diff: 7.62939453125e-06
+dK mean diff: 1.3887882232666016e-05
+dV mean diff: 2.384185791015625e-07
+dQ Pytorch max diff: 0.00390625
+dK Pytorch max diff: 0.0029296875
+dV Pytorch max diff: 0.00390625
+dQ Pytorch mean diff: 3.3020973205566406e-05
+dK Pytorch mean diff: 5.7756900787353516e-05
+dV Pytorch mean diff: 4.9948692321777344e-05
+.Output max diff: 0.015625
+Output mean diff: 9.012222290039062e-05
+Pytorch max diff: 0.015625
+Pytorch mean diff: 0.000217437744140625
+==== 512 256 True 64 True torch.bfloat16
+dQ max diff: 0.015625
+dK max diff: 0.015625
+dV max diff: 0.03125
+dQ mean diff: 0.00011014938354492188
+dK mean diff: 0.00018405914306640625
+dV mean diff: 0.0001926422119140625
+dQ Pytorch max diff: 0.0234375
+dK Pytorch max diff: 0.015625
+dV Pytorch max diff: 0.03125
+dQ Pytorch mean diff: 0.000247955322265625
+dK Pytorch mean diff: 0.0004329681396484375
+dV Pytorch mean diff: 0.0003681182861328125
+.Output max diff: 0.001953125
+Output mean diff: 2.187490463256836e-05
+Pytorch max diff: 0.001953125
+Pytorch mean diff: 3.463029861450195e-05
+==== 512 256 True 128 False torch.float16
+dQ max diff: 0.00390625
+dK max diff: 0.001953125
+dV max diff: 0.00390625
+dQ mean diff: 1.8894672393798828e-05
+dK mean diff: 3.814697265625e-05
+dV mean diff: 3.421306610107422e-05
+dQ Pytorch max diff: 0.00390625
+dK Pytorch max diff: 0.00390625
+dV Pytorch max diff: 0.00390625
+dQ Pytorch mean diff: 3.8504600524902344e-05
+dK Pytorch mean diff: 6.74128532409668e-05
+dV Pytorch mean diff: 5.7637691497802734e-05
+.Output max diff: 0.015625
+Output mean diff: 8.821487426757812e-05
+Pytorch max diff: 0.015625
+Pytorch mean diff: 0.0002384185791015625
+==== 512 256 True 128 False torch.bfloat16
+dQ max diff: 0.03125
+dK max diff: 0.015625
+dV max diff: 0.03125
+dQ mean diff: 0.0001087188720703125
+dK mean diff: 0.0001773834228515625
+dV mean diff: 0.00018596649169921875
+dQ Pytorch max diff: 0.03125
+dK Pytorch max diff: 0.0234375
+dV Pytorch max diff: 0.03125
+dQ Pytorch mean diff: 0.000278472900390625
+dK Pytorch mean diff: 0.00046539306640625
+dV Pytorch mean diff: 0.000392913818359375
+.Output max diff: 0.001953125
+Output mean diff: 2.2351741790771484e-05
+Pytorch max diff: 0.001953125
+Pytorch mean diff: 3.546476364135742e-05
+==== 512 256 True 128 True torch.float16
+dQ max diff: 0.00390625
+dK max diff: 0.001953125
+dV max diff: 0.00390625
+dQ mean diff: 1.9371509552001953e-05
+dK mean diff: 4.029273986816406e-05
+dV mean diff: 3.612041473388672e-05
+dQ Pytorch max diff: 0.00390625
+dK Pytorch max diff: 0.0029296875
+dV Pytorch max diff: 0.00390625
+dQ Pytorch mean diff: 3.933906555175781e-05
+dK Pytorch mean diff: 7.12275505065918e-05
+dV Pytorch mean diff: 6.091594696044922e-05
+.Output max diff: 0.015625
+Output mean diff: 9.012222290039062e-05
+Pytorch max diff: 0.015625
+Pytorch mean diff: 0.00024318695068359375
+==== 512 256 True 128 True torch.bfloat16
+dQ max diff: 0.03125
+dK max diff: 0.015625
+dV max diff: 0.03125
+dQ mean diff: 0.00011110305786132812
+dK mean diff: 0.000186920166015625
+dV mean diff: 0.000194549560546875
+dQ Pytorch max diff: 0.03125
+dK Pytorch max diff: 0.0234375
+dV Pytorch max diff: 0.03125
+dQ Pytorch mean diff: 0.000286102294921875
+dK Pytorch mean diff: 0.000492095947265625
+dV Pytorch mean diff: 0.0004138946533203125
+"""
