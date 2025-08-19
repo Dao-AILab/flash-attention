@@ -655,7 +655,7 @@ mha_fwd_get_scheduler_metadata(
         auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
-        auto device_idx = torch::stable::accelerator::getCurrentDevice();
+        auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
         auto stream = (cudaStream_t)torch::stable::accelerator::getCurrentStream(device_idx).id();
         prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
@@ -1151,7 +1151,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     #endif
 
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
-        auto device_idx = torch::stable::accelerator::getCurrentDevice();
+        auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
         auto stream = (cudaStream_t)torch::stable::accelerator::getCurrentStream(device_idx).id();
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
@@ -1543,7 +1543,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     #endif
 
     if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
-        auto device_idx = torch::stable::accelerator::getCurrentDevice();
+        auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
         auto stream = (cudaStream_t)torch::stable::accelerator::getCurrentStream(device_idx).id();
         run_mha_bwd(params, stream);
     } else if (total_k > 0 && num_heads_k > 0) {
@@ -1650,7 +1650,7 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
     params.arch = dprops.major * 10 + dprops.minor;
 
     if (seqlen > 0 && batch_size > 0) {
-        auto device_idx = torch::stable::accelerator::getCurrentDevice();
+        auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
         auto stream = (cudaStream_t)torch::stable::accelerator::getCurrentStream(device_idx).id();
         run_mha_fwd_combine(params, stream, false /*enable_pdl*/);
     }
