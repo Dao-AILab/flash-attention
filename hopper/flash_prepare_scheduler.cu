@@ -16,10 +16,10 @@
 namespace flash {
 
 // Sort in descending order
-template <typename DataType>
+template <typename T>
 struct PrepareSortOp
 {
-    __device__ bool operator()(const DataType &lhs, const DataType &rhs)
+    __device__ __forceinline__ bool operator()(T const & lhs, T const & rhs)
     {
         return lhs > rhs;
     }
@@ -27,14 +27,14 @@ struct PrepareSortOp
 
 template <>
 struct PrepareSortOp<int2> {
-    __device__ bool operator()(const int2& lhs, const int2& rhs) const {
+    __device__ __forceinline__ bool operator()(int2 const & lhs, int2 const & rhs) const {
         return lhs.x > rhs.x;
     }
 };
 
 template <>
 struct PrepareSortOp<int4> {
-    __device__ bool operator()(const int4& lhs, const int4& rhs) const {
+    __device__ __forceinline__ bool operator()(int4 const & lhs, int4 const & rhs) const {
         return lhs.x > rhs.x;
     }
 };
