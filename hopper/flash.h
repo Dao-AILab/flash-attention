@@ -161,6 +161,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool varlen_sort_batches;
     int tile_count_semaphore_offset;
     bool head_swizzle;
+    bool use_prepare_varlen;
 
     int arch;
     int num_sm;
