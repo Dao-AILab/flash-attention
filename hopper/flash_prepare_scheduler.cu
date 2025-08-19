@@ -15,14 +15,9 @@
 
 namespace flash {
 
-// needs (tensor size = batches):
-// 1. varlen_batch_idx_ptr: virtual_batch_idx -> batch_idx
-// 2. num_m_blocks_ptr: virtual_batch_idx -> num_m_blocks[batch_idx]
-// 3. num_splits_dynamic_ptr: virtual_batch_idx -> num_splits[batch_idx]
-
-// Custom comparison functor for descending order
+// Sort in descending order
 template <typename DataType>
-struct CustomMore
+struct PrepareSortOp
 {
     __device__ bool operator()(const DataType &lhs, const DataType &rhs)
     {
@@ -30,17 +25,15 @@ struct CustomMore
     }
 };
 
-// Specialization for int2
 template <>
-struct CustomMore<int2> {
+struct PrepareSortOp<int2> {
     __device__ bool operator()(const int2& lhs, const int2& rhs) const {
         return lhs.x > rhs.x;
     }
 };
 
-// Specialization for int4
 template <>
-struct CustomMore<int4> {
+struct PrepareSortOp<int4> {
     __device__ bool operator()(const int4& lhs, const int4& rhs) const {
         return lhs.x > rhs.x;
     }
@@ -176,7 +169,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
         // } __syncthreads();
 
         // Sort batches by num_n_blocks in descending order
-        BlockMergeSort(temp_storage).Sort(batch_coords, CustomMore<int4>());
+        BlockMergeSort(temp_storage).Sort(batch_coords, PrepareSortOp<int4>());
 
         // if (threadIdx.x == 0) {
         //     printf("Sorted: num_n_blocks - num_m_blocks = %d, num_m_blocks = %d, num_splits = %d, batch_idx = %d.\n", 
@@ -188,6 +181,12 @@ __global__ void prepare_varlen_num_blocks_kernel(
             batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + batch_coords[0].y * blockm_divmod.divisor);
         }
 
+        // When sorting, we re-index some metadata by 'virtual batch index'
+        // and also store the vbidx -> bidx mapping.
+        // 1. num_nheads_in_l2_ptr: virtual_batch_idx -> num_nheads_in_l2[batch_idx]
+        // 2. num_splits_dynamic_ptr: virtual_batch_idx -> num_splits[batch_idx]
+        // 3. num_m_blocks_ptr: virtual_batch_idx -> num_m_blocks[batch_idx]
+        // 4. varlen_batch_idx_ptr: virtual_batch_idx -> batch_idx        
         if (threadIdx.x < num_batch) {
             // num_n_blocks_ptr[threadIdx.x] = max(batch_coords[0].x, 1);
             if(num_nheads_in_l2_ptr) { num_nheads_in_l2_ptr[threadIdx.x] = get_nheads_in_l2(max(batch_coords[0].x, 1)); }
