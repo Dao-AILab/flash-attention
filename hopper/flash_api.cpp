@@ -15,6 +15,7 @@
 #include "heuristics.h"
 #include "cuda_check.h"
 
+#include <torch/csrc/stable/tensor.h>
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/accelerator.h>
@@ -69,9 +70,14 @@ PyObject* PyInit__C(void)
 }
 
 #define CHECK_DEVICE(x) STD_TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
-# define CHECK_SHAPE(x, ...)
-// FIXME: is the above sufficient to be a no-op
-// #define CHECK_SHAPE(x, ...) STD_TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+#define CHECK_SHAPE(x, ...) \
+    do { \
+        auto expected_dims = std::vector<int64_t>{__VA_ARGS__}; \
+        STD_TORCH_CHECK(x.dim() == static_cast<int64_t>(expected_dims.size()), #x " must have " + std::to_string(expected_dims.size()) + " dimensions, got " + std::to_string(x.dim())); \
+        for (size_t i = 0; i < expected_dims.size(); ++i) { \
+            STD_TORCH_CHECK(x.size(i) == expected_dims[i], #x " dimension " + std::to_string(i) + " must have size " + std::to_string(expected_dims[i]) + ", got " + std::to_string(x.size(i))); \
+        } \
+    } while (0)
 #define CHECK_CONTIGUOUS(x) STD_TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 void set_params_fprop(Flash_fwd_params &params,
