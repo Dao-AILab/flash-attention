@@ -42,7 +42,7 @@ def round_up_headdim(head_size: int) -> int:
     return 256
 
 
-@torch.library.custom_op("flash_attn::_flash_attn_forward", mutates_args=(), device_types="cuda")
+@torch.library.custom_op("flash_attn_3::_flash_attn_forward", mutates_args=(), device_types="cuda")
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -129,7 +129,7 @@ def _flash_attn_forward(
     return out, softmax_lse, *rest
 
 
-@torch.library.register_fake("flash_attn::_flash_attn_forward")
+@torch.library.register_fake("flash_attn_3::_flash_attn_forward")
 def _flash_attn_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -231,7 +231,7 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, out_accum, softmax_lse_accum
 
 
-@torch.library.custom_op("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
+@torch.library.custom_op("flash_attn_3::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -285,7 +285,7 @@ def _flash_attn_backward(
     return softmax_d
 
 
-@torch.library.register_fake("flash_attn::_flash_attn_backward")
+@torch.library.register_fake("flash_attn_3::_flash_attn_backward")
 def _flash_attn_backward_fake(
     dout: torch.Tensor,
     q: torch.Tensor,
