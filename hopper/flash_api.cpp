@@ -527,7 +527,6 @@ mha_fwd_get_scheduler_metadata(
         bool has_softcap,
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        bool sort_batches,
         int64_t sm_margin) {
 
     TORCH_CHECK(qkv_dtype == at::ScalarType::Half || qkv_dtype == at::ScalarType::BFloat16 || qkv_dtype == at::ScalarType::Float8_e4m3fn,
@@ -606,7 +605,7 @@ mha_fwd_get_scheduler_metadata(
     at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
     bool const scheduler_needs_semaphore = params.arch >= 90 || params.num_splits > 1;
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
-    params.varlen_sort_batches = sort_batches;
+    params.varlen_sort_batches = !params.is_local;
     params.head_swizzle = params.is_causal || params.is_local;
     if (scheduler_needs_semaphore || use_prepare_varlen) {   
         int b_rounded = round_multiple(params.b, 4); // for 16 byte alignment of pointers 
@@ -688,9 +687,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        bool sort_batches,
-        int64_t sm_margin,
-        bool head_swizzle
+        int64_t sm_margin
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -976,8 +973,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     bool const scheduler_needs_semaphore = params.arch >= 90
         ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
         : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
-    params.varlen_sort_batches = sort_batches;
-    params.head_swizzle = head_swizzle;
+    params.varlen_sort_batches = !params.is_local;
+    params.head_swizzle = params.is_causal || params.is_local;
     if (scheduler_needs_semaphore || use_prepare_varlen) {
         int b_rounded = round_multiple(params.b, 4); // for 16 byte alignment of pointers
         int num_prepare_batch_vectors = use_prepare_varlen ? 1 : 0;
@@ -1013,6 +1010,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 
     if (q_v_.has_value()) {
         TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
+        TORCH_CHECK(head_size_v >= 256, "q_v is only supported for hdim_v >= 256.");
         TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
                     "q_v is only supported for fp16 and bf16 data type");
         TORCH_CHECK(params.arch == 90, "q_v is only supported for Hopper GPUs");
@@ -1688,8 +1686,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
-        "bool sort_batches = False,"
-        "int sm_margin = 0, bool head_swizzle = False) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
@@ -1742,7 +1739,6 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "bool has_softcap = False,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
-        "bool sort_batches = False,"
         "int sm_margin = 0) -> Tensor");
 }
 

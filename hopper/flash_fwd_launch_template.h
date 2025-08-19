@@ -58,7 +58,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
     static constexpr int NumProducerThreads = Arch >= 90 ? CollectiveMainloop::NumProducerThreads : CollectiveMainloop::NumMmaThreads;
     using SchedulerPersistent = std::conditional_t<Varlen,
-        flash::VarlenDynamicPersistentTileScheduler<kBlockM, kBlockN, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/, Is_causal /*LPT*/>,
+        flash::VarlenDynamicPersistentTileScheduler<kBlockM, kBlockN, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/, Is_causal || Is_local /*LPT*/>,
         std::conditional_t<!Is_causal && !Is_local,
             flash::StaticPersistentTileScheduler<Split>,
             flash::DynamicPersistentTileScheduler<CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/>
@@ -154,7 +154,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.num_splits_dynamic_ptr,
         params.num_m_blocks_ptr,
         params.varlen_batch_idx_ptr,
-        params.head_swizzle ? params.num_nheads_in_l2_ptr : nullptr // can toggle for swizzle ablation testing
+        params.num_nheads_in_l2_ptr
     };
 
     if (Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation) {
