@@ -1541,16 +1541,16 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        # (1, 239),
-        # (3, 799),
-        # (127, 512),
-        # (127, 513),
-        # (113, 203),
-        # (128, 217),
-        # (113, 211),
-        # (108, 256),
+        (1, 239),
+        (3, 799),
+        (127, 512),
+        (127, 513),
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
         (256, 512),
-        # (1023, 1024),
+        (1023, 1024),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
@@ -2599,7 +2599,7 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dk, dk0)
         assert torch.equal(dq, dq0)
 
-@pytest.mark.parametrize("dtype", ([torch.float16]))
+@pytest.mark.parametrize("dtype", ([torch.bfloat16]))
 @pytest.mark.parametrize("d", [64])
 @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("swap_sq_sk", [True])
@@ -2627,7 +2627,7 @@ def test_flash_attn_sink_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype)
     k_ref = k.transpose(1, 2)
     v_ref = v.transpose(1, 2)
     sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
-    out = flash_attn_sink_func(q, k, v, sink, 0.0, causal=causal, window_size=window_size)
+    out = flash_attn_sink_func(q, k, v, sink, 0.0, softmax_scale=d**-0.5, causal=causal, window_size=window_size)
 
     attention_mask = get_attention_mask(seqlen_q, seqlen_k, causal, device, window_size)
     if attention_mask is not None:
@@ -2678,6 +2678,8 @@ def test_flash_attn_sink_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype)
     print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().detach().item()}")
     print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().detach().item()}")
     print(f"dS Pytorch mean diff: {(dsink_pt - dsink_ref).abs().mean().detach().item()}")
+    print(f"dS Relative error: {torch.mean(torch.abs(dsink - dsink_ref) / (torch.abs(dsink_ref) + 1e-8)).detach()}")
+    print(f"dS Pytorch relative error: {torch.mean(torch.abs(dsink_pt - dsink_ref) / (torch.abs(dsink_ref) + 1e-8)).detach()}")
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.

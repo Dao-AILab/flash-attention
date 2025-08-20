@@ -131,6 +131,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     if constexpr (Has_sink) {
         if (tidx == 0) { shared_sink_val = static_cast<float>(reinterpret_cast<ElementAccum*>(params.sink_ptr)[bidh]); }
+        __syncthreads();
     }
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one

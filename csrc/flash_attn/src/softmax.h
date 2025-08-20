@@ -141,8 +141,9 @@ struct Softmax {
         static_assert(decltype(size<0>(scores))::value == kNRows);
         if (Is_first) {
             if constexpr (Has_sink) {
+                const float sink_scaled = (sink_val * float(M_LOG2E) / softmax_scale_log2);
                 #pragma unroll
-                for (int mi = 0; mi < size(row_max); ++mi) { row_max(mi) = sink_val; }
+                for (int mi = 0; mi < size(row_max); ++mi) { row_max(mi) = sink_scaled; }
                 FLASH_NAMESPACE::template reduce_max</*zero_init=*/false>(scores, row_max);
             } else {
                 FLASH_NAMESPACE::template reduce_max</*zero_init=*/true>(scores, row_max);
@@ -185,7 +186,7 @@ struct Softmax {
             float sum = row_sum(mi);
             if (Has_sink) {
                 const float max_scaled = row_max(mi) == -INFINITY ? 0.f : row_max(mi) * softmax_scale;
-                sum += expf(sink_val - max_scaled);
+                sum += exp2f((sink_val - max_scaled) * float(M_LOG2E));
             }
             float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
             lse(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : row_max(mi) * softmax_scale + __logf(sum);
