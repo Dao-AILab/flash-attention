@@ -1039,7 +1039,7 @@ class FlashAttnSinkFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, sink, out, softmax_lse, rng_state = ctx.saved_tensors
-        dq, dk, dv, dsink = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v), torch.empty_like(sink)
+        dq, dk, dv, dsink = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v), torch.zeros_like(sink)
         head_size_og = dout.size(3)
         dout_padded = dout
         if head_size_og % 8 != 0:

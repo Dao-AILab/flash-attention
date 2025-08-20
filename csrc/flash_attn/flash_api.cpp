@@ -540,6 +540,7 @@ mha_sink_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round
                 "FlashAttention only support fp16 and bf16 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(sink.dtype() == torch::kFloat32, "sink must have the same dtype");
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
 
@@ -559,6 +560,7 @@ mha_sink_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round
     TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+    TORCH_CHECK(num_heads == sink.size(0), "Number of heads in query must match sink size");
 
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
 
@@ -582,6 +584,7 @@ mha_sink_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
+    CHECK_SHAPE(sink, num_heads);
 
     at::Tensor out;
     if (out_.has_value()) {
