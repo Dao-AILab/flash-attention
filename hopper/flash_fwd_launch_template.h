@@ -57,8 +57,11 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV>;
 
     static constexpr int NumProducerThreads = Arch >= 90 ? CollectiveMainloop::NumProducerThreads : CollectiveMainloop::NumMmaThreads;
+    static constexpr bool LPT = Is_causal || Is_local;
+    // condition since we may want to sort without PrepareVarlen being true when arch is sm8x
+    static constexpr bool Sort = cute::conditional_return<Arch >= 90>(!Is_local && PrepareVarlen, !Is_local);
     using SchedulerPersistent = std::conditional_t<Varlen,
-        flash::VarlenDynamicPersistentTileScheduler<kBlockM, kBlockN, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/, Is_causal || Is_local /*LPT*/, PrepareVarlen, !Is_local /*Sort*/>,
+        flash::VarlenDynamicPersistentTileScheduler<kBlockM, kBlockN, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/, LPT, PrepareVarlen, Sort>,
         std::conditional_t<!Is_causal && !Is_local,
             flash::StaticPersistentTileScheduler<Split>,
             flash::DynamicPersistentTileScheduler<CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/>
@@ -157,7 +160,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.num_nheads_in_l2_ptr
     };
 
-    if (PrepareVarlen && !params.skip_scheduler_metadata_computation) {
+    if (Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation) {
         prepare_varlen_num_blocks(params, stream, PackGQA, kBlockM, kBlockN, Arch >= 90 /*enable_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
@@ -191,7 +194,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         }
         // kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
         cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
-                                           Arch >= 90 && PrepareVarlen && !params.skip_scheduler_metadata_computation /*launch_with_pdl*/);
+                                           Arch >= 90 && Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation /*launch_with_pdl*/);
     }
     CHECK_CUDA_KERNEL_LAUNCH();
 }
@@ -206,7 +209,9 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
             static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
             VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
                 BOOL_SWITCH(params.use_prepare_varlen, PrepareVarlen_, [&] {
-                    static constexpr bool PrepareVarlen = PrepareVarlen_ && Varlen;
+                    // If arch is sm8x, don't compile for the PrepareVarlen option to save time.
+                    // For sm8x we only use varlen dynamic persistent scheduler with split case anyway and memory-bound kernels aren't as impacted.
+                    static constexpr bool PrepareVarlen = PrepareVarlen_ && Varlen && Arch >= 90;
                     // Only needed here to decide if we should use cluster
                     static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap)) : 128;
                     static constexpr bool Enable_cluster = Arch == 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKVNonTMA && !Varlen;

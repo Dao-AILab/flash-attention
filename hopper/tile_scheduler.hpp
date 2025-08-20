@@ -466,7 +466,8 @@ public:
 
 ///////////////////////////////////////////////////////////////////////////////
 
-template<int kBlockM, int kBlockN, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp, bool Split=false, bool PackGQA=false, bool WarpSpecialized=true, bool LPT = false, bool Prepared = true, bool Sort = true>
+template<int kBlockM, int kBlockN, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
+         bool Split=false, bool PackGQA=false, bool WarpSpecialized=true, bool LPT = false, bool Prepared = false, bool Sort = false>
 class VarlenDynamicPersistentTileScheduler {
 
     static_assert(WarpSpecialized || NumProducerThreads == NumMmaThreads);
@@ -540,8 +541,14 @@ public:
         cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
             auto get_actual_batch = [&](int virtual_batch) {
-                if constexpr(Prepared && Sort) { return params.varlen_batch_idx_ptr[virtual_batch]; }
-                else { return virtual_batch; }
+                if constexpr(Prepared && Sort) {
+                    return params.varlen_batch_idx_ptr[virtual_batch];
+                } else if constexpr (Sort) {
+                    // use conditional for sm8x kernels
+                    return params.varlen_batch_idx_ptr ? params.varlen_batch_idx_ptr[virtual_batch] : virtual_batch;
+                } else { 
+                    return virtual_batch;
+                }
             };
             if constexpr (!Split) {
                 return {block, bidh, get_actual_batch(bidb), 0 /*split_idx*/};
@@ -576,6 +583,13 @@ public:
                 return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
                     ? params.num_m_blocks_ptr[batch_idx] : 0;
             } else {
+                if constexpr(!Prepared && Sort) {
+                    // use conditional for sm8x kernels
+                    if (params.num_m_blocks_ptr) {
+                        return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
+                            ? params.num_m_blocks_ptr[batch_idx] : 0;
+                    }
+                }
                 int seqlen = params.seqlen * (!PackGQA ? 1 : params.qhead_per_khead);
                 if (seqlen > kBlockM) {
                     if (params.seqused) {
@@ -603,7 +617,11 @@ public:
             } else if constexpr(Prepared) {
                 return is_valid ? params.num_splits_dynamic_ptr[batch_idx] : 0;
             } else {
-                return is_valid ? params.nsplits_divmod.divisor : 0;
+                return is_valid
+                    ? (params.num_splits_dynamic_ptr // use conditional for sm8x kernels
+                        ? params.num_splits_dynamic_ptr[batch_idx]
+                        : params.nsplits_divmod.divisor)
+                    : 0;
             }
         };
 
@@ -658,7 +676,7 @@ public:
         int mh_block = next_tile_idx - group_start_tile;
         int block, bidh;
         if constexpr (LPT) {
-            if (Prepared && (!Split || num_splits == 1)) {
+            if (!Split || num_splits == 1) {
                 // NOTE: code for computing nheads_in_l2 directly left as reference
                 // int num_n_blocks = params.num_n_blocks_ptr ? params.num_n_blocks_ptr[bidb] : num_m_blocks;
                 // auto find_log2_floor = [&](int n) { return 31 - cutlass::clz(n); };
@@ -666,7 +684,15 @@ public:
                 //     ? 1 : 1 << find_log2_floor(params.max_kvblocks_in_l2 / num_n_blocks);
                 // if constexpr (!PackGQA) { nheads_in_l2 *= params.qhead_per_khead; }
                 // nheads_in_l2 = min(nheads_in_l2, params.num_head);
-                int nheads_in_l2 = params.num_nheads_in_l2_ptr[bidb];
+                auto get_nheads_in_l2 = [&](int batch_idx) {
+                    if constexpr(Prepared) {
+                        return params.num_nheads_in_l2_ptr[batch_idx];
+                    } else {
+                        // use conditional for sm8x kernels
+                        return params.num_nheads_in_l2_ptr ? params.num_nheads_in_l2_ptr[batch_idx] : (!PackGQA ? params.qhead_per_khead : 1);
+                    }
+                };
+                int nheads_in_l2 = get_nheads_in_l2(bidb);
                 int mh_in_l2 = nheads_in_l2 * num_m_blocks;
                 int section_idx = mh_block / mh_in_l2;
                 int l2_mod = mh_block - section_idx * mh_in_l2;
