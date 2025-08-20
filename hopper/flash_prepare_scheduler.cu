@@ -121,8 +121,8 @@ __global__ void prepare_varlen_num_blocks_kernel(
     };
 
     int warp_idx = threadIdx.x / cutlass::NumThreadsPerWarp;
-    int batch_offset = int(blockIdx.x) * 992;
-    int bidb_start = batch_offset + kNumBatchPerWarp * warp_idx;
+    int batch_cta_idx_offset = int(blockIdx.x) * 992;
+    int bidb_start = batch_cta_idx_offset + kNumBatchPerWarp * warp_idx;
     int batch_idx = lane + bidb_start;
     int num_m_blocks = get_num_m_blocks(batch_idx);
     int num_n_blocks = get_num_n_blocks(batch_idx);
@@ -136,92 +136,82 @@ __global__ void prepare_varlen_num_blocks_kernel(
         if(!packgqa) { nheads_in_l2 *= qhead_per_khead; }
         return min(nheads_in_l2, num_head);
     };
-
-    if (blockIdx.x > 0) {
-        // trivially handle excess batches
-        if (batch_idx < num_batch && lane < kNumBatchPerWarp) {
-            num_splits_dynamic_ptr[batch_idx] = 1;
-            num_m_blocks_ptr[batch_idx] = num_m_blocks;
-            if(num_nheads_in_l2_ptr) { num_nheads_in_l2_ptr[batch_idx] = get_nheads_in_l2(max(num_n_blocks, 1)); }
-            if constexpr (Sort) {
-                varlen_batch_idx_ptr[batch_idx] = batch_idx;
-            }
-        }
+    
+    int num_splits_dynamic;
+    if (int(gridDim.x) > 1 || num_splits_static == 1) {
+        // set num splits for all batches to 1 (note that user expects num_splits_static to mean upper bound on splits)
+        // for batch size > 992, we expect GPU occupancy to not be an issue except in degenerate cases (e.g., most are zero-length)
+        num_splits_dynamic = 1;
     } else {
-        int num_splits_dynamic;
-        if (int(gridDim.x) > 1 || num_splits_static == 1) {
-            // set num splits for all batches to 1 (note that user expects num_splits_static to mean upper bound on splits)
-            // for batch size > 992, we expect GPU occupancy to not be an issue except in degenerate cases (e.g., most are zero-length)
-            num_splits_dynamic = 1;
-        } else {
-            int total_blocks = num_m_blocks * num_n_blocks;
-            // Warp sum
-            #pragma unroll
-            for (int i = cutlass::NumThreadsPerWarp / 2; i >= 1; i /= 2) {
-                total_blocks += __shfl_down_sync(0xffffffff, total_blocks, i);
-            }
-            if (lane == 0) { atomicAdd(total_blocks_smem, total_blocks); }
-            __syncthreads();
-            total_blocks = total_blocks_smem[0];
-            // 10% margin
-            int blocks_per_sm = static_cast<int>(ceilf(float(total_blocks) * 1.1f * float(num_head) / float(num_sm)));
-            // blocks_per_sm = std::max(1, blocks_per_sm);  // 1 is the minimum number of blocks per SM
-            num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
-            // num_n_blocks per work tile for the batch
-            num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic); 
+        int total_blocks = num_m_blocks * num_n_blocks;
+        // Warp sum
+        #pragma unroll
+        for (int i = cutlass::NumThreadsPerWarp / 2; i >= 1; i /= 2) {
+            total_blocks += __shfl_down_sync(0xffffffff, total_blocks, i);
+        }
+        if (lane == 0) { atomicAdd(total_blocks_smem, total_blocks); }
+        __syncthreads();
+        total_blocks = total_blocks_smem[0];
+        // 10% margin
+        int blocks_per_sm = static_cast<int>(ceilf(float(total_blocks) * 1.1f * float(num_head) / float(num_sm)));
+        // blocks_per_sm = std::max(1, blocks_per_sm);  // 1 is the minimum number of blocks per SM
+        num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
+        // num_n_blocks per work tile for the batch
+        num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic); 
+    }
+
+    if constexpr (Sort) {
+        if(lane == kNumBatchPerWarp || batch_idx >= num_batch) {
+            num_n_blocks = INT_MIN; // sort last
+        } else if (is_causal) {
+            // sort by shortest member to process
+            num_n_blocks = num_n_blocks * blockn_divmod.divisor - num_m_blocks * blockm_divmod.divisor;
+        }
+        int4 batch_coords[ITEMS_PER_THREAD]; // 1 item per thread
+        batch_coords[0] = make_int4(num_n_blocks, num_m_blocks, num_splits_dynamic, batch_idx);
+
+        // if (threadIdx.x == 0) {
+        //     printf("Unsorted: num_n_blocks - num_m_blocks = %d, num_m_blocks = %d, num_splits = %d, batch_idx = %d.\n", 
+        //         batch_coords[0].x, batch_coords[0].y, batch_coords[0].z, batch_coords[0].w);
+        // } __syncthreads();
+
+        // Sort batches by num_n_blocks in descending order
+        BlockMergeSort(temp_storage).Sort(batch_coords, PrepareSortOp<int4>());
+
+        // if (threadIdx.x == 0) {
+        //     printf("Sorted: num_n_blocks - num_m_blocks = %d, num_m_blocks = %d, num_splits = %d, batch_idx = %d.\n", 
+        //         batch_coords[0].x, batch_coords[0].y, batch_coords[0].z, batch_coords[0].w);
+        // } __syncthreads();
+
+        if (is_causal) {
+            // reset value to num_n_blocks
+            batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + batch_coords[0].y * blockm_divmod.divisor);
         }
 
-        if constexpr (Sort) {
-            if(lane == kNumBatchPerWarp || batch_idx >= num_batch) {
-                num_n_blocks = INT_MIN; // sort last
-            } else if (is_causal) {
-                // sort by shortest member to process
-                num_n_blocks = num_n_blocks * blockn_divmod.divisor - num_m_blocks * blockm_divmod.divisor;
-            }
-            int4 batch_coords[ITEMS_PER_THREAD]; // 1 item per thread
-            batch_coords[0] = make_int4(num_n_blocks, num_m_blocks, num_splits_dynamic, batch_idx);
-
-            // if (threadIdx.x == 0) {
-            //     printf("Unsorted: num_n_blocks - num_m_blocks = %d, num_m_blocks = %d, num_splits = %d, batch_idx = %d.\n", 
-            //         batch_coords[0].x, batch_coords[0].y, batch_coords[0].z, batch_coords[0].w);
-            // } __syncthreads();
-
-            // Sort batches by num_n_blocks in descending order
-            BlockMergeSort(temp_storage).Sort(batch_coords, PrepareSortOp<int4>());
-
-            // if (threadIdx.x == 0) {
-            //     printf("Sorted: num_n_blocks - num_m_blocks = %d, num_m_blocks = %d, num_splits = %d, batch_idx = %d.\n", 
-            //         batch_coords[0].x, batch_coords[0].y, batch_coords[0].z, batch_coords[0].w);
-            // } __syncthreads();
-
-            if (is_causal) {
-                // reset value to num_n_blocks
-                batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + batch_coords[0].y * blockm_divmod.divisor);
-            }
-
-            // When sorting, we re-index some metadata by 'virtual batch index'
-            // and also store the vbidx -> bidx mapping.
-            // 1. num_nheads_in_l2_ptr: virtual_batch_idx -> num_nheads_in_l2[batch_idx]
-            // 2. num_splits_dynamic_ptr: virtual_batch_idx -> num_splits[batch_idx]
-            // 3. num_m_blocks_ptr: virtual_batch_idx -> num_m_blocks[batch_idx]
-            // 4. varlen_batch_idx_ptr: virtual_batch_idx -> batch_idx        
-            if (threadIdx.x < min(num_batch, 992)) {
-                // num_n_blocks_ptr[threadIdx.x] = max(batch_coords[0].x, 1);
-                if(num_nheads_in_l2_ptr) { num_nheads_in_l2_ptr[threadIdx.x] = get_nheads_in_l2(max(batch_coords[0].x, 1)); }
-                num_m_blocks_ptr[threadIdx.x] = batch_coords[0].y;
-                num_splits_dynamic_ptr[threadIdx.x] = batch_coords[0].z;
-                varlen_batch_idx_ptr[threadIdx.x] = batch_coords[0].w;
-            }  
-        } else {
-            if (batch_idx < num_batch && lane < kNumBatchPerWarp) {
-                // num_n_blocks_ptr[batch_idx] = max(num_n_blocks, 1);
-                if(num_nheads_in_l2_ptr) { num_nheads_in_l2_ptr[batch_idx] = get_nheads_in_l2(max(num_n_blocks, 1)); }
-                num_splits_dynamic_ptr[batch_idx] = num_splits_dynamic;
-                num_m_blocks_ptr[batch_idx] = num_m_blocks;
-                // printf("idx = %d, num_m_blocks = %d, num_n_blocks = %d, num_split_static = %d, num_splits_dynamic = %d\n", bidb_start + lane, num_m_blocks_ptr[bidb_start + lane], num_n_blocks, num_splits_static, num_splits_dynamic);
-            }
+        // When sorting, we re-index some metadata by 'virtual batch index'
+        // and also store the vbidx -> bidx mapping.
+        // 1. num_nheads_in_l2_ptr: virtual_batch_idx -> num_nheads_in_l2[batch_idx]
+        // 2. num_splits_dynamic_ptr: virtual_batch_idx -> num_splits[batch_idx]
+        // 3. num_m_blocks_ptr: virtual_batch_idx -> num_m_blocks[batch_idx]
+        // 4. varlen_batch_idx_ptr: virtual_batch_idx -> batch_idx      
+        batch_idx = batch_cta_idx_offset + threadIdx.x;
+        if (batch_idx < num_batch && threadIdx.x < 992) {
+            // num_n_blocks_ptr[threadIdx.x] = max(batch_coords[0].x, 1);
+            if(num_nheads_in_l2_ptr) { num_nheads_in_l2_ptr[batch_idx] = get_nheads_in_l2(max(batch_coords[0].x, 1)); }
+            num_m_blocks_ptr[batch_idx] = batch_coords[0].y;
+            num_splits_dynamic_ptr[batch_idx] = batch_coords[0].z;
+            varlen_batch_idx_ptr[batch_idx] = batch_coords[0].w;
+        }  
+    } else {
+        if (batch_idx < num_batch && lane < kNumBatchPerWarp) {
+            // num_n_blocks_ptr[batch_idx] = max(num_n_blocks, 1);
+            if(num_nheads_in_l2_ptr) { num_nheads_in_l2_ptr[batch_idx] = get_nheads_in_l2(max(num_n_blocks, 1)); }
+            num_splits_dynamic_ptr[batch_idx] = num_splits_dynamic;
+            num_m_blocks_ptr[batch_idx] = num_m_blocks;
+            // printf("idx = %d, num_m_blocks = %d, num_n_blocks = %d, num_split_static = %d, num_splits_dynamic = %d\n", bidb_start + lane, num_m_blocks_ptr[bidb_start + lane], num_n_blocks, num_splits_static, num_splits_dynamic);
         }
     }
+    
 }
 
 } // flash
