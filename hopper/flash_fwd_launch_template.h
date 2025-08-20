@@ -26,7 +26,7 @@ using namespace cute;
 
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
-          bool PackGQA, bool Split, bool V_colmajor, bool PrepareVarlen>
+          bool PackGQA, bool Split, bool V_colmajor>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
@@ -58,10 +58,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
     static constexpr int NumProducerThreads = Arch >= 90 ? CollectiveMainloop::NumProducerThreads : CollectiveMainloop::NumMmaThreads;
     static constexpr bool LPT = Is_causal || Is_local;
-    // condition since we may want to sort without PrepareVarlen being true when arch is sm8x
-    static constexpr bool Sort = cute::conditional_return<Arch >= 90>(!Is_local && PrepareVarlen, !Is_local);
+    static constexpr bool Sort = !Is_local;
     using SchedulerPersistent = std::conditional_t<Varlen,
-        flash::VarlenDynamicPersistentTileScheduler<kBlockM, kBlockN, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/, LPT, PrepareVarlen, Sort>,
+        flash::VarlenDynamicPersistentTileScheduler<kBlockM, kBlockN, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/, LPT, Sort, true /*Prepared*/>,
         std::conditional_t<!Is_causal && !Is_local,
             flash::StaticPersistentTileScheduler<Split>,
             flash::DynamicPersistentTileScheduler<CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/>
@@ -160,8 +159,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.num_nheads_in_l2_ptr
     };
 
-    if (Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation) {
-        prepare_varlen_num_blocks(params, stream, PackGQA, kBlockM, kBlockN, Arch >= 90 /*enable_pdl*/);
+    if (Varlen && !params.skip_scheduler_metadata_computation) {
+        prepare_varlen_num_blocks(params, stream, PackGQA, kBlockM, kBlockN, Arch >= 90 && params.prepare_varlen_pdl /*enable_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
 
@@ -194,7 +193,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         }
         // kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
         cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
-                                           Arch >= 90 && Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation /*launch_with_pdl*/);
+                                           Arch >= 90 && Varlen && !params.skip_scheduler_metadata_computation && params.prepare_varlen_pdl /*launch_with_pdl*/);
     }
     CHECK_CUDA_KERNEL_LAUNCH();
 }
@@ -208,21 +207,16 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
         VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
             static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
             VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
-                BOOL_SWITCH(params.use_prepare_varlen, PrepareVarlen_, [&] {
-                    // If arch is sm8x, don't compile for the PrepareVarlen option to save time.
-                    // For sm8x we only use varlen dynamic persistent scheduler with split case anyway and memory-bound kernels aren't as impacted.
-                    static constexpr bool PrepareVarlen = PrepareVarlen_ && Varlen && Arch >= 90;
-                    // Only needed here to decide if we should use cluster
-                    static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap)) : 128;
-                    static constexpr bool Enable_cluster = Arch == 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKVNonTMA && !Varlen;
-                    BOOL_SWITCH(params.qv_ptr, HasQV_, [&] {
-                        static constexpr bool HasQv = HasQV_ && Arch == 90 && !Is_FP8 && kHeadDim == 64 && kHeadDimV >= 256;
-                        APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
-                            // Only use Cluster if number of tiles along seqlen_q is even and not varlen
-                            CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
-                                static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
-                                run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, PrepareVarlen>(params, stream);
-                            });
+                // Only needed here to decide if we should use cluster
+                static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap)) : 128;
+                static constexpr bool Enable_cluster = Arch == 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKVNonTMA && !Varlen;
+                BOOL_SWITCH(params.qv_ptr, HasQV_, [&] {
+                    static constexpr bool HasQv = HasQV_ && Arch == 90 && !Is_FP8 && kHeadDim == 64 && kHeadDimV >= 256;
+                    APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
+                        // Only use Cluster if number of tiles along seqlen_q is even and not varlen
+                        CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
+                            static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
+                            run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor>(params, stream);
                         });
                     });
                 });
