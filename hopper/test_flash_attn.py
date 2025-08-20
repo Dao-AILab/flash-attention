@@ -882,7 +882,10 @@ def test_flash_attn_kvcache(
             print(f"{num_splits = }, {precompute_metadata = }")
             if precompute_metadata:
                 scheduler_metadata = get_scheduler_metadata(
-                    batch_size, max_seqlen_q if varlen_q else seqlen_q, seqlen_k, nheads, nheads_k, d,
+                    batch_size,
+                    max_seqlen_q if varlen_q else seqlen_q,
+                    seqlen_k if page_size is None else page_table.shape[1] * page_size,
+                    nheads, nheads_k, d,
                     cache_seqlens, q.dtype, headdim_v=dv, cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k_new, cache_leftpad=cache_leftpad,
                     max_seqlen_k_new=seqlen_new, page_size=page_size,
