@@ -21,28 +21,53 @@
 #include <torch/headeronly/util/Exception.h>
 
 #include <cuda_runtime.h>
-#include <string.h>
+#include <string>
+#include <deque>
+#include <mutex>
 
 using torch::stable::Tensor;
 
 namespace {
+std::deque<std::once_flag> device_flags;
+std::vector<cudaDeviceProp> device_properties;
+
+void initVectors() {
+  static bool init_flag [[maybe_unused]] = []() {
+    int device_count;
+    // FIXME: change to stable::accelerator version of device count
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess) {
+      STD_TORCH_CHECK(false, "cudaGetDeviceProperties failed: " +
+                                 std::string(cudaGetErrorString(err)));
+    }
+    device_flags.resize(device_count);
+    device_properties.resize(device_count);
+    return true;
+  }();
+}
+
+void initDeviceProperty(int device_index) {
+  cudaDeviceProp device_prop{};
+  cudaError_t err = cudaGetDeviceProperties(&device_prop, device_index);
+  if (err != cudaSuccess) {
+    STD_TORCH_CHECK(false, "cudaGetDeviceProperties failed: " +
+                               std::string(cudaGetErrorString(err)));
+  }
+  device_properties[device_index] = device_prop;
+}
+
 // Helper function to get device properties using raw CUDA APIs
-cudaDeviceProp get_device_prop() {
-  int device;
-  cudaError_t err = cudaGetDevice(&device);
+cudaDeviceProp* get_device_prop() {
+  initVectors();
+  int device_index;
+  cudaError_t err = cudaGetDevice(&device_index);
   if (err != cudaSuccess) {
     STD_TORCH_CHECK(false, "cudaGetDevice failed: " +
                                std::string(cudaGetErrorString(err)));
   }
 
-  cudaDeviceProp prop;
-  err = cudaGetDeviceProperties(&prop, device);
-  if (err != cudaSuccess) {
-    STD_TORCH_CHECK(false, "cudaGetDeviceProperties failed: " +
-                               std::string(cudaGetErrorString(err)));
-  }
-
-  return prop;
+  std::call_once(device_flags[device_index], initDeviceProperty, device_index);
+  return &device_properties[device_index];
 }
 } // anonymous namespace
 
@@ -190,8 +215,8 @@ void set_params_fprop(Flash_fwd_params &params,
     params.attention_chunk = attention_chunk;
 
     auto dprops = get_device_prop();
-    params.arch = dprops.major * 10 + dprops.minor;
-    params.num_sm = dprops.multiProcessorCount - sm_margin;
+    params.arch = dprops->major * 10 + dprops->minor;
+    params.num_sm = dprops->multiProcessorCount - sm_margin;
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
         STD_TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
@@ -618,8 +643,8 @@ mha_fwd_get_scheduler_metadata(
     params.window_size_right = window_size_right;
     params.attention_chunk = attention_chunk;
     auto dprops = get_device_prop();
-    params.arch = dprops.major * 10 + dprops.minor;
-    params.num_sm = dprops.multiProcessorCount - sm_margin;
+    params.arch = dprops->major * 10 + dprops->minor;
+    params.num_sm = dprops->multiProcessorCount - sm_margin;
     params.softcap = has_softcap ? 1.0f : 0.0f;
 
     params.page_size = page_size.has_value() ? page_size.value() : 1;
@@ -713,13 +738,13 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         ) {
 
     auto dprops = get_device_prop();
-    bool is_sm8x = dprops.major >= 8;
+    bool is_sm8x = dprops->major >= 8;
     STD_TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
 
     auto q_type = q.scalar_type();
     STD_TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16 || q_type == at::ScalarType::Float8_e4m3fn,
                 "FlashAttention only supports fp16, bf16, and fp8_e4m3 data type");
-    if (dprops.major < 9) {
+    if (dprops->major < 9) {
         STD_TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
                     "FlashAttention on Ampere/Ada cards only supports fp16 and bf16 data type");
     }
@@ -788,7 +813,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
                    (head_size <= 64 && head_size_v <= 512),
                    "If V headdim is different from Q/K dim, we only support Q/K headdim in (128, 192] and V headdim in (96, 128], "
                    "or (Q/K <= 64 and V <= 512).");
-        STD_TORCH_CHECK(dprops.major == 9, "Only Hopper supports different V headdim");
+        STD_TORCH_CHECK(dprops->major == 9, "Only Hopper supports different V headdim");
         if (head_size_v > 256) {
             STD_TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
                         "HeaddimV > 256 requires fp16 and bf16 data type");
@@ -1283,7 +1308,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     #endif
 
     auto dprops = get_device_prop();
-    bool is_sm8x = dprops.major >= 8;
+    bool is_sm8x = dprops->major >= 8;
     STD_TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
 
     auto q_type = q.scalar_type();
@@ -1353,7 +1378,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM (and cause IMA).
     is_causal = window_size_left < 0 && window_size_right == 0;
 
-    int const arch = dprops.major * 10 + dprops.minor;
+    int const arch = dprops->major * 10 + dprops->minor;
     int const head_size_rounded = round_up_headdim(std::max(head_size, head_size_v));
     int const head_size_v_rounded = head_size_rounded;
     // Very important that these match the kernel configs
@@ -1567,7 +1592,7 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
             ) {
 
     auto dprops = get_device_prop();
-    bool is_sm8x = dprops.major >= 8;
+    bool is_sm8x = dprops->major >= 8;
     STD_TORCH_CHECK(is_sm8x, "Attention combine function only supports Ampere GPUs or newer.");
 
     auto out_partial_type = out_partial.scalar_type();
@@ -1647,7 +1672,7 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
     params.o_row_stride = out.stride(1);
     params.o_head_stride = out.stride(2);
     params.o_batch_stride = out.stride(0);
-    params.arch = dprops.major * 10 + dprops.minor;
+    params.arch = dprops->major * 10 + dprops->minor;
 
     if (seqlen > 0 && batch_size > 0) {
         auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
