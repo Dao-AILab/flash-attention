@@ -153,6 +153,7 @@ public:
         int const* const cu_seqlens = nullptr;
         int const* const seqused = nullptr;
         int const* const num_splits_dynamic_ptr = nullptr;
+        int const* const varlen_batch_idx_ptr = nullptr;
         int* const semaphore_to_reset = nullptr;
     };
 
@@ -173,6 +174,7 @@ public:
         int const* const cu_seqlens = nullptr;
         int const* const seqused = nullptr;
         int const* const num_splits_dynamic_ptr = nullptr;
+        int const* const varlen_batch_idx_ptr = nullptr;
         int* const semaphore_to_reset = nullptr;
     };
 
@@ -197,6 +199,7 @@ public:
             args.cu_seqlens,
             args.seqused,
             args.num_splits_dynamic_ptr,
+            args.varlen_batch_idx_ptr,
             args.semaphore_to_reset
         };
     }
@@ -209,6 +212,7 @@ public:
         int dv;
         int const* cu_seqlens_q;
         int const* seqused_q;
+        int const* varlen_batch_idx_ptr;
     };
 
     struct StaticTileScheduler {
@@ -258,6 +262,7 @@ public:
             int const* const cu_seqlens_q;
             int const* const seqused_q;
             SchedulingAlgo algo;
+            int const* const varlen_batch_idx_ptr = nullptr;
         };
 
         SharedStorage& shared_storage;
@@ -283,7 +288,8 @@ public:
                 args.num_heads,
                 args.cu_seqlens_q,
                 args.seqused_q,
-                choose_scheduling_algo(args)
+                choose_scheduling_algo(args),
+                args.varlen_batch_idx_ptr
             }; 
         }
 
@@ -332,7 +338,8 @@ public:
 
                     auto get_num_m_blocks = [&](int bidb) {
                         if (bidb >= params.b) return 0;
-                        flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, 0, params.cu_seqlens_q, params.seqused_q};
+                        int actual_bidb = params.varlen_batch_idx_ptr ? params.varlen_batch_idx_ptr[bidb] : bidb;
+                        flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{actual_bidb, 0, params.cu_seqlens_q, params.seqused_q};
                         return cute::ceil_div(seqlen_info.seqlen * num_heads, Int<kBlockM>{}());
                     };
 
@@ -418,14 +425,15 @@ public:
 
         int const m_block = block_coord.block_m;
         int const k_block = block_coord.block_k;
-        int const batch = block_coord.bidb;
+        int const maybe_virtual_batch = block_coord.bidb;
+        if (maybe_virtual_batch >= params.b) { return; }
+        int const batch = params.varlen_batch_idx_ptr ? params.varlen_batch_idx_ptr[maybe_virtual_batch] : maybe_virtual_batch;
 
         if (params.semaphore_to_reset && threadIdx.x == 0 && blockIdx.x == gridDim.x - 1 && blockIdx.y == gridDim.y - 1 && blockIdx.z == gridDim.z - 1) {
             cutlass::arch::wait_on_dependent_grids();
             *params.semaphore_to_reset = 0;
         }
-
-        if (batch >= params.b) { return; }
+        
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
         int const offset = seqlen_info.offset;
         int const seqlen = seqlen_info.seqlen;
@@ -433,7 +441,7 @@ public:
 
         if (m_block >= cute::ceil_div(max_idx, Int<kBlockM>{})) { return; }
 
-        int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[batch] : get<1>(params.shape_LSE_partial);
+        int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[maybe_virtual_batch] : get<1>(params.shape_LSE_partial);
         if (num_splits <= 1) { return; }
 
         cutlass::FastDivmod seqlen_divmod_dynamic(seqlen);

@@ -59,6 +59,8 @@ namespace pybind11::detail {
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+#define PREPARE_VARLEN_MAX_BATCHES_1CTA 992
+
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
                       const size_t b,
@@ -614,9 +616,10 @@ mha_fwd_get_scheduler_metadata(
     params.page_size = page_size.has_value() ? page_size.value() : 1;
     params.page_table = !page_size.has_value() ? nullptr : reinterpret_cast<int*>(1);
 
-    // disable dynamic split if given explicit instructions to not split
-    bool const use_dynamic_split = params.b <= 992 && num_splits != 1;
-    params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
+    bool const use_prepare_varlen = true;
+    params.prepare_varlen_pdl = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA;
+    // set to use in split heuristic
+    params.num_splits_dynamic_ptr = reinterpret_cast<int*>(1);
 
     params.pagedkv_tma = get_pagedkv_tma(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
@@ -624,6 +627,8 @@ mha_fwd_get_scheduler_metadata(
     // Always enable PackGQA for Split
     params.pack_gqa |= params.num_splits > 1;
     // printf("Num splits (metadata) = %d.\n", params.num_splits);
+
+    bool const use_dynamic_split = params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA && params.num_splits > 1;
 
     bool is_varlen = true;
 
@@ -635,18 +640,47 @@ mha_fwd_get_scheduler_metadata(
     // This needs to be set after get_num_splits
     at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
     bool const scheduler_needs_semaphore = params.arch >= 90 || params.num_splits > 1;
-    if (scheduler_needs_semaphore || use_dynamic_split) {
-        tile_count_semaphore = torch::empty({int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b}, opts.dtype(torch::kInt32));
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    params.varlen_sort_batches = !params.is_local; // Use this value for Sort in scheduler template
+    params.head_swizzle = params.is_causal || params.is_local; // Use this value for LPT in scheduler template
+    if (scheduler_needs_semaphore || use_prepare_varlen) {   
+        int b_rounded = round_multiple(params.b, 4); // for 16 byte alignment of pointers 
+        int num_prepare_batch_vectors = use_prepare_varlen ? 1 : 0;
+        if (use_dynamic_split) { num_prepare_batch_vectors += 1; }
+        if (params.varlen_sort_batches) { num_prepare_batch_vectors += 1; }
+        if (params.head_swizzle) { num_prepare_batch_vectors += 1; }
+        int sort_offset =  b_rounded * (use_dynamic_split ? 2 : 1);
+        int head_swizzle_offset = b_rounded * (num_prepare_batch_vectors - 1);
+        int tile_count_semaphore_offset = b_rounded * num_prepare_batch_vectors;
+        // printf("(Metadata) num prepare batch vectors = %d.\n", num_prepare_batch_vectors);
+        tile_count_semaphore = torch::empty(
+            {int(scheduler_needs_semaphore) + tile_count_semaphore_offset},
+            opts.dtype(torch::kInt32));
+        // ORDER: {num_m_blocks, num_splits_dynamic, varlen_batch_idx, num_nheads_in_l2}
+        params.num_m_blocks_ptr =  use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() : nullptr;
+        params.num_splits_dynamic_ptr = use_prepare_varlen && use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
+        params.varlen_batch_idx_ptr =  use_prepare_varlen && params.varlen_sort_batches ? tile_count_semaphore.data_ptr<int>() + sort_offset : nullptr;
+        // params.num_n_blocks_ptr  = use_prepare_varlen && params.head_swizzle ? tile_count_semaphore.data_ptr<int>() + head_swizzle_offset : nullptr;
+        params.num_nheads_in_l2_ptr = use_prepare_varlen && params.head_swizzle ? tile_count_semaphore.data_ptr<int>() + head_swizzle_offset : nullptr;
         if (scheduler_needs_semaphore) {
-            if (!use_dynamic_split) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
-            params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+            if (!use_prepare_varlen) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
+            params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>() + tile_count_semaphore_offset;
         } else {
             params.tile_count_semaphore = nullptr;
         }
-        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
     }
+    // if (scheduler_needs_semaphore || use_dynamic_split) {
+    //     tile_count_semaphore = torch::empty({int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b}, opts.dtype(torch::kInt32));
+    //     if (scheduler_needs_semaphore) {
+    //         if (!use_dynamic_split) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
+    //         params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+    //     } else {
+    //         params.tile_count_semaphore = nullptr;
+    //     }
+    //     params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
+    // }
 
-    if (params.num_splits_dynamic_ptr) {
+    if (use_prepare_varlen) {
         auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params));
         auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
@@ -975,10 +1009,10 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         }
     }
 
-    // 992 = 32 * 31 is the max supported batch in prepare_varlen_num_blocks kernel
-    bool const use_dynamic_split = is_varlen && params.b <= 992 && num_splits != 1;
+    bool const use_prepare_varlen = is_varlen;
+    params.prepare_varlen_pdl = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA;
     // Temporarily set num_splits_dynamic_ptr to 1 since get_num_splits checks it
-    params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
+    params.num_splits_dynamic_ptr = !use_prepare_varlen ? nullptr : reinterpret_cast<int*>(1);
 
     params.pagedkv_tma = get_pagedkv_tma(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
@@ -987,14 +1021,29 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     // Always enable PackGQA for Split
     params.pack_gqa |= (params.num_splits > 1);
 
+    bool const use_dynamic_split = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA && params.num_splits > 1;
+    // disable split for varlen and >992 batches for now
+    if (use_prepare_varlen && params.b > PREPARE_VARLEN_MAX_BATCHES_1CTA) { params.num_splits = 1; }
+
     // This needs to be set after get_num_splits
     at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
     // We don't use the persistent scheduler if Split and not Varlen
     bool const scheduler_needs_semaphore = params.arch >= 90
         ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
         : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
-    if (scheduler_needs_semaphore || use_dynamic_split) {
-        int metadata_size = int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b;
+    params.varlen_sort_batches = !params.is_local; // Use this value for Sort in scheduler template
+    params.head_swizzle = params.is_causal || params.is_local; // Use this value for LPT in scheduler template
+    if (scheduler_needs_semaphore || use_prepare_varlen) {
+        int b_rounded = round_multiple(params.b, 4); // for 16 byte alignment of pointers
+        int num_prepare_batch_vectors = use_prepare_varlen ? 1 : 0;
+        if (use_dynamic_split) { num_prepare_batch_vectors += 1; }
+        if (params.varlen_sort_batches) { num_prepare_batch_vectors += 1; }
+        if (params.head_swizzle) { num_prepare_batch_vectors += 1; }
+        int sort_offset =  b_rounded * (use_dynamic_split ? 2 : 1);
+        int head_swizzle_offset = b_rounded * (num_prepare_batch_vectors - 1);
+        int tile_count_semaphore_offset = b_rounded * num_prepare_batch_vectors;
+        int metadata_size = int(scheduler_needs_semaphore) + tile_count_semaphore_offset;
+        // printf("Num prepare batch vectors = %d, metadata_size = %d.\n", num_prepare_batch_vectors, metadata_size);
         params.skip_scheduler_metadata_computation = scheduler_metadata_.has_value();
         if (scheduler_metadata_.has_value()) {
             at::Tensor scheduler_metadata = scheduler_metadata_.value();
@@ -1006,12 +1055,38 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         } else {
             tile_count_semaphore = torch::empty({metadata_size}, opts.dtype(torch::kInt32));
         }
-        if (scheduler_needs_semaphore && !use_dynamic_split) {
+        if (scheduler_needs_semaphore && !use_prepare_varlen) {
             tile_count_semaphore.zero_();  // If varlen we'll manually do the zero-ing
         }
-        params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() : nullptr;
-        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
+        // ORDER: {num_m_blocks, num_splits_dynamic, varlen_batch_idx, num_nheads_in_l2}
+        params.num_m_blocks_ptr =  use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() : nullptr;
+        params.num_splits_dynamic_ptr = use_prepare_varlen && use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
+        params.varlen_batch_idx_ptr =  use_prepare_varlen && params.varlen_sort_batches ? tile_count_semaphore.data_ptr<int>() + sort_offset : nullptr;
+        // params.num_n_blocks_ptr  = use_prepare_varlen && params.head_swizzle ? tile_count_semaphore.data_ptr<int>() + head_swizzle_offset : nullptr;
+        params.num_nheads_in_l2_ptr = use_prepare_varlen && params.head_swizzle ? tile_count_semaphore.data_ptr<int>() + head_swizzle_offset : nullptr;
+        params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() + tile_count_semaphore_offset : nullptr;
+        params.tile_count_semaphore_offset = tile_count_semaphore_offset; // might need to zero out semaphore later
     }
+
+    // if (scheduler_needs_semaphore || use_dynamic_split) {
+    //     int metadata_size = int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b;
+    //     params.skip_scheduler_metadata_computation = scheduler_metadata_.has_value();
+    //     if (scheduler_metadata_.has_value()) {
+    //         at::Tensor scheduler_metadata = scheduler_metadata_.value();
+    //         CHECK_DEVICE(scheduler_metadata);
+    //         CHECK_SHAPE(scheduler_metadata, metadata_size);
+    //         CHECK_CONTIGUOUS(scheduler_metadata);
+    //         TORCH_CHECK(scheduler_metadata.dtype() == torch::kInt32, "scheduler_metadata must have dtype int32");
+    //         tile_count_semaphore = scheduler_metadata;
+    //     } else {
+    //         tile_count_semaphore = torch::empty({metadata_size}, opts.dtype(torch::kInt32));
+    //     }
+    //     if (scheduler_needs_semaphore && !use_dynamic_split) {
+    //         tile_count_semaphore.zero_();  // If varlen we'll manually do the zero-ing
+    //     }
+    //     params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() : nullptr;
+    //     params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
+    // }
 
     if (q_v_.has_value()) {
         TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
@@ -1188,7 +1263,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
             run_mha_fwd_combine(params, stream, true /*enable_pdl*/);
         } else if (scheduler_needs_semaphore && params.skip_scheduler_metadata_computation) {
             // need to zero out the semaphore in this case
-            tile_count_semaphore.index({torch::indexing::Slice(0, 1)}).zero_();
+            tile_count_semaphore.index({torch::indexing::Slice(params.tile_count_semaphore_offset, params.tile_count_semaphore_offset + 1)}).zero_();
         }
     } else if (total_q > 0 && num_heads_k > 0) {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.

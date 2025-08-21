@@ -59,8 +59,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV, kBlockH>;
 
     static constexpr int NumProducerThreads = Arch >= 90 ? CollectiveMainloop::NumProducerThreads : CollectiveMainloop::NumMmaThreads;
+    static constexpr bool LPT = Is_causal || Is_local;
+    static constexpr bool Sort = !Is_local;
     using SchedulerPersistent = std::conditional_t<Varlen,
-        flash::VarlenDynamicPersistentTileScheduler<kBlockM, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/>,
+        flash::VarlenDynamicPersistentTileScheduler<kBlockM, kBlockN, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/, LPT, Sort, true /*Prepared*/>,
         std::conditional_t<!Is_causal && !Is_local,
             flash::StaticPersistentTileScheduler<Split>,
             flash::DynamicPersistentTileScheduler<CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/>
@@ -154,12 +156,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.seqlen_q,
         params.seqlen_k, params.d, params.dv, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q,
-        // params.num_m_blocks_ptr,
         params.num_splits_dynamic_ptr,
+        params.num_m_blocks_ptr,
+        params.varlen_batch_idx_ptr,
+        params.num_nheads_in_l2_ptr
     };
 
-    if (Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation) {
-        prepare_varlen_num_blocks(params, stream, PackGQA, kBlockM, kBlockN, Arch >= 90 /*enable_pdl*/);
+    if (Varlen && !params.skip_scheduler_metadata_computation) {
+        prepare_varlen_num_blocks(params, stream, PackGQA, kBlockM, kBlockN, Arch >= 90 && params.prepare_varlen_pdl /*enable_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
 
@@ -192,7 +196,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         }
         // kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
         cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
-                                           Arch >= 90 && Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation /*launch_with_pdl*/);
+                                           Arch >= 90 && Varlen && !params.skip_scheduler_metadata_computation && params.prepare_varlen_pdl /*launch_with_pdl*/);
     }
     CHECK_CUDA_KERNEL_LAUNCH();
 }
