@@ -997,7 +997,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // Epilogue
 
-    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split, Has_sink>(acc_o, params.scale_softmax);
+    // We fix the lse for sink in combine_attn_seqk_parallel.
+    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split, /*Has_sink=*/false>(acc_o, params.scale_softmax);
     // if (cute::thread0()) { print(lse); }
 
     Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(smem_)), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N)
@@ -1110,7 +1111,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, typename Params>
+template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, bool Has_sink, typename Params>
 inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -1190,15 +1191,41 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     MaxOp<float> max_op;
     lse_max = Allreduce<kRowsPerLoadTranspose>::run(lse_max, max_op);
     lse_max = lse_max == -INFINITY ? 0.0f : lse_max;  // In case all local LSEs are -inf
-    float lse_sum = expf(lse_accum(0) - lse_max);
+    float lse_sum = __expf(lse_accum(0) - lse_max);
     #pragma unroll
-    for (int l = 1; l < kNLsePerThread; ++l) { lse_sum += expf(lse_accum(l) - lse_max); }
+    for (int l = 1; l < kNLsePerThread; ++l) { lse_sum += __expf(lse_accum(l) - lse_max); }
     SumOp<float> sum_op;
     lse_sum = Allreduce<kRowsPerLoadTranspose>::run(lse_sum, sum_op);
     // For the case where all local lse == -INFINITY, we want to set lse_logsum to INFINITY. Otherwise
     // lse_logsum is log(0.0) = -INFINITY and we get NaN when we do lse_accum(l) - lse_logsum.
-    ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : logf(lse_sum) + lse_max;
+    ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : __logf(lse_sum) + lse_max;
     // if (bidx == 0 && tidx < 32) { printf("tidx = %d, lse = %f, lse_max = %f, lse_logsum = %f\n", tidx, lse_accum(0), lse_max, lse_logsum); }
+
+    if constexpr (Has_sink) {
+        #pragma unroll
+        for (int l = 0; l < kNLsePerThread; ++l) {
+            const int row = l * kRowsPerLoadTranspose + tidx % kRowsPerLoadTranspose;
+            const int col = tidx / kRowsPerLoadTranspose;
+            if (row < params.num_splits && col < kBlockM) {
+                const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
+                if (params.unpadded_lse) {
+                    // LSE is written as (h, seqlen_q, b) or (h, b, seqlen_q).
+                    if (lse_offset < lse_size) {
+                        const int head_idx = lse_offset / (params.b * params.seqlen_q);
+                        const float lse_logsum_sink = __expf(lse_logsum);
+                        const float sink_val_exp = params.learnable_sink_ptr == nullptr ? 0.f : __expf(reinterpret_cast<float *>(params.learnable_sink_ptr)[head_idx]);
+                        lse_logsum = __logf(lse_logsum_sink + sink_val_exp);;
+                    }
+                } else {
+                    // LSE is written as (b, h, seqlen_q).
+                    const int head_idx = (lse_offset % (params.h * params.seqlen_q)) / params.seqlen_q;
+                    const float lse_logsum_sink = __expf(lse_logsum);
+                    const float sink_val_exp = params.learnable_sink_ptr == nullptr ? 0.f : __expf(reinterpret_cast<float *>(params.learnable_sink_ptr)[head_idx]);
+                    lse_logsum = __logf(lse_logsum_sink + sink_val_exp);
+                }
+            }
+        }
+    }
     if (tidx % kRowsPerLoadTranspose == 0 && tidx / kRowsPerLoadTranspose < kBlockM) {
         if (params.unpadded_lse) {
             const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;

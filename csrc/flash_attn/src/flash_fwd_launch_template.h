@@ -46,9 +46,9 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_kernel, bool Is_causal, bool Is_lo
     #endif
 }
 
-DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int Log_max_splits, bool Is_even_K) {
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int Log_max_splits, bool Is_even_K, bool Has_sink) {
     static_assert(Log_max_splits >= 1);
-    FLASH_NAMESPACE::combine_attn_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
+    FLASH_NAMESPACE::combine_attn_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K, Has_sink>(params);
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
@@ -144,22 +144,24 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         constexpr static int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
         dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
         EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
-            if (params.num_splits <= 2) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-            } else if (params.num_splits <= 4) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 2, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-            } else if (params.num_splits <= 8) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 3, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-            } else if (params.num_splits <= 16) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 4, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-            } else if (params.num_splits <= 32) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 5, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-            } else if (params.num_splits <= 64) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 6, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-            } else if (params.num_splits <= 128) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-            }
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            SINK_SWITCH(params.learnable_sink_ptr != nullptr, Has_sink, [&] {
+                if (params.num_splits <= 2) {
+                    flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst, Has_sink><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                } else if (params.num_splits <= 4) {
+                    flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 2, IsEvenKConst, Has_sink><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                } else if (params.num_splits <= 8) {
+                    flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 3, IsEvenKConst, Has_sink><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                } else if (params.num_splits <= 16) {
+                    flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 4, IsEvenKConst, Has_sink><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                } else if (params.num_splits <= 32) {
+                    flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 5, IsEvenKConst, Has_sink><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                } else if (params.num_splits <= 64) {
+                    flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 6, IsEvenKConst, Has_sink><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                } else if (params.num_splits <= 128) {
+                    flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst, Has_sink><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                }
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+            });
         });
     }
 }
