@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from flash_attn import (
     flash_attn_func,
-    flash_attn_sink_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
     flash_attn_varlen_func,
@@ -1530,12 +1529,12 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("local", [False, True])
 # @pytest.mark.parametrize("local", [True])
-# @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
+@pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-@pytest.mark.parametrize("d", [64, 128])
+# @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("swap_sq_sk", [False, True])
 # @pytest.mark.parametrize("swap_sq_sk", [True])
 @pytest.mark.parametrize(
@@ -2599,11 +2598,35 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dk, dk0)
         assert torch.equal(dq, dq0)
 
-@pytest.mark.parametrize("dtype", ([torch.bfloat16]))
-@pytest.mark.parametrize("d", [64])
-@pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize("swap_sq_sk", [True])
-@pytest.mark.parametrize('seqlen_q,seqlen_k', [(512, 512)])
+
+@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
+# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("local", [False, True])
+# @pytest.mark.parametrize("local", [True])
+@pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
+# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
+# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
+# @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
+# @pytest.mark.parametrize('d', [56, 80])
+# @pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("swap_sq_sk", [False, True])
+# @pytest.mark.parametrize("swap_sq_sk", [True])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        # (1, 239), # TODO: fix this
+        (3, 799),
+        (127, 512),
+        (127, 513),
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (1023, 1024),
+    ],
+)
+# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_flash_attn_sink_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     if (
         max(seqlen_q, seqlen_k) >= 2048
@@ -2627,7 +2650,7 @@ def test_flash_attn_sink_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype)
     k_ref = k.transpose(1, 2)
     v_ref = v.transpose(1, 2)
     sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
-    out = flash_attn_sink_func(q, k, v, sink, 0.0, softmax_scale=d**-0.5, causal=causal, window_size=window_size)
+    out = flash_attn_func(q, k, v, sink, 0.0, softmax_scale=d**-0.5, causal=causal, window_size=window_size)
 
     attention_mask = get_attention_mask(seqlen_q, seqlen_k, causal, device, window_size)
     if attention_mask is not None:
