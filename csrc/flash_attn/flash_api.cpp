@@ -348,7 +348,7 @@ void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi
 }
 
 void set_params_sink(Flash_fwd_params &params, const std::optional<const at::Tensor> &learnable_sink_, int num_heads) {
-#ifdef FLASHATTENTION_DISABLE_ALIBI
+#ifdef FLASHATTENTION_DISABLE_SINK
     TORCH_CHECK(!learnable_sink_.has_value(), "This flash attention build does not support learnable sink.");
     params.learnable_sink_ptr = nullptr;
 #else
