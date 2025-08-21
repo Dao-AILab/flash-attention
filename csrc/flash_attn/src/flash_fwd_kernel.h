@@ -282,7 +282,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     clear(acc_o);
 
-    const float sink_val = !Has_sink || params.sink_ptr == nullptr ? -INFINITY : reinterpret_cast<float *>(params.sink_ptr)[bidh];
+    const float sink_val = !Has_sink || params.learnable_sink_ptr == nullptr ? -INFINITY : reinterpret_cast<float *>(params.learnable_sink_ptr)[bidh];
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax(sink_val);
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
@@ -535,7 +535,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
     }
-    if (tidx == 0) printf("compute_attn_1rowblock_splitkv: m_block = %d, binfo.actual_seqlen_q = %d, kBlockM = %d, binfo.actual_seqlen_k = %d, kBlockN = %d, params.sink_ptr = %p, Split = %d\n", m_block, binfo.actual_seqlen_q, kBlockM, binfo.actual_seqlen_k, kBlockN, params.sink_ptr, Split);
+
     if (n_block_min >= n_block_max) {  // This also covers the case where n_block_max <= 0
         // We exit early and write 0 to gOaccum and -inf to gLSEaccum.
         // Otherwise we might read OOB elements from gK and gV,
@@ -835,7 +835,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     clear(acc_o);
 
-    const float sink_val = !Has_sink || params.sink_ptr == nullptr ? -INFINITY : reinterpret_cast<float *>(params.sink_ptr)[bidh];
+    const float sink_val = !Has_sink || params.learnable_sink_ptr == nullptr ? -INFINITY : reinterpret_cast<float *>(params.learnable_sink_ptr)[bidh];
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax(sink_val);
 
     const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;

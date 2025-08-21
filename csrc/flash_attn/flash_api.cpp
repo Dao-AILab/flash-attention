@@ -347,7 +347,7 @@ void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi
 #endif
 }
 
-void set_params_sink(Flash_fwd_params &params, const std::optional<const at::Tensor> &learnable_sink_, int num_heads, const std::optional<at::Tensor> &dsink_=std::nullopt) {
+void set_params_sink(Flash_fwd_params &params, const std::optional<const at::Tensor> &learnable_sink_, int num_heads) {
 #ifdef FLASHATTENTION_DISABLE_ALIBI
     TORCH_CHECK(!learnable_sink_.has_value(), "This flash attention build does not support learnable sink.");
     params.learnable_sink_ptr = nullptr;
@@ -359,17 +359,8 @@ void set_params_sink(Flash_fwd_params &params, const std::optional<const at::Ten
         TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
         CHECK_SHAPE(learnable_sink, num_heads);
         params.learnable_sink_ptr = learnable_sink.data_ptr();
-        if (dsink_.has_value()) {
-            auto dsink = dsink_.value();
-            CHECK_DEVICE(dsink);
-            CHECK_SHAPE(dsink, num_heads);
-            params.dsink_ptr = dsink.data_ptr();
-        } else {
-            params.dsink_ptr = nullptr;
-        }
     } else {
         params.learnable_sink_ptr = nullptr;
-        params.dsink_ptr = nullptr;
     }
 #endif
 }
@@ -911,6 +902,10 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     if (learnable_sink.has_value()) {
         if (dsink_.has_value()) {
             dsink = dsink_.value();
+            TORCH_CHECK(dsink.dtype() == torch::kFloat32, "dsink must have dtype fp32");
+            CHECK_DEVICE(dsink);
+            TORCH_CHECK(dsink.stride(-1) == 1, "dsink tensor must have contiguous last dimension");
+            CHECK_SHAPE(dsink, num_heads);
         } else {
             dsink = torch::zeros_like(v);
         }
@@ -994,6 +989,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
     set_params_sink(params, learnable_sink, num_heads);
+    params.dsink_ptr = learnable_sink.has_value() ? dsink.data_ptr() : nullptr;
 
     if (seqlen_q > 0) {
         launch(params, stream);
@@ -1140,6 +1136,10 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     if (learnable_sink.has_value()) {
         if (dsink_.has_value()) {
             dsink = dsink_.value();
+            TORCH_CHECK(dsink.dtype() == torch::kFloat32, "dsink must have dtype fp32");
+            CHECK_DEVICE(dsink);
+            TORCH_CHECK(dsink.stride(-1) == 1, "dsink tensor must have contiguous last dimension");
+            CHECK_SHAPE(dsink, num_heads);
         } else {
             dsink = torch::zeros_like(v);
         }
@@ -1233,7 +1233,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
-    set_params_sink(params, learnable_sink, num_heads, dsink);
+    set_params_sink(params, learnable_sink, num_heads);
+    params.dsink_ptr = learnable_sink.has_value() ? dsink.data_ptr() : nullptr;
 
     if (max_seqlen_q > 0) {
         launch(params, stream);

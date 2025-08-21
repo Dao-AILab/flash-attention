@@ -136,7 +136,7 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, p, rng_state
 
 
-if torch.__version__ >= "12.4.0":
+if torch.__version__ >= "2.4.0":
     _wrapped_flash_attn_forward = torch.ops.flash_attn._flash_attn_forward
 else:
     _wrapped_flash_attn_forward = _flash_attn_forward
@@ -271,7 +271,7 @@ def _flash_attn_backward(
         dv,
         dsink,
         softmax_d,
-    ) = flash_attn_gpu.sink_bwd(
+    ) = flash_attn_gpu.bwd(
         dout,
         q,
         k,
@@ -517,7 +517,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         q, k, v, learnable_sink, out, softmax_lse, rng_state = ctx.saved_tensors
         qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
         dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
-        dsink = None if learnable_sink is None else torch.empty_like(learnable_sink)
+        dsink = None if learnable_sink is None else torch.zeros_like(learnable_sink)
         head_size_og = dout.size(3)
         dout_padded = dout
         if head_size_og % 8 != 0:
@@ -612,7 +612,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         q, k, v, learnable_sink, out, softmax_lse, cu_seqlens, rng_state = ctx.saved_tensors
         qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
         dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
-        dsink = None if learnable_sink is None else torch.empty_like(learnable_sink)
+        dsink = None if learnable_sink is None else torch.zeros_like(learnable_sink)
         head_size_og = dout.size(2)
         dout_padded = dout
         if head_size_og % 8 != 0:
@@ -707,7 +707,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         dq = torch.empty_like(q)
         kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
         dkv = torch.empty(kv_shape, dtype=k.dtype, device=k.device)
-        dsink = None if learnable_sink is None else torch.empty_like(learnable_sink)
+        dsink = None if learnable_sink is None else torch.zeros_like(learnable_sink)
         head_size_og = dout.size(3)
         dout_padded = dout
         if head_size_og % 8 != 0:
@@ -812,7 +812,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         dq = torch.empty_like(q)
         kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
         dkv = torch.empty(kv_shape, dtype=k.dtype, device=k.device)
-        dsink = None if learnable_sink is None else torch.empty_like(learnable_sink)
+        dsink = None if learnable_sink is None else torch.zeros_like(learnable_sink)
         head_size_og = dout.size(2)
         dout_padded = dout
         if head_size_og % 8 != 0:
@@ -906,7 +906,7 @@ class FlashAttnFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, learnable_sink, out, softmax_lse, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        dsink = None if learnable_sink is None else torch.empty_like(learnable_sink)
+        dsink = None if learnable_sink is None else torch.zeros_like(learnable_sink)
         head_size_og = dout.size(3)
         dout_padded = dout
         if head_size_og % 8 != 0:
@@ -1012,7 +1012,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, learnable_sink, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        dsink = None if learnable_sink is None else torch.empty_like(learnable_sink)
+        dsink = None if learnable_sink is None else torch.zeros_like(learnable_sink)
         head_size_og = dout.size(2)
         dout_padded = dout
         if head_size_og % 8 != 0:
