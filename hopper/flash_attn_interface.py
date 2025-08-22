@@ -378,6 +378,49 @@ def _flash_attn_backward_fake(
     return softmax_d
 
 
+def setup_context(ctx, inputs, output):
+    q, k, v = inputs[:3]
+    out, softmax_lse, _, _ = output
+    ctx.save_for_backward(q, k, v, out, softmax_lse)
+    ctx.softmax_scale = inputs[-11]
+    ctx.causal = inputs[-10]
+    ctx.window_size = [inputs[-9], inputs[-8]]
+    ctx.attention_chunk = inputs[-7]
+    ctx.softcap = inputs[-6]
+    ctx.sm_margin = inputs[-1]
+
+    
+def _backward(ctx, dout, *grads):
+    q, k, v, out, softmax_lse = ctx.saved_tensors
+    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    _flash_attn_backward(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        None, None, # cu_seqlens_q, cu_seqlens_k,
+        None, None, # sequed_q, sequed_k,
+        None, None, # max_seqlen_q, max_seqlen_k,
+        dq,
+        dk,
+        dv,
+        ctx.softmax_scale,
+        ctx.causal,
+        ctx.window_size[0],
+        ctx.window_size[1],
+        ctx.softcap,
+        False, # deterministic
+        ctx.sm_margin,
+    )
+    return dq, dk, dv, *((None,) * 21)
+
+
+_flash_attn_forward.register_autograd(_backward, setup_context=setup_context)
+
+
+
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def forward(

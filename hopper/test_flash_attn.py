@@ -43,8 +43,8 @@ DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
-ENABLE_FAKE_CHECK = os.getenv("FLASH_ATTENTION_ENABLE_FAKE_CHECK", "FALSE") == "TRUE"
-ENABLE_AUTOGRAD_CHECK = os.getenv("FLASH_ATTENTION_ENABLE_FAKE_CHECK", "FALSE") == "TRUE"
+ENABLE_OPCHECK = os.getenv("FLASH_ATTENTION_ENABLE_OPCHECK", "FALSE") == "TRUE"
+ENABLE_AUTOGRAD_CHECK = os.getenv("FLASH_ATTENTION_ENABLE_AUTOGRAD_CHECK", "FALSE") == "TRUE"
 
 COMPILED_HDIMS = (
     []
@@ -88,7 +88,7 @@ def run_opcheck(fn):
     return wrapper
 
 
-if ENABLE_FAKE_CHECK:
+if ENABLE_OPCHECK:
     flash_attn_func = run_opcheck(flash_attn_func)
     flash_attn_varlen_func = run_opcheck(flash_attn_varlen_func)
 
