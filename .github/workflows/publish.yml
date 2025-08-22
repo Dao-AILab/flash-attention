@@ -61,6 +61,7 @@ jobs:
       cuda-version: ${{ matrix.cuda-version }}
       torch-version: ${{ matrix.torch-version }}
       cxx11_abi: ${{ matrix.cxx11_abi }}
+      upload-to-release: true
       release-version: ${{ needs.setup_release.outputs.release-version }}
 
   publish_package:
