@@ -139,20 +139,17 @@ jobs:
         run: |
           ls dist
 
-      - name: Get the tag version
-        id: extract_branch
-        run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
-
       - name: Get Release with tag
         id: get_current_release
         uses: joutvhu/get-release@v1
         with:
-          tag_name: ${{ steps.extract_branch.outputs.branch }}
+          tag_name: ${{ inputs.release-version }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Release Asset
         id: upload_release_asset
+        if: inputs.upload-to-release
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
