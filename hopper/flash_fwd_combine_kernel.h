@@ -209,10 +209,12 @@ public:
         int seqlen_q;
         int total_q;
         int num_heads;
+        int num_heads_kv;
         int dv;
+        bool pack_gqa;
         int const* cu_seqlens_q;
         int const* seqused_q;
-        int const* varlen_batch_idx_ptr;
+        int const* prepare_seqlen_q_ptr;
     };
 
     struct StaticTileScheduler {
@@ -257,12 +259,14 @@ public:
         };
 
         struct Params {
-            int b;
-            int num_heads;
+            int const b;
+            int const num_heads;
+            int const num_heads_kv;
+            bool const pack_gqa;
             int const* const cu_seqlens_q;
             int const* const seqused_q;
+            int const* const prepare_seqlen_q_ptr;
             SchedulingAlgo algo;
-            int const* const varlen_batch_idx_ptr = nullptr;
         };
 
         SharedStorage& shared_storage;
@@ -286,10 +290,12 @@ public:
             return {
                 args.b,
                 args.num_heads,
+                args.num_heads_kv,
+                args.pack_gqa,
                 args.cu_seqlens_q,
                 args.seqused_q,
-                choose_scheduling_algo(args),
-                args.varlen_batch_idx_ptr
+                args.prepare_seqlen_q_ptr,
+                choose_scheduling_algo(args)
             }; 
         }
 
@@ -315,7 +321,6 @@ public:
         }
 
         CUTE_DEVICE BlockCoord get_block_coord_linearized_m_and_batch(Params const& params) {
-            int num_heads = params.num_heads;
             int curr_tile_id = blockIdx.x;
 
             // Scan through the batches find the batch that contains the current
@@ -338,9 +343,13 @@ public:
 
                     auto get_num_m_blocks = [&](int bidb) {
                         if (bidb >= params.b) return 0;
-                        int actual_bidb = params.varlen_batch_idx_ptr ? params.varlen_batch_idx_ptr[bidb] : bidb;
-                        flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{actual_bidb, 0, params.cu_seqlens_q, params.seqused_q};
-                        return cute::ceil_div(seqlen_info.seqlen * num_heads, Int<kBlockM>{}());
+                        if (params.prepare_seqlen_q_ptr) {
+                            int length = params.prepare_seqlen_q_ptr[bidb] * (!params.pack_gqa ? params.num_heads : params.num_heads_kv);
+                            return cute::ceil_div(length, Int<kBlockM>{});
+                        } else {
+                            flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, 0, params.cu_seqlens_q, params.seqused_q};
+                            return cute::ceil_div(seqlen_info.seqlen * params.num_heads, Int<kBlockM>{});
+                        }
                     };
 
                     // Cumulative number of blocks for the next 31 batches

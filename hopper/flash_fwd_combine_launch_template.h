@@ -40,9 +40,8 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool e
     };
 
     typename CombineKernel::SchedulerArguments scheduler_args  {
-        params.b, params.seqlen_q, params.total_q, params.h, params.dv,
-        params.cu_seqlens_q, params.seqused_q,
-        params.varlen_batch_idx_ptr
+        params.b, params.seqlen_q, params.total_q, params.h, params.h_k, params.dv, params.pack_gqa,
+        params.cu_seqlens_q, params.seqused_q, params.prepare_seqlen_q_ptr
     };
 
     typename CombineKernel::Params kernel_params = {

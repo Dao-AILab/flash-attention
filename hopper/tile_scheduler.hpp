@@ -25,7 +25,7 @@ struct TileSchedulerArguments {
     int const* const cu_seqlens = nullptr;
     int const* const seqused = nullptr;
     int const* const num_splits_dynamic_ptr = nullptr;
-    int const* const num_m_blocks_ptr = nullptr;
+    int const* const prepare_seqlen_q_ptr = nullptr;
     int const* const varlen_batch_idx_ptr = nullptr;
     // int const* const num_n_blocks_ptr = nullptr;
     int const* const num_nheads_in_l2_ptr = nullptr;
@@ -385,7 +385,7 @@ public:
         int const* const cu_seqlens;
         int const* const seqused;
         int const* const num_splits_dynamic_ptr;
-        int const* const num_m_blocks_ptr;
+        int const* const prepare_seqlen_q_ptr;
         int const* const varlen_batch_idx_ptr;
         // int const* const num_n_blocks_ptr;
         int const* const num_nheads_in_l2_ptr;
@@ -408,7 +408,7 @@ public:
                 cutlass::FastDivmod(!Split ? 1 : args.num_splits),
                 args.tile_count_semaphore, args.cu_seqlens, args.seqused,
                 args.num_splits_dynamic_ptr,
-                args.num_m_blocks_ptr,
+                args.prepare_seqlen_q_ptr,
                 args.varlen_batch_idx_ptr,
                 // aras.num_n_blocks_ptr,
                 args.num_nheads_in_l2_ptr};
@@ -470,7 +470,7 @@ public:
             int batch_idx = lane + bidb_start;
             if constexpr (Prepared) {
                 return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
-                    ? params.num_m_blocks_ptr[batch_idx] : 0;
+                    ? cute::ceil_div(params.prepare_seqlen_q_ptr[batch_idx], kBlockM) : 0;
             } else {
                 int seqlen = params.seqlen * (!PackGQA ? 1 : params.qhead_per_khead);
                 if (seqlen > kBlockM) {
@@ -487,7 +487,6 @@ public:
                 }
                 return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
                     ? cute::ceil_div(seqlen, kBlockM) : 0;
-                    // ? params.num_m_blocks_ptr[batch_idx] : 0;
             }
         };
 

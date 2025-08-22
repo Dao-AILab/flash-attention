@@ -157,7 +157,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.seqlen_k, params.d, params.dv, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q,
         params.num_splits_dynamic_ptr,
-        params.num_m_blocks_ptr,
+        params.prepare_seqlen_q_ptr,
         params.varlen_batch_idx_ptr,
         params.num_nheads_in_l2_ptr
     };
