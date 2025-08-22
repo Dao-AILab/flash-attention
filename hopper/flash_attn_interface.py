@@ -311,9 +311,9 @@ def _flash_attn_backward_fake(
     sm_margin: int = 0,
 ) -> torch.Tensor:
 
-    is_varlen_q = bool(cu_seqlens_q)
-    is_varlen_k = bool(cu_seqlens_k)
-    is_varlen = is_varlen_q or is_varlen_k or bool(sequed_q) or bool(sequed_k)
+    is_varlen_q = cu_seqlens_q is not None
+    is_varlen_k = cu_seqlens_q is not None
+    is_varlen = is_varlen_q or is_varlen_k or sequed_q is not None or sequed_k is not None
 
     if not is_varlen_q:
         batch_size = q.size(0)
