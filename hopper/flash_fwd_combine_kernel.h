@@ -145,6 +145,7 @@ public:
         int const* const cu_seqlens = nullptr;
         int const* const seqused = nullptr;
         int const* const num_splits_dynamic_ptr = nullptr;
+        int const* const varlen_batch_idx_ptr = nullptr;
         int* const semaphore_to_reset = nullptr;
     };
 
@@ -164,6 +165,7 @@ public:
         int const* const cu_seqlens = nullptr;
         int const* const seqused = nullptr;
         int const* const num_splits_dynamic_ptr = nullptr;
+        int const* const varlen_batch_idx_ptr = nullptr;
         int* const semaphore_to_reset = nullptr;
     };
 
@@ -187,7 +189,9 @@ public:
             args.cu_seqlens,
             args.seqused,
             args.num_splits_dynamic_ptr,
-            args.semaphore_to_reset
+            args.varlen_batch_idx_ptr,
+            args.semaphore_to_reset,
+            
         };
     }
 
@@ -203,8 +207,9 @@ public:
         int const thread_idx = threadIdx.x;
         int const m_block = blockIdx.x;
         int const k_block = blockIdx.y;
-        int const batch = blockIdx.z;
-        int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[batch] : get<1>(params.shape_LSE_partial);
+        int const maybe_virtual_batch = blockIdx.z;
+        int const batch = params.varlen_batch_idx_ptr ? params.varlen_batch_idx_ptr[maybe_virtual_batch] : maybe_virtual_batch;
+        int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[maybe_virtual_batch] : get<1>(params.shape_LSE_partial);
 
         if (params.semaphore_to_reset && threadIdx.x == 0 && blockIdx.x == gridDim.x - 1 && blockIdx.y == gridDim.y - 1 && blockIdx.z == gridDim.z - 1) {
             cutlass::arch::wait_on_dependent_grids();
