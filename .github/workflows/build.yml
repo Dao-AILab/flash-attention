@@ -33,6 +33,7 @@ on:
         description: "Upload wheel to this release"
         required: false
         type: string
+  push:
 
 jobs:
   build-wheels:
