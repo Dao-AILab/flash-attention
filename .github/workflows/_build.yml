@@ -122,9 +122,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: build.tar
-          key: build-${{ inputs.release-version }}-${{ inputs.python-version }}-${{ inputs.cuda-version }}-${{ inputs.torch-version }}-${{ inputs.cxx11-abi }}-${{ github.run_number }}-${{ github.run_attempt }}
+          key: build-${{ inputs.release-version }}-${{ inputs.python-version }}-${{ inputs.cuda-version }}-${{ inputs.torch-version }}-${{ inputs.cxx11_abi }}-${{ github.run_number }}-${{ github.run_attempt }}
           restore-keys: |
-            build-${{ inputs.release-version }}-${{ inputs.python-version }}-${{ inputs.cuda-version }}-${{ inputs.torch-version }}-${{ inputs.cxx11-abi }}-
+            build-${{ inputs.release-version }}-${{ inputs.python-version }}-${{ inputs.cuda-version }}-${{ inputs.torch-version }}-${{ inputs.cxx11_abi }}-
 
       - name: Unpack build cache
         run: |
@@ -159,14 +159,14 @@ jobs:
           export MAX_JOBS=$([ "$MATRIX_CUDA_VERSION" == "129" ] && echo 1 || echo 2)
           export NVCC_THREADS=2
           export FLASH_ATTENTION_FORCE_BUILD="TRUE"
-          export FLASH_ATTENTION_FORCE_CXX11_ABI=${{ inputs.cxx11-abi }}
+          export FLASH_ATTENTION_FORCE_CXX11_ABI=${{ inputs.cxx11_abi }}
 
           # 5h timeout since GH allows max 6h and we want some buffer
           EXIT_CODE=0
           timeout 5h python setup.py bdist_wheel --dist-dir=dist || EXIT_CODE=$?
 
           if [ $EXIT_CODE -eq 0 ]; then
-            tmpname=cu${WHEEL_CUDA_VERSION}torch${MATRIX_TORCH_VERSION}cxx11abi${{ inputs.cxx11-abi }}
+            tmpname=cu${WHEEL_CUDA_VERSION}torch${MATRIX_TORCH_VERSION}cxx11abi${{ inputs.cxx11_abi }}
             wheel_name=$(ls dist/*whl | xargs -n 1 basename | sed "s/-/+$tmpname-/2")
             ls dist/*whl |xargs -I {} mv {} dist/${wheel_name}
             echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
@@ -188,7 +188,7 @@ jobs:
         if: always() && steps.build_wheel.outputs.build_exit_code == 124
         uses: actions/cache/save@v4
         with:
-          key: build-${{ inputs.release-version }}-${{ inputs.python-version }}-${{ inputs.cuda-version }}-${{ inputs.torch-version }}-${{ inputs.cxx11-abi }}-${{ github.run_number }}-${{ github.run_attempt }}
+          key: build-${{ inputs.release-version }}-${{ inputs.python-version }}-${{ inputs.cuda-version }}-${{ inputs.torch-version }}-${{ inputs.cxx11_abi }}-${{ github.run_number }}-${{ github.run_attempt }}
           path: build.tar
 
       - name: Log Built Wheels
