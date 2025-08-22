@@ -197,7 +197,6 @@ jobs:
 
       - name: Get Release with tag
         id: get_current_release
-        if: steps.build_wheel.outputs.build_exit_code == 0
         uses: joutvhu/get-release@v1
         with:
           tag_name: ${{ inputs.release-version }}
@@ -206,7 +205,7 @@ jobs:
 
       - name: Upload Release Asset
         id: upload_release_asset
-        if: inputs.upload-to-release && steps.build_wheel.outputs.build_exit_code == 0
+        if: inputs.upload-to-release
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
