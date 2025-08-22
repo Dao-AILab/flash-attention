@@ -42,6 +42,6 @@ jobs:
       python-version: 3.12 # ${{ inputs.python-version }}
       cuda-version: 12.8.0 # ${{ inputs.cuda-version }}
       torch-version: 2.7.1 # ${{ inputs.torch-version }}
-      cxx11-abi: FALSE # ${{ inputs.cxx11_abi }}
+      cxx11_abi: FALSE # ${{ inputs.cxx11_abi }}
       upload-to-release: false
       release-version: v2.7.4.post1 # ${{ inputs.release-version }}
