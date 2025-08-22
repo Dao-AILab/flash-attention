@@ -13,9 +13,6 @@ from flash_attn.utils.benchmark import benchmark_fwd_bwd, benchmark_combined
 
 from flash_attn import flash_attn_qkvpacked_func
 from flash_attn import flash_attn_func
-from flash_attn import flash_attn_sink_func
-from flash_attn_with_sink import flash_attn_with_sink_func
-from flash_attn_with_sink_fused import flash_attn_with_sink_fused_func
 
 try:
     from triton.ops.flash_attention import attention as attention_triton
@@ -81,7 +78,7 @@ headdim_vals = [64, 128]
 dim = 2048
 dropout_p = 0.0
 
-methods = (["Flash2", "Flash2UnPacked", "Pytorch", "Flash2Sink", "Flash2SinkFused"]
+methods = (["Flash2", "Pytorch", "Flash2Sink"]
            + (["Triton"] if attention_triton is not None else [])
            + (["xformers.c"] if xops is not None else [])
            + (["xformers.f"] if xops is not None else []))
@@ -105,13 +102,6 @@ for causal in causal_vals:
             time_f[config, "Flash2"] = f
             time_b[config, "Flash2"] = b
 
-            q, k, v = [torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype,
-                                    requires_grad=True) for _ in range(3)]
-            f, b = time_fwd_bwd(
-                flash_attn_func, q, k, v, dropout_p, causal=causal, repeats=repeats, verbose=False
-            )
-            time_f[config, "Flash2UnPacked"] = f
-            time_b[config, "Flash2UnPacked"] = b
 
             try:
                 qkv = qkv.detach().requires_grad_(True)
@@ -133,27 +123,11 @@ for causal in causal_vals:
             sink = torch.randn((nheads,), dtype=torch.float32, device=device, requires_grad=True)
             
             f, b = time_fwd_bwd(
-                flash_attn_with_sink_fused_func, q, k, v, sink, softmax_scale=scaling, dropout_p=dropout_p, causal=causal, repeats=repeats, verbose=False
+                flash_attn_func, q, k, v, softmax_scale=scaling, dropout_p=dropout_p, causal=causal, learnable_sink=sink, repeats=repeats, verbose=False
             )
-            time_f[config, "Flash2SinkFused"] = f
-            time_b[config, "Flash2SinkFused"] = b
-
-            try:
-                scaling = nheads**-0.5
-                num_key_value_heads = nheads # // 8
-                q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype,
-                                        requires_grad=True)
-                k, v = [torch.randn(batch_size, seqlen, num_key_value_heads, headdim, device=device, dtype=dtype,
-                                        requires_grad=True) for _ in range(2)]
-                sink = torch.randn((nheads,), dtype=dtype, device=device, requires_grad=True)
-                
-                f, b = time_fwd_bwd(
-                    flash_attn_with_sink_func, q, k, v, sink, softmax_scale=scaling, dropout_p=dropout_p, causal=causal, repeats=repeats, verbose=False
-                )
-            except:  # Skip if OOM
-                f, b = float('nan'), float('nan')
             time_f[config, "Flash2Sink"] = f
             time_b[config, "Flash2Sink"] = b
+
 
             if attention_triton is not None:
                 q, k, v = [torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype,

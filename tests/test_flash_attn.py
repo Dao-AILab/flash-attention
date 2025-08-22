@@ -2650,7 +2650,7 @@ def test_flash_attn_sink_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype)
     k_ref = k.transpose(1, 2)
     v_ref = v.transpose(1, 2)
     sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
-    out = flash_attn_func(q, k, v, sink, 0.0, softmax_scale=d**-0.5, causal=causal, window_size=window_size)
+    out = flash_attn_func(q, k, v, 0.0, softmax_scale=d**-0.5, causal=causal, window_size=window_size, learnable_sink=sink)
 
     attention_mask = get_attention_mask(seqlen_q, seqlen_k, causal, device, window_size)
     if attention_mask is not None:

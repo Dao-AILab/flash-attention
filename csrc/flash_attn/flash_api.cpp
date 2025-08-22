@@ -353,6 +353,9 @@ void set_params_sink(Flash_fwd_params &params, const std::optional<const at::Ten
     params.learnable_sink_ptr = nullptr;
 #else
     if (learnable_sink_.has_value()) {
+        // Make the compiler happy by forbidding Learnable sink and ALiBi to party together —
+        // mixing them causes a template explosion and very long compile times!
+        TORCH_CHECK(params.alibi_slopes_ptr == nullptr, "Learnable sink and ALiBi slopes cannot be used together");
         auto learnable_sink = learnable_sink_.value();
         TORCH_CHECK(learnable_sink.dtype() == torch::kFloat32, "Learnable sink must have dtype fp32");
         CHECK_DEVICE(learnable_sink);
