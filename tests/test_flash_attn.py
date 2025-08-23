@@ -1,4 +1,5 @@
 import math
+from typing import Optional
 
 import pytest
 import torch
@@ -562,6 +563,79 @@ def get_dropout_fraction(
         valid.masked_fill_(local_mask, False)
     dropped_total = dropped.sum()
     return dropped.sum() / valid.sum()
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep).
+    The hidden states go from (batch, num_key_value_heads, seqlen, head_dim)
+    to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def attention_sink_ref(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sink: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    num_key_value_groups: int = 8,
+    **kwargs,
+):
+    key_states = repeat_kv(key, num_key_value_groups)
+    value_states = repeat_kv(value, num_key_value_groups)
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_weights = attn_weights + causal_mask
+
+    sinks = sink.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+    combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+    # This was not in the original implementation and slightly affect results;
+    # it prevents overflow in BF16/FP16 when training with bsz>1 we clamp max values.
+    combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+    
+    probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+    scores = probs[..., :-1]  # we drop the sink here
+    attn_weights = torch.nn.functional.dropout(scores, p=dropout, training=True)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, attn_weights
+
+
+def get_attention_mask(
+    seqlen_q,
+    seqlen_k,
+    causal,
+    device,
+    window_size=(-1, -1),
+    query_padding_mask=None,
+    key_padding_mask=None,
+    key_leftpad=None,
+):
+    if causal:
+        window_size = (window_size[0], 0)
+    if window_size[0] >= 0 or window_size[1] >= 0:
+        local_mask = construct_local_mask(
+            seqlen_q,
+            seqlen_k,
+            window_size,
+            query_padding_mask,
+            key_padding_mask,
+            device,
+            key_leftpad=key_leftpad,
+        )
+        return torch.where(local_mask, torch.tensor(float('-inf')), torch.tensor(0.0))
+    return None
 
 
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
@@ -2523,3 +2597,118 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dv, dv0)
         assert torch.equal(dk, dk0)
         assert torch.equal(dq, dq0)
+
+
+@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
+# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("local", [False, True])
+# @pytest.mark.parametrize("local", [True])
+@pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
+# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
+# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
+# @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
+# @pytest.mark.parametrize('d', [56, 80])
+# @pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("swap_sq_sk", [False, True])
+# @pytest.mark.parametrize("swap_sq_sk", [True])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (1, 239), # disable seqlenq_ngroups_swapped
+        (3, 799),
+        (127, 512),
+        (127, 513),
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (1023, 1024),
+    ],
+)
+# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
+def test_flash_attn_sink_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
+    if (
+        max(seqlen_q, seqlen_k) >= 2048
+        and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
+    ):
+        pytest.skip()  # Reference implementation OOM
+    if swap_sq_sk:
+        seqlen_q, seqlen_k = seqlen_k, seqlen_q
+    device = "cuda"
+    causal = True
+    # set seed
+    torch.random.manual_seed(0)
+    batch_size = 1
+    nheads = 64
+    num_key_value_groups = 8
+    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(batch_size, seqlen_k, nheads // num_key_value_groups, d, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads // num_key_value_groups, d, device=device, dtype=dtype, requires_grad=True)
+    q_ref = q.transpose(1, 2)
+    k_ref = k.transpose(1, 2)
+    v_ref = v.transpose(1, 2)
+    sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
+    out = flash_attn_func(q, k, v, 0.0, softmax_scale=d**-0.5, causal=causal, window_size=window_size, learnable_sink=sink)
+
+    attention_mask = get_attention_mask(seqlen_q, seqlen_k, causal, device, window_size)
+    if attention_mask is not None:
+        attention_mask = attention_mask.expand(batch_size, nheads, -1, -1).to(dtype)
+
+    out_ref, _ = attention_sink_ref(q_ref.float(), k_ref.float(), v_ref.float(), sink.float(), attention_mask.float(), d**-0.5, 0.0, num_key_value_groups)
+    out_ref = out_ref.to(dtype)
+    out_pt, _ = attention_sink_ref(q_ref, k_ref, v_ref, sink.to(dtype), attention_mask, d**-0.5, 0.0, num_key_value_groups)
+    
+    print(f"Output max diff: {(out - out_ref).abs().max().detach().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().detach().item()}")
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().detach().item()}")
+    print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().detach().item()}")
+
+    g = torch.randn_like(out)
+    do_o = (g.float() * out.float()).sum(-1)
+    (
+        dq,
+        dk,
+        dv,
+        dsink,
+    ) = torch.autograd.grad(out, (q, k, v, sink), g)
+    (
+        dq_ref,
+        dk_ref,
+        dv_ref,
+        dsink_ref,
+    ) = torch.autograd.grad(out_ref, (q, k, v, sink), g)
+    (
+        dq_pt,
+        dk_pt,
+        dv_pt,
+        dsink_pt,
+    ) = torch.autograd.grad(out_pt, (q, k, v, sink), g)
+    print(f"dQ max diff: {(dq - dq_ref).abs().max().detach().item()}")
+    print(f"dK max diff: {(dk - dk_ref).abs().max().detach().item()}")
+    print(f"dV max diff: {(dv - dv_ref).abs().max().detach().item()}")
+    print(f"dS max diff: {(dsink - dsink_ref).abs().max().detach().item()}")
+    print(f"dQ mean diff: {(dq - dq_ref).abs().mean().detach().item()}")
+    print(f"dK mean diff: {(dk - dk_ref).abs().mean().detach().item()}")
+    print(f"dV mean diff: {(dv - dv_ref).abs().mean().detach().item()}")
+    print(f"dS mean diff: {(dsink - dsink_ref).abs().mean().detach().item()}")
+    print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().detach().item()}")
+    print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().detach().item()}")
+    print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().detach().item()}")
+    print(f"dS Pytorch max diff: {(dsink_pt - dsink_ref).abs().max().detach().item()}")
+    print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().detach().item()}")
+    print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().detach().item()}")
+    print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().detach().item()}")
+    print(f"dS Pytorch mean diff: {(dsink_pt - dsink_ref).abs().mean().detach().item()}")
+    print(f"dS Relative error: {torch.mean(torch.abs(dsink - dsink_ref) / (torch.abs(dsink_ref) + 1e-8)).detach()}")
+    print(f"dS Pytorch relative error: {torch.mean(torch.abs(dsink_pt - dsink_ref) / (torch.abs(dsink_ref) + 1e-8)).detach()}")
+
+    # Check that FlashAttention's numerical error is at most twice the numerical error
+    # of a Pytorch implementation.
+    assert (out - out_ref).abs().max().detach().item() <= 2 * (out_pt - out_ref).abs().max().detach().item() + 1e-5
+
+    assert (dq - dq_ref).abs().max().detach().item() <= 2 * (dq_pt - dq_ref).abs().max().detach().item() + 1e-5
+    assert (dk - dk_ref).abs().max().detach().item() <= 2 * (dk_pt - dk_ref).abs().max().detach().item() + 1e-5
+    assert (dv - dv_ref).abs().max().detach().item() <= 2 * (dv_pt - dv_ref).abs().max().detach().item() + 1e-5
+    assert (dsink - dsink_ref).abs().max().detach().item() <= 2 * (dsink_pt - dsink_ref).abs().max().detach().item() + 1e-5
