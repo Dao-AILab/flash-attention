@@ -1050,13 +1050,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
 def flash_attn_qkvpacked_func(
     qkv,
-    learnable_sink=None,
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0,  # <=0.0 means deactivate
     alibi_slopes=None,
+    learnable_sink=None,
     deterministic=False,
     return_attn_probs=False,
 ):
@@ -1072,8 +1072,6 @@ def flash_attn_qkvpacked_func(
 
     Arguments:
         qkv: (batch_size, seqlen, 3, nheads, headdim)
-        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
-            additional attention logit to each query's attention scores before softmax.
         dropout_p: float. Dropout probability.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
@@ -1082,6 +1080,8 @@ def flash_attn_qkvpacked_func(
         softcap: float. Anything > 0 activates softcapping attention.
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of (-alibi_slope * |i - j|) is added to
             the attention score of query i and key j.
+        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
+            additional attention logit to each query's attention scores before softmax.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
@@ -1114,13 +1114,13 @@ def flash_attn_qkvpacked_func(
 def flash_attn_kvpacked_func(
     q,
     kv,
-    learnable_sink,
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0,  # 0.0 means deactivated
     alibi_slopes=None,
+    learnable_sink=None,
     deterministic=False,
     return_attn_probs=False,
 ):
@@ -1152,8 +1152,6 @@ def flash_attn_kvpacked_func(
     Arguments:
         q: (batch_size, seqlen, nheads, headdim)
         kv: (batch_size, seqlen, 2, nheads_k, headdim)
-        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
-            additional attention logit to each query's attention scores before softmax.
         dropout_p: float. Dropout probability.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
@@ -1163,6 +1161,8 @@ def flash_attn_kvpacked_func(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
+            additional attention logit to each query's attention scores before softmax.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
@@ -1197,13 +1197,13 @@ def flash_attn_func(
     q,
     k,
     v,
-    learnable_sink,
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
+    learnable_sink=None,
     deterministic=False,
     return_attn_probs=False,
 ):
@@ -1233,8 +1233,6 @@ def flash_attn_func(
         q: (batch_size, seqlen, nheads, headdim)
         k: (batch_size, seqlen, nheads_k, headdim)
         v: (batch_size, seqlen, nheads_k, headdim)
-        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
-            additional attention logit to each query's attention scores before softmax.
         dropout_p: float. Dropout probability.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
@@ -1243,6 +1241,8 @@ def flash_attn_func(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
+            additional attention logit to each query's attention scores before softmax.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
@@ -1276,7 +1276,6 @@ def flash_attn_func(
 
 def flash_attn_varlen_qkvpacked_func(
     qkv,
-    learnable_sink,
     cu_seqlens,
     max_seqlen,
     dropout_p=0.0,
@@ -1285,6 +1284,7 @@ def flash_attn_varlen_qkvpacked_func(
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
+    learnable_sink=None,
     deterministic=False,
     return_attn_probs=False,
 ):
@@ -1300,8 +1300,6 @@ def flash_attn_varlen_qkvpacked_func(
 
     Arguments:
         qkv: (total, 3, nheads, headdim), where total = total number of tokens in the batch.
-        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
-            additional attention logit to each query's attention scores before softmax.
         cu_seqlens: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
            of the sequences in the batch, used to index into qkv.
         max_seqlen: int. Maximum sequence length in the batch.
@@ -1313,6 +1311,8 @@ def flash_attn_varlen_qkvpacked_func(
         softcap: float. Anything > 0 activates softcapping attention.
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of (-alibi_slope * |i - j|)
             is added to the attention score of query i and key j.
+        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
+            additional attention logit to each query's attention scores before softmax.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
@@ -1347,7 +1347,6 @@ def flash_attn_varlen_qkvpacked_func(
 def flash_attn_varlen_kvpacked_func(
     q,
     kv,
-    learnable_sink,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -1358,6 +1357,7 @@ def flash_attn_varlen_kvpacked_func(
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
+    learnable_sink=None,
     deterministic=False,
     return_attn_probs=False,
 ):
@@ -1389,8 +1389,6 @@ def flash_attn_varlen_kvpacked_func(
     Arguments:
         q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
         kv: (total_k, 2, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
-            additional attention logit to each query's attention scores before softmax.
         cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
            of the sequences in the batch, used to index into q.
         cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
@@ -1406,6 +1404,8 @@ def flash_attn_varlen_kvpacked_func(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
+            additional attention logit to each query's attention scores before softmax.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
@@ -1444,7 +1444,6 @@ def flash_attn_varlen_func(
     q,
     k,
     v,
-    learnable_sink,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -1455,6 +1454,7 @@ def flash_attn_varlen_func(
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
+    learnable_sink=None,
     deterministic=False,
     return_attn_probs=False,
     block_table=None,
@@ -1485,8 +1485,6 @@ def flash_attn_varlen_func(
         q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
         k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
         v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
-            additional attention logit to each query's attention scores before softmax.
         cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
            of the sequences in the batch, used to index into q.
         cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
@@ -1502,6 +1500,8 @@ def flash_attn_varlen_func(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
+            additional attention logit to each query's attention scores before softmax.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
