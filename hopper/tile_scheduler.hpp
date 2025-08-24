@@ -24,8 +24,11 @@ struct TileSchedulerArguments {
     int* const tile_count_semaphore = nullptr;
     int const* const cu_seqlens = nullptr;
     int const* const seqused = nullptr;
-    // int const* const num_m_blocks_ptr = nullptr;
     int const* const num_splits_dynamic_ptr = nullptr;
+    int const* const num_m_blocks_ptr = nullptr;
+    int const* const varlen_batch_idx_ptr = nullptr;
+    // int const* const num_n_blocks_ptr = nullptr;
+    int const* const num_nheads_in_l2_ptr = nullptr;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -463,7 +466,8 @@ public:
 
 ///////////////////////////////////////////////////////////////////////////////
 
-template<int kBlock, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp, bool Split=false, bool PackGQA=false, bool WarpSpecialized=true>
+template<int kBlockM, int kBlockN, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
+         bool Split=false, bool PackGQA=false, bool WarpSpecialized=true, bool LPT = false, bool Sort = false, bool Prepared = true>
 class VarlenDynamicPersistentTileScheduler {
 
     static_assert(WarpSpecialized || NumProducerThreads == NumMmaThreads);
@@ -482,13 +486,17 @@ public:
         int num_head, num_batch;
         int const qhead_per_khead;
         int const seqlen;
+        // int const max_kvblocks_in_l2;
         cutlass::FastDivmod head_divmod;
         cutlass::FastDivmod nsplits_divmod;
         int* const tile_count_semaphore;
         int const* const cu_seqlens;
         int const* const seqused;
-        // int* const num_m_blocks_ptr;
         int const* const num_splits_dynamic_ptr;
+        int const* const num_m_blocks_ptr;
+        int const* const varlen_batch_idx_ptr;
+        // int const* const num_n_blocks_ptr;
+        int const* const num_nheads_in_l2_ptr;
     };
 
     static Params
@@ -498,13 +506,20 @@ public:
         assert(args.tile_count_semaphore != nullptr);
         assert(args.num_head < (1 << 16));  // We use the top 16 bits to store num_splits & split_idx
         assert(!Split || args.num_splits < (1 << 8)); // We use the top 8 bits to store num_splits
+        // int const size_l2 = 50 * 1024 * 1024; // 50 MB
+        // int const size_one_kvblock = kBlockN * (args.headdim + args.headdim_v) * args.element_size;
+        // int max_kvblocks_in_l2 = size_l2 / size_one_kvblock;
         return {args.num_head, args.num_batch,
                 args.qhead_per_khead, args.seqlen,
+                // max_kvblocks_in_l2,
                 cutlass::FastDivmod(args.num_head),
                 cutlass::FastDivmod(!Split ? 1 : args.num_splits),
                 args.tile_count_semaphore, args.cu_seqlens, args.seqused,
-                // args.num_m_blocks_ptr,
-                args.num_splits_dynamic_ptr};
+                args.num_splits_dynamic_ptr,
+                args.num_m_blocks_ptr,
+                args.varlen_batch_idx_ptr,
+                // aras.num_n_blocks_ptr,
+                args.num_nheads_in_l2_ptr};
     }
 
     static dim3
@@ -525,8 +540,15 @@ public:
         CUTLASS_DEVICE
         cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
+            auto get_actual_batch = [&](int virtual_batch) {
+                if constexpr(Prepared && Sort) {
+                    return params.varlen_batch_idx_ptr[virtual_batch];
+                } else {
+                    return virtual_batch;
+                }
+            };
             if constexpr (!Split) {
-                return {block, bidh, bidb, 0 /*split_idx*/};
+                return {block, bidh, get_actual_batch(bidb), 0 /*split_idx*/};
             } else {
                 // the top 8 bits of bidh store num_splits and the next 8 bits store split_idx
                 // reinterpret_cast to uint32_t to make sure we're not doing sign extension when we shift
@@ -540,7 +562,7 @@ public:
                 // if (threadIdx.x == 128) {
                 //     printf("blockIdx.x = %d, bidb = %d, bidh = %d, bidh_actual = %d, split_idx = %d\n", blockIdx.x, bidb, bidh, bidh_actual, split_idx);
                 // }
-                return {block, bidh_actual, bidb, split_idx};
+                return {block, bidh_actual, get_actual_batch(bidb), split_idx};
             }
         }
     };
@@ -554,31 +576,39 @@ public:
         int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
         auto get_num_m_blocks = [&] (int bidb_start) {
             int batch_idx = lane + bidb_start;
-            int seqlen = params.seqlen * (!PackGQA ? 1 : params.qhead_per_khead);
-            if (seqlen > kBlock) {
-                if (params.seqused) {
-                    seqlen = batch_idx < params.num_batch ? params.seqused[batch_idx] : 0;
-                } else if (params.cu_seqlens) {
-                    int cur_cu_seqlen = batch_idx <= params.num_batch ? params.cu_seqlens[batch_idx] : 0;
-                    int next_cu_seqlen = __shfl_down_sync(0xffffffff, cur_cu_seqlen, 1);
-                    seqlen = next_cu_seqlen - cur_cu_seqlen;
-                } else {
-                    seqlen = params.seqlen;
+            if constexpr (Prepared) {
+                return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
+                    ? params.num_m_blocks_ptr[batch_idx] : 0;
+            } else {
+                int seqlen = params.seqlen * (!PackGQA ? 1 : params.qhead_per_khead);
+                if (seqlen > kBlockM) {
+                    if (params.seqused) {
+                        seqlen = batch_idx < params.num_batch ? params.seqused[batch_idx] : 0;
+                    } else if (params.cu_seqlens) {
+                        int cur_cu_seqlen = batch_idx <= params.num_batch ? params.cu_seqlens[batch_idx] : 0;
+                        int next_cu_seqlen = __shfl_down_sync(0xffffffff, cur_cu_seqlen, 1);
+                        seqlen = next_cu_seqlen - cur_cu_seqlen;
+                    } else {
+                        seqlen = params.seqlen;
+                    }
+                    if constexpr (PackGQA) { seqlen *= params.qhead_per_khead; }
                 }
-                if constexpr (PackGQA) { seqlen *= params.qhead_per_khead; }
+                return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
+                    ? cute::ceil_div(seqlen, kBlockM) : 0;
+                    // ? params.num_m_blocks_ptr[batch_idx] : 0;
             }
-            return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
-                ? cute::ceil_div(seqlen, kBlock) : 0;
-                // ? params.num_m_blocks_ptr[batch_idx] : 0;
         };
 
         auto get_num_splits = [&] (int bidb_start) {
             int batch_idx = lane + bidb_start;
-            return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
-                ? (!Split ? 1 : (params.num_splits_dynamic_ptr
-                                ? params.num_splits_dynamic_ptr[batch_idx]
-                                : params.nsplits_divmod.divisor))
-                : 0;
+            bool is_valid = batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1;
+            if constexpr (!Split) {
+                return is_valid ? 1 : 0;
+            } else if constexpr(Prepared) {
+                return is_valid ? params.num_splits_dynamic_ptr[batch_idx] : 0;
+            } else {
+                return is_valid ? params.nsplits_divmod.divisor : 0;
+            }
         };
 
         int num_m_blocks = get_num_m_blocks(current_work.bidb);  // Different for each lane
@@ -589,12 +619,14 @@ public:
         // Total number of blocks for the next 31 batches
         int m_blocks_in_group = __shfl_sync(0xffffffff, num_m_blocks_cumulative, cutlass::NumThreadsPerWarp - 1);
         // Only the lower 16 bits are the actual bidh
-        int current_bidh = !Split ? current_work.bidh : (current_work.bidh & 0x0000FFFF);
-        int group_end_tile = current_work.tile_idx - current_work.block - current_bidh * __shfl_sync(0xffffffff, num_split_m_blocks, 0 /*lane*/) + m_blocks_in_group * params.num_head;  // Same for all lanes
-        if constexpr (Split) {
-            int current_split_idx = (current_work.bidh & 0x00FF0000) >> 16;
-            group_end_tile -= current_split_idx * __shfl_sync(0xffffffff, num_m_blocks, 0 /*lane*/);
-        }
+        // int current_bidh = !Split ? current_work.bidh : (current_work.bidh & 0x0000FFFF);
+        // int group_end_tile = current_work.tile_idx - current_work.block - current_bidh * __shfl_sync(0xffffffff, num_split_m_blocks, 0 /*lane*/) + m_blocks_in_group * params.num_head;  // Same for all lanes
+        // if constexpr (Split) {
+        //     int current_split_idx = (current_work.bidh & 0x00FF0000) >> 16;
+        //     group_end_tile -= current_split_idx * __shfl_sync(0xffffffff, num_m_blocks, 0 /*lane*/);
+        // }
+        // NEW: current_work.tile_idx holds group_start_tile for starting batch
+        int group_end_tile = current_work.tile_idx + m_blocks_in_group * params.num_head;  // Same for all lanes
         int bidb = current_work.bidb;
         // if (blockIdx.x <= 9 && threadIdx.x == 0) {
         //     printf("Before while, blockIdx.x = %d, threadIdx.x = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, cur tile_idx = %d, cur block = %d, cur bidh = %d, num_split_m_blocks = %d, group_end_tile = %d, m_blocks_in_group = %d\n", blockIdx.x, threadIdx.x, current_work.bidb, num_m_blocks, next_tile_idx, current_work.tile_idx, current_work.block, current_bidh, num_split_m_blocks, group_end_tile, m_blocks_in_group);
@@ -626,27 +658,81 @@ public:
         bidb += batch_idx_in_group;
         num_m_blocks = __shfl_sync(0xffffffff, num_m_blocks, batch_idx_in_group);
         if constexpr (Split) { num_splits = __shfl_sync(0xffffffff, num_splits, batch_idx_in_group); }
-        int mh_block = next_tile_idx - group_start_tile - (batch_idx_in_group == 0 ? 0 : __shfl_sync(0xffffffff, num_m_blocks_cumulative, batch_idx_in_group - 1)) * params.num_head;
-        int bidh = mh_block / num_m_blocks;
-        int block = mh_block - bidh * num_m_blocks;
-        if constexpr (Split) {
-            int bidh_actual = bidh / num_splits;
-            int split_idx = bidh - bidh_actual * num_splits;
-            // TODO: idk why this gives wrong answer nondeterministically
-            // int bidh_actual, split_idx;
-            // split_idx = params.head_divmod.divmod(bidh_actual, bidh);
-            // Use the top 8 bits to store num_splits and the next 8 bits to store split_idx
-            // reinterpret_cast to uint32_t to make sure we're not doing sign extension when we shift
-            uint32_t bidh_packed = reinterpret_cast<uint32_t&>(bidh_actual) + (reinterpret_cast<uint32_t&>(split_idx) << 16) + (reinterpret_cast<uint32_t&>(num_splits) << 24);
-            // if (threadIdx.x == 0) {
-            //     printf("blockIdx.x = %d, group_start_tiled = %d, bidb = %d, batch_idx_in_group = %d, mh_block = %d, num_m_blocks = %d, bidh = %d, bidh_actual = %d, split_idx = %d, num_splits = %d, bidh_packed = %d\n", blockIdx.x, group_start_tile, bidb, batch_idx_in_group, mh_block, num_m_blocks, bidh, bidh_actual, split_idx, num_splits, bidh_packed);
+        group_start_tile += (batch_idx_in_group == 0 ? 0 : __shfl_sync(0xffffffff, num_m_blocks_cumulative, batch_idx_in_group - 1)) * params.num_head;
+        int mh_block = next_tile_idx - group_start_tile;
+        int block, bidh;
+        if constexpr (LPT) {
+            if (!Split || num_splits == 1) {
+                // NOTE: code for computing nheads_in_l2 directly left as reference
+                // int num_n_blocks = params.num_n_blocks_ptr ? params.num_n_blocks_ptr[bidb] : num_m_blocks;
+                // auto find_log2_floor = [&](int n) { return 31 - cutlass::clz(n); };
+                // int nheads_in_l2 = params.max_kvblocks_in_l2 < num_n_blocks
+                //     ? 1 : 1 << find_log2_floor(params.max_kvblocks_in_l2 / num_n_blocks);
+                // if constexpr (!PackGQA) { nheads_in_l2 *= params.qhead_per_khead; }
+                // nheads_in_l2 = min(nheads_in_l2, params.num_head);
+                auto get_nheads_in_l2 = [&](int batch_idx) {
+                    if constexpr(Prepared) {
+                        return params.num_nheads_in_l2_ptr[batch_idx];
+                    } else {
+                        return !PackGQA ? params.qhead_per_khead : 1;
+                    }
+                };
+                int nheads_in_l2 = get_nheads_in_l2(bidb);
+                int mh_in_l2 = nheads_in_l2 * num_m_blocks;
+                int section_idx = mh_block / mh_in_l2;
+                int l2_mod = mh_block - section_idx * mh_in_l2;
+                // tail section
+                int nheads_remainder = params.num_head - section_idx * nheads_in_l2;
+                int nheads_in_this_section = nheads_in_l2 <= nheads_remainder ? nheads_in_l2 : nheads_remainder;
+                block = l2_mod / nheads_in_this_section;
+                int bidh_residual = l2_mod - block * nheads_in_this_section;
+                bidh = section_idx * nheads_in_l2 + bidh_residual;
+                if constexpr(Split) {
+                    // remember to set num_splits = 1 in work tile
+                    uint32_t bidh_packed = reinterpret_cast<uint32_t&>(bidh) + (reinterpret_cast<uint32_t&>(num_splits) << 24);
+                    bidh = reinterpret_cast<int&>(bidh_packed);
+                }
+            } else {
+                // NOTE: leave traverse heads first version for reference
+                // block = params.head_divmod.divmod(bidh, mh_block);
+                // if constexpr (Split) {
+                //     int split_idx = block / num_m_blocks;
+                //     block = block - split_idx * num_m_blocks;
+                //     uint32_t bidh_packed = reinterpret_cast<uint32_t&>(bidh) + (reinterpret_cast<uint32_t&>(split_idx) << 16) + (reinterpret_cast<uint32_t&>(num_splits) << 24);
+                //     bidh = reinterpret_cast<int&>(bidh_packed);
+                // }
+                bidh = mh_block / num_m_blocks;
+                block = mh_block - bidh * num_m_blocks;
+                if constexpr (Split) {
+                    int bidh_actual = bidh / num_splits;
+                    int split_idx = bidh - bidh_actual * num_splits;
+                    uint32_t bidh_packed = reinterpret_cast<uint32_t&>(bidh_actual) + (reinterpret_cast<uint32_t&>(split_idx) << 16) + (reinterpret_cast<uint32_t&>(num_splits) << 24);
+                    bidh = reinterpret_cast<int&>(bidh_packed);
+                }
+            }
+            block = num_m_blocks - 1 - block;
+        } else {
+            bidh = mh_block / num_m_blocks;
+            block = mh_block - bidh * num_m_blocks;
+            if constexpr (Split) {
+                int bidh_actual = bidh / num_splits;
+                int split_idx = bidh - bidh_actual * num_splits;
+                // TODO: idk why this gives wrong answer nondeterministically
+                // int bidh_actual, split_idx;
+                // split_idx = params.head_divmod.divmod(bidh_actual, bidh);
+                // Use the top 8 bits to store num_splits and the next 8 bits to store split_idx
+                // reinterpret_cast to uint32_t to make sure we're not doing sign extension when we shift
+                uint32_t bidh_packed = reinterpret_cast<uint32_t&>(bidh_actual) + (reinterpret_cast<uint32_t&>(split_idx) << 16) + (reinterpret_cast<uint32_t&>(num_splits) << 24);
+                // if (threadIdx.x == 0) {
+                //     printf("blockIdx.x = %d, group_start_tiled = %d, bidb = %d, batch_idx_in_group = %d, mh_block = %d, num_m_blocks = %d, bidh = %d, bidh_actual = %d, split_idx = %d, num_splits = %d, bidh_packed = %d\n", blockIdx.x, group_start_tile, bidb, batch_idx_in_group, mh_block, num_m_blocks, bidh, bidh_actual, split_idx, num_splits, bidh_packed);
+                // }
+                bidh = reinterpret_cast<int&>(bidh_packed);
+            }
+            // if (blockIdx.x <= 9 && threadIdx.x == 0) {
+            //     printf("Before returning, blockIdx.x = %d, threadIdx.x = %d, group_start_tile = %d, batch_idx_in_group = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, group_end_tile = %d, m_blocks_in_group = %d, mh_block = %d, bidh = %d, block = %d\n", blockIdx.x, threadIdx.x, group_start_tile, batch_idx_in_group, bidb, num_m_blocks, next_tile_idx, group_end_tile, m_blocks_in_group, mh_block, bidh, block);
             // }
-            bidh = reinterpret_cast<int&>(bidh_packed);
         }
-        // if (blockIdx.x <= 9 && threadIdx.x == 0) {
-        //     printf("Before returning, blockIdx.x = %d, threadIdx.x = %d, group_start_tile = %d, batch_idx_in_group = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, group_end_tile = %d, m_blocks_in_group = %d, mh_block = %d, bidh = %d, block = %d\n", blockIdx.x, threadIdx.x, group_start_tile, batch_idx_in_group, bidb, num_m_blocks, next_tile_idx, group_end_tile, m_blocks_in_group, mh_block, bidh, block);
-        // }
-        return {next_tile_idx, block, bidh, bidb};
+        return {group_start_tile, block, bidh, bidb};
     }
 
     template<bool IsProducerWarp=false>

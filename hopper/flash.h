@@ -152,10 +152,16 @@ struct Flash_fwd_params : public Qkv_params {
     bool pack_gqa;
 
     int * __restrict__ tile_count_semaphore;
-    // int * __restrict__ num_m_blocks_ptr;
+    int * __restrict__ num_m_blocks_ptr;
     // int * __restrict__ num_n_blocks_ptr;
     int * __restrict__ num_splits_dynamic_ptr;
+    int * __restrict__ varlen_batch_idx_ptr; // virtual -> actual
+    int * __restrict__ num_nheads_in_l2_ptr;
     bool skip_scheduler_metadata_computation;
+    bool varlen_sort_batches;
+    int tile_count_semaphore_offset;
+    bool head_swizzle;
+    bool prepare_varlen_pdl;
 
     int arch;
     int num_sm;

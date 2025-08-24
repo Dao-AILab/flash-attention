@@ -55,7 +55,7 @@ class Softmax:
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
         row_scale = cute.make_fragment_like(self.row_max, Float32)
         # Each iteration processes one row of acc_S
-        for r in cutlass.range_constexpr(cute.size(self.row_max)):
+        for r in cutlass.range(cute.size(self.row_max), unroll_full=True):
             acc_S_row = acc_S_mn[r, None].load()  # (n_block_size)
             row_max_cur = self._compute_row_max(
                 acc_S_row,
@@ -84,12 +84,18 @@ class Softmax:
         return row_scale
 
     @cute.jit
-    def finalize(self, final_scale: Float32 = 1.0) -> cute.Tensor:
+    def finalize(self, final_scale: Float32 = 1.0, sink_val: Float32 | cute.Tensor | None = None) -> cute.Tensor:
         """Finalize the online softmax by computing the scale and logsumexp."""
+        if cutlass.const_expr(sink_val is not None and isinstance(sink_val, cute.Tensor)):
+            assert cute.size(sink_val) == cute.size(self.row_sum)
         # quad reduction for row_sum as we didn't do it during each iteration of online softmax
         self.row_sum.store(utils.warp_reduce(self.row_sum.load(), operator.add, width=4))
         row_scale = cute.make_fragment_like(self.row_max, Float32)
-        for r in cutlass.range_constexpr(cute.size(self.row_sum)):
+        for r in cutlass.range(cute.size(self.row_sum), unroll_full=True):
+            if cutlass.const_expr(sink_val is not None):
+                sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
+                LOG2_E = math.log2(math.e)
+                self.row_sum[r] += utils.exp2f(sink_val_cur * LOG2_E - self.row_max[r] * self.scale_log2)
             # if row_sum is zero or nan, set acc_O_mn_row to 1.0
             acc_O_mn_row_is_zero_or_nan = (
                 self.row_sum[r] == 0.0 or self.row_sum[r] != self.row_sum[r]
@@ -116,7 +122,7 @@ class Softmax:
         """
         acc_O_mn = utils.make_acc_tensor_mn_view(acc_O)
         assert cute.size(row_scale) == cute.size(acc_O_mn, mode=[0])
-        for r in cutlass.range_constexpr(cute.size(row_scale)):
+        for r in cutlass.range(cute.size(row_scale), unroll_full=True):
             acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])
 
 
@@ -162,7 +168,7 @@ class SoftmaxSm100(Softmax):
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         row_max_scaled = row_max * self.scale_log2
-        for i in cutlass.range_constexpr(0, cute.size(acc_S_row.shape), 2):
+        for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
             acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
                 (acc_S_row[i], acc_S_row[i + 1]),
                 (self.scale_log2, self.scale_log2),

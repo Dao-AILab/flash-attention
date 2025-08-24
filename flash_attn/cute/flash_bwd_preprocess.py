@@ -233,7 +233,7 @@ class FlashAttentionBackwardPreprocess:
         assert cute.size(tOgO, mode=[0]) == cute.size(tOgdO, mode=[0])
         assert cute.size(tOgO, mode=[1]) == cute.size(tOgdO, mode=[1])
         assert cute.size(tOgO, mode=[2]) == cute.size(tOgdO, mode=[2])
-        for m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
+        for m in cutlass.range(cute.size(tOrO.shape[1]), unroll_full=True):
             # Instead of using tOcO, we using t0OcO and subtract the offset from the limit
             # (seqlen_q - m_block * kBlockM). This is because the entries of t0OcO are known at compile time.
             if t0OcO[0, m, 0][0] < seqlen_q - m_block * self.m_block_size - tOcO[0][0]:
@@ -263,7 +263,7 @@ class FlashAttentionBackwardPreprocess:
         )
         # Only the thread corresponding to column 0 writes out the lse to gmem
         if tOcO[0, 0, 0][1] == 0:
-            for m in cutlass.range_constexpr(cute.size(dP_sum)):
+            for m in cutlass.range(cute.size(dP_sum), unroll_full=True):
                 row = tOcO[0, m, 0][0]
                 gdPsum[row] = dP_sum[m] if row < mO.shape[1] - m_block * self.m_block_size else 0.0
 

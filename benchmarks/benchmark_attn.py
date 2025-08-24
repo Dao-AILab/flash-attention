@@ -93,10 +93,11 @@ def convert_to_cudnn_type(torch_type):
 def cudnn_spda_setup(q, k, v, causal=False, window_size_left=None):
     b, nheads, seqlen_q, headdim = q.shape
     _, nheads_k, seqlen_k, _ = k.shape
-    assert v.shape == (b, nheads_k, seqlen_k, headdim)
+    headdim_v = v.shape[-1]
+    assert v.shape == (b, nheads_k, seqlen_k, headdim_v)
     assert cudnn is not None, 'CUDNN is not available'
     q_gpu, k_gpu, v_gpu = q, k, v
-    o_gpu = torch.empty_like(q_gpu)
+    o_gpu = torch.empty((b, nheads, seqlen_q, headdim_v), dtype=q.dtype, device=q.device)
     stats_gpu = torch.empty(b, nheads, seqlen_q, 1, dtype=torch.float32, device=q.device)
     graph = cudnn.pygraph(
         io_data_type=convert_to_cudnn_type(q.dtype),
@@ -148,9 +149,10 @@ def cudnn_spda_setup(q, k, v, causal=False, window_size_left=None):
 def cudnn_spda_bwd_setup(q, k, v, o, g, lse, causal=False, window_size_left=None):
     b, nheads, seqlen_q, headdim = q.shape
     _, nheads_k, seqlen_k, _ = k.shape
-    assert v.shape == (b, nheads_k, seqlen_k, headdim)
-    assert g.shape == (b, nheads, seqlen_q, headdim)
-    assert o.shape == (b, nheads, seqlen_q, headdim)
+    headdim_v = v.shape[-1]
+    assert v.shape == (b, nheads_k, seqlen_k, headdim_v)
+    assert g.shape == (b, nheads, seqlen_q, headdim_v)
+    assert o.shape == (b, nheads, seqlen_q, headdim_v)
     assert lse.shape == (b, nheads, seqlen_q, 1)
     assert cudnn is not None, 'CUDNN is not available'
     q_gpu, k_gpu, v_gpu, o_gpu, g_gpu = q, k, v, o, g
@@ -226,6 +228,7 @@ verbose = True
 varlen = False
 has_backward = False
 page_size = None
+# page_size = 128
 softcap = 0.0
 V_colmajor = False
 deterministic = False
@@ -255,20 +258,24 @@ time_b = {}
 # for headdim in [64, 128, 256]:
 # for headdim in [64, 96, 128, 192, 256]:
 for headdim in [128]:
-    nheads = dim // headdim
+    # nheads = dim // headdim
+    nheads = 32 if headdim <= 64 else 16 if headdim <= 192 else 8
     # nheads = 128
     # headdim = 64
     # batch_size = 64
     # seqlen = 512
     # nheads = 8
     # headdim = 128
-    nheads_kv = nheads
-    # nheads_kv = nheads // 4
+    # nheads_kv = nheads
+    nheads_kv = nheads // 8
     # nheads_kv = 1
-    headdim_v = headdim
+    # headdim_v = headdim
+    headdim_v = 128 if headdim == 192 else headdim
     # headdim_v = 512
     has_qv = headdim == 64 and headdim_v == 512
     # has_qv = False
+    # sinks = torch.randn(nheads, dtype=torch.bfloat16, device=device)
+    sinks = None
 
     for batch_size, seqlen in bs_seqlen_vals:
         num_splits = 0
@@ -297,7 +304,7 @@ for headdim in [128]:
         if varlen:
             q_unpad, k_unpad, v_unpad = [rearrange(x.detach(), "b s h d -> (b s) h d").requires_grad_(has_backward) for x in [q, k, v]]
             cu_seqlens_q = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen_q
-            cu_seqlens_k = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen
+            cu_seqlens_k = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen if page_size is None else None
             # cu_seqlens_q = torch.tensor([0, 248, 249, 250, 251, 252, 253, 254, 255, 256], device=device, dtype=torch.int32)
             # q_unpad = q_unpad[:256]
             # seqlen_q = 256
@@ -318,9 +325,10 @@ for headdim in [128]:
             nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen, headdim if not has_qv else headdim + headdim_v, headdim_v, causal=causal, window_size=window_size)
             if cudnn is not None:
             # if False:
-                if headdim <= 256 and dtype != torch.float8_e4m3fn and headdim == headdim_v:
+                if headdim <= 256 and dtype != torch.float8_e4m3fn:
                     cudnn_spda = cudnn_spda_setup(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=causal, window_size_left=window_size[0])
-                    cudnn_spda_bwd = cudnn_spda_bwd_setup(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), o.transpose(1, 2), g.transpose(1, 2), stats.transpose(1, 2), causal=causal, window_size_left=window_size[0])
+                    if has_backward and headdim == headdim_v:
+                        cudnn_spda_bwd = cudnn_spda_bwd_setup(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), o.transpose(1, 2), g.transpose(1, 2), stats.transpose(1, 2), causal=causal, window_size_left=window_size[0])
             if dtype != torch.float8_e4m3fn and headdim == headdim_v and flash_attn_func is not None:
             # if False:
                 if not varlen:
@@ -341,13 +349,14 @@ for headdim in [128]:
 
             if cudnn is not None:
             # if False:
-                if headdim <= 256 and dtype != torch.float8_e4m3fn and headdim == headdim_v:
+                if headdim <= 256 and dtype != torch.float8_e4m3fn:
                     time.sleep(1) # Sleep to avoid residual power throttling from the previous benchmark
                     m2 = time_fwd(cudnn_spda, repeats=repeats, verbose=verbose, desc='CuDNN')
                     time_f[(causal, headdim, batch_size, seqlen), "cuDNN"] = m2.mean
-                    time.sleep(1)
-                    m2b = time_fwd(cudnn_spda_bwd, repeats=repeats, verbose=verbose, desc='CuDNN')
-                    time_b[(causal, headdim, batch_size, seqlen), "cuDNN"] = m2b.mean
+                    if has_backward:
+                        time.sleep(1)
+                        m2b = time_fwd(cudnn_spda_bwd, repeats=repeats, verbose=verbose, desc='CuDNN')
+                        time_b[(causal, headdim, batch_size, seqlen), "cuDNN"] = m2b.mean
                 # pytorch_profiler(cudnn_spda, backward=False)
                 # pytorch_profiler(cudnn_spda_bwd, backward=False)
             time.sleep(1)
@@ -362,9 +371,9 @@ for headdim in [128]:
                 time_f[(causal, headdim, batch_size, seqlen), "Flash3"] = m1.mean
             if flash_attn_func_python is not None:
                 if not varlen:
-                    m1_py = time_fwd(flash_attn_func_python, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, causal=causal, window_size=window_size, softcap=softcap, repeats=repeats, verbose=verbose, desc='Fav3 python')
+                    m1_py = time_fwd(flash_attn_func_python, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, causal=causal, window_size=window_size, learnable_sink=sinks, softcap=softcap, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3 python')
                 else:
-                    m1_py = time_fwd(flash_attn_varlen_func_python, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, causal=causal, window_size=window_size, softcap=softcap, repeats=repeats, verbose=verbose, desc='Fav3 python')
+                    m1_py = time_fwd(flash_attn_varlen_func_python, q_unpad, k_unpad if page_size is None else k_paged, v_unpad if page_size is None else v_paged, cu_seqlens_q, cu_seqlens_k, page_table=page_table, causal=causal, window_size=window_size, softcap=softcap, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3 python')
             if dtype != torch.float8_e4m3fn and headdim == headdim_v and flash_attn_func_v3 is not None and has_backward:
                 time.sleep(1)
                 if not varlen:
