@@ -690,6 +690,7 @@ mha_fwd_get_scheduler_metadata(
         int tile_count_semaphore_offset = b_rounded * num_prepare_batch_vectors;
         // printf("(Metadata) num prepare batch vectors = %d.\n", num_prepare_batch_vectors);
         tile_count_semaphore = torch::stable::new_empty(
+            seqused_k,
             {int(scheduler_needs_semaphore) + tile_count_semaphore_offset},
             std::make_optional(torch::headeronly::ScalarType::Int));
         // {num_splits_dynamic, num_m_blocks, varlen_batch_idx, num_nheads_in_l2}
@@ -1082,9 +1083,9 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     }
 
     if (q_v_.has_value()) {
-        TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
-        TORCH_CHECK(head_size_v >= 256, "q_v is only supported for hdim_v >= 256.");
-        TORCH_CHECK(q_type == torch::headeronly::ScalarType::Half || q_type == torch::headeronly::ScalarType::BFloat16,
+        STD_TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
+        STD_TORCH_CHECK(head_size_v >= 256, "q_v is only supported for hdim_v >= 256.");
+        STD_TORCH_CHECK(q_type == torch::headeronly::ScalarType::Half || q_type == torch::headeronly::ScalarType::BFloat16,
                     "q_v is only supported for fp16 and bf16 data type");
         STD_TORCH_CHECK(params.arch == 90, "q_v is only supported for Hopper GPUs");
         Tensor q_v = q_v_.value();
@@ -1598,8 +1599,10 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     params.dq_semaphore = static_cast<int*>(dq_semaphore.data_ptr());
     if (num_heads_k != num_heads && params.deterministic) {
         // TODO: maybe also zero'ed out dk_semaphore and dv_semaphore in the backward preprocess kernel
-        Tensor dk_semaphore = torch::stable::zero_(torch::stable::new_empty({(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(torch::headeronly::ScalarType::Int)));
-        Tensor dv_semaphore = torch::stable::zero_(torch::stable::new_empty({(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(torch::headeronly::ScalarType::Int)));
+        Tensor dk_semaphore = torch::stable::new_empty(q, {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(torch::headeronly::ScalarType::Int));
+        zero_(dk_semaphore);
+        Tensor dv_semaphore = torch::stable::new_empty(q, {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(torch::headeronly::ScalarType::Int));
+        zero_(dv_semaphore);
         params.dk_semaphore = static_cast<int*>(dk_semaphore.data_ptr());
         params.dv_semaphore = static_cast<int*>(dv_semaphore.data_ptr());
     }
