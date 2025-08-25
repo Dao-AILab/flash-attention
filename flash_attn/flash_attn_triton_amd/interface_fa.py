@@ -74,11 +74,9 @@ def fwd(q: torch.Tensor,
     if alibi_slopes is not None:
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
 
-    if dropout_p > 0.0:
-        metadata.need_dropout(dropout_p)
-        rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset]) # as_tensors uses the underlying data and doesnot cast
-    else:
-        rng_state = None
+    # store rng state
+    metadata.need_dropout(dropout_p, return_softmax)
+    rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset]) # as_tensors uses the underlying data and doesnot cast
 
     # check arguments
     metadata.check_args(q, k, v, out)
@@ -212,8 +210,7 @@ def bwd(
     dk = torch.zeros_like(k) if dk is None else dk.zero_()
     dv = torch.zeros_like(v) if dv is None else dv.zero_()
 
-    if dropout_p > 0.0:
-        assert rng_state is not None
+    if rng_state is not None:
         philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
     else:
         philox_seed, philox_offset = None, None
@@ -423,11 +420,9 @@ def varlen_fwd(
     if alibi_slopes is not None:
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
 
-    if dropout_p > 0.0:
-        metadata.need_dropout(dropout_p)
-        rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset]) # as_tensors uses the underlying data and doesnot cast
-    else:
-        rng_state = None
+    # store rng state
+    metadata.need_dropout(dropout_p, return_softmax)
+    rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset]) # as_tensors uses the underlying data and doesnot cast
 
     # Check arguments
     metadata.check_args(q, k, v, out)
@@ -563,8 +558,7 @@ def varlen_bwd(
     dk = torch.zeros_like(k) if dk is None else dk.zero_()
     dv = torch.zeros_like(v) if dv is None else dv.zero_()
 
-    if dropout_p > 0.0:
-        assert rng_state is not None
+    if rng_state is not None:
         philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
     else:
         philox_seed, philox_offset = None, None

@@ -1161,7 +1161,7 @@ def attention_prefill_backward_triton_split_impl(
     delta = torch.zeros_like(softmax_lse)
     if IS_VARLEN:
         stride_deltab = 0
-        stride_deltam, stride_deltah = delta.stride()
+        stride_deltah, stride_deltam = delta.stride()
     else:
         stride_deltab, stride_deltah, stride_deltam = delta.stride()
     pre_grid = (triton.cdiv(max_seqlen_q_final, PRE_BLOCK), batch, nheads_q)
