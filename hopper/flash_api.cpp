@@ -34,7 +34,6 @@ std::vector<cudaDeviceProp> device_properties;
 void initVectors() {
   static bool init_flag [[maybe_unused]] = []() {
     int device_count;
-    // FIXME: change to stable::accelerator version of device count
     cudaError_t err = cudaGetDeviceCount(&device_count);
     if (err != cudaSuccess) {
       STD_TORCH_CHECK(false, "cudaGetDeviceProperties failed: " +
