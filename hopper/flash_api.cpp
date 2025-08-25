@@ -584,7 +584,7 @@ mha_fwd_get_scheduler_metadata(
         int64_t num_heads_k,
         int64_t headdim,
         int64_t headdim_v,
-        at::ScalarType qkv_dtype,
+        torch::headeronly::ScalarType qkv_dtype,
         Tensor seqused_k, // b
         std::optional<Tensor> cu_seqlens_q_,  // b+1
         std::optional<Tensor> cu_seqlens_k_,  // b+1
@@ -602,14 +602,14 @@ mha_fwd_get_scheduler_metadata(
         std::optional<bool> pack_gqa_,
         int64_t sm_margin) {
 
-    STD_TORCH_CHECK(qkv_dtype == at::ScalarType::Half || qkv_dtype == at::ScalarType::BFloat16 || qkv_dtype == at::ScalarType::Float8_e4m3fn,
+    STD_TORCH_CHECK(qkv_dtype == torch::headeronly::ScalarType::Half || qkv_dtype == torch::headeronly::ScalarType::BFloat16 || qkv_dtype == torch::headeronly::ScalarType::Float8_e4m3fn,
                 "FlashAttention only supports fp16, bf16, and fp8_e4m3 data type");
     STD_TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     // Reset the parameters
     Flash_fwd_params params{};
-    params.is_bf16 = qkv_dtype == at::ScalarType::BFloat16;
-    params.is_e4m3 = qkv_dtype == at::ScalarType::Float8_e4m3fn;
+    params.is_bf16 = qkv_dtype == torch::headeronly::ScalarType::BFloat16;
+    params.is_e4m3 = qkv_dtype == torch::headeronly::ScalarType::Float8_e4m3fn;
     params.b = batch_size;
     params.seqlen_q = max_seqlen_q;
     params.seqlen_k = max_seqlen_k;
@@ -770,10 +770,10 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     STD_TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
 
     auto q_type = q.scalar_type();
-    STD_TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16 || q_type == at::ScalarType::Float8_e4m3fn,
+    STD_TORCH_CHECK(q_type == torch::headeronly::ScalarType::Half || q_type == torch::headeronly::ScalarType::BFloat16 || q_type == torch::headeronly::ScalarType::Float8_e4m3fn,
                 "FlashAttention only supports fp16, bf16, and fp8_e4m3 data type");
     if (dprops->major < 9) {
-        STD_TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
+        STD_TORCH_CHECK(q_type == torch::headeronly::ScalarType::Half || q_type == torch::headeronly::ScalarType::BFloat16,
                     "FlashAttention on Ampere/Ada cards only supports fp16 and bf16 data type");
     }
     STD_TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
@@ -843,7 +843,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
                    "or (Q/K <= 64 and V <= 512).");
         STD_TORCH_CHECK(dprops->major == 9, "Only Hopper supports different V headdim");
         if (head_size_v > 256) {
-            STD_TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
+            STD_TORCH_CHECK(q_type == torch::headeronly::ScalarType::Half || q_type == torch::headeronly::ScalarType::BFloat16,
                         "HeaddimV > 256 requires fp16 and bf16 data type");
         }
     }
@@ -912,7 +912,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     STD_TORCH_CHECK(head_size % alignment == 0, "head_size should be a multiple of " + std::to_string(alignment));
     STD_TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
-    auto out_type = q_type == at::ScalarType::Float8_e4m3fn ? at::ScalarType::BFloat16 : q_type;
+    auto out_type = q_type == torch::headeronly::ScalarType::Float8_e4m3fn ? torch::headeronly::ScalarType::BFloat16 : q_type;
     Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -1084,7 +1084,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     if (q_v_.has_value()) {
         TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
         TORCH_CHECK(head_size_v >= 256, "q_v is only supported for hdim_v >= 256.");
-        TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
+        TORCH_CHECK(q_type == torch::headeronly::ScalarType::Half || q_type == torch::headeronly::ScalarType::BFloat16,
                     "q_v is only supported for fp16 and bf16 data type");
         STD_TORCH_CHECK(params.arch == 90, "q_v is only supported for Hopper GPUs");
         Tensor q_v = q_v_.value();
@@ -1146,7 +1146,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     }
 
     Tensor out_accum, softmax_lse_accum;
-    auto outaccum_type = at::ScalarType::Float;
+    auto outaccum_type = torch::headeronly::ScalarType::Float;
     if (params.num_splits > 1) {
         STD_TORCH_CHECK(params.num_splits <= 256, "num_splits > 256 not supported");
         if (!is_varlen_q) {
@@ -1168,7 +1168,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         params.lseaccum_head_stride = softmax_lse_accum.stride(-2);
     }
 
-    if (q_type == at::ScalarType::Float8_e4m3fn) {
+    if (q_type == torch::headeronly::ScalarType::Float8_e4m3fn) {
         if (q_descale_.has_value()) {
             auto q_descale = q_descale_.value();
             CHECK_DEVICE(q_descale);
@@ -1225,7 +1225,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         auto stream = (cudaStream_t)torch::stable::accelerator::getCurrentStream(device_idx).id();
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
-            if (out_type == at::ScalarType::BFloat16) {
+            if (out_type == torch::headeronly::ScalarType::BFloat16) {
                 // Since we want output in BF16. Otherwise fwd_combine will output to FP16
                 params.is_bf16 = true;
             }
@@ -1598,10 +1598,10 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     params.dq_semaphore = static_cast<int*>(dq_semaphore.data_ptr());
     if (num_heads_k != num_heads && params.deterministic) {
         // TODO: maybe also zero'ed out dk_semaphore and dv_semaphore in the backward preprocess kernel
-        at::Tensor dk_semaphore = torch::stable::zero_(torch::stable::new_empty({(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, opts.dtype(torch::kInt32)));
-        at::Tensor dv_semaphore = torch::stable::zero_(torch::stable::new_empty({(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, opts.dtype(torch::kInt32)));
-        params.dk_semaphore = dk_semaphore.data_ptr<int>();
-        params.dv_semaphore = dv_semaphore.data_ptr<int>();
+        Tensor dk_semaphore = torch::stable::zero_(torch::stable::new_empty({(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(torch::headeronly::ScalarType::Int)));
+        Tensor dv_semaphore = torch::stable::zero_(torch::stable::new_empty({(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(torch::headeronly::ScalarType::Int)));
+        params.dk_semaphore = static_cast<int*>(dk_semaphore.data_ptr());
+        params.dv_semaphore = static_cast<int*>(dv_semaphore.data_ptr());
     }
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
@@ -1632,7 +1632,7 @@ std::tuple<Tensor, Tensor>
 mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x num_heads x head_size
             Tensor lse_partial,         // num_splits x batch_size x seqlen x num_heads
             std::optional<Tensor> out_,        // batch_size x seqlen x num_heads x head_size
-            std::optional<at::ScalarType> out_dtype_
+            std::optional<torch::headeronly::ScalarType> out_dtype_
             ) {
 
     auto dprops = get_device_prop();
@@ -1640,8 +1640,8 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
     STD_TORCH_CHECK(is_sm8x, "Attention combine function only supports Ampere GPUs or newer.");
 
     auto out_partial_type = out_partial.scalar_type();
-    STD_TORCH_CHECK(out_partial_type == at::ScalarType::Float, "Attention combine function only support fp32 data type");
-    STD_TORCH_CHECK(lse_partial.scalar_type() == at::ScalarType::Float, "Attention combine function only support fp32 data type");
+    STD_TORCH_CHECK(out_partial_type == torch::headeronly::ScalarType::Float, "Attention combine function only support fp32 data type");
+    STD_TORCH_CHECK(lse_partial.scalar_type() == torch::headeronly::ScalarType::Float, "Attention combine function only support fp32 data type");
 
     CHECK_DEVICE(out_partial); CHECK_DEVICE(lse_partial);
 
@@ -1671,8 +1671,8 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
     const int head_size = round_multiple(head_size_og, alignment);
 
     // auto opts = out_partial.options();
-    at::ScalarType out_type = out_dtype_.value_or(out_partial.scalar_type());
-    STD_TORCH_CHECK(out_type == at::ScalarType::Float || out_type == at::ScalarType::BFloat16 || out_type == at::ScalarType::Half, "Output type must be FP32, FP16 or BF16");
+    torch::headeronly::ScalarType out_type = out_dtype_.value_or(out_partial.scalar_type());
+    STD_TORCH_CHECK(out_type == torch::headeronly::ScalarType::Float || out_type == torch::headeronly::ScalarType::BFloat16 || out_type == torch::headeronly::ScalarType::Half, "Output type must be FP32, FP16 or BF16");
     Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -1695,8 +1695,8 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
     softmax_lse = torch::stable::transpose(softmax_lse, 1, 2);
 
     Flash_fwd_params params {};  // Need to reset the params to set everything to zero
-    params.is_fp32 = out_type == at::ScalarType::Float;
-    params.is_bf16 = out_type == at::ScalarType::BFloat16;
+    params.is_fp32 = out_type == torch::headeronly::ScalarType::Float;
+    params.is_bf16 = out_type == torch::headeronly::ScalarType::BFloat16;
     params.oaccum_ptr = out_partial_padded.data_ptr();
     params.softmax_lseaccum_ptr = lse_partial.data_ptr();
     params.o_ptr = out.data_ptr();
@@ -1830,7 +1830,7 @@ void boxed_mha_combine(
     auto out_partial = to<Tensor>(stack[0]);
     auto lse_partial = to<Tensor>(stack[1]);
     auto out = to<std::optional<Tensor>>(stack[2]);
-    auto out_dtype = to<std::optional<at::ScalarType>>(stack[3]);
+    auto out_dtype = to<std::optional<torch::headeronly::ScalarType>>(stack[3]);
 
     auto [out_, softmax_lse] = mha_combine(out_partial, lse_partial, out, out_dtype);
 
@@ -1850,7 +1850,7 @@ void boxed_mha_fwd_get_scheduler_metadata(
     auto num_heads_k = to<int64_t>(stack[4]);
     auto headdim = to<int64_t>(stack[5]);
     auto headdim_v = to<int64_t>(stack[6]);
-    auto qkv_dtype = to<at::ScalarType>(stack[7]);
+    auto qkv_dtype = to<torch::headeronly::ScalarType>(stack[7]);
     auto seqused_k = to<Tensor>(stack[8]);
     auto cu_seqlens_q = to<std::optional<Tensor>>(stack[9]);
     auto cu_seqlens_k = to<std::optional<Tensor>>(stack[10]);
