@@ -1243,7 +1243,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
             run_mha_fwd_combine(params, stream, true /*enable_pdl*/);
         } else if (scheduler_needs_semaphore && params.skip_scheduler_metadata_computation) {
             // need to zero out the semaphore in this case
-            auto slice = torch::stable::narrow(tile_count_semaphore, 0, params.tile_count_semaphore_offset, params.tile_count_semaphore_offset + 1);
+            auto slice = torch::stable::narrow(tile_count_semaphore, 0, params.tile_count_semaphore_offset, 1);
             torch::stable::zero_(slice);
         }
     } else if (total_q > 0 && num_heads_k > 0) {
