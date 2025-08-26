@@ -226,6 +226,7 @@ def attention_ref(
     dropout_mask=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite window size
+    learnable_sink=None,
     softcap=0.0,
     upcast=True,
     reorder_ops=False,
@@ -284,7 +285,16 @@ def attention_ref(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
-    attention = torch.softmax(scores, dim=-1).to(v.dtype)
+    if learnable_sink is None:
+        attention = torch.softmax(scores, dim=-1).to(v.dtype)
+    else:
+        scores_fp32 = scores.to(torch.float32)
+        logits_max = torch.amax(scores_fp32, dim=-1, keepdim=True)
+        learnable_sink = rearrange(learnable_sink, "h -> h 1 1")
+        logits_or_sinks_max = torch.maximum(learnable_sink, logits_max)
+        unnormalized_scores = torch.exp(scores_fp32 - logits_or_sinks_max)
+        normalizer = unnormalized_scores.sum(dim=-1, keepdim=True) + torch.exp(learnable_sink - logits_or_sinks_max)
+        attention = (unnormalized_scores / normalizer).to(v.dtype)
     # Some rows might be completely masked out so we fill them with zero instead of NaN
     if window_size[0] >= 0 or window_size[1] >= 0:
         attention = attention.masked_fill(torch.all(local_mask, dim=-1, keepdim=True), 0.0)
@@ -315,6 +325,7 @@ def attention_kvpacked_ref(
     dropout_mask=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite window size
+    learnable_sink=None,
     softcap=0.0,
     upcast=True,
     reorder_ops=False,
@@ -332,6 +343,7 @@ def attention_kvpacked_ref(
         upcast=upcast,
         causal=causal,
         window_size=window_size,
+        learnable_sink=learnable_sink,
         softcap=softcap,
         reorder_ops=reorder_ops,
         key_leftpad=key_leftpad,
@@ -346,6 +358,7 @@ def attention_qkvpacked_ref(
     dropout_mask=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite window size
+    learnable_sink=None,
     softcap=0.0,
     upcast=True,
     reorder_ops=False,
@@ -362,6 +375,7 @@ def attention_qkvpacked_ref(
         upcast=upcast,
         causal=causal,
         window_size=window_size,
+        learnable_sink=learnable_sink,
         softcap=softcap,
         reorder_ops=reorder_ops,
     )
@@ -474,6 +488,7 @@ def normalize_flash_attn_S(
     is_dropout=False,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite window size
+    learnable_sink=None,
 ):
     """
     Arguments:
@@ -508,11 +523,16 @@ def normalize_flash_attn_S(
     block_size_n = _get_block_size_n(scores.device, head_dim, is_dropout, causal)
     scores_block = scores.split(block_size_n, dim=-1)
     lse_block = torch.stack([torch.logsumexp(s, dim=-1) for s in scores_block], dim=-1)
-    lse = torch.logsumexp(lse_block, dim=-1)
+    if learnable_sink is None:
+        lse = torch.logsumexp(lse_block, dim=-1)
+        scores_max_block = torch.stack([torch.amax(s, dim=-1) for s in scores_block], dim=-1)
+    else:
+        sinks = learnable_sink.reshape(1, -1, 1, 1).expand(scores.shape[0], -1, scores.shape[2], -1)
+        lse = torch.logsumexp(torch.cat([lse_block, sinks], dim=-1), dim=-1)
+        scores_max_block = torch.stack([torch.amax(torch.cat([s, sinks], dim=-1), dim=-1) for s in scores_block], dim=-1)
     # lse could be -inf (i.e. all values in scores are -inf), and we want to set those to inf
     # so that when we do torch.exp(m - lse), we get 0.0 instead of NaN.
     lse[lse == float("-inf")] = float("inf")
-    scores_max_block = torch.stack([torch.amax(s, dim=-1) for s in scores_block], dim=-1)
     cummax_block = torch.cummax(scores_max_block.flip(-1), dim=-1).values.flip(-1).unbind(dim=-1)
     attn_unnorm_block = attn_unnorm.split(block_size_n, dim=-1)
     attn_norm = torch.cat(
@@ -657,9 +677,12 @@ def get_attention_mask(
 # @pytest.mark.parametrize("seqlen", [512])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 # @pytest.mark.parametrize("dropout_p", [0.0])
-def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype):
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
+def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype, has_learnable_sink):
     if seqlen >= 2048 and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
+    if alibi and has_learnable_sink:
+        pytest.skip("Alibi and learnable sink not supported together")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -674,12 +697,17 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen, seqlen, causal=causal)
     else:
         alibi_slopes, attn_bias = None, None
+    if has_learnable_sink:
+        learnable_sink = torch.randn(nheads, device=device, dtype=torch.float32, requires_grad=True)
+    else:
+        learnable_sink = None
     out, lse, S_dmask = flash_attn_qkvpacked_func(
         qkv,
         dropout_p,
         causal=causal,
         window_size=window_size,
         alibi_slopes=alibi_slopes,
+        learnable_sink=learnable_sink,
         deterministic=deterministic,
         return_attn_probs=True,
     )
@@ -708,6 +736,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
             dropout_p > 0.0,
             causal=causal,
             window_size=window_size,
+            learnable_sink=learnable_sink,
         )
         dropout_fraction = get_dropout_fraction(
             dropout_mask, None, None, causal=causal, window_size=window_size
@@ -717,7 +746,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         dropout_mask = None
 
     out_ref, attn_ref = attention_qkvpacked_ref(
-        qkv, None, attn_bias, dropout_p, dropout_mask, causal=causal, window_size=window_size
+        qkv, None, attn_bias, dropout_p, dropout_mask, causal=causal, window_size=window_size, learnable_sink=learnable_sink
     )
     out_pt, attn_pt = attention_qkvpacked_ref(
         qkv,
@@ -727,6 +756,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         dropout_mask,
         causal=causal,
         window_size=window_size,
+        learnable_sink=learnable_sink,
         upcast=False,
         reorder_ops=True,
     )
@@ -761,9 +791,9 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
     # dv_tmp = torch.einsum('bhts,bthd->bshd', attn_pt[:, :, :64], g[:, :64])
     # dv_tmp1 = torch.einsum('bhts,bthd->bshd', attn_pt[:, :, 64:], g[:, 64:])
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
-        (dqkv,) = torch.autograd.grad(out, qkv, g)
-        (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g)
-        (dqkv_pt,) = torch.autograd.grad(out_pt, qkv, g)
+        (dqkv,) = torch.autograd.grad(out, qkv, g, retain_graph=has_learnable_sink)
+        (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g, retain_graph=has_learnable_sink)
+        (dqkv_pt,) = torch.autograd.grad(out_pt, qkv, g, retain_graph=has_learnable_sink)
         print(f"dQ max diff: {(dqkv[:, :, 0] - dqkv_ref[:, :, 0]).abs().max().item()}")
         print(f"dK max diff: {(dqkv[:, :, 1] - dqkv_ref[:, :, 1]).abs().max().item()}")
         print(f"dV max diff: {(dqkv[:, :, 2] - dqkv_ref[:, :, 2]).abs().max().item()}")
@@ -772,6 +802,14 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         print(f"dK Pytorch max diff: {(dqkv_pt[:, :, 1] - dqkv_ref[:, :, 1]).abs().max().item()}")
         print(f"dV Pytorch max diff: {(dqkv_pt[:, :, 2] - dqkv_ref[:, :, 2]).abs().max().item()}")
         print(f"dQKV Pytorch mean diff: {(dqkv_pt - dqkv_ref).abs().mean().item()}")
+        if has_learnable_sink:
+            (dsink,) = torch.autograd.grad(out, learnable_sink, g)
+            (dsink_ref,) = torch.autograd.grad(out_ref, learnable_sink, g)
+            (dsink_pt,) = torch.autograd.grad(out_pt, learnable_sink, g)
+            print(f"dSink max diff: {(dsink - dsink_ref).abs().max().item()}")
+            print(f"dSink mean diff: {(dsink - dsink_ref).abs().mean().item()}")
+            print(f"dSink Pytorch max diff: {(dsink_pt - dsink_ref).abs().max().item()}")
+            print(f"dSink Pytorch mean diff: {(dsink_pt - dsink_ref).abs().mean().item()}")
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
@@ -785,6 +823,9 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
 
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
+        if has_learnable_sink:
+            tol_multiplier = 7 if dtype == torch.float16 and dropout_p > 0.0 else 3
+            assert (dsink - dsink_ref).abs().max().item() <= tol_multiplier * (dsink_pt - dsink_ref).abs().max().item()
 
 
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
@@ -804,11 +845,14 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
 # @pytest.mark.parametrize('seqlen', [128])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 # @pytest.mark.parametrize('dropout_p', [0.0])
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
 def test_flash_attn_varlen_qkvpacked(
-    seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype
+    seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype, has_learnable_sink
 ):
     if seqlen >= 2048 and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
+    if alibi and has_learnable_sink:
+        pytest.skip("Alibi and learnable sink not supported together")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -818,6 +862,10 @@ def test_flash_attn_varlen_qkvpacked(
     qkv = torch.randn(
         batch_size, seqlen, 3, nheads, d, device=device, dtype=dtype, requires_grad=True
     )
+    if has_learnable_sink:
+        learnable_sink = torch.randn(nheads, device=device, dtype=torch.float32, requires_grad=True)
+    else:
+        learnable_sink = None
 
     key_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode="random")
     # key_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode='full')
@@ -841,6 +889,7 @@ def test_flash_attn_varlen_qkvpacked(
         causal=causal,
         window_size=window_size,
         alibi_slopes=alibi_slopes,
+        learnable_sink=learnable_sink,
         deterministic=deterministic,
         return_attn_probs=True,
     )
@@ -870,6 +919,7 @@ def test_flash_attn_varlen_qkvpacked(
             dropout_p > 0.0,
             causal=causal,
             window_size=window_size,
+            learnable_sink=learnable_sink,
         )
         dropout_fraction = get_dropout_fraction(
             dropout_mask, key_padding_mask, key_padding_mask, causal=causal, window_size=window_size
@@ -886,6 +936,7 @@ def test_flash_attn_varlen_qkvpacked(
         dropout_mask,
         causal=causal,
         window_size=window_size,
+        learnable_sink=learnable_sink,
     )
     out_pt, attn_pt = attention_qkvpacked_ref(
         qkv,
@@ -895,6 +946,7 @@ def test_flash_attn_varlen_qkvpacked(
         dropout_mask,
         causal=causal,
         window_size=window_size,
+        learnable_sink=learnable_sink,
         upcast=False,
         reorder_ops=True,
     )
@@ -908,10 +960,10 @@ def test_flash_attn_varlen_qkvpacked(
 
     g = torch.randn_like(out)
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
-        (dqkv_unpad,) = torch.autograd.grad(out, qkv_unpad, g)
+        (dqkv_unpad,) = torch.autograd.grad(out, qkv_unpad, g, retain_graph=has_learnable_sink)
         dqkv = dqkv_pad_fn(dqkv_unpad)
-        (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g)
-        (dqkv_pt,) = torch.autograd.grad(out_pt, qkv, g)
+        (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g, retain_graph=has_learnable_sink)
+        (dqkv_pt,) = torch.autograd.grad(out_pt, qkv, g, retain_graph=has_learnable_sink)
         print(f"dQ max diff: {(dqkv[:, :, 0] - dqkv_ref[:, :, 0]).abs().max().item()}")
         print(f"dK max diff: {(dqkv[:, :, 1] - dqkv_ref[:, :, 1]).abs().max().item()}")
         print(f"dV max diff: {(dqkv[:, :, 2] - dqkv_ref[:, :, 2]).abs().max().item()}")
@@ -920,6 +972,14 @@ def test_flash_attn_varlen_qkvpacked(
         print(f"dK Pytorch max diff: {(dqkv_pt[:, :, 1] - dqkv_ref[:, :, 1]).abs().max().item()}")
         print(f"dV Pytorch max diff: {(dqkv_pt[:, :, 2] - dqkv_ref[:, :, 2]).abs().max().item()}")
         print(f"dQKV Pytorch mean diff: {(dqkv_pt - dqkv_ref).abs().mean().item()}")
+        if has_learnable_sink:
+            (dsink,) = torch.autograd.grad(out, learnable_sink, g)
+            (dsink_ref,) = torch.autograd.grad(out_ref, learnable_sink, g)
+            (dsink_pt,) = torch.autograd.grad(out_pt, learnable_sink, g)
+            print(f"dSink max diff: {(dsink - dsink_ref).abs().max().item()}")
+            print(f"dSink mean diff: {(dsink - dsink_ref).abs().mean().item()}")
+            print(f"dSink Pytorch max diff: {(dsink_pt - dsink_ref).abs().max().item()}")
+            print(f"dSink Pytorch mean diff: {(dsink_pt - dsink_ref).abs().mean().item()}")
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
@@ -933,6 +993,9 @@ def test_flash_attn_varlen_qkvpacked(
 
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
+        if has_learnable_sink:
+            tol_multiplier = 7 if dtype == torch.float16 and dropout_p > 0.0 else 3
+            assert (dsink - dsink_ref).abs().max().item() <= tol_multiplier * (dsink_pt - dsink_ref).abs().max().item()
 
 
 @pytest.mark.parametrize("kvpacked", [True, False])
@@ -974,8 +1037,9 @@ def test_flash_attn_varlen_qkvpacked(
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 # @pytest.mark.parametrize("dropout_p", [0.0])
 @pytest.mark.parametrize("softcap", [0.0, 50.0])
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
 def test_flash_attn_output(
-    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
+    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap, has_learnable_sink
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
@@ -984,6 +1048,8 @@ def test_flash_attn_output(
         pytest.skip()  # Reference implementation OOM
     if softcap > 0.0 and dropout_p > 0.0:
         pytest.skip("Softcap and dropout not supported together")
+    if alibi and has_learnable_sink:
+        pytest.skip("Alibi and learnable sink not supported together")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -1012,7 +1078,10 @@ def test_flash_attn_output(
         attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen_q, seqlen_k, causal=causal)
     else:
         alibi_slopes, attn_bias = None, None
-
+    if has_learnable_sink:
+        learnable_sink = torch.randn(nheads, device=device, dtype=torch.float32, requires_grad=True)
+    else:
+        learnable_sink = None
     if kvpacked:
         out, lse, S_dmask = flash_attn_kvpacked_func(
             q,
@@ -1022,6 +1091,7 @@ def test_flash_attn_output(
             window_size=window_size,
             softcap=softcap,
             alibi_slopes=alibi_slopes,
+            learnable_sink=learnable_sink,
             deterministic=deterministic,
             return_attn_probs=True,
         )
@@ -1035,6 +1105,7 @@ def test_flash_attn_output(
             window_size=window_size,
             softcap=softcap,
             alibi_slopes=alibi_slopes,
+            learnable_sink=learnable_sink,
             deterministic=deterministic,
             return_attn_probs=True,
         )
@@ -1069,6 +1140,7 @@ def test_flash_attn_output(
             dropout_p > 0.0,
             causal=causal,
             window_size=window_size,
+            learnable_sink=learnable_sink,
         )
         dropout_fraction = get_dropout_fraction(
             dropout_mask, None, None, causal=causal, window_size=window_size
@@ -1088,6 +1160,7 @@ def test_flash_attn_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            learnable_sink=learnable_sink,
             softcap=softcap,
         )
         out_pt, attn_pt = attention_kvpacked_ref(
@@ -1100,6 +1173,7 @@ def test_flash_attn_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            learnable_sink=learnable_sink,
             softcap=softcap,
             upcast=False,
             reorder_ops=True,
@@ -1116,6 +1190,7 @@ def test_flash_attn_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            learnable_sink=learnable_sink,
             softcap=softcap,
         )
         out_pt, attn_pt = attention_ref(
@@ -1129,6 +1204,7 @@ def test_flash_attn_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            learnable_sink=learnable_sink,
             softcap=softcap,
             upcast=False,
             reorder_ops=True,
@@ -1149,34 +1225,34 @@ def test_flash_attn_output(
             (
                 dq,
                 dkv,
-            ) = torch.autograd.grad(out, (q, kv), g)
+            ) = torch.autograd.grad(out, (q, kv), g, retain_graph=has_learnable_sink)
             dk, dv = dkv.unbind(2)
             (
                 dq_ref,
                 dkv_ref,
-            ) = torch.autograd.grad(out_ref, (q, kv), g)
+            ) = torch.autograd.grad(out_ref, (q, kv), g, retain_graph=has_learnable_sink)
             dk_ref, dv_ref = dkv_ref.unbind(2)
             (
                 dq_pt,
                 dkv_pt,
-            ) = torch.autograd.grad(out_pt, (q, kv), g)
+            ) = torch.autograd.grad(out_pt, (q, kv), g, retain_graph=has_learnable_sink)
             dk_pt, dv_pt = dkv_pt.unbind(2)
         else:
             (
                 dq,
                 dk,
                 dv,
-            ) = torch.autograd.grad(out, (q, k, v), g)
+            ) = torch.autograd.grad(out, (q, k, v), g, retain_graph=has_learnable_sink)
             (
                 dq_ref,
                 dk_ref,
                 dv_ref,
-            ) = torch.autograd.grad(out_ref, (q, k, v), g)
+            ) = torch.autograd.grad(out_ref, (q, k, v), g, retain_graph=has_learnable_sink)
             (
                 dq_pt,
                 dk_pt,
                 dv_pt,
-            ) = torch.autograd.grad(out_pt, (q, k, v), g)
+            ) = torch.autograd.grad(out_pt, (q, k, v), g, retain_graph=has_learnable_sink)
         print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
         print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
         print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
@@ -1189,6 +1265,14 @@ def test_flash_attn_output(
         print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
         print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+        if has_learnable_sink:
+            dsink, = torch.autograd.grad(out, (learnable_sink,), g)
+            dsink_ref, = torch.autograd.grad(out_ref, (learnable_sink,), g)
+            dsink_pt, = torch.autograd.grad(out_pt, (learnable_sink,), g)
+            print(f"dSink max diff: {(dsink - dsink_ref).abs().max().item()}")
+            print(f"dSink mean diff: {(dsink - dsink_ref).abs().mean().item()}")
+            print(f"dSink Pytorch max diff: {(dsink_pt - dsink_ref).abs().max().item()}")
+            print(f"dSink Pytorch mean diff: {(dsink_pt - dsink_ref).abs().mean().item()}")
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
@@ -1204,6 +1288,8 @@ def test_flash_attn_output(
         assert (dq - dq_ref).abs().max().item() <= 3 * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= 3 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 3 * (dv_pt - dv_ref).abs().max().item()
+        if has_learnable_sink:
+            assert (dsink - dsink_ref).abs().max().item() <= 3 * (dsink_pt - dsink_ref).abs().max().item()
 
 
 @pytest.mark.parametrize("kvpacked", [True, False])
@@ -1220,9 +1306,9 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("local", [True])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize('causal', [True])
-@pytest.mark.parametrize("d", [32, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
+# @pytest.mark.parametrize("d", [32, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [64])
+@pytest.mark.parametrize('d', [64])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1243,8 +1329,9 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 @pytest.mark.parametrize("softcap", [0.0, 50.0])
 # @pytest.mark.parametrize('dropout_p', [0.0])
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
 def test_flash_attn_varlen_output(
-    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
+    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap, has_learnable_sink
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
@@ -1253,6 +1340,8 @@ def test_flash_attn_varlen_output(
         pytest.skip()  # Reference implementation OOM
     if softcap > 0.0 and dropout_p > 0.0:
         pytest.skip("Softcap and dropout not supported together")
+    if alibi and has_learnable_sink:
+        pytest.skip("Alibi and learnable sink not supported together")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -1277,7 +1366,10 @@ def test_flash_attn_varlen_output(
         v = torch.randn(
             batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
         )
-
+    if has_learnable_sink:
+        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
+    else:
+        learnable_sink = None
     query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random")
     key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode="random")
     # key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode='full')
@@ -1313,6 +1405,7 @@ def test_flash_attn_varlen_output(
             dropout_p,
             causal=causal,
             window_size=window_size,
+            learnable_sink=learnable_sink,
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             deterministic=deterministic,
@@ -1345,6 +1438,7 @@ def test_flash_attn_varlen_output(
             dropout_p,
             causal=causal,
             window_size=window_size,
+            learnable_sink=learnable_sink,
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             deterministic=deterministic,
@@ -1433,6 +1527,7 @@ def test_flash_attn_varlen_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            learnable_sink=learnable_sink,
             softcap=softcap,
         )
         out_pt, attn_pt = attention_ref(
@@ -1446,6 +1541,7 @@ def test_flash_attn_varlen_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            learnable_sink=learnable_sink,
             softcap=softcap,
             upcast=False,
             reorder_ops=True,
@@ -1465,36 +1561,36 @@ def test_flash_attn_varlen_output(
             (
                 dq_unpad,
                 dkv_unpad,
-            ) = torch.autograd.grad(out, (q_unpad, kv_unpad), g)
+            ) = torch.autograd.grad(out, (q_unpad, kv_unpad), g, retain_graph=has_learnable_sink)
             dk, dv = dkv_pad_fn(dkv_unpad).unbind(2)
             (
                 dq_ref,
                 dkv_ref,
-            ) = torch.autograd.grad(out_ref, (q, kv), g)
+            ) = torch.autograd.grad(out_ref, (q, kv), g, retain_graph=has_learnable_sink)
             dk_ref, dv_ref = dkv_ref.unbind(2)
             (
                 dq_pt,
                 dkv_pt,
-            ) = torch.autograd.grad(out_pt, (q, kv), g)
+            ) = torch.autograd.grad(out_pt, (q, kv), g, retain_graph=has_learnable_sink)
             dk_pt, dv_pt = dkv_pt.unbind(2)
         else:
             (
                 dq_unpad,
                 dk_unpad,
                 dv_unpad,
-            ) = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g)
+            ) = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g, retain_graph=has_learnable_sink)
             dk = dk_pad_fn(dk_unpad)
             dv = dk_pad_fn(dv_unpad)
             (
                 dq_ref,
                 dk_ref,
                 dv_ref,
-            ) = torch.autograd.grad(out_ref, (q, k, v), g)
+            ) = torch.autograd.grad(out_ref, (q, k, v), g, retain_graph=has_learnable_sink)
             (
                 dq_pt,
                 dk_pt,
                 dv_pt,
-            ) = torch.autograd.grad(out_pt, (q, k, v), g)
+            ) = torch.autograd.grad(out_pt, (q, k, v), g, retain_graph=has_learnable_sink)
         dq = dq_pad_fn(dq_unpad)
         print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
         print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
@@ -1508,6 +1604,14 @@ def test_flash_attn_varlen_output(
         print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
         print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+        if has_learnable_sink:
+            dsink, = torch.autograd.grad(out, (learnable_sink,), g)
+            dsink_ref, = torch.autograd.grad(out_ref, (learnable_sink,), g)
+            dsink_pt, = torch.autograd.grad(out_pt, (learnable_sink,), g)
+            print(f"dSink max diff: {(dsink - dsink_ref).abs().max().item()}")
+            print(f"dSink mean diff: {(dsink - dsink_ref).abs().mean().item()}")
+            print(f"dSink Pytorch max diff: {(dsink_pt - dsink_ref).abs().max().item()}")
+            print(f"dSink Pytorch mean diff: {(dsink_pt - dsink_ref).abs().mean().item()}")
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
@@ -1552,8 +1656,8 @@ def test_flash_attn_varlen_output(
         (1023, 1024),
     ],
 )
-# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
-def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
+@pytest.mark.parametrize("has_learnable_sink", [True, False])
+def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype, has_learnable_sink):
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
@@ -1571,9 +1675,13 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
-    out = flash_attn_func(q, k, v, 0.0, causal=causal, window_size=window_size)
+    if has_learnable_sink:
+        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
+    else:
+        learnable_sink = None
+    out = flash_attn_func(q, k, v, 0.0, causal=causal, window_size=window_size, learnable_sink=learnable_sink)
     out_ref, attn_ref = attention_ref(
-        q, k, v, None, None, None, 0.0, None, causal=causal, window_size=window_size
+        q, k, v, None, None, None, 0.0, None, causal=causal, window_size=window_size, learnable_sink=learnable_sink
     )
     out_pt, attn_pt = attention_ref(
         q,
@@ -1586,6 +1694,7 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
         None,
         causal=causal,
         window_size=window_size,
+        learnable_sink=learnable_sink,
         upcast=False,
         reorder_ops=True,
     )
@@ -1601,17 +1710,17 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
         dq,
         dk,
         dv,
-    ) = torch.autograd.grad(out, (q, k, v), g)
+    ) = torch.autograd.grad(out, (q, k, v), g, retain_graph=has_learnable_sink)
     (
         dq_ref,
         dk_ref,
         dv_ref,
-    ) = torch.autograd.grad(out_ref, (q, k, v), g)
+    ) = torch.autograd.grad(out_ref, (q, k, v), g, retain_graph=has_learnable_sink)
     (
         dq_pt,
         dk_pt,
         dv_pt,
-    ) = torch.autograd.grad(out_pt, (q, k, v), g)
+    ) = torch.autograd.grad(out_pt, (q, k, v), g, retain_graph=has_learnable_sink)
     print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
     print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
     print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
@@ -1624,6 +1733,14 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
     print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
     print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+    if has_learnable_sink:
+        dsink, = torch.autograd.grad(out, (learnable_sink,), g)
+        dsink_ref, = torch.autograd.grad(out_ref, (learnable_sink,), g)
+        dsink_pt, = torch.autograd.grad(out_pt, (learnable_sink,), g)
+        print(f"dSink max diff: {(dsink - dsink_ref).abs().max().item()}")
+        print(f"dSink mean diff: {(dsink - dsink_ref).abs().mean().item()}")
+        print(f"dSink Pytorch max diff: {(dsink_pt - dsink_ref).abs().max().item()}")
+        print(f"dSink Pytorch mean diff: {(dsink_pt - dsink_ref).abs().mean().item()}")
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
@@ -1632,6 +1749,8 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item() + 1e-5
     assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item() + 1e-5
     assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item() + 1e-5
+    if has_learnable_sink:
+        assert (dsink - dsink_ref).abs().max().item() <= 3 * (dsink_pt - dsink_ref).abs().max().item() + 1e-5
 
 
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
@@ -1664,8 +1783,9 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
 # TODO: add smaller page sizes when https://github.com/Dao-AILab/flash-attention/pull/824 is merged
 @pytest.mark.parametrize("paged_kv_block_size", [None, 256, 512])
 # @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 128)])
+@pytest.mark.parametrize("has_learnable_sink", [True, False])
 def test_flash_attn_varlen_causal(
-    seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, dtype
+    seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, has_learnable_sink, dtype
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
@@ -1695,6 +1815,10 @@ def test_flash_attn_varlen_causal(
         k, v, block_table, k_cache_paged, v_cache_paged, num_blocks = _generate_block_kvcache(
             seqlen_k, paged_kv_block_size, batch_size, nheads, d, device, dtype
         )
+    if has_learnable_sink:
+        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
+    else:
+        learnable_sink = None
     query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random")
     key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode="random")
     (
@@ -1723,6 +1847,7 @@ def test_flash_attn_varlen_causal(
         0.0,
         causal=causal,
         window_size=window_size,
+        learnable_sink=learnable_sink,
         block_table=block_table,
     )
     out = output_pad_fn(out_unpad)
@@ -1737,6 +1862,7 @@ def test_flash_attn_varlen_causal(
         None,
         causal=causal,
         window_size=window_size,
+        learnable_sink=learnable_sink,
     )
     out_pt, attn_pt = attention_ref(
         q,
@@ -1749,6 +1875,7 @@ def test_flash_attn_varlen_causal(
         None,
         causal=causal,
         window_size=window_size,
+        learnable_sink=learnable_sink,
         upcast=False,
         reorder_ops=True,
     )
@@ -1766,7 +1893,7 @@ def test_flash_attn_varlen_causal(
             dq_unpad,
             dk_unpad,
             dv_unpad,
-        ) = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g)
+        ) = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g, retain_graph=has_learnable_sink)
         dq = dq_pad_fn(dq_unpad)
         dk = dk_pad_fn(dk_unpad)
         dv = dk_pad_fn(dv_unpad)
@@ -1774,12 +1901,12 @@ def test_flash_attn_varlen_causal(
             dq_ref,
             dk_ref,
             dv_ref,
-        ) = torch.autograd.grad(out_ref, (q, k, v), g)
+        ) = torch.autograd.grad(out_ref, (q, k, v), g, retain_graph=has_learnable_sink)
         (
             dq_pt,
             dk_pt,
             dv_pt,
-        ) = torch.autograd.grad(out_pt, (q, k, v), g)
+        ) = torch.autograd.grad(out_pt, (q, k, v), g, retain_graph=has_learnable_sink)
         print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
         print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
         print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
@@ -1792,6 +1919,14 @@ def test_flash_attn_varlen_causal(
         print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
         print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+        if has_learnable_sink:
+            dsink, = torch.autograd.grad(out, (learnable_sink,), g)
+            dsink_ref, = torch.autograd.grad(out_ref, (learnable_sink,), g)
+            dsink_pt, = torch.autograd.grad(out_pt, (learnable_sink,), g)
+            print(f"dSink max diff: {(dsink - dsink_ref).abs().max().item()}")
+            print(f"dSink mean diff: {(dsink - dsink_ref).abs().mean().item()}")
+            print(f"dSink Pytorch max diff: {(dsink_pt - dsink_ref).abs().max().item()}")
+            print(f"dSink Pytorch mean diff: {(dsink_pt - dsink_ref).abs().mean().item()}")
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
@@ -1801,6 +1936,8 @@ def test_flash_attn_varlen_causal(
         assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item() + 1e-5
         assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item() + 1e-5
         assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item() + 1e-5
+        if has_learnable_sink:
+            assert (dsink - dsink_ref).abs().max().item() <= 2 * (dsink_pt - dsink_ref).abs().max().item() + 1e-5
 
 
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
@@ -1836,8 +1973,9 @@ def test_flash_attn_varlen_causal(
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
 def test_flash_attn_splitkv(
-    seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, alibi, deterministic, dtype
+    seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, alibi, deterministic, dtype, has_learnable_sink
 ):
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
@@ -1855,6 +1993,10 @@ def test_flash_attn_splitkv(
         attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen_q, seqlen_k, causal=causal)
     else:
         alibi_slopes, attn_bias = None, None
+    if has_learnable_sink:
+        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
+    else:
+        learnable_sink = None
     out, lse, _ = flash_attn_func(
         q,
         k,
@@ -1863,11 +2005,12 @@ def test_flash_attn_splitkv(
         causal=causal,
         window_size=window_size,
         alibi_slopes=alibi_slopes,
+        learnable_sink=learnable_sink,
         deterministic=deterministic,
         return_attn_probs=True,
     )
     out_ref, attn_ref = attention_ref(
-        q, k, v, None, None, attn_bias, 0.0, None, causal=causal, window_size=window_size
+        q, k, v, None, None, attn_bias, 0.0, None, causal=causal, window_size=window_size, learnable_sink=learnable_sink
     )
     out_pt, attn_pt = attention_ref(
         q,
@@ -1880,6 +2023,7 @@ def test_flash_attn_splitkv(
         None,
         causal=causal,
         window_size=window_size,
+        learnable_sink=learnable_sink,
         upcast=False,
         reorder_ops=True,
     )
@@ -1895,17 +2039,17 @@ def test_flash_attn_splitkv(
         dq,
         dk,
         dv,
-    ) = torch.autograd.grad(out, (q, k, v), g)
+    ) = torch.autograd.grad(out, (q, k, v), g, retain_graph=has_learnable_sink)
     (
         dq_ref,
         dk_ref,
         dv_ref,
-    ) = torch.autograd.grad(out_ref, (q, k, v), g)
+    ) = torch.autograd.grad(out_ref, (q, k, v), g, retain_graph=has_learnable_sink)
     (
         dq_pt,
         dk_pt,
         dv_pt,
-    ) = torch.autograd.grad(out_pt, (q, k, v), g)
+    ) = torch.autograd.grad(out_pt, (q, k, v), g, retain_graph=has_learnable_sink)
     print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
     print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
     print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
@@ -1918,6 +2062,14 @@ def test_flash_attn_splitkv(
     print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
     print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
     print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+    if has_learnable_sink:
+            dsink, = torch.autograd.grad(out, (learnable_sink,), g)
+            dsink_ref, = torch.autograd.grad(out_ref, (learnable_sink,), g)
+            dsink_pt, = torch.autograd.grad(out_pt, (learnable_sink,), g)
+            print(f"dSink max diff: {(dsink - dsink_ref).abs().max().item()}")
+            print(f"dSink mean diff: {(dsink - dsink_ref).abs().mean().item()}")
+            print(f"dSink Pytorch max diff: {(dsink_pt - dsink_ref).abs().max().item()}")
+            print(f"dSink Pytorch mean diff: {(dsink_pt - dsink_ref).abs().mean().item()}")
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
@@ -1927,6 +2079,8 @@ def test_flash_attn_splitkv(
     assert (dq - dq_ref).abs().max().item() <= mult * (dq_pt - dq_ref).abs().max().item() + 2e-4
     assert (dk - dk_ref).abs().max().item() <= mult * (dk_pt - dk_ref).abs().max().item() + 2e-4
     assert (dv - dv_ref).abs().max().item() <= mult * (dv_pt - dv_ref).abs().max().item() + 2e-4
+    if has_learnable_sink:
+        assert (dsink - dsink_ref).abs().max().item() <= mult * (dsink_pt - dsink_ref).abs().max().item() + 2e-4
 
 
 # @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
@@ -2598,36 +2752,14 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dk, dk0)
         assert torch.equal(dq, dq0)
 
-
-@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("local", [False, True])
-# @pytest.mark.parametrize("local", [True])
-@pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
-# @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
-# @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize("d", [64, 128])
-@pytest.mark.parametrize("swap_sq_sk", [False, True])
-# @pytest.mark.parametrize("swap_sq_sk", [True])
 @pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
+    "seqlen_q,seqlen_k,swap_sq_sk,d,local,sink,dtype",
     [
-        (1, 239), # disable seqlenq_ngroups_swapped
-        (3, 799),
-        (127, 512),
-        (127, 513),
-        (113, 203),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
-        (1023, 1024),
+        (1, 239, True, 64, True, True, torch.bfloat16),
+        (127, 513, True, 128, True, True, torch.float16),
     ],
 )
-# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
-def test_flash_attn_sink_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
+def test_flash_attn_sink_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, sink, dtype):
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
@@ -2639,9 +2771,9 @@ def test_flash_attn_sink_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype)
     causal = True
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 1
-    nheads = 64
-    num_key_value_groups = 8
+    batch_size = 8
+    nheads = 9
+    num_key_value_groups = 1
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(batch_size, seqlen_k, nheads // num_key_value_groups, d, device=device, dtype=dtype, requires_grad=True)

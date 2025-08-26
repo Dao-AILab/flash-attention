@@ -589,7 +589,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             float dsink_val_cols = 0.f;
             #pragma unroll
             for (int ni = 0; ni < size<1>(dS); ++ni) {
-                if constexpr (Has_sink) { dsink_val_cols += dS(mi, ni) * scores(mi, ni); }
+                if constexpr (Has_sink) { dsink_val_cols += pointwise_mult(scores(mi, ni), dS(mi, ni), 0.f); }
                 float scaled_ds = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi));
                 if constexpr (Is_softcap) { scaled_ds *= dtanh(mi, ni); }
                 dS(mi, ni) = scaled_ds;
@@ -801,7 +801,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         dsink_val = Allreduce<32>::run(dsink_val, sum_op);
         if (tidx % 32 == 0 && params.dsink_ptr != nullptr) {
             float* dsink_ptr = reinterpret_cast<float*>(params.dsink_ptr);
-            float val = -dsink_val * exp2f(sink_val * float(M_LOG2E));
+            float val = -dsink_val * exp2f(sink_val * float(M_LOG2E)) * params.rp_dropout;
             atomicAdd(dsink_ptr + bidh, val);
         }
     }
