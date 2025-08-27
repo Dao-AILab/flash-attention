@@ -62,6 +62,7 @@ jobs:
       torch-version: ${{ matrix.torch-version }}
       cxx11_abi: ${{ matrix.cxx11_abi }}
       release-version: ${{ needs.setup_release.outputs.release-version }}
+      upload-to-release: true
 
   publish_package:
     name: Publish package
