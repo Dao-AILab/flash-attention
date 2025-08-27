@@ -23,6 +23,11 @@ on:
         description: "The C++11 ABI to use for the build"
         required: true
         type: string
+      upload-to-release:
+        description: "Upload wheel to this release"
+        required: false
+        type: boolean
+        default: false
       release-version:
         description: "Upload wheel to this release"
         required: false
@@ -39,6 +44,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release-version }}
+          submodules: recursive
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -109,9 +117,34 @@ jobs:
           python -c "import torch; print('PyTorch:', torch.__version__)"
           python -c "import torch; print('CUDA:', torch.version.cuda)"
           python -c "from torch.utils import cpp_extension; print (cpp_extension.CUDA_HOME)"
-        shell: bash
+
+      - name: Restore build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build.tar
+          key: build-${{ inputs.release-version }}-${{ inputs.python-version }}-${{ inputs.cuda-version }}-${{ inputs.torch-version }}-${{ inputs.cxx11_abi }}-${{ github.run_number }}-${{ github.run_attempt }}
+          restore-keys: |
+            build-${{ inputs.release-version }}-${{ inputs.python-version }}-${{ inputs.cuda-version }}-${{ inputs.torch-version }}-${{ inputs.cxx11_abi }}-
+
+      - name: Unpack build cache
+        run: |
+          echo ::group::Adjust timestamps
+          sudo find / -exec touch -t 197001010000 {} + || true
+          echo ::endgroup::
+
+          if [ -f build.tar ]; then
+            find . -mindepth 1 -maxdepth 1 ! -name 'build.tar' -exec rm -rf {} +
+            tar -xpvf build.tar -C .
+          else
+            echo "No build.tar found, skipping"
+          fi
+
+          ls -al ./
+          ls -al build/ || true
+          ls -al csrc/ || true
 
       - name: Build wheel
+        id: build_wheel
         run: |
           # We want setuptools >= 49.6.0 otherwise we can't compile the extension if system CUDA version is 11.7 and pytorch cuda version is 11.6
           # https://github.com/pytorch/pytorch/blob/664058fa83f1d8eede5d66418abff6e20bd76ca8/torch/utils/cpp_extension.py#L810
@@ -122,11 +155,41 @@ jobs:
           export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
           # Limit MAX_JOBS otherwise the github runner goes OOM
           # nvcc 11.8 can compile with 2 jobs, but nvcc 12.3 goes OOM
-          MAX_JOBS=$([ "$MATRIX_CUDA_VERSION" == "129" ] && echo 1 || echo 2) NVCC_THREADS=2 FLASH_ATTENTION_FORCE_BUILD="TRUE" FLASH_ATTENTION_FORCE_CXX11_ABI=${{ inputs.cxx11_abi}} python setup.py bdist_wheel --dist-dir=dist
-          tmpname=cu${WHEEL_CUDA_VERSION}torch${MATRIX_TORCH_VERSION}cxx11abi${{ inputs.cxx11_abi }}
-          wheel_name=$(ls dist/*whl | xargs -n 1 basename | sed "s/-/+$tmpname-/2")
-          ls dist/*whl |xargs -I {} mv {} dist/${wheel_name}
-          echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
+
+          export MAX_JOBS=$([ "$MATRIX_CUDA_VERSION" == "129" ] && echo 1 || echo 2)
+          export NVCC_THREADS=2
+          export FLASH_ATTENTION_FORCE_BUILD="TRUE"
+          export FLASH_ATTENTION_FORCE_CXX11_ABI=${{ inputs.cxx11_abi }}
+
+          # 5h timeout since GH allows max 6h and we want some buffer
+          EXIT_CODE=0
+          timeout 5h python setup.py bdist_wheel --dist-dir=dist || EXIT_CODE=$?
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            tmpname=cu${WHEEL_CUDA_VERSION}torch${MATRIX_TORCH_VERSION}cxx11abi${{ inputs.cxx11_abi }}
+            wheel_name=$(ls dist/*whl | xargs -n 1 basename | sed "s/-/+$tmpname-/2")
+            ls dist/*whl |xargs -I {} mv {} dist/${wheel_name}
+            echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
+          fi
+
+          # Store exit code in GitHub env for later steps
+          echo "build_exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
+
+          # Do not fail the job if timeout killed the build
+          exit $EXIT_CODE
+
+      - name: Log build logs after timeout
+        if: always() && steps.build_wheel.outputs.build_exit_code == 124
+        run: |
+          ls -al ./
+          tar -cvf build.tar . --atime-preserve=replace
+
+      - name: Save build cache timeout
+        if: always() && steps.build_wheel.outputs.build_exit_code == 124
+        uses: actions/cache/save@v4
+        with:
+          key: build-${{ inputs.release-version }}-${{ inputs.python-version }}-${{ inputs.cuda-version }}-${{ inputs.torch-version }}-${{ inputs.cxx11_abi }}-${{ github.run_number }}-${{ github.run_attempt }}
+          path: build.tar
 
       - name: Log Built Wheels
         run: |
@@ -142,6 +205,7 @@ jobs:
 
       - name: Upload Release Asset
         id: upload_release_asset
+        if: inputs.upload-to-release
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
