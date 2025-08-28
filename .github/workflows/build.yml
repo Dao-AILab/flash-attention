@@ -1,7 +1,7 @@
 name: Build wheels
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       runs-on:
         description: "The runner to use for the build"
