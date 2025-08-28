@@ -199,7 +199,7 @@ def test_flash_attn_output(
         num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             print(f"{pack_gqa = }, {num_splits = }")
-            out = flash_attn_func(
+            out, lse = flash_attn_func(
                 q,
                 k,
                 v,
@@ -483,7 +483,7 @@ def test_flash_attn_varlen_output(
         # print("seqused_k: ", seqused_k)
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             print(f"{pack_gqa = }, {num_splits = }")
-            out_unpad = flash_attn_varlen_func(
+            out_unpad, lse_unpad = flash_attn_varlen_func(
                 q_unpad,
                 k_unpad,
                 v_unpad,
@@ -1080,7 +1080,7 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
     k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     torch.random.manual_seed(42)
-    out0 = flash_attn_func(q, k, v, causal=causal)
+    out0, lse0 = flash_attn_func(q, k, v, causal=causal)
     g = torch.randn_like(out0)
     dq0, dk0, dv0 = torch.autograd.grad(out0, (q, k, v), g)
     # Numerical error if we just do any arithmetic on dq
@@ -1088,9 +1088,9 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
 
     for i in range(1000):
         torch.random.manual_seed(42)
-        out = flash_attn_func(q, k, v, causal=causal)
+        out, lse = flash_attn_func(q, k, v, causal=causal)
         assert torch.equal(out, out0)
-        # assert torch.equal(lse, lse0)
+        assert torch.equal(lse, lse0)
 
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
         dq_equal = torch.allclose(dq, dq0, atol=dq_atol)
