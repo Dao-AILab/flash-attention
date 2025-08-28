@@ -305,7 +305,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
-        return out
+        return out, softmax_lse
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -404,7 +404,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
-        return out
+        return out, softmax_lse
 
     @staticmethod
     def backward(ctx, dout, *args):
