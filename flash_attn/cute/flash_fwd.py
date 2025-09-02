@@ -434,7 +434,7 @@ class FlashAttentionForwardBase:
                 else:
                     seqlen_limit = cutlass.min(seqlen - block * self.n_block_size, self.n_block_size)
             seqlen_limit -= tKcK[0][0]
-            for n in cutlass.range_constepxr(cute.size(tKsK.shape[1])):
+            for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
                 if t0KcK[0, n, 0][0] < seqlen_limit:
                     cute.copy(
                         gmem_tiled_copy,
@@ -468,7 +468,7 @@ class FlashAttentionForwardBase:
         # Do we need to check if we overshoot kBlockN when we load V?
         is_even_n_smem_v = self.n_block_size % gmem_tiled_copy.tiler_mn[0].shape == 0
         if const_expr(need_predicates or not is_even_n_smem_v):
-            for n in cutlass.range_constepxr(cute.size(tVsV.shape[1])):
+            for n in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
                 # If kBlockN doesn't evenly divide the tiled copy, only the last `n` needs to be checked
                 if is_even_n_smem_v or n < cute.size(tVsV.shape[1]) - 1 or tVcV[0, n, 0][0] < self.n_block_size:
                     predicate = tVpV[None, n, None] if const_expr(self.check_hdim_v_oob) else None
@@ -476,8 +476,8 @@ class FlashAttentionForwardBase:
                         seqlen_limit = seqlen - block * self.n_block_size - tVcV[0][0]
                         predicate_n = t0VcV[0, n, 0][0] < seqlen_limit
                         predicate = cute.make_fragment_like(tVpV[None, 0, None])
-                        for k in cutlass.range_constepxr(cute.size(predicate.shape[1])):
-                            for i in cutlass.range_constepxr(cute.size(predicate.shape[0])):
+                        for k in cutlass.range_constexpr(cute.size(predicate.shape[1])):
+                            for i in cutlass.range_constexpr(cute.size(predicate.shape[0])):
                                 predicate[i, k] = (tVpV[i, n, k] if const_expr(self.check_hdim_v_oob) else True) and predicate_n
                     cute.copy(
                         gmem_tiled_copy,
@@ -803,7 +803,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             preprocess_Q()
             cute.arch.barrier()  # Make sure all threads have read smem_q before loading V
 
-        for stage in cutlass.range_constepxr(self.num_stages):
+        for stage in cutlass.range_constexpr(self.num_stages):
             if const_expr(not self.Q_in_regs or stage > 0):
                 if stage == 0 or n_block - stage >= 0:
                     load_K(n_block - stage, smem_pipe_write=stage, need_predicates=stage==0)
