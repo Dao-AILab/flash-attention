@@ -1801,7 +1801,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # tOrP.store(tOrP_acc.load().to(self.dtype))
         utils.cvt_f16(tOrP_acc, tOrP)
         if const_expr(not self.mma_pv_is_rs):
-            tPrP = smem_copy_params.smem_thr_copy_P.retile(mma_params.tOrP)
+            tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
         softmax.rescale_O(mma_params.acc_O, row_scale)
         if const_expr(not self.mma_pv_is_rs):
