@@ -586,12 +586,13 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # (assigning it to softcap_val) and pre-multiply softcap_val * log2(e)
         # (assigning it to softmax_scale_log2).
         LOG2_E = math.log2(math.e)
-        if const_expr(softcap is not None):         
-            softmax_scale_log2 = softcap * LOG2_E
-            softcap_val = Float32(softmax_scale / softcap)
-        else:
+        if const_expr(softcap is None):
             softmax_scale_log2 = softmax_scale * LOG2_E
             softcap_val = None
+        else:
+            softmax_scale_log2 = softcap * LOG2_E
+            softcap_val = Float32(softmax_scale / softcap)
+            
         self.kernel(
             mQ,
             mK,
@@ -631,8 +632,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mLSE: Optional[cute.Tensor],
         softmax_scale_log2: Float32,
         softcap_val: Optional[Float32],
-        window_size_left: Int32,
-        window_size_right: Int32,
+        window_size_left: Optional[Int32],
+        window_size_right: Optional[Int32],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
