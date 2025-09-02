@@ -656,7 +656,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             window_size_left, window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
-        seqlen = SeqlenInfoQK(seqlen_q=mQ.shape[0], seqlen_k=mK.shape[0])
+        seqlen = SeqlenInfoQK(seqlen_q_static=mQ.shape[0], seqlen_k_static=mK.shape[0])
         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
         # TODO: return early if n_block_max == 0
         # if self.is_causal:
@@ -868,7 +868,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # reuse sQ's data iterator
         sO = cute.make_tensor(sQ.iterator, sO_layout)
         self.epilogue(
-            acc_O, softmax.row_sum, mO, mLSE, sO,
+            acc_O, softmax.row_sum, mO, mLSE, sO, seqlen,
             gmem_tiled_copy_O, None, tiled_mma_pv, tidx, m_block, num_head, batch_size
         )
 
