@@ -586,12 +586,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # (assigning it to softcap_val) and pre-multiply softcap_val * log2(e)
         # (assigning it to softmax_scale_log2).
         LOG2_E = math.log2(math.e)
-        if const_expr(softcap is not None):
-            softmax_scale_log2 = softmax_scale * LOG2_E
-            softcap_val = None
-        else:
+        if const_expr(softcap is not None):         
             softmax_scale_log2 = softcap * LOG2_E
             softcap_val = Float32(softmax_scale / softcap)
+        else:
+            softmax_scale_log2 = softmax_scale * LOG2_E
+            softcap_val = None
         self.kernel(
             mQ,
             mK,
