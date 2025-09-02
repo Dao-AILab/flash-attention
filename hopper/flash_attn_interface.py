@@ -90,7 +90,7 @@ def _flash_attn_forward(
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     seqlens_rotary = maybe_contiguous(seqlens_rotary)
-    out, softmax_lse, *rest = flash_attn_3_cuda.fwd(
+    out, softmax_lse, out_accum, softmax_lse_accum = flash_attn_3_cuda.fwd(
         q,
         k,
         v,
@@ -126,7 +126,14 @@ def _flash_attn_forward(
         pack_gqa,
         sm_margin,
     )
-    return out, softmax_lse, *rest
+
+    if out_accum is None:
+        out_accum = torch.tensor([], device=out.device)
+
+    if softmax_lse_accum is None:
+        softmax_lse_accum = torch.tensor([], device=out.device)
+
+    return out, softmax_lse, out_accum, softmax_lse_accum
 
 
 @torch.library.register_fake("flash_attn_3::_flash_attn_forward")
@@ -225,8 +232,8 @@ def _flash_attn_forward_fake(
             softmax_lse_accum = torch.empty((num_splits, batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device)
     else:
         # Tensors are not set when num_splits < 1
-        out_accum = None
-        softmax_lse_accum = None
+        out_accum = torch.tensor([], device=out.device)
+        softmax_lse_accum = torch.tensor([], device=out.device)
 
     return out, softmax_lse, out_accum, softmax_lse_accum
 
@@ -253,7 +260,7 @@ def _flash_attn_backward(
     window_size_left: int = -1,
     window_size_right: int = -1,
     softcap: float = 0.0,
-    deterministic: bool = False,
+    deterministic: bool= False,
     sm_margin: int = 0,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
