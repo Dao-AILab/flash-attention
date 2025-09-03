@@ -260,7 +260,7 @@ def _flash_attn_backward(
     window_size_left: int = -1,
     window_size_right: int = -1,
     softcap: float = 0.0,
-    deterministic: bool= False,
+    deterministic: bool = False,
     sm_margin: int = 0,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
