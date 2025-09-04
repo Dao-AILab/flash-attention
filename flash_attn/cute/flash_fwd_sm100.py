@@ -201,6 +201,7 @@ class FlashAttentionForwardSm100:
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
+        buffers = None  # Not typing for now since conversion behaves a lil funny
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -512,6 +513,7 @@ class FlashAttentionForwardSm100:
             tiled_mma_qk,
             tiled_mma_pv,
             tile_sched_params,
+            buffers,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -553,6 +555,7 @@ class FlashAttentionForwardSm100:
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         tile_sched_params: ParamsBase,
+        buffers = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -797,17 +800,18 @@ class FlashAttentionForwardSm100:
                 stage = Int32(0 if warp_idx < self.softmax1_warp_ids[0] else 1)
                 softmax_loop(
                     stage=stage,
-                    tStSi=cute.make_tensor(tStS.iterator + (self.tmem_s_offset[0] if stage == 0 else self.tmem_s_offset[1]), tStS.layout))
+                    tStSi=cute.make_tensor(tStS.iterator + (self.tmem_s_offset[0] if stage == 0 else self.tmem_s_offset[1]), tStS.layout),
+                    buffers=buffers)
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             else:
                 # If there's s0_s1_barrier, it's faster to have 2 WGs having different code
                 if warp_idx < self.softmax1_warp_ids[0]:
                     tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
-                    softmax_loop(stage=0, tStSi=tStSi)
+                    softmax_loop(stage=0, tStSi=tStSi, buffers=buffers)
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
                 if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax1_warp_ids[0]:
                     tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
-                    softmax_loop(stage=1, tStSi=tStSi)
+                    softmax_loop(stage=1, tStSi=tStSi, buffers=buffers)
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1160,6 +1164,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
+        buffers = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1250,6 +1255,8 @@ class FlashAttentionForwardSm100:
                 batch_idx=batch_idx,
                 head_idx=head_idx,
                 m_block=m_block * 2 + stage,
+                seqlen=seqlen,
+                buffers=buffers,
             )
 
             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase)
@@ -1340,6 +1347,8 @@ class FlashAttentionForwardSm100:
         batch_idx: Int32,
         head_idx: Int32,
         m_block: Int32,
+        seqlen,
+        buffers = None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
@@ -1382,6 +1391,8 @@ class FlashAttentionForwardSm100:
                 m_block,
                 n_block,
                 softmax,
+                seqlen,
+                buffers,
             )
 
         if const_expr(mask_fn is not None):
@@ -1942,7 +1953,9 @@ class FlashAttentionForwardSm100:
         m_block,
         n_block,
         softmax,
-        VEC_SIZE: cutlass.Constexpr[int] = 4,
+        seqlen,
+        buffers = None,
+        VEC_SIZE: cutlass.Constexpr[int] = 1,
     ):
         """Apply score modification function to attention scores.
         
@@ -1962,6 +1975,9 @@ class FlashAttentionForwardSm100:
         tScS = thr_mma_qk.partition_C(cS)
         tScS_t2r = thr_tmem_load.partition_D(tScS)
 
+        seqlenk_col_limit = seqlen.seqlen_k
+        seqlenq_row_limit = seqlen.seqlen_q
+
         # Build index + score fragments
         n_vals = cutlass.const_expr(cute.size(tSrS_t2r.shape))
         score_vec = cute.make_fragment(VEC_SIZE, self.qk_acc_dtype)
@@ -1970,7 +1986,7 @@ class FlashAttentionForwardSm100:
         # Create broadcasted fragments for constant values
         batch_idx_vec = utils.broadcast_scalar_to_vec(batch_idx, kv_idx_vec, cutlass.Int32)
         head_idx_vec = utils.broadcast_scalar_to_vec(head_idx, kv_idx_vec, cutlass.Int32)
-        q_idx_vec = utils.broadcast_scalar_to_vec(tScS_t2r[0][0], kv_idx_vec, cutlass.Int32)
+        q_idx_vec = utils.broadcast_scalar_to_vec(tScS_t2r[0][0] % seqlenq_row_limit, kv_idx_vec, cutlass.Int32)
         
         # Load SSA values once
         batch_idx_ssa = batch_idx_vec.load()
@@ -1981,16 +1997,22 @@ class FlashAttentionForwardSm100:
         for i in cutlass.range(0, n_vals, VEC_SIZE, unroll_full=True):
             for j in cutlass.range(VEC_SIZE, unroll_full=True):
                 score_vec[j] = tSrS_t2r[i + j] * softmax.softmax_scale
-                kv_idx_vec[j] = tScS_t2r[i + j][1]
+                # wrap around kv_idx to not index OOB
+                kv_idx_vec[j] = tScS_t2r[i + j][1] % seqlenk_col_limit
             score_ssa = score_vec.load()
             kv_idx_ssa = kv_idx_vec.load()
+
+            buffer_args = []
+            if cutlass.const_expr(buffers is not None):
+                buffer_args = buffers
 
             post_mod_scores = self.score_mod(
                 score_ssa,
                 batch_idx_ssa,
                 head_idx_ssa,
                 q_idx=q_idx_ssa,
-                kv_idx=kv_idx_ssa
+                kv_idx=kv_idx_ssa,
+                buffers=buffer_args
             )
 
             score_vec.store(post_mod_scores)
