@@ -103,12 +103,12 @@ jobs:
             print(minv if int(env['MATRIX_CUDA_VERSION']) < 120 else maxv)" \
           )
           # detect if we're on ARM
-          if [ "$(uname -m)" = "aarch64" ]; then
-            plat = 'linux_aarch64'
+          if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
+              PLAT=linux_aarch64
           else
-            plat = 'manylinux_2_27_x86_64.manylinux_2_28_x86_64'
+              PLAT=manylinux_2_27_x86_64.manylinux_2_28_x86_64
           fi
-          echo "PLAT=$plat" >> $GITHUB_ENV
+          echo "PLAT=$PLAT" >> $GITHUB_ENV
           if [[ ${{ inputs.torch-version }} == *"dev"* ]]; then
             # pip install --no-cache-dir --pre torch==${{ inputs.torch-version }} --index-url https://download.pytorch.org/whl/nightly/cu${TORCH_CUDA_VERSION}
             # Can't use --no-deps because we need cudnn etc.
