@@ -114,7 +114,8 @@ jobs:
             # Can't use --no-deps because we need cudnn etc.
             # Hard-coding this version of pytorch-triton for torch 2.9.0.20250904
             pip install jinja2
-            TRITON_URL="https://download.pytorch.org/whl/nightly/pytorch_triton-3.4.0%2Bgitf7888497-cp${MATRIX_PYTHON_VERSION}-cp${MATRIX_PYTHON_VERSION}-${PLAT}.whl"
+            pytorch_triton-3.4.0+gitf7888497-cp39-cp39-linux_aarch64.whl
+            TRITON_URL=https://download.pytorch.org/whl/nightly/pytorch_triton-3.4.0%2Bgitf7888497-cp${MATRIX_PYTHON_VERSION}-cp${MATRIX_PYTHON_VERSION}-${PLAT}.whl
             pip install --no-cache-dir --pre https://download.pytorch.org/whl/nightly/cu${TORCH_CUDA_VERSION}/torch-${{ inputs.torch-version }}%2Bcu${TORCH_CUDA_VERSION}-cp${MATRIX_PYTHON_VERSION}-cp${MATRIX_PYTHON_VERSION}-manylinux_2_28_$(uname -m).whl
             pip install "${TRITON_URL}"
             pip install --no-cache-dir --pre "${TORCH_URL}"
