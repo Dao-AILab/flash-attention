@@ -50,7 +50,6 @@ jobs:
         # when building without C++11 ABI and using it on nvcr images.
         cxx11_abi: ["FALSE", "TRUE"]
         include:
-            # CPU-only build
             - torch-version: "2.9.0.dev20250904"
               cuda-version: "13.0"
         exclude:
