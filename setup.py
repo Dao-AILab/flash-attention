@@ -22,7 +22,6 @@ from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 import torch
 from torch.utils.cpp_extension import (
     BuildExtension,
-    CppExtension,
     CUDAExtension,
     CUDA_HOME,
     ROCM_HOME,
@@ -39,15 +38,12 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
+IS_ROCM = False
 if BUILD_TARGET == "auto":
     if IS_HIP_EXTENSION:
         IS_ROCM = True
-    else:
-        IS_ROCM = False
 else:
-    if BUILD_TARGET == "cuda":
-        IS_ROCM = False
-    elif BUILD_TARGET == "rocm":
+    if BUILD_TARGET == "rocm":
         IS_ROCM = True
 
 PACKAGE_NAME = "flash_attn"
@@ -361,7 +357,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                 "csrc/flash_attn_ck/mha_fwd.cpp",
                 "csrc/flash_attn_ck/mha_varlen_bwd.cpp",
                 "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
-            f"build/fmha_*wd*.cpp"
+            "build/fmha_*wd*.cpp"
         )
 
         rename_cpp_to_cu(sources)
@@ -372,7 +368,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                         "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
                         "csrc/flash_attn_ck/mha_fwd.cu",
                         "csrc/flash_attn_ck/mha_varlen_bwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
+                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob("build/fmha_*wd*.cu")
 
         cc_flag += ["-O3","-std=c++17",
                     "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
