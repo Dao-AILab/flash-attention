@@ -1198,20 +1198,21 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     lse_sum = Allreduce<kRowsPerLoadTranspose>::run(lse_sum, sum_op);
 
     if constexpr(Has_sink){
-        const int row = l * kRowsPerLoadTranspose + tidx % kRowsPerLoadTranspose;
+        const int row = tidx % kRowsPerLoadTranspose;
         const int col = tidx / kRowsPerLoadTranspose;
         if (row < params.num_splits && col < kBlockM) {
-            const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
+            const index_t lse_offset = row_offset_lse + col;
             if(params.unpadded_lse){
                 // LSE is written as (h, seqlen_q, b) or (h, b, seqlen_q).
                 const int head_idx = lse_offset / (params.b * params.seqlen_q);
                 const float sink_val_exp = params.learnable_sink_ptr == nullptr ? 0.f : __expf(reinterpret_cast<float *>(params.learnable_sink_ptr)[head_idx] - lse_max);
+                lse_sum += sink_val_exp;
             }else{
                 // LSE is written as (b, h, seqlen_q).
                 const int head_idx = (lse_offset % (params.h * params.seqlen_q)) / params.seqlen_q;
                 const float sink_val_exp = params.learnable_sink_ptr == nullptr ? 0.f : __expf(reinterpret_cast<float *>(params.learnable_sink_ptr)[head_idx] - lse_max);
+                lse_sum += sink_val_exp;
             }
-            lse_sum += sink_val_exp;
         }
     }
     
