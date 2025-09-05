@@ -1,0 +1,39 @@
+[build-system]
+requires = [
+  "setuptools>=42",
+  "wheel",
+  "packaging",
+  "psutil",
+  "ninja",
+  "torch"  # keep here only if needed at build time
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash_attn"
+dynamic = ["version"]
+description = "Flash Attention: Fast and Memory-Efficient Exact Attention"
+readme = "README.md"
+requires-python = ">=3.9"
+url = "https://github.com/Dao-AILab/flash-attention"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: Unix"
+]
+authors = [
+  { name = "Tri Dao", email = "tri@tridao.me" }
+]
+license = { file = "LICENSE" }
+dependencies = [
+  "torch"
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["flash_attn*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "flash_attn.__version__" }
