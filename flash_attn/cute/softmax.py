@@ -17,11 +17,13 @@ class Softmax:
         scale_log2: Float32,
         num_rows: cutlass.Constexpr[int],
         arch: cutlass.Constexpr[int] = 80,
+        softmax_scale: Float32 | None = None
     ):
         self.scale_log2 = scale_log2
         self.row_max = cute.make_fragment(num_rows, Float32)
         self.row_sum = cute.make_fragment_like(self.row_max)
         self.arch = arch
+        self.softmax_scale = softmax_scale
 
     def reset(self) -> None:
         self.row_max.fill(-Float32.inf)
@@ -127,8 +129,8 @@ class Softmax:
 
 
 class SoftmaxSm100(Softmax):
-    def __init__(self, scale_log2: Float32, rescale_threshold: cutlass.Constexpr[float] = 0.0):
-        super().__init__(scale_log2, num_rows=1, arch=100)
+    def __init__(self, scale_log2: Float32, rescale_threshold: cutlass.Constexpr[float] = 0.0, softmax_scale: Float32 | None = None):
+        super().__init__(scale_log2, num_rows=1, arch=100, softmax_scale=softmax_scale)
         self.rescale_threshold = rescale_threshold
 
     @cute.jit

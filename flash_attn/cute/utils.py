@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
 
 import math
+import hashlib
 from typing import Type, Callable, Optional, Tuple
 
 import cutlass
@@ -11,6 +12,29 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm, arith, vector
 from cutlass.cute.runtime import from_dlpack
 
+
+def hash_callable(func: Callable) -> str:
+    """Hash a callable by combining bytecode and closure variables."""
+    parts = []
+
+    if hasattr(func, '__code__'):
+        parts.append(func.__code__.co_code)
+
+    if hasattr(func, '__closure__') and func.__closure__:
+        for cell in func.__closure__:
+            try:
+                parts.append(str(cell.cell_contents))
+            except:
+                pass
+
+    combined = b''.join(str(p).encode() for p in parts)
+    return hashlib.sha256(combined).hexdigest()
+
+
+def create_softcap_scoremod(softcap_val):
+    def scoremod_premask_fn(acc_S, batch_idx, head_idx, q_idx=None, kv_idx=None, softcap_val=softcap_val):
+        acc_S.store(cute.math.tanh(acc_S.load() * softcap_val, fastmath=True))
+    return scoremod_premask_fn
 
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
     return (
@@ -589,3 +613,31 @@ def coord_offset_i64(
     )
     new_layout = cute.slice_(tensor.layout, (*[None] * dim, 0, *[None] * (cute.rank(tensor) - dim - 1)))
     return cute.make_tensor(new_ptr, new_layout)
+
+
+@cute.jit
+def broadcast_to(a: cute.Tensor, b: cute.Tensor) -> cute.Tensor:
+    """ Take a single element a cute tensor and broadcast to b layout.shape """
+    stride_zero = cute.repeat_like(0, b.layout.shape)
+    a_broadcasted = cute.make_tensor(
+        a.iterator,
+        cute.make_layout(b.layout.shape, stride=stride_zero)
+    )
+    return a_broadcasted
+
+
+@cute.jit
+def broadcast_scalar_to_vec(scalar_value: cutlass.Numeric, b: cute.Tensor, dtype) -> cute.Tensor:
+    """Create a fragment of vec_size elements, all set to scalar_value.
+    
+    Args:
+        scalar_value: The value to broadcast
+        vec_size: Number of elements in the output fragment  
+        dtype: Data type of the fragment elements
+    
+    Returns:
+        A cute fragment with all elements set to scalar_value
+    """
+    vec = cute.make_fragment(1, dtype)
+    vec[0] = scalar_value
+    return broadcast_to(vec, b)
