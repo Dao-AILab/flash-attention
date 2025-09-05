@@ -98,8 +98,8 @@ jobs:
           # see https://github.com/pytorch/pytorch/blob/main/RELEASE.md#release-compatibility-matrix
           # This code is ugly, maybe there's a better way to do this.
           export TORCH_CUDA_VERSION=$(python -c "from os import environ as env; \
-            minv = {'2.4': 118, '2.5': 118, '2.6': 118, '2.7': 118, '2.8': 126, '2.9': 126}[env['MATRIX_TORCH_VERSION']]; \
-            maxv = {'2.4': 124, '2.5': 124, '2.6': 126, '2.7': 128, '2.8': 129, '2.9': 130}[env['MATRIX_TORCH_VERSION']]; \
+            minv = {'2.5': 118, '2.6': 118, '2.7': 118, '2.8': 126, '2.9': 126}[env['MATRIX_TORCH_VERSION']]; \
+            maxv = {'2.5': 124, '2.6': 126, '2.7': 128, '2.8': 129, '2.9': 130}[env['MATRIX_TORCH_VERSION']]; \
             print(minv if int(env['MATRIX_CUDA_VERSION']) < 120 else maxv)" \
           )
           # detect if we're on ARM
@@ -115,7 +115,7 @@ jobs:
             # Hard-coding this version of pytorch-triton for torch 2.9.0.20250904
             pip install jinja2
             TRITON_URL="https://download.pytorch.org/whl/nightly/pytorch_triton-3.4.0%2Bgitf7888497-cp${MATRIX_PYTHON_VERSION}-cp${MATRIX_PYTHON_VERSION}-${PLAT}.whl"
-            TORCH_URL="https://download.pytorch.org/whl/nightly/cu${TORCH_CUDA_VERSION}/torch-${{ inputs.torch-version }}%2Bcu${TORCH_CUDA_VERSION}-cp${MATRIX_PYTHON_VERSION}-cp${MATRIX_PYTHON_VERSION}-${PLAT}.whl"
+            pip install --no-cache-dir --pre https://download.pytorch.org/whl/nightly/cu${TORCH_CUDA_VERSION}/torch-${{ inputs.torch-version }}%2Bcu${TORCH_CUDA_VERSION}-cp${MATRIX_PYTHON_VERSION}-cp${MATRIX_PYTHON_VERSION}-linux_$(uname -r).whl
             pip install "${TRITON_URL}"
             pip install --no-cache-dir --pre "${TORCH_URL}"
           else
