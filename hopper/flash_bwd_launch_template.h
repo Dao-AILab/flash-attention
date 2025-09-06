@@ -94,8 +94,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         flash::CollectiveEpilogueBwdGQA<TileShape_MNK, ElementAccum, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, Deterministic>
     >;
     using Scheduler = std::conditional_t<
-        Is_causal && !Varlen,
-        flash::SingleTileBwdLPTScheduler,
+        Is_causal,
+        flash::SingleTileBwdLPTScheduler<Varlen, kBlockN>,
         flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>
     >;
     using AttnKernel = std::conditional_t<
