@@ -626,7 +626,7 @@ struct CollectiveMainloopBwdSm90 {
         using Barrier = cutlass::GenericBarrier<cutlass::detail::SyncwarpSync>;
         bool const lane_predicate = cute::elect_one_sync();
         constexpr int kBlockM = get<0>(TileShape_MNK{});
-        int m_block = Is_local && Deterministic ? cute::ceil_div(seqlen_info.seqlen_q, kBlockM) : m_block_max - 1;
+        int m_block = Is_local && Deterministic ? cute::ceil_div(seqlen_info.seqlen_q, kBlockM) - 1 : m_block_max - 1;
         if constexpr (Is_local && Deterministic) {
             #pragma unroll 2
             for (; m_block >= m_block_max; --m_block) {
