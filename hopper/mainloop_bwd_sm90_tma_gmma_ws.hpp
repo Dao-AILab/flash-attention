@@ -503,7 +503,7 @@ struct CollectiveMainloopBwdSm90 {
             }
         }
 
-        int m_block = m_block_min;
+        int m_block = m_block_max - 1;
 
         int lane_predicate = cute::elect_one_sync();
 
@@ -525,7 +525,7 @@ struct CollectiveMainloopBwdSm90 {
             copy(params.tma_load_V.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tVgV, tVsV);
 
             #pragma unroll (kHeadDim < 256 ? 2 : 1)
-            for (; m_block < m_block_max - 1; ++m_block) {
+            for (; m_block > m_block_min; --m_block) {
                 // If Q and dO have the same number of stages, we can use the same pipeline state variable
                 // to reduce registers
                 PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
@@ -538,9 +538,9 @@ struct CollectiveMainloopBwdSm90 {
                 ++smem_pipe_write;
                 pipeline_q.producer_acquire(smem_pipe_write);
                 copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
-                     tQgQ(_, m_block + 1), tQsQ(_, smem_pipe_write.index()));
+                     tQgQ(_, m_block - 1), tQsQ(_, smem_pipe_write.index()));
                 copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
-                     gLSE(_, m_block + 1), sLSE(_, smem_pipe_write.index()));
+                     gLSE(_, m_block - 1), sLSE(_, smem_pipe_write.index()));
             }
         }
         scheduler_prefetch();
@@ -607,7 +607,8 @@ struct CollectiveMainloopBwdSm90 {
             seqlen_info, n_block, bidb, params.window_size_left,
             params.window_size_right, 0 /*sink_token_length*/);
         // It's possible to have m_block_max <= m_block_min. Exit early
-        if constexpr (Is_causal || Is_local || Varlen) {
+        // Though if local and deterministic, still need to increment dq semaphore
+        if constexpr ((Is_causal || Is_local || Varlen) && !(Is_local && Deterministic)) {
             if (m_block_max <= m_block_min) { return; }
         }
 
@@ -625,9 +626,17 @@ struct CollectiveMainloopBwdSm90 {
         int *lock_ptr = !Deterministic ? nullptr : params.dq_semaphore + bidb * num_head + bidh;
         using Barrier = cutlass::GenericBarrier<cutlass::detail::SyncwarpSync>;
         bool const lane_predicate = cute::elect_one_sync();
-        int m_block = m_block_min;
+        constexpr int kBlockM = get<0>(TileShape_MNK{});
+        int m_block = Is_local && Deterministic ? cute::ceil_div(seqlen_info.seqlen_q, kBlockM) - 1 : m_block_max - 1;
+        // if (lane_predicate) { printf("blockIdx.x = %d, blockIdx.y = %d, blockIdx.z = %d, m_block = %d, bidh = %d, bidb = %d, num_batch = %d, num_head = %d.\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidh, bidb, num_batch, num_head);}
+        if constexpr (Is_local && Deterministic) {
+            #pragma unroll 2
+            for (; m_block >= m_block_max; --m_block) {
+                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
+            }
+        }
         #pragma unroll 2
-        for (; m_block < m_block_max; ++m_block) {
+        for (; m_block >= m_block_min; --m_block) {
             if constexpr (Deterministic) {
                 Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
             }
@@ -648,14 +657,7 @@ struct CollectiveMainloopBwdSm90 {
                 Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
             }
         }
-        if constexpr (Is_local && Deterministic) {
-            constexpr int kBlockM = get<0>(TileShape_MNK{});
-            int const m_block_global_max = cute::ceil_div(seqlen_info.seqlen_q, kBlockM);
-            #pragma unroll 2
-            for (; m_block < m_block_global_max; ++m_block) {
-                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
-            }
-        }
+        // if (lane_predicate) { printf("After barrier: blockIdx.x = %d, blockIdx.y = %d, blockIdx.z = %d, m_block = %d, bidh = %d, bidb = %d.\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidh, bidb);}
     }
 
     CUTLASS_DEVICE void
@@ -805,7 +807,7 @@ struct CollectiveMainloopBwdSm90 {
             params.attention_chunk_divmod, params.qhead_per_khead_divmod
         );
 
-        int m_block = m_block_min;
+        int m_block = m_block_max - 1;
 
         clear(tdKrdK);
         clear(tdVrdV);
@@ -992,34 +994,34 @@ struct CollectiveMainloopBwdSm90 {
             if constexpr (!Q_dO_same_stages) { ++smem_pipe_read_do; }
         };
 
-        // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
-        // this helps quite a bit to not have to do causal masking for most of the iterations.
-        if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {
-            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-            static constexpr int kBlockM = get<0>(TileShape_MNK{});
-            int const m_block_masking_max = ((n_block + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1;
+        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});
+
+        if constexpr (Is_local && SeparateMaskingIterations) {
+            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+            int const m_block_min_for_local_mask = std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
             CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block < std::min(m_block_max, m_block_masking_max); ++m_block) {
+            for (; m_block >= m_block_min_for_local_mask; --m_block) {
                 bwd_step(m_block, mask_fn);
             }
         }
 
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
-        static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        int const m_block_max_before_local_mask = !Is_local || !SeparateMaskingIterations
-            ? m_block_max
-            : std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
+        int const m_block_min_before_mask = (Is_causal || Is_local) && SeparateMaskingIterations
+            ? std::max(m_block_min, ((n_block + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1)
+            : m_block_min;
 
         auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
         CUTLASS_PRAGMA_NO_UNROLL
-        for (; m_block < m_block_max_before_local_mask; ++m_block) {
+        for (; m_block >= m_block_min_before_mask; --m_block) {
             bwd_step(m_block, mask_fn);
         }
 
-        if constexpr (Is_local && SeparateMaskingIterations) {
-            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+        // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
+        // this helps quite a bit to not have to do causal masking for most of the iterations.
+        if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {
+            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
             CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block < m_block_max; ++m_block) {
+            for (; m_block >= m_block_min; --m_block) {
                 bwd_step(m_block, mask_fn);
             }
         }
