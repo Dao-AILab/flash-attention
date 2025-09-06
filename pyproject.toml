@@ -34,6 +34,16 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["flash_attn*"]
+exclude = [
+  "build",
+  "csrc",
+  "include",
+  "tests",
+  "dist",
+  "docs",
+  "benchmarks",
+  "flash_attn.egg-info"
+]
 
 [tool.setuptools.dynamic]
 version = { attr = "flash_attn.__version__" }
