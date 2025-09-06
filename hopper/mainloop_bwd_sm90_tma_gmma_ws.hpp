@@ -607,7 +607,8 @@ struct CollectiveMainloopBwdSm90 {
             seqlen_info, n_block, bidb, params.window_size_left,
             params.window_size_right, 0 /*sink_token_length*/);
         // It's possible to have m_block_max <= m_block_min. Exit early
-        if constexpr (Is_causal || Is_local || Varlen) {
+        // Though if local and deterministic, still need to increment dq semaphore
+        if constexpr ((Is_causal || Is_local || Varlen) && !(Is_local && Deterministic)) {
             if (m_block_max <= m_block_min) { return; }
         }
 
@@ -627,6 +628,7 @@ struct CollectiveMainloopBwdSm90 {
         bool const lane_predicate = cute::elect_one_sync();
         constexpr int kBlockM = get<0>(TileShape_MNK{});
         int m_block = Is_local && Deterministic ? cute::ceil_div(seqlen_info.seqlen_q, kBlockM) - 1 : m_block_max - 1;
+        // if (lane_predicate) { printf("blockIdx.x = %d, blockIdx.y = %d, blockIdx.z = %d, m_block = %d, bidh = %d, bidb = %d, num_batch = %d, num_head = %d.\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidh, bidb, num_batch, num_head);}
         if constexpr (Is_local && Deterministic) {
             #pragma unroll 2
             for (; m_block >= m_block_max; --m_block) {
@@ -655,6 +657,7 @@ struct CollectiveMainloopBwdSm90 {
                 Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
             }
         }
+        // if (lane_predicate) { printf("After barrier: blockIdx.x = %d, blockIdx.y = %d, blockIdx.z = %d, m_block = %d, bidh = %d, bidb = %d.\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidh, bidb);}
     }
 
     CUTLASS_DEVICE void
