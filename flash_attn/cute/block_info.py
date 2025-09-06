@@ -43,6 +43,18 @@ class BlockInfo:
         return n_block_min, n_block_max
 
     @cute.jit
+    def get_m_block_min_max(
+        self, seqlen_info: SeqlenInfoQK, m_block: cutlass.Int32
+    ) -> Tuple[cutlass.Int32, cutlass.Int32]:
+        m_block_max = cute.ceil_div(seqlen_info.seqlen_k, self.m_block_size)
+
+        m_block_min = 0
+
+        return m_block_min, m_block_max
+
+
+
+    @cute.jit
     def get_n_block_min_causal_local_mask(
         self,
         seqlen_info: SeqlenInfoQK,
