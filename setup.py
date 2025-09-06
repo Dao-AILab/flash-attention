@@ -30,10 +30,6 @@ from torch.utils.cpp_extension import (
 )
 
 
-with open("README.md", "r", encoding="utf-8") as fh:
-    long_description = fh.read()
-
-
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
