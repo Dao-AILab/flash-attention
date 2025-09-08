@@ -160,7 +160,25 @@ else:
             os.path.exists("csrc/cutlass/include/cutlass/cutlass.h")
         ), "csrc/cutlass is missing, please use source distribution or git clone"
 
-if not SKIP_CUDA_BUILD and not IS_ROCM:
+# Force XPU
+os.environ["BUILD_WITH_XPU"] = "ON"
+os.environ["CC"] = "icx"
+os.environ["CXX"] = "icpx"
+os.environ["SKIP_CUDA_BUILD"] = "0"
+
+if "BUILD_WITH_XPU" in os.environ:
+    ext_modules = [
+        CppExtension(
+            name="flash_attn_xpu",
+            sources=[
+                "csrc/flash_attn_xe/flash_api.cpp",
+            ],
+            extra_compile_args={
+                "cxx": ["-fsycl", "-O3", "-std=c++17", "-fPIC"]
+            },
+        )
+    ]
+elif not SKIP_CUDA_BUILD and not IS_ROCM:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
