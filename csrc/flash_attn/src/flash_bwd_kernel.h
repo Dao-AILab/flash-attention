@@ -86,7 +86,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     // Shared memory.
     extern __shared__ char smem_[];
-    float dsink_val = 0.f;
+    double dsink_val = 0.0L;
+    
+    const float sink_val = !Has_sink || params.learnable_sink_ptr == nullptr ? -INFINITY : reinterpret_cast<float *>(params.learnable_sink_ptr)[bidh];
 
     // The thread index.
     const int tidx = threadIdx.x;
@@ -581,12 +583,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
         // Reshape acc_dp from (MMA=4, MMA_N, MMA_N) to (row=(2, MMA_N), col=(2, MMA_N))
         Tensor dS = make_tensor(acc_dp.data(), scores.layout());
-        auto pointwise_mult = [](float p, float dp, float d) {
+        auto pointwise_mult = [](double p, double dp, double d) {
             return p * (!Is_dropout || p >= 0 ? dp - d : d);
         };
         #pragma unroll
         for (int mi = 0; mi < size<0>(dS); ++mi) {
-            float dsink_val_cols = 0.f;
+            double dsink_val_cols = 0.0L;
             #pragma unroll
             for (int ni = 0; ni < size<1>(dS); ++ni) {
                 if constexpr (Has_sink) { dsink_val_cols += pointwise_mult(scores(mi, ni), dS(mi, ni), 0.f); }
@@ -594,7 +596,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 if constexpr (Is_softcap) { scaled_ds *= dtanh(mi, ni); }
                 dS(mi, ni) = scaled_ds;
             }
-            if constexpr (Has_sink) { dsink_val += dsink_val_cols / expf(lse(mi)); }
+            if constexpr (Has_sink) { dsink_val += dsink_val_cols * expf(sink_val - lse(mi)); }
         }
         // if (cute::thread0()) { print(dS); }
 
@@ -796,12 +798,22 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     );
 
     if constexpr (Has_sink) {
-        const float sink_val = !Has_sink || params.learnable_sink_ptr == nullptr ? -INFINITY : reinterpret_cast<float *>(params.learnable_sink_ptr)[bidh];
-        SumOp<float> sum_op;
+        SumOp<double> sum_op;
+
+        __shared__ double dsink_block_sum;
+        if (tidx == 0) dsink_block_sum = 0.0;
+        __syncthreads();
+
         dsink_val = Allreduce<32>::run(dsink_val, sum_op);
-        if (tidx % 32 == 0 && params.dsink_ptr != nullptr) {
+
+        if (tidx % 32 == 0) {
+            atomicAdd(&dsink_block_sum, dsink_val);
+        }
+        __syncthreads();
+
+        if (tidx == 0 && params.dsink_ptr != nullptr) {
             float* dsink_ptr = reinterpret_cast<float*>(params.dsink_ptr);
-            float val = -dsink_val * exp2f(sink_val * float(M_LOG2E)) * params.rp_dropout;
+            float val = -dsink_block_sum * params.rp_dropout;
             atomicAdd(dsink_ptr + bidh, val);
         }
     }

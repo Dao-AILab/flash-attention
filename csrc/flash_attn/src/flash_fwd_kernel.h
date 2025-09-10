@@ -997,8 +997,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // Epilogue
 
-    // We fix the lse for sink in combine_attn_seqk_parallel.
-    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split, /*Has_sink=*/false>(acc_o, params.scale_softmax);
+    // We fix the lse for sink in combine_attn_seqk_parallel if Split is true.
+    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split, /*Has_sink=*/!Split>(acc_o, params.scale_softmax);
     // if (cute::thread0()) { print(lse); }
 
     Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(smem_)), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N)
@@ -1196,18 +1196,18 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     for (int l = 1; l < kNLsePerThread; ++l) { lse_sum += __expf(lse_accum(l) - lse_max); }
     SumOp<float> sum_op;
     lse_sum = Allreduce<kRowsPerLoadTranspose>::run(lse_sum, sum_op);
-
-    if constexpr(Has_sink){
+    
+    if constexpr(Has_sink) {
         const int row = tidx % kRowsPerLoadTranspose;
         const int col = tidx / kRowsPerLoadTranspose;
         if (row < params.num_splits && col < kBlockM) {
             const index_t lse_offset = row_offset_lse + col;
-            if(params.unpadded_lse){
+            if (params.unpadded_lse) {
                 // LSE is written as (h, seqlen_q, b) or (h, b, seqlen_q).
                 const int head_idx = lse_offset / (params.b * params.seqlen_q);
                 const float sink_val_exp = params.learnable_sink_ptr == nullptr ? 0.f : __expf(reinterpret_cast<float *>(params.learnable_sink_ptr)[head_idx] - lse_max);
                 lse_sum += sink_val_exp;
-            }else{
+            } else {
                 // LSE is written as (b, h, seqlen_q).
                 const int head_idx = (lse_offset % (params.h * params.seqlen_q)) / params.seqlen_q;
                 const float sink_val_exp = params.learnable_sink_ptr == nullptr ? 0.f : __expf(reinterpret_cast<float *>(params.learnable_sink_ptr)[head_idx] - lse_max);
@@ -1215,7 +1215,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
             }
         }
     }
-    
+
     // For the case where all local lse == -INFINITY, we want to set lse_logsum to INFINITY. Otherwise
     // lse_logsum is log(0.0) = -INFINITY and we get NaN when we do lse_accum(l) - lse_logsum.
     ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : __logf(lse_sum) + lse_max;
