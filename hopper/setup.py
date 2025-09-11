@@ -530,11 +530,15 @@ if not SKIP_CUDA_BUILD:
     # Choose between flash_api.cpp and flash_api_stable.cpp based on torch version
     torch_version_parsed = parse(torch.__version__)
     target_version = parse("2.9.0.dev20250830")
+    stable_args = []
       
     if torch_version_parsed > target_version:
         flash_api_source = "flash_api_stable.cpp"
+        stable_args = ["-DTORCH_STABLE_ONLY"]
     else:
         flash_api_source = "flash_api.cpp"
+
+    print(f"\n\nflash_api_source file = {flash_api_source}\n\n")
 
     sources = (
         [flash_api_source]
@@ -576,7 +580,7 @@ if not SKIP_CUDA_BUILD:
             name=f"{PACKAGE_NAME}._C",
             sources=sources,
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17", "-DPy_LIMITED_API=0x03090000", "-DTORCH_STABLE_ONLY"] + feature_args,
+                "cxx": ["-O3", "-std=c++17", "-DPy_LIMITED_API=0x03090000"] + stable_args + feature_args,
                 "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
             },
             include_dirs=include_dirs,
