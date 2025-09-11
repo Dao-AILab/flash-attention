@@ -526,8 +526,18 @@ if not SKIP_CUDA_BUILD:
     if DISABLE_BACKWARD:
         sources_bwd_sm90 = []
         sources_bwd_sm80 = []
+    
+    # Choose between flash_api.cpp and flash_api_stable.cpp based on torch version
+    torch_version_parsed = parse(torch.__version__)
+    target_version = parse("2.9.0.dev20250830")
+      
+    if torch_version_parsed > target_version:
+        flash_api_source = "flash_api_stable.cpp"
+    else:
+        flash_api_source = "flash_api.cpp"
+
     sources = (
-        ["flash_api.cpp"]
+        [flash_api_source]
         + (sources_fwd_sm80 if not DISABLE_SM8x else []) + sources_fwd_sm90
         + (sources_bwd_sm80 if not DISABLE_SM8x else []) + sources_bwd_sm90
     )
