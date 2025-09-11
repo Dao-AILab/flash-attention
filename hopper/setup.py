@@ -532,7 +532,7 @@ if not SKIP_CUDA_BUILD:
     target_version = parse("2.9.0.dev20250830")
     stable_args = []
       
-    if torch_version > target_version:
+    if torch_version >= target_version:
         flash_api_source = "flash_api_stable.cpp"
         stable_args = ["-DTORCH_STABLE_ONLY"]  # Checks against including unstable Tensor APIs
     else:
