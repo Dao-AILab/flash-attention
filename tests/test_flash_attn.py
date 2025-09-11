@@ -288,6 +288,7 @@ def attention_ref(
     if learnable_sink is None:
         attention = torch.softmax(scores, dim=-1).to(v.dtype)
     else:
+        learnable_sink = learnable_sink.to(q.dtype)
         sinks = repeat(learnable_sink, 'h -> b h n 1', b=scores.shape[0], n=scores.shape[2])
         scores = torch.cat([scores, sinks], dim=-1)
         attention = torch.softmax(scores, dim=-1).to(v.dtype)
@@ -525,6 +526,7 @@ def normalize_flash_attn_S(
         lse = torch.logsumexp(lse_block, dim=-1)
         scores_max_block = torch.stack([torch.amax(s, dim=-1) for s in scores_block], dim=-1)
     else:
+        learnable_sink = learnable_sink.to(q.dtype)
         sinks = repeat(learnable_sink, 'h -> b h n 1', b=scores.shape[0], n=scores.shape[2])
         lse = torch.logsumexp(torch.cat([lse_block, sinks], dim=-1), dim=-1)
         scores_max_block = torch.stack([torch.amax(torch.cat([s, sinks], dim=-1), dim=-1) for s in scores_block], dim=-1)
