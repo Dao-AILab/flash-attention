@@ -51,7 +51,7 @@ jobs:
         cxx11_abi: ["FALSE", "TRUE"]
         include:
             - torch-version: "2.9.0.dev20250904"
-              cuda-version: "13.0"
+              cuda-version: "13.0.0"
         exclude:
           # see https://github.com/pytorch/pytorch/blob/main/RELEASE.md#release-compatibility-matrix
           # Pytorch < 2.5 does not support Python 3.13
