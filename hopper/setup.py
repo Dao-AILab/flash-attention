@@ -526,8 +526,20 @@ if not SKIP_CUDA_BUILD:
     if DISABLE_BACKWARD:
         sources_bwd_sm90 = []
         sources_bwd_sm80 = []
+    
+    # Choose between flash_api.cpp and flash_api_stable.cpp based on torch version
+    torch_version = parse(torch.__version__)
+    target_version = parse("2.9.0.dev20250830")
+    stable_args = []
+      
+    if torch_version >= target_version:
+        flash_api_source = "flash_api_stable.cpp"
+        stable_args = ["-DTORCH_STABLE_ONLY"]  # Checks against including unstable Tensor APIs
+    else:
+        flash_api_source = "flash_api.cpp"
+
     sources = (
-        ["flash_api.cpp"]
+        [flash_api_source]
         + (sources_fwd_sm80 if not DISABLE_SM8x else []) + sources_fwd_sm90
         + (sources_bwd_sm80 if not DISABLE_SM8x else []) + sources_bwd_sm90
     )
@@ -566,7 +578,7 @@ if not SKIP_CUDA_BUILD:
             name=f"{PACKAGE_NAME}._C",
             sources=sources,
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17", "-DPy_LIMITED_API=0x03090000"] + feature_args,
+                "cxx": ["-O3", "-std=c++17", "-DPy_LIMITED_API=0x03090000"] + stable_args + feature_args,
                 "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
             },
             include_dirs=include_dirs,
