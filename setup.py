@@ -96,42 +96,32 @@ def get_cuda_bare_metal_version(cuda_dir):
 
 def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
     """
-    Fills cc_flag with:
-      - regular 'sm_XX' targets
-      - PTX of the newest arch for forward-compat
-      - family-specific 'f' (100f/110f/120f) if CUDA >= 12.9
+    Adds -gencode flags:
+      - Regular sm_XX targets (80/90 always regular)
+      - For 100/110/120: family-specific 'f' if CUDA >= 12.9, else regular
+      - PTX for the newest arch for forward-compat
     """
-    # Regular targets
+    # Always regular 80 + 90
     if "80" in archs:
         cc_flag += ["-gencode", "arch=compute_80,code=sm_80"]
 
     if bare_metal_version >= Version("11.8") and "90" in archs:
         cc_flag += ["-gencode", "arch=compute_90,code=sm_90"]
 
-    if bare_metal_version >= Version("12.8") and "100" in archs:
-        cc_flag += ["-gencode", "arch=compute_100,code=sm_100"]
+    # 100/110/120 → choose family-specific if supported
+    if bare_metal_version >= Version("12.8"):
+        for a in ("100", "110", "120"):
+            if a in archs:
+                if bare_metal_version >= Version("12.9"):
+                    cc_flag += ["-gencode", f"arch=compute_{a}f,code=sm_{a}"]
+                else:
+                    cc_flag += ["-gencode", f"arch=compute_{a},code=sm_{a}"]
 
-    if bare_metal_version >= Version("12.8") and "110" in archs:
-        cc_flag += ["-gencode", "arch=compute_110,code=sm_110"]
-
-    if bare_metal_version >= Version("12.8") and "120" in archs:
-        cc_flag += ["-gencode", "arch=compute_120,code=sm_120"]
-
-    # PTX for newest arch (forward-compat)
+    # Add PTX of newest arch for forward-compat
     numeric_archs = [a for a in archs if a.isdigit()]
     if numeric_archs:
         newest = max(numeric_archs, key=int)
         cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
-
-    # Family-specific (CUDA >= 12.9): 100f/110f/120f
-    if bare_metal_version >= Version("12.9"):
-        if "100" in archs:
-            # code=sm_100 and code=sm_100f are aliases for the 100f family
-            cc_flag += ["-gencode", "arch=compute_100f,code=sm_100"]
-        if "110" in archs:
-            cc_flag += ["-gencode", "arch=compute_110f,code=sm_110"]
-        if "120" in archs:
-            cc_flag += ["-gencode", "arch=compute_120f,code=sm_120"]
 
     return cc_flag
     
