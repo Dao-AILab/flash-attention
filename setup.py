@@ -67,7 +67,7 @@ SKIP_CK_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CK_BUILD", "TRUE") == "TRUE" if 
 
 @functools.lru_cache(maxsize=None)
 def cuda_archs() -> str:
-    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;120").split(";")
+    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;110;120").split(";")
 
 
 def get_platform():
@@ -93,6 +93,48 @@ def get_cuda_bare_metal_version(cuda_dir):
 
     return raw_output, bare_metal_version
 
+
+def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
+    """
+    Fills cc_flag with:
+      - regular 'sm_XX' targets
+      - PTX of the newest arch for forward-compat
+      - family-specific 'f' (100f/110f/120f) if CUDA >= 12.9
+    """
+    # Regular targets
+    if "80" in archs:
+        cc_flag += ["-gencode", "arch=compute_80,code=sm_80"]
+
+    if bare_metal_version >= Version("11.8") and "90" in archs:
+        cc_flag += ["-gencode", "arch=compute_90,code=sm_90"]
+
+    if bare_metal_version >= Version("12.8") and "100" in archs:
+        cc_flag += ["-gencode", "arch=compute_100,code=sm_100"]
+
+    if bare_metal_version >= Version("12.8") and "110" in archs:
+        cc_flag += ["-gencode", "arch=compute_110,code=sm_110"]
+
+    if bare_metal_version >= Version("12.8") and "120" in archs:
+        cc_flag += ["-gencode", "arch=compute_120,code=sm_120"]
+
+    # PTX for newest arch (forward-compat)
+    numeric_archs = [a for a in archs if a.isdigit()]
+    if numeric_archs:
+        newest = max(numeric_archs, key=int)
+        cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
+
+    # Family-specific (CUDA >= 12.9): 100f/110f/120f
+    if bare_metal_version >= Version("12.9"):
+        if "100" in archs:
+            # code=sm_100 and code=sm_100f are aliases for the 100f family
+            cc_flag += ["-gencode", "arch=compute_100f,code=sm_100"]
+        if "110" in archs:
+            cc_flag += ["-gencode", "arch=compute_110f,code=sm_110"]
+        if "120" in archs:
+            cc_flag += ["-gencode", "arch=compute_120f,code=sm_120"]
+
+    return cc_flag
+    
 
 def get_hip_version():
     return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
@@ -175,20 +217,11 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "FlashAttention is only supported on CUDA 11.7 and above.  "
                 "Note: make sure nvcc has a supported version by running nvcc -V."
             )
-
-    if "80" in cuda_archs():
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_80,code=sm_80")
-    if CUDA_HOME is not None:
-        if bare_metal_version >= Version("11.8") and "90" in cuda_archs():
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_90,code=sm_90")
-        if bare_metal_version >= Version("12.8") and "100" in cuda_archs():
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_100,code=sm_100")
-        if bare_metal_version >= Version("12.8") and "120" in cuda_archs():
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_120,code=sm_120")
+        # Build -gencode (regular + PTX + family-specific 'f' when available)
+        add_cuda_gencodes(cc_flag, set(cuda_archs()), bare_metal_version)
+    else:
+        # No nvcc present; warnings already emitted above
+        pass
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
