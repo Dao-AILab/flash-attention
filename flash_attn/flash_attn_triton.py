@@ -557,7 +557,7 @@ def _bwd_kernel_one_col_block(
         # compute dq
         if not (
             EVEN_M & EVEN_HEADDIM
-        ):  # Otherewise there's a race condition when BIAS_TYPE='matrix'
+        ):  # Otherwise there's a race condition when BIAS_TYPE='matrix'
             tl.debug_barrier()
         if not ATOMIC_ADD:
             if EVEN_M & EVEN_HEADDIM:  # Race condition if we just do EVEN_M

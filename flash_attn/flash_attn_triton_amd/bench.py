@@ -907,7 +907,7 @@ def run_benchmark(func_config: FunctionConfig, input_configs):
     """
     Runs the benchmark for the provided function configuration with the given input configurations.
     """
-    # print new line to seperate benchmark runs
+    # print new line to separate benchmark runs
     print()
     if DEBUG:
         print("func_config:", func_config)
@@ -1158,7 +1158,7 @@ def main():
             combined_df = combined_df.merge(df, on=input_config_cols, how="outer")
     
 
-    # print new line to seperate the combined data information from the benchmark specific information
+    # print new line to separate the combined data information from the benchmark specific information
     print()
 
     # print total time for all benchmarks

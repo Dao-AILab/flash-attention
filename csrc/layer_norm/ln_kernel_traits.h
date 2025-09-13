@@ -67,7 +67,7 @@ struct Kernel_traits_finalize : public Base {
 
     // Shared memory size to transpose the CTA result.
     enum { SMEM_BYTES_TRANSPOSE = Base::THREADS_PER_CTA * BYTES_PER_LDG };
-    // Shared memory size to coalsece the CTA result.
+    // Shared memory size to coalesce the CTA result.
     enum { SMEM_BYTES_OUTPUT = Base::THREADS_PER_WARP * BYTES_PER_LDG };
     // Shared memory requirement per CTA. 
     static constexpr int NUM_FACTORS = Has_colscale ? 3 : 2;
