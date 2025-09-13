@@ -135,13 +135,13 @@ struct Softmax {
     __forceinline__ __device__ Softmax(const float sink_val = -INFINITY) : sink_val(sink_val) {};
 
     template<bool Is_first, bool Check_inf=false, bool Has_sink=false, typename Tensor0, typename Tensor1>
-    __forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2) {
+    __forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2, float softmax_scale=1.0) {
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
         if (Is_first) {
             if constexpr (Has_sink) {
-                const float sink_scaled = (sink_val * float(M_LOG2E) / softmax_scale_log2);
+                const float sink_scaled = sink_val / softmax_scale;
                 #pragma unroll
                 for (int mi = 0; mi < size(row_max); ++mi) { row_max(mi) = sink_scaled; }
                 FLASH_NAMESPACE::template reduce_max</*zero_init=*/false>(scores, row_max);
