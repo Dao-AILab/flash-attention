@@ -27,7 +27,8 @@ authors = [
 ]
 license = { file = "LICENSE" }
 dependencies = [
-  "torch"
+  "torch",
+  "einops"
 ]
 
 [tool.setuptools]
