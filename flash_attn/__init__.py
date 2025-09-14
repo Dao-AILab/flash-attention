@@ -9,3 +9,5 @@ from flash_attn.flash_attn_interface import (
     flash_attn_varlen_qkvpacked_func,
     flash_attn_with_kvcache,
 )
+
+from .determinism import set_deterministic_mode, get_deterministic_mode

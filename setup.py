@@ -139,10 +139,11 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
                 # else: no Thor support in older toolkits
 
     # PTX for newest requested arch (forward-compat)
-    numeric = [a for a in archs if a.isdigit()]
-    if numeric:
-        newest = max(numeric, key=int)
-        cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
+    # [MUYU]: patch, disable new archs
+    # numeric = [a for a in archs if a.isdigit()]
+    # if numeric:
+    #     newest = max(numeric, key=int)
+    #     cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
 
     return cc_flag
     
@@ -229,7 +230,9 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "Note: make sure nvcc has a supported version by running nvcc -V."
             )
         # Build -gencode (regular + PTX + family-specific 'f' when available)
-        add_cuda_gencodes(cc_flag, set(cuda_archs()), bare_metal_version)
+        # [MUYU]: patch, disable new archs
+        archs = {"80", "90"}
+        add_cuda_gencodes(cc_flag, archs, bare_metal_version)
     else:
         # No nvcc present; warnings already emitted above
         pass
