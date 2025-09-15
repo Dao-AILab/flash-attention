@@ -483,6 +483,16 @@ class FlashAttentionForwardSm100:
             window_size_left = Int32(window_size_left)
         if const_expr(window_size_right is not None):
             window_size_right = Int32(window_size_right)
+
+        fastdiv_mods = None
+        # Create FastDivmod objects only if buffers are present
+        if cutlass.const_expr(buffers is not None):
+            seqlen_q = cute.size(mQ.shape[0])
+            seqlen_k = cute.size(mK.shape[0])
+            seqlen_q_divmod = FastDivmod.create(seqlen_q)
+            seqlen_k_divmod = FastDivmod.create(seqlen_k)
+            fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
+
         # Launch the kernel synchronously
         self.kernel(
             tma_tensor_Q,
@@ -514,6 +524,7 @@ class FlashAttentionForwardSm100:
             tiled_mma_pv,
             tile_sched_params,
             buffers,
+            fastdiv_mods,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -556,6 +567,7 @@ class FlashAttentionForwardSm100:
         tiled_mma_pv: cute.TiledMma,
         tile_sched_params: ParamsBase,
         buffers = None,
+        fastdiv_mods = (None, None),
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -794,6 +806,8 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls=SeqlenInfoCls,
                 AttentionMaskCls=AttentionMaskCls,
                 TileSchedulerCls=TileSchedulerCls,
+                buffers=buffers,
+                fastdiv_mods=fastdiv_mods,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -801,17 +815,17 @@ class FlashAttentionForwardSm100:
                 softmax_loop(
                     stage=stage,
                     tStSi=cute.make_tensor(tStS.iterator + (self.tmem_s_offset[0] if stage == 0 else self.tmem_s_offset[1]), tStS.layout),
-                    buffers=buffers)
+                )
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             else:
                 # If there's s0_s1_barrier, it's faster to have 2 WGs having different code
                 if warp_idx < self.softmax1_warp_ids[0]:
                     tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
-                    softmax_loop(stage=0, tStSi=tStSi, buffers=buffers)
+                    softmax_loop(stage=0, tStSi=tStSi)
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
                 if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax1_warp_ids[0]:
                     tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
-                    softmax_loop(stage=1, tStSi=tStSi, buffers=buffers)
+                    softmax_loop(stage=1, tStSi=tStSi)
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1165,6 +1179,7 @@ class FlashAttentionForwardSm100:
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
         buffers = None,
+        fastdiv_mods = (None, None)
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1257,6 +1272,7 @@ class FlashAttentionForwardSm100:
                 m_block=m_block * 2 + stage,
                 seqlen=seqlen,
                 buffers=buffers,
+                fastdiv_mods=fastdiv_mods,
             )
 
             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase)
@@ -1349,6 +1365,7 @@ class FlashAttentionForwardSm100:
         m_block: Int32,
         seqlen,
         buffers = None,
+        fastdiv_mods = (None, None),
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
@@ -1391,8 +1408,8 @@ class FlashAttentionForwardSm100:
                 m_block,
                 n_block,
                 softmax,
-                seqlen,
                 buffers,
+                fastdiv_mods
             )
 
         if const_expr(mask_fn is not None):
@@ -1953,8 +1970,8 @@ class FlashAttentionForwardSm100:
         m_block,
         n_block,
         softmax,
-        seqlen,
         buffers = None,
+        fastdiv_mods = (None, None),
         VEC_SIZE: cutlass.Constexpr[int] = 1,
     ):
         """Apply score modification function to attention scores.
@@ -1975,18 +1992,23 @@ class FlashAttentionForwardSm100:
         tScS = thr_mma_qk.partition_C(cS)
         tScS_t2r = thr_tmem_load.partition_D(tScS)
 
-        seqlenk_col_limit = seqlen.seqlen_k
-        seqlenq_row_limit = seqlen.seqlen_q
-
         # Build index + score fragments
         n_vals = cutlass.const_expr(cute.size(tSrS_t2r.shape))
         score_vec = cute.make_fragment(VEC_SIZE, self.qk_acc_dtype)
         kv_idx_vec = cute.make_fragment(VEC_SIZE, cutlass.Int32)
-        
+
         # Create broadcasted fragments for constant values
         batch_idx_vec = utils.broadcast_scalar_to_vec(batch_idx, kv_idx_vec, cutlass.Int32)
         head_idx_vec = utils.broadcast_scalar_to_vec(head_idx, kv_idx_vec, cutlass.Int32)
-        q_idx_vec = utils.broadcast_scalar_to_vec(tScS_t2r[0][0] % seqlenq_row_limit, kv_idx_vec, cutlass.Int32)
+
+        # Use FastDivmod for bounds checking if buffers and divmods are present
+        if cutlass.const_expr(buffers is not None):
+            seqlen_q_divmod, _ = fastdiv_mods
+            _, q_idx_wrapped = seqlen_q_divmod.divmod(tScS_t2r[0][0])
+            q_idx_vec = utils.broadcast_scalar_to_vec(q_idx_wrapped, kv_idx_vec, cutlass.Int32)
+        else:
+            # No bounds checking needed - direct indexing
+            q_idx_vec = utils.broadcast_scalar_to_vec(tScS_t2r[0][0], kv_idx_vec, cutlass.Int32)
         
         # Load SSA values once
         batch_idx_ssa = batch_idx_vec.load()
@@ -1997,8 +2019,14 @@ class FlashAttentionForwardSm100:
         for i in cutlass.range(0, n_vals, VEC_SIZE, unroll_full=True):
             for j in cutlass.range(VEC_SIZE, unroll_full=True):
                 score_vec[j] = tSrS_t2r[i + j] * softmax.softmax_scale
-                # wrap around kv_idx to not index OOB
-                kv_idx_vec[j] = tScS_t2r[i + j][1] % seqlenk_col_limit
+                # Use FastDivmod for bounds checking if buffers and divmods are present
+                if cutlass.const_expr(buffers is not None and fastdiv_mods is not None):
+                    _, seqlen_k_divmod = fastdiv_mods
+                    _, kv_idx_wrapped = seqlen_k_divmod.divmod(tScS_t2r[i + j][1])
+                    kv_idx_vec[j] = kv_idx_wrapped
+                else:
+                    # No bounds checking needed - direct indexing
+                    kv_idx_vec[j] = tScS_t2r[i + j][1]
             score_ssa = score_vec.load()
             kv_idx_ssa = kv_idx_vec.load()
 
