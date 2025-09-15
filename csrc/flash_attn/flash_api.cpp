@@ -311,8 +311,30 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     at::Tensor softmax_lse_accum;
     at::Tensor out_accum;
 
+    // [PATCH]: fix split-size 
+    int fixed_split_tokens = 0;
+    if (const char* env = std::getenv("FA2_SPLIT_SIZE")) {
+        try {
+            fixed_split_tokens = std::max(0, std::stoi(env));
+        } catch (...) {
+            fixed_split_tokens = 0;
+        }
+    }
+    bool fa2_det = false;
+    if (const char* env_det = std::getenv("FA2_DETERMINISTIC")) {
+        fa2_det = (std::string(env_det) == "1");
+    }
+
+    if (p_dropout == 0.0f && fixed_split_tokens > 0 && params.num_splits < 1 && fa2_det) {
+        int blocks_per_split = (fixed_split_tokens + block_n - 1) / block_n;
+        blocks_per_split = std::max(1, blocks_per_split);
+
+        int computed_splits = (num_n_blocks + blocks_per_split - 1) / blocks_per_split;
+        params.num_splits = std::max(1, computed_splits);
+    }
+
     if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
-        if (num_splits < 1) {
+        if (params.num_splits < 1) {
             // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
             params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
         }
