@@ -89,6 +89,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         //     printf("m_block = %d, n_block_max = %d\n", m_block, n_block_max);
         // }
     }
+    const float sink_val = !Has_sink || params.learnable_sink_ptr == nullptr ? -INFINITY : reinterpret_cast<float *>(params.learnable_sink_ptr)[bidh];
     // We exit early and write 0 to gO and gLSE. This also covers the case where actual_seqlen_k == 0.
     // Otherwise we might read OOB elements from gK and gV.
     if ((Is_causal || Is_local || !Is_even_MN) && n_block_max <= n_block_min) {
@@ -122,7 +123,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         #pragma unroll
         for (int m = 0; m < size<1>(tOgO); ++m) {
             const int row = get<0>(tOcO(0, m, 0));
-            if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSE(row) = INFINITY; }
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSE(row) = Has_sink ? sink_val : INFINITY; }
         }
         return;
     }
@@ -282,7 +283,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     clear(acc_o);
 
-    const float sink_val = !Has_sink || params.learnable_sink_ptr == nullptr ? -INFINITY : reinterpret_cast<float *>(params.learnable_sink_ptr)[bidh];
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax(sink_val);
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
@@ -996,8 +996,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // Epilogue
 
-    // We fix the lse for sink in combine_attn_seqk_parallel if Split is true.
-    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split, /*Has_sink=*/!Split>(acc_o, params.scale_softmax);
+    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split, Has_sink>(acc_o, params.scale_softmax);
     // if (cute::thread0()) { print(lse); }
 
     Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(smem_)), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N)
@@ -1219,7 +1218,6 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     // lse_logsum is log(0.0) = -INFINITY and we get NaN when we do lse_accum(l) - lse_logsum.
     ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : logf(lse_sum) + lse_max;
     // if (bidx == 0 && tidx < 32) { printf("tidx = %d, lse = %f, lse_max = %f, lse_logsum = %f\n", tidx, lse_accum(0), lse_max, lse_logsum); }
-
     if (tidx % kRowsPerLoadTranspose == 0 && tidx / kRowsPerLoadTranspose < kBlockM) {
         if (params.unpadded_lse) {
             const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
