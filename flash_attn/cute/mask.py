@@ -76,6 +76,12 @@ class AttentionMask:
             causal_row_offset = (
                 1 + self.seqlen_k - n_block * self.n_block_size - self.seqlen_q - thr_col_offset
             )
+            c = 0
+            col_limit_transformed = 0
+            ncol: cute.Constexpr = 0
+            col_limit_right_s = 0
+            mask = 0
+            in_bound = False
             if cutlass.const_expr(mask_causal):
                 for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                     # get the column index limit based on current row. Only consider the row index, so the column index sets to 0.
@@ -113,6 +119,7 @@ class AttentionMask:
                     if cutlass.const_expr(self.window_size_left is not None)
                     else None
                 )
+                c = 0
                 for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                     if cutlass.const_expr(self.qhead_per_kvhead_packgqa == 1):
                         row_idx = tScS_mn[r, 0][0] + m_block * self.m_block_size
@@ -133,6 +140,7 @@ class AttentionMask:
                     # traverse column index.
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                         col_idx = t0ScS_mn[0, c][1]
+                        acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
                         # only consider the column index, so the row index sets to 0.
                         if col_idx >= col_limit_right or col_idx < col_limit_left:
                             acc_S_mn[r, c] = -cutlass.Float32.inf
@@ -193,6 +201,7 @@ class AttentionMask:
             row_idx = tScS_t2r[0][0] + m_block * self.m_block_size
             if cutlass.const_expr(self.qhead_per_kvhead_packgqa != 1):
                 row_idx = row_idx // self.qhead_per_kvhead_packgqa
+            c = 0
             if cutlass.const_expr(mask_causal):
                 col_limit_right = row_idx + causal_row_offset
                 if cutlass.const_expr(mask_seqlen):
