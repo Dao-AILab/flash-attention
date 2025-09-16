@@ -3,8 +3,30 @@ from typing import Optional
 import cutlass
 import cutlass.cute as cute
 
+"""
+This consolidates all the info related to sequence length. This is so that we can do all
+the gmem reads once at the beginning of each tile, rather than having to repeat these reads
+to compute various things like n_block_min, n_block_max, etc.
+"""
 
 class SeqlenInfo:
+    def __init__(
+        self,
+        batch_idx: cutlass.Int32,
+        seqlen_static: cutlass.Int32,
+        cu_seqlens: Optional[cute.Tensor] = None,
+        seqused: Optional[cute.Tensor] = None,
+    ):
+        self.offset = 0 if cutlass.const_expr(cu_seqlens is None) else cu_seqlens[batch_idx]
+        if cutlass.const_expr(seqused is not None):
+            self.seqlen = seqused[batch_idx]
+        elif cutlass.const_expr(cu_seqlens is not None):
+            self.seqlen = cu_seqlens[batch_idx + 1] - cu_seqlens[batch_idx]
+        else:
+            self.seqlen = seqlen_static
+
+
+class SeqlenInfoQK:
     def __init__(
         self,
         batch_idx: cutlass.Int32,

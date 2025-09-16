@@ -219,6 +219,10 @@ def log2f(a: float | Float32, *, loc=None, ip=None) -> Float32:
         )
     )
 
+@dsl_user_op
+def logf(a: float | Float32, *, loc=None, ip=None) -> Float32:
+    return log2f(a, loc=loc, ip=ip) * math.log(2.0)
+
 
 @dsl_user_op
 def fmax(
@@ -349,6 +353,15 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
 
 @dsl_user_op
 def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+    return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def elem_pointer_i64(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+    flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
+    flat_stride = cute.flatten_to_tuple(x.stride)
+    assert len(flat_coord_i64) == len(flat_stride), "Coordinate and stride must have the same length"
+    offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 
@@ -485,59 +498,94 @@ def cvt_f16(src: cute.Tensor, dst: cute.Tensor):
 
 
 @dsl_user_op
-def i64_to_f32x2(c: cutlass.Int64, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
-    vec_i64x1 = vector.from_elements(T.vector(1, T.i64()), (c.ir_value(),), loc=loc, ip=ip)
-    vec_f32x2 = vector.bitcast(T.vector(2, T.f32()), vec_i64x1)
-    res0 = Float32(
-        vector.extract(vec_f32x2, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
+def e2e_asm2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    out_f32x2 = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [Float32(x).ir_value(loc=loc, ip=ip), Float32(y, loc=loc, ip=ip).ir_value()],
+        "{\n\t"
+        ".reg .f32 f1, f2, f3, f4, f5, f6, f7;\n\t"
+        ".reg .b64 l1, l2, l3, l4, l5, l6, l7, l8, l9, l10;\n\t"
+        ".reg .s32 r1, r2, r3, r4, r5, r6, r7, r8;\n\t"
+        "max.ftz.f32 f1, $2, 0fC2FE0000;\n\t"
+        "max.ftz.f32 f2, $3, 0fC2FE0000;\n\t"
+        "mov.b64 l1, {f1, f2};\n\t"
+        "mov.f32 f3, 0f4B400000;\n\t"
+        "mov.b64 l2, {f3, f3};\n\t"
+        "add.rm.ftz.f32x2 l7, l1, l2;\n\t"
+        "sub.rn.ftz.f32x2 l8, l7, l2;\n\t"
+        "sub.rn.ftz.f32x2 l9, l1, l8;\n\t"
+        "mov.f32 f7, 0f3D9DF09D;\n\t"
+        "mov.b64 l6, {f7, f7};\n\t"
+        "mov.f32 f6, 0f3E6906A4;\n\t"
+        "mov.b64 l5, {f6, f6};\n\t"
+        "mov.f32 f5, 0f3F31F519;\n\t"
+        "mov.b64 l4, {f5, f5};\n\t"
+        "mov.f32 f4, 0f3F800000;\n\t"
+        "mov.b64 l3, {f4, f4};\n\t"
+        "fma.rn.ftz.f32x2 l10, l9, l6, l5;\n\t"
+        "fma.rn.ftz.f32x2 l10, l10, l9, l4;\n\t"
+        "fma.rn.ftz.f32x2 l10, l10, l9, l3;\n\t"
+        "mov.b64 {r1, r2}, l7;\n\t"
+        "mov.b64 {r3, r4}, l10;\n\t"
+        "shl.b32 r5, r1, 23;\n\t"
+        "add.s32 r7, r5, r3;\n\t"
+        "shl.b32 r6, r2, 23;\n\t"
+        "add.s32 r8, r6, r4;\n\t"
+        "mov.b32 $0, r7;\n\t"
+        "mov.b32 $1, r8;\n\t"
+        "}\n",
+        "=r,=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
-    res1 = Float32(
-        vector.extract(vec_f32x2, dynamic_position=[], static_position=[1], loc=loc, ip=ip)
+    out0 = Float32(llvm.extractvalue(T.f32(), out_f32x2, [0], loc=loc, ip=ip))
+    out1 = Float32(llvm.extractvalue(T.f32(), out_f32x2, [1], loc=loc, ip=ip))
+    return out0, out1
+@dsl_user_op
+def domain_offset_aligned(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    assert isinstance(tensor.iterator, cute.Pointer)
+    # We assume that applying the offset does not change the pointer alignment
+    new_ptr = cute.make_ptr(
+        tensor.element_type,
+        elem_pointer(tensor, coord).toint(),
+        tensor.memspace,
+        assumed_align=tensor.iterator.alignment,
     )
-    return res0, res1
+    return cute.make_tensor(new_ptr, tensor.layout)
 
 
-@cute.jit
-def e2e_asm2(x: Float32, y: Float32) -> Tuple[Float32, Float32]:
-    out_i64 = cutlass.Int64(
-        llvm.inline_asm(
-            T.i64(),
-            [Float32(x).ir_value(), Float32(y).ir_value()],
-            "{\n\t"
-            ".reg .f32 f1, f2, f3, f4, f5, f6, f7;\n\t"
-            ".reg .b64 l1, l2, l3, l4, l5, l6, l7, l8, l9, l10;\n\t"
-            ".reg .s32 r1, r2, r3, r4, r5, r6, r7, r8;\n\t"
-            "max.ftz.f32 f1, $1, 0fC2FE0000;\n\t"
-            "max.ftz.f32 f2, $2, 0fC2FE0000;\n\t"
-            "mov.b64 l1, {f1, f2};\n\t"
-            "mov.f32 f3, 0f4B400000;\n\t"
-            "mov.b64 l2, {f3, f3};\n\t"
-            "add.rm.ftz.f32x2 l7, l1, l2;\n\t"
-            "sub.rn.ftz.f32x2 l8, l7, l2;\n\t"
-            "sub.rn.ftz.f32x2 l9, l1, l8;\n\t"
-            "mov.f32 f7, 0f3D9DF09D;\n\t"
-            "mov.b64 l6, {f7, f7};\n\t"
-            "mov.f32 f6, 0f3E6906A4;\n\t"
-            "mov.b64 l5, {f6, f6};\n\t"
-            "mov.f32 f5, 0f3F31F519;\n\t"
-            "mov.b64 l4, {f5, f5};\n\t"
-            "mov.f32 f4, 0f3F800000;\n\t"
-            "mov.b64 l3, {f4, f4};\n\t"
-            "fma.rn.ftz.f32x2 l10, l9, l6, l5;\n\t"
-            "fma.rn.ftz.f32x2 l10, l10, l9, l4;\n\t"
-            "fma.rn.ftz.f32x2 l10, l10, l9, l3;\n\t"
-            "mov.b64 {r1, r2}, l7;\n\t"
-            "mov.b64 {r3, r4}, l10;\n\t"
-            "shl.b32 r5, r1, 23;\n\t"
-            "add.s32 r7, r5, r3;\n\t"
-            "shl.b32 r6, r2, 23;\n\t"
-            "add.s32 r8, r6, r4;\n\t"
-            "mov.b64 $0, {r7, r8};\n\t"
-            "}\n",
-            "=l,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
+@dsl_user_op
+def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
+    flat_stride = cute.flatten_to_tuple(tensor.stride)
+    assert len(flat_coord_i64) == len(
+        flat_stride
+    ), "Coordinate and stride must have the same length"
+    offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
+    assert isinstance(tensor.iterator, cute.Pointer)
+    # HACK: we assume that applying the offset does not change the pointer alignment
+    new_ptr = cute.make_ptr(
+        tensor.element_type,
+        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
+        tensor.memspace,
+        assumed_align=tensor.iterator.max_alignment,
     )
-    return i64_to_f32x2(out_i64)
+    return cute.make_tensor(new_ptr, tensor.layout)
+
+
+@dsl_user_op
+def coord_offset_i64(
+    tensor: cute.Tensor, idx: cute.typing.Int, dim: int, *, loc=None, ip=None
+) -> cute.Tensor:
+    offset = cutlass.Int64(idx) * cute.size(tensor.stride[dim])
+    assert isinstance(tensor.iterator, cute.Pointer)
+    # HACK: we assume that applying the offset does not change the pointer alignment
+    new_ptr = cute.make_ptr(
+        tensor.element_type,
+        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
+        tensor.memspace,
+        assumed_align=tensor.iterator.max_alignment,
+    )
+    new_layout = cute.slice_(tensor.layout, (*[None] * dim, 0, *[None] * (cute.rank(tensor) - dim - 1)))
+    return cute.make_tensor(new_ptr, new_layout)
