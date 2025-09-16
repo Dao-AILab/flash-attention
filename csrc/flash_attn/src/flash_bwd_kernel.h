@@ -86,7 +86,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     // Shared memory.
     extern __shared__ char smem_[];
-    double dsink_val = 0.0L;
+    float dsink_val = 0.0f;
     
     const float sink_val = !Has_sink || params.learnable_sink_ptr == nullptr ? -INFINITY : reinterpret_cast<float *>(params.learnable_sink_ptr)[bidh];
 
@@ -453,6 +453,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     clear(acc_dv);
     clear(acc_dk);
 
+    if constexpr (Has_sink) {
+        float* dsink_block_sum_ptr = reinterpret_cast<float*>(smem_ + Kernel_traits::kSmemSize1colblock - sizeof(float));
+        if (tidx == 0) *dsink_block_sum_ptr = 0.0f;
+    }
+
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     FLASH_NAMESPACE::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
 
@@ -583,15 +588,15 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
         // Reshape acc_dp from (MMA=4, MMA_N, MMA_N) to (row=(2, MMA_N), col=(2, MMA_N))
         Tensor dS = make_tensor(acc_dp.data(), scores.layout());
-        auto pointwise_mult = [](double p, double dp, double d) {
+        auto pointwise_mult = [](float p, float dp, float d) {
             return p * (!Is_dropout || p >= 0 ? dp - d : d);
         };
         #pragma unroll
         for (int mi = 0; mi < size<0>(dS); ++mi) {
-            double dsink_val_cols = 0.0L;
+            float dsink_val_cols = 0.0f;
             #pragma unroll
             for (int ni = 0; ni < size<1>(dS); ++ni) {
-                if constexpr (Has_sink) { dsink_val_cols += pointwise_mult(scores(mi, ni), dS(mi, ni), 0.f); }
+                if constexpr (Has_sink) { dsink_val_cols += pointwise_mult(scores(mi, ni), dS(mi, ni), 0.0f); }
                 float scaled_ds = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi));
                 if constexpr (Is_softcap) { scaled_ds *= dtanh(mi, ni); }
                 dS(mi, ni) = scaled_ds;
@@ -798,22 +803,18 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     );
 
     if constexpr (Has_sink) {
-        SumOp<double> sum_op;
-
-        __shared__ double dsink_block_sum;
-        if (tidx == 0) dsink_block_sum = 0.0;
-        __syncthreads();
-
+        SumOp<float> sum_op;
+        float* dsink_block_sum_ptr = reinterpret_cast<float*>(smem_ + Kernel_traits::kSmemSize1colblock - sizeof(float));
         dsink_val = Allreduce<32>::run(dsink_val, sum_op);
 
         if (tidx % 32 == 0) {
-            atomicAdd(&dsink_block_sum, dsink_val);
+            atomicAdd(dsink_block_sum_ptr, dsink_val);
         }
         __syncthreads();
 
         if (tidx == 0 && params.dsink_ptr != nullptr) {
             float* dsink_ptr = reinterpret_cast<float*>(params.dsink_ptr);
-            float val = -dsink_block_sum * params.rp_dropout;
+            float val = -(*dsink_block_sum_ptr) * params.rp_dropout;
             atomicAdd(dsink_ptr + bidh, val);
         }
     }

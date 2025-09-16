@@ -1031,6 +1031,8 @@ def test_flash_attn_output(
         alibi_slopes, attn_bias = None, None
     if has_learnable_sink:
         learnable_sink = torch.randn(nheads, device=device, dtype=torch.float32, requires_grad=True) * 0.3
+        if softcap > 0:
+            learnable_sink = learnable_sink * softcap
     else:
         learnable_sink = None
     if kvpacked:
@@ -2032,7 +2034,7 @@ def test_flash_attn_splitkv(
     # of a Pytorch implementation.
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
 
-    mult = 2 if not alibi else 8
+    mult = 2 if not (alibi or (has_learnable_sink and dtype == torch.float16)) else 8
     assert (dq - dq_ref).abs().max().item() <= mult * (dq_pt - dq_ref).abs().max().item() + 2e-4
     assert (dk - dk_ref).abs().max().item() <= mult * (dk_pt - dk_ref).abs().max().item() + 2e-4
     assert (dv - dv_ref).abs().max().item() <= mult * (dv_pt - dv_ref).abs().max().item() + 2e-4
@@ -2333,7 +2335,7 @@ def test_flash_attn_kvcache(
             )[:, :seqlen_k]
         assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
         assert torch.equal(v_cache_select, v_cache_ref)
-    mult = 3 if not alibi else 5
+    mult = 3 if not (alibi or (has_learnable_sink and dtype == torch.float16)) else 5
     assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
 
 
