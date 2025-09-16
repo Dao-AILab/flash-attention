@@ -212,6 +212,7 @@ def _flash_attn_fwd(
 
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, utils.hash_callable(score_mod) if score_mod is not None else None,
+        buffers is not None,
         lse is None, cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
         page_table is not None,
         window_size_left is not None, window_size_right is not None,
@@ -239,6 +240,7 @@ def _flash_attn_fwd(
                 num_threads=num_threads,
                 Q_in_regs=False,
                 score_mod=score_mod,
+                has_buffers=buffers is not None,
             )
         elif compute_capability == 10:
             assert page_size in [None, 128], "Only page_size=128 is supported for paged KV on SM 10.0"
@@ -251,6 +253,7 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 is_persistent=not causal and not local and cu_seqlens_q is None and seqused_q is None,
                 score_mod=score_mod,
+                has_buffers=buffers is not None,
             )
         else:
             raise ValueError(f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x")

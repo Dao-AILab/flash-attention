@@ -430,3 +430,7 @@ def test_cute_vs_flex_attention_with_buffers(
     assert cute_error <= rtol * pt_error + fwd_atol, (
         f"CuTE error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
     )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

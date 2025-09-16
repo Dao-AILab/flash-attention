@@ -23,7 +23,7 @@ from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute import hopper_helpers as sm90_utils
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import Softmax
+from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute import pipeline
@@ -51,6 +51,7 @@ class FlashAttentionForwardBase:
         num_threads: int = 128,
         Q_in_regs: bool = False,
         score_mod: cutlass.Constexpr | None = None,
+        has_buffers: bool = False,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -67,7 +68,7 @@ class FlashAttentionForwardBase:
         :type num_threads: int
         :param is_causal: is causal
         :param score_mod: A callable that takes the attention scores and applies a modification.
-            Callable signature: 
+            Callable signature: ``score_mod(scores, batch_idx, head_idx, q_idx, kv_idx, buffers) -> Any``
         """
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -89,6 +90,11 @@ class FlashAttentionForwardBase:
         self.num_stages = num_stages
         self.Q_in_regs = Q_in_regs
         self.score_mod = score_mod
+        self.qk_acc_dtype = Float32
+        if cutlass.const_expr(has_buffers):
+            self.vec_size: cutlass.Constexpr = 1
+        else:
+            self.vec_size: cutlass.Constexpr = 2
 
     @staticmethod
     def can_implement(
@@ -934,11 +940,15 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
         if cutlass.const_expr(score_mod is not None):
             self.apply_score_mod(
-                acc_S, mma_params.thr_mma_qk, score_mod,
-                batch_idx, head_idx, m_block, n_block,
-                softmax_scale=softmax.softmax_scale,
+                acc_S,
+                mma_params.thr_mma_qk,
+                batch_idx,
+                head_idx,
+                m_block,
+                n_block,
+                softmax=softmax,
                 buffers=buffers,
-                fastdiv_mods=fastdiv_mods
+                fastdiv_mods=fastdiv_mods,
             )
             
         smem_pipe_write = self.advance_pipeline(smem_pipe_write)
@@ -1692,11 +1702,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # Use vectorized score modification
                 if cutlass.const_expr(score_mod is not None):
                     self.apply_score_mod(
-                        acc_S, thr_mma_qk, score_mod,
-                        batch_idx, head_idx, m_block, n_block_max - 1,
-                        softmax_scale=softmax.softmax_scale,
+                        acc_S,
+                        thr_mma_qk,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        n_block_max - 1,
+                        softmax=softmax,
                         buffers=buffers,
-                        fastdiv_mods=fastdiv_mods
+                        fastdiv_mods=fastdiv_mods,
                     )
                 # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
                 mask_fn(acc_S, n_block=n_block_max - 1, mask_seqlen=True)
@@ -1843,11 +1857,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_k.consumer_release(smem_pipe_read)
         if cutlass.const_expr(score_mod is not None):
             self.apply_score_mod(
-                acc_S, thr_mma_qk, score_mod,
-                batch_idx, head_idx, m_block, n_block,
-                softmax_scale=softmax.softmax_scale,
+                acc_S,
+                thr_mma_qk,
+                batch_idx,
+                head_idx,
+                m_block,
+                n_block,
+                softmax=softmax,
                 buffers=buffers,
-                fastdiv_mods=fastdiv_mods
+                fastdiv_mods=fastdiv_mods,
             )
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
@@ -1923,11 +1941,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_k.consumer_release(smem_pipe_read)
         if cutlass.const_expr(score_mod is not None):
             self.apply_score_mod(
-                acc_S, thr_mma_qk, score_mod,
-                batch_idx, head_idx, m_block, n_block,
-                softmax_scale=softmax.softmax_scale,
+                acc_S,
+                thr_mma_qk,
+                batch_idx,
+                head_idx,
+                m_block,
+                n_block,
+                softmax=softmax,
                 buffers=buffers,
-                fastdiv_mods=fastdiv_mods
+                fastdiv_mods=fastdiv_mods,
             )
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
         if const_expr(mask_fn is not None):
@@ -1965,73 +1987,32 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self,
         acc_S,
         thr_mma_qk,
-        score_mod,
         batch_idx,
         head_idx,
         m_block,
         n_block,
-        softmax_scale=None,
+        softmax,
         buffers=None,
         fastdiv_mods=None,
-        VEC_SIZE: cutlass.Constexpr[int] = 1,
     ):
-        # Get index tensors with proper domain offset
+        # Prepare index tensor
         cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
         cS = cute.domain_offset((m_block * self.m_block_size, n_block * self.n_block_size), cS)
         tScS = thr_mma_qk.partition_C(cS)
-        
-        # Vectorized processing similar to SM100
-        n_vals = cutlass.const_expr(cute.size(acc_S.shape))
-        score_vec = cute.make_fragment(VEC_SIZE, Float32)
-        kv_idx_vec = cute.make_fragment(VEC_SIZE, cutlass.Int32)
-        
-        # Create broadcasted fragments for constant values
-        batch_idx_vec = utils.broadcast_scalar_to_vec(batch_idx, kv_idx_vec, cutlass.Int32)
-        head_idx_vec = utils.broadcast_scalar_to_vec(head_idx, kv_idx_vec, cutlass.Int32)
-        q_idx_vec = cute.make_fragment(VEC_SIZE, cutlass.Int32)
-        
-        # Load SSA values once  
-        batch_idx_ssa = batch_idx_vec.load()
-        head_idx_ssa = head_idx_vec.load()
 
-        # Build SSA slices and call into scoremod / writeback
-        for i in cutlass.range(0, n_vals, VEC_SIZE, unroll_full=True):
-            for j in cutlass.range(VEC_SIZE, unroll_full=True):
-                score_vec[j] = acc_S[i + j]
-                if softmax_scale is not None:
-                    score_vec[j] = score_vec[j] * softmax_scale
-
-                # Use FastDivmod for bounds checking if buffers and divmods are present
-                if cutlass.const_expr(buffers is not None and fastdiv_mods is not None):
-                    seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
-                    _, q_idx_wrapped = seqlen_q_divmod.divmod(tScS[i + j][0])
-                    _, kv_idx_wrapped = seqlen_k_divmod.divmod(tScS[i + j][1])
-                    q_idx_vec[j] = q_idx_wrapped
-                    kv_idx_vec[j] = kv_idx_wrapped
-                else:
-                    # No bounds checking needed - direct indexing
-                    q_idx_vec[j] = tScS[i + j][0]
-                    kv_idx_vec[j] = tScS[i + j][1]
-            score_ssa = score_vec.load()
-            q_idx_ssa = q_idx_vec.load()
-            kv_idx_ssa = kv_idx_vec.load()
-
-            buffer_args = []
-            if cutlass.const_expr(buffers is not None):
-                buffer_args = buffers
-
-            post_mod_scores = score_mod(
-                score_ssa,
-                batch_idx_ssa,
-                head_idx_ssa,
-                q_idx=q_idx_ssa,
-                kv_idx=kv_idx_ssa,
-                buffers=buffer_args
-            )
-
-            score_vec.store(post_mod_scores)
-            for j in cutlass.range(VEC_SIZE, unroll_full=True):
-                acc_S[i + j] = score_vec[j]
+        apply_score_mod_inner(
+            acc_S,
+            tScS,
+            self.score_mod,
+            batch_idx,
+            head_idx,
+            softmax.softmax_scale,
+            self.vec_size,
+            self.qk_acc_dtype,
+            buffers,
+            fastdiv_mods,
+            constant_q_idx=None
+        )
 
     def warp_scheduler_barrier_sync(self):
         if const_expr(self.use_scheduler_barrier):

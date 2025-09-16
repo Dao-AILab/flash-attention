@@ -293,3 +293,91 @@ class SoftmaxSm100(Softmax):
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
             )
+
+
+@cute.jit
+def apply_score_mod_inner(
+    score_tensor,
+    index_tensor,
+    score_mod: cutlass.Constexpr,
+    batch_idx,
+    head_idx,
+    softmax_scale,
+    vec_size:cutlass.Constexpr,
+    qk_acc_dtype: cutlass.Constexpr,
+    buffers,
+    fastdiv_mods,
+    constant_q_idx:cutlass.Constexpr,
+):
+    """Shared implementation for applying score modification.
+
+    Args:
+        score_tensor: The scores to modify (acc_S for flash_fwd, tSrS_t2r for sm100)
+        index_tensor: Index positions (tScS for flash_fwd, tScS_t2r for sm100)
+        score_mod: The score modification function to apply
+        batch_idx: Batch index
+        head_idx: Head index
+        softmax_scale: Scale to apply
+        vec_size: Vector size for processing elements
+        qk_acc_dtype: Data type for accumulator
+        buffers: Optional buffers for FlexAttention
+        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
+        constant_q_idx: If provided, use this constant for all q_idx values
+                       If None, compute q_idx per-element
+    """
+    n_vals = cutlass.const_expr(cute.size(score_tensor.shape))
+    score_vec = cute.make_fragment(vec_size, qk_acc_dtype)
+    kv_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+
+    # SSA values for batch and head (constant across all elements)
+    batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32).broadcast_to((vec_size,))
+    head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32).broadcast_to((vec_size,))
+
+    # Handle q_idx based on whether it's constant
+    q_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    for i in cutlass.range(0, n_vals, vec_size, unroll_full=True):
+        for j in cutlass.range(vec_size, unroll_full=True):
+            score_vec[j] = score_tensor[i + j] * softmax_scale
+
+            # If we will do loads we mod, in order to not read OOB
+            if cutlass.const_expr(buffers is not None and fastdiv_mods is not None):
+                if cutlass.const_expr(constant_q_idx is None):
+                    seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
+                    _, q_idx_wrapped = seqlen_q_divmod.divmod(index_tensor[i + j][0])
+                    q_idx_vec[j] = q_idx_wrapped
+                else:
+                    _, seqlen_k_divmod = fastdiv_mods
+
+                _, kv_idx_wrapped = seqlen_k_divmod.divmod(index_tensor[i + j][1])
+                kv_idx_vec[j] = kv_idx_wrapped
+            else:
+                # No bounds checking - direct indexing
+                if constant_q_idx is None:
+                    q_idx_vec[j] = index_tensor[i + j][0]
+                kv_idx_vec[j] = index_tensor[i + j][1]
+
+        # Convert to SSA for score_mod call
+        score_ssa = score_vec.load()
+        kv_idx_ssa = kv_idx_vec.load()
+        if cutlass.const_expr(constant_q_idx is None):
+            q_idx_ssa = q_idx_vec.load()
+        else:
+            q_idx_ssa = utils.scalar_to_ssa(constant_q_idx, cutlass.Int32).broadcast_to((vec_size,))
+
+        buffer_args = []
+        if cutlass.const_expr(buffers is not None):
+            buffer_args = buffers
+
+        post_mod_scores = score_mod(
+            score_ssa,
+            batch_idx_ssa,
+            head_idx_ssa,
+            q_idx=q_idx_ssa,
+            kv_idx=kv_idx_ssa,
+            buffers=buffer_args
+        )
+
+        # Write back modified scores
+        score_vec.store(post_mod_scores)
+        for j in cutlass.range(vec_size, unroll_full=True):
+            score_tensor[i + j] = score_vec[j]
