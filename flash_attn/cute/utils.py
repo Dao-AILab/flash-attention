@@ -2,6 +2,7 @@
 
 import math
 import hashlib
+import inspect
 from typing import Type, Callable, Optional, Tuple
 
 import cutlass
@@ -14,26 +15,26 @@ from cutlass.cute.runtime import from_dlpack
 
 
 def hash_callable(func: Callable) -> str:
-    """Hash a callable by combining bytecode and closure variables."""
-    parts = []
+    """Hash a callable based on the source code or bytecode."""
 
-    if hasattr(func, '__code__'):
-        parts.append(func.__code__.co_code)
+    try:
+        data = inspect.getsource(func).encode()
+    except (OSError, TypeError):
+        if hasattr(func, "__code__") and func.__code__ is not None:
+            data = func.__code__.co_code
+        else:
+            data = repr(func).encode()
 
-    if hasattr(func, '__closure__') and func.__closure__:
-        for cell in func.__closure__:
-            try:
-                parts.append(str(cell.cell_contents))
-            except:
-                pass
-
-    combined = b''.join(str(p).encode() for p in parts)
-    return hashlib.sha256(combined).hexdigest()
+    return hashlib.sha256(data).hexdigest()
 
 
 def create_softcap_scoremod(softcap_val):
+    inv_softcap = 1.0 / softcap_val
+
     def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, buffers):
-        return cute.math.tanh(acc_S_SSA * softcap_val, fastmath=True)
+        scores = acc_S_SSA * inv_softcap
+        return scores * cute.math.tanh(scores, fastmath=True)
+
     return scoremod_premask_fn
 
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
@@ -616,28 +617,8 @@ def coord_offset_i64(
 
 
 @cute.jit
-def broadcast_to(a: cute.Tensor, b: cute.Tensor) -> cute.Tensor:
-    """ Take a single element a cute tensor and broadcast to b layout.shape """
-    stride_zero = cute.repeat_like(0, b.layout.shape)
-    a_broadcasted = cute.make_tensor(
-        a.iterator,
-        cute.make_layout(b.layout.shape, stride=stride_zero)
-    )
-    return a_broadcasted
-
-
-@cute.jit
-def broadcast_scalar_to_vec(scalar_value: cutlass.Numeric, b: cute.Tensor, dtype) -> cute.Tensor:
-    """Create a fragment of vec_size elements, all set to scalar_value.
-    
-    Args:
-        scalar_value: The value to broadcast
-        vec_size: Number of elements in the output fragment  
-        dtype: Data type of the fragment elements
-    
-    Returns:
-        A cute fragment with all elements set to scalar_value
-    """
+def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
+    """ Convert a scalar to a cute TensorSSA of shape (1,) and given dtype """
     vec = cute.make_fragment(1, dtype)
-    vec[0] = scalar_value
-    return broadcast_to(vec, b)
+    vec[0] = a
+    return vec.load()
