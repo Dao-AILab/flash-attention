@@ -522,8 +522,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                std::optional<const at::Tensor> &leftpad_k_, // batch_size
                std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
                std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
-               int max_seqlen_q,
-               const int max_seqlen_k,
+               const at::Tensor &max_seqlen_q_tensor,
+               const at::Tensor &max_seqlen_k_tensor,
                const float p_dropout,
                const float softmax_scale,
                const bool zero_tensors,
@@ -536,6 +536,21 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
+
+    int max_seqlen_k;
+    if (max_seqlen_k_tensor.numel() == 1) {
+        // Handle scalar tensor (including FakeTensor)
+        max_seqlen_k = max_seqlen_k_tensor.item<int>();
+    } else {
+        TORCH_CHECK(false, "max_seqlen_k_tensor must be a scalar tensor");
+    }
+    int max_seqlen_q;
+    if (max_seqlen_q_tensor.numel() == 1) {
+        // Handle scalar tensor (including FakeTensor)
+        max_seqlen_q = max_seqlen_q_tensor.item<int>();
+    } else {
+        TORCH_CHECK(false, "max_seqlen_q_tensor must be a scalar tensor");
+    }
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x_min = cc_major >= 8;
@@ -983,8 +998,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
                std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
-               const int max_seqlen_q,
-               const int max_seqlen_k,          // max sequence length to choose the kernel
+               const at::Tensor &max_seqlen_q_tensor,
+               const at::Tensor &max_seqlen_k_tensor,
                const float p_dropout,         // probability to drop
                const float softmax_scale,
                const bool zero_tensors,
@@ -1003,6 +1018,21 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
+
+    int max_seqlen_k;
+    if (max_seqlen_k_tensor.numel() == 1) {
+        // Handle scalar tensor (including FakeTensor)
+        max_seqlen_k = max_seqlen_k_tensor.item<int>();
+    } else {
+        TORCH_CHECK(false, "max_seqlen_k_tensor must be a scalar tensor");
+    }
+    int max_seqlen_q;
+    if (max_seqlen_q_tensor.numel() == 1) {
+        // Handle scalar tensor (including FakeTensor)
+        max_seqlen_q = max_seqlen_q_tensor.item<int>();
+    } else {
+        TORCH_CHECK(false, "max_seqlen_q_tensor must be a scalar tensor");
+    }
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x_min = cc_major >= 8;
