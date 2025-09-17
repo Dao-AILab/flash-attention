@@ -85,6 +85,10 @@ Alternatively you can compile from source:
 ```sh
 python setup.py install
 ```
+To fully utilize high-performance AI clusters with 1 TiB RAM and over 100 CPU cores:
+```
+MAX_JOBS=$(nproc) python3 setup.py install
+```
 
 If your machine has less than 96GB of RAM and lots of CPU cores, `ninja` might
 run too many parallel compilation jobs that could exhaust the amount of RAM. To
