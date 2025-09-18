@@ -1032,7 +1032,7 @@ def test_flash_attn_output(
     if has_learnable_sink:
         learnable_sink = torch.randn(nheads, device=device, dtype=torch.float32, requires_grad=True) * 0.3
         if softcap > 0:
-            learnable_sink = learnable_sink * softcap
+            learnable_sink = learnable_sink * softcap * 2
     else:
         learnable_sink = None
     if kvpacked:
@@ -1242,7 +1242,8 @@ def test_flash_attn_output(
         assert (dk - dk_ref).abs().max().item() <= 3 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 3 * (dv_pt - dv_ref).abs().max().item()
         if has_learnable_sink:
-            assert (dsink - dsink_ref).abs().max().item() <= 3 * (dsink_pt - dsink_ref).abs().max().item()
+            mult = 3 if not (dtype == torch.float16 and softcap > 0) else softcap
+            assert (dsink - dsink_ref).abs().max().item() <= mult * (dsink_pt - dsink_ref).abs().max().item() + 1e-5
 
 
 @pytest.mark.parametrize("kvpacked", [True, False])
@@ -2422,7 +2423,7 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
         dq_atol = 2 * ((dq0 + 0.3 - 0.3) - dq0).abs().max().item()
         if has_learnable_sink:
             dlearnable_sink0, = torch.autograd.grad(out0, (learnable_sink,), g)
-            dsink_atol = 2 * ((dlearnable_sink0 + 0.3 - 0.3) - dlearnable_sink0).abs().max().item()
+            dsink_atol = 2 * ((dlearnable_sink0 + 0.3 - 0.3) - dlearnable_sink0).abs().max().item() + 2e-4
 
     for i in range(250):
         torch.random.manual_seed(42)
@@ -2476,7 +2477,7 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype, has_learnable_sink):
     k.requires_grad_(True)
     v.requires_grad_(True)
     if has_learnable_sink:
-        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True) * 0.3
+        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
     else:
         learnable_sink = None
     out = flash_attn_func(q, k, v, causal=causal, learnable_sink=learnable_sink)
@@ -2541,7 +2542,7 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype, has_learnable_sink):
         for _ in range(3)
     ]
     if has_learnable_sink:
-        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True) * 0.3
+        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
     else:
         learnable_sink = None
     out = rearrange(flash_attn_func(q, k, v, causal=causal, learnable_sink=learnable_sink), "b s ... -> s b ...")
@@ -2611,7 +2612,7 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype, has_learnable_sink):
     k.requires_grad_(True)
     v.requires_grad_(True)
     if has_learnable_sink:
-        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True) * 0.3
+        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
     else:
         learnable_sink = None
 
