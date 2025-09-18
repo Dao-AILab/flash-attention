@@ -21,7 +21,7 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
                 return {128, 96, true, false};
             } else {
                 // Switch to tile size 192 x 192 for now
-                bool const use_blockN_128 = is_causal || is_local;
+                bool const use_blockN_128 = is_causal || is_local || paged_kv_non_TMA;
                 return {192, use_blockN_128 ? 128 : 192, use_blockN_128, true};
             }
             // Good for long seqlen (>= 4k) but suffers from tile quantization at short seqlen
@@ -29,8 +29,9 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         } else if (headdim <= 96) {
             return {192, is_local || paged_kv_non_TMA ? 128 : 144, false, true};
         } else if (headdim <= 128) {
-            return {128, is_causal || is_local || paged_kv_non_TMA ? 128 : 176, true, true};
-            // {128, 192, false, false} and {192, 128, false, true} are quite good too
+            bool const use_blockN_128 = is_causal || is_local || paged_kv_non_TMA;
+            return {128, use_blockN_128 ? 128 : 176, true, true};
+            // {128, 192, true, false} and {192, 128, false, true} are quite good too
             // 128 x 192 hits the limit of smem if MmaPV_is_RS, 128 x 144 hits the limit if !MmaPV_is_RS
         } else if (headdim <= 192) {
             return {128, paged_kv_non_TMA || is_local ? 96 : (headdim_v <= 128 ? 128 : 112), true, true};  // 128 x 112 hits the limit of smem

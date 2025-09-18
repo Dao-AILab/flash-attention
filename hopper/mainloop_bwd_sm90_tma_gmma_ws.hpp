@@ -607,7 +607,8 @@ struct CollectiveMainloopBwdSm90 {
             seqlen_info, n_block, bidb, params.window_size_left,
             params.window_size_right, 0 /*sink_token_length*/);
         // It's possible to have m_block_max <= m_block_min. Exit early
-        if constexpr (Is_causal || Is_local || Varlen) {
+        // Though if local and deterministic, still need to increment dq semaphore
+        if constexpr ((Is_causal || Is_local || Varlen) && !(Is_local && Deterministic)) {
             if (m_block_max <= m_block_min) { return; }
         }
 
@@ -626,10 +627,18 @@ struct CollectiveMainloopBwdSm90 {
         using Barrier = cutlass::GenericBarrier<cutlass::detail::SyncwarpSync>;
         bool const lane_predicate = cute::elect_one_sync();
         int m_block = m_block_min;
+        constexpr int kBlockM = get<0>(TileShape_MNK{});
+        constexpr int kBlockN = get<1>(TileShape_MNK{});
+        int n_block_global_max = cute::ceil_div(seqlen_info.seqlen_k, kBlockN);
         #pragma unroll 2
         for (; m_block < m_block_max; ++m_block) {
             if constexpr (Deterministic) {
-                Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
+                if constexpr(Is_causal) {
+                    int n_block_max_for_m_block = std::min(n_block_global_max, cute::ceil_div((m_block + 1) * kBlockM + seqlen_info.seqlen_k - seqlen_info.seqlen_q, kBlockN));
+                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block_max_for_m_block - 1 - n_block);
+                } else {
+                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
+                }
             }
             #pragma unroll
             for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
@@ -649,7 +658,6 @@ struct CollectiveMainloopBwdSm90 {
             }
         }
         if constexpr (Is_local && Deterministic) {
-            constexpr int kBlockM = get<0>(TileShape_MNK{});
             int const m_block_global_max = cute::ceil_div(seqlen_info.seqlen_q, kBlockM);
             #pragma unroll 2
             for (; m_block < m_block_global_max; ++m_block) {

@@ -3,6 +3,7 @@
 import math
 import operator
 from typing import Tuple
+from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
@@ -19,9 +20,32 @@ class Softmax:
         arch: cutlass.Constexpr[int] = 80,
     ):
         self.scale_log2 = scale_log2
+        self.num_rows = num_rows
+        self.arch = arch
         self.row_max = cute.make_fragment(num_rows, Float32)
         self.row_sum = cute.make_fragment_like(self.row_max)
-        self.arch = arch
+
+    def __extract_mlir_values__(self):
+        non_constexpr_fields = [self.scale_log2, self.row_max, self.row_sum]
+        values, self._values_pos = [], []
+        for obj in non_constexpr_fields:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        field_names = ['scale_log2', 'row_max', 'row_sum']
+        reconstructed_fields = {}
+        for name, n_items in zip(field_names, self._values_pos):
+            original_field = getattr(self, name)
+            reconstructed_fields[name] = cutlass.new_from_mlir_values(original_field, values[:n_items])
+            values = values[n_items:]
+
+        new_obj = self.__class__(reconstructed_fields['scale_log2'], self.num_rows, self.arch)
+        new_obj.row_max = reconstructed_fields['row_max']
+        new_obj.row_sum = reconstructed_fields['row_sum']
+        return new_obj
 
     def reset(self) -> None:
         self.row_max.fill(-Float32.inf)
@@ -84,12 +108,18 @@ class Softmax:
         return row_scale
 
     @cute.jit
-    def finalize(self, final_scale: Float32 = 1.0) -> cute.Tensor:
+    def finalize(self, final_scale: Float32 = 1.0, sink_val: Float32 | cute.Tensor | None = None) -> cute.Tensor:
         """Finalize the online softmax by computing the scale and logsumexp."""
+        if cutlass.const_expr(sink_val is not None and isinstance(sink_val, cute.Tensor)):
+            assert cute.size(sink_val) == cute.size(self.row_sum)
         # quad reduction for row_sum as we didn't do it during each iteration of online softmax
         self.row_sum.store(utils.warp_reduce(self.row_sum.load(), operator.add, width=4))
         row_scale = cute.make_fragment_like(self.row_max, Float32)
         for r in cutlass.range(cute.size(self.row_sum), unroll_full=True):
+            if cutlass.const_expr(sink_val is not None):
+                sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
+                LOG2_E = math.log2(math.e)
+                self.row_sum[r] += utils.exp2f(sink_val_cur * LOG2_E - self.row_max[r] * self.scale_log2)
             # if row_sum is zero or nan, set acc_O_mn_row to 1.0
             acc_O_mn_row_is_zero_or_nan = (
                 self.row_sum[r] == 0.0 or self.row_sum[r] != self.row_sum[r]
@@ -124,6 +154,11 @@ class SoftmaxSm100(Softmax):
     def __init__(self, scale_log2: Float32, rescale_threshold: cutlass.Constexpr[float] = 0.0):
         super().__init__(scale_log2, num_rows=1, arch=100)
         self.rescale_threshold = rescale_threshold
+
+    def __new_from_mlir_values__(self, values):
+        new_obj = super().__new_from_mlir_values__(values)
+        new_obj.rescale_threshold = self.rescale_threshold
+        return new_obj
 
     @cute.jit
     def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
