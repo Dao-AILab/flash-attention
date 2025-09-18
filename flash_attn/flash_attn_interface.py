@@ -78,6 +78,7 @@ def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    learnable_sink: Optional[torch.Tensor],
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -92,6 +93,7 @@ def _flash_attn_forward(
         q,
         k,
         v,
+        learnable_sink,
         None,
         alibi_slopes,
         dropout_p,
@@ -111,6 +113,7 @@ def _flash_attn_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    learnable_sink: Optional[torch.Tensor],
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -144,6 +147,7 @@ def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    learnable_sink: Optional[torch.Tensor],
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
@@ -166,6 +170,7 @@ def _flash_attn_varlen_forward(
         q,
         k,
         v,
+        learnable_sink,
         None,
         cu_seqlens_q,
         cu_seqlens_k,
@@ -195,6 +200,7 @@ def _flash_attn_varlen_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    learnable_sink: Optional[torch.Tensor],
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
@@ -234,17 +240,19 @@ else:
     _wrapped_flash_attn_varlen_forward = _flash_attn_varlen_forward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
+@_torch_custom_op_wrapper("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv", "dsink"), device_types="cuda")
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    learnable_sink: Optional[torch.Tensor], 
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
     dq: Optional[torch.Tensor],
     dk: Optional[torch.Tensor],
     dv: Optional[torch.Tensor],
+    dsink: Optional[torch.Tensor],
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -261,17 +269,20 @@ def _flash_attn_backward(
         dq,
         dk,
         dv,
+        dsink,
         softmax_d,
     ) = flash_attn_gpu.bwd(
         dout,
         q,
         k,
         v,
+        learnable_sink,
         out,
         softmax_lse,
         dq,
         dk,
         dv,
+        dsink,
         alibi_slopes,
         dropout_p,
         softmax_scale,
@@ -292,11 +303,13 @@ def _flash_attn_backward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    learnable_sink: Optional[torch.Tensor],
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
     dq: Optional[torch.Tensor],
     dk: Optional[torch.Tensor],
     dv: Optional[torch.Tensor],
+    dsink: Optional[torch.Tensor],
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -314,6 +327,8 @@ def _flash_attn_backward_fake(
         dk = torch.empty_like(k)
     if dv is None:
         dv = torch.empty_like(v)
+    if dsink is None and learnable_sink is not None:
+        dsink = torch.empty_like(learnable_sink)
     batch_size, seqlen_q, num_heads, _ = q.shape
     softmax_d = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128)), device=q.device, dtype=torch.float32)
     
@@ -326,17 +341,19 @@ else:
     _wrapped_flash_attn_backward = _flash_attn_backward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
+@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv", "dsink"), device_types="cuda")
 def _flash_attn_varlen_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    learnable_sink: Optional[torch.Tensor],
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
     dq: Optional[torch.Tensor],
     dk: Optional[torch.Tensor],
     dv: Optional[torch.Tensor],
+    dsink: Optional[torch.Tensor],
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
@@ -358,17 +375,20 @@ def _flash_attn_varlen_backward(
         dq,
         dk,
         dv,
+        dsink,
         softmax_d,
     ) = flash_attn_gpu.varlen_bwd(
         dout,
         q,
         k,
         v,
+        learnable_sink,
         out,
         softmax_lse,
         dq,
         dk,
         dv,
+        dsink,
         cu_seqlens_q,
         cu_seqlens_k,
         alibi_slopes,
@@ -396,11 +416,13 @@ def _flash_attn_varlen_backward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    learnable_sink: Optional[torch.Tensor],
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
     dq: Optional[torch.Tensor],
     dk: Optional[torch.Tensor],
     dv: Optional[torch.Tensor],
+    dsink: Optional[torch.Tensor],
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
@@ -426,6 +448,8 @@ def _flash_attn_varlen_backward_fake(
         dk = torch.empty_like(k)
     if dv is None:
         dv = torch.empty_like(v)
+    if dsink is None and learnable_sink is not None:
+        dsink = torch.empty_like(learnable_sink)
     softmax_d = torch.empty((num_heads, total_q + 128 * batch_size), device=q.device, dtype=torch.float32)
     
     return softmax_d
@@ -442,6 +466,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
     def forward(
         ctx,
         qkv,
+        learnable_sink,
         dropout_p,
         softmax_scale,
         causal,
@@ -465,6 +490,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             q,
             k,
             v,
+            learnable_sink,
             dropout_p,
             softmax_scale,
             causal=causal,
@@ -475,7 +501,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             return_softmax=return_softmax and dropout_p > 0,
         )
         if is_grad:
-            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+            ctx.save_for_backward(q, k, v, learnable_sink, out_padded, softmax_lse, rng_state)
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
@@ -488,9 +514,10 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+        q, k, v, learnable_sink, out, softmax_lse, rng_state = ctx.saved_tensors
         qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
         dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
+        dsink = None if learnable_sink is None else torch.zeros_like(learnable_sink)
         head_size_og = dout.size(3)
         dout_padded = dout
         if head_size_og % 8 != 0:
@@ -500,11 +527,13 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             q,
             k,
             v,
+            learnable_sink,
             out,
             softmax_lse,
             dqkv[:, :, 0],
             dqkv[:, :, 1],
             dqkv[:, :, 2],
+            dsink,
             ctx.dropout_p,
             ctx.softmax_scale,
             ctx.causal,
@@ -516,7 +545,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             rng_state=rng_state,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None, None, None, None
+        return dqkv, dsink, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
@@ -524,6 +553,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
     def forward(
         ctx,
         qkv,
+        learnable_sink,
         cu_seqlens,
         max_seqlen,
         dropout_p,
@@ -549,6 +579,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             q,
             k,
             v,
+            learnable_sink,
             cu_seqlens,
             cu_seqlens,
             max_seqlen,
@@ -564,7 +595,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             block_table=None,
         )
         if is_grad:
-            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens, rng_state)
+            ctx.save_for_backward(q, k, v, learnable_sink, out_padded, softmax_lse, cu_seqlens, rng_state)
             ctx.dropout_p = dropout_p
             ctx.max_seqlen = max_seqlen
             ctx.softmax_scale = softmax_scale
@@ -578,9 +609,10 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens, rng_state = ctx.saved_tensors
+        q, k, v, learnable_sink, out, softmax_lse, cu_seqlens, rng_state = ctx.saved_tensors
         qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
         dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
+        dsink = None if learnable_sink is None else torch.zeros_like(learnable_sink)
         head_size_og = dout.size(2)
         dout_padded = dout
         if head_size_og % 8 != 0:
@@ -590,11 +622,13 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             q,
             k,
             v,
+            learnable_sink,
             out,
             softmax_lse,
             dqkv[:, 0],
             dqkv[:, 1],
             dqkv[:, 2],
+            dsink,
             cu_seqlens,
             cu_seqlens,
             ctx.max_seqlen,
@@ -610,7 +644,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             rng_state=rng_state,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None, None, None, None, None, None
+        return dqkv, dsink, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnKVPackedFunc(torch.autograd.Function):
@@ -619,6 +653,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         ctx,
         q,
         kv,
+        learnable_sink,
         dropout_p,
         softmax_scale,
         causal,
@@ -644,6 +679,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             q,
             k,
             v,
+            learnable_sink,
             dropout_p,
             softmax_scale,
             causal=causal,
@@ -654,7 +690,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             return_softmax=return_softmax and dropout_p > 0,
         )
         if is_grad:
-            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+            ctx.save_for_backward(q, k, v, learnable_sink, out_padded, softmax_lse, rng_state)
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
@@ -667,10 +703,11 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+        q, k, v, learnable_sink, out, softmax_lse, rng_state = ctx.saved_tensors
         dq = torch.empty_like(q)
         kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
         dkv = torch.empty(kv_shape, dtype=k.dtype, device=k.device)
+        dsink = None if learnable_sink is None else torch.zeros_like(learnable_sink)
         head_size_og = dout.size(3)
         dout_padded = dout
         if head_size_og % 8 != 0:
@@ -680,11 +717,13 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             q,
             k,
             v,
+            learnable_sink,
             out,
             softmax_lse,
             dq,
             dkv[:, :, 0],
             dkv[:, :, 1],
+            dsink,
             ctx.dropout_p,
             ctx.softmax_scale,
             ctx.causal,
@@ -697,7 +736,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., : dout.shape[-1]]
-        return dq, dkv, None, None, None, None, None, None, None, None, None
+        return dq, dkv, dsink, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
@@ -706,6 +745,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         ctx,
         q,
         kv,
+        learnable_sink,
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
@@ -735,6 +775,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             q,
             k,
             v,
+            learnable_sink,
             cu_seqlens_q,
             cu_seqlens_k,
             max_seqlen_q,
@@ -751,7 +792,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         )
         if is_grad:
             ctx.save_for_backward(
-                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
+                q, k, v, learnable_sink, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
             )
             ctx.dropout_p = dropout_p
             ctx.max_seqlen_q = max_seqlen_q
@@ -767,10 +808,11 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
+        q, k, v, learnable_sink, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
         dq = torch.empty_like(q)
         kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
         dkv = torch.empty(kv_shape, dtype=k.dtype, device=k.device)
+        dsink = None if learnable_sink is None else torch.zeros_like(learnable_sink)
         head_size_og = dout.size(2)
         dout_padded = dout
         if head_size_og % 8 != 0:
@@ -780,11 +822,13 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             q,
             k,
             v,
+            learnable_sink,
             out,
             softmax_lse,
             dq,
             dkv[:, 0],
             dkv[:, 1],
+            dsink,
             cu_seqlens_q,
             cu_seqlens_k,
             ctx.max_seqlen_q,
@@ -801,7 +845,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., : dout.shape[-1]]
-        return dq, dkv, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dkv, dsink, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -811,6 +855,7 @@ class FlashAttnFunc(torch.autograd.Function):
         q,
         k,
         v,
+        learnable_sink,
         dropout_p,
         softmax_scale,
         causal,
@@ -835,6 +880,7 @@ class FlashAttnFunc(torch.autograd.Function):
             q,
             k,
             v,
+            learnable_sink,
             dropout_p,
             softmax_scale,
             causal=causal,
@@ -845,7 +891,7 @@ class FlashAttnFunc(torch.autograd.Function):
             return_softmax=return_softmax and dropout_p > 0,
         )
         if is_grad:
-            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+            ctx.save_for_backward(q, k, v, learnable_sink, out_padded, softmax_lse, rng_state)
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
@@ -858,8 +904,9 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+        q, k, v, learnable_sink, out, softmax_lse, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        dsink = None if learnable_sink is None else torch.zeros_like(learnable_sink)
         head_size_og = dout.size(3)
         dout_padded = dout
         if head_size_og % 8 != 0:
@@ -869,11 +916,13 @@ class FlashAttnFunc(torch.autograd.Function):
             q,
             k,
             v,
+            learnable_sink,
             out,
             softmax_lse,
             dq,
             dk,
             dv,
+            dsink,
             ctx.dropout_p,
             ctx.softmax_scale,
             ctx.causal,
@@ -887,7 +936,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, dsink, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -897,6 +946,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         q,
         k,
         v,
+        learnable_sink,
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
@@ -926,6 +976,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             q,
             k,
             v,
+            learnable_sink,
             cu_seqlens_q,
             cu_seqlens_k,
             max_seqlen_q,
@@ -942,7 +993,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         )
         if is_grad:
             ctx.save_for_backward(
-                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
+                q, k, v, learnable_sink, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
             )
             ctx.dropout_p = dropout_p
             ctx.max_seqlen_q = max_seqlen_q
@@ -959,8 +1010,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
+        q, k, v, learnable_sink, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        dsink = None if learnable_sink is None else torch.zeros_like(learnable_sink)
         head_size_og = dout.size(2)
         dout_padded = dout
         if head_size_og % 8 != 0:
@@ -970,11 +1022,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             q,
             k,
             v,
+            learnable_sink,
             out,
             softmax_lse,
             dq,
             dk,
             dv,
+            dsink,
             cu_seqlens_q,
             cu_seqlens_k,
             ctx.max_seqlen_q,
@@ -992,7 +1046,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, dsink, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -1003,6 +1057,7 @@ def flash_attn_qkvpacked_func(
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0,  # <=0.0 means deactivate
     alibi_slopes=None,
+    learnable_sink=None,
     deterministic=False,
     return_attn_probs=False,
 ):
@@ -1026,6 +1081,8 @@ def flash_attn_qkvpacked_func(
         softcap: float. Anything > 0 activates softcapping attention.
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of (-alibi_slope * |i - j|) is added to
             the attention score of query i and key j.
+        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
+            additional attention logit to each query's attention scores before softmax.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
@@ -1042,6 +1099,7 @@ def flash_attn_qkvpacked_func(
     """
     return FlashAttnQKVPackedFunc.apply(
         qkv,
+        learnable_sink,
         dropout_p,
         softmax_scale,
         causal,
@@ -1063,6 +1121,7 @@ def flash_attn_kvpacked_func(
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0,  # 0.0 means deactivated
     alibi_slopes=None,
+    learnable_sink=None,
     deterministic=False,
     return_attn_probs=False,
 ):
@@ -1103,6 +1162,8 @@ def flash_attn_kvpacked_func(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
+            additional attention logit to each query's attention scores before softmax.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
@@ -1120,6 +1181,7 @@ def flash_attn_kvpacked_func(
     return FlashAttnKVPackedFunc.apply(
         q,
         kv,
+        learnable_sink,
         dropout_p,
         softmax_scale,
         causal,
@@ -1142,6 +1204,7 @@ def flash_attn_func(
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
+    learnable_sink=None,
     deterministic=False,
     return_attn_probs=False,
 ):
@@ -1179,6 +1242,8 @@ def flash_attn_func(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
+            additional attention logit to each query's attention scores before softmax.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
@@ -1197,6 +1262,7 @@ def flash_attn_func(
         q,
         k,
         v,
+        learnable_sink,
         dropout_p,
         softmax_scale,
         causal,
@@ -1219,6 +1285,7 @@ def flash_attn_varlen_qkvpacked_func(
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
+    learnable_sink=None,
     deterministic=False,
     return_attn_probs=False,
 ):
@@ -1245,6 +1312,8 @@ def flash_attn_varlen_qkvpacked_func(
         softcap: float. Anything > 0 activates softcapping attention.
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of (-alibi_slope * |i - j|)
             is added to the attention score of query i and key j.
+        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
+            additional attention logit to each query's attention scores before softmax.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
@@ -1261,6 +1330,7 @@ def flash_attn_varlen_qkvpacked_func(
     """
     return FlashAttnVarlenQKVPackedFunc.apply(
         qkv,
+        learnable_sink,
         cu_seqlens,
         max_seqlen,
         dropout_p,
@@ -1288,6 +1358,7 @@ def flash_attn_varlen_kvpacked_func(
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
+    learnable_sink=None,
     deterministic=False,
     return_attn_probs=False,
 ):
@@ -1334,6 +1405,8 @@ def flash_attn_varlen_kvpacked_func(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
+            additional attention logit to each query's attention scores before softmax.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
@@ -1351,6 +1424,7 @@ def flash_attn_varlen_kvpacked_func(
     return FlashAttnVarlenKVPackedFunc.apply(
         q,
         kv,
+        learnable_sink,
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
@@ -1381,6 +1455,7 @@ def flash_attn_varlen_func(
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
+    learnable_sink=None,
     deterministic=False,
     return_attn_probs=False,
     block_table=None,
@@ -1426,6 +1501,8 @@ def flash_attn_varlen_func(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
+            additional attention logit to each query's attention scores before softmax.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
@@ -1444,6 +1521,7 @@ def flash_attn_varlen_func(
         q,
         k,
         v,
+        learnable_sink,
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
@@ -1479,6 +1557,7 @@ def flash_attn_with_kvcache(
     softcap=0.0, # 0.0 means deactivated
     rotary_interleaved=True,
     alibi_slopes=None,
+    learnable_sink=None,
     num_splits=0,
     return_softmax_lse=False,
 ):
@@ -1557,6 +1636,8 @@ def flash_attn_with_kvcache(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        learnable_sink: (nheads,) fp32 tensor. A learnable attention sink value per head that is appended as an
+            additional attention logit to each query's attention scores before softmax.
         num_splits: int. If > 1, split the key/value into this many chunks along the sequence.
            If num_splits == 1, we don't split the key/value. If num_splits == 0, we use a heuristic
            to automatically determine the number of splits.
@@ -1594,6 +1675,7 @@ def flash_attn_with_kvcache(
         cache_leftpad,
         block_table,
         alibi_slopes,
+        learnable_sink,
         None,
         softmax_scale,
         causal,
