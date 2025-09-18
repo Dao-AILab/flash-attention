@@ -3,10 +3,9 @@ import torch
 import triton # type: ignore
 import triton.language as tl # type: ignore
 from typing import Literal, Optional
-from .utils import AUTOTUNE, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, compute_fp8_scaling_factors, \
+from .utils import AUTOTUNE, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, DEBUG, compute_fp8_scaling_factors, \
     create_dropout_mask, create_dropout_mask_varlen, is_cdna, is_fp8, is_rdna, round_multiple
 
-DEBUG= False
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
 tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
@@ -29,7 +28,7 @@ def get_autotune_configs():
             ]
             preprocess_autotune_keys = [
                 "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
-                "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+                "ACTUAL_HEAD_DIM_QK", "ACTUAL_HEAD_DIM_V", "IS_VARLEN", "HQ", "HK",
             ]
             causal_autotune_configs = [
                 triton.Config({"BLOCK_M1": 32, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 32, "BLK_SLICE_FACTOR": 2, "waves_per_eu": WAVES_PER_EU, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),  # og config
@@ -39,7 +38,7 @@ def get_autotune_configs():
             ]
             causal_autotune_keys = [
                 "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
-                "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+                "ACTUAL_HEAD_DIM_QK", "ACTUAL_HEAD_DIM_V", "IS_VARLEN", "HQ", "HK",
             ]
             noncausal_autotune_configs = [
                 triton.Config({"BLOCK_M1": 32, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 32, "BLK_SLICE_FACTOR": 2, "waves_per_eu": WAVES_PER_EU, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),  # og config
@@ -49,7 +48,7 @@ def get_autotune_configs():
             ]
             noncausal_autotune_keys = [
                 "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
-                "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+                "ACTUAL_HEAD_DIM_QK", "ACTUAL_HEAD_DIM_V", "IS_VARLEN", "HQ", "HK",
             ]
             
             return (preprocess_autotune_configs, preprocess_autotune_keys), (causal_autotune_configs, causal_autotune_keys), (noncausal_autotune_configs, noncausal_autotune_keys)
@@ -72,21 +71,21 @@ def get_autotune_configs():
         ]
         preprocess_autotune_keys = [
             "max_seqlen_q",
-           "ACTUAL_HEAD_DIM", "IS_VARLEN",
+           "ACTUAL_HEAD_DIM_V", "IS_VARLEN",
         ]
         causal_autotune_configs = [
             triton.Config({"BLOCK_M1": BLOCK_M1, "BLOCK_N1": BLOCK_N1, "BLOCK_M2": BLOCK_M2, "BLOCK_N2": BLOCK_N2, "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR, "waves_per_eu": WAVES_PER_EU}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
         ]
         causal_autotune_keys = [
             "dropout_p", "max_seqlen_q", "max_seqlen_k", 
-            "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+            "ACTUAL_HEAD_DIM_QK", "ACTUAL_HEAD_DIM_V", "IS_VARLEN", "HQ", "HK",
         ]
         noncausal_autotune_configs = [
             triton.Config({"BLOCK_M1": BLOCK_M1, "BLOCK_N1": BLOCK_N1, "BLOCK_M2": BLOCK_M2, "BLOCK_N2": BLOCK_N2, "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR, "waves_per_eu": WAVES_PER_EU}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
         ]
         noncausal_autotune_keys = [
             "dropout_p", "max_seqlen_q", "max_seqlen_k", 
-            "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+            "ACTUAL_HEAD_DIM_QK", "ACTUAL_HEAD_DIM_V", "IS_VARLEN", "HQ", "HK",
         ]
         return (preprocess_autotune_configs, preprocess_autotune_keys), (causal_autotune_configs, causal_autotune_keys), (noncausal_autotune_configs, noncausal_autotune_keys)
     
@@ -117,8 +116,8 @@ def _bwd_preprocess(
     cu_seqlens_q, max_seqlen_q,
     Descale_do,
     PRE_BLOCK: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    ACTUAL_HEAD_DIM: tl.constexpr,
+    HEAD_DIM_V: tl.constexpr,
+    ACTUAL_HEAD_DIM_V: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_FP8: tl.constexpr
 ):
@@ -136,7 +135,7 @@ def _bwd_preprocess(
 
     # Compute offsets
     offs_m = pid_m * PRE_BLOCK + tl.arange(0, PRE_BLOCK)
-    offs_d = tl.arange(0, HEAD_DIM)
+    offs_d = tl.arange(0, HEAD_DIM_V)
     # pointer offsets for O & DO
     off_o = ( bid * stride_ob 
             + hid * stride_oh 
@@ -152,9 +151,9 @@ def _bwd_preprocess(
     # create masks
     mask_m = offs_m < seqlen_q
     mask_md = mask_m[:, None]
-    PADDED_HEAD: tl.constexpr = (ACTUAL_HEAD_DIM != HEAD_DIM)
-    if PADDED_HEAD:
-        mask_md &= offs_d[None, :] < ACTUAL_HEAD_DIM
+    PADDED_HEAD_V: tl.constexpr = (ACTUAL_HEAD_DIM_V != HEAD_DIM_V)
+    if PADDED_HEAD_V:
+        mask_md &= offs_d[None, :] < ACTUAL_HEAD_DIM_V
     # load
     o = tl.load(O + off_o, mask=mask_md, other=0.0)
     do = tl.load(DO + off_do, mask=mask_md, other=0.0)
@@ -185,8 +184,10 @@ def _bwd_dkdv_inner(
     stride_lse_m, stride_delta_m,
     BLOCK_M: tl.constexpr,  # 16
     BLOCK_N: tl.constexpr,  # 128
-    HEAD_DIM: tl.constexpr,  #
-    ACTUAL_HEAD_DIM: tl.constexpr,  #
+    HEAD_DIM_QK: tl.constexpr,  #
+    HEAD_DIM_V: tl.constexpr,  #
+    ACTUAL_HEAD_DIM_QK: tl.constexpr,  #
+    ACTUAL_HEAD_DIM_V: tl.constexpr,  #
     dropout_p, philox_seed, batch_philox_offset, dropout_offset,
     alibi_slope,
     seqlen_q, seqlen_k,  # max sequence length for q and k
@@ -203,18 +204,20 @@ def _bwd_dkdv_inner(
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
     # if HEAD_DIM is padded
-    PADDED_HEAD: tl.constexpr = (ACTUAL_HEAD_DIM != HEAD_DIM)
+    PADDED_HEAD_QK: tl.constexpr = (ACTUAL_HEAD_DIM_QK != HEAD_DIM_QK)
+    PADDED_HEAD_V: tl.constexpr = (ACTUAL_HEAD_DIM_V != HEAD_DIM_V)
     delta_qk = seqlen_q - seqlen_k
     offs_m = start_m + tl.arange(0, BLOCK_M)  # start_m + (0, 15)
     offs_n = start_n + tl.arange(0, BLOCK_N)  # start_m + (0, 127)
-    offs_k = tl.arange(0, HEAD_DIM)
+    offs_k_qk = tl.arange(0, HEAD_DIM_QK)
+    offs_k_v = tl.arange(0, HEAD_DIM_V)
     # mask to make sure not OOB of seqlen_q
     mask_n = offs_n < seqlen_k
     # Q and DO are (seqlen_q, head_dim)
-    # qT_ptrs = (1, BLOCK_M) + (HEAD_DIM, 1), transpose of q
-    qT_ptrs = Q + offs_m[None, :] * stride_qm + offs_k[:, None] * stride_qk
-    # do_ptrs = (BLOCK_M, 1) + (1, HEAD_DIM), NOT transposed
-    do_ptrs = DO + offs_m[:, None] * stride_dom + offs_k[None, :] * stride_dok
+    # qT_ptrs = (1, BLOCK_M) + (HEAD_DIM_QK, 1), transpose of q
+    qT_ptrs = Q + offs_m[None, :] * stride_qm + offs_k_qk[:, None] * stride_qk
+    # do_ptrs = (BLOCK_M, 1) + (1, HEAD_DIM_V), NOT transposed
+    do_ptrs = DO + offs_m[:, None] * stride_dom + offs_k_v[None, :] * stride_dok
     # BLOCK_N must be a multiple of BLOCK_M, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_N % BLOCK_M == 0)
     curr_m = start_m
@@ -231,9 +234,10 @@ def _bwd_dkdv_inner(
         mask_qT = mask_m[None, :]
         mask_do = mask_m[:, None]
         mask_nm = mask_n[:, None] & (offs_m[None, :] < seqlen_q)
-        if PADDED_HEAD:
-            mask_qT &= offs_k[:, None] < ACTUAL_HEAD_DIM
-            mask_do &= offs_k[None, :] < ACTUAL_HEAD_DIM
+        if PADDED_HEAD_QK:
+            mask_qT &= offs_k_qk[:, None] < ACTUAL_HEAD_DIM_QK
+        if PADDED_HEAD_V:
+            mask_do &= offs_k_v[None, :] < ACTUAL_HEAD_DIM_V
         qT = tl.load(qT_ptrs, mask=mask_qT, other=0.0)
         # generate dropout mask
         if ENABLE_DROPOUT:
@@ -341,8 +345,10 @@ def _bwd_dq_inner(
     seqlen_q, seqlen_k,  #
     BLOCK_M2: tl.constexpr,  #
     BLOCK_N2: tl.constexpr,  #
-    HEAD_DIM: tl.constexpr,
-    ACTUAL_HEAD_DIM: tl.constexpr,  #
+    HEAD_DIM_QK: tl.constexpr,
+    HEAD_DIM_V: tl.constexpr,
+    ACTUAL_HEAD_DIM_QK: tl.constexpr,
+    ACTUAL_HEAD_DIM_V: tl.constexpr,  #
     dropout_p, philox_seed, batch_philox_offset, dropout_offset,
     alibi_slope,
     # Filled in by the wrapper.
@@ -358,17 +364,19 @@ def _bwd_dq_inner(
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
     # if HEAD_DIM is padded
-    PADDED_HEAD: tl.constexpr = (ACTUAL_HEAD_DIM != HEAD_DIM)
+    PADDED_HEAD_QK: tl.constexpr = (ACTUAL_HEAD_DIM_QK != HEAD_DIM_QK)
+    PADDED_HEAD_V: tl.constexpr = (ACTUAL_HEAD_DIM_V != HEAD_DIM_V)
     delta_qk = seqlen_q - seqlen_k
     offs_m = start_m + tl.arange(0, BLOCK_M2)
     offs_n = start_n + tl.arange(0, BLOCK_N2)
-    offs_k = tl.arange(0, HEAD_DIM)
+    offs_k_qk = tl.arange(0, HEAD_DIM_QK)
+    offs_k_v = tl.arange(0, HEAD_DIM_V)
 
     # mask to make sure not OOB of seqlen_q
     mask_m = offs_m < seqlen_q
 
-    kT_ptrs = K + offs_n[None, :] * stride_kn + offs_k[:, None] * stride_kk
-    vT_ptrs = V + offs_n[None, :] * stride_vn + offs_k[:, None] * stride_vk
+    kT_ptrs = K + offs_n[None, :] * stride_kn + offs_k_qk[:, None] * stride_kk
+    vT_ptrs = V + offs_n[None, :] * stride_vn + offs_k_v[:, None] * stride_vk
     # D (= delta) is pre-divided by ds_scale.
     Di = tl.load(Delta + offs_m * stride_delta_m, mask=mask_m, other=0.0)
     # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
@@ -387,12 +395,15 @@ def _bwd_dq_inner(
         if DEBUG_TRITON_DETAIL: print(f"start_n = {start_n}, end_n = {end_n}, offs_n: {offs_n.shape}\n{offs_n}")  # noqa: E701
         if DEBUG_TRITON_DETAIL: print(f"mask_n: {mask_n.shape}\n{mask_n}")  # noqa: E701
         mask_kT = mask_n[None, :]
+        mask_vT = mask_n[None, :]
         mask_mn = mask_m[:, None] & (offs_n[None, :] < end_n)
-        if PADDED_HEAD:
-            mask_kT &= offs_k[:, None] < ACTUAL_HEAD_DIM
+        if PADDED_HEAD_QK:
+            mask_kT &= offs_k_qk[:, None] < ACTUAL_HEAD_DIM_QK
+        if PADDED_HEAD_V:
+            mask_vT &= offs_k_v[:, None] < ACTUAL_HEAD_DIM_V
 
         kT = tl.load(kT_ptrs, mask=mask_kT, other=0.0)
-        vT = tl.load(vT_ptrs, mask=mask_kT, other=0.0)
+        vT = tl.load(vT_ptrs, mask=mask_vT, other=0.0)
 
         if ENABLE_DROPOUT:
             # NOTE: dropout is transposed because it is used to mask pT
@@ -477,6 +488,7 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
     stride_az, stride_ah,
     HQ, HK,
     cu_seqlens_q, cu_seqlens_k,
+    seqused_q, seqused_k,  # Add seqused parameters
     max_seqlen_q, max_seqlen_k,
     Dropout_mask, dropout_p, philox_seed, philox_offset_base,
     Alibi_slopes,
@@ -486,8 +498,10 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
     BLOCK_M2: tl.constexpr,
     BLOCK_N2: tl.constexpr,
     BLK_SLICE_FACTOR: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    ACTUAL_HEAD_DIM: tl.constexpr,
+    HEAD_DIM_QK: tl.constexpr,
+    HEAD_DIM_V: tl.constexpr,
+    ACTUAL_HEAD_DIM_QK: tl.constexpr,
+    ACTUAL_HEAD_DIM_V: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_ALIBI: tl.constexpr,
@@ -495,6 +509,7 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
     FP8_OUTPUT: tl.constexpr,
+    USE_SEQUSED: tl.constexpr,  # Add flag for seqused
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
@@ -514,21 +529,31 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
         q_end = tl.load(cu_seqlens_q + bid + 1)
         k_start = tl.load(cu_seqlens_k + bid)
         k_end = tl.load(cu_seqlens_k + bid + 1)
-        seqlen_q = q_end - q_start
-        seqlen_k = k_end - k_start
+        
+        # If seqused is provided, use it to limit the actual sequence length
+        if USE_SEQUSED:
+            actual_seqlen_q = tl.load(seqused_q + bid) if seqused_q is not None else q_end - q_start
+            seqlen_q = tl.minimum(actual_seqlen_q, q_end - q_start)
+            actual_seqlen_k = tl.load(seqused_k + bid) if seqused_k is not None else k_end - k_start
+            seqlen_k = tl.minimum(actual_seqlen_k, k_end - k_start)
+        else:
+            seqlen_q = q_end - q_start
+            seqlen_k = k_end - k_start
 
     delta_qk = seqlen_q - seqlen_k
     if DEBUG_TRITON: print(f"delta_qk = {delta_qk}")  # noqa: E701
-    PADDED_HEAD: tl.constexpr = (ACTUAL_HEAD_DIM != HEAD_DIM)
-    offs_d = tl.arange(0, HEAD_DIM)
+    PADDED_HEAD_QK: tl.constexpr = (ACTUAL_HEAD_DIM_QK != HEAD_DIM_QK)
+    PADDED_HEAD_V: tl.constexpr = (ACTUAL_HEAD_DIM_V != HEAD_DIM_V)
+    offs_d_qk = tl.arange(0, HEAD_DIM_QK)
+    offs_d_v = tl.arange(0, HEAD_DIM_V)
     GROUP_SIZE: tl.constexpr = HQ // HK
 
     # align the delta_qk
     start_n = pid * BLOCK_N1
     if start_n < seqlen_k:
         # This section does dk and dv
-        dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
-        dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+        dk = tl.zeros([BLOCK_N1, HEAD_DIM_QK], dtype=tl.float32)
+        dv = tl.zeros([BLOCK_N1, HEAD_DIM_V], dtype=tl.float32)
 
         # q > k: diretcly skip all the way until the start of causal block
         start_delta_q_gt_k = delta_qk
@@ -548,17 +573,21 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
 
         offs_n = start_n + tl.arange(0, BLOCK_N1)
         # Mask for loading K and V
-        mask_kv = offs_n[:, None] < seqlen_k
-        if PADDED_HEAD:
-            mask_d = offs_d < ACTUAL_HEAD_DIM
-            mask_kv &= mask_d[None, :]
+        mask_k = offs_n[:, None] < seqlen_k
+        mask_v = offs_n[:, None] < seqlen_k
+        if PADDED_HEAD_QK:
+            mask_d_qk = offs_d_qk < ACTUAL_HEAD_DIM_QK
+            mask_k &= mask_d_qk[None, :]
+        if PADDED_HEAD_V:
+            mask_d_v = offs_d_v < ACTUAL_HEAD_DIM_V
+            mask_v &= mask_d_v[None, :]
 
         # K/V tensors not changed for the group
-        adj_k = bid * stride_kb + hkid * stride_kh + k_start * stride_kn + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-        adj_v = bid * stride_vb + hkid * stride_vh + k_start * stride_vn + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+        adj_k = bid * stride_kb + hkid * stride_kh + k_start * stride_kn + offs_n[:, None] * stride_kn + offs_d_qk[None, :] * stride_kd
+        adj_v = bid * stride_vb + hkid * stride_vh + k_start * stride_vn + offs_n[:, None] * stride_vn + offs_d_v[None, :] * stride_vd
         # load K and V: they stay in SRAM throughout the inner loop.
-        k = tl.load(K + adj_k, mask=mask_kv, other=0.0)
-        v = tl.load(V + adj_v, mask=mask_kv, other=0.0)
+        k = tl.load(K + adj_k, mask=mask_k, other=0.0)
+        v = tl.load(V + adj_v, mask=mask_v, other=0.0)
         # If MQA / GQA, set the K and V head offsets appropriately.
         # hqid = hkid
         for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
@@ -628,7 +657,7 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
                 stride_dropoutm, stride_dropoutn,  # strides for dropout
                 stride_lse_m, stride_delta_m,
                 MASK_BLOCK_M1, BLOCK_N1,  # block dim
-                HEAD_DIM, ACTUAL_HEAD_DIM,  # head dim
+                HEAD_DIM_QK, HEAD_DIM_V, ACTUAL_HEAD_DIM_QK, ACTUAL_HEAD_DIM_V,  # head dim
                 dropout_p, philox_seed, batch_philox_offset, dropout_offset,
                 alibi_slope,
                 seqlen_q, seqlen_k,  # max sequence length for q and k
@@ -658,7 +687,7 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
                 stride_dropoutm, stride_dropoutn,  # strides for dropout
                 stride_lse_m, stride_delta_m,
                 BLOCK_M1, BLOCK_N1,  # block dim
-                HEAD_DIM, ACTUAL_HEAD_DIM,  # head dim
+                HEAD_DIM_QK, HEAD_DIM_V, ACTUAL_HEAD_DIM_QK, ACTUAL_HEAD_DIM_V,  # head dim
                 dropout_p, philox_seed, batch_philox_offset, dropout_offset,
                 alibi_slope,
                 seqlen_q, seqlen_k,  # max sequence length for q and k
@@ -676,13 +705,13 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
         # end of GQA/MQA of dkdv
         # Write back dV
         adj_dv = bid * stride_dvb + hkid * stride_dvh + k_start * stride_dvn
-        offs_dv = offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd
-        tl.store(DV + adj_dv + offs_dv, dv, mask=mask_kv)
+        offs_dv = offs_n[:, None] * stride_dvn + offs_d_v[None, :] * stride_dvd
+        tl.store(DV + adj_dv + offs_dv, dv, mask=mask_v)
         # write back dk
         adj_dk = bid * stride_dkb + hkid * stride_dkh + k_start * stride_dkn
-        offs_dk = offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
+        offs_dk = offs_n[:, None] * stride_dkn + offs_d_qk[None, :] * stride_dkd
         dk *= sm_scale
-        tl.store(DK + adj_dk + offs_dk, dk, mask=mask_kv)
+        tl.store(DK + adj_dk + offs_dk, dk, mask=mask_k)
 
     # This part does dq
     start_m = pid * BLOCK_M2
@@ -696,11 +725,15 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
         offs_m = start_m + tl.arange(0, BLOCK_M2)
         # Mask for loading K and V
         mask_q = offs_m[:, None] < seqlen_q
-        if PADDED_HEAD:
-            mask_d = offs_d < ACTUAL_HEAD_DIM
-            mask_q &= mask_d[None, :]
-        offs_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-        offs_do = offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
+        mask_do = offs_m[:, None] < seqlen_q
+        if PADDED_HEAD_QK:
+            mask_d_qk = offs_d_qk < ACTUAL_HEAD_DIM_QK
+            mask_q &= mask_d_qk[None, :]
+        if PADDED_HEAD_V:
+            mask_d_v = offs_d_v < ACTUAL_HEAD_DIM_V
+            mask_do &= mask_d_v[None, :]
+        offs_q = offs_m[:, None] * stride_qm + offs_d_qk[None, :] * stride_qd
+        offs_do = offs_m[:, None] * stride_dom + offs_d_v[None, :] * stride_dod
         # NOTE: don't assume that the strides for k and v are the same!
         K +=  bid * stride_kb + hkid * stride_kh + k_start * stride_kn
         V +=  bid * stride_vb + hkid * stride_vh + k_start * stride_vn
@@ -739,7 +772,7 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
                 dropout_offset = \
                     Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
             q = tl.load(Q + adj_q + offs_q, mask=mask_q, other=0.0)
-            do = tl.load(DO + adj_do + offs_do, mask=mask_q, other=0.0)
+            do = tl.load(DO + adj_do + offs_do, mask=mask_do, other=0.0)
             m = tl.load(M + adj_m + offs_m * stride_lse_m,
                         mask=offs_m < seqlen_q)
             m = m[:, None]
@@ -757,7 +790,7 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
             else:
                 descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
-            dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
+            dq = tl.zeros([BLOCK_M2, HEAD_DIM_QK], dtype=tl.float32)
             dq = _bwd_dq_inner(
                 dq,
                 q, K, V, do, m, Delta_ptr, sm_scale,
@@ -767,7 +800,7 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
                 stride_delta_m,
                 seqlen_q, seqlen_k,
                 BLOCK_M2, MASK_BLOCK_N2,
-                HEAD_DIM, ACTUAL_HEAD_DIM,
+                HEAD_DIM_QK, HEAD_DIM_V, ACTUAL_HEAD_DIM_QK, ACTUAL_HEAD_DIM_V,
                 dropout_p, philox_seed, batch_philox_offset, dropout_offset,
                 alibi_slope,
                 start_m, start_n, end_n, num_steps,
@@ -794,7 +827,7 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
                 stride_delta_m,
                 seqlen_q, seqlen_k,
                 BLOCK_M2, BLOCK_N2,
-                HEAD_DIM, ACTUAL_HEAD_DIM,
+                HEAD_DIM_QK, HEAD_DIM_V, ACTUAL_HEAD_DIM_QK, ACTUAL_HEAD_DIM_V,
                 dropout_p, philox_seed, batch_philox_offset, dropout_offset,
                 alibi_slope,
                 start_m, start_n, end_n, num_steps,
@@ -810,7 +843,7 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
             )
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
-            offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
+            offs_dq = offs_m[:, None] * stride_dqm + offs_d_qk[None, :] * stride_dqd
             dq *= sm_scale
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
             # end of GQA/MQA of dq
@@ -838,6 +871,7 @@ def bwd_kernel_noncausal(
     stride_az, stride_ah,
     HQ, HK,
     cu_seqlens_q, cu_seqlens_k,
+    seqused_q, seqused_k,  # Add seqused parameters
     max_seqlen_q, max_seqlen_k,
     Dropout_mask, dropout_p, philox_seed, philox_offset_base,
     Alibi_slopes,
@@ -847,8 +881,10 @@ def bwd_kernel_noncausal(
     BLOCK_M2: tl.constexpr,  # 128
     BLOCK_N2: tl.constexpr,  # 32
     BLK_SLICE_FACTOR: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    ACTUAL_HEAD_DIM: tl.constexpr,
+    HEAD_DIM_QK: tl.constexpr,
+    HEAD_DIM_V: tl.constexpr,
+    ACTUAL_HEAD_DIM_QK: tl.constexpr,
+    ACTUAL_HEAD_DIM_V: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_ALIBI: tl.constexpr,
@@ -856,6 +892,7 @@ def bwd_kernel_noncausal(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
     FP8_OUTPUT: tl.constexpr,
+    USE_SEQUSED: tl.constexpr,  # Add flag for seqused
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
@@ -875,31 +912,45 @@ def bwd_kernel_noncausal(
         q_end = tl.load(cu_seqlens_q + bid + 1)
         k_start = tl.load(cu_seqlens_k + bid)
         k_end = tl.load(cu_seqlens_k + bid + 1)
-        seqlen_q = q_end - q_start
-        seqlen_k = k_end - k_start
+        
+        # If seqused is provided, use it to limit the actual sequence length
+        if USE_SEQUSED:
+            actual_seqlen_q = tl.load(seqused_q + bid) if seqused_q is not None else q_end - q_start
+            seqlen_q = tl.minimum(actual_seqlen_q, q_end - q_start)
+            actual_seqlen_k = tl.load(seqused_k + bid) if seqused_k is not None else k_end - k_start
+            seqlen_k = tl.minimum(actual_seqlen_k, k_end - k_start)
+        else:
+            seqlen_q = q_end - q_start
+            seqlen_k = k_end - k_start
 
-    PADDED_HEAD: tl.constexpr = (ACTUAL_HEAD_DIM != HEAD_DIM)
-    offs_d = tl.arange(0, HEAD_DIM)
+    PADDED_HEAD_QK: tl.constexpr = (ACTUAL_HEAD_DIM_QK != HEAD_DIM_QK)
+    PADDED_HEAD_V: tl.constexpr = (ACTUAL_HEAD_DIM_V != HEAD_DIM_V)
+    offs_d_qk = tl.arange(0, HEAD_DIM_QK)
+    offs_d_v = tl.arange(0, HEAD_DIM_V)
     GROUP_SIZE: tl.constexpr = HQ // HK
 
     start_n = pid * BLOCK_N1
     if start_n < seqlen_k:
-        dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
-        dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+        dk = tl.zeros([BLOCK_N1, HEAD_DIM_QK], dtype=tl.float32)
+        dv = tl.zeros([BLOCK_N1, HEAD_DIM_V], dtype=tl.float32)
 
         offs_n = start_n + tl.arange(0, BLOCK_N1)
         # Mask for loading K and V
-        mask_kv = offs_n[:, None] < seqlen_k
-        if PADDED_HEAD:
-            mask_d = offs_d < ACTUAL_HEAD_DIM
-            mask_kv &= mask_d[None, :]
+        mask_k = offs_n[:, None] < seqlen_k
+        mask_v = offs_n[:, None] < seqlen_k
+        if PADDED_HEAD_QK:
+            mask_d_qk = offs_d_qk < ACTUAL_HEAD_DIM_QK
+            mask_k &= mask_d_qk[None, :]
+        if PADDED_HEAD_V:
+            mask_d_v = offs_d_v < ACTUAL_HEAD_DIM_V
+            mask_v &= mask_d_v[None, :]
         # NOTE: don't assume that the strides for k and v are the same!
         # K/V tensors not changed for the group
-        adj_k = bid * stride_kb + hkid * stride_kh + k_start * stride_kn + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-        adj_v = bid * stride_vb + hkid * stride_vh + k_start * stride_vn + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+        adj_k = bid * stride_kb + hkid * stride_kh + k_start * stride_kn + offs_n[:, None] * stride_kn + offs_d_qk[None, :] * stride_kd
+        adj_v = bid * stride_vb + hkid * stride_vh + k_start * stride_vn + offs_n[:, None] * stride_vn + offs_d_v[None, :] * stride_vd
         # load K and V: they stay in SRAM throughout the inner loop.
-        k = tl.load(K + adj_k, mask=mask_kv, other=0.0)
-        v = tl.load(V + adj_v, mask=mask_kv, other=0.0)
+        k = tl.load(K + adj_k, mask=mask_k, other=0.0)
+        v = tl.load(V + adj_v, mask=mask_v, other=0.0)
         # If MQA / GQA, set the K and V head offsets appropriately.
         for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
             # offset input and output tensor by batch and Q/K heads
@@ -948,7 +999,7 @@ def bwd_kernel_noncausal(
                 stride_lse_m,
                 stride_delta_m,
                 BLOCK_M1, BLOCK_N1,  # block dim
-                HEAD_DIM, ACTUAL_HEAD_DIM,  # head dim
+                HEAD_DIM_QK, HEAD_DIM_V, ACTUAL_HEAD_DIM_QK, ACTUAL_HEAD_DIM_V,  # head dim
                 dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
                 alibi_slope,
                 seqlen_q, seqlen_k,  # max sequence length for q and k
@@ -966,13 +1017,13 @@ def bwd_kernel_noncausal(
 
         # Write back dV
         adj_dv = bid * stride_dvb + hkid * stride_dvh + k_start * stride_dvn
-        offs_dv = offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd
-        tl.store(DV + adj_dv + offs_dv, dv, mask=mask_kv)
+        offs_dv = offs_n[:, None] * stride_dvn + offs_d_v[None, :] * stride_dvd
+        tl.store(DV + adj_dv + offs_dv, dv, mask=mask_v)
         # write back dk
         adj_dk = bid * stride_dkb + hkid * stride_dkh + k_start * stride_dkn
-        offs_dk = offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
+        offs_dk = offs_n[:, None] * stride_dkn + offs_d_qk[None, :] * stride_dkd
         dk *= sm_scale
-        tl.store(DK + adj_dk + offs_dk, dk, mask=mask_kv)
+        tl.store(DK + adj_dk + offs_dk, dk, mask=mask_k)
 
     # THIS PART DOES DQ
     start_m = pid * BLOCK_M2
@@ -980,11 +1031,15 @@ def bwd_kernel_noncausal(
         offs_m = start_m + tl.arange(0, BLOCK_M2)
         # Mask for loading K and V
         mask_q = offs_m[:, None] < seqlen_q
-        if PADDED_HEAD:
-            mask_d = offs_d < ACTUAL_HEAD_DIM
-            mask_q &= mask_d[None, :]
-        offs_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-        offs_do = offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
+        mask_do = offs_m[:, None] < seqlen_q
+        if PADDED_HEAD_QK:
+            mask_d_qk = offs_d_qk < ACTUAL_HEAD_DIM_QK
+            mask_q &= mask_d_qk[None, :]
+        if PADDED_HEAD_V:
+            mask_d_v = offs_d_v < ACTUAL_HEAD_DIM_V
+            mask_do &= mask_d_v[None, :]
+        offs_q = offs_m[:, None] * stride_qm + offs_d_qk[None, :] * stride_qd
+        offs_do = offs_m[:, None] * stride_dom + offs_d_v[None, :] * stride_dod
         K +=  bid * stride_kb + hkid * stride_kh + k_start * stride_kn
         V +=  bid * stride_vb + hkid * stride_vh + k_start * stride_vn
         # If MQA / GQA, set the K and V head offsets appropriately.
@@ -1016,7 +1071,7 @@ def bwd_kernel_noncausal(
                     Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
 
             q = tl.load(Q + adj_q + offs_q, mask=mask_q, other=0.0)
-            do = tl.load(DO + adj_do + offs_do, mask=mask_q, other=0.0)
+            do = tl.load(DO + adj_do + offs_do, mask=mask_do, other=0.0)
             m = tl.load(M + adj_m + offs_m * stride_lse_m,
                         mask=offs_m < seqlen_q)
             m = m[:, None]
@@ -1034,7 +1089,7 @@ def bwd_kernel_noncausal(
             end_n = seqlen_k
             num_steps = tl.cdiv(seqlen_k, BLOCK_N2)
 
-            dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
+            dq = tl.zeros([BLOCK_M2, HEAD_DIM_QK], dtype=tl.float32)
             dq = _bwd_dq_inner(
                 dq,
                 q, K, V, do, m, Delta_ptr, sm_scale,
@@ -1044,7 +1099,7 @@ def bwd_kernel_noncausal(
                 stride_delta_m,
                 seqlen_q, seqlen_k,
                 BLOCK_M2, BLOCK_N2,
-                HEAD_DIM, ACTUAL_HEAD_DIM,
+                HEAD_DIM_QK, HEAD_DIM_V, ACTUAL_HEAD_DIM_QK, ACTUAL_HEAD_DIM_V,
                 dropout_p, philox_seed, batch_philox_offset, dropout_offset,
                 alibi_slope,
                 start_m, start_n, end_n, num_steps,
@@ -1060,7 +1115,7 @@ def bwd_kernel_noncausal(
             )
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
-            offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
+            offs_dq = offs_m[:, None] * stride_dqm + offs_d_qk[None, :] * stride_dqd
             dq *= sm_scale
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
 
@@ -1106,6 +1161,9 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     descale_dq: Optional[torch.Tensor],
     descale_dk: Optional[torch.Tensor],
     descale_dv: Optional[torch.Tensor],
+    # seqused for FA v3
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -1135,13 +1193,13 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
         assert max_seqlen_k is not None, "max_seqlen_k must be provided for varlen layout"
         
         # assert head dimensions
-        assert head_size_q == head_size_k == head_size_v, f"head sizes must match: q={head_size_q}, k={head_size_k}, v={head_size_v}"
+        assert head_size_q == head_size_k, f"head sizes must match: q={head_size_q}, k={head_size_k}"
         assert nheads_k == nheads_v, f"k and v must have same number of heads: k={nheads_k}, v={nheads_v}"
         assert nheads_q % nheads_k == 0, f"nheads_q {nheads_q} must be divisible by nheads_k {nheads_k} for GQA/MQA"
         assert nheads_lse == nheads_q, f"softmax_lse heads {nheads_lse} != q heads {nheads_q}"
         
         # assert output shapes
-        assert o.shape == (total_seqlen_q, nheads_q, head_size_q), f"o shape {o.shape} != expected {(total_seqlen_q, nheads_q, head_size_q)}"
+        assert o.shape == (total_seqlen_q, nheads_q, head_size_v), f"o shape {o.shape} != expected {(total_seqlen_q, nheads_q, head_size_v)}"
         assert do.shape == o.shape, f"do shape {do.shape} != o shape {o.shape}"
         assert dq.shape == q.shape, f"dq shape {dq.shape} != q shape {q.shape}"
         assert dk.shape == k.shape, f"dk shape {dk.shape} != k shape {k.shape}"
@@ -1157,7 +1215,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
         
         # set vars
         batch = len(cu_seqlens_q) - 1
-        head_size = head_size_q
+        head_size_qk = head_size_q
 
         # strides
         stride_qb, stride_qm, stride_qh, stride_qd = 0, q.stride(0), q.stride(1), q.stride(2)
@@ -1180,7 +1238,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
         assert batch_q == batch_k == batch_v, f"batch sizes must match: q={batch_q}, k={batch_k}, v={batch_v}"
         
         # assert head dimensions
-        assert head_size_q == head_size_k == head_size_v, f"head sizes must match: q={head_size_q}, k={head_size_k}, v={head_size_v}"
+        assert head_size_q == head_size_k, f"head sizes must match: q={head_size_q}, k={head_size_k}"
         assert nheads_k == nheads_v, f"k and v must have same number of heads: k={nheads_k}, v={nheads_v}"
         assert nheads_q % nheads_k == 0, f"nheads_q {nheads_q} must be divisible by nheads_k {nheads_k} for GQA/MQA"
         
@@ -1188,7 +1246,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
         assert seqlen_k == seqlen_v, f"k and v sequence lengths must match: k={seqlen_k}, v={seqlen_v}"
         
         # assert output shapes
-        assert o.shape == (batch_q, seqlen_q, nheads_q, head_size_q), f"o shape {o.shape} != expected"
+        assert o.shape == (batch_q, seqlen_q, nheads_q, head_size_v), f"o shape {o.shape} != expected"
         assert do.shape == o.shape, f"do shape {do.shape} != o shape {o.shape}"
         assert dq.shape == q.shape, f"dq shape {dq.shape} != q shape {q.shape}"
         assert dk.shape == k.shape, f"dk shape {dk.shape} != k shape {k.shape}"
@@ -1199,7 +1257,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
 
         # set vars
         batch = batch_q
-        head_size = head_size_q
+        head_size_qk = head_size_q
         max_seqlen_q = seqlen_q
         max_seqlen_k = seqlen_k
 
@@ -1233,6 +1291,9 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
         stride_descale_v_z = descale_v.stride(0) if descale_v is not None else None
         stride_descale_o_z = descale_o.stride(0) if descale_o is not None else None
         stride_descale_do_z = descale_do.stride(0) if descale_do is not None else None
+
+        if DEBUG:
+            print(f"FP8 path triggered in bwd_prefill_fused_no_atomics.py (FP8_OUTPUT={FP8_OUTPUT})")
     else:
         FP8_MAX = None
         FP8_OUTPUT = False
@@ -1242,10 +1303,14 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     use_alibi, (stride_az, stride_ah) = (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
 
     # get closest power of 2 over or equal to 32.
-    padded_d_model = 1 << (head_size - 1).bit_length()
-    padded_d_model = max(padded_d_model, 32)
-    HEAD_DIM = padded_d_model
-    ACTUAL_HEAD_DIM = head_size
+    padded_d_model_qk = 1 << (head_size_qk - 1).bit_length()
+    padded_d_model_qk = max(padded_d_model_qk, 32)
+    padded_d_model_v = 1 << (head_size_v - 1).bit_length()
+    padded_d_model_v = max(padded_d_model_v, 32)
+    HEAD_DIM_QK = padded_d_model_qk
+    HEAD_DIM_V = padded_d_model_v
+    ACTUAL_HEAD_DIM_QK = head_size_qk
+    ACTUAL_HEAD_DIM_V = head_size_v
 
     # init delta
     if OLD_LSE:
@@ -1280,13 +1345,13 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
         stride_descale_do_z,
         cu_seqlens_q, max_seqlen_q,
         descale_do,
-        HEAD_DIM=HEAD_DIM,
-        ACTUAL_HEAD_DIM=ACTUAL_HEAD_DIM,
+        HEAD_DIM_V=HEAD_DIM_V,
+        ACTUAL_HEAD_DIM_V=ACTUAL_HEAD_DIM_V,
         IS_VARLEN=IS_VARLEN,
         IS_FP8=IS_FP8
     )
 
-    if DEBUG:
+    if False:
         print("delta:", delta, delta.shape)
 
     # dropout mask tensor for debugging. We dump the dropout mask created in
@@ -1337,12 +1402,15 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
             stride_az, stride_ah,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
+            seqused_q, seqused_k,  # Pass seqused tensors
             max_seqlen_q, max_seqlen_k,
             dropout_mask, dropout_p, philox_seed, philox_offset,
             alibi_slopes,
             descale_q, descale_k, descale_v, descale_do,
-            HEAD_DIM=HEAD_DIM,
-            ACTUAL_HEAD_DIM=ACTUAL_HEAD_DIM,
+            HEAD_DIM_QK=HEAD_DIM_QK,
+            HEAD_DIM_V=HEAD_DIM_V,
+            ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
+            ACTUAL_HEAD_DIM_V=ACTUAL_HEAD_DIM_V,
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
             USE_ALIBI=use_alibi,
@@ -1350,6 +1418,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
             FP8_OUTPUT=FP8_OUTPUT,
+            USE_SEQUSED=(seqused_q is not None or seqused_k is not None),  # Add flag for seqused
             DEBUG_TRITON=DEBUG_TRITON,
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
@@ -1371,12 +1440,15 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
             stride_az, stride_ah,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
+            seqused_q, seqused_k,  # Pass seqused tensors
             max_seqlen_q, max_seqlen_k,
             dropout_mask, dropout_p, philox_seed, philox_offset,
             alibi_slopes,
             descale_q, descale_k, descale_v, descale_do,
-            HEAD_DIM=HEAD_DIM,
-            ACTUAL_HEAD_DIM=ACTUAL_HEAD_DIM,
+            HEAD_DIM_QK=HEAD_DIM_QK,
+            HEAD_DIM_V=HEAD_DIM_V,
+            ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
+            ACTUAL_HEAD_DIM_V=ACTUAL_HEAD_DIM_V,
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
             USE_ALIBI=use_alibi,
@@ -1384,6 +1456,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
             FP8_OUTPUT=FP8_OUTPUT,
+            USE_SEQUSED=(seqused_q is not None or seqused_k is not None),  # Add flag for seqused
             DEBUG_TRITON=DEBUG_TRITON,
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )

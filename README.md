@@ -183,15 +183,17 @@ WORKDIR /workspace
 # install triton
 RUN pip install triton==3.3.0
 
-# install flash attention
-ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-
-RUN git clone https://github.com/ROCm/flash-attention.git &&\ 
+# build flash attention with triton backend
+RUN git clone https://github.com/Dao-AILab/flash-attention &&\ 
     cd flash-attention &&\
-    python setup.py install
+    FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
 
 # set working dir
 WORKDIR /workspace/flash-attention
+
+# set env variable to use triton backend
+ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+
 ```
 
 To build the docker file

@@ -2,10 +2,8 @@ import torch
 import triton # type: ignore
 import triton.language as tl # type: ignore
 from typing import Literal, Optional
-from .utils import DROPOUT_USE_PYTORCH, DROPOUT_DUMP, compute_fp8_scaling_factors, get_shapes_from_layout, \
+from .utils import DROPOUT_USE_PYTORCH, DROPOUT_DUMP, DEBUG, compute_fp8_scaling_factors, get_shapes_from_layout, \
     get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, is_fp8
-
-DEBUG = False
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
@@ -1092,6 +1090,9 @@ def attention_prefill_backward_triton_split_impl(
     descale_dq: Optional[torch.Tensor],
     descale_dk: Optional[torch.Tensor],
     descale_dv: Optional[torch.Tensor],
+    # seqused for FA v3 (currently ignored in this implementation)
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
 ):
     # debug
     DEBUG_TRITON: bool = False
@@ -1117,6 +1118,9 @@ def attention_prefill_backward_triton_split_impl(
         stride_descale_v_z = descale_v.stride(0) if descale_v is not None else None
         stride_descale_o_z = descale_o.stride(0) if descale_o is not None else None
         stride_descale_do_z = descale_do.stride(0) if descale_do is not None else None
+
+        if DEBUG:
+            print(f"FP8 path triggered in bwd_prefill_split.py (FP8_OUTPUT={FP8_OUTPUT})")
     else:
         FP8_MAX = None
         FP8_OUTPUT = False

@@ -5,7 +5,7 @@ from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
 from .bwd_prefill_fused_atomics import attention_prefill_backward_triton_fused_atomics_impl
 from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_split_fused_no_atomics_impl
 from .fwd_decode import attention_decode_forward_triton_impl
-from .fwd_ref import attention_forward_pytorch_ref_impl, attention_decode_forward_ref_impl
+from .fwd_ref import attention_prefill_forward_ref_impl, attention_decode_forward_ref_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
 from .utils import DEBUG, USE_REF, MetaData, is_fp8
 from einops import rearrange, repeat
@@ -31,8 +31,7 @@ def fwd(q: torch.Tensor,
         gen_: Optional[torch.Tensor] = None,
         descale_q: Optional[torch.Tensor] = None,
         descale_k: Optional[torch.Tensor] = None,
-        descale_v: Optional[torch.Tensor] = None,
-        descale_o: Optional[torch.Tensor] = None
+        descale_v: Optional[torch.Tensor] = None
     ):
 
     if DEBUG:
@@ -53,11 +52,12 @@ def fwd(q: torch.Tensor,
         print("descale_q:", descale_q, descale_q.shape if descale_q is not None else None)
         print("descale_k:", descale_k, descale_k.shape if descale_k is not None else None)
         print("descale_v:", descale_v, descale_v.shape if descale_v is not None else None)
-        print("descale_o:", descale_o, descale_o.shape if descale_o is not None else None)
 
     if is_fp8(q):
         assert out is not None, "fp8 output tensor should be passed in."
-        assert (descale_q is not None) and (descale_k is not None) and (descale_v is not None), f"For fp8, you need to pass descale factors for q, k and v"
+        if (descale_q is None) or (descale_k is None) or (descale_v is None):
+            import warnings
+            warnings.warn("FP8 tensors detected but descale factors not provided. Using default scale of 1.0", UserWarning)
     else:
         out = torch.zeros_like(q) if out is None else out.zero_()
 
@@ -93,7 +93,7 @@ def fwd(q: torch.Tensor,
     if USE_REF:
         if DEBUG:
             print("Using reference implementation")
-        softmax_lse_ref, sd_mask_ref = attention_forward_pytorch_ref_impl(
+        softmax_lse_ref, sd_mask_ref = attention_prefill_forward_ref_impl(
                                                 q,
                                                 k,
                                                 v,
@@ -140,16 +140,13 @@ def fwd(q: torch.Tensor,
                                                 USE_EXP2,
                                                 descale_q,
                                                 descale_k,
-                                                descale_v,
-                                                descale_o)
+                                                descale_v)
         softmax_lse=softmax_lse_triton
         sd_mask=sd_mask_triton
 
     if DEBUG:
         print("flash_attn_triton_amd.py::fwd outputs")
         print("o:", out, out.shape)
-        if is_fp8(out):
-            print("descale_o:", descale_o, descale_o.shape if descale_o is not None else None)
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
         print("sd_mask:", sd_mask, sd_mask.shape if sd_mask is not None else None )
         print("rng_state:", rng_state)
@@ -405,8 +402,7 @@ def varlen_fwd(
         gen_: Optional[torch.Tensor] = None,
         descale_q: Optional[torch.Tensor] = None,
         descale_k: Optional[torch.Tensor] = None,
-        descale_v: Optional[torch.Tensor] = None,
-        descale_o: Optional[torch.Tensor] = None
+        descale_v: Optional[torch.Tensor] = None
     ):
 
     if DEBUG:
@@ -432,7 +428,9 @@ def varlen_fwd(
 
     if is_fp8(q):
         assert out is not None, "fp8 output tensor should be passed in."
-        assert (descale_q is not None) and (descale_k is not None) and (descale_v is not None), f"For fp8, you need to pass descale factors for q, k and v"
+        if (descale_q is None) or (descale_k is None) or (descale_v is None):
+            import warnings
+            warnings.warn("FP8 tensors detected but descale factors not provided. Using default scale of 1.0", UserWarning)
     else:
         out = torch.zeros_like(q) if out is None else out.zero_()
 
@@ -468,7 +466,7 @@ def varlen_fwd(
     if USE_REF:
         if DEBUG:
             print("Using reference implementation")
-        softmax_lse_ref, sd_mask_ref = attention_forward_pytorch_ref_impl(
+        softmax_lse_ref, sd_mask_ref = attention_prefill_forward_ref_impl(
                                                 q,
                                                 k,
                                                 v,
@@ -515,8 +513,7 @@ def varlen_fwd(
                                                             USE_EXP2,
                                                             descale_q,
                                                             descale_k,
-                                                            descale_v,
-                                                            descale_o)
+                                                            descale_v)
         softmax_lse=softmax_lse_triton
         sd_mask=sd_mask_triton
 
@@ -899,6 +896,7 @@ def fwd_kvcache(
                 metadata.layout,
                 metadata.cache_seqlens,
                 metadata.cache_batch_idx,
+                block_table,
             )
         softmax_lse=softmax_lse_ref
     else:
@@ -919,6 +917,7 @@ def fwd_kvcache(
             metadata.layout,
             metadata.cache_seqlens,
             metadata.cache_batch_idx,
+            block_table,
         )
         softmax_lse = softmax_lse_triton
     

@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-from flash_attn.flash_attn_triton_amd.utils import compute_fp8_scaling_factors
+from flash_attn.flash_attn_triton_amd.utils import compute_fp8_scaling_factors, DEBUG, is_fp8
 
 from typing import Optional, Tuple
 
@@ -1503,11 +1503,17 @@ def attention_prefill_backward_triton_fused_atomics_impl(
     descale_v: Optional[torch.Tensor] = None,
     descale_do: Optional[torch.Tensor] = None,
     fused: bool = False,
+    # seqused for FA v3 (currently ignored in this implementation)
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
 ):
     IS_FP8 = is_fp8(q)
     if IS_FP8:
         FP8_MAX = torch.finfo(q.dtype).max
         descale_strides = (descale_q.stride(0),descale_k.stride(0),descale_v.stride(0),descale_do.stride(0) )
+        
+        if DEBUG:
+            print(f"FP8 path triggered in bwd_prefill_fused_atomics.py")
     else:
         FP8_MAX = None
         stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = stride_descale_do_z = None

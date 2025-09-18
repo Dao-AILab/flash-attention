@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional, Union
-from .utils import AUTOTUNE, get_padded_headsize, get_shape_and_strides_from_layout, is_cdna
+from .utils import AUTOTUNE, get_padded_headsize, get_shape_and_strides_from_layout, is_cdna, is_fp8
 
 DEBUG = False
 
@@ -59,6 +59,118 @@ def get_autotune_configs():
 
 (fwd_auto_tune_configs, fwd_autotune_keys), (reduce_auto_tune_configs, reduce_autotune_keys) = get_autotune_configs()
 
+@triton.jit
+def _attn_fwd_inner(
+    q, kT, v, pos, col_mask,
+    m_i, l_i, acc,
+    pid_m,
+    q_descale, k_descale, v_descale,  # FP8 scaling factors
+    IS_FP8: tl.constexpr,  # FP8 flag
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    N_CTX_Q: tl.constexpr,
+    N_CTX_K_FINAL: tl.constexpr,
+    USE_ALIBI: tl.constexpr,
+    alibi_slope,
+    USE_SLIDING_WINDOW: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    WINDOW_SIZE_LEFT: tl.constexpr,
+    WINDOW_SIZE_RIGHT: tl.constexpr,
+    APPLY_COL_MASK: tl.constexpr,  # apply provided col_mask when True
+):
+    # -- compute qk ---
+    qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    if IS_FP8:
+        qk += (tl.dot(q, kT) * q_descale * k_descale)  # Apply FP8 scaling
+    else:
+        qk += tl.dot(q, kT)  # noqa: F821
+
+    if USE_ALIBI:
+        row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        col_idx = pos + tl.arange(0, BLOCK_N)
+        
+        # Compute relative positions
+        relative_pos = row_idx[:, None] + N_CTX_K_FINAL - (N_CTX_Q + col_idx[None, :])
+        relative_pos = tl.abs(relative_pos)
+        
+        # Compute ALiBi bias
+        alibi_bias = -1 * alibi_slope * relative_pos
+        qk += (alibi_bias * 1.44269504)
+
+    # ------------------------------------------------------------------
+    # masking
+    # ------------------------------------------------------------------
+    if USE_SLIDING_WINDOW:
+        row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)        # q positions
+        col_idx = pos + tl.arange(0, BLOCK_N)                    # k positions
+        row = row_idx[:, None]                                   # [M,1]
+        col = col_idx[None, :]                                   # [1,N]
+
+        if IS_CAUSAL:
+            # -------- causal + window --------
+            diag      = N_CTX_K_FINAL - N_CTX_Q                  # sk-sq
+            causal_ok = col <= row + diag
+            if WINDOW_SIZE_LEFT < 0:                             # only right window
+                win_ok = col <= row + diag + WINDOW_SIZE_RIGHT
+            else:                                                # both sides
+                win_ok = ((col >= row + diag - WINDOW_SIZE_LEFT) &
+                            (col <= row + diag + WINDOW_SIZE_RIGHT))
+            mask = ~(causal_ok & win_ok)                         # True ⇒ -inf
+        else:
+            # -------- non-causal window --------
+            sk, sq = N_CTX_K_FINAL, N_CTX_Q
+            if WINDOW_SIZE_LEFT < 0:
+                mask = col > row + (sk - sq) + WINDOW_SIZE_RIGHT
+            else:
+                right = tl.minimum(row + (sk - sq) + WINDOW_SIZE_RIGHT, sk)
+                left  = row + (sk - sq) - WINDOW_SIZE_LEFT
+                mask  = (col > right) | (col < left)
+        qk = tl.where(mask, float("-inf"), qk)
+    else:
+        if IS_CAUSAL:
+            row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            col_idx = pos + tl.arange(0, BLOCK_N)
+
+            # create a N_CTX_Q x kv_len causal mask
+            col_offset = N_CTX_K_FINAL - N_CTX_Q
+            causal_mask = row_idx[:, None] >= (col_idx[None, :] - col_offset)
+
+            # Apply the mask
+            qk = tl.where(causal_mask, qk, float("-inf"))
+
+    # Column mask (tail / variable-length). Instead of recomputing an arange each time,
+    # we accept a precomputed mask from the caller (col_valid_mask).
+    if APPLY_COL_MASK:
+        # Expect col_mask shape: [BLOCK_N]. True where column is within sequence.
+        qk = tl.where(col_mask[None, :], qk, float("-inf"))
+
+    m_i_new = tl.maximum(m_i, tl.max(qk, 1))           # per-row max so far
+
+    # rows that are *all* -inf after masking
+    valid   = m_i_new > float("-inf")
+
+    # scale previous partial sums safely
+    alpha   = tl.where(valid, tl.math.exp2(m_i - m_i_new), 0.0)
+
+    # subtract the row max only on valid rows
+    qk      = tl.where(valid[:, None], qk - m_i_new[:, None], float("-inf"))
+    p = tl.math.exp2(qk)
+
+    # -- update m_i and l_i --
+    l_i = l_i * alpha + tl.sum(p, 1)
+    m_i = m_i_new
+    p = p.to(q.dtype)
+
+    # -- scale and update acc --
+    acc *= alpha[:, None]
+    if IS_FP8:
+        acc += tl.dot(p.to(v.dtype), v) * v_descale  # Apply FP8 scaling for V
+    else:
+        acc += tl.dot(p.to(v.dtype), v)
+    
+    return m_i, l_i, acc
+
+
 # @triton.autotune(
 #     configs=fwd_auto_tune_configs,
 #     key=fwd_autotune_keys,
@@ -69,6 +181,9 @@ def _fwd_kernel_splitK(
     Q,
     K,
     V,
+    Q_Descale,  # FP8 descale factors for Q
+    K_Descale,  # FP8 descale factors for K
+    V_Descale,  # FP8 descale factors for V
     sm_scale,
     Out_splitK,  # [B*H*G, split_k, Mq, K]
     Metadata,  # [B*H*G, 2, split_k, M_ceil] contains [mi, li]
@@ -76,6 +191,7 @@ def _fwd_kernel_splitK(
     V_new,
     Cache_seqlens,
     Cache_batch_idx,
+    Block_table,
     Alibi_slopes,
     stride_qz,
     stride_qm,
@@ -110,13 +226,22 @@ def _fwd_kernel_splitK(
     stride_vn_g,
     stride_vn_h,
     stride_vn_d,
+    stride_bt_b,
+    stride_bt_s,
     stride_az, 
     stride_ah,
+    stride_q_descale_z,  # FP8 descale strides
+    stride_q_descale_h,
+    stride_k_descale_z,
+    stride_k_descale_h,
+    stride_v_descale_z,
+    stride_v_descale_h,
     Z,
     N_CTX_Q,
     N_CTX_K,
     N_CTX_NEW,
     BLOCK_N_PER_SPLIT,
+    BLOCK_SIZE_K: tl.constexpr,
     H_q: tl.constexpr,
     H_kv: tl.constexpr,
     G_q: tl.constexpr,
@@ -136,6 +261,8 @@ def _fwd_kernel_splitK(
     USE_SLIDING_WINDOW: tl.constexpr,
     WINDOW_SIZE_LEFT: tl.constexpr,
     WINDOW_SIZE_RIGHT: tl.constexpr,
+    USE_BLOCK_TABLE: tl.constexpr,
+    IS_FP8: tl.constexpr,  # FP8 flag
 ):
     # get program ids
     pid_m = tl.program_id(0)
@@ -155,14 +282,24 @@ def _fwd_kernel_splitK(
         hk_id = hq_id
         hv_id = hq_id
 
+    # Load FP8 descale factors if needed
+    if IS_FP8:
+        if IS_GQA:
+            # For MQA/GQA, q_descale uses the same indexing as k/v (hk_id)
+            q_descale = tl.load(Q_Descale + z_id * stride_q_descale_z + hk_id * stride_q_descale_h)
+        else:
+            # For MHA, q_descale uses hq_id
+            q_descale = tl.load(Q_Descale + z_id * stride_q_descale_z + hq_id * stride_q_descale_h)
+        k_descale = tl.load(K_Descale + z_id * stride_k_descale_z + hk_id * stride_k_descale_h)
+        v_descale = tl.load(V_Descale + z_id * stride_v_descale_z + hv_id * stride_v_descale_h)
+    else:
+        q_descale, k_descale, v_descale = 1.0, 1.0, 1.0
+
     # figure out seqlens
     lo = pid_splitk * BLOCK_N_PER_SPLIT
     if USE_CACHE_SEQLENs:
         cache_seqlen_last_idx = tl.load(Cache_seqlens + z_id)
-        if NEW_KV:
-            N_CTX_K_FINAL = cache_seqlen_last_idx + N_CTX_NEW
-        else:
-            N_CTX_K_FINAL = cache_seqlen_last_idx
+        N_CTX_K_FINAL = cache_seqlen_last_idx
     else:
         N_CTX_K_FINAL = N_CTX_K
     hi = tl.minimum((pid_splitk + 1) * BLOCK_N_PER_SPLIT, N_CTX_K_FINAL)
@@ -181,8 +318,15 @@ def _fwd_kernel_splitK(
     # compute ptrs
     q_offset = Q + hq_id * stride_qh + z_id * stride_qz + g_id * stride_qg
     q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    k_offset = K + hk_id * stride_kh + cache_batch_idx * stride_kz + g_id * stride_kg
-    v_offset = V + hv_id * stride_vh + cache_batch_idx * stride_vz + g_id * stride_vg
+    
+    # Handle block table for paged attention
+    if USE_BLOCK_TABLE:
+        # K and V now point to paged cache
+        # Each batch has its own block table row
+        block_table_ptr = Block_table + z_id * stride_bt_b
+    else:
+        k_offset = K + hk_id * stride_kh + cache_batch_idx * stride_kz + g_id * stride_kg
+        v_offset = V + hv_id * stride_vh + cache_batch_idx * stride_vz + g_id * stride_vg
 
     # compute masks
     if PADDED_HEAD:
@@ -212,160 +356,122 @@ def _fwd_kernel_splitK(
     else:
         alibi_slope = None
 
-    # Copy new Keys and Values into Cache
-    if NEW_KV:
-        knew_base = K_new + hk_id * stride_kn_h + z_id * stride_kn_z + g_id * stride_kn_g
-        
-        # Determine the starting position for new data in the cache
-        if USE_CACHE_SEQLENs:
-            start_idx = tl.load(Cache_seqlens + z_id)
-        else:
-            start_idx = N_CTX_K - N_CTX_NEW
-
-        # Copy new Keys
-        for i in range(0, N_CTX_NEW, BLOCK_N):
-            # Load from K_new
-            k_new_block = tl.load(
-                knew_base +
-                tl.arange(0, BLOCK_DMODEL)[:, None] * stride_kn_d +
-                (tl.arange(0, BLOCK_N) + i)[None, :] * stride_kn_n,
-                 mask=(tl.arange(0, BLOCK_N)[None, :] + i < N_CTX_NEW) &
-                     (tl.arange(0, BLOCK_DMODEL)[:, None] < ACTUAL_BLOCK_DMODEL),
-                other=0
-            )
-            
-            # Store to K
-            tl.store(
-                k_offset +
-                tl.arange(0, BLOCK_DMODEL)[:, None] * stride_kd +
-                (tl.arange(0, BLOCK_N) + i + start_idx)[None, :] * stride_kn,
-                k_new_block,
-                 mask=(tl.arange(0, BLOCK_N)[None, :] + i < N_CTX_NEW) &
-                     (tl.arange(0, BLOCK_DMODEL)[:, None] < ACTUAL_BLOCK_DMODEL),
-            )
-
-        # Copy new Values
-        vnew_base = V_new + hv_id * stride_vn_h + z_id * stride_vn_z + g_id * stride_vn_g
-        for i in range(0, N_CTX_NEW, BLOCK_N):
-            # Load from V_new
-            v_new_block = tl.load(
-                vnew_base +
-                (tl.arange(0, BLOCK_N) + i)[:, None] * stride_vn_n +
-                tl.arange(0, BLOCK_DMODEL)[None, :] * stride_vn_d,
-                mask=(tl.arange(0, BLOCK_N)[:, None] + i < N_CTX_NEW) &
-                     (tl.arange(0, BLOCK_DMODEL)[None, :] < ACTUAL_BLOCK_DMODEL),
-                other=0
-            )
-            
-            # Store to V
-            tl.store(
-                v_offset + 
-                (tl.arange(0, BLOCK_N) + i + start_idx)[:, None] * stride_vn +
-                tl.arange(0, BLOCK_DMODEL)[None, :] * stride_vd,
-                v_new_block,
-                 mask=(tl.arange(0, BLOCK_N)[:, None] + i < N_CTX_NEW) &
-                     (tl.arange(0, BLOCK_DMODEL)[None, :] < ACTUAL_BLOCK_DMODEL),
-            )
-
-
     # initialize pointer to m and l
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)  # noqa: F821
 
-
     # loop over k, v and update accumulator
-    for start_n in range(lo, hi, BLOCK_N):
-        kT_ptrs = k_offset + offs_d[:, None] * stride_kd + (start_n + offs_n)[None, :] * stride_kn
-        V_ptrs = v_offset + (start_n + offs_n)[:, None] * stride_vn + offs_d[None, :] * stride_vd
-
-        # load k
-        kT = tl.load(kT_ptrs, mask=kT_mask, other=0.0)
-        v = tl.load(V_ptrs, mask=v_mask, other=0.0)
-
-        # -- compute qk ---
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, kT)  # noqa: F821
-
-        if USE_ALIBI:
-            row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            col_idx = start_n + tl.arange(0, BLOCK_N)
+    if USE_BLOCK_TABLE:
+        # Paged attention: process all KV blocks from cache
+        # Note: Cache should be updated externally before calling this kernel
+        num_kv_blocks = (N_CTX_K_FINAL + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+        
+        for block_idx in range(num_kv_blocks):
+            # Calculate sequence range for this block
+            block_start = block_idx * BLOCK_SIZE_K
+            block_end = tl.minimum(block_start + BLOCK_SIZE_K, N_CTX_K_FINAL)
             
-            # Compute relative positions
-            relative_pos = row_idx[:, None] + N_CTX_K_FINAL - (N_CTX_Q + col_idx[None, :])
-            relative_pos = tl.abs(relative_pos)
-            
-            # Compute ALiBi bias
-            alibi_bias = -1 * alibi_slope * relative_pos
-            qk += (alibi_bias * 1.44269504)
-
-        # ------------------------------------------------------------------
-        # masking
-        # ------------------------------------------------------------------
-        if USE_SLIDING_WINDOW:
-            row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)        # q positions
-            col_idx = start_n + tl.arange(0, BLOCK_N)                # k positions
-            row = row_idx[:, None]                                   # [M,1]
-            col = col_idx[None, :]                                   # [1,N]
-    
-            if IS_CAUSAL:
-                # -------- causal + window --------
-                diag      = N_CTX_K_FINAL - N_CTX_Q                  # sk-sq
-                causal_ok = col <= row + diag
-                if WINDOW_SIZE_LEFT < 0:                             # only right window
-                    win_ok = col <= row + diag + WINDOW_SIZE_RIGHT
-                else:                                                # both sides
-                    win_ok = ((col >= row + diag - WINDOW_SIZE_LEFT) &
-                                (col <= row + diag + WINDOW_SIZE_RIGHT))
-                mask = ~(causal_ok & win_ok)                         # True ⇒ -inf
-            else:
-                # -------- non-causal window --------
-                sk, sq = N_CTX_K_FINAL, N_CTX_Q
-                if WINDOW_SIZE_LEFT < 0:
-                    mask = col > row + (sk - sq) + WINDOW_SIZE_RIGHT
+            # Check if block overlaps with our split-k range [lo, hi)
+            if block_end > lo and block_start < hi:
+                # Load physical block number
+                physical_block = tl.load(block_table_ptr + block_idx * stride_bt_s)
+                
+                # Calculate the range within this block that overlaps with [lo, hi)
+                process_start = tl.maximum(lo - block_start, 0)
+                process_end = tl.minimum(hi - block_start, BLOCK_SIZE_K)
+                process_end = tl.minimum(process_end, block_end - block_start)
+                
+                # Instead of forcing a floor alignment to BLOCK_N (which can still skip
+                # part of the intended range if start falls mid-tile for small splits),
+                # start from the raw (possibly unaligned) process_start rounded *down* but
+                # allow the loop to begin earlier (at most BLOCK_N before) so that any
+                # partial tile overlapping [lo, hi) is covered. Masking below will remove
+                # columns < lo or >= hi ensuring numerically identical coverage without
+                # duplication.
+                aligned_start = (process_start // BLOCK_N) * BLOCK_N
+                if aligned_start > 0 and aligned_start + BLOCK_N > process_start:
+                    # ensure we include the tile that contains process_start
+                    process_start = aligned_start
                 else:
-                    right = tl.minimum(row + (sk - sq) + WINDOW_SIZE_RIGHT, sk)
-                    left  = row + (sk - sq) - WINDOW_SIZE_LEFT
-                    mask  = (col > right) | (col < left)
-            qk = tl.where(mask, float("-inf"), qk)
-        else:
-            if IS_CAUSAL:
-                row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-                col_idx = start_n + tl.arange(0, BLOCK_N)
+                    process_start = aligned_start
+                
+                for offset in range(process_start, process_end, BLOCK_N):
+                    # Current position (may begin slightly before logical split range; masking fixes it)
+                    pos = block_start + offset
+                    # Proceed unconditionally; masking below enforces [lo, hi)
+                    # Calculate base addresses for K and V in this physical block
+                    k_base = K + physical_block * BLOCK_SIZE_K * stride_kn + hk_id * stride_kh + g_id * stride_kg
+                    v_base = V + physical_block * BLOCK_SIZE_K * stride_vn + hv_id * stride_vh + g_id * stride_vg
+                    
+                    # Offsets within the current block
+                    block_offs = offset + offs_n
+                    
+                    # Masks for valid data respecting:
+                    #   (1) global key length (seq_mask)
+                    #   (2) block bounds (block_mask)
+                    #   (3) current split range [lo, hi)
+                    seq_mask = ((pos + offs_n) < N_CTX_K_FINAL)
+                    block_mask = (block_offs < BLOCK_SIZE_K)
+                    end_mask = (block_offs < process_end)
+                    split_mask = ((pos + offs_n) >= lo) & ((pos + offs_n) < hi)
+                    col_mask = seq_mask & block_mask & end_mask & split_mask
+                    
+                    # Apply masks
+                    kT_mask_final = kT_mask & col_mask[None, :]
+                    v_mask_final = v_mask & col_mask[:, None]
+                    
+                    # Load K and V
+                    kT_ptrs = k_base + offs_d[:, None] * stride_kd + block_offs[None, :] * stride_kn
+                    v_ptrs = v_base + block_offs[:, None] * stride_vn + offs_d[None, :] * stride_vd
+                    
+                    kT = tl.load(kT_ptrs, mask=kT_mask_final, other=0.0)
+                    v = tl.load(v_ptrs, mask=v_mask_final, other=0.0)
+                    
+                    # Unified inner function handles both paged and contiguous
+                    m_i, l_i, acc = _attn_fwd_inner(
+                        q, kT, v, pos, col_mask,
+                        m_i, l_i, acc,
+                        pid_m,
+                        q_descale, k_descale, v_descale,
+                        IS_FP8,
+                        BLOCK_M, BLOCK_N,
+                        N_CTX_Q, N_CTX_K_FINAL,
+                        USE_ALIBI, alibi_slope,
+                        USE_SLIDING_WINDOW, IS_CAUSAL,
+                        WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT,
+                        True,
+                    )
+    else:
+        # Non-paged attention: process KV from cache
+        # Note: Cache should be updated externally before calling this kernel
+        # loop over k, v and update accumulator
+        for start_n in range(lo, hi, BLOCK_N):
+            kT_ptrs = k_offset + offs_d[:, None] * stride_kd + (start_n + offs_n)[None, :] * stride_kn
+            V_ptrs = v_offset + (start_n + offs_n)[:, None] * stride_vn + offs_d[None, :] * stride_vd
 
-                # create a N_CTX_Q x kv_len causal mask
-                col_offset = N_CTX_Q - N_CTX_K_FINAL
-                causal_mask = row_idx[:, None] >= (col_offset + col_idx[None, :])
+            # load k
+            kT = tl.load(kT_ptrs, mask=kT_mask, other=0.0)
+            v = tl.load(V_ptrs, mask=v_mask, other=0.0)
 
-                # Apply the mask
-                qk = tl.where(causal_mask, qk, float("-inf"))
+            # Use the same inner loop logic
+            # Precompute column validity mask for this tile (all True for full tiles).
+            # hi is the upper bound of the overall split range; start_n marks this tile's base.
+            col_valid_mask = offs_n < (hi - start_n)
 
-        # TODO: This is slow, and only needed at the last iteration.
-        # Maybe we can unroll the last iteration instead?
-        if BOUNDS_CHECKS_N:
-            qk = tl.where(tl.arange(0, BLOCK_N) < hi - start_n, qk, float("-inf"))
-
-        m_i_new = tl.maximum(m_i, tl.max(qk, 1))           # per-row max so far
-
-        # rows that are *all* -inf after masking
-        valid   = m_i_new > float("-inf")
-
-        # scale previous partial sums safely
-        alpha   = tl.where(valid, tl.math.exp2(m_i - m_i_new), 0.0)
-
-        # subtract the row max only on valid rows
-        qk      = tl.where(valid[:, None], qk - m_i_new[:, None], float("-inf"))
-        p = tl.math.exp2(qk)
-
-        # -- update m_i and l_i --
-        l_i = l_i * alpha + tl.sum(p, 1)
-        m_i = m_i_new
-        p = p.to(Q.dtype.element_ty)
-
-        # -- scale and update acc --
-        acc *= alpha[:, None]
-        acc += tl.dot(p.to(v.dtype), v)
+            m_i, l_i, acc = _attn_fwd_inner(
+                q, kT, v, start_n, col_valid_mask,
+                m_i, l_i, acc,
+                pid_m,
+                q_descale, k_descale, v_descale,
+                IS_FP8,
+                BLOCK_M, BLOCK_N,
+                N_CTX_Q, N_CTX_K_FINAL,
+                USE_ALIBI, alibi_slope,
+                USE_SLIDING_WINDOW, IS_CAUSAL,
+                WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT,
+                BOUNDS_CHECKS_N,
+            )
 
     # write back O
     osk_offset = Out_splitK + pid_zhg * stride_osk_zhg + pid_splitk * stride_osk_s
@@ -598,7 +704,71 @@ def attention_decode_forward_triton_impl(
         layout: Literal["bshd"], 
         cache_seqlens: Optional[torch.Tensor], 
         cache_batch_idx: Optional[torch.Tensor],
+        block_table: Optional[torch.Tensor] = None,
+        q_descale: Optional[torch.Tensor] = None,
+        k_descale: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None,
 ):
+    # handle cache updates
+    if k_new is not None and v_new is not None:
+        # Update cache with new KV values
+        if block_table is None:
+            # Non-paged attention: update cache directly
+            batch_size = k_new.shape[0]
+            seqlen_new = k_new.shape[1]
+            
+            if cache_seqlens is not None:
+                # Use cache_seqlens to determine where to insert new KV
+                for b in range(batch_size):
+                    start_idx = int(cache_seqlens[b].item())
+                    end_idx = start_idx + seqlen_new
+                    k_cache[b, start_idx:end_idx] = k_new[b]
+                    v_cache[b, start_idx:end_idx] = v_new[b]
+                    cache_seqlens[b] = end_idx
+            else:
+                # Append at the end of existing cache
+                seqlen_cache = k_cache.shape[1]
+                k_cache[:, seqlen_cache - seqlen_new:] = k_new
+                v_cache[:, seqlen_cache - seqlen_new:] = v_new
+        else:
+            # Paged attention: update cache using block table
+            batch_size = k_new.shape[0]
+            seqlen_new = k_new.shape[1]
+            block_size = k_cache.shape[1]  # k_cache shape: [num_blocks, block_size, nheads, head_dim]
+            
+            # Update cache for each batch element
+            for b in range(batch_size):
+                if cache_seqlens is not None:
+                    start_idx = int(cache_seqlens[b].item())
+                else:
+                    # If no cache_seqlens, assume we're appending at the end
+                    # Find the last used position from block table
+                    start_idx = 0
+                    for block_idx in range(block_table.shape[1]):
+                        if block_table[b, block_idx] >= 0:
+                            start_idx = (block_idx + 1) * block_size
+                        else:
+                            start_idx = block_idx * block_size
+                            break
+                
+                # Copy new KV values into the paged cache
+                for i in range(seqlen_new):
+                    pos = start_idx + i
+                    block_idx = pos // block_size
+                    within_block_idx = pos % block_size
+                    
+                    # Get the physical block number from block table
+                    if block_idx < block_table.shape[1]:
+                        physical_block = int(block_table[b, block_idx].item())
+                        
+                        # Update k_cache and v_cache at the physical block location
+                        k_cache[physical_block, within_block_idx] = k_new[b, i]
+                        v_cache[physical_block, within_block_idx] = v_new[b, i]
+                
+                # Update cache_seqlens if provided
+                if cache_seqlens is not None:
+                    cache_seqlens[b] = start_idx + seqlen_new
+    
     # triton configs
     BLOCK_M = 16
     BLOCK_N = 64
@@ -607,17 +777,45 @@ def attention_decode_forward_triton_impl(
     num_warps_reduce = 4
         
     # kernel_configs
-    is_new_kv = True if k_new is not None and v_new is not None else False
+    is_new_kv = False  # Cache has been updated, so no new KV in kernel
     use_alibi, (stride_az, stride_ah) = True if alibi_slopes is not None else False,  alibi_slopes.stride() if alibi_slopes is not None else (None, None)
     use_cache_seqlens = cache_seqlens is not None
     use_sliding_window = window_size_left != -1 or window_size_right != -1
+    use_block_table = block_table is not None
     SPLIT_K = None
     NUM_QUANT_GROUPS = 1
 
     # get shapes and strides
     (batch_size, seqlen_q, nheads_q, dim_q), (stride_qz, stride_qh, stride_qm, stride_qd) = get_shape_and_strides_from_layout(q, layout)
-    (_, seqlen_kc, nheads_kc, dim_kc), (stride_kc_z, stride_kc_h, stride_kc_n, stride_kc_d) = get_shape_and_strides_from_layout(k_cache, layout)
-    (_, seqlen_vc, nheads_vc, dim_vc), (stride_vc_z, stride_vc_h, stride_vc_n, stride_vc_d) = get_shape_and_strides_from_layout(v_cache, layout)
+    
+    # Handle paged KV cache layout
+    if use_block_table:
+        # For paged attention, k_cache and v_cache have shape [num_blocks, block_size, nheads, head_dim]
+        num_blocks_kc, block_size_k, nheads_kc, dim_kc = k_cache.shape
+        num_blocks_vc, block_size_v, nheads_vc, dim_vc = v_cache.shape
+        # Get the actual sequence length from cache_seqlens or block_table
+        if cache_seqlens is not None:
+            seqlen_kc = int(cache_seqlens.max().item())
+        else:
+            # Infer from block_table shape [batch_size, num_blocks_per_seq]
+            num_blocks_per_seq = block_table.shape[1]
+            seqlen_kc = num_blocks_per_seq * block_size_k
+        seqlen_vc = seqlen_kc
+        
+        # Strides for paged layout
+        stride_kc_z = 0  # No batch dimension in paged cache
+        stride_kc_n = k_cache.stride(1)  # Sequence stride
+        stride_kc_h = k_cache.stride(2)  # Head stride
+        stride_kc_d = k_cache.stride(3)  # Dim stride
+        
+        stride_vc_z = 0
+        stride_vc_n = v_cache.stride(1)
+        stride_vc_h = v_cache.stride(2)
+        stride_vc_d = v_cache.stride(3)
+    else:
+        (_, seqlen_kc, nheads_kc, dim_kc), (stride_kc_z, stride_kc_h, stride_kc_n, stride_kc_d) = get_shape_and_strides_from_layout(k_cache, layout)
+        (_, seqlen_vc, nheads_vc, dim_vc), (stride_vc_z, stride_vc_h, stride_vc_n, stride_vc_d) = get_shape_and_strides_from_layout(v_cache, layout)
+        block_size_k = 0  # Not used
     if is_new_kv:
         ( _, seqlen_kn, nheads_kn, dim_kn), (stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d) = get_shape_and_strides_from_layout(k_new, layout)
         (_, seqlen_vn, nheads_vn, dim_vn), (stride_vn_z, stride_vn_h, stride_vn_n, stride_vn_d) = get_shape_and_strides_from_layout(v_new, layout)
@@ -657,7 +855,12 @@ def attention_decode_forward_triton_impl(
         split_k = SPLIT_K
     else:
         # Use heuristics
-        split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, seqlen_kc) # NOTE: should the split think about seqlens?
+        if use_block_table:
+            # For paged attention, use the actual sequence length from cache_seqlens
+            max_seqlen = int(cache_seqlens.max().item()) if cache_seqlens is not None else block_size_k
+            split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, max_seqlen)
+        else:
+            split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, seqlen_kc)
     split_size = (seqlen_kc + split_k - 1) // split_k
 
     # setup grid
@@ -673,6 +876,39 @@ def attention_decode_forward_triton_impl(
     stride_osk_zhg, stride_osk_s, stride_osk_m, stride_osk_d = out_splitk.stride()
     stride_mzhg, stride_m2, stride_ms, stride_mm = metadata.stride()
     stride_lse_zhg, stride_lse_m = lse.stride()
+    
+    # Block table strides
+    if use_block_table:
+        stride_bt_b, stride_bt_s = block_table.stride()
+    else:
+        stride_bt_b, stride_bt_s = 0, 0
+    
+    # FP8 support
+    IS_FP8 = is_fp8(q)
+    if IS_FP8:
+        if (q_descale is None) or (k_descale is None) or (v_descale is None):
+            import warnings
+            warnings.warn("FP8 tensors detected but descale factors not provided. Using default scale of 1.0", UserWarning)
+            # Create default descale tensors if not provided
+            if q_descale is None:
+                q_descale = torch.ones(batch_size, nheads_q, dtype=torch.float32, device=q.device)
+            if k_descale is None:
+                k_descale = torch.ones(batch_size, nheads_kc, dtype=torch.float32, device=q.device)
+            if v_descale is None:
+                v_descale = torch.ones(batch_size, nheads_vc, dtype=torch.float32, device=q.device)
+        stride_q_descale_z, stride_q_descale_h = q_descale.stride()
+        stride_k_descale_z, stride_k_descale_h = k_descale.stride()
+        stride_v_descale_z, stride_v_descale_h = v_descale.stride()
+    else:
+        q_descale = None
+        k_descale = None
+        v_descale = None
+        stride_q_descale_z = 0
+        stride_q_descale_h = 0
+        stride_k_descale_z = 0
+        stride_k_descale_h = 0
+        stride_v_descale_z = 0
+        stride_v_descale_h = 0
 
     if DEBUG:
         print("batch_size, seqlen_q, nheads_q, dim_q", (batch_size, seqlen_q, nheads_q, dim_q))
@@ -689,18 +925,21 @@ def attention_decode_forward_triton_impl(
         print("stride_mzhg, stride_m2, stride_ms, stride_mm", (stride_mzhg, stride_m2, stride_ms, stride_mm))
         print("stride_lse_zhg, stride_lse_m", (stride_lse_zhg, stride_lse_m))
 
-    # TODO: enable quantization
     _fwd_kernel_splitK[grid](
         Q=q,
         K=k_cache,
         V=v_cache,
+        Q_Descale=q_descale,
+        K_Descale=k_descale,
+        V_Descale=v_descale,
         sm_scale=sm_scale,
         Out_splitK=out_splitk,
         Metadata=metadata,
-        K_new=k_new,
-        V_new=v_new,
+        K_new=None,
+        V_new=None,
         Cache_seqlens=cache_seqlens,
         Cache_batch_idx=cache_batch_idx,
+        Block_table=block_table,
         Alibi_slopes=alibi_slopes,
         # q strides
         stride_qz=stride_qz,
@@ -742,17 +981,28 @@ def attention_decode_forward_triton_impl(
         stride_vn_g=stride_vn_g,
         stride_vn_h=stride_vn_h,
         stride_vn_d=stride_vn_d,
+        # block table strides
+        stride_bt_b=stride_bt_b,
+        stride_bt_s=stride_bt_s,
         # alibi strides
         stride_az=stride_az,
         stride_ah=stride_ah,
+        # FP8 descale strides
+        stride_q_descale_z=stride_q_descale_z,
+        stride_q_descale_h=stride_q_descale_h,
+        stride_k_descale_z=stride_k_descale_z,
+        stride_k_descale_h=stride_k_descale_h,
+        stride_v_descale_z=stride_v_descale_z,
+        stride_v_descale_h=stride_v_descale_h,
         Z=batch_size,
         H_q=heads_per_group_q,
         H_kv=heads_per_group_k,
         G_q=n_group_q,
         N_CTX_Q=seqlen_q,
         N_CTX_K=seqlen_kc,
-        N_CTX_NEW=seqlen_kn,
+        N_CTX_NEW=0,  # No new KV, cache already updated
         BLOCK_N_PER_SPLIT=split_size,
+        BLOCK_SIZE_K=block_size_k if use_block_table else 256,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_DMODEL=dim_padded,
@@ -760,7 +1010,7 @@ def attention_decode_forward_triton_impl(
         BOUNDS_CHECKS_N=(split_size % BLOCK_N) > 0 or use_cache_seqlens,
         USE_CACHE_SEQLENs=use_cache_seqlens,
         USE_CACHE_BATCH_IDX=cache_batch_idx is not None,
-        NEW_KV=is_new_kv,
+        NEW_KV=False,  # Cache already updated
         IS_GQA=is_gqa,
         IS_CAUSAL=causal,
         USE_ALIBI=use_alibi,
@@ -769,6 +1019,8 @@ def attention_decode_forward_triton_impl(
         USE_SLIDING_WINDOW=use_sliding_window,
         WINDOW_SIZE_LEFT=window_size_left,
         WINDOW_SIZE_RIGHT=window_size_right,
+        USE_BLOCK_TABLE=use_block_table,
+        IS_FP8=IS_FP8,
         num_warps=num_warps_fwd,
         num_stages=num_stages,
     )
