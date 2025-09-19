@@ -8,9 +8,9 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu import cpasync, warp
-
+from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from flash_attn.cute import ampere_helpers as sm80_utils
+import cutlass.utils.hopper_helpers as sm90_utils_basic
 from flash_attn.cute import utils
 
 
@@ -304,3 +304,205 @@ class FlashAttentionBackwardPostprocess:
                     tdQgdQ[None, rest_m, None],
                     pred=tdQpdQ[None, rest_m, None],
                 )
+
+
+class FlashAttentionBackwardPostprocess_sm90(FlashAttentionBackwardPostprocess):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.universal_copy_bits = 128
+
+    def _setup_attributes(self):
+        self.sdQaccum_layout = cute.make_layout(
+                                shape=(self.m_block_size * self.head_dim_padded, ),
+                            )
+
+        sdQ_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+            cutlass.utils.hopper_helpers.get_smem_layout_atom(
+               cutlass.utils.LayoutEnum.ROW_MAJOR, self.dtype, self.head_dim_padded
+            ),
+            self.dtype
+        )
+        self.sdQ_layout = cute.tile_to_shape(
+                                sdQ_layout_atom,
+                                (self.m_block_size,  self.head_dim_padded),
+                                (0, 1)
+                            )
+        # G->S
+        async_copy_elements = self.universal_copy_bits // cutlass.Float32.width
+        self.G2S_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.Float32,
+                num_bits_per_copy=self.universal_copy_bits
+            ),
+            cute.make_layout(self.tiled_mma.size),
+            cute.make_layout(async_copy_elements)
+        )
+
+        # S->R
+        self.S2R_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
+                    cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=self.universal_copy_bits),
+                    cute.make_layout(self.tiled_mma.size),
+                    cute.make_layout(async_copy_elements)
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        mdQaccum: cute.Tensor,
+        mdQ:      cute.Tensor,
+        scale:    cutlass.Float32,
+        stream:   cuda.CUstream,
+    ):
+
+        mdQ =      cute.make_tensor(mdQ.iterator, cute.select(mdQ.layout, mode=[1,3,2,0]))
+        mdQaccum = cute.make_tensor(mdQaccum.iterator, cute.select(mdQaccum.layout, mode=[2,1,0]))
+
+        # tiled_mma
+        tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
+            self.dtype,
+            self.dtype,
+            warpgroup.OperandMajorMode.K,
+            warpgroup.OperandMajorMode.MN,
+            cutlass.Float32,
+            atom_layout_mnk=(self.m_block_size // 64, 1, 1),
+            tiler_mn=(64, self.head_dim_padded)
+        )
+
+        self.tiled_mma = tiled_mma
+        self.num_mma_threads = tiled_mma.size
+        self._setup_attributes()
+
+
+        # TMA setup
+        tma_atom_dQ, mdQ = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileS2GOp(),
+            mdQ,
+            self.sdQ_layout,
+            (self.m_block_size, self.head_dim_padded),
+        )
+
+        seqlen = mdQ.shape[0]
+        grid_dim = [
+            cute.ceil_div(seqlen, self.m_block_size),
+            cute.size(mdQ.shape[2]),
+            cute.size(mdQ.shape[3]),
+        ]
+        smem_size = max(
+            cute.size_in_bytes(cutlass.Float32, self.sdQaccum_layout),
+            cute.size_in_bytes(self.dtype, self.sdQ_layout)
+        )
+        self.kernel(
+            mdQaccum,
+            mdQ,
+            tma_atom_dQ,
+            tiled_mma,
+            self.sdQaccum_layout,
+            self.sdQ_layout,
+            self.G2S_tiled_copy_dQaccum,
+            self.S2R_tiled_copy_dQaccum,
+            scale,
+        ).launch(
+            grid=grid_dim,
+            block=[self.num_mma_threads, 1, 1],
+            smem=smem_size,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mdQaccum:               cute.Tensor,
+        mdQ:                    cute.Tensor,
+        tma_atom_dQ:            cute.CopyAtom,
+        tiled_mma:              cute.TiledMma,
+        sdQaccum_layout:        cute.Layout,
+        sdQ_layout:             cute.ComposedLayout,
+        g2s_tiled_copy_dQaccum: cute.TiledCopy,
+        s2r_tiled_copy_dQaccum: cute.TiledCopy,
+        scale:                  cutlass.Float32,
+    ):
+        # basic setup
+        tidx = cute.arch.thread_idx()[0]
+        m_block, head_idx, batch_idx = cute.arch.block_idx()
+        warp_idx       = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        smem =     cutlass.utils.SmemAllocator()
+        sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=128)
+        sdQ      = cute.make_tensor(
+                        cute.recast_ptr(sdQaccum.iterator, sdQ_layout.inner, dtype=self.dtype),
+                        sdQ_layout.outer
+        )
+
+        if warp_idx == 0:
+            cpasync.prefetch_descriptor(tma_atom_dQ)
+
+        # G->S
+        gdQaccum = cute.local_tile(
+            mdQaccum[None, head_idx, batch_idx],
+            (self.m_block_size * self.head_dim_padded, ),
+            (m_block,)
+        )
+
+        gmem_thr_copy_dQaccum = g2s_tiled_copy_dQaccum.get_slice(tidx)
+        tdQaccumgdQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)
+        tdQaccumsdQaccum = gmem_thr_copy_dQaccum.partition_D(sdQaccum)
+
+        cute.copy(g2s_tiled_copy_dQaccum, tdQaccumgdQaccum, tdQaccumsdQaccum)
+        cute.arch.barrier()
+
+        # S->R
+        acc_dQaccum = cute.make_fragment(
+            tiled_mma.partition_shape_C((self.m_block_size, self.head_dim_padded)),
+            cutlass.Float32
+        )
+        acc_dQaccum.fill(0)
+
+        smem_thr_copy_dQaccum = s2r_tiled_copy_dQaccum.get_slice(tidx)
+        tdQaccumsdQaccum = smem_thr_copy_dQaccum.partition_S(sdQaccum)
+
+
+        tdQaccumrdQaccum = cute.make_tensor(acc_dQaccum.iterator, cute.make_layout(tdQaccumsdQaccum.shape))
+        cute.copy(smem_thr_copy_dQaccum, tdQaccumsdQaccum, tdQaccumrdQaccum)
+
+
+        # Scale + FP32->BF16/FP16
+        acc_mmaA_view = cute.make_tensor(acc_dQaccum.iterator, utils.convert_layout_acc_frgA(acc_dQaccum.layout))
+        rdQ = cute.make_fragment_like(acc_mmaA_view, self.dtype)
+
+        acc_dQaccum.store(acc_dQaccum.load() * scale)
+        utils.cvt_f16(acc_mmaA_view, rdQ) # BF16/FP16 output
+
+
+        # R->S (StMatrix)
+        smem_copy_atom = cute.make_copy_atom(
+                                cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4),
+                                self.dtype, #BF16/FP16
+        )
+
+        smem_thr_copy = cute.make_tiled_copy_C(smem_copy_atom, tiled_mma).get_slice(tidx)
+        tdQsdQ = smem_thr_copy.partition_D(sdQ)
+        tdQrdQ = cute.make_tensor(rdQ.iterator, cute.make_layout(tdQsdQ.shape))
+
+        cute.copy(smem_thr_copy, tdQrdQ, tdQsdQ)
+        cute.arch.barrier()
+
+        #S->G (TMA)
+        gdQ = cute.local_tile(
+            mdQ[None, None, head_idx, batch_idx],
+            (self.m_block_size, self.head_dim_padded),
+            (m_block, 0)
+        )
+
+        tdQsdQ, tdQgdQ = cpasync.tma_partition(
+            tma_atom_dQ,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sdQ, 0, 2),
+            cute.group_modes(gdQ, 0, 2)
+        )
+        cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+        if warp_idx == 4: # only one warp writes
+           cute.copy(tma_atom_dQ, tdQsdQ, tdQgdQ)
+           cute.arch.cp_async_bulk_commit_group()
+           cute.arch.cp_async_bulk_wait_group(0, read=True)

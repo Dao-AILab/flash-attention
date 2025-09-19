@@ -251,7 +251,7 @@ public:
 
     static Params
     to_underlying_arguments(TileSchedulerArguments const& args) {
-        int const size_one_kv_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size;
+        long long const size_one_kv_head = long(args.seqlen_k) * long(args.headdim + args.headdim_v) * long(args.element_size);
         int const size_l2 = 32 * 1024 * 1024;  // 32 MB for K & V
         // Swizzle is the size of each "section". Round swizzle to a power of 2
         // If not PackGQA already, the size of each section can increase by qhead_per_khead
@@ -364,6 +364,7 @@ public:
 
 ///////////////////////////////////////////////////////////////////////////////
 
+template <bool Varlen, int kBlock, bool SPT = false>
 class SingleTileBwdLPTScheduler {
 
 public:
@@ -373,18 +374,21 @@ public:
     // Device side kernel params
     struct Params {
         int const total_blocks;
-        cutlass::FastDivmod const m_block_divmod, head_divmod;
+        cutlass::FastDivmod const block_divmod, head_divmod;
         cutlass::FastDivmod const l2_minor_divmod, l2_major_divmod;
         cutlass::FastDivmod const l2_minor_residual_divmod;
         int const num_hb_quotient;
+        int const seqlen;
+        int const* const cu_seqlens;
+        int const* const seqused;
     };
 
     static Params
     to_underlying_arguments(TileSchedulerArguments const& args) {
         // Since it's the bwd pass, seqlen_k get passed to args.seqlen and seqlen_q is passed to args.seqlen_k
-        int const size_one_qdo_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size;
-        int const size_one_dqaccum_head = args.seqlen_k * args.headdim * sizeof(float);
-        int const size_one_head = size_one_qdo_head + size_one_dqaccum_head;
+        long long const size_one_qdo_head = long(args.seqlen_k) * long(args.headdim + args.headdim_v) * long(args.element_size);
+        long long const size_one_dqaccum_head = long(args.seqlen_k) * long(args.headdim) * sizeof(float);
+        long long const size_one_head = size_one_qdo_head + size_one_dqaccum_head;
         int const size_l2 = 40 * 1024 * 1024;  // 40 MB for Q, dO, and dQaccum
         // Swizzle is the size of each "section". Round swizzle to a power of 2
         // Need to be careful about the case where only one head will fit
@@ -401,7 +405,8 @@ public:
                 cutlass::FastDivmod(swizzle), cutlass::FastDivmod(swizzle * args.num_blocks),
                 // don't divide by 0
                 cutlass::FastDivmod(num_hb_remainder > 0 ? num_hb_remainder : 1),
-                (args.num_head * args.num_batch) / swizzle};
+                (args.num_head * args.num_batch) / swizzle,
+                args.seqlen, !Varlen ? nullptr : args.cu_seqlens, !Varlen ? nullptr : args.seqused};
     }
 
     static dim3
@@ -410,28 +415,19 @@ public:
     }
 
     struct WorkTileInfo {
-        int tile_idx;
+        int block;
+        int bidh;
+        int bidb;
 
         CUTLASS_DEVICE
         bool
         is_valid(Params const& params) const {
-            return tile_idx < params.total_blocks;
+            return bidb >= 0;
         }
 
         CUTLASS_DEVICE
         cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
-            int block, bidh, bidb;
-            int l2_mod, bidhb, bidhb_residual;
-            bidhb = params.l2_major_divmod.divmod(l2_mod, tile_idx);
-            // If we're in the last section (called residual), we don't want to divide by
-            // swizzle. Instead we want to divide by the remainder.
-            if (bidhb < params.num_hb_quotient) {
-                block = params.l2_minor_divmod.divmod(bidhb_residual, l2_mod);
-            } else {
-                block = params.l2_minor_residual_divmod.divmod(bidhb_residual, l2_mod);
-            }
-            bidb = params.head_divmod.divmod(bidh, bidhb * params.l2_minor_divmod.divisor + bidhb_residual);
             return {block, bidh, bidb, 0 /*split_idx*/};
         }
 
@@ -444,7 +440,33 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     get_initial_work(Params const& params) const {
-        return {int(blockIdx.x)};
+        int tile_idx = blockIdx.x;
+        int block, bidh, bidb;
+        int l2_mod, bidhb, bidhb_residual;
+        bidhb = params.l2_major_divmod.divmod(l2_mod, tile_idx);
+        // If we're in the last section (called residual), we don't want to divide by
+        // swizzle. Instead we want to divide by the remainder.
+        if (bidhb < params.num_hb_quotient) {
+            block = params.l2_minor_divmod.divmod(bidhb_residual, l2_mod);
+        } else {
+            block = params.l2_minor_residual_divmod.divmod(bidhb_residual, l2_mod);
+        }
+        bidb = params.head_divmod.divmod(bidh, bidhb * params.l2_minor_divmod.divisor + bidhb_residual);
+        bool is_valid_tile = true;
+        int num_blocks;
+        if constexpr (Varlen) {
+            int seqlen = params.seqused
+                ? params.seqused[bidb]
+                : (params.cu_seqlens ? params.cu_seqlens[bidb + 1] - params.cu_seqlens[bidb] : params.seqlen);
+            num_blocks = cute::ceil_div(seqlen, Int<kBlock>{});
+            is_valid_tile = block < num_blocks;
+        } else {
+            num_blocks = params.block_divmod.divisor;
+        }
+        if constexpr (SPT) {
+            block = num_blocks - block - 1;
+        }
+        return {block, bidh, is_valid_tile ? bidb : -1};
     }
 
     CUTLASS_DEVICE
@@ -459,7 +481,7 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     get_next_work(Params const& params, WorkTileInfo const& current_work) const {
-        return {params.total_blocks};
+        return {0, 0, -1};
     }
 
 };

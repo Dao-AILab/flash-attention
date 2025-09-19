@@ -1,0 +1,225 @@
+name: ~Build wheel template
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: "The runner to use for the build"
+        required: true
+        type: string
+      python-version:
+        description: "The Python version to use for the build"
+        required: true
+        type: string
+      cuda-version:
+        description: "The CUDA version to use for the build"
+        required: true
+        type: string
+      torch-version:
+        description: "The PyTorch version to use for the build"
+        required: true
+        type: string
+      cxx11_abi:
+        description: "The C++11 ABI to use for the build"
+        required: true
+        type: string
+      upload-to-release:
+        description: "Upload wheel to this release"
+        required: false
+        type: boolean
+        default: false
+      release-version:
+        description: "Upload wheel to this release"
+        required: false
+        type: string
+
+defaults:
+  run:
+    shell: bash -x -e -u -o pipefail {0}
+
+jobs:
+  build-wheel:
+    runs-on: ${{ inputs.runs-on }}
+    name: Build wheel (${{ inputs.release-version }}-${{ inputs.python-version }}-${{ inputs.cuda-version }}-${{ inputs.torch-version }}-${{ inputs.cxx11_abi }})
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release-version }}
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Set CUDA and PyTorch versions
+        run: |
+          echo "MATRIX_CUDA_VERSION=$(echo ${{ inputs.cuda-version }} | awk -F \. {'print $1 $2'})" >> $GITHUB_ENV
+          echo "MATRIX_TORCH_VERSION=$(echo ${{ inputs.torch-version }} | awk -F \. {'print $1 "." $2'})" >> $GITHUB_ENV
+          echo "WHEEL_CUDA_VERSION=$(echo ${{ inputs.cuda-version }} | awk -F \. {'print $1'})" >> $GITHUB_ENV
+          echo "MATRIX_PYTHON_VERSION=$(echo ${{ inputs.python-version }} | awk -F \. {'print $1 $2'})" >> $GITHUB_ENV
+
+      - name: Free up disk space
+        if: ${{ runner.os == 'Linux' }}
+        # https://github.com/easimon/maximize-build-space/blob/master/action.yml
+        # https://github.com/easimon/maximize-build-space/tree/test-report
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+      - name: Set up swap space
+        if: runner.os == 'Linux'
+        uses: pierotofy/set-swap-space@v1.0
+        with:
+          swap-size-gb: 10
+
+      - name: Install CUDA ${{ inputs.cuda-version }}
+        if: ${{ inputs.cuda-version != 'cpu' }}
+        uses: Jimver/cuda-toolkit@v0.2.27
+        id: cuda-toolkit
+        with:
+          cuda: ${{ inputs.cuda-version }}
+          linux-local-args: '["--toolkit"]'
+          # default method is "local", and we're hitting some error with caching for CUDA 11.8 and 12.1
+          # method: ${{ (inputs.cuda-version == '11.8.0' || inputs.cuda-version == '12.1.0') && 'network' || 'local' }}
+          method: "network"
+          sub-packages: '["nvcc"]'
+
+      - name: Install PyTorch ${{ inputs.torch-version }}+cu${{ inputs.cuda-version }}
+        run: |
+          pip install --upgrade pip
+          # With python 3.13 and torch 2.5.1, unless we update typing-extensions, we get error
+          # AttributeError: attribute '__default__' of 'typing.ParamSpec' objects is not writable
+          pip install typing-extensions==4.12.2
+          # We want to figure out the CUDA version to download pytorch
+          # e.g. we can have system CUDA version being 11.7 but if torch==1.12 then we need to download the wheel from cu116
+          # see https://github.com/pytorch/pytorch/blob/main/RELEASE.md#release-compatibility-matrix
+          # This code is ugly, maybe there's a better way to do this.
+          export TORCH_CUDA_VERSION=$(python -c "from os import environ as env; \
+            minv = {'2.5': 118, '2.6': 118, '2.7': 118, '2.8': 126, '2.9': 126}[env['MATRIX_TORCH_VERSION']]; \
+            maxv = {'2.5': 124, '2.6': 126, '2.7': 128, '2.8': 129, '2.9': 130}[env['MATRIX_TORCH_VERSION']]; \
+            print(minv if int(env['MATRIX_CUDA_VERSION']) < 120 else maxv)" \
+          )
+          # detect if we're on ARM
+          if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
+              PLAT=linux_aarch64
+          else
+              PLAT=manylinux_2_27_x86_64.manylinux_2_28_x86_64
+          fi
+          echo "PLAT=$PLAT" >> $GITHUB_ENV
+          if [[ ${{ inputs.torch-version }} == *"dev"* ]]; then
+            # pip install --no-cache-dir --pre torch==${{ inputs.torch-version }} --index-url https://download.pytorch.org/whl/nightly/cu${TORCH_CUDA_VERSION}
+            # Can't use --no-deps because we need cudnn etc.
+            # Hard-coding this version of pytorch-triton for torch 2.9.0.dev20250904
+            pip install jinja2
+            TRITON_URL=https://download.pytorch.org/whl/nightly/pytorch_triton-3.4.0%2Bgitf7888497-cp${MATRIX_PYTHON_VERSION}-cp${MATRIX_PYTHON_VERSION}-${PLAT}.whl
+            TORCH_URL=https://download.pytorch.org/whl/nightly/cu${TORCH_CUDA_VERSION}/torch-${{ inputs.torch-version }}%2Bcu${TORCH_CUDA_VERSION}-cp${MATRIX_PYTHON_VERSION}-cp${MATRIX_PYTHON_VERSION}-manylinux_2_28_$(uname -m).whl
+            pip install --no-cache-dir --pre "${TRITON_URL}"
+            pip install --no-cache-dir --pre "${TORCH_URL}"
+          else
+            pip install --no-cache-dir torch==${{ inputs.torch-version }} --index-url https://download.pytorch.org/whl/cu${TORCH_CUDA_VERSION}
+          fi
+          nvcc --version
+          python --version
+          python -c "import torch; print('PyTorch:', torch.__version__)"
+          python -c "import torch; print('CUDA:', torch.version.cuda)"
+          python -c "from torch.utils import cpp_extension; print (cpp_extension.CUDA_HOME)"
+
+      - name: Restore build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build.tar
+          key: build-${{ inputs.release-version }}-${{ inputs.python-version }}-${{ inputs.cuda-version }}-${{ inputs.torch-version }}-${{ inputs.cxx11_abi }}-${{ github.run_number }}-${{ github.run_attempt }}
+          restore-keys: |
+            build-${{ inputs.release-version }}-${{ inputs.python-version }}-${{ inputs.cuda-version }}-${{ inputs.torch-version }}-${{ inputs.cxx11_abi }}-
+
+      - name: Unpack build cache
+        run: |
+          echo ::group::Adjust timestamps
+          sudo find / -exec touch -t 197001010000 {} + || true
+          echo ::endgroup::
+
+          if [ -f build.tar ]; then
+            find . -mindepth 1 -maxdepth 1 ! -name 'build.tar' -exec rm -rf {} +
+            tar -xpvf build.tar -C .
+          else
+            echo "No build.tar found, skipping"
+          fi
+
+          ls -al ./
+          ls -al build/ || true
+          ls -al csrc/ || true
+
+      - name: Build wheel
+        id: build_wheel
+        run: |
+          # We want setuptools >= 49.6.0 otherwise we can't compile the extension if system CUDA version is 11.7 and pytorch cuda version is 11.6
+          # https://github.com/pytorch/pytorch/blob/664058fa83f1d8eede5d66418abff6e20bd76ca8/torch/utils/cpp_extension.py#L810
+          # However this still fails so I'm using a newer version of setuptools
+          pip install setuptools==75.8.0
+          pip install ninja packaging wheel
+          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+          export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+          # Limit MAX_JOBS otherwise the github runner goes OOM
+          # nvcc 11.8 can compile with 2 jobs, but nvcc 12.3 goes OOM
+
+          export MAX_JOBS=$([ "$MATRIX_CUDA_VERSION" == "129" ] && echo 1 || echo 2)
+          export NVCC_THREADS=2
+          export FLASH_ATTENTION_FORCE_BUILD="TRUE"
+          export FLASH_ATTENTION_FORCE_CXX11_ABI=${{ inputs.cxx11_abi }}
+
+          # 5h timeout since GH allows max 6h and we want some buffer
+          EXIT_CODE=0
+          timeout 5h python setup.py bdist_wheel --dist-dir=dist || EXIT_CODE=$?
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            tmpname=cu${WHEEL_CUDA_VERSION}torch${MATRIX_TORCH_VERSION}cxx11abi${{ inputs.cxx11_abi }}
+            wheel_name=$(ls dist/*whl | xargs -n 1 basename | sed "s/-/+$tmpname-/2")
+            ls dist/*whl |xargs -I {} mv {} dist/${wheel_name}
+            echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
+          fi
+
+          # Store exit code in GitHub env for later steps
+          echo "build_exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
+
+          # Do not fail the job if timeout killed the build
+          exit $EXIT_CODE
+
+      - name: Log build logs after timeout
+        if: always() && steps.build_wheel.outputs.build_exit_code == 124
+        run: |
+          ls -al ./
+          tar -cvf build.tar . --atime-preserve=replace
+
+      - name: Save build cache timeout
+        if: always() && steps.build_wheel.outputs.build_exit_code == 124
+        uses: actions/cache/save@v4
+        with:
+          key: build-${{ inputs.release-version }}-${{ inputs.python-version }}-${{ inputs.cuda-version }}-${{ inputs.torch-version }}-${{ inputs.cxx11_abi }}-${{ github.run_number }}-${{ github.run_attempt }}
+          path: build.tar
+
+      - name: Log Built Wheels
+        run: |
+          ls dist
+
+      - name: Get Release with tag
+        id: get_current_release
+        uses: joutvhu/get-release@v1
+        with:
+          tag_name: ${{ inputs.release-version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Release Asset
+        id: upload_release_asset
+        if: inputs.upload-to-release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.get_current_release.outputs.upload_url }}
+          asset_path: ./dist/${{env.wheel_name}}
+          asset_name: ${{env.wheel_name}}
+          asset_content_type: application/*

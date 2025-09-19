@@ -39,7 +39,7 @@ public:
     if (is_initializing_warp) {
       // Barrier FULL and EMPTY init
       constexpr int producer_arv_cnt = 1;
-      uint32_t const num_consumer_warpgroups_per_cluster = params.num_consumers / NumThreadsPerWarpGroup;
+      uint32_t const num_consumer_warpgroups_per_cluster = (params.num_consumers + NumThreadsPerWarpGroup - 1) / NumThreadsPerWarpGroup;
       uint32_t const multicast_consumer_arrival_count = num_consumer_warpgroups_per_cluster;
 
       cutlass::arch::detail::initialize_barrier_array_pair_aligned<decltype(storage.full_barrier_), decltype(storage.empty_barrier_), Stages>(
