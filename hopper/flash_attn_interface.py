@@ -414,25 +414,15 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         if ctx.ndim == 4:
-            print("ctx.ndim == 4")
-            print(f"q.shape: {q.shape}")
-            print(f"k.shape: {k.shape}")
-            print(f"v.shape: {v.shape}")
-            raise ValueError("ctx.ndim == 4")
             qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
             dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
             dq, dk, dv = dqkv.unbind(dim=-2)
         else:
-            print("ctx.ndim == 3")
-            print(f"q.shape: {q.shape}")
-            print(f"k.shape: {k.shape}")
-            print(f"v.shape: {v.shape}")
-            raise ValueError("ctx.ndim == 3")
-            num_heads_q = q.shape[2]
-            num_heads_k = k.shape[2]
-            qkv_shape = q.shape[:-2] + (num_heads_q + num_heads_k * 2, *q.shape[-1:])
+            num_heads_q = q.shape[1]
+            num_heads_k = k.shape[1]
+            qkv_shape = q.shape[:-1] + (num_heads_q + num_heads_k * 2, *q.shape[-1:])
             dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
-            dq, dk, dv = dqkv.split([num_heads_q, num_heads_k, num_heads_k], dim=-2)
+            dq, dk, dv = dqkv.split([num_heads_q, num_heads_k, num_heads_k], dim=-1)
         _flash_attn_backward(
             dout,
             q,
