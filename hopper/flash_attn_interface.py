@@ -364,13 +364,13 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
         if qkv.dim() == 4:
-            assert qkv.shape[-2] == 3
-            q, k, v = qkv.unbind(dim=-2)
+            assert qkv.shape[-3] == 3
+            q, k, v = qkv.unbind(dim=-3)
         else:
             assert qkv.dim() == 3
             assert num_heads_q is not None
-            num_heads_k = (qkv.shape[1] - num_heads_q) // 2
-            assert num_heads_k * 2 + num_heads_q == qkv.shape[1]
+            num_heads_k = (qkv.shape[2] - num_heads_q) // 2
+            assert num_heads_k * 2 + num_heads_q == qkv.shape[2]
             q, k, v = qkv.split([num_heads_q, num_heads_k, num_heads_k], dim=-2)
         out, softmax_lse, *rest = _flash_attn_forward(
             q,
@@ -418,8 +418,8 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
             dq, dk, dv = dqkv.unbind(dim=-2)
         else:
-            num_heads_q = q.shape[1]
-            num_heads_k = k.shape[1]
+            num_heads_q = q.shape[2]
+            num_heads_k = k.shape[2]
             qkv_shape = q.shape[:-2] + (num_heads_q + num_heads_k * 2, *q.shape[-1:])
             dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
             dq, dk, dv = dqkv.split([num_heads_q, num_heads_k, num_heads_k], dim=-2)
