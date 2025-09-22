@@ -413,16 +413,10 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
-        if ctx.ndim == 4:
-            qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
-            dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
-            dq, dk, dv = dqkv.unbind(dim=-2)
-        else:
-            num_heads_q = q.shape[1]
-            num_heads_k = k.shape[1]
-            qkv_shape = q.shape[:-1] + (num_heads_q + num_heads_k * 2, *q.shape[-1:])
-            dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
-            dq, dk, dv = dqkv.split([num_heads_q, num_heads_k, num_heads_k], dim=-1)
+        
+        # Create gradients with same shapes as q, k, v
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        
         _flash_attn_backward(
             dout,
             q,
@@ -446,6 +440,15 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             ctx.deterministic,
             ctx.sm_margin,
         )
+        
+        # Reconstruct dqkv tensor in the original format
+        if ctx.ndim == 4:
+            # For 4D input: (total, 3, nheads, headdim)
+            dqkv = torch.stack([dq, dk, dv], dim=1)
+        else:
+            # For 3D input: (total, nheads_packed, headdim) where nheads_packed = nheads_q + 2*nheads_kv
+            dqkv = torch.cat([dq, dk, dv], dim=1)
+        
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
         return dqkv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
