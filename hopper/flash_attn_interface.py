@@ -418,6 +418,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             print(f"q.shape: {q.shape}")
             print(f"k.shape: {k.shape}")
             print(f"v.shape: {v.shape}")
+            raise ValueError("ctx.ndim == 4")
             qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
             dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
             dq, dk, dv = dqkv.unbind(dim=-2)
@@ -426,6 +427,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             print(f"q.shape: {q.shape}")
             print(f"k.shape: {k.shape}")
             print(f"v.shape: {v.shape}")
+            raise ValueError("ctx.ndim == 3")
             num_heads_q = q.shape[2]
             num_heads_k = k.shape[2]
             qkv_shape = q.shape[:-2] + (num_heads_q + num_heads_k * 2, *q.shape[-1:])
