@@ -32,9 +32,6 @@ namespace {
 inline tsa::DeviceGuard make_device_guard(const Tensor& t) {
   return tsa::DeviceGuard(static_cast<tsa::DeviceIndex>(t.get_device()));
 }
-inline tsa::DeviceGuard make_device_guard_from_index(int device) {
-  return tsa::DeviceGuard(static_cast<tsa::DeviceIndex>(device));
-}
 std::deque<std::once_flag> device_flags;
 std::vector<cudaDeviceProp> device_properties;
 
