@@ -41,7 +41,6 @@ PyObject* PyInit__C(void)
 
 #define PREPARE_VARLEN_MAX_BATCHES_1CTA 992
 
-// -----------------------------------------------------------------------------
 namespace {
 inline at::cuda::CUDAGuard make_cuda_guard_from_tensor(const at::Tensor& t) {
   return at::cuda::CUDAGuard(static_cast<c10::DeviceIndex>(t.get_device()));
