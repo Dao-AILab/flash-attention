@@ -45,9 +45,6 @@ namespace {
 inline at::cuda::CUDAGuard make_cuda_guard_from_tensor(const at::Tensor& t) {
   return at::cuda::CUDAGuard(static_cast<c10::DeviceIndex>(t.get_device()));
 }
-inline at::cuda::CUDAGuard make_cuda_guard_from_index(int device) {
-  return at::cuda::CUDAGuard(static_cast<c10::DeviceIndex>(device));
-}
 } // namespace
 
 void set_params_fprop(Flash_fwd_params &params,
