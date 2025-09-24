@@ -16,7 +16,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
-import cutlass.utils.ampere_helpers as sm80_utils_basic
+import cutlass.utils as utils_basic
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 
 from flash_attn.cute import ampere_helpers as sm80_utils
@@ -127,7 +127,7 @@ class FlashAttentionForwardBase:
         smem_usage_QV = (smem_usage_Q + smem_usage_V) if not Q_in_regs else max(smem_usage_Q, smem_usage_V)
         smem_usage = smem_usage_QV + smem_usage_K
         # TODO: sm86 and sm89
-        smem_capacity = sm80_utils_basic.SMEM_CAPACITY["sm80"]
+        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
         if smem_usage > smem_capacity:
             return False
         # Check if twice the block size is divisible by the number of threads

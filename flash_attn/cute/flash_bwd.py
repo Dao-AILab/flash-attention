@@ -11,7 +11,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
-import cutlass.utils.ampere_helpers as sm80_utils_basic
+import cutlass.utils as utils_basic
 
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute import utils
@@ -125,7 +125,7 @@ class FlashAttentionBackwardSm80:
         smem_usage_V = n_block_size * head_dim_v * 2
         smem_usage_QV = (smem_usage_Q + smem_usage_V) if not V_in_regs else max(smem_usage_Q, smem_usage_V)
         smem_usage = smem_usage_QV + smem_usage_dO + smem_usage_K
-        smem_capacity = sm80_utils_basic.SMEM_CAPACITY["sm80"]
+        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
         if smem_usage > smem_capacity:
             return False
         return True
