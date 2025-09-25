@@ -26,8 +26,12 @@
 #include <mutex>
 
 using torch::stable::Tensor;
+namespace tsa = torch::stable::accelerator;
 
 namespace {
+inline tsa::DeviceGuard make_device_guard(const Tensor& t) {
+  return tsa::DeviceGuard(static_cast<tsa::DeviceIndex>(t.get_device()));
+}
 std::deque<std::once_flag> device_flags;
 std::vector<cudaDeviceProp> device_properties;
 
@@ -673,7 +677,7 @@ mha_fwd_get_scheduler_metadata(
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    torch::stable::accelerator::DeviceGuard device_guard{(char)seqused_k.get_device()};
+    auto device_guard = make_device_guard(seqused_k);
 
     // This needs to be set after get_num_splits
     Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
@@ -939,7 +943,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    torch::stable::accelerator::DeviceGuard device_guard{(char)q.get_device()};
+    auto device_guard = make_device_guard(q);
 
     Tensor softmax_lse;
     if (!is_varlen_q) {
@@ -1528,7 +1532,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    torch::stable::accelerator::DeviceGuard device_guard{(char)q.get_device()};
+    auto device_guard = make_device_guard(q);
 
     // auto opts = q.options();
     // Need softmax_d to have total_q_padded_rounded since we want its address to be aligned by 16/8 bytes for TMA / LDG.64
@@ -1691,7 +1695,7 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    torch::stable::accelerator::DeviceGuard device_guard{(char)out_partial.get_device()};
+    auto device_guard = make_device_guard(out_partial);
 
     auto softmax_lse = torch::stable::new_empty(out_partial, {batch_size, num_heads, seqlen}, std::make_optional(torch::headeronly::ScalarType::Float));
     softmax_lse = torch::stable::transpose(softmax_lse, 1, 2);
