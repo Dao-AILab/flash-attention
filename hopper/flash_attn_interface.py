@@ -11,7 +11,7 @@ USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TR
 if USE_TRITON_ROCM:
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from flash_attn.flash_attn_triton_amd import interface_fa_v3 as flash_attn_3_gpu
+    from flash_attn.flash_attn_triton_amd import flash_attn_3 as flash_attn_3_gpu
 else:
     # isort: off
     # We need to import the CUDA kernels after importing torch
