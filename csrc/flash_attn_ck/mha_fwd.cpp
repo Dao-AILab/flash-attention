@@ -19,6 +19,7 @@ fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
                            dtype,
                            false, // is_group_mode
                            true,  // is_v_rowmajor
+                           false, // has_logits_soft_cap
                            mask.type,
                            enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
                            has_lse,
@@ -40,14 +41,13 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    const at::Tensor q,
                                    const at::Tensor k,
                                    const at::Tensor v,
-                                   c10::optional<at::Tensor> &alibi_slopes_,
+                                   std::optional<at::Tensor> &alibi_slopes_,
                                    at::Tensor out,
                                    at::Tensor softmax_lse,
                                    at::Tensor dropout_randval,
                                    float softmax_scale,
                                    float p_dropout,
-                                   uint64_t drop_seed,
-                                   uint64_t drop_offset)
+                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -112,6 +112,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          softmax_scale, // scale_s
                          1,             // scale_p
                          1,             // scale_o
+                         0.0f,          // logits_soft_cap
                          stride_q,
                          stride_k,
                          stride_v,
@@ -135,17 +136,18 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          mask.left,
                          mask.right,
                          static_cast<ck_tile::index_t>(mask.type),
+                         0, // min_seqlen_q
                          p_dropout,
                          has_dropout_randval,
-                         {drop_seed, drop_offset}};
+                         drop_seed_offset};
 }
 
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
         const at::Tensor &k,                      // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
         const at::Tensor &v,                      // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
-        c10::optional<at::Tensor> &out_,          // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
-        c10::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+        std::optional<at::Tensor> &out_,          // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
+        std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
         const float p_dropout,
         const float softmax_scale,
         bool is_causal,
@@ -153,7 +155,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         int window_size_right,
         const float /*softcap*/,
         const bool return_dropout_randval,
-        c10::optional<at::Generator> gen_)
+        std::optional<at::Generator> gen_)
 {
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -235,8 +237,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
     bool has_lse = true;
@@ -255,10 +256,9 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         p = torch::empty({ 0 }, opts);
     }
 
-    uint64_t drop_seed = 1, drop_offset = 0;
     int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
+    auto rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
+    auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     if (p_dropout > 0.0)  {
         auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
@@ -266,13 +266,12 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         auto philox_args = gen->philox_cuda_state(counter_offset);
-        std::tie(drop_seed, drop_offset) = flash::unpack(philox_args);
+        hipLaunchKernelGGL(
+            flash::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0, philox_args, rng_state_ptr);
     }
 
-    rng_state[0] = *(reinterpret_cast<int64_t*>(&drop_seed));
-    rng_state[1] = *(reinterpret_cast<int64_t*>(&drop_offset));
-
     if (seqlen_k > 0) {
+        auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         auto stream = at::cuda::getCurrentHIPStream().stream();
         ck_tile::stream_config stream_config{stream};
 
@@ -305,8 +304,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                 p,
                 softmax_scale,
                 p_dropout,
-                drop_seed,
-                drop_offset);
+                drop_seed_offset);
 
         float t = fmha_fwd(traits, args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");

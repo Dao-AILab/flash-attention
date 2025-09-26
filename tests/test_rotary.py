@@ -5,6 +5,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+
+import triton
+
 from flash_attn.layers.rotary import apply_rotary_emb, apply_rotary_emb_torch
 from flash_attn.layers.rotary import apply_rotary_emb_qkv_, apply_rotary_emb_kv_
 from flash_attn.bert_padding import pad_input, unpad_input
@@ -45,7 +48,7 @@ def index_cos_sin(cos, sin, seqlen_offsets, seqlen):
 @pytest.mark.parametrize(
     "dtype", ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16])
 )
-# @pytest.mark.parametrize('dtype', ([torch.float16]))
+# @pytest.mark.parametrize('dtype', ([torch.bfloat16]))
 @pytest.mark.parametrize("seqlen_offsets_type", [0, int, torch.Tensor])
 # @pytest.mark.parametrize("seqlen_offsets_type", [0])
 @pytest.mark.parametrize("rotary_fraction", [1.0, 0.5])
@@ -97,6 +100,8 @@ def test_rotary_emb_func(inplace, interleaved, rotary_fraction, seqlen_offsets_t
     "dtype", ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16])
 )
 # @pytest.mark.parametrize('dtype', ([torch.float16]))
+@pytest.mark.parametrize("compiled", [False, True])
+# @pytest.mark.parametrize("compiled", [True])
 @pytest.mark.parametrize("gqa", [False, True])
 # @pytest.mark.parametrize("gqa", [False])
 @pytest.mark.parametrize("seqlen_offsets_type", [0, int, torch.Tensor])
@@ -105,7 +110,9 @@ def test_rotary_emb_func(inplace, interleaved, rotary_fraction, seqlen_offsets_t
 # @pytest.mark.parametrize('rotary_fraction', [1.0])
 @pytest.mark.parametrize("interleaved", [False, True])
 # @pytest.mark.parametrize('interleaved', [False])
-def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, dtype):
+def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, compiled, dtype):
+    if compiled:  # Don't fall back to eager just bc of recompilation
+        torch._dynamo.config.recompile_limit = 2 ** 31
     rtol = 1e-3
     batch_size = 32
     nheads = 4
@@ -126,7 +133,8 @@ def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, 
     qkv_pt = qkv.detach().clone().requires_grad_()
     cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
     seqlen_offsets = generate_seqlen_offsets(seqlen_offsets_type, batch_size, seqlen, device)
-    out = apply_rotary_emb_qkv_(
+    fn = apply_rotary_emb_qkv_ if not compiled else torch.compile(apply_rotary_emb_qkv_)
+    out = fn(
         qkv, cos, sin, seqlen_offsets=seqlen_offsets, interleaved=interleaved,
         num_heads_q=None if not gqa else nheads
     )
@@ -271,7 +279,7 @@ def test_rotary_emb_varlen_func(inplace, interleaved, rotary_fraction, seqlen_of
 
 
 def test_compilation_count():
-    batch_size = 1
+    nheads = 4
     headdim = 128
     device = "cuda"
     dtype = torch.float16
@@ -288,11 +296,17 @@ def test_compilation_count():
     old_cache_func = JITFunction.cache_hook
 
     try:
-        rotary_kernel.cache.clear()
+        if hasattr(rotary_kernel, "cache"):
+            rotary_kernel.cache.clear()
+        else:  # Triton 3.3 replaces cache with per-device device_caches
+            device = triton.runtime.driver.active.get_current_device()
+            # device_caches[device] returns a 4-tuple: (kernel_cache, target, backend, binder)
+            rotary_kernel.device_caches[device][0].clear()
+
         JITFunction.cache_hook = count_compilations
 
         for seqlen in (128, 256):
-            for nheads in (4, 32):
+            for batch_size in (4, 32):
                 x = torch.randn(batch_size, seqlen, nheads, headdim, dtype=dtype, device=device)
                 x.requires_grad_()
                 cos, sin = generate_cos_sin(seqlen, headdim, device, dtype)

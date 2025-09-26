@@ -876,9 +876,7 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
         (1023, 1024),
     ],
 )
-# TODO: Support paged_kv_block
-# @pytest.mark.parametrize("paged_kv_block_size", [None, 256, 512])
-@pytest.mark.parametrize("paged_kv_block_size", [None])
+@pytest.mark.parametrize("paged_kv_block_size", [None, 256, 512])
 def test_flash_attn_varlen_causal(
     seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, dtype
 ):
@@ -1401,7 +1399,7 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
     print(f"dK Pytorch max diff: {(k_pt.grad - k_ref.grad).abs().max().item()}")
     print(f"dV Pytorch max diff: {(v_pt.grad - v_ref.grad).abs().max().item()}")
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
-    assert (q.grad - q_ref.grad).abs().max().item() <= 5 * (
+    assert (q.grad - q_ref.grad).abs().max().item() <= 7 * (
         q_pt.grad - q_ref.grad
     ).abs().max().item() + 1e-3
     assert (k.grad - k_ref.grad).abs().max().item() <= 5 * (

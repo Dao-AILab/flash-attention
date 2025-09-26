@@ -103,18 +103,18 @@ layer_norm::BwdFunction & get_parallel_bwd_launcher(torch::Dtype wtype, torch::D
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: BxSxhidden_size
-                                           c10::optional<const at::Tensor> &residual_,  // Residual: BxSxhidden_size
+                                           std::optional<const at::Tensor> &residual_,  // Residual: BxSxhidden_size
                                            const at::Tensor &gamma,   // hidden_size
-                                           c10::optional<const at::Tensor> &beta_,   // hidden_size
-                                           c10::optional<const at::Tensor> &rowscale_,      // BxS
-                                           c10::optional<const at::Tensor> &colscale_,      // hidden_size
-                                           c10::optional<const at::Tensor> &x0_subset_,      // BxS
-                                           c10::optional<const at::Tensor> &z_subset_,      // BxS
+                                           std::optional<const at::Tensor> &beta_,   // hidden_size
+                                           std::optional<const at::Tensor> &rowscale_,      // BxS
+                                           std::optional<const at::Tensor> &colscale_,      // hidden_size
+                                           std::optional<const at::Tensor> &x0_subset_,      // BxS
+                                           std::optional<const at::Tensor> &z_subset_,      // BxS
                                            const float dropout_p,
                                            const float epsilon,
                                            const float rowscale_const,
                                            const int64_t z_numrows,
-                                           c10::optional<at::Generator> gen_,
+                                           std::optional<at::Generator> gen_,
                                            bool residual_in_fp32=false,
                                            bool is_rms_norm=false
 ) {
@@ -194,8 +194,7 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
     TORCH_CHECK(epsilon >= 0.f);
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)x0.get_device()};
+    at::cuda::CUDAGuard device_guard{x0.device()};
 
     auto opts = x0.options();
 
@@ -281,17 +280,17 @@ std::vector<at::Tensor> dropout_add_ln_fwd(const at::Tensor &x0,      // Input: 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidden_size
-                                           c10::optional<const at::Tensor> &dx_,     // BxSxhidden_size
+                                           std::optional<const at::Tensor> &dx_,     // BxSxhidden_size
                                            const at::Tensor &x,      // BxSxhidden_size
-                                           c10::optional<const at::Tensor> &x0_,     // BxSxhidden_size
-                                           c10::optional<const at::Tensor> &dmask_,  // BxSxhidden_size
+                                           std::optional<const at::Tensor> &x0_,     // BxSxhidden_size
+                                           std::optional<const at::Tensor> &dmask_,  // BxSxhidden_size
                                            const at::Tensor &mu,     // BxS, FP32!
                                            const at::Tensor &rsigma, // BxS, FP32!
                                            const at::Tensor &gamma,   // hidden_size
-                                           c10::optional<const at::Tensor> &rowscale_,      // BxS
-                                           c10::optional<const at::Tensor> &colscale_,      // hidden_size
-                                           c10::optional<const at::Tensor> &x0_subset_,      // BxS
-                                           c10::optional<const at::Tensor> &z_subset_,      // BxS
+                                           std::optional<const at::Tensor> &rowscale_,      // BxS
+                                           std::optional<const at::Tensor> &colscale_,      // hidden_size
+                                           std::optional<const at::Tensor> &x0_subset_,      // BxS
+                                           std::optional<const at::Tensor> &z_subset_,      // BxS
                                            const float dropout_p,
                                            const float rowscale_const,
                                            const int64_t x0_numrows,
@@ -398,8 +397,7 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
     TORCH_CHECK(gamma.numel() == cols);
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)dz.get_device()};
+    at::cuda::CUDAGuard device_guard{dz.device()};
 
     auto opts = x.options();
 
@@ -483,15 +481,15 @@ std::vector<at::Tensor> dropout_add_ln_bwd(const at::Tensor &dz,     // BxSxhidd
 
 std::vector<at::Tensor> dropout_add_ln_parallel_residual_fwd(
     const at::Tensor &x0,      // Input: BxSxhidden_size
-    c10::optional<const at::Tensor> &x1_,      // Input: BxSxhidden_size
-    c10::optional<const at::Tensor> &residual_,  // Residual: BxSxhidden_size
+    std::optional<const at::Tensor> &x1_,      // Input: BxSxhidden_size
+    std::optional<const at::Tensor> &residual_,  // Residual: BxSxhidden_size
     const at::Tensor &gamma0,   // hidden_size
-    c10::optional<const at::Tensor> &beta0_,   // hidden_size
-    c10::optional<const at::Tensor> &gamma1_,   // hidden_size
-    c10::optional<const at::Tensor> &beta1_,   // hidden_size
+    std::optional<const at::Tensor> &beta0_,   // hidden_size
+    std::optional<const at::Tensor> &gamma1_,   // hidden_size
+    std::optional<const at::Tensor> &beta1_,   // hidden_size
     const float dropout_p,
     const float epsilon,
-    c10::optional<at::Generator> gen_,
+    std::optional<at::Generator> gen_,
     bool residual_in_fp32=false,
     bool is_rms_norm=false
 ) {
@@ -558,8 +556,7 @@ std::vector<at::Tensor> dropout_add_ln_parallel_residual_fwd(
     TORCH_CHECK(epsilon >= 0.f);
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)x0.get_device()};
+    at::cuda::CUDAGuard device_guard{x0.device()};
 
     auto opts = x0.options();
 
@@ -651,15 +648,15 @@ std::vector<at::Tensor> dropout_add_ln_parallel_residual_fwd(
 
 std::vector<at::Tensor> dropout_add_ln_parallel_residual_bwd(
     const at::Tensor &dz0,     // BxSxhidden_size
-    c10::optional<const at::Tensor> &dz1_,     // BxSxhidden_size
-    c10::optional<const at::Tensor> &dx_,     // BxSxhidden_size
+    std::optional<const at::Tensor> &dz1_,     // BxSxhidden_size
+    std::optional<const at::Tensor> &dx_,     // BxSxhidden_size
     const at::Tensor &x,      // BxSxhidden_size
-    c10::optional<const at::Tensor> &dmask0_,  // BxSxhidden_size
-    c10::optional<const at::Tensor> &dmask1_,  // BxSxhidden_size
+    std::optional<const at::Tensor> &dmask0_,  // BxSxhidden_size
+    std::optional<const at::Tensor> &dmask1_,  // BxSxhidden_size
     const at::Tensor &mu,     // BxS, FP32!
     const at::Tensor &rsigma, // BxS, FP32!
     const at::Tensor &gamma0,   // hidden_size
-    c10::optional<const at::Tensor> &gamma1_,   // hidden_size
+    std::optional<const at::Tensor> &gamma1_,   // hidden_size
     const float dropout_p,
     const bool has_x1,
     const bool has_residual,
@@ -744,8 +741,7 @@ std::vector<at::Tensor> dropout_add_ln_parallel_residual_bwd(
     TORCH_CHECK(mu.sizes() == rsigma.sizes());
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)dz0.get_device()};
+    at::cuda::CUDAGuard device_guard{dz0.device()};
 
     auto opts = x.options();
 

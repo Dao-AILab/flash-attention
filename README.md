@@ -40,14 +40,11 @@ This is a beta release for testing / benchmarking before we integrate that with
 the rest of the repo.
 
 Currently released:
-- FP16 forward and backward
-
-Coming soon in the next couple of days / next week:
-- BF16
-- Variable length (FP16, BF16)
-- FP8 forward.
+- FP16 / BF16 forward and backward, FP8 forward
 
 Requirements: H100 / H800 GPU, CUDA >= 12.3.
+
+We highly recommend CUDA 12.8 for best performance.
 
 To install:
 ```sh
@@ -59,13 +56,16 @@ To run the test:
 export PYTHONPATH=$PWD
 pytest -q -s test_flash_attn.py
 ```
-
-
+Once the package is installed, you can import it as follows:
+```python
+import flash_attn_interface
+flash_attn_interface.flash_attn_func()
+```
 
 ## Installation and features
 **Requirements:**
 - CUDA toolkit or ROCm toolkit
-- PyTorch 1.12 and above.
+- PyTorch 2.2 and above.
 - `packaging` Python package (`pip install packaging`)
 - `ninja` Python package (`pip install ninja`) *
 - Linux. Might work for Windows starting v2.3.2 (we've seen a few positive [reports](https://github.com/Dao-AILab/flash-attention/issues/595)) but Windows compilation still requires more testing. If you have ideas on how to set up prebuilt CUDA wheels for Windows, please reach out via Github issue.
@@ -98,7 +98,7 @@ MAX_JOBS=4 pip install flash-attn --no-build-isolation
 
 ### NVIDIA CUDA Support
 **Requirements:**
-- CUDA 11.7 and above.
+- CUDA 12.0 and above.
 
 We recommend the
 [Pytorch](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch)
@@ -112,7 +112,7 @@ FlashAttention-2 with CUDA currently supports:
 3. All head dimensions up to 256. ~~Head dim > 192 backward requires A100/A800 or H100/H800~~. Head dim 256 backward now works on consumer GPUs (if there's no dropout) as of flash-attn 2.5.5.
 
 ### AMD ROCm Support
-ROCm version uses [composable_kernel](https://github.com/ROCm/composable_kernel) as the backend. It provides the implementation of FlashAttention-2.
+ROCm version has two backends. There is [composable_kernel](https://github.com/ROCm/composable_kernel) (ck) which is the default backend and a [Triton](https://github.com/triton-lang/triton) backend. They provide an implementation of FlashAttention-2.
 
 **Requirements:**
 - ROCm 6.0 and above.
@@ -121,11 +121,90 @@ We recommend the
 [Pytorch](https://hub.docker.com/r/rocm/pytorch)
 container from ROCm, which has all the required tools to install FlashAttention.
 
-FlashAttention-2 with ROCm currently supports:
+#### Composable Kernel Backend
+FlashAttention-2 ROCm CK backend currently supports:
 1. MI200 or MI300 GPUs.
 2. Datatype fp16 and bf16
-3. Forward's head dimensions up to 256. Backward head dimensions up to 128.
+3. Both forward's and backward's head dimensions up to 256.
 
+#### Triton Backend
+The Triton implementation of the [Flash Attention v2](https://tridao.me/publications/flash2/flash2.pdf) is currently a work in progress.
+
+It supports AMD's CDNA (MI200, MI300) and RDNA GPU's using fp16, bf16 and fp32 datatypes.
+
+These features are supported in Fwd and Bwd
+1) Fwd and Bwd with causal masking
+2) Variable sequence lengths
+3) Arbitrary Q and KV sequence lengths
+4) Arbitrary head sizes
+5) Multi and grouped query attention
+6) Dropout
+7) Rotary embeddings
+8) ALiBi
+
+We are working on the following things
+1) Paged Attention 
+2) Sliding Window
+3) FP8
+4) Performance Improvements
+
+##### Getting Started
+To get started with the triton backend for AMD, follow the steps below.
+
+First install the recommended Triton version 
+
+```
+pip install triton==3.2.0
+```
+Then install Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.
+
+```
+cd flash-attention
+git checkout main_perf
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
+```
+
+To test that things are working, you can run our tests. These tests take hours so you don't need to run the full thing.
+```
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd.py
+```
+
+You can use autotune for better performance by using this flag `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE"`
+```
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE" python $PATH_TO_CODE
+```
+
+###### Docker
+You can also use the Dockerfile below which does the above steps on top of the latest rocm/pytorch image.
+```
+FROM rocm/pytorch:latest
+
+WORKDIR /workspace
+
+# install triton
+RUN pip install triton==3.2.0
+
+# install flash attention
+ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+
+RUN git clone https://github.com/ROCm/flash-attention.git &&\ 
+    cd flash-attention &&\
+    git checkout main_perf &&\
+    python setup.py install
+
+# set working dir
+WORKDIR /workspace/flash-attention
+```
+
+To build the docker file
+```
+docker build -t fa_triton .
+```
+
+To run the docker image
+```
+docker run -it --network=host --user root --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ipc=host --shm-size 16G --device=/dev/kfd --device=/dev/dri fa_triton
+```
 
 ## How to use FlashAttention
 
@@ -372,6 +451,10 @@ Thanks to @beginlner for this contribution.
 
 Support attention with softcapping, as used in Gemma-2 and Grok models.
 Thanks to @Narsil and @lucidrains for this contribution.
+
+### 2.7: Compatibility with torch compile
+
+Thanks to @ani300 for this contribution.
 
 ## Performance
 
