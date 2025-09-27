@@ -198,7 +198,7 @@ class SoftmaxSm100(Softmax):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         row_max_scaled = row_max * self.scale_log2
         for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
-            acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
+            acc_S_row[i], acc_S_row[i + 1] = utils.fma_packed_f32x2(
                 (acc_S_row[i], acc_S_row[i + 1]),
                 (self.scale_log2, self.scale_log2),
                 (-row_max_scaled, -row_max_scaled),
@@ -235,7 +235,8 @@ class SoftmaxSm100(Softmax):
                         acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
                         acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
                     else:
-                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
+                        # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
+                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
             )
@@ -250,14 +251,14 @@ class SoftmaxSm100(Softmax):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         minus_row_max_scaled = -row_max * self.scale_log2
         for i in cutlass.range_constexpr(0, cute.size(acc_S_row.shape), 2):
-            acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
+            acc_S_row[i], acc_S_row[i + 1] = utils.fma_packed_f32x2(
                 (acc_S_row[i], acc_S_row[i + 1]),
                 (self.scale_log2, self.scale_log2),
                 (minus_row_max_scaled, minus_row_max_scaled),
             )
 
         # for i in cutlass.range_constexpr(0, cute.size(acc_S_row.shape), 2):
-        #     acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
+        #     acc_S_row[i], acc_S_row[i + 1] = utils.fma_packed_f32x2(
         #         (acc_S_row[i], acc_S_row[i + 1]),
         #         (self.scale_log2, self.scale_log2),
         #         (minus_row_max_scaled, minus_row_max_scaled),
@@ -276,7 +277,7 @@ class SoftmaxSm100(Softmax):
         for j in cutlass.range_constexpr(frg_cnt):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
                 # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = (
-                #     cute.arch.fma_packed_f32x2(
+                #     utils.fma_packed_f32x2(
                 #         (acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]),
                 #         (self.scale_log2, self.scale_log2),
                 #         (minus_row_max_scaled, minus_row_max_scaled),
