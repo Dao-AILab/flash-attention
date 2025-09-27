@@ -185,21 +185,6 @@ def transpose_view(a: cute.Tensor) -> cute.Tensor:
     return cute.composition(a, cute.make_ordered_layout(shape, order=order))
 
 
-@dsl_user_op
-def exp2f_asm(a: float | Float32, *, loc=None, ip=None) -> Float32:
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "ex2.approx.ftz.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
 @cute.jit
 def exp2f(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
     """exp2f calculation for both vector and scalar.
@@ -284,10 +269,9 @@ def fmax_reduce(
         # We instead force the 3-input max.
         res = cute.make_fragment(x.shape, Float32)
         res.store(x)
+        local_max_0 = fmax(init_val, res[0], res[1]) if const_expr(init_val is not None) else fmax(res[0], res[1])
         local_max = [
-            fmax(init_val, res[0], res[1])
-            if const_expr(init_val is not None)
-            else fmax(res[0], res[1]),
+            local_max_0,
             fmax(res[2], res[3]),
             fmax(res[4], res[5]),
             fmax(res[6], res[7]),
@@ -375,7 +359,7 @@ def elem_pointer_i64(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) ->
     flat_stride = cute.flatten_to_tuple(x.stride)
     assert len(flat_coord_i64) == len(flat_stride), "Coordinate and stride must have the same length"
     offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
-    return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
+    return x.iterator + offset
 
 
 @cute.jit
@@ -392,18 +376,6 @@ def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
         for rest_k in cutlass.range_constexpr(tApA.shape[2]):
             tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
     return tApA
-
-
-@dsl_user_op
-def cp_async_mbarrier_arrive_shared(
-    mbar_ptr: cute.Pointer, noinc: bool = False, *, loc=None, ip=None
-) -> None:
-    nvvm.cp_async_mbarrier_arrive_shared(
-        mbar_ptr.llvm_ptr,
-        noinc=noinc,
-        loc=loc,
-        ip=ip,
-    )
 
 
 def canonical_warp_group_idx(sync: bool = True) -> cutlass.Int32:
@@ -575,7 +547,7 @@ def ex2_emulation(x: Float32, *, loc=None, ip=None) -> Float32:
     # We assume x <= 127.0
     poly_ex2_deg3 = (1.0, 0.695146143436431884765625, 0.227564394474029541015625, 0.077119089663028717041015625)
     fp32_round_int = float(2**23 + 2**22)
-    x_clamped = cute.arch.fmax(x, Float32(-127.0))
+    x_clamped = cute.arch.fmax(x, -127.0)
     # We want to round down here, so that the fractional part is in [0, 1)
     x_rounded = add_round_down(x_clamped, fp32_round_int, loc=loc, ip=ip)
     # The integer floor of x is now in the last 8 bits of x_rounded
@@ -592,7 +564,7 @@ def ex2_emulation_2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float
     # We assume x <= 127.0 and y <= 127.0
     poly_ex2_deg3 = (1.0, 0.695146143436431884765625, 0.227564394474029541015625, 0.077119089663028717041015625)
     fp32_round_int = float(2**23 + 2**22)
-    xy_clamped = (cute.arch.fmax(x, Float32(-127.0)), cute.arch.fmax(y, Float32(-127.0)))
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     # We want to round down here, so that the fractional part is in [0, 1)
     xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM)
     # The integer floor of x & y are now in the last 8 bits of xy_rounded

@@ -1632,7 +1632,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q,
                 #             headdim=mQ.shape[1])
                 pack_gqa.load_Q(mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q)
-                utils.cp_async_mbarrier_arrive_shared(mbar_ptr_Q, noinc=True)
+                cute.arch.cp_async_mbarrier_arrive_noinc(mbar_ptr_Q)
 
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
             cute.arch.mbarrier_wait(mbar_ptr_Q, phase=q_consumer_phase)
