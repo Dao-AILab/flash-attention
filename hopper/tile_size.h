@@ -60,7 +60,11 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         } else if (headdim <= 96) {
             return {192, 128, true, true};
         } else if (headdim <= 128) {
-            return {128, paged_kv_non_TMA ? 160 : (v_colmajor || (softcap && is_local) ? 192 : 224), true, true};
+            if (use_one_mma_wg) {
+                return {64, 96, true, true};
+            } else{
+                return {128, paged_kv_non_TMA ? 160 : (v_colmajor || (softcap && is_local) ? 192 : 224), true, true};
+            }
         } else if (headdim <= 192) {
             return {128, (paged_kv_non_TMA || softcap) && is_local ? 128 : 160, true, true};
         } else {
