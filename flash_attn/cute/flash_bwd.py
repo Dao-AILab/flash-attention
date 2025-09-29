@@ -819,7 +819,7 @@ class FlashAttentionBackwardSm80:
         else:
             tdVrP = mma_params.tdVrP
 
-        # MMA dK
+        # MMA dV
         sm80_utils.gemm(
             mma_params.thr_mma_dkv, mma_params.acc_dV, tdVrP, mma_params.tdVrdO,
             smem_copy_params.tdVsPt,

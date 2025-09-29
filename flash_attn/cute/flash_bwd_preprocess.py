@@ -261,7 +261,7 @@ class FlashAttentionBackwardPreprocess:
         gdPsum = cute.local_tile(
             mdPsum[batch_size, num_head, None], (self.m_block_size,), (m_block,)
         )
-        # Only the thread corresponding to column 0 writes out the lse to gmem
+        # Only the thread corresponding to column 0 writes out the dPsum to gmem
         if tOcO[0, 0, 0][1] == 0:
             for m in cutlass.range(cute.size(dP_sum), unroll_full=True):
                 row = tOcO[0, m, 0][0]
