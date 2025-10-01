@@ -167,7 +167,7 @@ class FlashAttentionForwardSm100:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
 
-        self.kv_stage = 4 if self.q_dtype.width == 8 else 3
+        self.kv_stage = 4 if (self.k_dtype.width == 8 or self.v_dtype.width == 8) else 3
         self.acc_stage = 1
         self.epi_stage = 2
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
@@ -251,11 +251,13 @@ class FlashAttentionForwardSm100:
         if const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN):
             raise RuntimeError("The layout of mV is not supported")
 
-        # check type consistency
-        if const_expr(self.q_dtype != self.k_dtype):
-            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
-        if const_expr(self.q_dtype != self.v_dtype):
-            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
+        # Allow mixed precision: Q(bf16/f16) with KV(bf16/f16/fp8)
+        if const_expr(self.q_dtype.width not in [16]):
+            raise TypeError(f"Q must be 16-bit precision, got {self.q_dtype}")
+        if const_expr(self.k_dtype.width not in [8, 16]):
+            raise TypeError(f"K must be 8-bit or 16-bit precision, got {self.k_dtype}")
+        if const_expr(self.v_dtype.width not in [8, 16]):
+            raise TypeError(f"V must be 8-bit or 16-bit precision, got {self.v_dtype}")
         self._setup_attributes()
         self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
         # This can be tuned
@@ -267,8 +269,11 @@ class FlashAttentionForwardSm100:
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = tcgen05.OperandMajorMode.K
+        qk_dtype = self.q_dtype if const_expr(self.q_dtype.width >= self.k_dtype.width) else self.k_dtype
+        pv_dtype = self.q_dtype if const_expr(self.q_dtype.width >= self.v_dtype.width) else self.v_dtype
+
         tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
-            self.q_dtype,
+            qk_dtype,
             self.q_major_mode,
             self.k_major_mode,
             self.qk_acc_dtype,
@@ -276,7 +281,7 @@ class FlashAttentionForwardSm100:
             self.mma_tiler_qk[:2],
         )
         tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
-            self.v_dtype,
+            pv_dtype,
             p_major_mode,
             self.v_major_mode,
             self.pv_acc_dtype,
