@@ -1024,7 +1024,7 @@ class FlashAttentionForwardSm100:
                 # are empty. For subsequent iterations, the wait happened at the end
                 # of the while loop.
                 # 3. gemm
-                # sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
+                # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
                 sK_cur = sK[None, None, None, mma_kv_consumer_state.index]
                 if const_expr(self.uneven_kv_smem):
                     sK_cur = self.offset_kv_smem(sK_cur, mma_kv_consumer_state.index, mma_kv_consumer_state.phase)
@@ -1085,7 +1085,7 @@ class FlashAttentionForwardSm100:
                     # Don't need to wait for the softmax warp to have finished reading the previous
                     # Si, since this gemm is scheduled after the PV gemm, which guaranteed that Si
                     # has been read and Pi has been written.
-                    # sm100_utils.gemm(tiled_mma_qk, tStS0, tSrQs[0], tSrK[None, None, None, Ki_index], zero_init=True)
+                    # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrK[None, None, None, Ki_index], zero_init=True)
                     sK_cur = sK[None, None, None, Ki_index]
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
