@@ -93,6 +93,7 @@ def warp_reduce(
     op: Callable,
     width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
 ) -> cute.TensorSSA | cute.Numeric:
+    assert width <= cute.arch.WARP_SIZE
     if const_expr(isinstance(val, cute.TensorSSA)):
         res = cute.make_fragment(val.shape, val.dtype)
         res.store(val)

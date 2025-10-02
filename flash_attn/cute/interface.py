@@ -296,17 +296,17 @@ def _flash_attn_bwd(
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        utils.convert_from_dlpack(t.detach(), leading_dim=t.ndim - 1, alignment=16, divisibility=8)
         for t in (q, k, v, out, dout, dq, dk, dv)
     ]
     lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=2)
     dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        utils.convert_from_dlpack(t.detach(), leading_dim=2, alignment=16, divisibility=4)
         for t in (dq_accum, dpsum, lse_log2)
     ]
     if qhead_per_kvhead > 1:
         dk_accum_tensor, dv_accum_tensor = [
-            from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=2)
+            utils.convert_from_dlpack(t.detach(), leading_dim=2, alignment=16, divisibility=4)
             for t in (dk_accum, dv_accum)
         ]
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -465,7 +465,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.softcap,
         )
-        return dq, dk, dv, *((None,) * 5)
+        return dq, dk, dv, *((None,) * 6)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
