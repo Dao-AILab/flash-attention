@@ -59,6 +59,12 @@ namespace pybind11::detail {
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+namespace {
+inline at::cuda::CUDAGuard make_cuda_guard_from_tensor(const at::Tensor& t) {
+  return at::cuda::CUDAGuard(static_cast<c10::DeviceIndex>(t.get_device()));
+}
+} // namespace
+
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
                       const size_t b,
@@ -629,7 +635,7 @@ mha_fwd_get_scheduler_metadata(
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)seqused_k.get_device()};
+    auto device_guard = make_cuda_guard_from_tensor(seqused_k);
 
     auto opts = seqused_k.options();
     // This needs to be set after get_num_splits
@@ -884,7 +890,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    auto device_guard = make_cuda_guard_from_tensor(q);
 
     at::Tensor softmax_lse;
     if (!is_varlen_q) {
@@ -1454,7 +1460,7 @@ std::vector<at::Tensor> mha_bwd(
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    auto device_guard = make_cuda_guard_from_tensor(q);
 
     auto opts = q.options();
     // Need softmax_d to have total_q_padded_rounded since we want its address to be aligned by 16/8 bytes for TMA / LDG.64

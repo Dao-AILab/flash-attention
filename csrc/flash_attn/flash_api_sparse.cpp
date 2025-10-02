@@ -16,6 +16,12 @@
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+namespace {
+inline at::cuda::CUDAGuard make_cuda_guard_from_tensor(const at::Tensor& t) {
+  return at::cuda::CUDAGuard(static_cast<c10::DeviceIndex>(t.get_device()));
+}
+} // namespace
+
 namespace FLASH_NAMESPACE {
 
 //
@@ -231,7 +237,7 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    auto device_guard = make_cuda_guard_from_tensor(q);
 
     auto opts = q.options();
 
@@ -435,7 +441,7 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    auto device_guard = make_cuda_guard_from_tensor(q);
 
     auto opts = q.options();
     auto softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
