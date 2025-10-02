@@ -21,6 +21,8 @@
 #include "dropout.h"
 #include "rotary.h"
 
+#include "rpe.h"
+
 namespace FLASH_NAMESPACE {
 
 using namespace cute;
@@ -48,7 +50,7 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
 }
 
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Has_rpe_bias, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -284,8 +286,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
 
+    // RPE biases
+    //Tensor rpe_weights = make_tensor(make_smem_ptr(reinterpret_cast<cutlass::tfloat32_t*>(smem_ + Kernel_traits::kSmemQKVSize)), typename Kernel_traits::SmemLayoutRPE{});
+    FLASH_NAMESPACE::RPE<Is_causal, kBlockM, kBlockN, Kernel_traits::kNWarps, Kernel_traits::kNThreads, false> rpe(params.rpe_num_buckets, params.rpe_max_distance, params.h, params.scale_softmax);
+    float *smem_rpe_weights = reinterpret_cast<float *>(smem_ + Kernel_traits::kSmemQKVSize);
+    float *gmem_rpe_weights = reinterpret_cast<float*>(params.rpe_weights_ptr) + bidh * params.rpe_num_buckets;
+
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
-    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi, Has_rpe_bias> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope, kBlockM - 1, kBlockN + kBlockM - 1);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
@@ -304,6 +312,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         clear(acc_s);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+
+        // Load RPE biases
+        if (Has_rpe_bias) {
+            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx);
+            __syncthreads();
+        }
 
         // Advance gV
         if (masking_step > 0) {
@@ -326,7 +340,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         mask.template apply_mask<Is_causal, Is_even_MN>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16, smem_rpe_weights
         );
 
         FLASH_NAMESPACE::cp_async_wait<0>();
@@ -383,6 +397,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         cute::cp_async_fence();
 
+        // Load RPE biases
+        if (Has_rpe_bias) {
+            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx);
+            __syncthreads();
+        }
+        
         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
@@ -401,7 +421,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         mask.template apply_mask</*Causal_mask=*/false>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16, smem_rpe_weights
         );
 
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
@@ -495,7 +515,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Has_rpe_bias, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
 
     using Element = typename Kernel_traits::Element;
@@ -835,8 +855,13 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
 
+    // Array for RPE iases
+    FLASH_NAMESPACE::RPE<Is_causal, kBlockM, kBlockN, Kernel_traits::kNWarps, Kernel_traits::kNThreads, false> rpe(params.rpe_num_buckets, params.rpe_max_distance, params.h, params.scale_softmax);
+    float *smem_rpe_weights = reinterpret_cast<float *>(smem_ + Kernel_traits::kSmemQKVSize);
+    float *gmem_rpe_weights = reinterpret_cast<float*>(params.rpe_weights_ptr) + bidh * params.rpe_num_buckets;
+
     const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
-    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi, Has_rpe_bias> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope, kBlockM - 1, kBlockN + kBlockM - 1);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
@@ -855,6 +880,12 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         clear(acc_s);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+
+        // Load RPE biases
+        if (Has_rpe_bias) {
+            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx);
+            __syncthreads();
+        }
 
         // Advance gV
         if (masking_step > 0) {
@@ -887,7 +918,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 
         mask.template apply_mask<Is_causal, Is_even_MN>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16, smem_rpe_weights
         );
 
         FLASH_NAMESPACE::cp_async_wait<0>();
@@ -939,6 +970,13 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         clear(acc_s);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+
+        // Load RPE biases
+        if (Has_rpe_bias) {
+            rpe.load_rpe(gmem_rpe_weights, smem_rpe_weights, m_block, n_block, tidx);
+            __syncthreads();
+        }
+
         // Advance gV
         if (block_table == nullptr) {
             tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
@@ -980,7 +1018,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
 
         mask.template apply_mask</*Causal_mask=*/false>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16, smem_rpe_weights
         );
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
@@ -1072,7 +1110,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Has_rpe_bias, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1088,12 +1126,12 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
+    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Has_rpe_bias, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Has_rpe_bias, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_splitkv(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1102,7 +1140,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
-    FLASH_NAMESPACE::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    FLASH_NAMESPACE::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Has_rpe_bias, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

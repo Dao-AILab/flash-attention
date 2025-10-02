@@ -140,6 +140,10 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+
+    void * __restrict__ rpe_weights_ptr;
+    int rpe_num_buckets;
+    int rpe_max_distance;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -179,6 +183,9 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
     // The pointer to the softmax d sum.
     void *__restrict__ dsoftmax_sum;
+
+    // Pointer to drpe_weights
+    void *__restrict__ drpe_weights_ptr;
 
     bool deterministic;
     index_t dq_accum_split_stride;
