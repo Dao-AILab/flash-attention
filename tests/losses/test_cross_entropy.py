@@ -5,11 +5,11 @@ import torch
 import torch.nn.functional as F
 from flash_attn.losses.cross_entropy import CrossEntropyLoss
 
-is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
+# is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 
 
 @pytest.mark.parametrize(
-    "dtype", [torch.float16, torch.float32] + ([torch.bfloat16] if is_sm8x else [])
+    "dtype", [torch.float16, torch.float32] #+ ([torch.bfloat16] if is_sm8x else [])
 )
 # @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("precompute_lse", [False, True])
@@ -37,7 +37,8 @@ def test_cross_entropy_loss(
 ):
     if precompute_lse and (logit_scale != 1.0 or smoothing != 0.0):
         pytest.skip("precompute_lse only works with logit_scale=1.0 and smoothing=0.0")
-    device = "cuda"
+    # device = "cuda"
+    device = "npu"
     rtol, atol = (1e-5, 1e-6) if dtype == torch.float32 else (1e-3, 1e-4)
     # set seed
     torch.random.manual_seed(0)

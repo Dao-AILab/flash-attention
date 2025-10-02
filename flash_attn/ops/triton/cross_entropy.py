@@ -36,63 +36,116 @@ def cross_entropy_fwd_kernel(
     class_start_idx,  # Useful for tensor parallel when each rank only has a subset of classes
     n_cols,  # shapes
     logits_row_stride,  # strides
+    n_rows,
     BLOCK_SIZE: tl.constexpr,
     HAS_SMOOTHING: tl.constexpr,
     # if SPLIT (e.g. tensor parallel), don't include the LSE in the loss since it's not the final LSE
     SPLIT: tl.constexpr,
     PRECOMPUTED_LSE: tl.constexpr,  # If LSE is already computed (also no smoothing and logit_scale == 1.0)
 ):
+    # row_idx = tl.program_id(0)
+    # logits_ptr = logits_ptr + row_idx * logits_row_stride.to(tl.int64)
+    # sum_logits = 0.0  # For smoothing
+    # if not PRECOMPUTED_LSE:
+    #     # Statistics for online softmax
+    #     m_i = -float("inf")
+    #     l_i = 0.0
+    #     for col_offset in range(0, n_cols, BLOCK_SIZE):
+    #         cols = col_offset + tl.arange(0, BLOCK_SIZE)
+    #         logits = tl.load(logits_ptr + cols, mask=cols < n_cols, other=-float("inf")).to(
+    #             tl.float32
+    #         ) * logit_scale
+    #         if HAS_SMOOTHING:
+    #             sum_logits += tl.sum(tl.where(cols < n_cols, logits, 0.0))
+    #         m_i_new = tl.maximum(m_i, tl.max(logits))
+    #         l_i = tl.exp(m_i - m_i_new) * l_i + tl.sum(tl.exp(logits - m_i_new))
+    #         m_i = m_i_new
+    #     lse = tl.log(l_i) + m_i
+    #     tl.store(lse_ptr + row_idx, lse)
+    # else:
+    #     lse = tl.load(lse_ptr + row_idx)
+    # label_idx = tl.load(labels_ptr + row_idx)
+    # if label_idx == ignore_index:
+    #     loss = 0.0
+    #     z_loss = 0.0
+    # else:
+    #     label_idx -= class_start_idx
+    #     if label_idx >= 0 and label_idx < n_cols:
+    #         logits_label = tl.load(logits_ptr + label_idx) * logit_scale
+    #         if HAS_SMOOTHING:
+    #             loss = (
+    #                 (lse if not SPLIT else 0.0)
+    #                 - smoothing * sum_logits / total_classes
+    #                 - (1 - smoothing) * logits_label
+    #             )
+    #         else:
+    #             loss = (lse if not SPLIT else 0.0) - logits_label
+    #     else:
+    #         # If label is out of bounds, we set the CE loss to 0.0. But we still want the smoothing loss
+    #         if HAS_SMOOTHING:
+    #             loss = smoothing * ((lse if not SPLIT else 0.0) - sum_logits / total_classes)
+    #         else:
+    #             loss = 0.0
+    #     if not SPLIT:
+    #         z_loss = lse_square_scale * lse * lse
+    #         loss += z_loss
+    #     else:
+    #         z_loss = 0.0
+    # tl.store(loss_ptr + row_idx, loss)
+    # if not SPLIT:
+    #     tl.store(z_loss_ptr + row_idx, z_loss)
     row_idx = tl.program_id(0)
-    logits_ptr = logits_ptr + row_idx * logits_row_stride.to(tl.int64)
-    sum_logits = 0.0  # For smoothing
-    if not PRECOMPUTED_LSE:
-        # Statistics for online softmax
-        m_i = -float("inf")
-        l_i = 0.0
-        for col_offset in range(0, n_cols, BLOCK_SIZE):
-            cols = col_offset + tl.arange(0, BLOCK_SIZE)
-            logits = tl.load(logits_ptr + cols, mask=cols < n_cols, other=-float("inf")).to(
-                tl.float32
-            ) * logit_scale
-            if HAS_SMOOTHING:
-                sum_logits += tl.sum(tl.where(cols < n_cols, logits, 0.0))
-            m_i_new = tl.maximum(m_i, tl.max(logits))
-            l_i = tl.exp(m_i - m_i_new) * l_i + tl.sum(tl.exp(logits - m_i_new))
-            m_i = m_i_new
-        lse = tl.log(l_i) + m_i
-        tl.store(lse_ptr + row_idx, lse)
-    else:
-        lse = tl.load(lse_ptr + row_idx)
-    label_idx = tl.load(labels_ptr + row_idx)
-    if label_idx == ignore_index:
-        loss = 0.0
-        z_loss = 0.0
-    else:
-        label_idx -= class_start_idx
-        if label_idx >= 0 and label_idx < n_cols:
-            logits_label = tl.load(logits_ptr + label_idx) * logit_scale
-            if HAS_SMOOTHING:
-                loss = (
-                    (lse if not SPLIT else 0.0)
-                    - smoothing * sum_logits / total_classes
-                    - (1 - smoothing) * logits_label
-                )
-            else:
-                loss = (lse if not SPLIT else 0.0) - logits_label
+    grid_size = tl.num_programs(0)
+    for i in range(row_idx, n_rows, grid_size):
+        logits_ptr_i = logits_ptr + i * logits_row_stride.to(tl.int64)
+        sum_logits = 0.0
+        if not PRECOMPUTED_LSE:
+            m_i = -float("inf")
+            l_i = 0.0
+            for col_offset in range(0, n_cols, BLOCK_SIZE):
+                cols = col_offset + tl.arange(0, BLOCK_SIZE)
+                logits = tl.load(logits_ptr_i + cols, mask=cols < n_cols, other=-float("inf")).to(
+                    tl.float32
+                ) * logit_scale
+                if HAS_SMOOTHING:
+                    sum_logits += tl.sum(tl.where(cols < n_cols, logits, 0.0))
+                m_i_new = tl.maximum(m_i, tl.max(logits))
+                l_i = tl.exp(m_i - m_i_new) * l_i + tl.sum(tl.exp(logits - m_i_new))
+                m_i = m_i_new
+            lse = tl.log(l_i) + m_i
+            tl.store(lse_ptr + i, lse)
         else:
-            # If label is out of bounds, we set the CE loss to 0.0. But we still want the smoothing loss
-            if HAS_SMOOTHING:
-                loss = smoothing * ((lse if not SPLIT else 0.0) - sum_logits / total_classes)
-            else:
-                loss = 0.0
-        if not SPLIT:
-            z_loss = lse_square_scale * lse * lse
-            loss += z_loss
-        else:
+            lse = tl.load(lse_ptr + i)
+        label_idx = tl.load(labels_ptr + i)
+        if label_idx == ignore_index:
+            loss = 0.0
             z_loss = 0.0
-    tl.store(loss_ptr + row_idx, loss)
-    if not SPLIT:
-        tl.store(z_loss_ptr + row_idx, z_loss)
+        else:
+            label_idx -= class_start_idx
+            if label_idx >= 0 and label_idx < n_cols:
+                logits_label = tl.load(logits_ptr_i + label_idx) * logit_scale
+                if HAS_SMOOTHING:
+                    loss = (
+                        (lse if not SPLIT else 0.0)
+                        - smoothing * sum_logits / total_classes
+                        - (1 - smoothing) * logits_label
+                    )
+                else:
+                    loss = (lse if not SPLIT else 0.0) - logits_label
+            else:
+                # If label is out of bounds, we set the CE loss to 0.0. But we still want the smoothing loss
+                if HAS_SMOOTHING:
+                    loss = smoothing * ((lse if not SPLIT else 0.0) - sum_logits / total_classes)
+                else:
+                    loss = 0.0
+            if not SPLIT:
+                z_loss = lse_square_scale * lse * lse
+                loss += z_loss
+            else:
+                z_loss = 0.0
+        tl.store(loss_ptr + i, loss)
+        if not SPLIT:
+            tl.store(z_loss_ptr + i, z_loss)
 
 
 @triton.heuristics(
@@ -120,30 +173,60 @@ def cross_entropy_bwd_kernel(
     BLOCK_SIZE: tl.constexpr,
     HAS_SMOOTHING: tl.constexpr,
 ):
+    # row_idx = tl.program_id(0)
+    # col_block_idx = tl.program_id(1)
+    # logits_ptr = logits_ptr + row_idx * logits_row_stride.to(tl.int64)
+    # dlogits_ptr = dlogits_ptr + row_idx * dlogits_row_stride.to(tl.int64)
+    # col_offsets = col_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # label_idx = tl.load(labels_ptr + row_idx)
+    # if label_idx != ignore_index:
+    #     dloss = tl.load(dloss_ptr + row_idx * dloss_row_stride)
+    # else:
+    #     dloss = 0.0
+    # logits = tl.load(logits_ptr + col_offsets, mask=col_offsets < n_cols, other=-float("inf")).to(
+    #     tl.float32
+    # ) * logit_scale
+    # lse = tl.load(lse_ptr + row_idx)
+    # probs = tl.exp(logits - lse)
+    # probs += 2.0 * lse_square_scale * lse * probs
+    # label_idx -= class_start_idx
+    # if HAS_SMOOTHING:
+    #     smooth_positive = 1.0 - smoothing
+    #     smooth_negative = smoothing / total_classes
+    #     probs = tl.where(col_offsets == label_idx, probs - smooth_positive, probs) - smooth_negative
+    # else:
+    #     probs = tl.where(col_offsets == label_idx, probs - 1.0, probs)
+    # tl.store(dlogits_ptr + col_offsets, (dloss * logit_scale) * probs, mask=col_offsets < n_cols)
+
     row_idx = tl.program_id(0)
-    col_block_idx = tl.program_id(1)
     logits_ptr = logits_ptr + row_idx * logits_row_stride.to(tl.int64)
     dlogits_ptr = dlogits_ptr + row_idx * dlogits_row_stride.to(tl.int64)
-    col_offsets = col_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     label_idx = tl.load(labels_ptr + row_idx)
+    lse = tl.load(lse_ptr + row_idx)
+    label_idx -= class_start_idx
+
     if label_idx != ignore_index:
         dloss = tl.load(dloss_ptr + row_idx * dloss_row_stride)
     else:
         dloss = 0.0
-    logits = tl.load(logits_ptr + col_offsets, mask=col_offsets < n_cols, other=-float("inf")).to(
+
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < n_cols
+
+        logits = tl.load(logits_ptr + col_offsets, mask=col_offsets < n_cols, other=-float("inf")).to(
         tl.float32
-    ) * logit_scale
-    lse = tl.load(lse_ptr + row_idx)
-    probs = tl.exp(logits - lse)
-    probs += 2.0 * lse_square_scale * lse * probs
-    label_idx -= class_start_idx
-    if HAS_SMOOTHING:
-        smooth_positive = 1.0 - smoothing
-        smooth_negative = smoothing / total_classes
-        probs = tl.where(col_offsets == label_idx, probs - smooth_positive, probs) - smooth_negative
-    else:
-        probs = tl.where(col_offsets == label_idx, probs - 1.0, probs)
-    tl.store(dlogits_ptr + col_offsets, (dloss * logit_scale) * probs, mask=col_offsets < n_cols)
+        ) * logit_scale
+        probs = tl.exp(logits - lse)
+        probs += 2.0 * lse_square_scale * lse * probs
+        
+        if HAS_SMOOTHING:
+            smooth_positive = 1.0 - smoothing
+            smooth_negative = smoothing / total_classes
+            probs = tl.where(col_offsets == label_idx, probs - smooth_positive, probs) - smooth_negative
+        else:
+            probs = tl.where(col_offsets == label_idx, probs - 1.0, probs)
+        tl.store(dlogits_ptr + col_offsets, (dloss * logit_scale) * probs, mask=col_offsets < n_cols)
 
 
 class CrossEntropyLoss(torch.autograd.Function):
@@ -178,7 +261,7 @@ class CrossEntropyLoss(torch.autograd.Function):
         if logits.stride(-1) != 1:
             logits = logits.contiguous()
         MAX_BLOCK_SIZE = 16 * 1024
-        BLOCK_SIZE = min(triton.next_power_of_2(n_cols), MAX_BLOCK_SIZE)
+        BLOCK_SIZE = 2048 #min(triton.next_power_of_2(n_cols), MAX_BLOCK_SIZE)
         num_warps = (
             4
             if BLOCK_SIZE < 2048
@@ -193,8 +276,10 @@ class CrossEntropyLoss(torch.autograd.Function):
         z_losses = torch.empty(n_rows, dtype=torch.float, device=logits.device)
         # Need this, otherwise Triton tries to launch from cuda:0 and we get
         # ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
-        with torch.cuda.device(logits.device.index):
-            cross_entropy_fwd_kernel[(n_rows,)](
+        # with torch.cuda.device(logits.device.index):
+        with torch.npu.device(logits.device.index):
+            # cross_entropy_fwd_kernel[(n_rows,)](
+            cross_entropy_fwd_kernel[(1024,)](
                 losses,  # data ptrs
                 lse,
                 z_losses,
@@ -208,6 +293,7 @@ class CrossEntropyLoss(torch.autograd.Function):
                 class_start_idx,
                 n_cols,  # shapes
                 logits.stride(0),  # strides
+                n_rows,
                 BLOCK_SIZE=BLOCK_SIZE,  # constants
                 SPLIT=world_size > 1,
                 PRECOMPUTED_LSE=use_precomputed_lse,
@@ -263,10 +349,12 @@ class CrossEntropyLoss(torch.autograd.Function):
         n_rows, n_cols = logits.shape
         BLOCK_SIZE = min(triton.next_power_of_2(n_cols), 4 * 1024)
         num_warps = 4 if BLOCK_SIZE < 2048 else (8 if BLOCK_SIZE < 8192 else 16)
-        grid = lambda META: (n_rows, triton.cdiv(n_cols, META["BLOCK_SIZE"]))  # noqa
+        # grid = lambda META: (n_rows, triton.cdiv(n_cols, META["BLOCK_SIZE"]))  # noqa
+        grid = (n_rows,)
         # Need this, otherwise Triton tries to launch from cuda:0 and we get
         # ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
-        with torch.cuda.device(logits.device.index):
+        # with torch.cuda.device(logits.device.index):
+        with torch.npu.device(logits.device.index):
             cross_entropy_bwd_kernel[grid](
                 dlogits,  # data ptrs
                 grad_losses,
