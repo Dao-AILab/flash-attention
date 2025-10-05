@@ -215,6 +215,9 @@ struct CollectiveMainloopFwdSm80 {
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
         ElementSAux const* const ptr_S_aux = nullptr;
+        int cp_world_size;
+        int cp_rank;
+        int const* const cp_tot_seqused_k = nullptr;
     };
 
     // Device side kernel params

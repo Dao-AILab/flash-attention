@@ -707,7 +707,10 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         int num_splits,
         std::optional<bool> pack_gqa_,
         int const sm_margin,
-        std::optional<const at::Tensor> &s_aux_ // (h)
+        std::optional<const at::Tensor> &s_aux_, // (h)
+        int const cp_world_size,  // context parallelism (cp) world size
+        int const cp_rank,         // cp rank
+        std::optional<const at::Tensor> &cp_tot_seqused_k_ // b. total seqused_k in cp world
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -844,6 +847,12 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(seqused_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
         CHECK_DEVICE(seqused_k); CHECK_CONTIGUOUS(seqused_k);
         CHECK_SHAPE(seqused_k, batch_size);
+    }
+    if (cp_tot_seqused_k_.has_value()) {
+        auto cp_tot_seqused_k = cp_tot_seqused_k_.value();
+        TORCH_CHECK(cp_tot_seqused_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
+        CHECK_DEVICE(cp_tot_seqused_k); CHECK_CONTIGUOUS(cp_tot_seqused_k);
+        CHECK_SHAPE(cp_tot_seqused_k, batch_size);
     }
 
     if (leftpad_k_.has_value()) {
@@ -1153,6 +1162,14 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     } else {
         params.s_aux_ptr = nullptr;
     }
+
+    params.cp_world_size = cp_world_size;
+    params.cp_rank = cp_rank;
+    params.cp_tot_seqused_k = cp_tot_seqused_k_.has_value() ?
+      static_cast<int *>(cp_tot_seqused_k_.value().data_ptr()) : nullptr;
+    TORCH_CHECK(cp_world_size > 0, "cp_world_size must be positive, required by downstream unified code path. Use 1 if CP is not enabled.");
+    TORCH_CHECK(cp_world_size != 1 || cp_rank == 0, "When context parallelism is disabled, cp_rank must be zero");
+    TORCH_CHECK(cp_world_size == 1 || cp_tot_seqused_k_.has_value(), "cp_tot_seqused_k_ must be provided when context parallelism is enabled.");
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
     TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");

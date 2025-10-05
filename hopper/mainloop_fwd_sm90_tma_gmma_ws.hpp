@@ -412,6 +412,10 @@ struct CollectiveMainloopFwdSm90 {
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
         ElementSAux const* const ptr_S_aux = nullptr;
+        // Context parallelism (CP) parameters
+        int const cp_world_size = 1;
+        int const cp_rank = 0;
+        int const* const cp_tot_seqused_k = nullptr;
     };
 
     // Device side kernel params
@@ -469,6 +473,9 @@ struct CollectiveMainloopFwdSm90 {
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
         ElementSAux const* const ptr_S_aux = nullptr;
+        int cp_world_size = 1;
+        int cp_rank = 0;
+        int const* const cp_tot_seqused_k = nullptr;
     };
 
     static Params
@@ -584,7 +591,8 @@ struct CollectiveMainloopFwdSm90 {
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
-                args.ptr_S_aux};
+                args.ptr_S_aux,
+                args.cp_world_size, args.cp_rank, args.cp_tot_seqused_k};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -1093,7 +1101,8 @@ struct CollectiveMainloopFwdSm90 {
         // But we subtract n_offset for consistency in mask calculations
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 - n_offset /*sink_token_length*/,
-            params.qhead_per_khead_divmod
+            params.qhead_per_khead_divmod,
+            params.cp_world_size, params.cp_rank, seqlen_info.tot_seqlen_k
         );
 
         float softcap_val = params.softcap_val;
@@ -1275,8 +1284,13 @@ struct CollectiveMainloopFwdSm90 {
                 auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
                 int const m_idx_min = !PackGQA ? m_block * kBlockM : params.qhead_per_khead_divmod.divide(m_block * kBlockM);
                 // If local, blocking (window_size_right + window_size_left)
+                // when cp is not enabled, tot_seqlen_k is equal to seqlen_k, and cp_world_size is 1.
+                // cp_world_size is guaranteed to be greater than 0
                 int const n_block_min_causal_local_mask =
-                    std::max(n_block_min, (m_idx_min + seqlen_k - seqlen_q + params.window_size_right) / kBlockN);
+                    std::max(n_block_min,
+                             (m_idx_min + seqlen_info.tot_seqlen_k - seqlen_q + params.window_size_right) /
+                             seqlen_info.cp_world_size /
+                             kBlockN);
                 #pragma unroll 1
                 for (; n_block >= n_block_min_causal_local_mask; --n_block) {
                     fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);
@@ -1285,10 +1299,15 @@ struct CollectiveMainloopFwdSm90 {
 
             int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : params.qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
             // If local, blocking (m_idx_max - m_idx_min)
+            // when cp is not enabled, tot_seqlen_k is equal to seqlen_k, and cp_world_size is 1.
+            // cp_world_size is guaranteed to be greater than 0
             int const n_block_min_before_local_mask = !Is_local
                 ? n_block_min
                 : std::max(n_block_min,
-                           cute::ceil_div(m_idx_max + seqlen_k - seqlen_q - params.window_size_left, kBlockN));
+                           cute::ceil_div(
+                           cute::ceil_div(m_idx_max + seqlen_info.tot_seqlen_k - seqlen_q - params.window_size_left - seqlen_info.cp_rank,
+                                          seqlen_info.cp_world_size),
+                           kBlockN));
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; --n_block) {

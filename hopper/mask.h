@@ -23,11 +23,13 @@ struct Mask {
     int const seqlen_q, seqlen_k;
     int const window_size_left, window_size_right, sink_token_length;
     cutlass::FastDivmod const qhead_per_khead_divmod;
+    int const cp_world_size, cp_rank, tot_seqlen_k;
 
     CUTLASS_DEVICE
     Mask(const int thread_idx, const int seqlen_q, const int seqlen_k,
          const int window_size_left, const int window_size_right, const int sink_token_length,
-         cutlass::FastDivmod const &qhead_per_khead_divmod)
+         cutlass::FastDivmod const &qhead_per_khead_divmod,
+         const int cp_world_size = 1, const int cp_rank = 0, const int tot_seqlen_k = 0)
         : thread_idx(thread_idx)
         , seqlen_q(seqlen_q)
         , seqlen_k(seqlen_k)
@@ -35,6 +37,9 @@ struct Mask {
         , window_size_right(window_size_right)
         , sink_token_length(sink_token_length)
         , qhead_per_khead_divmod(qhead_per_khead_divmod)
+        , cp_world_size(cp_world_size)
+        , cp_rank(cp_rank)
+        , tot_seqlen_k(tot_seqlen_k)
     {
     };
 
@@ -94,7 +99,19 @@ struct Mask {
                             : __viaddmin_s32(row_idx, causal_row_offset, seqlenk_col_limit);
                         #pragma unroll
                         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-                            if (int(get<Col>(t0ScS_rowcol(_0{}, n))) >= col_limit_right) { tSrS_rowcol(m, n) = -INFINITY; }
+                            int col_idx = int(get<Col>(t0ScS_rowcol(_0{}, n)));
+                            if (cp_world_size > 1) {
+                                int local_k_idx = int(get<Col>(t0ScS_rowcol(_0{}, n))) + get<Col>(tScS_rowcol(_0{}, _0{})) + n_block * kBlockN;
+                                int abs_k_idx = local_k_idx * cp_world_size + cp_rank;
+                                int k_limit = row_idx + tot_seqlen_k - seqlen_q;
+                                if (abs_k_idx > k_limit || (Seqlenk_mask && abs_k_idx >= tot_seqlen_k)) {
+                                    tSrS_rowcol(m, n) = -INFINITY;
+                                }
+                            } else {
+                                if (col_idx >= col_limit_right) {
+                                    tSrS_rowcol(m, n) = -INFINITY;
+                                }
+                            }
                         }
                     }
                 } else {

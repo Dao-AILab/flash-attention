@@ -163,7 +163,24 @@ def construct_local_mask(
     key_padding_mask=None,
     key_leftpad=None,
     device=None,
+    cp_world_size=1,
+    cp_rank=0,
+    cp_tot_seqlen_k=None,
 ):
+    if cp_world_size > 1:
+        return construct_cp_mask(
+            seqlen_q,
+            seqlen_k,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
+            cp_tot_seqlen_k=cp_tot_seqlen_k,
+            window_size=window_size,
+            sink_token_length=sink_token_length,
+            query_padding_mask=query_padding_mask,
+            key_padding_mask=key_padding_mask,
+            key_leftpad=key_leftpad,
+            device=device,
+        )
     row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")
     col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
     if key_leftpad is not None:
@@ -189,6 +206,106 @@ def construct_local_mask(
             torch.logical_and(col_idx < row_idx + sk - sq - window_size[0], col_idx >= sink_token_length),
         )
 
+def construct_cp_mask(
+    seqlen_q,
+    seqlen_k,
+    cp_world_size=1,
+    cp_rank=0,
+    cp_tot_seqlen_k=None,
+    window_size=(-1, -1),  # -1 means infinite window size
+    sink_token_length=0,
+    query_padding_mask=None,
+    key_padding_mask=None,
+    key_leftpad=None,
+    device=None,
+):
+    """
+    Construct attention mask for context parallelism (DCP).
+
+    This function creates a mask that handles both local windowing and context parallelism.
+    For DCP, each rank only sees a subset of KV tokens (interleaved), and the mask
+    must account for the global positions when applying causal or windowing constraints.
+
+    Args:
+        seqlen_q: Length of query sequence
+        seqlen_k: Length of key sequence (local to this rank)
+        cp_world_size: Number of context parallel ranks
+        cp_rank: Current rank ID (0 to cp_world_size-1)
+        cp_tot_seqlen_k: Total lengths of key sequence in cp world
+        window_size: (left_window, right_window), -1 = infinite
+        sink_token_length: Number of "sink" tokens that can always be attended to
+        query_padding_mask: Which query positions are valid
+        key_padding_mask: Which key positions are valid
+        key_leftpad: Left padding for keys (per batch)
+        device: Device to place tensors on
+
+    Returns:
+        mask: Boolean tensor of shape [seqlen_q, seqlen_k] where True = masked out
+    """
+    # Create position indices
+    row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")  # [seqlen_q, 1]
+    col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)  # [seqlen_k]
+
+    # Handle left padding if present
+    if key_leftpad is not None:
+        key_leftpad = rearrange(key_leftpad, "b -> b 1 1 1")
+        col_idx = repeat(col_idx, "s -> b 1 1 s", b=key_leftpad.shape[0])
+        col_idx = torch.where(col_idx >= key_leftpad, col_idx - key_leftpad, 2**32)
+
+    # Calculate effective sequence lengths
+    sk = (
+        cp_tot_seqlen_k[0]
+        if key_padding_mask is None
+        else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1") * cp_world_size
+    )
+    sq = (
+        torch.tensor(seqlen_q, device=device, dtype=torch.long)  # Global seqlen_k for DCP
+        if query_padding_mask is None
+        else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
+    )
+
+    if cp_world_size > 1:
+        # DCP masking logic
+        # Convert local K indices to global (absolute) K positions
+        # local_k_idx * cp_world_size + cp_rank gives the global position
+        abs_k_idx = col_idx * cp_world_size + cp_rank  # [seqlen_k] -> global positions
+
+        # Query global positions: row_idx + seqlen_k_global - seqlen_q
+        # This handles the case where query and key sequences might have different lengths
+        abs_q_idx = row_idx + sk - sq  # [seqlen_q, 1] -> global query positions
+
+        if window_size[0] < 0:
+            # Infinite left window - essentially causal masking with right window
+            mask = abs_k_idx > abs_q_idx + window_size[1]
+        else:
+            # Finite window - sliding window attention
+            # Right boundary: abs_k_idx > abs_q_idx + window_size[1]
+            right_mask = abs_k_idx > torch.minimum(abs_q_idx + window_size[1], sk)
+
+            # Left boundary: abs_k_idx < abs_q_idx - window_size[0], but exclude sink tokens
+            left_mask = torch.logical_and(
+                abs_k_idx < abs_q_idx - window_size[0],
+                abs_k_idx >= sink_token_length
+            )
+
+            mask = torch.logical_or(right_mask, left_mask)
+
+    else:
+        # Non-DCP case: fall back to original construct_local_mask logic
+        if window_size[0] < 0:
+            mask = col_idx > row_idx + sk - sq + window_size[1]
+        else:
+            sk_local = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk // cp_world_size
+            mask = torch.logical_or(
+                col_idx > torch.minimum(row_idx + sk_local - sq + window_size[1], sk_local),
+                torch.logical_and(
+                    col_idx < row_idx + sk_local - sq - window_size[0],
+                    col_idx >= sink_token_length
+                ),
+            )
+
+    return mask
+
 
 def attention_ref(
     q,
@@ -209,7 +326,10 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     intermediate_dtype=None,
-    s_aux=None
+    s_aux=None,
+    cp_world_size=1,
+    cp_rank=0,
+    cp_tot_seqlen_k=None,
 ):
     """
     Arguments:
@@ -229,6 +349,9 @@ def attention_ref(
             without changing the math. This is to estimate the numerical error from operation
             reordering.
         s_aux: (nheads)
+        cp_world_size: Number of context parallel ranks
+        cp_rank: Current rank ID (0 to cp_world_size-1)
+        cp_tot_seqlen_k:  (batch_size) total seqlen of k/v in cp world
     Output:
         output: (batch_size, seqlen_q, nheads, head_dim_v)
         attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
@@ -276,6 +399,9 @@ def attention_ref(
             key_padding_mask,
             key_leftpad=key_leftpad,
             device=q.device,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
+            cp_tot_seqlen_k=cp_tot_seqlen_k,
         )
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
