@@ -1041,3 +1041,40 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     out_no_lse, lse_no_lse = flash_attn_combine(out_partial, lse_partial, out_dtype=dtype, return_lse=False)
     assert lse_no_lse is None, "LSE should be None when return_lse=False"
     assert torch.allclose(out_no_lse, out, atol=1e-5, rtol=1e-5), "Output should be the same regardless of return_lse"
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (256, 256)])
+def test_flash_attn_mixed_precision_q_bf16_kv_fp8(seqlen_q, seqlen_k, d, causal):
+    """Test Q(bfloat16) + KV(float8) + O(bfloat16) mixed precision."""
+    device = "cuda"
+    torch.random.manual_seed(66)
+    batch_size = 2
+    nheads = 8
+    nheads_kv = 8  # MHA for simplicity
+
+    # Generate Q in bfloat16
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=torch.bfloat16, requires_grad=True)
+
+    # Generate K, V in float8_e4m3fn
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=torch.bfloat16)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=torch.bfloat16)
+    k = k.to(torch.float8_e4m3fn)
+    v = v.to(torch.float8_e4m3fn)
+
+    # Reference computation in bfloat16
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().to(torch.bfloat16).requires_grad_(True)
+    v_ref = v.detach().to(torch.bfloat16).requires_grad_(True)
+
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, None, None, causal=causal)
+    out_pt, _ = attention_ref(q_ref, k_ref, v_ref, None, None, causal=causal, upcast=False, reorder_ops=True)
+
+    # FlashAttention mixed precision computation
+    out, lse = flash_attn_func(q, k, v, causal=causal)
+
+    mult = 4  # Higher tolerance for FP8 mixed precision
+    assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
+    mult_mean = 3
+    assert (out - out_ref).abs().mean().item() <= mult_mean * (out_pt - out_ref).abs().mean().item()

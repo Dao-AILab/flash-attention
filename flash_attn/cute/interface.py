@@ -47,6 +47,8 @@ torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.float8_e5m2: cutlass.Float8E5M2,
 }
 
 
@@ -111,8 +113,9 @@ def _flash_attn_fwd(
         assert cu_seqlens_q.shape == (batch_size + 1,), "cu_seqlens_q must have shape (batch_size + 1,)"
     assert seqused_q is None or seqused_q.shape == (batch_size,), "seqused_q must have shape (batch_size,)"
     assert seqused_k is None or seqused_k.shape == (batch_size,), "seqused_k must have shape (batch_size,)"
-    assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
-    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    assert q.dtype in [torch.float16, torch.bfloat16], "Q must be float16 or bfloat16"
+    assert k.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2], "K must be float16, bfloat16, or float8"
+    assert v.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2], "V must be float16, bfloat16, or float8"
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
         if t is not None:
             assert t.dtype == torch.int32, "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be int32"
@@ -123,7 +126,10 @@ def _flash_attn_fwd(
     assert all(t is None or t.is_cuda for t in (q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table, learnable_sink)), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
-    alignment = 16 // q.element_size()
+    if k.dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or v.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        alignment = 32  # FP8 requires 32-byte alignment
+    else:
+        alignment = 16 // q.element_size()
     assert head_dim % alignment == 0, f"head_dim must be divisible by {alignment}"
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
     if softmax_scale is None:
@@ -142,17 +148,23 @@ def _flash_attn_fwd(
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
     lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad else None
 
-    dtype = torch2cute_dtype_map[q.dtype]
-    q_tensor, k_tensor, v_tensor, o_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
-        for t in (q, k, v, out)
-    ]
-    lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1) if lse is not None else None
-    cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor, learnable_sink_tensor = [
-        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None
-        for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
-    ]
-    page_table_tensor = from_dlpack(page_table.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1) if page_table is not None else None
+    q_dtype = torch2cute_dtype_map[q.dtype]
+    k_dtype = torch2cute_dtype_map[k.dtype]
+    v_dtype = torch2cute_dtype_map[v.dtype]
+    o_dtype = torch2cute_dtype_map[out.dtype]
+    # Convert FP8 to BF16 for compatibility and create cute tensors
+    def to_cute(t, align=16, leading_dim=None):
+        if t is None: return None
+        leading_dim = t.ndim - 1 if leading_dim is None else leading_dim
+        t = t.to(torch.bfloat16) if t.dtype in [torch.float8_e4m3fn, torch.float8_e5m2] else t
+        return from_dlpack(t.detach(), assumed_align=align).mark_layout_dynamic(leading_dim=leading_dim)
+
+    q_tensor, k_tensor, v_tensor, o_tensor = [to_cute(t) for t in (q, k, v, out)]
+    lse_tensor = to_cute(lse, 4, lse.ndim - 1) if lse is not None else None
+    cu_seqlens_q_tensor, cu_seqlens_k_tensor = [to_cute(t, 4, 0) for t in (cu_seqlens_q, cu_seqlens_k)]
+    seqused_q_tensor, seqused_k_tensor = [to_cute(t, 4, 0) for t in (seqused_q, seqused_k)]
+    learnable_sink_tensor = to_cute(learnable_sink, 4, 0)
+    page_table_tensor = to_cute(page_table, 4, 1)
     if causal:
         window_size_right = 0
     local = window_size_left is not None or window_size_right is not None
@@ -174,7 +186,7 @@ def _flash_attn_fwd(
             pack_gqa = False
 
     compile_key = (
-        dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,
+        q_dtype, k_dtype, v_dtype, o_dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,
         lse is None, cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
         page_table is not None,
         window_size_left is not None, window_size_right is not None,
@@ -187,7 +199,7 @@ def _flash_attn_fwd(
             assert page_table is None, "paged KV not supported on SM 9.0"
             # fa_fwd = FlashAttentionForwardSm80(
             fa_fwd = FlashAttentionForwardSm90(
-                dtype,
+                q_dtype,
                 head_dim,
                 head_dim_v,
                 qhead_per_kvhead,
