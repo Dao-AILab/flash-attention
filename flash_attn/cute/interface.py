@@ -153,7 +153,7 @@ def _flash_attn_fwd(
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
-    
+
     if out is None:
         out = torch.empty(*q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
     else:
@@ -162,7 +162,7 @@ def _flash_attn_fwd(
         assert out.dtype == out_torch_dtype, f"out tensor dtype {out.dtype} does not match expected dtype {out_torch_dtype}"
         assert out.device == device, f"out tensor device {out.device} does not match input device {device}"
         assert out.is_cuda, "out tensor must be on CUDA device"
-    
+
     if lse is None:
         lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad or return_lse else None
     elif lse is not None:
@@ -205,6 +205,13 @@ def _flash_attn_fwd(
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
+
+    if score_mod is not None:
+        is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None or seqused_q is not None or seqused_k is not None
+        if is_varlen:
+            raise NotImplementedError("score_mod with buffers is not yet supported for varlen sequences. This will be fixed in a future PR.")
+        if pack_gqa:
+            raise NotImplementedError("score_mod with buffers is not yet supported with pack_gqa=True. This will be fixed in a future PR.")
 
     cute_buffers = None
     if buffers is not None:

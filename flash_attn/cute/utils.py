@@ -27,8 +27,7 @@ sub_packed_f32x2 = partial(
 )
 
 def hash_callable(func: Callable) -> str:
-    """Hash a callable based on the source code or bytecode."""
-
+    """Hash a callable based on the source code or bytecode and closure values."""
     try:
         data = inspect.getsource(func).encode()
     except (OSError, TypeError):
@@ -37,7 +36,14 @@ def hash_callable(func: Callable) -> str:
         else:
             data = repr(func).encode()
 
-    return hashlib.sha256(data).hexdigest()
+    hasher = hashlib.sha256(data)
+
+    if hasattr(func, "__closure__") and func.__closure__ is not None:
+        for cell in func.__closure__:
+            cell_value = cell.cell_contents
+            hasher.update(repr(cell_value).encode())
+
+    return hasher.hexdigest()
 
 
 def create_softcap_scoremod(softcap_val):

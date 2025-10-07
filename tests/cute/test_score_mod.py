@@ -269,7 +269,7 @@ def run_cute_flash(q, k, v, cute_score_mod, buffers=None) -> torch.Tensor:
 def run_flex_reference(q, k, v, eager_score_mod, dtype=None) -> torch.Tensor:
     if dtype is not None:
         q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
-    return flex_attention(q, k, v, score_mod=eager_score_mod)
+    return flex_attention(q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1])
 
 
 @pytest.mark.parametrize(
@@ -430,6 +430,95 @@ def test_cute_vs_flex_attention_with_buffers(
     assert cute_error <= rtol * pt_error + fwd_atol, (
         f"CuTE error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
     )
+
+
+@pytest.mark.xfail(raises=NotImplementedError, reason="PackGQA with score_mod not yet supported")
+def test_packgqa_with_score_mod():
+    """Test that PackGQA works correctly with score_mod index wrapping.
+
+    Without proper index wrapping, q_idx will be in packed space
+    (0 to qhead_per_kvhead * seqlen_q - 1) instead of logical space (0 to seqlen_q - 1).
+    This causes causal masking to be incorrect.
+    """
+    torch.random.manual_seed(42)
+
+    batch_size = 2
+    seqlen_q = 128
+    seqlen_kv = 128
+    qhead_per_kvhead = 4
+    num_heads_kv = 2
+    num_heads = num_heads_kv * qhead_per_kvhead
+    dtype = torch.bfloat16
+
+    q = torch.randn(batch_size, num_heads, seqlen_q, 128, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, num_heads_kv, seqlen_kv, 128, device="cuda", dtype=dtype)
+    v = torch.randn(batch_size, num_heads_kv, seqlen_kv, 128, device="cuda", dtype=dtype)
+
+    q_transposed, k_transposed, v_transposed = map(
+        lambda x: x.transpose(1, 2), (q, k, v)
+    )
+    out_cute = torch.empty_like(q_transposed)
+
+    _flash_attn_fwd(
+        q_transposed,
+        k_transposed,
+        v_transposed,
+        return_lse=True,
+        score_mod=score_mod_2,
+        out=out_cute,
+        lse=None,
+        pack_gqa=True,
+    )
+    out_cute = out_cute.transpose(1, 2)
+
+    out_ref_fp32 = run_flex_reference(q, k, v, causal_mask_eager, dtype=torch.float32)
+
+    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
+    cute_error = (out_cute - out_ref_fp32).abs().max().item()
+
+    assert not torch.isnan(out_cute).any(), "Output contains NaN values"
+    assert torch.isfinite(out_cute).all(), "Output contains infinite values"
+    assert cute_error <= fwd_atol * 10, (
+        f"CuTE error {cute_error:.2e} exceeds tolerance {fwd_atol * 10:.2e}"
+    )
+
+
+@pytest.mark.xfail(raises=NotImplementedError, reason="Varlen with score_mod not yet supported")
+def test_varlen_with_score_mod():
+    """Test that varlen (variable length sequences) works with score_mod.
+
+    For varlen, tokens from different sequences should not attend to each other.
+    Without proper index mapping, the causal mask will be applied to the global
+    indices instead of per-sequence logical indices.
+    """
+    torch.random.manual_seed(42)
+
+    seqlens = [64, 56, 128]
+    total_seq = sum(seqlens)
+    num_heads = 4
+    dtype = torch.bfloat16
+
+    cu_seqlens = torch.tensor([0] + list(torch.tensor(seqlens).cumsum(0).tolist()), device="cuda", dtype=torch.int32)
+    q = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)
+    k = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)
+    v = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)
+
+    out_cute = torch.empty_like(q)
+
+    _flash_attn_fwd(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        return_lse=True,
+        score_mod=score_mod_2,
+        out=out_cute,
+        lse=None,
+    )
+
+    assert not torch.isnan(out_cute).any(), "Output contains NaN values"
+    assert torch.isfinite(out_cute).all(), "Output contains infinite values"
 
 
 if __name__ == "__main__":
