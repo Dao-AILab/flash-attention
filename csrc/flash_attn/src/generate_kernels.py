@@ -10,7 +10,7 @@ DTYPE_MAP = {
 }
 
 SM = [80]  # Sm80 kernels support up to
-HEAD_DIMENSIONS = [32, 64, 96, 128, 160, 192, 256]
+HEAD_DIMENSIONS = [32, 64, 96, 128, 192, 256]
 IS_CAUSAL = ["false", "true"]
 NAMESPACE_INCLUDE = '#include "namespace_config.h"\n'
 

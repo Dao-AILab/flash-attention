@@ -17,12 +17,6 @@ from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
 
 from flash_attn import flash_attn_qkvpacked_func, flash_attn_kvpacked_func
 
-try:
-    from flash_attn.fused_softmax import scaled_upper_triang_masked_softmax
-except ImportError:
-    scaled_upper_triang_masked_softmax = None
-
-
 def attention_pytorch(qkv, dropout_p=0.0, causal=True):
     """
     Arguments:
@@ -49,27 +43,6 @@ def attention_pytorch(qkv, dropout_p=0.0, causal=True):
     attention = torch.softmax(scores, dim=-1)
     attention_drop = F.dropout(attention, dropout_p)
     output = torch.einsum('bhts,bshd->bthd', attention_drop , v)
-    return output.to(dtype=qkv.dtype)
-
-
-def attention_megatron(qkv):
-    """
-    Arguments:
-        qkv: (batch_size, seqlen, 3, nheads, head_dim)
-    Output:
-        output: (batch_size, seqlen, nheads, head_dim)
-    """
-    batch_size, seqlen, _, nheads, d = qkv.shape
-    q, k, v = qkv.unbind(dim=2)
-    q = rearrange(q, 'b t h d -> (b h) t d')
-    k = rearrange(k, 'b s h d -> (b h) d s')
-    softmax_scale = 1.0 / math.sqrt(d)
-    # Preallocate attn_weights for `baddbmm`
-    scores = torch.empty(batch_size * nheads, seqlen, seqlen, dtype=qkv.dtype, device=qkv.device)
-    scores = rearrange(torch.baddbmm(scores, q, k, beta=0, alpha=softmax_scale),
-                       '(b h) t s -> b h t s', h=nheads)
-    attention = scaled_upper_triang_masked_softmax(scores, None, scale=1.0)
-    output = torch.einsum('bhts,bshd->bthd', attention, v)
     return output.to(dtype=qkv.dtype)
 
 
@@ -129,9 +102,6 @@ pytorch_profiler(flash_attn_qkvpacked_func, qkv, dropout_p, causal=causal, backw
 #                        requires_grad=True) for _ in range(3)]
 # benchmark_all(attention_og, q, k, v, 1.0, repeats=repeats, desc='FlashAttention Triton OG')
 # # pytorch_profiler(attention, q, k, v, 1.0, backward=True)
-
-# if scaled_upper_triang_masked_softmax is not None:
-#     benchmark_all(attention_megatron, qkv, repeats=repeats, desc='Megatron Attention')
 
 # from src.ops.fftconv import fftconv_func
 

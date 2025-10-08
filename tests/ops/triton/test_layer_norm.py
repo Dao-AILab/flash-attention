@@ -16,8 +16,10 @@ from flash_attn.ops.triton.layer_norm import (
 is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 
 
+# @pytest.mark.parametrize("zero_centered_weight", [False, True])
+@pytest.mark.parametrize("zero_centered_weight", [False])
 @pytest.mark.parametrize("has_weight1", [False, True])
-# @pytest.mark.parametrize("has_weight1", [True])
+# @pytest.mark.parametrize("has_weight1", [False])
 @pytest.mark.parametrize("has_x1", [False, True])
 # @pytest.mark.parametrize("has_x1", [False])
 @pytest.mark.parametrize("has_rowscale", [False, True])
@@ -25,11 +27,11 @@ is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 @pytest.mark.parametrize("dropout_p", [0.0, 0.27])
 # @pytest.mark.parametrize("dropout_p", [0.0])
 @pytest.mark.parametrize("prenorm", [True, False])
-# @pytest.mark.parametrize("prenorm", [False])
+# @pytest.mark.parametrize("prenorm", [True])
 @pytest.mark.parametrize("is_rms_norm", [False, True])
 # @pytest.mark.parametrize("is_rms_norm", [True])
 @pytest.mark.parametrize("has_residual", [True, False])
-# @pytest.mark.parametrize("has_residual", [False])
+# @pytest.mark.parametrize("has_residual", [True])
 @pytest.mark.parametrize(
     "weight_dtype", [torch.float32, torch.float16] + ([torch.bfloat16] if is_sm8x else [])
 )
@@ -41,7 +43,7 @@ is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 )
 # @pytest.mark.parametrize("input_dtype,residual_dtype", [(torch.float16, torch.float16)])
 @pytest.mark.parametrize("hidden_size", [192, 2048, 2560, 3000, 4096])
-# @pytest.mark.parametrize("hidden_size", [256])
+# @pytest.mark.parametrize("hidden_size", [1024])
 def test_layer_norm(
     hidden_size,
     input_dtype,
@@ -54,6 +56,7 @@ def test_layer_norm(
     has_rowscale,
     has_x1,
     has_weight1,
+    zero_centered_weight,
 ):
     if has_rowscale and has_x1:
         pytest.skip("Not supported")
@@ -145,6 +148,7 @@ def test_layer_norm(
         rowscale=rowscale,
         prenorm=prenorm,
         residual_in_fp32=residual_in_fp32,
+        zero_centered_weight=zero_centered_weight,
         is_rms_norm=is_rms_norm,
         return_dropout_mask=True,
     )
@@ -162,6 +166,7 @@ def test_layer_norm(
         dropout_p=dropout_p,
         rowscale=rowscale,
         prenorm=prenorm,
+        zero_centered_weight=zero_centered_weight,
         dropout_mask=dropout_mask,
         dropout_mask1=dropout_mask1,
     )
@@ -177,6 +182,7 @@ def test_layer_norm(
         dropout_p=dropout_p,
         rowscale=rowscale,
         prenorm=prenorm,
+        zero_centered_weight=zero_centered_weight,
         dropout_mask=dropout_mask,
         dropout_mask1=dropout_mask1,
         upcast=True,

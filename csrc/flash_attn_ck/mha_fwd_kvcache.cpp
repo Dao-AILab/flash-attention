@@ -33,7 +33,8 @@ fmha_fwd_splitkv_traits get_ck_fmha_fwd_splitkv_traits(const mask_info &mask,
                                    head_size,
                                    dtype,
                                    false, // is_group_mode
-                                   true, // is_v_rowmajor
+                                   true,  // is_v_rowmajor
+                                   false, // has_logits_soft_cap
                                    mask.type,
                                    enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
                                    has_lse,

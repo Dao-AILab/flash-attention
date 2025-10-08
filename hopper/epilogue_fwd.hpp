@@ -89,10 +89,11 @@ struct CollectiveEpilogueFwd {
     using ShapeLSEPacked = std::conditional_t<!PackGQA, cute::Shape<int32_t, int32_t, int32_t, int32_t>, cute::Shape<cute::Shape<int32_t, int32_t>, int32_t, int32_t, int32_t>>;
     using StrideLSEPacked = std::conditional_t<!PackGQA, StrideLSE, cute::Stride<cute::Stride<int64_t, _1>, int64_t, int64_t, int64_t>>;
 
+    using EpilogueTile_MN = decltype(select<0, 1>(TileShape_MNK_PV{}));
     using CopyOpR2S = std::conditional_t<
         ArchTag::kMinComputeCapability >= 90,
         // cute::SM90_U32x4_STSM_N if Element size is 2 bytes (fp16, bf16)
-        decltype(cutlass::epilogue::collective::detail::sm90_get_smem_store_op_for_accumulator<StrideO, Element, TileShape_MNK_PV>()),
+        decltype(cutlass::epilogue::collective::detail::sm90_get_smem_store_op_for_accumulator<StrideO, Element, EpilogueTile_MN>()),
         AutoVectorizingCopyWithAssumedAlignment<128>
     >;
     using SmemCopyAtomO = Copy_Atom<CopyOpR2S, Element>;

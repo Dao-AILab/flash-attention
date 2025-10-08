@@ -4,3 +4,4 @@
 [submodule "csrc/composable_kernel"]
 	path = csrc/composable_kernel
 	url = https://github.com/ROCm/composable_kernel.git
+	branch = amd-master

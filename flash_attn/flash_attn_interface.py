@@ -38,11 +38,6 @@ def _get_block_size_n(device, head_dim, is_dropout, is_causal):
             return 64 if (not is_dropout and is_causal) else 32
         else:
             return 64 if not is_dropout else 32
-    elif head_dim <= 160:
-        if is_sm8x:
-            return 64
-        else:
-            return 32
     elif head_dim <= 192:
         return 64
     elif head_dim <= 224:
@@ -1910,7 +1905,7 @@ def flash_attn_with_kvcache(
         softmax_scale = q.shape[-1] ** (-0.5)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
-            (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
