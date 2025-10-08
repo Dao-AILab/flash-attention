@@ -146,8 +146,8 @@ def _flash_attn_varlen_forward(
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
+    max_seqlen_q: torch.Tensor,
+    max_seqlen_k: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -197,8 +197,8 @@ def _flash_attn_varlen_forward_fake(
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
+    max_seqlen_q: torch.Tensor,
+    max_seqlen_k: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -339,8 +339,8 @@ def _flash_attn_varlen_backward(
     dv: Optional[torch.Tensor],
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
+    max_seqlen_q: torch.Tensor,
+    max_seqlen_k: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -403,8 +403,8 @@ def _flash_attn_varlen_backward_fake(
     dv: Optional[torch.Tensor],
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
+    max_seqlen_q: torch.Tensor,
+    max_seqlen_k: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -912,6 +912,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_table,
         is_grad_enabled,
     ):
+        if isinstance(max_seqlen_q, int):
+            max_seqlen_q = torch.tensor(max_seqlen_q)
+        if isinstance(max_seqlen_k, int):
+            max_seqlen_k = torch.tensor(max_seqlen_k)
         is_grad = is_grad_enabled and any(
             x.requires_grad for x in [q, k, v]
         )
