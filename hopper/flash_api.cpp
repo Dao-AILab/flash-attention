@@ -1563,12 +1563,3 @@ mha_combine(const at::Tensor &out_partial,         // num_splits x batch_size x 
 
     return {out, softmax_lse};
 }
-
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FlashAttention";
-    m.def("fwd", &mha_fwd, "Forward pass");
-    m.def("bwd", &mha_bwd, "Backward pass");
-    m.def("fwd_combine", &mha_combine, "Combine partial attention outputs");
-    m.def("get_scheduler_metadata", &mha_fwd_get_scheduler_metadata, "Get scheduler metadata for varlen forward pass");
-}
