@@ -20,7 +20,7 @@
 # - bwd pass optimized for Hopper/Blackwell
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
 
 import torch
 
@@ -49,7 +49,6 @@ torch2cute_dtype_map = {
     torch.float32: cutlass.Float32,
 }
 
-
 def _flash_attn_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -73,7 +72,22 @@ def _flash_attn_fwd(
     num_threads: int = 384,
     pack_gqa: Optional[bool] = None,
     _compute_capability: Optional[int] = None,
+    score_mod: Callable | None = None,
+    return_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    buffers: Optional[list[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Forward pass for FlashAttention.
+
+    Args:
+        ...
+        score_mod: A callable that takes the attention scores and applies a modification.
+        return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
+        out: Optional pre-allocated output tensor. If None, will be allocated internally.
+        lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
+        buffers: Some score_mods will want to read from global buffers. This is how we thread them through to the inner kernel.
+    """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
@@ -137,10 +151,25 @@ def _flash_attn_fwd(
     out_torch_dtype = q.dtype
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
-    out = torch.empty(*q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
-    lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad else None
+
+    if out is None:
+        out = torch.empty(*q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
+    else:
+        expected_out_shape = (*q_batch_seqlen_shape, num_head, head_dim_v)
+        assert out.shape == expected_out_shape, f"out tensor shape {out.shape} does not match expected shape {expected_out_shape}"
+        assert out.dtype == out_torch_dtype, f"out tensor dtype {out.dtype} does not match expected dtype {out_torch_dtype}"
+        assert out.device == device, f"out tensor device {out.device} does not match input device {device}"
+        assert out.is_cuda, "out tensor must be on CUDA device"
+
+    if lse is None:
+        lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad or return_lse else None
+    elif lse is not None:
+        assert lse.shape == lse_shape, f"lse tensor shape {lse.shape} does not match expected shape {lse_shape}"
+        assert lse.dtype == torch.float32, f"lse tensor dtype {lse.dtype} does not match expected dtype torch.float32"
+        assert lse.device == device, f"lse tensor device {lse.device} does not match input device {device}"
+        assert lse.is_cuda, "lse tensor must be on CUDA device"
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor = [
@@ -173,8 +202,24 @@ def _flash_attn_fwd(
         if pack_gqa and (128 % qhead_per_kvhead != 0) or (cu_seqlens_q is not None or seqused_q is not None):
             pack_gqa = False
 
+    if softcap is not None:
+        assert score_mod is None, "softcap and score_mod cannot be used together"
+        score_mod = utils.create_softcap_scoremod(softcap)
+
+    if score_mod is not None:
+        is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None or seqused_q is not None or seqused_k is not None
+        if is_varlen:
+            raise NotImplementedError("score_mod with buffers is not yet supported for varlen sequences. This will be fixed in a future PR.")
+        if pack_gqa:
+            raise NotImplementedError("score_mod with buffers is not yet supported with pack_gqa=True. This will be fixed in a future PR.")
+
+    cute_buffers = None
+    if buffers is not None:
+        cute_buffers = [from_dlpack(buf) for buf in buffers]
+
     compile_key = (
-        dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,
+        dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, utils.hash_callable(score_mod) if score_mod is not None else None,
+        buffers is not None,
         lse is None, cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
         page_table is not None,
         window_size_left is not None, window_size_right is not None,
@@ -182,6 +227,7 @@ def _flash_attn_fwd(
         m_block_size, n_block_size, num_threads, pack_gqa,
         compute_capability,
     )
+
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
@@ -200,6 +246,8 @@ def _flash_attn_fwd(
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
+                score_mod=score_mod,
+                has_buffers=buffers is not None,
             )
         elif compute_capability == 10:
             assert page_size in [None, 128], "Only page_size=128 is supported for paged KV on SM 10.0"
@@ -211,27 +259,29 @@ def _flash_attn_fwd(
                 is_local=local,
                 pack_gqa=pack_gqa,
                 is_persistent=not causal and not local and cu_seqlens_q is None and seqused_q is None,
+                score_mod=score_mod,
+                has_buffers=buffers is not None,
             )
         else:
             raise ValueError(f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x")
         # TODO: check @can_implement
+        # TODO caching for buffers; cute_buffers
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
             cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
             page_table_tensor,
-            softcap, window_size_left, window_size_right, learnable_sink_tensor,
+            window_size_left, window_size_right, learnable_sink_tensor, cute_buffers,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
         cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
         page_table_tensor,
-        softcap, window_size_left, window_size_right, learnable_sink_tensor,
+        window_size_left, window_size_right, learnable_sink_tensor, cute_buffers
     )
     return out, lse
 
 
 _flash_attn_fwd.compile_cache = {}
-
 
 def _flash_attn_bwd(
     q: torch.Tensor,
