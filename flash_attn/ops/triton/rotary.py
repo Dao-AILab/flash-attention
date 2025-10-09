@@ -1,4 +1,5 @@
-# Copyright (c) 2023, Tri Dao.
+# Copyright (c) 2025, Tri Dao.
+# As of 2025-04-23, we require triton >= 3.0
 
 from typing import Optional, Union
 
@@ -18,7 +19,7 @@ def rotary_kernel(
     SEQLEN_OFFSETS,  # this could be int or a pointer
     # Matrix dimensions
     seqlen,
-    rotary_dim,
+    nheads,
     seqlen_ro,
     # strides
     stride_out_batch,
@@ -30,104 +31,72 @@ def rotary_kernel(
     stride_x_nheads,
     stride_x_headdim,
     # Meta-parameters
-    BLOCK_K: tl.constexpr,
+    # We want ROTARY_DIM to be constexpr, otherwise the triton compiler doesn't know that
+    # the mask is constant every 8 elements, and it will generate LDG.16 instead of LDG.128
+    ROTARY_DIM: tl.constexpr,
     IS_SEQLEN_OFFSETS_TENSOR: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     CONJUGATE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
-    pid_m = tl.program_id(axis=0)
-    pid_batch = tl.program_id(axis=1)
-    pid_head = tl.program_id(axis=2)
-    rotary_dim_half = rotary_dim // 2
+    BLOCK_K: tl.constexpr = triton.next_power_of_2(ROTARY_DIM)
+    ROTARY_DIM_HALF = ROTARY_DIM // 2
+    pid_head = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+    pid_batch = tl.program_id(axis=2)
 
     if not IS_VARLEN:
-        X = X + pid_batch * stride_x_batch + pid_head * stride_x_nheads
-        OUT = OUT + pid_batch * stride_out_batch + pid_head * stride_out_nheads
+        X = X + pid_batch * stride_x_batch
+        OUT = OUT + pid_batch * stride_out_batch
     else:
         start_idx = tl.load(CU_SEQLENS + pid_batch)
         seqlen = tl.load(CU_SEQLENS + pid_batch + 1) - start_idx
-        X = X + start_idx * stride_x_seqlen + pid_head * stride_x_nheads
-        OUT = OUT + start_idx * stride_out_seqlen + pid_head * stride_out_nheads
+        X = X + start_idx * stride_x_seqlen
+        OUT = OUT + start_idx * stride_out_seqlen
 
     if pid_m * BLOCK_M >= seqlen:
         return
+
+    rh = pid_head * BLOCK_H + tl.arange(0, BLOCK_H)
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     if not IS_SEQLEN_OFFSETS_TENSOR:
         rm_cs = rm + SEQLEN_OFFSETS
     else:
         rm_cs = rm + tl.load(SEQLEN_OFFSETS + pid_batch)
-    rk = tl.arange(0, BLOCK_K)
+
     rk_half = tl.arange(0, BLOCK_K // 2)
+    COS = COS + (rm_cs[:, None] * ROTARY_DIM_HALF + rk_half[None, :])
+    SIN = SIN + (rm_cs[:, None] * ROTARY_DIM_HALF + rk_half[None, :])
+    mask_cs = (rm_cs[:, None] < seqlen_ro) & (rk_half[None, :] < ROTARY_DIM_HALF)
+    cos = tl.load(COS, mask=mask_cs, other=1.0).to(tl.float32)
+    sin = tl.load(SIN, mask=mask_cs, other=0.0).to(tl.float32)
+    if CONJUGATE:
+        sin = -sin
 
     if not INTERLEAVED:
         # Load the 1st and 2nd halves of X, do calculation, then store to 1st and 2nd halves of OUT
-        X = X + (rm[:, None] * stride_x_seqlen + rk_half[None, :] * stride_x_headdim)
-        COS = COS + (rm_cs[:, None] * rotary_dim_half + rk_half[None, :])
-        SIN = SIN + (rm_cs[:, None] * rotary_dim_half + rk_half[None, :])
-        cos = tl.load(
-            COS, mask=(rm_cs[:, None] < seqlen_ro) & (rk_half[None, :] < rotary_dim_half), other=1.0
-        ).to(tl.float32)
-        sin = tl.load(
-            SIN, mask=(rm_cs[:, None] < seqlen_ro) & (rk_half[None, :] < rotary_dim_half), other=0.0
-        ).to(tl.float32)
-        x0 = tl.load(
-            X, mask=(rm[:, None] < seqlen) & (rk_half[None, :] < rotary_dim_half), other=0.0
-        ).to(tl.float32)
-        x1 = tl.load(
-            X + rotary_dim_half * stride_x_headdim,
-            mask=(rm[:, None] < seqlen) & (rk_half[None, :] < rotary_dim_half),
-            other=0.0,
-        ).to(tl.float32)
-        if CONJUGATE:
-            sin = -sin
+        X = X + (rh[:, None, None] * stride_x_nheads + rm[None, :, None] * stride_x_seqlen + rk_half[None, None, :] * stride_x_headdim)
+        OUT = OUT + (rh[:, None, None] * stride_out_nheads + rm[None, :, None] * stride_out_seqlen + rk_half[None, None, :] * stride_out_headdim)
+        mask = (rh[:, None, None] < nheads) & (rm[None, :, None] < seqlen) & (rk_half[None, None, :] < ROTARY_DIM_HALF)
+        x0 = tl.load(X, mask=mask, other=0.0).to(tl.float32)
+        x1 = tl.load(X + ROTARY_DIM_HALF * stride_x_headdim, mask=mask, other=0.0,).to(tl.float32)
         o0 = x0 * cos - x1 * sin
         o1 = x0 * sin + x1 * cos
-        # write back result
-        OUT = OUT + (rm[:, None] * stride_out_seqlen + rk_half[None, :] * stride_out_headdim)
-        tl.store(OUT, o0, mask=(rm[:, None] < seqlen) & (rk_half[None, :] < rotary_dim_half))
-        tl.store(
-            OUT + rotary_dim_half * stride_out_headdim,
-            o1,
-            mask=(rm[:, None] < seqlen) & (rk_half[None, :] < rotary_dim_half),
-        )
+        tl.store(OUT, o0, mask=mask)
+        tl.store(OUT + ROTARY_DIM_HALF * stride_out_headdim, o1, mask=mask)
     else:
-        # We don't want to load X[0, 2, 4, ...] and X[1, 3, 5, ...] separately since both are slow.
-        # Instead, we load x0 = X[0, 1, 2, 3, ...] and x1 = X[1, 0, 3, 2, ...].
-        # Loading x0 will be fast but x1 will be slow.
-        # Then we load cos = COS[0, 0, 1, 1, ...] and sin = SIN[0, 0, 1, 1, ...].
-        # Then we do the calculation and use tl.where to pick put the right outputs for the even
-        # and for the odd indices.
-        rk_swap = rk + ((rk + 1) % 2) * 2 - 1  # 1, 0, 3, 2, 5, 4, ...
-        rk_repeat = tl.arange(0, BLOCK_K) // 2
-        X0 = X + (rm[:, None] * stride_x_seqlen + rk[None, :] * stride_x_headdim)
-        X1 = X + (rm[:, None] * stride_x_seqlen + rk_swap[None, :] * stride_x_headdim)
-        COS = COS + (rm_cs[:, None] * rotary_dim_half + rk_repeat[None, :])
-        SIN = SIN + (rm_cs[:, None] * rotary_dim_half + rk_repeat[None, :])
-        cos = tl.load(
-            COS,
-            mask=(rm_cs[:, None] < seqlen_ro) & (rk_repeat[None, :] < rotary_dim_half),
-            other=1.0,
-        ).to(tl.float32)
-        sin = tl.load(
-            SIN,
-            mask=(rm_cs[:, None] < seqlen_ro) & (rk_repeat[None, :] < rotary_dim_half),
-            other=0.0,
-        ).to(tl.float32)
-        x0 = tl.load(X0, mask=(rm[:, None] < seqlen) & (rk[None, :] < rotary_dim), other=0.0).to(
-            tl.float32
-        )
-        x1 = tl.load(
-            X1, mask=(rm[:, None] < seqlen) & (rk_swap[None, :] < rotary_dim), other=0.0
-        ).to(tl.float32)
-        if CONJUGATE:
-            sin = -sin
-        x0_cos = x0 * cos
-        x1_sin = x1 * sin
-        out = tl.where(rk[None, :] % 2 == 0, x0_cos - x1_sin, x0_cos + x1_sin)
-        OUT = OUT + (rm[:, None] * stride_out_seqlen + rk[None, :] * stride_out_headdim)
-        tl.store(OUT, out, mask=(rm[:, None] < seqlen) & (rk[None, :] < rotary_dim))
+        rk = tl.arange(0, BLOCK_K)
+        X = X + (rh[:, None, None] * stride_x_nheads + rm[None, :, None] * stride_x_seqlen + rk[None, None, :] * stride_x_headdim)
+        OUT = OUT + (rh[:, None, None] * stride_out_nheads + rm[None, :, None] * stride_out_seqlen + rk[None, None, :] * stride_out_headdim)
+        mask = (rh[:, None, None] < nheads) & (rm[None, :, None] < seqlen) & (rk[None, None, :] < ROTARY_DIM)
+        x = tl.load(X, mask=mask, other=0.0).to(tl.float32)
+        x0, x1 = tl.split(tl.reshape(x, [BLOCK_H, BLOCK_M, BLOCK_K // 2, 2]))
+        o0 = x0 * cos - x1 * sin
+        o1 = x0 * sin + x1 * cos
+        o = tl.reshape(tl.join(o0, o1), [BLOCK_H, BLOCK_M, BLOCK_K])
+        tl.store(OUT, o, mask=mask)
 
 
 def apply_rotary(
@@ -169,13 +138,6 @@ def apply_rotary(
     assert headdim <= 256, "Only support headdim <= 256"
     assert seqlen_ro >= seqlen, "seqlen_ro must be >= seqlen"
 
-    assert (
-        cos.dtype == sin.dtype
-    ), f"cos and sin must have the same dtype, got {cos.dtype} and {sin.dtype}"
-    assert (
-        x.dtype == cos.dtype
-    ), f"Input and cos/sin must have the same dtype, got {x.dtype} and {cos.dtype}"
-
     cos, sin = cos.contiguous(), sin.contiguous()
     if isinstance(seqlen_offsets, torch.Tensor):
         assert seqlen_offsets.shape == (batch,)
@@ -188,18 +150,13 @@ def apply_rotary(
     if rotary_dim < headdim and not inplace:
         output[..., rotary_dim:].copy_(x[..., rotary_dim:])
 
-    BLOCK_K = (
-        32
-        if rotary_dim <= 32
-        else (64 if rotary_dim <= 64 else (128 if rotary_dim <= 128 else 256))
-    )
-    grid = lambda META: (triton.cdiv(seqlen, META["BLOCK_M"]), batch, nheads)  # noqa
-    BLOCK_M = 4 if interleaved else (8 if rotary_dim <= 128 else 4)
+    grid = lambda META: (triton.cdiv(nheads, META["BLOCK_H"]), triton.cdiv(seqlen, META["BLOCK_M"]), batch)  # noqa
+    BLOCK_M = 8 if rotary_dim <= 128 else 4
 
     # Need this, otherwise Triton tries to launch from cuda:0 and we get
     # ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
     with torch.cuda.device(x.device.index):
-        rotary_kernel[grid](
+        torch.library.wrap_triton(rotary_kernel)[grid](
             output,  # data ptrs
             x,
             cos,
@@ -207,7 +164,7 @@ def apply_rotary(
             cu_seqlens,
             seqlen_offsets,
             seqlen,  # shapes
-            rotary_dim,
+            nheads,
             seqlen_ro,
             output.stride(0) if not is_varlen else 0,  # batch_strides if not varlen else 0
             output.stride(-3),  # seqlen_stride or total_seqlen_stride
@@ -217,11 +174,12 @@ def apply_rotary(
             x.stride(-3),  # seqlen stride or total_seqlen_stride
             x.stride(-2),  # nheads stride
             x.stride(-1),  # headdim stride
-            BLOCK_K,
+            rotary_dim,
             isinstance(seqlen_offsets, torch.Tensor),
             is_varlen,
             interleaved,
             conjugate,
-            BLOCK_M,
+            BLOCK_M=BLOCK_M,
+            BLOCK_H=2,
         )
     return output

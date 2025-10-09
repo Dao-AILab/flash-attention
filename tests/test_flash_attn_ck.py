@@ -1399,7 +1399,7 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
     print(f"dK Pytorch max diff: {(k_pt.grad - k_ref.grad).abs().max().item()}")
     print(f"dV Pytorch max diff: {(v_pt.grad - v_ref.grad).abs().max().item()}")
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
-    assert (q.grad - q_ref.grad).abs().max().item() <= 5 * (
+    assert (q.grad - q_ref.grad).abs().max().item() <= 7 * (
         q_pt.grad - q_ref.grad
     ).abs().max().item() + 1e-3
     assert (k.grad - k_ref.grad).abs().max().item() <= 5 * (

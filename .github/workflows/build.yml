@@ -1,0 +1,47 @@
+name: Build wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs-on:
+        description: "The runner to use for the build"
+        required: true
+        type: string
+        default: ubuntu-22.04
+      python-version:
+        description: "The Python version to use for the build"
+        required: true
+        type: string
+      cuda-version:
+        description: "The CUDA version to use for the build"
+        required: true
+        type: string
+      torch-version:
+        description: "The PyTorch version to use for the build"
+        required: true
+        type: string
+      cxx11_abi:
+        description: "Enable torch flag C++11 ABI (TRUE/FALSE)"
+        required: true
+        type: string
+      upload-to-release:
+        description: "Upload wheel to this release"
+        required: false
+        type: boolean
+        default: false
+      release-version:
+        description: "Upload wheel to this release"
+        required: false
+        type: string
+
+jobs:
+  build-wheels:
+    uses: ./.github/workflows/_build.yml
+    with:
+      runs-on: ${{ inputs.runs-on }}
+      python-version: ${{ inputs.python-version }}
+      cuda-version: ${{ inputs.cuda-version }}
+      torch-version: ${{ inputs.torch-version }}
+      cxx11_abi: ${{ inputs.cxx11_abi }}
+      upload-to-release: ${{ inputs.upload-to-release }}
+      release-version: ${{ inputs.release-version }}

@@ -22,11 +22,13 @@ struct Mask {
     int const thread_idx;
     int const seqlen_q, seqlen_k;
     int const window_size_left, window_size_right, sink_token_length;
+    cutlass::FastDivmod const attention_chunk_divmod;
     cutlass::FastDivmod const qhead_per_khead_divmod;
 
     CUTLASS_DEVICE
     Mask(const int thread_idx, const int seqlen_q, const int seqlen_k,
          const int window_size_left, const int window_size_right, const int sink_token_length,
+         cutlass::FastDivmod const &attention_chunk_divmod,
          cutlass::FastDivmod const &qhead_per_khead_divmod)
         : thread_idx(thread_idx)
         , seqlen_q(seqlen_q)
@@ -34,6 +36,7 @@ struct Mask {
         , window_size_left(window_size_left)
         , window_size_right(window_size_right)
         , sink_token_length(sink_token_length)
+        , attention_chunk_divmod(attention_chunk_divmod)
         , qhead_per_khead_divmod(qhead_per_khead_divmod)
     {
     };
@@ -100,16 +103,21 @@ struct Mask {
                 } else {
                     int const local_row_offset_right = causal_row_offset + window_size_right;
                     int const local_row_offset_left = causal_row_offset - 1 - window_size_left;
-                    int const col_limit_sink = sink_token_length - n_block * kBlockN;
+                    int const col_limit_sink = sink_token_length - n_block * kBlockN;  // TODO: subtract thread_col_offset?
                     #pragma unroll
                     for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
                         int const row_idx = !PackGQA
                             ? get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM
                             :  __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
-                        int const col_limit_right = !Seqlenk_mask
+                        int col_limit_right = !Seqlenk_mask
                             ? row_idx + local_row_offset_right
                             : __viaddmin_s32(row_idx, local_row_offset_right, seqlenk_col_limit);
-                        int const col_limit_left = row_idx + local_row_offset_left;
+                        int col_limit_left = row_idx + local_row_offset_left;
+                        if (attention_chunk_divmod.divisor > 0) {
+                            int col_limit_left_chunk = flash::round_down(attention_chunk_divmod, row_idx + seqlen_k - seqlen_q) - n_block * kBlockN - thread_col_offset;
+                            col_limit_left = std::max(col_limit_left, col_limit_left_chunk);
+                            col_limit_right = std::min(col_limit_right, col_limit_left_chunk + attention_chunk_divmod.divisor);
+                        }
                         #pragma unroll
                         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                             int const col_idx = int(get<Col>(t0ScS_rowcol(m, n)));
@@ -118,6 +126,7 @@ struct Mask {
                     }
                 }
             } else {
+                // TODO: backward does not support attention_chunk yet
                 int const thread_row_offset = get<Row>(tScS_rowcol(_0{}, _0{}));
                 int const causal_row_offset = seqlenk_col_limit - seqlen_q + m_block * kBlockM + thread_row_offset;
                 if constexpr (Causal_mask) {

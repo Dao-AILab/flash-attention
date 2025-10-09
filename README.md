@@ -137,38 +137,74 @@ These features are supported in Fwd and Bwd
 2) Variable sequence lengths
 3) Arbitrary Q and KV sequence lengths
 4) Arbitrary head sizes
+5) Multi and grouped query attention
+6) Dropout
+7) Rotary embeddings
+8) ALiBi
 
-These features are supported in Fwd for now. We will add them to backward soon.
-1) Multi and grouped query attention
-2) ALiBi and matrix bias
-
-These features are in development
+We are working on the following things
 1) Paged Attention 
 2) Sliding Window
-3) Rotary embeddings
-4) Dropout
-5) Performance Improvements
+3) FP8
+4) Performance Improvements
 
-#### Getting Started
+##### Getting Started
 To get started with the triton backend for AMD, follow the steps below.
 
-First install the recommended Triton [commit](https://github.com/triton-lang/triton/commit/3ca2f498e98ed7249b82722587c511a5610e00c4).
+First install the recommended Triton version 
 
 ```
-git clone https://github.com/triton-lang/triton
-cd triton
-git checkout 3ca2f498e98ed7249b82722587c511a5610e00c4 
-pip install --verbose -e python
+pip install triton==3.2.0
 ```
-Then install and test Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.
+Then install Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.
 
 ```
-export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
 cd flash-attention
-python setup.py install
-pytest tests/test_flash_attn.py
+git checkout main_perf
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
 ```
 
+To test that things are working, you can run our tests. These tests take hours so you don't need to run the full thing.
+```
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd.py
+```
+
+You can use autotune for better performance by using this flag `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE"`
+```
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE" python $PATH_TO_CODE
+```
+
+###### Docker
+You can also use the Dockerfile below which does the above steps on top of the latest rocm/pytorch image.
+```
+FROM rocm/pytorch:latest
+
+WORKDIR /workspace
+
+# install triton
+RUN pip install triton==3.2.0
+
+# install flash attention
+ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+
+RUN git clone https://github.com/ROCm/flash-attention.git &&\ 
+    cd flash-attention &&\
+    git checkout main_perf &&\
+    python setup.py install
+
+# set working dir
+WORKDIR /workspace/flash-attention
+```
+
+To build the docker file
+```
+docker build -t fa_triton .
+```
+
+To run the docker image
+```
+docker run -it --network=host --user root --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ipc=host --shm-size 16G --device=/dev/kfd --device=/dev/dri fa_triton
+```
 
 ## How to use FlashAttention
 
