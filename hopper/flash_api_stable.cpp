@@ -74,26 +74,6 @@ cudaDeviceProp* get_device_prop() {
 }
 } // anonymous namespace
 
-
-extern "C" {
-/* Creates a dummy empty _C module that can be imported from Python.
-    The import from Python will load the .so consisting of this file
-    in this extension, so that the STABLE_TORCH_LIBRARY static initializers
-    below are run. */
-PyObject* PyInit__C(void)
-{
-    static struct PyModuleDef module_def = {
-        PyModuleDef_HEAD_INIT,
-        "_C",   /* name of module */
-        NULL,   /* module documentation, may be NULL */
-        -1,     /* size of per-interpreter state of the module,
-                    or -1 if the module keeps state in global variables. */
-        NULL,   /* methods */
-    };
-    return PyModule_Create(&module_def);
-}
-}
-
 #define CHECK_DEVICE(x) STD_TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) \
     do { \
@@ -767,7 +747,8 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         std::optional<Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int64_t sm_margin
+        int64_t sm_margin,
+        std::optional<const at::Tensor> &sinks_ // (h)
         ) {
 
     auto dprops = get_device_prop();
@@ -1204,6 +1185,18 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         } else {
             params.v_descale_ptr = nullptr;
         }
+    }
+
+    if(sinks_.has_value()) {
+        auto sinks = sinks_.value();
+        TORCH_CHECK(sinks.scalar_type() == at::ScalarType::BFloat16,
+            "sinks must have dtype bfloat16");
+        CHECK_DEVICE(sinks);
+        CHECK_SHAPE(sinks, num_heads);
+        CHECK_CONTIGUOUS(sinks);
+        params.sink_ptr = sinks.data_ptr();
+    } else {
+        params.sink_ptr = nullptr;
     }
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
@@ -1877,102 +1870,4 @@ void boxed_mha_fwd_get_scheduler_metadata(
     auto scheduler_metadata = mha_fwd_get_scheduler_metadata(batch_size, max_seqlen_q, max_seqlen_k, num_heads, num_heads_k, headdim, headdim_v, qkv_dtype, seqused_k, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, leftpad_k, page_size, max_seqlen_k_new, is_causal, window_size_left, window_size_right, attention_chunk, has_softcap, num_splits, pack_gqa, sm_margin);
 
     stack[0] = from(scheduler_metadata);
-}
-
-STABLE_TORCH_LIBRARY(flash_attn_3, m) {
-    m.def("fwd("
-        "Tensor q,"
-        "Tensor k,"
-        "Tensor v,"
-        "Tensor(k_new!)? k_new = None,"
-        "Tensor(v_new!)? v_new = None,"
-        "Tensor? q_v = None,"
-        "Tensor(out!)? out = None,"
-        "Tensor? cu_seqlens_q = None,"
-        "Tensor? cu_seqlens_k = None,"
-        "Tensor? cu_seqlens_k_new = None,"
-        "Tensor? seqused_q = None,"
-        "Tensor? seqused_k = None,"
-        "int? max_seqlen_q = None,"
-        "int? max_seqlen_k = None,"
-        "Tensor? page_table = None,"
-        "Tensor? kv_batch_idx = None,"
-        "Tensor? leftpad_k = None,"
-        "Tensor? rotary_cos = None,"
-        "Tensor? rotary_sin = None,"
-        "Tensor? seqlens_rotary = None,"
-        "Tensor? q_descale = None,"
-        "Tensor? k_descale = None,"
-        "Tensor? v_descale = None,"
-        "float? softmax_scale = None,"
-        "bool is_causal = False,"
-        "int window_size_left = -1,"
-        "int window_size_right = -1,"
-        "int attention_chunk = 0,"
-        "float softcap = 0.0,"
-        "bool is_rotary_interleaved = False,"
-        "Tensor? scheduler_metadata = None,"
-        "int num_splits = 0,"
-        "bool? pack_gqa = None,"
-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
-    m.def("bwd("
-        "Tensor dout,"
-        "Tensor q,"
-        "Tensor k,"
-        "Tensor v,"
-        "Tensor out,"
-        "Tensor softmax_lse,"
-        "Tensor(dq!)? dq = None,"
-        "Tensor(dk!)? dk = None,"
-        "Tensor(dv!)? dv = None,"
-        "Tensor? cu_seqlens_q = None,"
-        "Tensor? cu_seqlens_k = None,"
-        "Tensor? seqused_q = None,"
-        "Tensor? seqused_k = None,"
-        "int? max_seqlen_q = None,"
-        "int? max_seqlen_k = None,"
-        "float? softmax_scale = None,"
-        "bool is_causal = False,"
-        "int window_size_left = -1,"
-        "int window_size_right = -1,"
-        "float softcap = 0.0,"
-        "bool deterministic = False,"
-        "int sm_margin = 0) -> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)");
-    m.def("fwd_combine("
-        "Tensor out_partial,"
-        "Tensor lse_partial,"
-        "Tensor(out!)? out = None,"
-        "ScalarType? out_dtype = None) -> (Tensor(out!), Tensor)");
-    m.def("get_scheduler_metadata("
-        "int batch_size,"
-        "int max_seqlen_q,"
-        "int max_seqlen_k,"
-        "int num_heads,"
-        "int num_heads_k,"
-        "int headdim,"
-        "int headdim_v,"
-        "ScalarType qkv_dtype,"
-        "Tensor seqused_k,"
-        "Tensor? cu_seqlens_q = None,"
-        "Tensor? cu_seqlens_k = None,"
-        "Tensor? cu_seqlens_k_new = None,"
-        "Tensor? seqused_q = None,"
-        "Tensor? leftpad_k = None,"
-        "int? page_size = None,"
-        "int max_seqlen_k_new = 0,"
-        "bool is_causal = False,"
-        "int window_size_left = -1,"
-        "int window_size_right = -1,"
-        "int attention_chunk = 0,"
-        "bool has_softcap = False,"
-        "int num_splits = 0,"
-        "bool? pack_gqa = None,"
-        "int sm_margin = 0) -> Tensor");
-}
-
-STABLE_TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
-    m.impl("fwd", &boxed_mha_fwd);
-    m.impl("bwd", &boxed_mha_bwd);
-    m.impl("fwd_combine", &boxed_mha_combine);
-    m.impl("get_scheduler_metadata", &boxed_mha_fwd_get_scheduler_metadata);
 }
