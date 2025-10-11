@@ -769,7 +769,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             tVpV = utils.predicate_k(tVcV, limit=mV.shape[1])
 
         # shape: (atom_v_m * rest_m)
-        softmax = Softmax(softmax_scale_log2, num_rows=acc_O.shape[0][0] * acc_O.shape[1], softmax_scale=softmax_scale)
+        softmax = Softmax.create(softmax_scale_log2, num_rows=acc_O.shape[0][0] * acc_O.shape[1], softmax_scale=softmax_scale)
         softmax.reset()
 
         # group parameters for compute_one_n_block
@@ -1650,7 +1650,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # if work_tile.is_valid_tile:
 
             # shape: (atom_v_m * rest_m)
-            softmax = Softmax(softmax_scale_log2, num_rows=acc_O.shape[0][0] * acc_O.shape[1], softmax_scale=softmax_scale)
+            softmax = Softmax.create(softmax_scale_log2, num_rows=acc_O.shape[0][0] * acc_O.shape[1], softmax_scale=softmax_scale)
             m_block, head_idx, batch_idx = work_tile.tile_idx
             score_mod = self.score_mod
             mma_one_n_block = partial(
@@ -1789,7 +1789,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             else:
                 self.warp_scheduler_barrier_arrive()
 
-            # normalize acc_O by row_sum and calculate the lse
+            sink_val = None
             if const_expr(learnable_sink is not None):
                 if const_expr(not self.pack_gqa):
                     sink_val = Float32(learnable_sink[head_idx])
@@ -1801,9 +1801,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         row = m_block * self.m_block_size + tScS_mn[r][0]
                         q_head_idx = row % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
                         sink_val[r] = Float32(learnable_sink[q_head_idx])
-            else:
-                sink_val = None
 
+            # normalize acc_O by row_sum and calculate the lse
             row_scale = softmax.finalize(sink_val=sink_val)
             softmax.rescale_O(acc_O, row_scale)
 
