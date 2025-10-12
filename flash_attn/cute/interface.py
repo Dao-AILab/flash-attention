@@ -515,7 +515,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.softcap,
         )
-        return dq, dk, dv, *((None,) * 5)
+        return dq, dk, dv, *((None,) * 10)  # Extra Nones is fine
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):

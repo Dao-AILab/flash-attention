@@ -151,6 +151,10 @@ class FlashAttentionBackwardPostprocess:
             if cutlass.const_expr(not mdQaccum.element_type in [cutlass.Float32]):
                 raise TypeError("dQaccum tensor must be Float32")
 
+        # Assume all strides are divisible by 128 bits except the last stride
+        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
+        mdQaccum, mdQ = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mdQaccum, mdQ)]
+
         num_mma_warps = self.num_threads // 32
         AtomLayoutdQ = (
             (self.AtomLayoutMdQ, num_mma_warps // self.AtomLayoutMdQ, 1)
