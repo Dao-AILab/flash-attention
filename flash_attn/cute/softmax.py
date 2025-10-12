@@ -136,15 +136,21 @@ class Softmax(ParamsBase):
             acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])
 
 
+@dataclass
 class SoftmaxSm100(Softmax):
-    def __init__(self, scale_log2: Float32, rescale_threshold: cutlass.Constexpr[float] = 0.0, softmax_scale: Float32 | None = None):
-        super().__init__(scale_log2, num_rows=1, arch=100, softmax_scale=softmax_scale)
-        self.rescale_threshold = rescale_threshold
+    rescale_threshold: cutlass.Constexpr[float] = 0.0
 
-    def __new_from_mlir_values__(self, values):
-        new_obj = super().__new_from_mlir_values__(values)
-        new_obj.rescale_threshold = self.rescale_threshold
-        return new_obj
+    @staticmethod
+    def create(
+        scale_log2: Float32,
+        rescale_threshold: cutlass.Constexpr[float] = 0.0,
+        softmax_scale: Float32 | None = None,
+    ):
+        num_rows = 1
+        arch = 100
+        row_max = cute.make_fragment(num_rows, Float32)
+        row_sum = cute.make_fragment(num_rows, Float32)
+        return SoftmaxSm100(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale, rescale_threshold=rescale_threshold)
 
     @cute.jit
     def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
