@@ -11,8 +11,8 @@ import flash_attn.cute.utils as utils
 
 @dataclass(frozen=True)
 class AttentionMask:
-    m_block_size: cutlass.Constexpr[int]
-    n_block_size: cutlass.Constexpr[int]
+    tile_m: cutlass.Constexpr[int]
+    tile_n: cutlass.Constexpr[int]
     seqlen_q: cutlass.Int32
     seqlen_k: cutlass.Int32
     window_size_left: Optional[cutlass.Int32] = None
@@ -32,13 +32,13 @@ class AttentionMask:
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
-        cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
+        cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
         tScS_mn = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS))
         # We use t0ScS as these indices are known at compile time. We then must subtract the
         # column limit by the thread column offset.
         t0ScS_mn = utils.make_acc_tensor_mn_view(thr_mma.get_slice(0).partition_C(cS))
         thr_col_offset = tScS_mn[0][1]
-        seqlenk_col_limit = self.seqlen_k - n_block * self.n_block_size - thr_col_offset
+        seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
         if cutlass.const_expr(not mask_causal and not mask_local):
             if cutlass.const_expr(mask_seqlen):
                 if cutlass.const_expr(False):
@@ -71,10 +71,10 @@ class AttentionMask:
                 assert cute.size(acc_S_mn.shape[0]) <= threads_per_row
                 tidx = thr_mma.thr_idx
                 mma_m_idx = (
-                    m_block * self.m_block_size + tScS_mn[tidx % threads_per_row, 0][0]
+                    m_block * self.tile_m + tScS_mn[tidx % threads_per_row, 0][0]
                 ) // self.qhead_per_kvhead_packgqa
             causal_row_offset = (
-                1 + self.seqlen_k - n_block * self.n_block_size - self.seqlen_q - thr_col_offset
+                1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q - thr_col_offset
             )
             c = 0
             col_limit_transformed = 0
@@ -86,7 +86,7 @@ class AttentionMask:
                 for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                     # get the column index limit based on current row. Only consider the row index, so the column index sets to 0.
                     if cutlass.const_expr(self.qhead_per_kvhead_packgqa == 1):
-                        row_idx = tScS_mn[r, 0][0] + m_block * self.m_block_size
+                        row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
                     else:
                         row_idx = utils.shuffle_sync(
                             mma_m_idx, r % threads_per_row, width=threads_per_row
@@ -122,7 +122,7 @@ class AttentionMask:
                 c = 0
                 for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                     if cutlass.const_expr(self.qhead_per_kvhead_packgqa == 1):
-                        row_idx = tScS_mn[r, 0][0] + m_block * self.m_block_size
+                        row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
                     else:
                         row_idx = utils.shuffle_sync(
                             mma_m_idx, r % threads_per_row, width=threads_per_row
@@ -132,7 +132,7 @@ class AttentionMask:
                         if cutlass.const_expr(mask_seqlen):
                             col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                     else:
-                        col_limit_right = self.n_block_size
+                        col_limit_right = self.tile_n
                     col_limit_left = (
                         row_idx + local_row_offset_left if cutlass.const_expr(self.window_size_left is not None) else 0
                     )
@@ -158,10 +158,10 @@ class AttentionMask:
         mask_local: cutlass.Constexpr,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
-        cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
+        cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
         tScS = thr_mma.partition_C(cS)
         tScS_t2r = thr_tmem_load.partition_D(tScS)
-        seqlenk_col_limit = self.seqlen_k - n_block * self.n_block_size
+        seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n
         if cutlass.const_expr(not mask_causal and not mask_local):
             if cutlass.const_expr(mask_seqlen):
                 ncol = cutlass.const_expr(cute.size(tScS_t2r.shape))
@@ -197,8 +197,8 @@ class AttentionMask:
                             # acc_S[s * 24 + i] = acc_S[s * 24 + i] if col_limit_right_s <= i else -cutlass.Float32.inf
                     # if tidx == 0: cute.print_tensor(acc_S)
         else:  # Causal or local
-            causal_row_offset = 1 + self.seqlen_k - n_block * self.n_block_size - self.seqlen_q
-            row_idx = tScS_t2r[0][0] + m_block * self.m_block_size
+            causal_row_offset = 1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q
+            row_idx = tScS_t2r[0][0] + m_block * self.tile_m
             if cutlass.const_expr(self.qhead_per_kvhead_packgqa != 1):
                 row_idx = row_idx // self.qhead_per_kvhead_packgqa
             c = 0
@@ -243,7 +243,7 @@ class AttentionMask:
                     if cutlass.const_expr(mask_seqlen):
                         col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                 else:
-                    col_limit_right = self.n_block_size
+                    col_limit_right = self.tile_n
                 col_limit_left = (
                     row_idx + local_row_offset_left if cutlass.const_expr(self.window_size_left is not None) else 0
                 )
