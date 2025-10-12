@@ -959,17 +959,17 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
         if cutlass.const_expr(score_mod is not None):
             self.apply_score_mod(
-                acc_S,
                 mma_params.thr_mma_qk,
                 batch_idx,
                 head_idx,
                 m_block,
+                acc_S,
                 n_block,
-                softmax=softmax,
+                softmax_scale=softmax.softmax_scale,
                 buffers=buffers,
                 fastdiv_mods=fastdiv_mods,
             )
-            
+
         smem_pipe_write = self.advance_pipeline(smem_pipe_write)
         def load_K_next():
             if n_block - self.num_stages >= 0:
@@ -1655,7 +1655,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             pipeline_k=pipeline_k, pipeline_v=pipeline_v,
             acc_O=acc_O, tOrP=tOrP,
             smem_copy_params=smem_copy_params,
-            thr_mma_qk=thr_mma_qk,
             check_inf=True,
         )
 
@@ -1672,17 +1671,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # shape: (atom_v_m * rest_m)
             softmax = Softmax.create(softmax_scale_log2, num_rows=acc_O.shape[0][0] * acc_O.shape[1], softmax_scale=softmax_scale)
             m_block, head_idx, batch_idx = work_tile.tile_idx
-            score_mod = self.score_mod
-            mma_one_n_block = partial(
-                mma_one_n_block_all, softmax=softmax, score_mod=score_mod,
-                batch_idx=batch_idx, head_idx=head_idx, m_block=m_block, buffers=buffers,
-                fastdiv_mods=fastdiv_mods
-            )
             seqlen = SeqlenInfoCls(batch_idx)
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
                 mask.apply_mask, m_block=m_block, thr_mma=thr_mma_qk,
                 mask_causal=self.is_causal, mask_local=self.is_local,
+            )
+            score_mod_fn = None
+            if const_expr(self.score_mod is not None):
+                score_mod_fn = partial(
+                    self.apply_score_mod,
+                    thr_mma_qk, batch_idx, head_idx, m_block,
+                    softmax_scale=softmax.softmax_scale, buffers=buffers, fastdiv_mods=fastdiv_mods,
+                )
+            mma_one_n_block = partial(
+                mma_one_n_block_all, softmax=softmax, score_mod_fn=score_mod_fn
             )
             softmax.reset()
             # Load Q if not TMA_Q
@@ -1715,18 +1718,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 acc_S = mma_qk_fn(kv_consumer_state.index, wg_wait=0)
                 pipeline_k.consumer_release(kv_consumer_state)
                 # Use vectorized score modification
-                if cutlass.const_expr(score_mod is not None):
-                    self.apply_score_mod(
-                        acc_S,
-                        thr_mma_qk,
-                        batch_idx,
-                        head_idx,
-                        m_block,
-                        n_block_max - 1,
-                        softmax=softmax,
-                        buffers=buffers,
-                        fastdiv_mods=fastdiv_mods,
-                    )
+                if cutlass.const_expr(score_mod_fn is not None):
+                    score_mod_fn(acc_S, n_block=n_block_max - 1)
                 # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
                 mask_fn(acc_S, n_block=n_block_max - 1, mask_seqlen=True)
                 # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
@@ -1839,13 +1832,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tOrP: cute.Tensor,
         smem_copy_params: SimpleNamespace,
         softmax: Softmax,
-        score_mod: Callable,
-        batch_idx: cutlass.Int32,
-        head_idx: cutlass.Int32,
-        m_block: cutlass.Int32,
-        thr_mma_qk: cute.TiledMma,
-        buffers=None,
-        fastdiv_mods=None,
+        score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
@@ -1856,18 +1843,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(0)
         pipeline_k.consumer_release(smem_pipe_read)
-        if cutlass.const_expr(score_mod is not None):
-            self.apply_score_mod(
-                acc_S,
-                thr_mma_qk,
-                batch_idx,
-                head_idx,
-                m_block,
-                n_block,
-                softmax=softmax,
-                buffers=buffers,
-                fastdiv_mods=fastdiv_mods,
-            )
+        if const_expr(score_mod_fn is not None):
+            score_mod_fn(acc_S, n_block=n_block)
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
@@ -1910,13 +1887,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tOrP: cute.Tensor,
         smem_copy_params: SimpleNamespace,
         softmax: Softmax,
-        score_mod: Callable,
-        batch_idx: cutlass.Int32,
-        head_idx: cutlass.Int32,
-        m_block: cutlass.Int32,
-        thr_mma_qk: cute.TiledMma,
-        buffers=None,
-        fastdiv_mods=None,
+        score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
         O_should_accumulate: Boolean = True,
@@ -1931,18 +1902,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(1)
         pipeline_k.consumer_release(smem_pipe_read)
-        if cutlass.const_expr(score_mod is not None):
-            self.apply_score_mod(
-                acc_S,
-                thr_mma_qk,
-                batch_idx,
-                head_idx,
-                m_block,
-                n_block,
-                softmax=softmax,
-                buffers=buffers,
-                fastdiv_mods=fastdiv_mods,
-            )
+        if const_expr(score_mod_fn is not None):
+            score_mod_fn(acc_S, n_block=n_block)
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
@@ -1982,13 +1943,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     @cute.jit
     def apply_score_mod(
         self,
-        acc_S,
         thr_mma_qk,
         batch_idx,
         head_idx,
         m_block,
+        acc_S,
         n_block,
-        softmax,
+        softmax_scale,
         buffers=None,
         fastdiv_mods=None,
     ):
@@ -2003,7 +1964,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.score_mod,
             batch_idx,
             head_idx,
-            softmax.softmax_scale,
+            softmax_scale,
             self.vec_size,
             self.qk_acc_dtype,
             buffers,
