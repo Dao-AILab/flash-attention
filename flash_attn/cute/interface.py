@@ -71,6 +71,7 @@ def _flash_attn_fwd(
     m_block_size: int = 128,
     n_block_size: int = 128,
     num_threads: int = 384,
+    num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     _compute_capability: Optional[int] = None,
     score_mod: Callable | None = None,
@@ -146,26 +147,30 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
+    assert num_splits > 0, "num_splits must be greater than 0"
+    is_split_kv = num_splits > 1
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    out_torch_dtype = q.dtype
+    # TODO (timmy) accumulate split kv in fp32
+    out_torch_dtype = q.dtype # if not is_split_kv else torch.float32
     device = q.device
+    split_kv_prefix = (num_splits,) if is_split_kv else ()
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
-    lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
+    lse_shape = split_kv_prefix + ((batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q))
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
 
     if out is None:
-        out = torch.empty(*q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
+        out = torch.empty(*split_kv_prefix, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
     else:
-        expected_out_shape = (*q_batch_seqlen_shape, num_head, head_dim_v)
+        expected_out_shape = (*split_kv_prefix, *q_batch_seqlen_shape, num_head, head_dim_v)
         assert out.shape == expected_out_shape, f"out tensor shape {out.shape} does not match expected shape {expected_out_shape}"
         assert out.dtype == out_torch_dtype, f"out tensor dtype {out.dtype} does not match expected dtype {out_torch_dtype}"
         assert out.device == device, f"out tensor device {out.device} does not match input device {device}"
         assert out.is_cuda, "out tensor must be on CUDA device"
 
     if lse is None:
-        lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad or return_lse else None
+        lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad or return_lse or is_split_kv else None
     elif lse is not None:
         assert lse.shape == lse_shape, f"lse tensor shape {lse.shape} does not match expected shape {lse_shape}"
         assert lse.dtype == torch.float32, f"lse tensor dtype {lse.dtype} does not match expected dtype torch.float32"
@@ -225,7 +230,7 @@ def _flash_attn_fwd(
         page_table is not None,
         window_size_left is not None, window_size_right is not None,
         learnable_sink is not None,
-        m_block_size, n_block_size, num_threads, pack_gqa,
+        m_block_size, n_block_size, num_threads, is_split_kv, pack_gqa,
         compute_capability,
     )
 
@@ -240,6 +245,7 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
                 tile_m=m_block_size,
                 tile_n=n_block_size,
@@ -258,8 +264,9 @@ def _flash_attn_fwd(
                 qhead_per_kvhead=qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
-                is_persistent=not causal and not local and cu_seqlens_q is None and seqused_q is None,
+                is_persistent=not causal and not local and cu_seqlens_q is None and seqused_q is None and not is_split_kv,
                 score_mod=score_mod,
                 has_buffers=buffers is not None,
             )
@@ -592,6 +599,7 @@ class FlashAttnFunc(torch.autograd.Function):
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
+        num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
     ):
         out, lse = _flash_attn_fwd(
@@ -604,6 +612,7 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             learnable_sink=learnable_sink,
             softcap=softcap,
+            num_splits=num_splits,
             pack_gqa=pack_gqa,
         )
         ctx.save_for_backward(q, k, v, out, lse)
@@ -707,6 +716,7 @@ def flash_attn_func(
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
+    num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
 ):
     return FlashAttnFunc.apply(
@@ -718,6 +728,7 @@ def flash_attn_func(
         window_size,
         learnable_sink,
         softcap,
+        num_splits,
         pack_gqa,
     )
 
@@ -866,7 +877,7 @@ def _flash_attn_fwd_combine(
         if not fa_combine.can_implement(
             dtype, dtype_partial, head_dim, m_block_size, k_block_size, log_max_splits, num_threads=256
         ):
-            raise RuntimeError(f"FlashAttention combine kernel cannot be implemented with given parameters")
+            raise RuntimeError("FlashAttention combine kernel cannot be implemented with given parameters")
 
         _flash_attn_fwd_combine.compile_cache[compile_key] = cute.compile(
             fa_combine,

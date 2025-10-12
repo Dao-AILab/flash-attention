@@ -60,6 +60,7 @@ class FlashAttentionForwardSm100:
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
         is_causal: bool = False,
         is_local: bool = False,
+        is_split_kv: bool = False,
         pack_gqa: bool = False,
         m_block_size: int = 128,
         n_block_size: int = 128,
@@ -93,6 +94,7 @@ class FlashAttentionForwardSm100:
         self.is_causal = is_causal
         self.is_local = is_local
         self.qhead_per_kvhead = qhead_per_kvhead
+        self.is_split_kv = is_split_kv
         self.pack_gqa = pack_gqa
         if pack_gqa:
             assert m_block_size % self.qhead_per_kvhead == 0, "For PackGQA, m_block_size must be divisible by qhead_per_kvhead"
@@ -229,18 +231,23 @@ class FlashAttentionForwardSm100:
         # Assume all strides are divisible by 128 bits except the last stride
         new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
         mQ, mK, mV, mO = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mQ, mK, mV, mO)]
-        QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
-        mQ, mO = [
-            cute.make_tensor(t.iterator, cute.select(t.layout, mode=QO_layout_transpose))
-            for t in (mQ, mO)
-        ]
+        Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
+        mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
         # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there's cu_seqlens_k or (page_size, d, h_k, num_pages) if there's page_table
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
         mK, mV = [
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose))
             for t in (mK, mV)
         ]
-        LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
+        if const_expr(self.is_split_kv):
+            O_layout_transpose = [2, 4, 0, 3, 1] if const_expr(mCuSeqlensQ is None) else [1, 3, 0, 2]
+            LSE_layout_transpose = [3, 0, 2, 1] if const_expr(mCuSeqlensQ is None) else [2, 0, 1]
+            num_splits = mO.shape[0]
+        else:
+            O_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
+            LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
+            num_splits = Int32(1)
+        mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
         mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose)) if const_expr(mLSE is not None) else None
         # (s, d, h, b) -> (d, s, h, b)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
@@ -324,6 +331,7 @@ class FlashAttentionForwardSm100:
             sV_layout = cute.make_composed_layout(sV_layout.inner, 0, cute.make_layout((*sV_layout.outer.shape[:-1], self.kv_stage), stride=(*sV_layout.outer.stride[:-1], stage_stride)))
 
         if const_expr(self.pack_gqa):
+            # TODO(timmy): ordering will be wrong if split kv is enabled
             shape_Q_packed = ((self.qhead_per_kvhead, mQ.shape[0]), mQ.shape[1], mK.shape[2], *mQ.shape[3:])
             stride_Q_packed = ((mQ.stride[2], mQ.stride[0]), mQ.stride[1], mQ.stride[2] * self.qhead_per_kvhead, *mQ.stride[3:])
             mQ = cute.make_tensor(mQ.iterator, cute.make_layout(shape_Q_packed, stride=stride_Q_packed))
@@ -413,6 +421,7 @@ class FlashAttentionForwardSm100:
             cute.ceil_div(cute.size(mQ.shape[0]), self.cta_tiler[0]),
             cute.size(mQ.shape[2]),
             cute.size(mQ.shape[3]) if const_expr(mCuSeqlensQ is None) else cute.size(mCuSeqlensQ.shape[0] - 1),
+            num_splits,
             cute.size(mK.shape[0]) if const_expr(mPageTable is None) else mK.shape[0] * mPageTable.shape[1],
             mQ.shape[1],
             mV.shape[0],  # Note that this is different from Sm90 since we transpose mV in Sm100
@@ -424,6 +433,7 @@ class FlashAttentionForwardSm100:
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,
             lpt=self.is_causal or self.is_local,
+            is_split_kv=self.is_split_kv,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler
@@ -526,6 +536,7 @@ class FlashAttentionForwardSm100:
             tiled_mma_qk,
             tiled_mma_pv,
             tile_sched_params,
+            num_splits,
             buffers,
             fastdiv_mods,
         ).launch(
@@ -569,6 +580,7 @@ class FlashAttentionForwardSm100:
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         tile_sched_params: ParamsBase,
+        num_splits: Int32,
         buffers = None,
         fastdiv_mods = (None, None),
     ):
@@ -689,7 +701,7 @@ class FlashAttentionForwardSm100:
 
         block_info = BlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
-            self.cta_tiler[0], self.cta_tiler[1], self.is_causal, self.is_local,
+            self.cta_tiler[0], self.cta_tiler[1], self.is_causal, self.is_local, self.is_split_kv,
             window_size_left, window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
@@ -735,6 +747,7 @@ class FlashAttentionForwardSm100:
                 pipeline_kv,
                 mbar_ptr,
                 block_info,
+                num_splits,
                 SeqlenInfoCls,
                 TileSchedulerCls,
             )
@@ -766,6 +779,7 @@ class FlashAttentionForwardSm100:
                 pipeline_kv,
                 mbar_ptr,
                 block_info,
+                num_splits,
                 SeqlenInfoCls,
                 TileSchedulerCls,
             )
@@ -806,6 +820,7 @@ class FlashAttentionForwardSm100:
                 learnable_sink=learnable_sink,
                 mbar_ptr=mbar_ptr,
                 block_info=block_info,
+                num_splits=num_splits,
                 SeqlenInfoCls=SeqlenInfoCls,
                 AttentionMaskCls=AttentionMaskCls,
                 TileSchedulerCls=TileSchedulerCls,
@@ -853,6 +868,7 @@ class FlashAttentionForwardSm100:
                 mbar_ptr,
                 softmax_scale_log2,
                 block_info,
+                num_splits,
                 SeqlenInfoCls,
                 TileSchedulerCls,
             )
@@ -878,6 +894,7 @@ class FlashAttentionForwardSm100:
         pipeline_kv: cutlass.pipeline.PipelineAsync,
         mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
+        num_splits: Int32,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
@@ -887,7 +904,7 @@ class FlashAttentionForwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mQ_cur = mQ[None, None, head_idx, batch_idx]
@@ -953,7 +970,7 @@ class FlashAttentionForwardSm100:
                 K_or_V="V",
             )
 
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
             load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
             page_idx = mPageTable[batch_idx, n_block_max - 1] if const_expr(mPageTable is not None) else None
             load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
@@ -993,6 +1010,7 @@ class FlashAttentionForwardSm100:
         pipeline_kv: cutlass.pipeline.PipelineAsync,
         mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
+        num_splits: Int32,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
@@ -1034,9 +1052,9 @@ class FlashAttentionForwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
             for stage in cutlass.range_constexpr(self.q_stage):
                 # GEMM_QK00 (Q0 * K0 -> S0) or GEMM_QK01 (Q1 * K0 -> S1)
@@ -1181,6 +1199,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor],
         mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
+        num_splits: Int32,
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
@@ -1249,9 +1268,9 @@ class FlashAttentionForwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
                 mask.apply_mask_sm100, m_block=self.q_stage * m_block + stage, thr_mma=thr_mma_qk, thr_tmem_load=thr_tmem_load, mask_causal=self.is_causal, mask_local=self.is_local
@@ -1482,6 +1501,7 @@ class FlashAttentionForwardSm100:
         mbar_ptr: cute.Pointer,
         softmax_scale_log2: Float32,
         block_info: BlockInfo,
+        num_splits: Int32,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
@@ -1512,9 +1532,9 @@ class FlashAttentionForwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
             # Ignore first signal from softmax as no correction is required
             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_softmax_corr_full_offset + 0, softmax_corr_consumer_phase)
@@ -1591,10 +1611,16 @@ class FlashAttentionForwardSm100:
                 # if tidx == 0: cute.printf("Correction final scale for stage %d: %f\n", stage, scale)
             if const_expr(mLSE is not None):
                 if const_expr(not seqlen.has_cu_seqlens_q):
-                    mLSE_cur = mLSE[None, head_idx, batch_idx]
+                    if const_expr(self.is_split_kv):
+                        mLSE_cur = mLSE[None, split_idx, head_idx, batch_idx]
+                    else:
+                        mLSE_cur = mLSE[None, head_idx, batch_idx]
                 else:
                     offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
-                    mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
+                    if const_expr(self.is_split_kv):
+                        mLSE_cur = cute.domain_offset((offset,), mLSE[None, split_idx, head_idx])
+                    else:
+                        mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
                 for stage in cutlass.range_constexpr(self.q_stage):
                     gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (self.q_stage * m_block + stage,))
                     row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
@@ -1805,13 +1831,19 @@ class FlashAttentionForwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(not seqlen.has_cu_seqlens_q):
-                mO_cur = mO[None, None, head_idx, batch_idx]
+                if const_expr(self.is_split_kv):
+                    mO_cur = mO[None, None, split_idx, head_idx, batch_idx]
+                else:
+                    mO_cur = mO[None, None, head_idx, batch_idx]
             else:
                 offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
-                mO_cur = cute.domain_offset((offset, 0), mO[None, None, head_idx])
+                if const_expr(self.is_split_kv):
+                    mO_cur = cute.domain_offset((offset, 0), mO[None, None, split_idx, head_idx])
+                else:
+                    mO_cur = cute.domain_offset((offset, 0), mO[None, None, head_idx])
             gO = cute.local_tile(mO_cur, (self.m_block_size, self.head_dim_v_padded), (None, 0))
             if const_expr(self.use_tma_O):
                 tOsO, tOgO = cpasync.tma_partition(
