@@ -1530,12 +1530,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
                 if const_expr(self.use_tma_Q):
                     gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
-                    tQsQ, tQgQ = cpasync.tma_partition(
-                        tma_atom_Q,
-                        0,
-                        cute.make_layout(1),
-                        cute.group_modes(sQ, 0, 2),
-                        cute.group_modes(gQ, 0, 2),
+                    load_Q, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
                     )
                 # TODO: mcast
                 # TODO check warp_idx if we have 128 producer threads
@@ -1549,7 +1545,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     q_producer_phase ^= 1
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr_Q, self.tma_copy_q_bytes)
-                    cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr=mbar_ptr_Q)
+                    load_Q(tma_bar_ptr=mbar_ptr_Q)
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
                 # if cute.arch.thread_idx()[0] == 0:
                 #     cute.printf("m_block = %d, n_block_min: %d, n_block_max: %d", m_block, n_block_min, n_block_max)

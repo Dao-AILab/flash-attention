@@ -91,6 +91,7 @@ def tma_get_copy_fn(
     src_tensor: cute.Tensor,
     dst_tensor: cute.Tensor,
     filter_zeros: bool = False,
+    single_stage: bool = False,
     **kwargs,
 ) -> Callable:
     src_is_smem = const_expr(
@@ -98,13 +99,15 @@ def tma_get_copy_fn(
         and src_tensor.memspace == cute.AddressSpace.smem
     )
     smem_tensor, gmem_tensor = (src_tensor, dst_tensor) if src_is_smem else (dst_tensor, src_tensor)
+    group_rank_smem = const_expr(cute.rank(smem_tensor) - (1 if not single_stage else 0))
+    group_rank_gmem = const_expr(cute.rank(gmem_tensor) - (1 if not single_stage else 0))
     # ((atom_v, rest_v), STAGE), ((atom_v, rest_v), RestK)
     s, g = cpasync.tma_partition(
         atom,
         cta_coord,
         cta_layout,
-        cute.group_modes(smem_tensor, 0, cute.rank(smem_tensor) - 1),
-        cute.group_modes(gmem_tensor, 0, cute.rank(gmem_tensor) - 1),
+        cute.group_modes(smem_tensor, 0, group_rank_smem),
+        cute.group_modes(gmem_tensor, 0, group_rank_gmem),
     )
     if const_expr(filter_zeros):
         s = cute.filter_zeros(s)
@@ -114,7 +117,10 @@ def tma_get_copy_fn(
     def copy_tma(src_idx, dst_idx, **new_kwargs):
         cute.copy(atom, src[None, src_idx], dst[None, dst_idx], **new_kwargs, **kwargs)
 
-    return copy_tma, s, g
+    def copy_tma_single_stage(**new_kwargs):
+        cute.copy(atom, src, dst, **new_kwargs, **kwargs)
+
+    return (copy_tma if const_expr(not single_stage) else copy_tma_single_stage), s, g
 
 
 def tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsync):
