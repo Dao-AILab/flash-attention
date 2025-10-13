@@ -2,7 +2,7 @@
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_bwd_postprocess_kernel.h
 # from Cutlass C++ to Cute-DSL.
 import math
-from typing import Type
+from typing import Callable, Optional, Type
 
 import cuda.bindings.driver as cuda
 
@@ -12,6 +12,13 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from flash_attn.cute import ampere_helpers as sm80_utils
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from flash_attn.cute import utils
+from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn.cute.tile_scheduler import (
+    ParamsBase, 
+    SingleTileScheduler, 
+    SingleTileVarlenScheduler, 
+    TileSchedulerArguments
+)
 
 
 class FlashAttentionBackwardPostprocess:
@@ -142,6 +149,8 @@ class FlashAttentionBackwardPostprocess:
         mdQaccum: cute.Tensor,
         mdQ: cute.Tensor,
         scale: cutlass.Float32,
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
         # Get the data type and check if it is fp16 or bf16
@@ -175,15 +184,39 @@ class FlashAttentionBackwardPostprocess:
             cute.size_in_bytes(self.dtype, self.sdQ_layout),
         )
 
-        # grid_dim: (m_block, num_head, batch_size)
-        grid_dim = (
-            cute.ceil_div(mdQ.shape[1], self.m_block_size),
-            cute.size(mdQ.shape[2]),
-            cute.size(mdQ.shape[0]),
+        if cutlass.const_expr(mCuSeqlensQ is not None):
+            TileScheduler = SingleTileVarlenScheduler
+            num_head = mdQ.shape[1]
+            num_batch = mCuSeqlensQ.shape[0] - 1
+        else:
+            TileScheduler = SingleTileScheduler
+            num_head = mdQ.shape[2]
+            num_batch = mdQ.shape[0]
+
+
+        tile_sched_args = TileSchedulerArguments(
+            num_block=cute.ceil_div(mdQ.shape[1], self.m_block_size),
+            num_head=num_head,
+            num_batch=num_batch,
+            seqlen_k=0,
+            headdim=mdQ.shape[2],
+            headdim_v=0,
+            total_q=mdQ.shape[0],
+            tile_shape_mn=(self.m_block_size, 1),
+            mCuSeqlensQ=mCuSeqlensQ,
+            mSeqUsedQ=mSeqUsedQ,
         )
+
+        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
+
+
+        # grid_dim: (m_block, num_head, batch_size)
         self.kernel(
             mdQaccum,
             mdQ,
+            mCuSeqlensQ,
+            mSeqUsedQ,
             scale,
             tiled_mma,
             self.dQ_swapAB,
@@ -192,6 +225,8 @@ class FlashAttentionBackwardPostprocess:
             self.g2s_tiled_copy_dQaccum,
             self.s2r_tiled_copy_dQaccum,
             self.gmem_tiled_copy_dQ,
+            tile_sched_params,
+            TileScheduler,
         ).launch(
             grid=grid_dim,
             block=[tiled_mma.size, 1, 1],
@@ -204,6 +239,8 @@ class FlashAttentionBackwardPostprocess:
         self,
         mdQaccum: cute.Tensor,
         mdQ: cute.Tensor,
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
         scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
         dQ_swapAB: cutlass.Constexpr,
@@ -212,21 +249,54 @@ class FlashAttentionBackwardPostprocess:
         g2s_tiled_copy_dQaccum: cute.TiledCopy,
         s2r_tiled_copy_dQaccum: cute.TiledCopy,
         gmem_tiled_copy_dQ: cute.TiledCopy,
+        tile_sched_params: ParamsBase,
+        TileScheduler: cutlass.Constexpr[Callable],
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
-        m_block, num_head, batch_size = cute.arch.block_idx()
 
-        if True:
+        tile_scheduler = TileScheduler.create(tile_sched_params)
+        work_tile = tile_scheduler.initial_work_tile_info()
+
+        m_block, num_head, batch_size = work_tile.tile_idx
+
+        if work_tile.is_valid_tile:
             # ///////////////////////////////////////////////////////////////////////////////
             # Get the appropriate tiles for this thread block.
             # ///////////////////////////////////////////////////////////////////////////////
+
+            seqlen = SeqlenInfoQK(batch_size, mdQ.shape[1], 0, mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=None, mSeqUsedQ=mSeqUsedQ, mSeqUsedK=None)
+            if cutlass.const_expr(not seqlen.has_cu_seqlens_q):
+                mdQ_cur = mdQ[batch_size, None, num_head, None]
+                mdQaccum_cur = mdQaccum[batch_size, num_head, None]
+                head_dim = mdQ.shape[3]
+            else:
+                padded_offset_q = seqlen.offset_q + batch_size * self.m_block_size
+                mdQ_cur = cute.domain_offset((seqlen.offset_q, 0), mdQ[None, num_head, None])
+                mdQaccum_cur = cute.domain_offset((padded_offset_q * self.head_dim_padded,), mdQaccum[num_head, None])
+                head_dim = mdQ.shape[2]
+
+                # HACK: Compiler doesn't seem to recognize that padding 
+                # by padded_offset_q * self.head_dim_padded keeps alignment 
+                # since statically divisible by 4
+
+                mdQaccum_cur_ptr = cute.make_ptr(
+                    dtype=mdQaccum_cur.element_type,
+                    value=mdQaccum_cur.iterator.toint(),
+                    mem_space=mdQaccum_cur.iterator.memspace,
+                    assumed_align=mdQaccum.iterator.alignment,
+                )
+                mdQaccum_cur = cute.make_tensor(
+                    mdQaccum_cur_ptr,
+                    mdQaccum_cur.layout
+                )
+
             blkdQaccum_shape = (self.m_block_size * self.head_dim_padded,)
             gdQaccum = cute.local_tile(
-                mdQaccum[batch_size, num_head, None], blkdQaccum_shape, (m_block,)
+                mdQaccum_cur, blkdQaccum_shape, (m_block,)
             )
             blkdQ_shape = (self.m_block_size, self.head_dim_padded)
-            gdQ = cute.local_tile(mdQ[batch_size, None, num_head, None], blkdQ_shape, (m_block, 0))
+            gdQ = cute.local_tile(mdQ_cur, blkdQ_shape, (m_block, 0))
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Get shared memory buffer
@@ -235,7 +305,7 @@ class FlashAttentionBackwardPostprocess:
             sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
             sdQ = cute.make_tensor(cute.recast_ptr(sdQaccum.iterator, dtype=self.dtype), sdQ_layout)
 
-            seqlen_q = mdQ.shape[1]
+            seqlen_q = seqlen.seqlen_q
             seqlen_q_rounded = cute.round_up(seqlen_q, self.m_block_size)
 
             # Step 1: load dQaccum from gmem to smem
@@ -300,9 +370,9 @@ class FlashAttentionBackwardPostprocess:
             # Step 5: Copy dQ from register to gmem
             cdQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
             tdQcdQ = gmem_thr_copy_dQ.partition_S(cdQ)
-            tdQpdQ = utils.predicate_k(tdQcdQ, limit=mdQ.shape[3])
+            tdQpdQ = utils.predicate_k(tdQcdQ, limit=head_dim)
             for rest_m in cutlass.range(cute.size(tdQrdQ.shape[1]), unroll_full=True):
-                if tdQcdQ[0, rest_m, 0][0] < mdQ.shape[1] - m_block * self.m_block_size:
+                if tdQcdQ[0, rest_m, 0][0] < seqlen_q - m_block * self.m_block_size:
                     cute.copy(
                         gmem_tiled_copy_dQ,
                         tdQrdQ[None, rest_m, None],
@@ -357,6 +427,8 @@ class FlashAttentionBackwardPostprocess_sm90(FlashAttentionBackwardPostprocess):
         mdQaccum: cute.Tensor,
         mdQ:      cute.Tensor,
         scale:    cutlass.Float32,
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
         stream:   cuda.CUstream,
     ):
         # Assume all strides are divisible by 128 bits except the last stride
