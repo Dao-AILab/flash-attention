@@ -9,6 +9,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import dsl_user_op
+from cutlass._mlir.dialects import llvm
 import cutlass.pipeline
 
 
@@ -82,6 +83,63 @@ def tiled_copy_2d(
     )
     val_layout = cute.make_layout((1, copy_elems))
     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
+
+@dsl_user_op
+def cpasync_bulk_g2s(
+    gmem_ptr: cute.Pointer,
+    smem_ptr: cute.Pointer,
+    tma_bar_ptr: cute.Pointer,
+    size: int | Int32,
+    *,
+    loc=None,
+    ip=None,
+):
+    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    mbar_ptr_i32 = tma_bar_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [gmem_ptr_i64, smem_ptr_i32, mbar_ptr_i32, Int32(size).ir_value()],
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [$1], [$0], $3, [$2];",
+        "l,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def cpasync_bulk_get_copy_fn(
+    src_tensor: cute.Tensor,
+    dst_tensor: cute.Tensor,
+    single_stage: bool = False,
+    **kwargs,
+) -> Callable:
+    # src_is_smem = const_expr(
+    #     isinstance(src_tensor.iterator, cute.Pointer)
+    #     and src_tensor.memspace == cute.AddressSpace.smem
+    # )
+    group_rank_src = const_expr(cute.rank(src_tensor) - (1 if not single_stage else 0))
+    group_rank_dst = const_expr(cute.rank(dst_tensor) - (1 if not single_stage else 0))
+    # ((atom_v, rest_v), STAGE), ((atom_v, rest_v), RestK)
+    src = cute.group_modes(src_tensor, 0, group_rank_src)
+    dst = cute.group_modes(dst_tensor, 0, group_rank_dst)
+
+    def copy_bulk(src_idx, dst_idx, **new_kwargs):
+        size = const_expr(cute.size(src.shape[:-1]) * src.element_type.width // 8)
+        cpasync_bulk_g2s(
+            src[None, src_idx].iterator,
+            dst[None, dst_idx].iterator,
+            size=size,
+            **new_kwargs,
+            **kwargs
+        )
+
+    def copy_bulk_single_stage(**new_kwargs):
+        size = const_expr(cute.size(src.shape) * src.element_type.width // 8)
+        cpasync_bulk_g2s(src.iterator, dst.iterator, size=size, **new_kwargs, **kwargs)
+
+    return copy_bulk if const_expr(not single_stage) else copy_bulk_single_stage
 
 
 def tma_get_copy_fn(

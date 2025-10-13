@@ -183,24 +183,18 @@ class FlashAttentionBackwardSm90:
             tiler_mn=(64, self.tile_n // 2),
         )
         # dV = P.T @ dO, dK = dS.T @ Q
-        tiled_mma_dK = sm90_utils_basic.make_trivial_tiled_mma(
-            self.dtype,
-            self.dtype,
-            warpgroup.OperandMajorMode.MN,
-            warpgroup.OperandMajorMode.MN,
-            Float32,
-            atom_layout_mnk=(self.tile_n // 64, 1, 1),
-            tiler_mn=(64, self.tile_hdim),
-        )
-        tiled_mma_dV = sm90_utils_basic.make_trivial_tiled_mma(
-            self.dtype,
-            self.dtype,
-            warpgroup.OperandMajorMode.MN,
-            warpgroup.OperandMajorMode.MN,
-            Float32,
-            atom_layout_mnk=(self.tile_n // 64, 1, 1),
-            tiler_mn=(64, self.tile_hdimv),
-        )
+        tiled_mma_dK, tiled_mma_dV = [
+            sm90_utils_basic.make_trivial_tiled_mma(
+                self.dtype,
+                self.dtype,
+                warpgroup.OperandMajorMode.MN,
+                warpgroup.OperandMajorMode.MN,
+                Float32,
+                atom_layout_mnk=(self.tile_n // 64, 1, 1),
+                tiler_mn=(64, tile_hdim),
+            )
+            for tile_hdim in (self.tile_hdim, self.tile_hdimv)
+        ]
         # dQ = dS @ K
         tiled_mma_dQ = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
@@ -238,12 +232,9 @@ class FlashAttentionBackwardSm90:
 
         @cute.struct
         class SharedStorageQKV:
-            mbar_ptr_K: cute.struct.MemRange[cutlass.Int64, 2]
-            mbar_ptr_V: cute.struct.MemRange[cutlass.Int64, 2]
+            mbar_ptr_KV: cute.struct.MemRange[cutlass.Int64, 2]
             mbar_ptr_Q: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
             mbar_ptr_dO: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
-            mbar_ptr_LSE: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
-            mbar_ptr_dPsum: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
             sLSE: sLSE_struct
             sdPsum: sdPsum_struct
             sQ: sQ_struct
@@ -316,6 +307,8 @@ class FlashAttentionBackwardSm90:
 
         self.num_mma_regs = 240
         self.num_producer_regs = 24
+        # self.num_mma_regs = 232
+        # self.num_producer_regs = 40
 
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
@@ -358,18 +351,6 @@ class FlashAttentionBackwardSm90:
             cute.select(self.sdO_layout, mode=[0, 1]),
             (self.tile_m, self.tile_hdimv),
         )
-        tma_atom_LSE, tma_tensor_LSE = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(),
-            mLSE,
-            cute.make_layout(self.tile_m),
-            (self.tile_m,),
-        )
-        tma_atom_dPsum, tma_tensor_dPsum = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(),
-            mdPsum,
-            cute.make_layout(self.tile_m),
-            (self.tile_m,),
-        )
         TileScheduler = SingleTileScheduler
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.tile_n),
@@ -398,15 +379,13 @@ class FlashAttentionBackwardSm90:
             tma_tensor_Q,
             tma_tensor_K,
             tma_tensor_V,
-            tma_tensor_LSE,
-            tma_tensor_dPsum,
             tma_tensor_dO,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
-            tma_atom_LSE,
-            tma_atom_dPsum,
             tma_atom_dO,
+            mLSE,
+            mdPsum,
             mdK,
             mdV,
             mdQaccum,
@@ -442,15 +421,13 @@ class FlashAttentionBackwardSm90:
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
-        mLSE: cute.Tensor,
-        mdPsum: cute.Tensor,
         mdO: cute.Tensor,
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
-        tma_atom_LSE: Optional[cute.CopyAtom],
-        tma_atom_dPsum: Optional[cute.CopyAtom],
         tma_atom_dO: Optional[cute.CopyAtom],
+        mLSE: cute.Tensor,
+        mdPsum: cute.Tensor,
         mdK: cute.Tensor,
         mdV: cute.Tensor,
         mdQaccum: cute.Tensor,
@@ -480,20 +457,16 @@ class FlashAttentionBackwardSm90:
             cpasync.prefetch_descriptor(tma_atom_Q)
             cpasync.prefetch_descriptor(tma_atom_K)
             cpasync.prefetch_descriptor(tma_atom_V)
-            cpasync.prefetch_descriptor(tma_atom_LSE)
-            cpasync.prefetch_descriptor(tma_atom_dPsum)
             cpasync.prefetch_descriptor(tma_atom_dO)
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
-        mbar_ptr_K = storage.mbar_ptr_K.data_ptr()
-        mbar_ptr_V = storage.mbar_ptr_V.data_ptr()
+        mbar_ptr_KV = storage.mbar_ptr_KV.data_ptr()
 
         # mbarrier init
         if warp_idx == 1:
-            cute.arch.mbarrier_init(mbar_ptr_K, 1)
-            cute.arch.mbarrier_init(mbar_ptr_V, 1)
+            cute.arch.mbarrier_init(mbar_ptr_KV, 1)
 
         pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
         pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(
@@ -565,9 +538,9 @@ class FlashAttentionBackwardSm90:
                     mQ,
                     mK,
                     mV,
+                    mdO,
                     mLSE,
                     mdPsum,
-                    mdO,
                     sQ,
                     sK,
                     sV,
@@ -578,12 +551,9 @@ class FlashAttentionBackwardSm90:
                     tma_atom_K,
                     tma_atom_V,
                     tma_atom_dO,
-                    tma_atom_LSE,
-                    tma_atom_dPsum,
                     pipeline_q,
                     pipeline_do,
-                    mbar_ptr_K,
-                    mbar_ptr_V,
+                    mbar_ptr_KV,
                     block_info,
                     SeqlenInfoCls,
                     TileSchedulerCls,
@@ -617,8 +587,7 @@ class FlashAttentionBackwardSm90:
                 sdQaccum,
                 pipeline_q,
                 pipeline_do,
-                mbar_ptr_K,
-                mbar_ptr_V,
+                mbar_ptr_KV,
                 tidx,
                 gmem_tiled_copy_dV,
                 gmem_tiled_copy_dK,
@@ -636,9 +605,9 @@ class FlashAttentionBackwardSm90:
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        mdO: cute.Tensor,
         mLSE: cute.Tensor,
         mdPsum: cute.Tensor,
-        mdO: cute.Tensor,
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -649,12 +618,9 @@ class FlashAttentionBackwardSm90:
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
         tma_atom_dO: cute.CopyAtom,
-        tma_atom_LSE: cute.CopyAtom,
-        tma_atom_dPsum: cute.CopyAtom,
         pipeline_q: cutlass.pipeline.PipelineAsync,
         pipeline_do: cutlass.pipeline.PipelineAsync,
-        mbar_ptr_K: cutlass.Pointer,
-        mbar_ptr_V: cutlass.Pointer,
+        mbar_ptr_KV: cutlass.Pointer,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
@@ -700,31 +666,31 @@ class FlashAttentionBackwardSm90:
                     tma_atom_dO, 0, cute.make_layout(1), gdO, sdO
                 )
                 load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_do)
-                load_LSE, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_LSE, 0, cute.make_layout(1), gLSE, sLSE
-                )
+                load_LSE = copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE)
                 load_LSE = copy_utils.tma_producer_copy_fn(load_LSE, pipeline_q)
-                load_dPsum, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_dPsum, 0, cute.make_layout(1), gdPsum, sdPsum
-                )
+                load_dPsum = copy_utils.cpasync_bulk_get_copy_fn(gdPsum, sdPsum)
                 load_dPsum = copy_utils.tma_producer_copy_fn(load_dPsum, pipeline_do)
 
                 # TODO: need to wait if we do persistent kernel
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr_K, self.tma_copy_bytes["K"])
-                    cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr_V, self.tma_copy_bytes["V"])
-                load_K(tma_bar_ptr=mbar_ptr_K)
-                load_V(tma_bar_ptr=mbar_ptr_V)
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        mbar_ptr_KV, self.tma_copy_bytes["K"] + self.tma_copy_bytes["V"]
+                    )
+                load_K(tma_bar_ptr=mbar_ptr_KV)
+                load_V(tma_bar_ptr=mbar_ptr_KV)
 
                 m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
                 for i in cutlass.range(m_block_max - m_block_min, unroll=2):
                     m_block = m_block_max - i - 1
                     pipeline_q.producer_acquire(producer_state)
                     load_Q(m_block, producer_state=producer_state)
-                    load_LSE(m_block, producer_state=producer_state)
+                    # cp.async.bulk is using ptx, so we need to elect one thread to do it
+                    with cute.arch.elect_one():
+                        load_LSE(m_block, producer_state=producer_state)
                     pipeline_do.producer_acquire(producer_state)
                     load_dO(m_block, producer_state=producer_state)
-                    load_dPsum(m_block, producer_state=producer_state)
+                    with cute.arch.elect_one():
+                        load_dPsum(m_block, producer_state=producer_state)
                     producer_state.advance()
 
                 tile_scheduler.prefetch_next_work()
@@ -752,8 +718,7 @@ class FlashAttentionBackwardSm90:
         sdQaccum: cute.Tensor,
         pipeline_q: cutlass.pipeline.PipelineAsync,
         pipeline_do: cutlass.pipeline.PipelineAsync,
-        mbar_ptr_K: cutlass.Pointer,
-        mbar_ptr_V: cutlass.Pointer,
+        mbar_ptr_KV: cutlass.Pointer,
         tidx: Int32,
         gmem_tiled_copy_dV: cute.TiledCopy,
         gmem_tiled_copy_dK: cute.TiledCopy,
@@ -806,15 +771,15 @@ class FlashAttentionBackwardSm90:
             sLSE.iterator,
             cute.make_layout(
                 (self.tile_m, self.tile_n, self.num_stages),
-                stride=(1, 0, cute.round_up(self.tile_m, 64))
-            )
+                stride=(1, 0, cute.round_up(self.tile_m, 64)),
+            ),
         )
         sdPsum_mma = cute.make_tensor(
             sdPsum.iterator,
             cute.make_layout(
                 (self.tile_m, self.tile_n, self.num_stages),
-                stride=(1, 0, cute.round_up(self.tile_m, 64))
-            )
+                stride=(1, 0, cute.round_up(self.tile_m, 64)),
+            ),
         )
         LSEslice = (None, 0, None)
         tLSEsLSE = utils.make_acc_tensor_mn_view(thr_mma_SdP.partition_C(sLSE_mma))[LSEslice]
@@ -833,13 +798,18 @@ class FlashAttentionBackwardSm90:
         )
 
         mma_qk_fn = partial(mma_zero_init, tiled_mma_SdP, (self.tile_m, self.tile_n), tSrQ, tSrK)
-        mma_dov_fn = partial(mma_zero_init, tiled_mma_SdP, (self.tile_m, self.tile_n), tdPrdO, tdPrV)
+        mma_dov_fn = partial(
+            mma_zero_init, tiled_mma_SdP, (self.tile_m, self.tile_n), tdPrdO, tdPrV
+        )
         mma_pdo_fn = partial(mma_sm90, tiled_mma_dV, acc_dV, tdVrPt, tdVrdOt)
         mma_dsq_fn = partial(mma_sm90, tiled_mma_dK, acc_dK, tdKrdSt, tdKrQt)
-        mma_dsk_fn = partial(mma_zero_init, tiled_mma_dQ, (self.tile_m, self.tile_hdim), tdQrdS, tdQrKt)
+        mma_dsk_fn = partial(
+            mma_zero_init, tiled_mma_dQ, (self.tile_m, self.tile_hdim), tdQrdS, tdQrKt
+        )
 
         mma_one_m_block_all = partial(
             self.mma_one_m_block,
+            warp_group_idx=warp_group_idx,
             mma_qk_fn=mma_qk_fn,
             mma_dov_fn=mma_dov_fn,
             mma_pdo_fn=mma_pdo_fn,
@@ -855,12 +825,9 @@ class FlashAttentionBackwardSm90:
             smem_thr_copy_PdS=smem_thr_copy_PdS,
             smem_thr_copy_dQaccum=smem_thr_copy_dQaccum,
             softmax_scale_log2=softmax_scale_log2,
-            acc_dV=acc_dV,
-            acc_dK=acc_dK,
+            # acc_dV=acc_dV,
+            # acc_dK=acc_dK,
         )
-
-        acc_dV.fill(0.0)
-        acc_dK.fill(0.0)
 
         kv_consumer_phase = Int32(0)
         consumer_state = pipeline.make_pipeline_state(
@@ -875,13 +842,16 @@ class FlashAttentionBackwardSm90:
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
             # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("tidx = {}, m_block_min = {}, m_block_max = {}", cute.arch.thread_idx()[0], m_block_min, m_block_max)
 
-            cute.arch.mbarrier_wait(mbar_ptr_K, phase=kv_consumer_phase)
-            cute.arch.mbarrier_wait(mbar_ptr_V, phase=kv_consumer_phase)
+            cute.arch.mbarrier_wait(mbar_ptr_KV, phase=kv_consumer_phase)
             kv_consumer_phase ^= 1
 
+            dKV_should_accumulate = False
             for m_tile in cutlass.range(m_block_max - m_block_min, unroll=1):
                 m_block = m_block_max - 1 - m_tile
-                consumer_state = mma_one_m_block_all(warp_group_idx, m_block, consumer_state)
+                consumer_state = mma_one_m_block_all(
+                    m_block, consumer_state, dKV_should_accumulate=dKV_should_accumulate
+                )
+                dKV_should_accumulate = True
 
             # scale dK
             acc_dK.store(acc_dK.load() * softmax_scale)
@@ -909,9 +879,9 @@ class FlashAttentionBackwardSm90:
     @cute.jit
     def mma_one_m_block(
         self,
-        warp_group_idx,
         m_block: Int32,
         smem_pipe_read: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
+        warp_group_idx: Int32,
         mma_qk_fn: Callable,
         mma_dov_fn: Callable,
         mma_pdo_fn: Callable,
@@ -927,8 +897,9 @@ class FlashAttentionBackwardSm90:
         smem_thr_copy_PdS: cute.TiledCopy,
         smem_thr_copy_dQaccum: cute.TiledCopy,
         softmax_scale_log2: Float32,
-        acc_dV,
-        acc_dK,
+        # acc_dV,
+        # acc_dK,
+        dKV_should_accumulate: Boolean = True,
     ):
         smem_idx = smem_pipe_read.index
         # (1) [GEMM 1] S = Q @ K^T
@@ -1000,7 +971,7 @@ class FlashAttentionBackwardSm90:
         cute.copy(smem_thr_copy_PdS, tdSrdS, tdSsdS[None, None, None, PdS_smem_idx])
 
         # (4) [GEMM 3] dV += P.T @ dO
-        mma_pdo_fn(A_idx=PdS_smem_idx, B_idx=smem_idx, zero_init=False, wg_wait=-1)
+        mma_pdo_fn(A_idx=PdS_smem_idx, B_idx=smem_idx, zero_init=not dKV_should_accumulate, wg_wait=-1)
 
         # smem fence to make sure sdS is written before it's read by WGMMA
         cute.arch.fence_proxy(
@@ -1015,7 +986,7 @@ class FlashAttentionBackwardSm90:
         pipeline_do.consumer_release(smem_pipe_read)  # release dO as dV mma is done
 
         # (7) [GEMM 5] dK += dS.T @ Q
-        mma_dsq_fn(A_idx=PdS_smem_idx, B_idx=smem_idx, zero_init=False, wg_wait=1)
+        mma_dsq_fn(A_idx=PdS_smem_idx, B_idx=smem_idx, zero_init=not dKV_should_accumulate, wg_wait=1)
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_dQ)
 
         cute.arch.barrier(

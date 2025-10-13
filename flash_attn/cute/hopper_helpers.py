@@ -2,7 +2,7 @@
 from typing import Type, Union, Optional
 import cutlass
 import cutlass.cute as cute
-from cutlass import const_expr
+from cutlass import Int32, const_expr
 from cutlass.cute.nvgpu import warpgroup
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Numeric, dsl_user_op
@@ -63,15 +63,17 @@ def make_smem_layout(
 
 @dsl_user_op
 def tma_reduce_add_bulk_f32(
-        smem_ptr: cute.Pointer,
-        gmem_ptr: cute.Pointer,
-        store_bytes: cutlass.Int32,
-        *, loc=None, ip=None
-    ):
-    smem_u32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    smem_ptr: cute.Pointer,
+    gmem_ptr: cute.Pointer,
+    store_bytes: Int32,
+    *,
+    loc=None,
+    ip=None,
+):
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
     llvm.inline_asm(
         None,
-        [gmem_ptr.llvm_ptr, smem_u32, store_bytes.ir_value()],
+        [gmem_ptr.llvm_ptr, smem_ptr_i32, store_bytes.ir_value()],
         "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;",
         "l,r,r",
         has_side_effects=True,
