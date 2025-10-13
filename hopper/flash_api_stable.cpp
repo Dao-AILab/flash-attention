@@ -1830,14 +1830,11 @@ void boxed_mha_bwd(
 
     auto [softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum] = mha_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, window_size_left, window_size_right, softcap, deterministic, sm_margin);
 
-    stack[0] = from(dq);
-    stack[1] = from(dk);
-    stack[2] = from(dv);
-    stack[3] = from(softmax_d);
-    stack[4] = from(softmax_lse_log2);
-    stack[5] = from(dq_accum);
-    stack[6] = from(dk_accum);
-    stack[7] = from(dv_accum);
+    stack[0] = from(softmax_d);
+    stack[1] = from(softmax_lse_log2);
+    stack[2] = from(dq_accum);
+    stack[3] = from(dk_accum);
+    stack[4] = from(dv_accum);
 }
 
 void boxed_mha_combine(
