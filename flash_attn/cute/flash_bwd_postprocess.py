@@ -151,6 +151,10 @@ class FlashAttentionBackwardPostprocess:
             if cutlass.const_expr(not mdQaccum.element_type in [cutlass.Float32]):
                 raise TypeError("dQaccum tensor must be Float32")
 
+        # Assume all strides are divisible by 128 bits except the last stride
+        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
+        mdQaccum, mdQ = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mdQaccum, mdQ)]
+
         num_mma_warps = self.num_threads // 32
         AtomLayoutdQ = (
             (self.AtomLayoutMdQ, num_mma_warps // self.AtomLayoutMdQ, 1)
@@ -354,6 +358,9 @@ class FlashAttentionBackwardPostprocess_sm90(FlashAttentionBackwardPostprocess):
         scale:    cutlass.Float32,
         stream:   cuda.CUstream,
     ):
+        # Assume all strides are divisible by 128 bits except the last stride
+        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
+        mdQaccum, mdQ = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mdQaccum, mdQ)]
 
         mdQ =      cute.make_tensor(mdQ.iterator, cute.select(mdQ.layout, mode=[1,3,2,0]))
         mdQaccum = cute.make_tensor(mdQaccum.iterator, cute.select(mdQaccum.layout, mode=[2,1,0]))
@@ -365,7 +372,7 @@ class FlashAttentionBackwardPostprocess_sm90(FlashAttentionBackwardPostprocess):
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.MN,
             cutlass.Float32,
-            atom_layout_mnk=(self.m_block_size // 64, 1, 1),
+            atom_layout_mnk=(self.m_block_size // 64, 2, 1),
             tiler_mn=(64, self.head_dim_padded)
         )
 

@@ -208,6 +208,10 @@ def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
     return rA_mma_view
 
 
+def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
+    return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
+
+
 def transpose_view(a: cute.Tensor) -> cute.Tensor:
     """Transpose the first two dimensions of a tensor on smem."""
     shape = (a.shape[1], a.shape[0], *a.shape[2:])

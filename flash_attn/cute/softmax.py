@@ -10,45 +10,28 @@ import cutlass.cute as cute
 from cutlass import Float32
 
 import flash_attn.cute.utils as utils
+from flash_attn.cute.cute_dsl_utils import ParamsBase
 
 
-class Softmax:
-    def __init__(
-        self,
+@dataclass
+class Softmax(ParamsBase):
+    scale_log2: Float32
+    num_rows: cutlass.Constexpr[int]
+    row_max: cute.Tensor
+    row_sum: cute.Tensor
+    arch: cutlass.Constexpr[int] = 80
+    softmax_scale: Float32 | None = None
+
+    @staticmethod
+    def create(
         scale_log2: Float32,
         num_rows: cutlass.Constexpr[int],
         arch: cutlass.Constexpr[int] = 80,
         softmax_scale: Float32 | None = None
     ):
-        self.scale_log2 = scale_log2
-        self.num_rows = num_rows
-        self.arch = arch
-        self.softmax_scale = softmax_scale
-        self.row_max = cute.make_fragment(num_rows, Float32)
-        self.row_sum = cute.make_fragment_like(self.row_max)
-
-    def __extract_mlir_values__(self):
-        non_constexpr_fields = [self.scale_log2, self.row_max, self.row_sum, self.softmax_scale]
-        values, self._values_pos = [], []
-        for obj in non_constexpr_fields:
-            obj_values = cutlass.extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        field_names = ['scale_log2', 'row_max', 'row_sum', 'softmax_scale']
-        reconstructed_fields = {}
-        for name, n_items in zip(field_names, self._values_pos):
-            original_field = getattr(self, name)
-            reconstructed_fields[name] = cutlass.new_from_mlir_values(original_field, values[:n_items])
-            values = values[n_items:]
-
-        new_obj = self.__class__(reconstructed_fields['scale_log2'], self.num_rows, self.arch)
-        new_obj.row_max = reconstructed_fields['row_max']
-        new_obj.row_sum = reconstructed_fields['row_sum']
-        new_obj.softmax_scale = reconstructed_fields['softmax_scale']
-        return new_obj
+        row_max = cute.make_fragment(num_rows, Float32)
+        row_sum = cute.make_fragment(num_rows, Float32)
+        return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale)
 
     def reset(self) -> None:
         self.row_max.fill(-Float32.inf)
@@ -82,7 +65,7 @@ class Softmax:
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
         row_scale = cute.make_fragment_like(self.row_max, Float32)
         # Each iteration processes one row of acc_S
-        for r in cutlass.range(cute.size(self.row_max), unroll_full=True):
+        for r in cutlass.range_constexpr(cute.size(self.row_max)):
             acc_S_row = acc_S_mn[r, None].load()  # (n_block_size)
             row_max_cur = self._compute_row_max(
                 acc_S_row,
@@ -118,7 +101,7 @@ class Softmax:
         # quad reduction for row_sum as we didn't do it during each iteration of online softmax
         self.row_sum.store(utils.warp_reduce(self.row_sum.load(), operator.add, width=4))
         row_scale = cute.make_fragment_like(self.row_max, Float32)
-        for r in cutlass.range(cute.size(self.row_sum), unroll_full=True):
+        for r in cutlass.range_constexpr(cute.size(self.row_sum)):
             if cutlass.const_expr(sink_val is not None):
                 sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
                 LOG2_E = math.log2(math.e)
@@ -153,15 +136,21 @@ class Softmax:
             acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])
 
 
+@dataclass
 class SoftmaxSm100(Softmax):
-    def __init__(self, scale_log2: Float32, rescale_threshold: cutlass.Constexpr[float] = 0.0, softmax_scale: Float32 | None = None):
-        super().__init__(scale_log2, num_rows=1, arch=100, softmax_scale=softmax_scale)
-        self.rescale_threshold = rescale_threshold
+    rescale_threshold: cutlass.Constexpr[float] = 0.0
 
-    def __new_from_mlir_values__(self, values):
-        new_obj = super().__new_from_mlir_values__(values)
-        new_obj.rescale_threshold = self.rescale_threshold
-        return new_obj
+    @staticmethod
+    def create(
+        scale_log2: Float32,
+        rescale_threshold: cutlass.Constexpr[float] = 0.0,
+        softmax_scale: Float32 | None = None,
+    ):
+        num_rows = 1
+        arch = 100
+        row_max = cute.make_fragment(num_rows, Float32)
+        row_sum = cute.make_fragment(num_rows, Float32)
+        return SoftmaxSm100(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale, rescale_threshold=rescale_threshold)
 
     @cute.jit
     def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
