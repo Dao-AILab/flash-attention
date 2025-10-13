@@ -14,7 +14,12 @@ from cutlass import Float32
 from flash_attn.cute import utils
 from flash_attn.cute import copy_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.tile_scheduler import ParamsBase, SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
+from flash_attn.cute.tile_scheduler import (
+    ParamsBase,
+    SingleTileScheduler,
+    SingleTileVarlenScheduler,
+    TileSchedulerArguments,
+)
 
 
 class FlashAttentionBackwardPreprocess:
@@ -86,13 +91,17 @@ class FlashAttentionBackwardPreprocess:
                 else (32 if self.head_dim_padded % 32 == 0 else 16)
             )
         )
-        self.gmem_tiled_copy_O = copy_utils.tiled_copy_2d(self.dtype, gmem_k_block_size, self.num_threads)
+        self.gmem_tiled_copy_O = copy_utils.tiled_copy_2d(
+            self.dtype, gmem_k_block_size, self.num_threads
+        )
         universal_copy_bits = 128
         num_copy_elems_dQaccum = universal_copy_bits // Float32.width
         assert (
             self.m_block_size * self.head_dim_padded // num_copy_elems_dQaccum
         ) % self.num_threads == 0
-        self.gmem_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(Float32, self.num_threads, num_copy_elems_dQaccum)
+        self.gmem_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
+            Float32, self.num_threads, num_copy_elems_dQaccum
+        )
 
     @cute.jit
     def __call__(
@@ -110,23 +119,31 @@ class FlashAttentionBackwardPreprocess:
         # Get the data type and check if it is fp16 or bf16
         if cutlass.const_expr(not (mO.element_type == mdO.element_type)):
             raise TypeError("All tensors must have the same data type")
-        if cutlass.const_expr(not mO.element_type in [cutlass.Float16, cutlass.BFloat16]):
+        if cutlass.const_expr(mO.element_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise TypeError("Only Float16 or BFloat16 is supported")
-        if cutlass.const_expr(not mdPsum.element_type in [Float32]):
+        if cutlass.const_expr(mdPsum.element_type not in [Float32]):
             raise TypeError("dPsum tensor must be Float32")
         if cutlass.const_expr(mdQaccum is not None):
-            if cutlass.const_expr(not mdQaccum.element_type in [Float32]):
+            if cutlass.const_expr(mdQaccum.element_type not in [Float32]):
                 raise TypeError("dQaccum tensor must be Float32")
         if cutlass.const_expr(mLSE is not None):
             assert mLSElog2 is not None, "If mLSE is provided, mLSElog2 must also be provided"
-            if cutlass.const_expr(not mLSE.element_type in [Float32]):
+            if cutlass.const_expr(mLSE.element_type not in [Float32]):
                 raise TypeError("LSE tensor must be Float32")
-            if cutlass.const_expr(not mLSElog2.element_type in [Float32]):
+            if cutlass.const_expr(mLSElog2.element_type not in [Float32]):
                 raise TypeError("LSElog2 tensor must be Float32")
 
         # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
-        mO, mdO, mdQaccum = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) if t is not None else None for t in (mO, mdO, mdQaccum)]
+        new_stride = lambda t: (
+            *(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]),
+            t.stride[-1],
+        )
+        mO, mdO, mdQaccum = [
+            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
+            if t is not None
+            else None
+            for t in (mO, mdO, mdQaccum)
+        ]
 
         self._setup_attributes()
 
@@ -138,7 +155,6 @@ class FlashAttentionBackwardPreprocess:
             TileScheduler = SingleTileScheduler
             num_head = mO.shape[2]
             num_batch = mO.shape[0]
-
 
         tile_sched_args = TileSchedulerArguments(
             num_block=cute.ceil_div(mO.shape[1], self.m_block_size),
@@ -202,7 +218,15 @@ class FlashAttentionBackwardPreprocess:
             # ///////////////////////////////////////////////////////////////////////////////
             # Get the appropriate tiles for this thread block.
             # ///////////////////////////////////////////////////////////////////////////////
-            seqlen = SeqlenInfoQK(batch_size, mO.shape[1], 0, mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=None, mSeqUsedQ=mSeqUsedQ, mSeqUsedK=None)
+            seqlen = SeqlenInfoQK(
+                batch_size,
+                mO.shape[1],
+                0,
+                mCuSeqlensQ=mCuSeqlensQ,
+                mCuSeqlensK=None,
+                mSeqUsedQ=mSeqUsedQ,
+                mSeqUsedK=None,
+            )
 
             if cutlass.const_expr(not seqlen.has_cu_seqlens_q):
                 mO_cur = mO[batch_size, None, num_head, None]
@@ -216,7 +240,7 @@ class FlashAttentionBackwardPreprocess:
                 padded_offset_q = seqlen.offset_q + batch_size * self.m_block_size
                 mdPsum_cur = cute.domain_offset((padded_offset_q,), mdPsum[num_head, None])
                 headdim_v = mO.shape[2]
-                
+
             blkOdO_shape = (self.m_block_size, self.head_dim_padded)
             # (m_block_size, head_dim)
             gO = cute.local_tile(mO_cur, blkOdO_shape, (m_block, 0))
@@ -238,7 +262,7 @@ class FlashAttentionBackwardPreprocess:
             tOpO = utils.predicate_k(tOcO, limit=headdim_v)
             tOpdO = utils.predicate_k(tOcO, limit=headdim_v)
 
-            seqlen_q = seqlen.seqlen_q 
+            seqlen_q = seqlen.seqlen_q
             seqlen_q_rounded = cute.round_up(seqlen_q, self.m_block_size)
 
             if cutlass.const_expr(mLSE is not None):
@@ -247,9 +271,7 @@ class FlashAttentionBackwardPreprocess:
                 else:
                     mLSE_cur = cute.domain_offset((seqlen.offset_q,), mLSE[num_head, None])
 
-                gLSE = cute.local_tile(
-                    mLSE_cur, (self.m_block_size,), (m_block,)
-                )
+                gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_block,))
                 lse = Float32.inf
                 if tidx < seqlen_q - m_block * self.m_block_size:
                     lse = gLSE[tidx]
@@ -267,13 +289,17 @@ class FlashAttentionBackwardPreprocess:
                         gmem_thr_copy_O,
                         tOgO[None, m, None],
                         tOrO[None, m, None],
-                        pred=tOpO[None, m, None] if cutlass.const_expr(self.check_hdim_oob) else None,
+                        pred=tOpO[None, m, None]
+                        if cutlass.const_expr(self.check_hdim_oob)
+                        else None,
                     )
                     cute.copy(
                         gmem_thr_copy_O,
                         tOgdO[None, m, None],
                         tOrdO[None, m, None],
-                        pred=tOpdO[None, m, None] if cutlass.const_expr(self.check_hdim_oob) else None,
+                        pred=tOpdO[None, m, None]
+                        if cutlass.const_expr(self.check_hdim_oob)
+                        else None,
                     )
             # Sum across the "k" dimension
             dpsum = (tOrO.load().to(Float32) * tOrdO.load().to(Float32)).reduce(
@@ -286,9 +312,7 @@ class FlashAttentionBackwardPreprocess:
             dP_sum.store(dpsum)
 
             # Write dPsum from rmem -> gmem
-            gdPsum = cute.local_tile(
-                mdPsum_cur, (self.m_block_size,), (m_block,)
-            )
+            gdPsum = cute.local_tile(mdPsum_cur, (self.m_block_size,), (m_block,))
             # Only the thread corresponding to column 0 writes out the dPsum to gmem
             if tOcO[0, 0, 0][1] == 0:
                 for m in cutlass.range(cute.size(dP_sum), unroll_full=True):
@@ -301,10 +325,12 @@ class FlashAttentionBackwardPreprocess:
                     mdQaccum_cur = mdQaccum[batch_size, num_head, None]
                 else:
                     padded_offset_q = seqlen.offset_q + batch_size * self.m_block_size
-                    mdQaccum_cur = cute.domain_offset((padded_offset_q * self.head_dim_padded,), mdQaccum[num_head, None])
+                    mdQaccum_cur = cute.domain_offset(
+                        (padded_offset_q * self.head_dim_padded,), mdQaccum[num_head, None]
+                    )
 
-                    # HACK: Compiler doesn't seem to recognize that padding 
-                    # by padded_offset_q * self.head_dim_padded keeps alignment 
+                    # HACK: Compiler doesn't seem to recognize that padding
+                    # by padded_offset_q * self.head_dim_padded keeps alignment
                     # since statically divisible by 4
 
                     mdQaccum_cur_ptr = cute.make_ptr(
@@ -313,15 +339,10 @@ class FlashAttentionBackwardPreprocess:
                         mem_space=mdQaccum_cur.iterator.memspace,
                         assumed_align=mdQaccum.iterator.alignment,
                     )
-                    mdQaccum_cur = cute.make_tensor(
-                        mdQaccum_cur_ptr,
-                        mdQaccum_cur.layout
-                    )
+                    mdQaccum_cur = cute.make_tensor(mdQaccum_cur_ptr, mdQaccum_cur.layout)
 
                 blkdQaccum_shape = (self.m_block_size * self.head_dim_padded,)
-                gdQaccum = cute.local_tile(
-                    mdQaccum_cur, blkdQaccum_shape, (m_block,)
-                )
+                gdQaccum = cute.local_tile(mdQaccum_cur, blkdQaccum_shape, (m_block,))
                 gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
                 tQgQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)
                 zero = cute.make_fragment_like(tQgQaccum)
@@ -335,9 +356,7 @@ class FlashAttentionBackwardPreprocess:
                     padded_offset_q = seqlen.offset_q + batch_size * self.m_block_size
                     mLSElog2_cur = cute.domain_offset((padded_offset_q,), mLSElog2[num_head, None])
 
-                gLSElog2 = cute.local_tile(
-                    mLSElog2_cur, (self.m_block_size,), (m_block,)
-                )
+                gLSElog2 = cute.local_tile(mLSElog2_cur, (self.m_block_size,), (m_block,))
                 LOG2_E = math.log2(math.e)
                 if tidx < seqlen_q_rounded - m_block * self.m_block_size:
                     gLSElog2[tidx] = lse * LOG2_E if lse != -Float32.inf else 0.0

@@ -69,7 +69,12 @@ class FlashAttentionBackwardSm90:
         self.AtomLayoutNdKV = AtomLayoutNdKV
         self.AtomLayoutMdQ = AtomLayoutMdQ
         self.num_mma_warp_groups = (self.num_threads // 128) - 1
-        self.Mma_dKV_is_RS = AtomLayoutMSdP == 1 and AtomLayoutNdKV == self.num_mma_warp_groups and SdP_swapAB and not dKV_swapAB
+        self.Mma_dKV_is_RS = (
+            AtomLayoutMSdP == 1
+            and AtomLayoutNdKV == self.num_mma_warp_groups
+            and SdP_swapAB
+            and not dKV_swapAB
+        )
         self.V_in_regs = V_in_regs
 
     @staticmethod
@@ -172,7 +177,9 @@ class FlashAttentionBackwardSm90:
                 Float32,
                 atom_layout_mnk=atom_layout_dKV + (1,),
                 tiler_mn=tiler_mn_d,
-                a_source=warpgroup.OperandSource.RMEM if self.Mma_dKV_is_RS else warpgroup.OperandSource.SMEM,
+                a_source=warpgroup.OperandSource.RMEM
+                if self.Mma_dKV_is_RS
+                else warpgroup.OperandSource.SMEM,
             )
             for tiler_mn_d in (tiler_mn_dK, tiler_mn_dV)
         ]
@@ -666,7 +673,9 @@ class FlashAttentionBackwardSm90:
                 # cp.async.bulk is using ptx, so we need to elect one thread to do it
                 with cute.arch.elect_one():
                     load_LSE(m_block, producer_state=producer_state)
-                pipeline_do.producer_acquire(producer_state, extra_tx_count=self.tma_copy_bytes["V"])
+                pipeline_do.producer_acquire(
+                    producer_state, extra_tx_count=self.tma_copy_bytes["V"]
+                )
                 load_V(tma_bar_ptr=pipeline_do.producer_get_barrier(producer_state))
                 load_dO(m_block, producer_state=producer_state)
                 with cute.arch.elect_one():
@@ -963,7 +972,9 @@ class FlashAttentionBackwardSm90:
         cute.copy(smem_thr_copy_PdS, tdSrdS, tdSsdS[None, None, None, PdS_smem_idx])
 
         # (5) [GEMM 3] dV += P.T @ dO
-        mma_pdo_fn(A_idx=PdS_smem_idx, B_idx=smem_idx, zero_init=not dKV_should_accumulate, wg_wait=-1)
+        mma_pdo_fn(
+            A_idx=PdS_smem_idx, B_idx=smem_idx, zero_init=not dKV_should_accumulate, wg_wait=-1
+        )
 
         # smem fence to make sure sdS is written before it's read by WGMMA
         cute.arch.fence_proxy(
@@ -978,7 +989,9 @@ class FlashAttentionBackwardSm90:
         pipeline_do.consumer_release(smem_pipe_read)  # release dO as dV mma is done
 
         # (7) [GEMM 5] dK += dS.T @ Q
-        mma_dsq_fn(A_idx=PdS_smem_idx, B_idx=smem_idx, zero_init=not dKV_should_accumulate, wg_wait=1)
+        mma_dsq_fn(
+            A_idx=PdS_smem_idx, B_idx=smem_idx, zero_init=not dKV_should_accumulate, wg_wait=1
+        )
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_dQ)
 
         cute.arch.barrier(
@@ -1055,7 +1068,9 @@ class FlashAttentionBackwardSm90:
         taccdVsdV = smem_thr_copy_dV.partition_D(sV)  # reuse sV SMEM
         cute.copy(smem_copy_atom_dKV, taccdVrdV, taccdVsdV)
         # ensure smem writes are visible to TMA
-        cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+        )
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_mma_threads
         )
@@ -1065,7 +1080,9 @@ class FlashAttentionBackwardSm90:
         taccdKsdK = smem_thr_copy_dK.partition_D(sK)  # reuse sK SMEM
         cute.copy(smem_copy_atom_dKV, taccdKrdK, taccdKsdK)
         # ensure smem writes are visible to TMA
-        cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+        )
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_mma_threads
         )
