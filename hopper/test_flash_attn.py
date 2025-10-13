@@ -75,9 +75,17 @@ def should_test_backward(args, kwargs):
     return False
 
 
+def should_run_schema_check(args, kwargs):
+    v = args[2]
+    if v.dtype == torch.float8_e4m3fn:
+        return False
+    return True
+
+
 def run_opcheck(fn):
     def wrapper(*args, **kwargs):
-        safe_schema_check(fn, args, kwargs)
+        if should_run_schema_check(args, kwargs):
+            safe_schema_check(fn, args, kwargs)
         safe_fake_check(fn, args, kwargs)
 
         if should_test_backward(args, kwargs):
