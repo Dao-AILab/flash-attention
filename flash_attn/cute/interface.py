@@ -37,7 +37,6 @@ from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreproces
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
-from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess_sm90
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
 
@@ -449,6 +448,13 @@ def _flash_attn_bwd(
     )
     m_block_size = 64
     n_block_size = 128
+    num_stages_Q = 2
+    num_stages_dO = 2
+    num_stages_PdS = 2
+    AtomLayoutMSdP = 1
+    AtomLayoutNdKV = 2
+    AtomLayoutMdQ = 1
+    num_threads = 384
     if compile_key not in _flash_attn_bwd.compile_cache:
         fa_bwd_sm80 = FlashAttentionBackwardSm80(
             dtype,
@@ -475,19 +481,20 @@ def _flash_attn_bwd(
             head_dim,
             head_dim_v,
             qhead_per_kvhead,
+            causal,
             m_block_size,
             n_block_size,
-            # num_stages_Q,
-            # num_stages_dO,
-            # num_threads,
-            # causal,
-            # SdP_swapAB,
-            # dKV_swapAB,
-            # dQ_swapAB,
-            # AtomLayoutMSdP,
-            # AtomLayoutNdKV,
-            # AtomLayoutMdQ,
-            # V_in_regs=V_in_regs,
+            num_stages_Q,
+            num_stages_dO,
+            num_stages_PdS,
+            SdP_swapAB,
+            dKV_swapAB,
+            dQ_swapAB,
+            AtomLayoutMSdP,
+            AtomLayoutNdKV,
+            AtomLayoutMdQ,
+            num_threads,
+            V_in_regs=V_in_regs,
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
@@ -517,12 +524,13 @@ def _flash_attn_bwd(
         seqused_k_tensor,
     )
 
+    num_threads -= 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
     compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
-        # fa_bwd_post = FlashAttentionBackwardPostprocess(
-        fa_bwd_post = FlashAttentionBackwardPostprocess_sm90(
-            dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB
+        arch = 90
+        fa_bwd_post = FlashAttentionBackwardPostprocess(
+            dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(

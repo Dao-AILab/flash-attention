@@ -30,11 +30,20 @@ class FlashAttentionBackwardSm90:
         head_dim: int,
         head_dim_v: Optional[int] = None,
         qhead_per_kvhead: int = 1,
+        is_causal: bool = False,
         tile_m: int = 64,
         tile_n: int = 128,
-        num_stages: int = 2,
+        Q_stage: int = 2,
+        dO_stage: int = 2,
+        PdS_stage: int = 2,
+        SdP_swapAB: bool = False,
+        dKV_swapAB: bool = False,
+        dQ_swapAB: bool = False,
+        AtomLayoutMSdP: int = 1,
+        AtomLayoutNdKV: int = 2,
+        AtomLayoutMdQ: int = 1,
         num_threads: int = 384,
-        Q_in_regs: bool = False,
+        V_in_regs: bool = False,
     ):
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -47,12 +56,21 @@ class FlashAttentionBackwardSm90:
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
         self.qhead_per_kvhead = qhead_per_kvhead
+        self.is_causal = is_causal
         self.tile_m = tile_m
         self.tile_n = tile_n
         self.num_threads = num_threads
-        self.num_stages = num_stages
-        self.dS_stage = 2
-        self.Q_in_regs = Q_in_regs
+        self.Q_stage = Q_stage
+        self.dO_stage = dO_stage
+        self.PdS_stage = PdS_stage
+        assert self.dO_stage in [1, self.Q_stage]
+        assert self.PdS_stage in [1, self.Q_stage]
+        self.AtomLayoutMSdP = AtomLayoutMSdP
+        self.AtomLayoutNdKV = AtomLayoutNdKV
+        self.AtomLayoutMdQ = AtomLayoutMdQ
+        self.num_mma_warp_groups = (self.num_threads // 128) - 1
+        self.Mma_dKV_is_RS = AtomLayoutMSdP == 1 and AtomLayoutNdKV == self.num_mma_warp_groups and SdP_swapAB and not dKV_swapAB
+        self.V_in_regs = V_in_regs
 
     @staticmethod
     def can_implement(
@@ -61,9 +79,9 @@ class FlashAttentionBackwardSm90:
         head_dim_v,
         tile_m,
         tile_n,
-        num_stages,
+        Q_stage,
         num_threads,
-        Q_in_regs=False,
+        V_in_regs=False,
     ) -> bool:
         if dtype not in [cutlass.Float16, cutlass.BFloat16]:
             return False
@@ -115,11 +133,11 @@ class FlashAttentionBackwardSm90:
         self.sQ_layout, self.sK_layout, self.sV_layout, self.sdO_layout, self.sPdS_layout = [
             sm90_utils.make_smem_layout(self.dtype, LayoutEnum.ROW_MAJOR, shape, stage)
             for shape, stage in [
-                ((self.tile_m, self.tile_hdim), self.num_stages),
+                ((self.tile_m, self.tile_hdim), self.Q_stage),
                 ((self.tile_n, self.tile_hdim), None),
                 ((self.tile_n, self.tile_hdimv), None),
-                ((self.tile_m, self.tile_hdimv), self.num_stages),
-                ((self.tile_m, self.tile_n), self.dS_stage),
+                ((self.tile_m, self.tile_hdimv), self.dO_stage),
+                ((self.tile_m, self.tile_n), self.PdS_stage),
             ]
         ]
         self.sdQaccum_layout = cute.make_layout(self.tile_m * self.tile_hdim)
@@ -130,16 +148,21 @@ class FlashAttentionBackwardSm90:
 
     def _get_tiled_mma(self):
         # S = Q @ K.T, dP = dO @ V.T
+        atom_layout_SdP = (self.AtomLayoutMSdP, self.num_mma_warp_groups // self.AtomLayoutMSdP)
+        tiler_mn_SdP = (self.tile_m // atom_layout_SdP[0], self.tile_n // atom_layout_SdP[1])
         tiled_mma_SdP = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.K,
             Float32,
-            atom_layout_mnk=(self.tile_m // 64, 2, 1),
-            tiler_mn=(64, self.tile_n // 2),
+            atom_layout_mnk=atom_layout_SdP + (1,),
+            tiler_mn=tiler_mn_SdP,
         )
         # dV = P.T @ dO, dK = dS.T @ Q
+        atom_layout_dKV = (self.AtomLayoutNdKV, self.num_mma_warp_groups // self.AtomLayoutNdKV)
+        tiler_mn_dK = (self.tile_n // atom_layout_dKV[0], self.tile_hdim // atom_layout_dKV[1])
+        tiler_mn_dV = (self.tile_n // atom_layout_dKV[0], self.tile_hdimv // atom_layout_dKV[1])
         tiled_mma_dK, tiled_mma_dV = [
             sm90_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
@@ -147,20 +170,23 @@ class FlashAttentionBackwardSm90:
                 warpgroup.OperandMajorMode.MN,
                 warpgroup.OperandMajorMode.MN,
                 Float32,
-                atom_layout_mnk=(self.tile_n // 64, 1, 1),
-                tiler_mn=(64, tile_hdim),
+                atom_layout_mnk=atom_layout_dKV + (1,),
+                tiler_mn=tiler_mn_d,
+                a_source=warpgroup.OperandSource.RMEM if self.Mma_dKV_is_RS else warpgroup.OperandSource.SMEM,
             )
-            for tile_hdim in (self.tile_hdim, self.tile_hdimv)
+            for tiler_mn_d in (tiler_mn_dK, tiler_mn_dV)
         ]
         # dQ = dS @ K
+        atom_layout_dQ = (self.AtomLayoutMdQ, self.num_mma_warp_groups // self.AtomLayoutMdQ)
+        tiler_mn_dQ = (self.tile_m // atom_layout_dQ[0], self.tile_hdim // atom_layout_dQ[1])
         tiled_mma_dQ = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.MN,
             Float32,
-            atom_layout_mnk=(self.tile_m // 64, 2, 1),
-            tiler_mn=(64, self.tile_hdim // 2),
+            atom_layout_mnk=atom_layout_dQ + (1,),
+            tiler_mn=tiler_mn_dQ,
         )
         return tiled_mma_SdP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ
 
@@ -179,18 +205,18 @@ class FlashAttentionBackwardSm90:
         ]
 
         cosize_sdS = cute.cosize(self.sPdS_layout)
-        cosize_sP = cute.cosize(self.sPdS_layout)  # Could be zero
+        cosize_sP = cute.cosize(self.sPdS_layout) if const_expr(not self.Mma_dKV_is_RS) else 0
         sLSE_struct = cute.struct.Align[
-            cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64) * self.num_stages], 128
+            cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64) * self.Q_stage], 128
         ]
         sdPsum_struct = cute.struct.Align[
-            cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64) * self.num_stages], 128
+            cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64) * self.dO_stage], 128
         ]
 
         @cute.struct
         class SharedStorageQKV:
-            mbar_ptr_Q: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
-            mbar_ptr_dO: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+            mbar_ptr_Q: cute.struct.MemRange[cutlass.Int64, self.Q_stage * 2]
+            mbar_ptr_dO: cute.struct.MemRange[cutlass.Int64, self.dO_stage * 2]
             sLSE: sLSE_struct
             sdPsum: sdPsum_struct
             sQ: sQ_struct
@@ -256,9 +282,9 @@ class FlashAttentionBackwardSm90:
         tiled_mma_SdP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ = self._get_tiled_mma()
 
         self.num_mma_threads = tiled_mma_SdP.size
+        assert self.num_mma_threads + 128 == self.num_threads
 
         self.num_threads_per_warp_group = 128
-        self.num_mma_warp_groups = self.num_mma_threads // self.num_threads_per_warp_group
         self.num_producer_threads = 32
 
         self.num_mma_regs = 240
@@ -435,7 +461,7 @@ class FlashAttentionBackwardSm90:
         )
         pipeline_q = pipeline.PipelineTmaAsyncNoCluster.create(
             barrier_storage=storage.mbar_ptr_Q.data_ptr(),
-            num_stages=self.num_stages,
+            num_stages=self.Q_stage,
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
             tx_count=self.tma_copy_bytes["Q"] + self.tma_copy_bytes["LSE"],
@@ -443,7 +469,7 @@ class FlashAttentionBackwardSm90:
         )
         pipeline_do = pipeline.PipelineTmaAsyncNoCluster.create(
             barrier_storage=storage.mbar_ptr_dO.data_ptr(),
-            num_stages=self.num_stages,
+            num_stages=self.dO_stage,
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
             tx_count=self.tma_copy_bytes["dO"] + self.tma_copy_bytes["dPsum"],
@@ -454,18 +480,20 @@ class FlashAttentionBackwardSm90:
         sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
-        sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
+        sP = None
+        if const_expr(not self.Mma_dKV_is_RS):
+            sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
         sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
 
         sLSE = storage.sLSE.get_tensor(
             cute.make_layout(
-                (self.tile_m, self.num_stages),
+                (self.tile_m, self.Q_stage),
                 stride=(1, cute.round_up(self.tile_m, 64)),
             )
         )
         sdPsum = storage.sdPsum.get_tensor(
             cute.make_layout(
-                (self.tile_m, self.num_stages),
+                (self.tile_m, self.dO_stage),
                 stride=(1, cute.round_up(self.tile_m, 64)),
             )
         )
@@ -587,7 +615,7 @@ class FlashAttentionBackwardSm90:
 
         if warp_idx_in_wg == 0:
             producer_state = pipeline.make_pipeline_state(
-                cutlass.pipeline.PipelineUserType.Producer, self.num_stages
+                cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
             )
 
             tile_scheduler = TileSchedulerCls()
@@ -708,9 +736,11 @@ class FlashAttentionBackwardSm90:
         tdPrdO = tiled_mma_SdP.make_fragment_A(wg_mma_SdP.partition_A(sdO))
         tdPrV = tiled_mma_SdP.make_fragment_B(wg_mma_SdP.partition_B(sV))
         # dV += P.T @ dO
-        sPt = utils.transpose_view(sP)
+        sPt = utils.transpose_view(sP) if sP is not None else None
         sdOt = utils.transpose_view(sdO)
-        tdVrPt = tiled_mma_dV.make_fragment_A(wg_mma_dV.partition_A(sPt))
+        tdVrPt = None
+        if const_expr(sP is not None):
+            tdVrPt = tiled_mma_dV.make_fragment_A(wg_mma_dV.partition_A(sPt))
         tdVrdOt = tiled_mma_dV.make_fragment_B(wg_mma_dV.partition_B(sdOt))
         # dK += dS.T @ Q
         sdSt = utils.transpose_view(sdS)
@@ -727,20 +757,22 @@ class FlashAttentionBackwardSm90:
         smem_thr_copy_PdS = cute.make_tiled_copy_C(smem_copy_atom_PdS, tiled_mma_SdP).get_slice(
             tidx
         )
-        tPsP = smem_thr_copy_PdS.partition_D(sP)
+        tPsP = None
+        if const_expr(sP is not None):
+            tPsP = smem_thr_copy_PdS.partition_D(sP)
         tdSsdS = smem_thr_copy_PdS.partition_D(sdS)
 
         sLSE_mma = cute.make_tensor(
             sLSE.iterator,
             cute.make_layout(
-                (self.tile_m, self.tile_n, self.num_stages),
+                (self.tile_m, self.tile_n, self.Q_stage),
                 stride=(1, 0, cute.round_up(self.tile_m, 64)),
             ),
         )
         sdPsum_mma = cute.make_tensor(
             sdPsum.iterator,
             cute.make_layout(
-                (self.tile_m, self.tile_n, self.num_stages),
+                (self.tile_m, self.tile_n, self.dO_stage),
                 stride=(1, 0, cute.round_up(self.tile_m, 64)),
             ),
         )
@@ -795,7 +827,7 @@ class FlashAttentionBackwardSm90:
         )
 
         consumer_state = pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, self.num_stages
+            cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage
         )
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -888,11 +920,11 @@ class FlashAttentionBackwardSm90:
         tLSErdPsum = cute.make_fragment_like(tLSEsdPsum[None, 0])
         cute.autovec_copy(tLSEsdPsum[None, smem_idx], tLSErdPsum)
 
-        PdS_smem_idx = smem_idx if const_expr(self.dS_stage > 1) else 0
+        PdS_smem_idx = smem_idx if const_expr(self.PdS_stage > 1) else 0
         # R2S for P
         tPrP = smem_thr_copy_PdS.retile(tdVrP)
         # sync to make sure P has already been used in the previous iteration before writing new vals
-        if const_expr(self.dS_stage == 1):
+        if const_expr(self.PdS_stage == 1):
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=self.num_mma_threads
             )
@@ -930,7 +962,7 @@ class FlashAttentionBackwardSm90:
         tdSrdS = smem_thr_copy_PdS.retile(tdKrdS)
         cute.copy(smem_thr_copy_PdS, tdSrdS, tdSsdS[None, None, None, PdS_smem_idx])
 
-        # (4) [GEMM 3] dV += P.T @ dO
+        # (5) [GEMM 3] dV += P.T @ dO
         mma_pdo_fn(A_idx=PdS_smem_idx, B_idx=smem_idx, zero_init=not dKV_should_accumulate, wg_wait=-1)
 
         # smem fence to make sure sdS is written before it's read by WGMMA
