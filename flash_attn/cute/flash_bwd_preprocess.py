@@ -163,13 +163,14 @@ class FlashAttentionBackwardPreprocess:
         tidx, _, _ = cute.arch.thread_idx()
         m_block, num_head, batch_size = cute.arch.block_idx()
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Get the appropriate tiles for this thread block.
-        # ///////////////////////////////////////////////////////////////////////////////
-        blkOdO_shape = (self.m_block_size, self.head_dim_padded)
-        # (m_block_size, head_dim)
-        gO = cute.local_tile(mO[batch_size, None, num_head, None], blkOdO_shape, (m_block, 0))
-        gdO = cute.local_tile(mdO[batch_size, None, num_head, None], blkOdO_shape, (m_block, 0))
+        if True:
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Get the appropriate tiles for this thread block.
+            # ///////////////////////////////////////////////////////////////////////////////
+            blkOdO_shape = (self.m_block_size, self.head_dim_padded)
+            # (m_block_size, head_dim)
+            gO = cute.local_tile(mO[batch_size, None, num_head, None], blkOdO_shape, (m_block, 0))
+            gdO = cute.local_tile(mdO[batch_size, None, num_head, None], blkOdO_shape, (m_block, 0))
 
         gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
         # (CPY_Atom, CPY_M, CPY_K)
@@ -187,8 +188,8 @@ class FlashAttentionBackwardPreprocess:
         tOpO = utils.predicate_k(tOcO, limit=mO.shape[3])
         tOpdO = utils.predicate_k(tOcO, limit=mdO.shape[3])
 
-        seqlen_q = mO.shape[1]
-        seqlen_q_rounded = cute.round_up(seqlen_q, self.m_block_size)
+            seqlen_q = mO.shape[1]
+            seqlen_q_rounded = cute.round_up(seqlen_q, self.m_block_size)
 
         if cutlass.const_expr(mLSE is not None):
             gLSE = cute.local_tile(
@@ -239,17 +240,17 @@ class FlashAttentionBackwardPreprocess:
                 row = tOcO[0, m, 0][0]
                 gdPsum[row] = dP_sum[m] if row < mO.shape[1] - m_block * self.m_block_size else 0.0
 
-        # Clear dQaccum
-        if cutlass.const_expr(mdQaccum is not None):
-            blkdQaccum_shape = (self.m_block_size * self.head_dim_padded,)
-            gdQaccum = cute.local_tile(
-                mdQaccum[batch_size, num_head, None], blkdQaccum_shape, (m_block,)
-            )
-            gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
-            tQgQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)
-            zero = cute.make_fragment_like(tQgQaccum)
-            zero.fill(0.0)
-            cute.copy(gmem_tiled_copy_dQaccum, zero, tQgQaccum)
+            # Clear dQaccum
+            if cutlass.const_expr(mdQaccum is not None):
+                blkdQaccum_shape = (self.m_block_size * self.head_dim_padded,)
+                gdQaccum = cute.local_tile(
+                    mdQaccum[batch_size, num_head, None], blkdQaccum_shape, (m_block,)
+                )
+                gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
+                tQgQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)
+                zero = cute.make_fragment_like(tQgQaccum)
+                zero.fill(0.0)
+                cute.copy(gmem_tiled_copy_dQaccum, zero, tQgQaccum)
 
         if cutlass.const_expr(mLSE is not None):
             gLSElog2 = cute.local_tile(
