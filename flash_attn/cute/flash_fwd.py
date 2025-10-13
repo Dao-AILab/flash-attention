@@ -366,17 +366,13 @@ class FlashAttentionForwardBase:
             cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
             cute.arch.barrier_arrive(barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE)
             gO = cute.local_tile(mO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
-            tOsO, tOgO = cpasync.tma_partition(
-                tma_atom_O,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(sO, 0, 2),
-                cute.group_modes(gO, 0, 2),
+            store_O, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_O, 0, cute.make_layout(1), sO, gO, single_stage=True
             )
             warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
             if warp_idx == 4:
                 cute.arch.barrier(barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE)
-                cute.copy(tma_atom_O, tOsO, tOgO)
+                store_O()
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
         else:
