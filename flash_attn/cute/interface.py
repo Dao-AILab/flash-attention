@@ -20,7 +20,7 @@
 # - bwd pass optimized for Hopper/Blackwell
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
 
 import torch
 
@@ -35,7 +35,9 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionF
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
+from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess_sm90
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
 
@@ -48,7 +50,6 @@ torch2cute_dtype_map = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
 }
-
 
 def _flash_attn_fwd(
     q: torch.Tensor,
@@ -73,7 +74,22 @@ def _flash_attn_fwd(
     num_threads: int = 384,
     pack_gqa: Optional[bool] = None,
     _compute_capability: Optional[int] = None,
+    score_mod: Callable | None = None,
+    return_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    buffers: Optional[list[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Forward pass for FlashAttention.
+
+    Args:
+        ...
+        score_mod: A callable that takes the attention scores and applies a modification.
+        return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
+        out: Optional pre-allocated output tensor. If None, will be allocated internally.
+        lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
+        buffers: Some score_mods will want to read from global buffers. This is how we thread them through to the inner kernel.
+    """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
@@ -137,10 +153,25 @@ def _flash_attn_fwd(
     out_torch_dtype = q.dtype
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
-    out = torch.empty(*q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
-    lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad else None
+
+    if out is None:
+        out = torch.empty(*q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
+    else:
+        expected_out_shape = (*q_batch_seqlen_shape, num_head, head_dim_v)
+        assert out.shape == expected_out_shape, f"out tensor shape {out.shape} does not match expected shape {expected_out_shape}"
+        assert out.dtype == out_torch_dtype, f"out tensor dtype {out.dtype} does not match expected dtype {out_torch_dtype}"
+        assert out.device == device, f"out tensor device {out.device} does not match input device {device}"
+        assert out.is_cuda, "out tensor must be on CUDA device"
+
+    if lse is None:
+        lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad or return_lse else None
+    elif lse is not None:
+        assert lse.shape == lse_shape, f"lse tensor shape {lse.shape} does not match expected shape {lse_shape}"
+        assert lse.dtype == torch.float32, f"lse tensor dtype {lse.dtype} does not match expected dtype torch.float32"
+        assert lse.device == device, f"lse tensor device {lse.device} does not match input device {device}"
+        assert lse.is_cuda, "lse tensor must be on CUDA device"
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor = [
@@ -173,8 +204,24 @@ def _flash_attn_fwd(
         if pack_gqa and (128 % qhead_per_kvhead != 0) or (cu_seqlens_q is not None or seqused_q is not None):
             pack_gqa = False
 
+    if softcap is not None:
+        assert score_mod is None, "softcap and score_mod cannot be used together"
+        score_mod = utils.create_softcap_scoremod(softcap)
+
+    if score_mod is not None:
+        is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None or seqused_q is not None or seqused_k is not None
+        if is_varlen:
+            raise NotImplementedError("score_mod with buffers is not yet supported for varlen sequences. This will be fixed in a future PR.")
+        if pack_gqa:
+            raise NotImplementedError("score_mod with buffers is not yet supported with pack_gqa=True. This will be fixed in a future PR.")
+
+    cute_buffers = None
+    if buffers is not None:
+        cute_buffers = [from_dlpack(buf) for buf in buffers]
+
     compile_key = (
-        dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,
+        dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, utils.hash_callable(score_mod) if score_mod is not None else None,
+        buffers is not None,
         lse is None, cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
         page_table is not None,
         window_size_left is not None, window_size_right is not None,
@@ -182,6 +229,7 @@ def _flash_attn_fwd(
         m_block_size, n_block_size, num_threads, pack_gqa,
         compute_capability,
     )
+
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
@@ -194,12 +242,14 @@ def _flash_attn_fwd(
                 is_causal=causal,
                 is_local=local,
                 pack_gqa=pack_gqa,
-                m_block_size=m_block_size,
-                n_block_size=n_block_size,
+                tile_m=m_block_size,
+                tile_n=n_block_size,
                 # num_stages=1,
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
+                score_mod=score_mod,
+                has_buffers=buffers is not None,
             )
         elif compute_capability == 10:
             assert page_size in [None, 128], "Only page_size=128 is supported for paged KV on SM 10.0"
@@ -211,27 +261,29 @@ def _flash_attn_fwd(
                 is_local=local,
                 pack_gqa=pack_gqa,
                 is_persistent=not causal and not local and cu_seqlens_q is None and seqused_q is None,
+                score_mod=score_mod,
+                has_buffers=buffers is not None,
             )
         else:
             raise ValueError(f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x")
         # TODO: check @can_implement
+        # TODO caching for buffers; cute_buffers
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
             cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
             page_table_tensor,
-            softcap, window_size_left, window_size_right, learnable_sink_tensor,
+            window_size_left, window_size_right, learnable_sink_tensor, cute_buffers,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
         cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
         page_table_tensor,
-        softcap, window_size_left, window_size_right, learnable_sink_tensor,
+        window_size_left, window_size_right, learnable_sink_tensor, cute_buffers
     )
     return out, lse
 
 
 _flash_attn_fwd.compile_cache = {}
-
 
 def _flash_attn_bwd(
     q: torch.Tensor,
@@ -246,6 +298,7 @@ def _flash_attn_bwd(
     m_block_size: int = 64,
     n_block_size: int = 128,
     num_threads: int = 256,
+    pack_gqa: bool = False,
     num_stages_Q: int = 2,
     num_stages_dO: int = 2,
     SdP_swapAB: bool = False,
@@ -255,20 +308,61 @@ def _flash_attn_bwd(
     AtomLayoutNdKV: int = 2,
     AtomLayoutMdQ: int = 2,
     V_in_regs: bool = False,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, v, out, dout, lse = [maybe_contiguous(t) for t in (q, k, v, out, dout, lse)]
-    batch_size, seqlen_q, num_head, head_dim = q.shape
-    _, seqlen_k, num_head_kv, _ = k.shape
-    _, _, _, head_dim_v = v.shape
-    assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
-    assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
-    assert out.shape == (batch_size, seqlen_q, num_head, head_dim_v)
-    assert dout.shape == (batch_size, seqlen_q, num_head, head_dim_v)
-    assert lse.shape == (batch_size, num_head, seqlen_q), "lse must have shape (batch_size, num_head, seqlen_q)"
+    q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
+        maybe_contiguous(t) 
+        for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+    ]
+    num_head, head_dim = q.shape[-2:]
+    if cu_seqlens_q is None:
+        batch_size, seqlen_q = q.shape[:2]
+        total_q = batch_size * seqlen_q
+    else:
+        batch_size = cu_seqlens_q.shape[0] - 1
+        seqlen_q = None
+        total_q = q.shape[0]
+
+    if cu_seqlens_k is None:
+        batch_size, seqlen_k = k.shape[:2]
+        total_k = batch_size * seqlen_k
+    else:
+        batch_size = cu_seqlens_k.shape[0] - 1
+        seqlen_k = None
+        total_k = k.shape[0]
+
+    num_head_kv = k.shape[-2]
+    head_dim_v = v.shape[-1]
+
+    if cu_seqlens_k is None:
+        assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
+        assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+    else:
+        assert k.shape == (total_k, num_head_kv, head_dim)
+        assert v.shape == (total_k, num_head_kv, head_dim_v)
+        assert cu_seqlens_k.shape == (batch_size + 1,), "cu_seqlens_k must have shape (batch_size + 1,)"
+
+    if cu_seqlens_q is not None: 
+        assert cu_seqlens_q.shape == (batch_size + 1,), "cu_seqlens_q must have shape (batch_size + 1,)"
+
+        assert out.shape == (total_q, num_head, head_dim_v)
+        assert dout.shape == (total_q, num_head, head_dim_v)
+        assert lse.shape == (num_head, total_q), "lse must have shape (num_head, total_q)"
+    else:
+        assert out.shape == (batch_size, seqlen_q, num_head, head_dim_v)
+        assert dout.shape == (batch_size, seqlen_q, num_head, head_dim_v)
+        assert lse.shape == (batch_size, num_head, seqlen_q), "lse must have shape (batch_size, num_head, seqlen_q)"
+
     assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
     assert q.dtype == k.dtype == v.dtype == out.dtype == dout.dtype, "inputs must have the same dtype"
+    for t in [cu_seqlens_q, cu_seqlens_k]:
+        if t is not None:
+            assert t.dtype == torch.int32, "cu_seqlens_q, cu_seqlens_k must be int32"
     assert lse.dtype == torch.float32, "lse must be float32"
-    assert all(t.is_cuda for t in (q, k, v, out, dout, lse)), "inputs must be on CUDA device"
+    assert all(t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
     alignment = 16 // q.element_size()
@@ -277,38 +371,58 @@ def _flash_attn_bwd(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
+    if pack_gqa is None:
+        pack_gqa = qhead_per_kvhead > 1
 
     device = q.device
     # TODO: check if this is the right rounding
-    seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
-    head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
-    dq_accum = torch.empty(batch_size, num_head, seqlen_q_rounded * head_dim_rounded, dtype=torch.float32, device=device)
-    dpsum = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
-    lse_log2 = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
+
+    head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
+
+    if cu_seqlens_q is None:
+        seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
+        dq_accum = torch.empty(batch_size, num_head, seqlen_q_rounded * head_dim_rounded, dtype=torch.float32, device=device)
+        dpsum = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
+        lse_log2 = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
+    else:
+        total_q_rounded_padded = (total_q + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
+        dq_accum = torch.empty(num_head, total_q_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device)
+        dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
+        lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
+
     if qhead_per_kvhead > 1:
-        seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
-        dk_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_rounded, dtype=torch.float32, device=device)
-        dv_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_v_rounded, dtype=torch.float32, device=device)
+        if cu_seqlens_k is None:
+            seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
+            dk_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_rounded, dtype=torch.float32, device=device)
+            dv_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_v_rounded, dtype=torch.float32, device=device)
+        else:
+            total_k_rounded_padded = (total_k + cu_seqlens_k.shape[0] * n_block_size - 1) // n_block_size * n_block_size
+            dk_accum = torch.zeros(num_head_kv, total_k_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device)
+            dv_accum = torch.zeros(num_head_kv, total_k_rounded_padded * head_dim_v_rounded, dtype=torch.float32, device=device)
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
         for t in (q, k, v, out, dout, dq, dk, dv)
     ]
-    lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=2)
+    lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
     dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
         for t in (dq_accum, dpsum, lse_log2)
     ]
     if qhead_per_kvhead > 1:
         dk_accum_tensor, dv_accum_tensor = [
-            from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=2)
+            from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
             for t in (dk_accum, dv_accum)
         ]
+    cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor = [
+        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=t.ndim-1) if t is not None else None
+        for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+    ]
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
@@ -320,18 +434,21 @@ def _flash_attn_bwd(
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_pre[compile_key_pre] = cute.compile(
             fa_bwd_pre, o_tensor, do_tensor, dpsum_tensor, lse_tensor, lse_log2_tensor,
-            dq_accum_tensor, current_stream
+            dq_accum_tensor, cu_seqlens_q_tensor, seqused_q_tensor, current_stream
         )
     _flash_attn_bwd.compile_cache_pre[compile_key_pre](
-        o_tensor, do_tensor, dpsum_tensor, lse_tensor, lse_log2_tensor, dq_accum_tensor, current_stream
+        o_tensor, do_tensor, dpsum_tensor, lse_tensor, lse_log2_tensor, dq_accum_tensor, 
+        cu_seqlens_q_tensor, seqused_q_tensor, current_stream
     )
 
     # Backward kernel: compute dk, dv, dq_accum.
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap != 0.0, m_block_size,
-        n_block_size, num_threads, num_stages_Q, num_stages_dO, SdP_swapAB, dKV_swapAB, dQ_swapAB,
+        n_block_size, num_threads, pack_gqa, num_stages_Q, num_stages_dO, SdP_swapAB, dKV_swapAB, dQ_swapAB,
         AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs
     )
+    m_block_size = 64
+    n_block_size = 128
     if compile_key not in _flash_attn_bwd.compile_cache:
         fa_bwd_sm80 = FlashAttentionBackwardSm80(
             dtype,
@@ -343,6 +460,7 @@ def _flash_attn_bwd(
             num_stages_Q,
             num_stages_dO,
             num_threads,
+            pack_gqa,
             causal,
             SdP_swapAB,
             dKV_swapAB,
@@ -352,34 +470,67 @@ def _flash_attn_bwd(
             AtomLayoutMdQ,
             V_in_regs=V_in_regs,
         )
+        fa_bwd_sm90 = FlashAttentionBackwardSm90(
+            dtype,
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead,
+            m_block_size,
+            n_block_size,
+            # num_stages_Q,
+            # num_stages_dO,
+            # num_threads,
+            # causal,
+            # SdP_swapAB,
+            # dKV_swapAB,
+            # dQ_swapAB,
+            # AtomLayoutMSdP,
+            # AtomLayoutNdKV,
+            # AtomLayoutMdQ,
+            # V_in_regs=V_in_regs,
+        )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
-            fa_bwd_sm80, q_tensor, k_tensor, v_tensor, do_tensor, lse_log2_tensor, dpsum_tensor,
+            # fa_bwd_sm80,
+            fa_bwd_sm90,
+            q_tensor, k_tensor, v_tensor, do_tensor, lse_log2_tensor, dpsum_tensor,
             dq_accum_tensor,
             dk_tensor if qhead_per_kvhead == 1 else dk_accum_tensor,
             dv_tensor if qhead_per_kvhead == 1 else dv_accum_tensor,
-            softmax_scale, current_stream
+            softmax_scale,
+            current_stream,
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
+            seqused_q_tensor,
+            seqused_k_tensor,
         )
     _flash_attn_bwd.compile_cache[compile_key](
         q_tensor, k_tensor, v_tensor, do_tensor, lse_log2_tensor, dpsum_tensor,
         dq_accum_tensor,
         dk_tensor if qhead_per_kvhead == 1 else dk_accum_tensor,
         dv_tensor if qhead_per_kvhead == 1 else dv_accum_tensor,
-        softmax_scale, current_stream
+        softmax_scale,
+        current_stream,
+        cu_seqlens_q_tensor,
+        cu_seqlens_k_tensor,
+        seqused_q_tensor,
+        seqused_k_tensor,
     )
 
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
     compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
-        fa_bwd_post = FlashAttentionBackwardPostprocess(
+        # fa_bwd_post = FlashAttentionBackwardPostprocess(
+        fa_bwd_post = FlashAttentionBackwardPostprocess_sm90(
             dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
-            fa_bwd_post, dq_accum_tensor, dq_tensor, softmax_scale, current_stream
+            fa_bwd_post, dq_accum_tensor, dq_tensor, softmax_scale, cu_seqlens_q_tensor,
+            seqused_q_tensor, current_stream
         )
     _flash_attn_bwd.compile_cache_post[compile_key_post](
-        dq_accum_tensor, dq_tensor, softmax_scale, current_stream
+        dq_accum_tensor, dq_tensor, softmax_scale, cu_seqlens_q_tensor, seqused_q_tensor, current_stream
     )
 
     if qhead_per_kvhead > 1:
@@ -391,10 +542,10 @@ def _flash_attn_bwd(
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
-                fa_bwd_post, dk_accum_tensor, dk_tensor, softmax_scale, current_stream
+                fa_bwd_post, dk_accum_tensor, dk_tensor, softmax_scale, cu_seqlens_k_tensor, seqused_k_tensor, current_stream
             )
         _flash_attn_bwd.compile_cache_post[compile_key_post](
-            dk_accum_tensor, dk_tensor, softmax_scale, current_stream
+            dk_accum_tensor, dk_tensor, softmax_scale, cu_seqlens_k_tensor, seqused_k_tensor, current_stream
         )
         compile_key_post = (dtype, head_dim_v, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
@@ -403,10 +554,10 @@ def _flash_attn_bwd(
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
-                fa_bwd_post, dv_accum_tensor, dv_tensor, cutlass.Float32(1.0), current_stream
+                fa_bwd_post, dv_accum_tensor, dv_tensor, cutlass.Float32(1.0), cu_seqlens_k_tensor, seqused_k_tensor, current_stream
             )
         _flash_attn_bwd.compile_cache_post[compile_key_post](
-            dv_accum_tensor, dv_tensor, cutlass.Float32(1.0), current_stream
+            dv_accum_tensor, dv_tensor, cutlass.Float32(1.0), cu_seqlens_k_tensor, seqused_k_tensor, current_stream
         )
 
     return dq, dk, dv
@@ -465,7 +616,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.softcap,
         )
-        return dq, dk, dv, *((None,) * 5)
+        return dq, dk, dv, *((None,) * 10)  # Extra Nones is fine
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -515,9 +666,25 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
-        raise NotImplementedError(
-            "Backward pass for FlashAttention with variable length sequences is not implemented yet."
+        assert seqused_q == seqused_k == None
+        assert ctx.softcap == 0.0
+        dq, dk, dv = _flash_attn_bwd(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.softcap,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
         )
+
+        return dq, dk, dv, *((None,) * 11)
 
 
 def flash_attn_func(

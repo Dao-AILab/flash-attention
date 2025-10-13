@@ -1,6 +1,8 @@
 # Copyright (c) 2025, Tri Dao.
 
 import math
+import hashlib
+import inspect
 from typing import Type, Callable, Optional, Tuple
 from functools import partial
 
@@ -24,6 +26,34 @@ sub_packed_f32x2 = partial(
     rnd=nvvm.RoundingModeKind.RN
 )
 
+def hash_callable(func: Callable) -> str:
+    """Hash a callable based on the source code or bytecode and closure values."""
+    try:
+        data = inspect.getsource(func).encode()
+    except (OSError, TypeError):
+        if hasattr(func, "__code__") and func.__code__ is not None:
+            data = func.__code__.co_code
+        else:
+            data = repr(func).encode()
+
+    hasher = hashlib.sha256(data)
+
+    if hasattr(func, "__closure__") and func.__closure__ is not None:
+        for cell in func.__closure__:
+            cell_value = cell.cell_contents
+            hasher.update(repr(cell_value).encode())
+
+    return hasher.hexdigest()
+
+
+def create_softcap_scoremod(softcap_val):
+    inv_softcap = 1.0 / softcap_val
+
+    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, buffers):
+        scores = acc_S_SSA * inv_softcap
+        return scores * cute.math.tanh(scores, fastmath=True)
+
+    return scoremod_premask_fn
 
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
     return (
@@ -176,6 +206,10 @@ def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
             ),
         )
     return rA_mma_view
+
+
+def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
+    return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
 
 
 def transpose_view(a: cute.Tensor) -> cute.Tensor:
@@ -359,7 +393,14 @@ def elem_pointer_i64(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) ->
     flat_stride = cute.flatten_to_tuple(x.stride)
     assert len(flat_coord_i64) == len(flat_stride), "Coordinate and stride must have the same length"
     offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
-    return x.iterator + offset
+    # HACK: we assume that applying the offset does not change the pointer alignment
+    byte_offset = offset * x.element_type.width // 8
+    return cute.make_ptr(
+        x.element_type,
+        x.iterator.toint() + byte_offset,
+        x.memspace,
+        assumed_align=x.iterator.alignment,
+    )
 
 
 @cute.jit
@@ -669,3 +710,11 @@ def coord_offset_i64(
     )
     new_layout = cute.slice_(tensor.layout, (*[None] * dim, 0, *[None] * (cute.rank(tensor) - dim - 1)))
     return cute.make_tensor(new_ptr, new_layout)
+
+
+@cute.jit
+def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
+    """ Convert a scalar to a cute TensorSSA of shape (1,) and given dtype """
+    vec = cute.make_fragment(1, dtype)
+    vec[0] = a
+    return vec.load()

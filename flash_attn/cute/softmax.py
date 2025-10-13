@@ -10,42 +10,28 @@ import cutlass.cute as cute
 from cutlass import Float32
 
 import flash_attn.cute.utils as utils
+from flash_attn.cute.cute_dsl_utils import ParamsBase
 
 
-class Softmax:
-    def __init__(
-        self,
+@dataclass
+class Softmax(ParamsBase):
+    scale_log2: Float32
+    num_rows: cutlass.Constexpr[int]
+    row_max: cute.Tensor
+    row_sum: cute.Tensor
+    arch: cutlass.Constexpr[int] = 80
+    softmax_scale: Float32 | None = None
+
+    @staticmethod
+    def create(
         scale_log2: Float32,
         num_rows: cutlass.Constexpr[int],
         arch: cutlass.Constexpr[int] = 80,
+        softmax_scale: Float32 | None = None
     ):
-        self.scale_log2 = scale_log2
-        self.num_rows = num_rows
-        self.arch = arch
-        self.row_max = cute.make_fragment(num_rows, Float32)
-        self.row_sum = cute.make_fragment_like(self.row_max)
-
-    def __extract_mlir_values__(self):
-        non_constexpr_fields = [self.scale_log2, self.row_max, self.row_sum]
-        values, self._values_pos = [], []
-        for obj in non_constexpr_fields:
-            obj_values = cutlass.extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        field_names = ['scale_log2', 'row_max', 'row_sum']
-        reconstructed_fields = {}
-        for name, n_items in zip(field_names, self._values_pos):
-            original_field = getattr(self, name)
-            reconstructed_fields[name] = cutlass.new_from_mlir_values(original_field, values[:n_items])
-            values = values[n_items:]
-
-        new_obj = self.__class__(reconstructed_fields['scale_log2'], self.num_rows, self.arch)
-        new_obj.row_max = reconstructed_fields['row_max']
-        new_obj.row_sum = reconstructed_fields['row_sum']
-        return new_obj
+        row_max = cute.make_fragment(num_rows, Float32)
+        row_sum = cute.make_fragment(num_rows, Float32)
+        return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale)
 
     def reset(self) -> None:
         self.row_max.fill(-Float32.inf)
@@ -172,15 +158,21 @@ class Softmax:
             acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])
 
 
+@dataclass
 class SoftmaxSm100(Softmax):
-    def __init__(self, scale_log2: Float32, rescale_threshold: cutlass.Constexpr[float] = 0.0):
-        super().__init__(scale_log2, num_rows=1, arch=100)
-        self.rescale_threshold = rescale_threshold
+    rescale_threshold: cutlass.Constexpr[float] = 0.0
 
-    def __new_from_mlir_values__(self, values):
-        new_obj = super().__new_from_mlir_values__(values)
-        new_obj.rescale_threshold = self.rescale_threshold
-        return new_obj
+    @staticmethod
+    def create(
+        scale_log2: Float32,
+        rescale_threshold: cutlass.Constexpr[float] = 0.0,
+        softmax_scale: Float32 | None = None,
+    ):
+        num_rows = 1
+        arch = 100
+        row_max = cute.make_fragment(num_rows, Float32)
+        row_sum = cute.make_fragment(num_rows, Float32)
+        return SoftmaxSm100(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale, rescale_threshold=rescale_threshold)
 
     @cute.jit
     def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
@@ -312,3 +304,91 @@ class SoftmaxSm100(Softmax):
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
             )
+
+
+@cute.jit
+def apply_score_mod_inner(
+    score_tensor,
+    index_tensor,
+    score_mod: cutlass.Constexpr,
+    batch_idx,
+    head_idx,
+    softmax_scale,
+    vec_size:cutlass.Constexpr,
+    qk_acc_dtype: cutlass.Constexpr,
+    buffers,
+    fastdiv_mods,
+    constant_q_idx:cutlass.Constexpr,
+):
+    """Shared implementation for applying score modification.
+
+    Args:
+        score_tensor: The scores to modify (acc_S for flash_fwd, tSrS_t2r for sm100)
+        index_tensor: Index positions (tScS for flash_fwd, tScS_t2r for sm100)
+        score_mod: The score modification function to apply
+        batch_idx: Batch index
+        head_idx: Head index
+        softmax_scale: Scale to apply
+        vec_size: Vector size for processing elements
+        qk_acc_dtype: Data type for accumulator
+        buffers: Optional buffers for FlexAttention
+        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
+        constant_q_idx: If provided, use this constant for all q_idx values
+                       If None, compute q_idx per-element
+    """
+    n_vals = cutlass.const_expr(cute.size(score_tensor.shape))
+    score_vec = cute.make_fragment(vec_size, qk_acc_dtype)
+    kv_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+
+    # SSA values for batch and head (constant across all elements)
+    batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32).broadcast_to((vec_size,))
+    head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32).broadcast_to((vec_size,))
+
+    # Handle q_idx based on whether it's constant
+    q_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    for i in cutlass.range(0, n_vals, vec_size, unroll_full=True):
+        for j in cutlass.range(vec_size, unroll_full=True):
+            score_vec[j] = score_tensor[i + j] * softmax_scale
+
+            # If we will do loads we mod, in order to not read OOB
+            if cutlass.const_expr(buffers is not None and fastdiv_mods is not None):
+                if cutlass.const_expr(constant_q_idx is None):
+                    seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
+                    _, q_idx_wrapped = seqlen_q_divmod.divmod(index_tensor[i + j][0])
+                    q_idx_vec[j] = q_idx_wrapped
+                else:
+                    _, seqlen_k_divmod = fastdiv_mods
+
+                _, kv_idx_wrapped = seqlen_k_divmod.divmod(index_tensor[i + j][1])
+                kv_idx_vec[j] = kv_idx_wrapped
+            else:
+                # No bounds checking - direct indexing
+                if constant_q_idx is None:
+                    q_idx_vec[j] = index_tensor[i + j][0]
+                kv_idx_vec[j] = index_tensor[i + j][1]
+
+        # Convert to SSA for score_mod call
+        score_ssa = score_vec.load()
+        kv_idx_ssa = kv_idx_vec.load()
+        if cutlass.const_expr(constant_q_idx is None):
+            q_idx_ssa = q_idx_vec.load()
+        else:
+            q_idx_ssa = utils.scalar_to_ssa(constant_q_idx, cutlass.Int32).broadcast_to((vec_size,))
+
+        buffer_args = []
+        if cutlass.const_expr(buffers is not None):
+            buffer_args = buffers
+
+        post_mod_scores = score_mod(
+            score_ssa,
+            batch_idx_ssa,
+            head_idx_ssa,
+            q_idx=q_idx_ssa,
+            kv_idx=kv_idx_ssa,
+            buffers=buffer_args
+        )
+
+        # Write back modified scores
+        score_vec.store(post_mod_scores)
+        for j in cutlass.range(vec_size, unroll_full=True):
+            score_tensor[i + j] = score_vec[j]
