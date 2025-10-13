@@ -64,9 +64,9 @@ def should_test_backward(args, kwargs):
 
     if (
         ENABLE_AUTOGRAD_CHECK
-        and not DISABLE_BACKWARD 
-        and dtype != torch.float8_e4m3fn 
-        and not V_colmajor 
+        and not DISABLE_BACKWARD
+        and dtype != torch.float8_e4m3fn
+        and not V_colmajor
         and not has_qv
         and not dv > 256
         and not attention_chunk != 0

@@ -354,9 +354,6 @@ def _flash_attn_backward_fake(
 
     is_local = (window_size_left >= 0 or window_size_right >= 0) and not is_causal
 
-    if arch < 90:
-        raise ValueError(f"Only cuda compute capabilities 9.0 or newer are supported. Got {arch=}")
-
     if head_size_rounded <= 64:
         kBlockM_sm90 = 96 if (is_causal and softcap > 0.0) else 128
     elif head_size_rounded <= 96:
@@ -366,7 +363,15 @@ def _flash_attn_backward_fake(
     else:
         kBlockM_sm90 = 64
 
-    kBlockM = kBlockM_sm90
+    kBlockM_sm80 = 128 if head_size_rounded <= 64 else 64
+    kBlockM_sm86 = 64 if head_size_rounded <= 192 else 32
+
+    if arch >= 90:
+        kBlockM = kBlockM_sm90
+    elif arch == 86 or arch == 89:
+        kBlockM = kBlockM_sm86
+    else:
+        kBlockM = kBlockM_sm80
 
     num_heads = q.shape[-2]
     seqlen_q_rounded = round_multiple(seqlen_q, kBlockM)
@@ -374,7 +379,7 @@ def _flash_attn_backward_fake(
     total_q_padded_rounded = round_multiple(total_q + batch_size * kBlockM, kBlockM)
 
     dq = torch.empty_like(q) if dq is None else dq
-    dk = torch.empty_like(k) if dk is None else dk 
+    dk = torch.empty_like(k) if dk is None else dk
     dv = torch.empty_like(v) if dv is None else dv
 
     if not is_varlen:
@@ -396,7 +401,7 @@ def setup_context(ctx, inputs, output):
     ctx.softcap = inputs[-6]
     ctx.sm_margin = inputs[-1]
 
-    
+
 def _backward(ctx, dout, *grads):
     q, k, v, out, softmax_lse = ctx.saved_tensors
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
