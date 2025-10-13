@@ -1,4 +1,5 @@
 import os
+import warnings
 import torch
 import triton
 import triton.language as tl
@@ -6,65 +7,22 @@ from typing import Literal, Optional
 from .utils import (
     DEBUG,
     AUTOTUNE,
-    DROPOUT_USE_PYTORCH,
-    DROPOUT_DUMP,
     compute_alibi_block,
     compute_fp8_scaling_factors,
     get_arch,
+    get_cu_count,
     is_cdna,
     is_fp8,
     is_rdna,
-    create_dropout_mask,
     apply_rotary,
+    get_recommended_fp8_dtype,
 )
 
-# NOTE: triton fails to import tl.constexprs so create them here for the file
-tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
-tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
 
 
-# -------------------------------
-# Autotune
-# -------------------------------
-def get_fwd_prefill_cdna_autotune_configs():
-    return [
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "waves_per_eu": 2, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "waves_per_eu": 3, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "waves_per_eu": 1, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 32, "waves_per_eu": 2, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-        # Fall-back config.
-        triton.Config(
-            {"BLOCK_M": 16, "BLOCK_N": 16, "waves_per_eu": 1, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-    ], [
+def get_fwd_configs(autotune: bool):
+    configs = []
+    keys = [
         "IS_CAUSAL",
         "dropout_p",
         "MAX_SEQLENS_Q",
@@ -76,110 +34,129 @@ def get_fwd_prefill_cdna_autotune_configs():
         "HK",
     ]
 
-
-def get_fwd_prefill_rdna_autotune_configs():
-    return [
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 32, "waves_per_eu": 4, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=2,
-        ),
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 32, "waves_per_eu": 2, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=2,
-        ),
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 16, "waves_per_eu": 4, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=2,
-        ),
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 16, "waves_per_eu": 2, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=2,
-        ),
-        triton.Config(
-            {"BLOCK_M": 16, "BLOCK_N": 16, "waves_per_eu": 4, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=2,
-        ),
-        triton.Config(
-            {"BLOCK_M": 16, "BLOCK_N": 16, "waves_per_eu": 2, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=2,
-        ),
-        # Fall-back config.
-        triton.Config(
-            {"BLOCK_M": 16, "BLOCK_N": 16, "waves_per_eu": 1, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=2,
-        ),
-    ], [
-        "IS_CAUSAL",
-        "dropout_p",
-        "MAX_SEQLENS_Q",
-        "MAX_SEQLENS_K",
-        "ACTUAL_BLOCK_DMODEL_QK",
-        "ACTUAL_BLOCK_DMODEL_V",
-        "IS_VARLEN",
-        "HQ",
-        "HK",
-    ]
-
-
-def get_fwd_prefill_autotune_configs():
-    if AUTOTUNE:
-        if is_rdna():
-            return get_fwd_prefill_rdna_autotune_configs()
-        elif is_cdna():
-            return get_fwd_prefill_cdna_autotune_configs()
-        else:
-            raise ValueError("Unknown Device Type")
-    else:
+    # get best config for the architecture
+    if not autotune:
         arch = get_arch()
         if arch == "gfx950":
-            default_config = triton.Config(
-                {
-                    "BLOCK_M": 128,
-                    "BLOCK_N": 128,
-                    "waves_per_eu": 2,
-                    "PRE_LOAD_V": False,
-                },
-                num_stages=1,
-                num_warps=4,
+            configs.append(
+                triton.Config(
+                    {
+                        "BLOCK_M": 128,
+                        "BLOCK_N": 128,
+                        "waves_per_eu": 2,
+                        "PRE_LOAD_V": False,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                )
             )
-        elif (
-            arch == "gfx942" and False
-        ):  # Disabled due shared mem oom in CI when using triton==3.3.0 when using top of tree everything seems fine.
-            default_config = triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
-                num_stages=1,
-                num_warps=4,
+        elif arch == "gfx942":
+            if get_cu_count() < 304:
+                configs.extend(
+                    [
+                        # best fp8 config
+                        triton.Config(
+                            {
+                                "BLOCK_M": 128,
+                                "BLOCK_N": 64,
+                                "waves_per_eu": 2,
+                                "PRE_LOAD_V": False,
+                            },
+                            num_stages=1,
+                            num_warps=4,
+                        ),
+                        # best f16 config
+                        triton.Config(
+                            {
+                                "BLOCK_M": 128,
+                                "BLOCK_N": 32,
+                                "waves_per_eu": 2,
+                                "PRE_LOAD_V": False,
+                            },
+                            num_stages=2,
+                            num_warps=4,
+                        ),
+                    ]
+                )
+            else:
+                configs.append(
+                    triton.Config(
+                        {
+                            "BLOCK_M": 128,
+                            "BLOCK_N": 64,
+                            "waves_per_eu": 2,
+                            "PRE_LOAD_V": False,
+                        },
+                        num_stages=1,
+                        num_warps=4,
+                    )
+                )
+        elif arch in (
+            "gfx1030",
+            "gfx1100",
+            "gfx1101",
+            "gfx1102",
+            "gfx1200",
+            "gfx1201",
+        ):  # RDNA architectures
+            configs.append(
+                triton.Config(
+                    {
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 32,
+                        "waves_per_eu": 2,
+                        "PRE_LOAD_V": False,
+                    },
+                    num_stages=1,
+                    num_warps=2,
+                )
             )
         else:
-            default_config = triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
-                num_stages=1,
-                num_warps=4,
+            configs.append(
+                triton.Config(
+                    {
+                        "BLOCK_M": 64,
+                        "BLOCK_N": 64,
+                        "waves_per_eu": 2,
+                        "PRE_LOAD_V": False,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                )
             )
 
-        return [default_config], [
-            "IS_CAUSAL",
-            "dropout_p",
-            "MAX_SEQLENS_Q",
-            "MAX_SEQLENS_K",
-            "ACTUAL_BLOCK_DMODEL_QK",
-            "ACTUAL_BLOCK_DMODEL_V",
-            "IS_VARLEN",
-            "HQ",
-            "HK",
-        ]
+        return configs, keys
+
+    # ===================== Autotune Sweep =====================
+    BLOCK_M_OPTIONS = [128, 64, 32]
+    BLOCK_N_OPTIONS = [128, 64, 32]
+    NUM_WARPS_OPTIONS = [2, 4, 8]
+    NUM_STAGES_OPTIONS = [1, 2]
+    WAVES_PER_EU_OPTIONS = [4, 2, 1]
+    PRE_LOAD_V_OPTIONS = [False]
+    for bm in BLOCK_M_OPTIONS:
+        for bn in BLOCK_N_OPTIONS:
+            for waves in WAVES_PER_EU_OPTIONS:
+                for nw in NUM_WARPS_OPTIONS:
+                    for ns in NUM_STAGES_OPTIONS:
+                        for preload_v in PRE_LOAD_V_OPTIONS:
+                            configs.append(
+                                triton.Config(
+                                    {
+                                        "BLOCK_M": bm,
+                                        "BLOCK_N": bn,
+                                        "waves_per_eu": waves,
+                                        "PRE_LOAD_V": preload_v,
+                                    },
+                                    num_stages=ns,
+                                    num_warps=nw,
+                                )
+                            )
+
+    return configs, keys
 
 
-fwd_prefill_autotune_configs, fwd_prefill_autotune_keys = (
-    get_fwd_prefill_autotune_configs()
-)
+fwd_prefill_autotune_configs, fwd_prefill_autotune_keys = get_fwd_configs(AUTOTUNE)
 
 
 @triton.jit
@@ -195,14 +172,18 @@ def _attn_fwd_no_mask(
     stride_vk,
     stride_bn,
     stride_sn,
+    stride_sm,
     start_m,
     seqlen_k,
     seqlen_q,
     dropout_p,
     philox_seed,
-    philox_base_ptrs,
-    sd_mask_base_ptrs,
-    dropout_mask_base_ptrs,
+    philox_offset_base,
+    sd_mask,
+    stride_sz,
+    stride_sh,
+    off_z,
+    off_h_q,
     offs_m,
     offs_n,
     offs_d_qk,
@@ -242,28 +223,20 @@ def _attn_fwd_no_mask(
         v_ptrs = v_base_ptrs + start_n * stride_vk
 
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
+        # Load K
         if PADDED_HEAD_QK:
-            k_mask, k_mask_other = (offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK), 0.0
+            k_mask = offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK
+            k = tl.load(k_ptrs, mask=k_mask, other=0.0)
         else:
-            k_mask, k_mask_other = None, None
+            k = tl.load(k_ptrs)
 
-        if PADDED_HEAD_V:
-            v_mask, v_mask_other = (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V), 0.0
-        else:
-            v_mask, v_mask_other = None, None
-
-        # load k and if preload_v then v
-        k = (
-            tl.load(k_ptrs, mask=k_mask, other=k_mask_other)
-            if PADDED_HEAD_QK
-            else tl.load(k_ptrs)
-        )
+        # Optionally preload V
         if PRE_LOAD_V:
-            v = (
-                tl.load(v_ptrs, mask=v_mask, other=v_mask_other)
-                if PADDED_HEAD_V
-                else tl.load(v_ptrs)
-            )
+            if PADDED_HEAD_V:
+                v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
+                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+            else:
+                v = tl.load(v_ptrs)
 
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
@@ -309,29 +282,34 @@ def _attn_fwd_no_mask(
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
         if ENABLE_DROPOUT:
-            dropout_mask_ptrs = dropout_mask_base_ptrs + start_n * stride_sn
-            sd_mask_ptrs = sd_mask_base_ptrs + start_n * stride_sn
-            philox_ptrs = philox_base_ptrs + start_n * stride_sn
-            if tl_DROPOUT_USE_PYTORCH:
-                dropout_mask = tl.load(dropout_mask_ptrs, mask=qk_mask)
-            else:
-                rng_output = tl.rand(
-                    philox_seed, philox_ptrs
-                )  # TODO: use tl.randint for better performance
-                dropout_mask = rng_output > dropout_p
-                if tl_DROPOUT_DUMP:
-                    tl.store(dropout_mask_ptrs, dropout_mask, mask=qk_mask)
+            # Compute pointers for this block
+            philox_base = philox_offset_base + off_z * stride_sz + off_h_q * stride_sh
+            philox_ptrs = philox_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
+            
+            # compute dropout mask
+            rng_output = tl.rand(philox_seed, philox_ptrs)
+            dropout_mask = rng_output > dropout_p
 
-            # return scores with negative values for dropped vals
-            sd_mask = tl.where(dropout_mask, p, -p)
-            tl.store(sd_mask_ptrs, sd_mask, mask=qk_mask)
+            # return scores with negative values for dropped vals (only if RETURN_SCORES is True)
+            if RETURN_SCORES:
+                sd_mask_value = tl.where(dropout_mask, p, -p)
+                sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
+                sd_mask_ptrs = sd_mask_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
+                
+                # Compute mask for sd_mask storage
+                sd_store_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+                tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
 
             # apply dropout mask in place
             p = tl.where(dropout_mask, p, 0.0)
         elif RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
-            sd_mask_ptrs = sd_mask_base_ptrs + start_n * stride_sn
-            tl.store(sd_mask_ptrs, p, mask=qk_mask)
+            sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
+            sd_mask_ptrs = sd_mask_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
+            
+            # Compute mask for sd_mask storage
+            sd_store_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+            tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
 
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
@@ -343,11 +321,11 @@ def _attn_fwd_no_mask(
             alpha = tl.math.exp(m_diff)
         acc = acc * alpha[:, None]
         if not PRE_LOAD_V:
-            v = (
-                tl.load(v_ptrs, mask=v_mask, other=v_mask_other)
-                if PADDED_HEAD_V
-                else tl.load(v_ptrs)
-            )
+            if PADDED_HEAD_V:
+                v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
+                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+            else:
+                v = tl.load(v_ptrs)
 
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
@@ -382,14 +360,18 @@ def _attn_fwd_mask(
     stride_vk,
     stride_bn,
     stride_sn,
+    stride_sm,
     start_m,
     seqlen_k,
     seqlen_q,
     dropout_p,
     philox_seed,
-    philox_base_ptrs,
-    sd_mask_base_ptrs,
-    dropout_mask_base_ptrs,
+    philox_offset_base,
+    sd_mask,
+    stride_sz,
+    stride_sh,
+    off_z,
+    off_h_q,
     offs_m,
     offs_n,
     offs_d_qk,
@@ -611,29 +593,74 @@ def _attn_fwd_mask(
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
         if ENABLE_DROPOUT:
-            dropout_mask_ptrs = dropout_mask_base_ptrs + start_n * stride_sn
-            sd_mask_ptrs = sd_mask_base_ptrs + start_n * stride_sn
-            philox_ptrs = philox_base_ptrs + start_n * stride_sn
-            if tl_DROPOUT_USE_PYTORCH:
-                dropout_mask = tl.load(dropout_mask_ptrs, mask=qk_mask)
-            else:
-                rng_output = tl.rand(
-                    philox_seed, philox_ptrs
-                )  # TODO: use tl.randint for better performance
-                dropout_mask = rng_output > dropout_p
-                if tl_DROPOUT_DUMP:
-                    tl.store(dropout_mask_ptrs, dropout_mask, mask=qk_mask)
+            # Compute pointers for this block
+            philox_base = philox_offset_base + off_z * stride_sz + off_h_q * stride_sh
+            philox_ptrs = philox_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
+            
+            # compute dropout mask
+            rng_output = tl.rand(philox_seed, philox_ptrs)
+            dropout_mask = rng_output > dropout_p
 
-            # return scores with negative values for dropped vals
-            sd_mask = tl.where(dropout_mask, p, -p)
-            tl.store(sd_mask_ptrs, sd_mask, mask=qk_mask)
+            # return scores with negative values for dropped vals (only if RETURN_SCORES is True)
+            if RETURN_SCORES:
+                sd_mask_value = tl.where(dropout_mask, p, -p)
+                sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
+                sd_mask_ptrs = sd_mask_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
+                
+                # Compute mask for sd_mask storage - include bounds check
+                sd_store_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+                
+                # Add causal mask if applicable to prevent writing to invalid positions
+                if IS_CAUSAL:
+                    seqlen_delta_qk = seqlen_k - seqlen_q
+                    causal_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk)
+                    sd_store_mask = sd_store_mask & causal_constraint
+                
+                # Add sliding window mask if applicable
+                if USE_SLIDING_WINDOW:
+                    seqlen_delta_qk = seqlen_k - seqlen_q
+                    if WINDOW_SIZE_LEFT < 0:
+                        # Only right window constraint
+                        window_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT)
+                    else:
+                        # Both left and right window constraints
+                        left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
+                        right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
+                        window_constraint = (kv_offs_n[None, :] >= left_bound) & (kv_offs_n[None, :] <= right_bound)
+                    sd_store_mask = sd_store_mask & window_constraint
+                
+                tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
 
             # apply dropout mask in place
             p = tl.where(dropout_mask, p, 0.0)
         elif RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
-            sd_mask_ptrs = sd_mask_base_ptrs + start_n * stride_sn
-            tl.store(sd_mask_ptrs, p, mask=qk_mask)
+            sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
+            sd_mask_ptrs = sd_mask_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
+            
+            # Compute mask for sd_mask storage - include bounds check
+            sd_store_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+            
+            # Add causal mask if applicable
+            if IS_CAUSAL:
+                seqlen_delta_qk = seqlen_k - seqlen_q
+                causal_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk)
+                sd_store_mask = sd_store_mask & causal_constraint
+            
+            # Add sliding window mask if applicable
+            if USE_SLIDING_WINDOW:
+                seqlen_delta_qk = seqlen_k - seqlen_q
+                if WINDOW_SIZE_LEFT < 0:
+                    # Only right window constraint
+                    window_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT)
+                else:
+                    # Both left and right window constraints
+                    left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
+                    right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
+                    window_constraint = (kv_offs_n[None, :] >= left_bound) & (kv_offs_n[None, :] <= right_bound)
+                sd_store_mask = sd_store_mask & window_constraint
+            
+            tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
 
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
@@ -974,9 +1001,10 @@ def attn_fwd(
     stride_q_descale_z,
     stride_k_descale_z,
     stride_v_descale_z,
-    SM_SCALE: tl.constexpr,
     LSE,
     Out,
+    SD_MASK,
+    ALIBI_SLOPES,
     stride_qz,
     stride_qh,
     stride_qm,
@@ -1013,9 +1041,6 @@ def attn_fwd(
     dropout_p,
     philox_seed,
     philox_offset_base,
-    sd_mask,
-    dropout_mask,
-    alibi_slopes,
     HQ: tl.constexpr,
     HK: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
@@ -1023,6 +1048,7 @@ def attn_fwd(
     MAX_SEQLENS_Q: tl.constexpr,
     MAX_SEQLENS_K: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    SM_SCALE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     USE_SLIDING_WINDOW: tl.constexpr,
     WINDOW_SIZE_LEFT: tl.constexpr,
@@ -1035,7 +1061,6 @@ def attn_fwd(
     USE_BIAS: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
-    NEEDS_SDMASK: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
@@ -1215,40 +1240,9 @@ def attn_fwd(
 
     if USE_ALIBI:
         a_offset = off_z * stride_az + off_h_q * stride_ah
-        alibi_slope = tl.load(alibi_slopes + a_offset)
+        alibi_slope = tl.load(ALIBI_SLOPES + a_offset)
     else:
         alibi_slope = None
-
-    if NEEDS_SDMASK:
-        sd_mask_offset = (
-            sd_mask + off_z * stride_sz + off_h_q * stride_sh
-        )  # + cu_seqlens_q_start * stride_sm
-        sd_mask_ptrs = (
-            sd_mask_offset + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
-        )
-    else:
-        sd_mask_ptrs = None
-
-    if ENABLE_DROPOUT:
-        dropout_mask_offset = (
-            dropout_mask + off_z * stride_sz + off_h_q * stride_sh
-        )  # + cu_seqlens_q_start * stride_sm
-        dropout_mask_ptrs = (
-            dropout_mask_offset
-            + offs_m[:, None] * stride_sm
-            + offs_n[None, :] * stride_sn
-        )
-        batch_philox_offset = (
-            philox_offset_base + off_z * stride_sz + off_h_q * stride_sh
-        )  # + cu_seqlens_q_start * stride_sm
-        philox_ptrs = (
-            batch_philox_offset
-            + offs_m[:, None] * stride_sm
-            + offs_n[None, :] * stride_sn
-        )
-    else:
-        dropout_mask_ptrs = None
-        philox_ptrs = 0
 
     # initialize pointer to m and l
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=ACCUMULATOR_TYPE)
@@ -1279,14 +1273,18 @@ def attn_fwd(
             stride_vk,
             stride_bn,
             stride_sn,
+            stride_sm,
             start_m,
             seqlen_k,
             seqlen_q,
             dropout_p,
             philox_seed,
-            philox_ptrs,
-            sd_mask_ptrs,
-            dropout_mask_ptrs,
+            philox_offset_base,
+            SD_MASK,
+            stride_sz,
+            stride_sh,
+            off_z,
+            off_h_q,
             offs_m,
             offs_n,
             offs_d_qk,
@@ -1341,14 +1339,18 @@ def attn_fwd(
             stride_vk,
             stride_bn,
             stride_sn,
+            stride_sm,
             start_m,
             seqlen_k,
             seqlen_q,
             dropout_p,
             philox_seed,
-            philox_ptrs,
-            sd_mask_ptrs,
-            dropout_mask_ptrs,
+            philox_offset_base,
+            SD_MASK,
+            stride_sz,
+            stride_sh,
+            off_z,
+            off_h_q,
             offs_m,
             offs_n,
             offs_d_qk,
@@ -1403,14 +1405,18 @@ def attn_fwd(
             stride_vk,
             stride_bn,
             stride_sn,
+            stride_sm,
             start_m,
             seqlen_k,
             seqlen_q,
             dropout_p,
             philox_seed,
-            philox_ptrs,
-            sd_mask_ptrs,
-            dropout_mask_ptrs,
+            philox_offset_base,
+            SD_MASK,
+            stride_sz,
+            stride_sh,
+            off_z,
+            off_h_q,
             offs_m,
             offs_n,
             offs_d_qk,
@@ -1572,6 +1578,8 @@ def attention_forward_prefill_triton_impl(
     k: torch.Tensor,
     v: torch.Tensor,
     o: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    sd_mask: Optional[torch.Tensor],
     sm_scale: float,
     alibi_slopes: Optional[torch.Tensor],
     causal: bool,
@@ -1589,7 +1597,7 @@ def attention_forward_prefill_triton_impl(
     philox_seed: Optional[int],
     philox_offset: Optional[int],
     # misc
-    return_softmax: bool,
+    return_scores: bool,
     use_exp2: bool,
     # fp8
     q_descale: Optional[torch.Tensor],
@@ -1679,10 +1687,19 @@ def attention_forward_prefill_triton_impl(
         batch = len(cu_seqlens_q) - 1
         head_size_qk = head_size_q
 
-        # softmax_lse shape
-        softmax_lse = torch.zeros(
-            (nheads_q, total_seqlen_q), device=q.device, dtype=torch.float32
-        )
+        # Assert softmax_lse tensor is large enough
+        assert (
+            softmax_lse.shape[0] >= nheads_q
+        ), f"softmax_lse.shape[0]={softmax_lse.shape[0]} must be >= nheads_q={nheads_q}"
+        assert (
+            softmax_lse.shape[1] >= total_seqlen_q
+        ), f"softmax_lse.shape[1]={softmax_lse.shape[1]} must be >= total_seqlen_q={total_seqlen_q}"
+        assert (
+            softmax_lse.dtype == torch.float32
+        ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
+        assert (
+            softmax_lse.device == q.device
+        ), f"softmax_lse must be on same device as q"
 
         # strides
         stride_qb, stride_qh, stride_qm, stride_qd = (
@@ -1755,10 +1772,22 @@ def attention_forward_prefill_triton_impl(
         max_seqlens_q = seqlen_q
         max_seqlens_k = seqlen_k
 
-        # softmax_lse shape
-        softmax_lse = torch.zeros(
-            (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
-        )
+        # Assert softmax_lse tensor is large enough
+        assert (
+            softmax_lse.shape[0] >= batch
+        ), f"softmax_lse.shape[0]={softmax_lse.shape[0]} must be >= batch={batch}"
+        assert (
+            softmax_lse.shape[1] >= nheads_q
+        ), f"softmax_lse.shape[1]={softmax_lse.shape[1]} must be >= nheads_q={nheads_q}"
+        assert (
+            softmax_lse.shape[2] >= seqlen_q
+        ), f"softmax_lse.shape[2]={softmax_lse.shape[2]} must be >= seqlen_q={seqlen_q}"
+        assert (
+            softmax_lse.dtype == torch.float32
+        ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
+        assert (
+            softmax_lse.device == q.device
+        ), f"softmax_lse must be on same device as q"
 
         # strides
         stride_qb, stride_qh, stride_qm, stride_qd = (
@@ -1807,16 +1836,18 @@ def attention_forward_prefill_triton_impl(
         )
 
     # fp8 setup and assertions
-    IS_FP8 = is_fp8(q)
+    IS_FP8 = is_fp8([q, k, v])
     if IS_FP8:
-        # we already asserted that q, k, v all have the same dtype, so no need to check each one
-
         FP8_MAX = torch.finfo(q.dtype).max
+        rec_dtype = get_recommended_fp8_dtype(q)
+        if q.dtype != rec_dtype or k.dtype != rec_dtype or v.dtype != rec_dtype:
+            arch = get_arch()
+            warnings.warn(
+                f"Use {rec_dtype} data type on {arch}. Got q: {q.dtype}, k: {k.dtype}, v: {v.dtype}",
+                UserWarning,
+            )
 
-        # Check and create default descale tensors if not provided
         if (q_descale is None) or (k_descale is None) or (v_descale is None):
-            import warnings
-
             warnings.warn(
                 "FP8 tensors detected but descale factors not provided. Using default scale of 1.0",
                 UserWarning,
@@ -1834,6 +1865,23 @@ def attention_forward_prefill_triton_impl(
                 v_descale = torch.ones(
                     batch, nheads_k, dtype=torch.float32, device=q.device
                 )
+        else:
+            # Enforce exact expected shapes; no reshaping or normalization.
+            assert (
+                q_descale.dim() == 2
+                and q_descale.shape[0] == batch
+                and q_descale.shape[1] == nheads_k
+            ), f"q_descale expected shape ({batch}, {nheads_k}) got {tuple(q_descale.shape)}"
+            assert (
+                k_descale.dim() == 2
+                and k_descale.shape[0] == batch
+                and k_descale.shape[1] == nheads_k
+            ), f"k_descale expected shape ({batch}, {nheads_k}) got {tuple(k_descale.shape)}"
+            assert (
+                v_descale.dim() == 2
+                and v_descale.shape[0] == batch
+                and v_descale.shape[1] == nheads_k
+            ), f"v_descale expected shape ({batch}, {nheads_k}) got {tuple(v_descale.shape)}"
 
         # o should be fp32 or fp16/bf16
         assert o.dtype in [
@@ -1875,29 +1923,27 @@ def attention_forward_prefill_triton_impl(
     padded_d_model_qk = max(padded_d_model_qk, 16)
     padded_d_model_v = max(padded_d_model_v, 16)
 
-    # sd_mask is used to validate dropout behavior vs the PyTorch SDPA math backend reference.  We zero this out
-    # to give a consistent starting point and then populate it with the output of softmax with the sign bit set according
-    # to the dropout mask. The resulting return allows this mask to be fed into the reference implementation for testing
-    # only. This return holds no useful output aside from debugging.
-    NEEDS_SDMASK = (dropout_p > 0.0) or return_softmax
-    if NEEDS_SDMASK:
-        sd_mask = torch.zeros(
-            (batch, nheads_q, max_seqlens_q, max_seqlens_k),
-            device=q.device,
-            dtype=torch.float32,
-        )
-        if DROPOUT_USE_PYTORCH:
-            dropout_mask = create_dropout_mask(
-                dropout_p,
-                (batch, nheads_q, max_seqlens_q, max_seqlens_k),
-                seed=philox_seed,
-            )
-        else:
-            dropout_mask = torch.zeros(
-                (batch, nheads_q, max_seqlens_q, max_seqlens_k),
-                device=q.device,
-                dtype=torch.float32,
-            )
+    # sd_mask assertions and strides
+    if sd_mask is not None:
+        assert dropout_p > 0.0 or return_scores, "sd_mask provided but not used"
+        assert (
+            sd_mask is not None
+        ), "sd_mask must be provided when return_scores=True or dropout_p > 0"
+        # Assert sd_mask tensor is large enough
+        assert (
+            sd_mask.shape[0] >= batch
+        ), f"sd_mask.shape[0]={sd_mask.shape[0]} must be >= batch={batch}"
+        assert (
+            sd_mask.shape[1] >= nheads_q
+        ), f"sd_mask.shape[1]={sd_mask.shape[1]} must be >= nheads_q={nheads_q}"
+        assert (
+            sd_mask.shape[2] >= max_seqlens_q
+        ), f"sd_mask.shape[2]={sd_mask.shape[2]} must be >= max_seqlens_q={max_seqlens_q}"
+        assert (
+            sd_mask.shape[3] >= max_seqlens_k
+        ), f"sd_mask.shape[3]={sd_mask.shape[3]} must be >= max_seqlens_k={max_seqlens_k}"
+        assert sd_mask.device == q.device, f"sd_mask must be on same device as q"
+
         stride_sz, stride_sh, stride_sm, stride_sn = (
             sd_mask.stride(0),
             sd_mask.stride(1),
@@ -1905,8 +1951,6 @@ def attention_forward_prefill_triton_impl(
             sd_mask.stride(3),
         )
     else:
-        sd_mask = None
-        dropout_mask = None
         stride_sz, stride_sh, stride_sm, stride_sn = (0, 0, 0, 0)
 
     if bias is not None:
@@ -1932,9 +1976,10 @@ def attention_forward_prefill_triton_impl(
         stride_q_descale_z,
         stride_k_descale_z,
         stride_v_descale_z,
-        sm_scale,
         softmax_lse,
         o,
+        sd_mask,
+        alibi_slopes,
         stride_qb,
         stride_qh,
         stride_qm,
@@ -1971,15 +2016,13 @@ def attention_forward_prefill_triton_impl(
         dropout_p=dropout_p,
         philox_seed=philox_seed,
         philox_offset_base=philox_offset,
-        sd_mask=sd_mask,
-        dropout_mask=dropout_mask,
-        alibi_slopes=alibi_slopes,
         HQ=nheads_q,
         HK=nheads_k,
         ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
         ACTUAL_BLOCK_DMODEL_V=head_size_v,
         MAX_SEQLENS_Q=max_seqlens_q,
         MAX_SEQLENS_K=max_seqlens_k,
+        SM_SCALE=sm_scale,
         IS_CAUSAL=causal,
         USE_SLIDING_WINDOW=use_sliding_window,
         WINDOW_SIZE_LEFT=window_size_left,
@@ -1991,12 +2034,9 @@ def attention_forward_prefill_triton_impl(
         USE_ALIBI=use_alibi,
         ENABLE_DROPOUT=dropout_p > 0.0,
         USE_EXP2=use_exp2,
-        RETURN_SCORES=return_softmax,
-        NEEDS_SDMASK=NEEDS_SDMASK,
+        RETURN_SCORES=return_scores,
         IS_FP8=IS_FP8,
         FP8_MAX=FP8_MAX,
         FP8_P_DESCALE=False,
         USE_SEQUSED=(seqused_q is not None or seqused_k is not None),
-    )  # Add flag for seqused
-
-    return softmax_lse, sd_mask if return_softmax else None
+    )

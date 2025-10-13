@@ -3,15 +3,18 @@
 from typing import Optional, Union, List, Tuple
 
 import os
+import sys
+from pathlib import Path
 import torch
 import torch.nn as nn
 
 
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 if USE_TRITON_ROCM:
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from flash_attn.flash_attn_triton_amd import flash_attn_3 as flash_attn_3_gpu
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from flash_attn.flash_attn_triton_amd import flash_attn_3 as flash_attn_3_gpu  # type: ignore
 else:
     # isort: off
     # We need to import the CUDA kernels after importing torch

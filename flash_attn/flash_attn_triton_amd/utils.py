@@ -17,23 +17,13 @@ AUTOTUNE = os.environ.get("FLASH_ATTENTION_TRITON_AMD_AUTOTUNE", "0").lower() in
     "true",
     "yes",
 )
-if AUTOTUNE:
-    os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 DEBUG = os.environ.get("FLASH_ATTENTION_TRITON_AMD_DEBUG", "0").lower() in (
     "1",
     "true",
     "yes",
 )
-PERF = os.environ.get("FLASH_ATTENTION_TRITON_AMD_PERF", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-)
-USE_SINGLE_BWD_KERNEL = os.environ.get("USE_SINGLE_BWD_KERNEL", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+if AUTOTUNE or DEBUG:
+    os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 USE_TRITON_INTERPRET = os.environ.get("TRITON_INTERPRET", "0").lower() in (
     "1",
@@ -50,12 +40,11 @@ DEBUG_TRITON_DETAIL = (
 )
 if USE_TRITON_ROCM:  # TODO remove this
     random.seed(42)
-BWD_MODE = os.environ.get("BWD_MODE", "fused_no_atomics").lower()
-DROPOUT_USE_PYTORCH = False
-DROPOUT_DUMP = False
+BWD_MODE: Literal["fused", "fused_atomic", "split"] = "fused"
 USE_EXP2 = True
 PHILOX_SEED = 0x1BF58
 PHILOX_OFFSET = 0x1D4B49
+SHAPE_EXPECTATIONS: Literal["exact", "rounded"] = "exact"
 
 
 # -------------------------------
@@ -555,299 +544,6 @@ def generate_varlen_kv_packed(
         return x, cu_seqlens, max_seqlen
 
 
-def input_helper(
-    BATCH: int,
-    HQ: int,
-    HK: int,
-    N_CTX_Q: int,
-    N_CTX_K: int,
-    D_HEAD: int,
-    CAUSAL: bool,
-    DROPOUT_P: float,
-    dtype: torch.dtype,
-    layout: Literal["bshd", "bhsd", "thd"],
-    packing: Optional[Literal["kv", "qkv"]] = None,
-    device: Literal["cpu", "cuda"] = "cuda",
-):
-    torch.manual_seed(20)
-    is_fp8_dtype = is_dtype_fp8(dtype)
-
-    if layout == "thd":
-        # set params
-        TOTAL_SEQLENS_Q = BATCH * N_CTX_Q
-        TOTAL_SEQLENS_K = BATCH * N_CTX_K
-        equal_seqlens = False
-
-        # deal with packing
-        if packing is None:
-            # gen tensors
-            if is_fp8_dtype:
-                q, cu_seqlens_q, max_seqlen_q, descale_q = generate_varlen_tensor(
-                    TOTAL_SEQLENS_Q,
-                    HQ,
-                    D_HEAD,
-                    batch_size=BATCH,
-                    dtype=dtype,
-                    device=device,
-                    equal_seqlens=equal_seqlens,
-                )
-                k, cu_seqlens_k, max_seqlen_k, descale_k = generate_varlen_tensor(
-                    TOTAL_SEQLENS_K,
-                    HK,
-                    D_HEAD,
-                    batch_size=BATCH,
-                    dtype=dtype,
-                    device=device,
-                    equal_seqlens=equal_seqlens,
-                )
-                v, _, _, descale_v = generate_varlen_tensor(
-                    TOTAL_SEQLENS_K,
-                    HK,
-                    D_HEAD,
-                    batch_size=BATCH,
-                    dtype=dtype,
-                    device=device,
-                    equal_seqlens=equal_seqlens,
-                )
-                do, _, _, descale_do = generate_varlen_tensor(
-                    TOTAL_SEQLENS_Q,
-                    HQ,
-                    D_HEAD,
-                    batch_size=BATCH,
-                    dtype=dtype,
-                    device=device,
-                    equal_seqlens=equal_seqlens,
-                )
-            else:
-                q, cu_seqlens_q, max_seqlen_q = generate_varlen_tensor(
-                    TOTAL_SEQLENS_Q,
-                    HQ,
-                    D_HEAD,
-                    batch_size=BATCH,
-                    dtype=dtype,
-                    device=device,
-                    equal_seqlens=equal_seqlens,
-                )
-                k, cu_seqlens_k, max_seqlen_k = generate_varlen_tensor(
-                    TOTAL_SEQLENS_K,
-                    HK,
-                    D_HEAD,
-                    batch_size=BATCH,
-                    dtype=dtype,
-                    device=device,
-                    equal_seqlens=equal_seqlens,
-                )
-                v, _, _ = generate_varlen_tensor(
-                    TOTAL_SEQLENS_K,
-                    HK,
-                    D_HEAD,
-                    batch_size=BATCH,
-                    dtype=dtype,
-                    device=device,
-                    equal_seqlens=equal_seqlens,
-                )
-                do, _, _ = generate_varlen_tensor(
-                    TOTAL_SEQLENS_Q,
-                    HQ,
-                    D_HEAD,
-                    batch_size=BATCH,
-                    dtype=dtype,
-                    device=device,
-                    equal_seqlens=equal_seqlens,
-                )
-        elif packing == "kv":
-            # gen tensors with kv packing
-            if is_fp8_dtype:
-                raise ValueError("FP8 not supported for KV packing yet")
-            else:
-                q, cu_seqlens_q, max_seqlen_q = generate_varlen_tensor(
-                    TOTAL_SEQLENS_Q,
-                    HQ,
-                    D_HEAD,
-                    batch_size=BATCH,
-                    dtype=dtype,
-                    device=device,
-                    equal_seqlens=equal_seqlens,
-                )
-                kv, cu_seqlens_k, max_seqlen_k = generate_varlen_kv_packed(
-                    TOTAL_SEQLENS_K,
-                    HK,
-                    D_HEAD,
-                    batch_size=BATCH,
-                    dtype=dtype,
-                    device=device,
-                    equal_seqlens=equal_seqlens,
-                )
-                do, _, _ = generate_varlen_tensor(
-                    TOTAL_SEQLENS_Q,
-                    HQ,
-                    D_HEAD,
-                    batch_size=BATCH,
-                    dtype=dtype,
-                    device=device,
-                    equal_seqlens=equal_seqlens,
-                )
-        elif packing == "qkv":
-            # qkv packing - requires same sequence length for q and k
-            assert (
-                N_CTX_Q == N_CTX_K
-            ), "For QKV packing, Q and K must have same sequence length"
-            assert HQ == HK, "For QKV packing, Q and K must have same number of heads"
-
-            if is_fp8_dtype:
-                raise ValueError("FP8 not supported for QKV packing yet")
-            else:
-                qkv, cu_seqlens_q, max_seqlen_q = generate_varlen_qkv_packed(
-                    TOTAL_SEQLENS_Q,
-                    HQ,
-                    D_HEAD,
-                    batch_size=BATCH,
-                    dtype=dtype,
-                    device=device,
-                    equal_seqlens=equal_seqlens,
-                )
-                cu_seqlens_k = cu_seqlens_q
-                max_seqlen_k = max_seqlen_q
-                do, _, _ = generate_varlen_tensor(
-                    TOTAL_SEQLENS_Q,
-                    HQ,
-                    D_HEAD,
-                    batch_size=BATCH,
-                    dtype=dtype,
-                    device=device,
-                    equal_seqlens=equal_seqlens,
-                )
-
-    elif layout == "bshd" or layout == "bhsd":
-        # deal with packing
-        if packing is None:
-            # gen tensors
-            if layout == "bshd":
-                if is_fp8_dtype:
-                    q, descale_q = generate_bshd_tensor(
-                        BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device
-                    )
-                    k, descale_k = generate_bshd_tensor(
-                        BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device
-                    )
-                    v, descale_v = generate_bshd_tensor(
-                        BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device
-                    )
-                    do, descale_do = generate_bshd_tensor(
-                        BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device
-                    )
-                else:
-                    q = generate_bshd_tensor(
-                        BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device
-                    )
-                    k = generate_bshd_tensor(
-                        BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device
-                    )
-                    v = generate_bshd_tensor(
-                        BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device
-                    )
-                    do = generate_bshd_tensor(
-                        BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device
-                    )
-            elif layout == "bhsd":
-                q, descale_q = generate_bhsd_tensor(
-                    BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device
-                )
-                k, descale_k = generate_bhsd_tensor(
-                    BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device
-                )
-                v, descale_v = generate_bhsd_tensor(
-                    BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device
-                )
-                do, descale_do = generate_bhsd_tensor(
-                    BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device
-                )
-            else:
-                q = generate_bhsd_tensor(
-                    BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device
-                )
-                k = generate_bhsd_tensor(
-                    BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device
-                )
-                v = generate_bhsd_tensor(
-                    BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device
-                )
-                do = generate_bhsd_tensor(
-                    BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device
-                )
-        elif packing == "kv":
-            # gen tensors with kv packing
-            if is_fp8_dtype:
-                raise ValueError("FP8 not supported for KV packing yet")
-            else:
-                if layout == "bshd":
-                    q = generate_bshd_tensor(
-                        BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device
-                    )
-                    kv = generate_bshd_kv_packed(
-                        BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device
-                    )
-                    do = generate_bshd_tensor(
-                        BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device
-                    )
-                elif layout == "bhsd":
-                    q = generate_bhsd_tensor(
-                        BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device
-                    )
-                    kv = generate_bhsd_kv_packed(
-                        BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device
-                    )
-                    do = generate_bhsd_tensor(
-                        BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device
-                    )
-        elif packing == "qkv":
-            # qkv packing - requires same sequence length for q and k
-            assert (
-                N_CTX_Q == N_CTX_K
-            ), "For QKV packing, Q and K must have same sequence length"
-            assert HQ == HK, "For QKV packing, Q and K must have same number of heads"
-
-            if is_fp8_dtype:
-                raise ValueError("FP8 not supported for QKV packing yet")
-            else:
-                if layout == "bshd":
-                    qkv = generate_bshd_qkv_packed(
-                        BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device
-                    )
-                    do = generate_bshd_tensor(
-                        BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device
-                    )
-                elif layout == "bhsd":
-                    qkv = generate_bhsd_qkv_packed(
-                        BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device
-                    )
-                    do = generate_bhsd_tensor(
-                        BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device
-                    )
-
-    else:
-        raise ValueError(f"Unknown layout: {layout}")
-
-    # return based on packing
-    if packing is None:
-        if is_fp8_dtype:
-            return (q, descale_q), (k, descale_k), (v, descale_v), (do, descale_do)
-        else:
-            return q, k, v, do
-    elif packing == "kv":
-        if is_fp8_dtype:
-            raise ValueError("FP8 not supported kv packing yet")
-        else:
-            return q, kv, do
-    elif packing == "qkv":
-        if is_fp8_dtype:
-            raise ValueError("FP8 not supported qkv packing yet")
-        else:
-            return qkv, do
-    else:
-        assert False, f"Unsupported packing mode: {packing}"
-
-
 # -------------------------------
 # Alibi
 # -------------------------------
@@ -889,23 +585,72 @@ def compute_alibi_block(
 # -------------------------------
 # FP8
 # -------------------------------
-def is_dtype_fp8(dtype):
-    if dtype in {
+def is_dtype_fp8(dtype) -> bool:
+    supported = {
         torch.float8_e4m3fnuz,
         torch.float8_e4m3fn,
         torch.float8_e5m2,
         torch.float8_e5m2fnuz,
-    }:
-        if arch_supports_fp8():
+    }
+    if dtype not in supported:
+        return False
+    return True
+
+
+_RECOMMENDED_FP8_REPLACEMENTS = {
+    "gfx942": {
+        torch.float8_e4m3fn: torch.float8_e4m3fnuz,
+        torch.float8_e5m2: torch.float8_e5m2fnuz,
+    },
+}
+
+
+def get_recommended_fp8_dtype(x):
+    dtype = x.dtype if isinstance(x, torch.Tensor) else x
+    if not is_dtype_fp8(dtype):
+        return dtype
+    arch = get_arch()
+    return _RECOMMENDED_FP8_REPLACEMENTS.get(arch, {}).get(dtype, dtype)
+
+
+def is_fp8(x) -> bool:
+    """Return whether tensor(s) use FP8.
+
+    Accepts either a single tensor or a list/tuple of tensors.
+
+    Rules:
+      * Single tensor: return True if FP8 (after arch validation), else False.
+      * Multiple tensors:
+          - If all tensors are FP8 -> return True.
+          - If none are FP8 -> return False.
+          - If a mix of FP8 and non-FP8 -> raise ValueError.
+
+    Empty list/tuple returns False.
+    """
+
+    def _is_fp8_single(t: torch.Tensor) -> bool:
+        if is_dtype_fp8(t.dtype):
+            arch = get_arch()
+            if arch not in ("gfx942", "gfx950"):
+                raise RuntimeError(
+                    f"{arch} is not in the list of supported architectures for FP8"
+                )
             return True
-        else:
-            raise RuntimeError("This device doesnot support fp8")
-    else:
         return False
 
-
-def is_fp8(x):
-    return is_dtype_fp8(x.dtype)
+    if isinstance(x, (list, tuple)):
+        if len(x) == 0:
+            return False
+        flags = [_is_fp8_single(t) for t in x]
+        if all(flags):
+            return True
+        if not any(flags):
+            return False
+        raise ValueError(
+            "Mixed FP8 and non-FP8 tensors provided; either all or none must be FP8."
+        )
+    else:
+        return _is_fp8_single(x)
 
 
 @triton.jit
@@ -1514,9 +1259,7 @@ def _apply_rotary_kernel(
         batch,
     )
 
-    # NOTE: We assume CUDA device indexing compatibility in upstream; adapt for ROCm by using device context.
-    # For ROCm, torch.cuda.device works if HIP_VISIBLE_DEVICES mapping is set.
-    with torch.cuda.device(x.device.index):  # Works for ROCm as alias
+    with torch.cuda.device(x.device.index):
         torch.library.wrap_triton(_rotary_kernel)[grid](
             out,
             x,
@@ -1738,6 +1481,13 @@ def get_arch():
 
 
 @functools.cache
+def get_cu_count():
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
+@functools.cache
 def is_cdna():
     return is_hip() and get_arch() in (
         "gfx908",
@@ -1759,8 +1509,3 @@ def is_rdna():
         "gfx1200",
         "gfx1201",
     )
-
-
-@functools.cache
-def arch_supports_fp8():
-    return is_hip() and get_arch() in ("gfx942")

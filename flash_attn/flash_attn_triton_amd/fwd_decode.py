@@ -1,3 +1,5 @@
+import os
+import warnings
 import torch
 import triton
 import triton.language as tl
@@ -5,11 +7,13 @@ from typing import Literal, Optional
 from .utils import (
     DEBUG,
     AUTOTUNE,
+    get_arch,
     get_padded_headsize,
     get_shape_and_strides_from_layout,
     apply_rotary,
     is_cdna,
     is_fp8,
+    get_recommended_fp8_dtype,
 )
 
 
@@ -842,6 +846,7 @@ def attention_forward_decode_triton_impl(
     k_new: Optional[torch.Tensor],
     v_new: Optional[torch.Tensor],
     out: torch.Tensor,
+    softmax_lse: torch.Tensor,
     sm_scale: float,
     causal: bool,
     window_size_left: int,
@@ -1025,13 +1030,13 @@ def attention_forward_decode_triton_impl(
             stride_kn_h,
             stride_kn_n,
             stride_kn_d,
-        ) = (None, None, None, None), (None, None, None, None)
+        ) = (None, None, None, None,), (None, None, None, None)
         (_, seqlen_vn, nheads_vn, dim_vn), (
             stride_vn_z,
             stride_vn_h,
             stride_vn_n,
             stride_vn_d,
-        ) = (None, None, None, None), (None, None, None, None)
+        ) = (None, None, None, None,), (None, None, None, None)
     (_, seqlen_o, nheads_o, dim_o), (stride_oz, stride_oh, stride_om, stride_od) = (
         get_shape_and_strides_from_layout(out, layout)
     )
@@ -1100,11 +1105,27 @@ def attention_forward_decode_triton_impl(
         dtype=torch.float32,
         device=q.device,
     )
-    lse = torch.empty(
-        (batch_size * n_group_q * heads_per_group_q, seqlen_q),
-        dtype=torch.float32,
-        device=q.device,
-    )
+
+    # Validate pre-allocated softmax_lse tensor
+    # Expected shape after view: (batch_size, n_group_q * heads_per_group_q, seqlen_q)
+    # Internal shape: (batch_size * n_group_q * heads_per_group_q, seqlen_q)
+    expected_h_total = batch_size * n_group_q * heads_per_group_q
+    assert (
+        softmax_lse.shape[0] == batch_size
+    ), f"softmax_lse.shape[0] ({softmax_lse.shape[0]}) must equal batch_size ({batch_size})"
+    assert (
+        softmax_lse.shape[1] == n_group_q * heads_per_group_q
+    ), f"softmax_lse.shape[1] ({softmax_lse.shape[1]}) must equal n_group_q * heads_per_group_q ({n_group_q * heads_per_group_q})"
+    assert (
+        softmax_lse.shape[2] >= seqlen_q
+    ), f"softmax_lse.shape[2] ({softmax_lse.shape[2]}) must be >= seqlen_q ({seqlen_q})"
+    assert (
+        softmax_lse.dtype == torch.float32
+    ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
+    assert softmax_lse.device == q.device, f"softmax_lse must be on same device as q"
+
+    # Create internal lse view for kernel use
+    lse = softmax_lse.view(expected_h_total, -1)[:, :seqlen_q].contiguous()
 
     # get intermediate tensor strides
     stride_osk_zhg, stride_osk_s, stride_osk_m, stride_osk_d = out_splitk.stride()
@@ -1118,11 +1139,20 @@ def attention_forward_decode_triton_impl(
         stride_bt_b, stride_bt_s = 0, 0
 
     # FP8 support
-    IS_FP8 = is_fp8(q)
+    IS_FP8 = is_fp8([q, k_cache, v_cache])
     if IS_FP8:
+        rec_dtype = get_recommended_fp8_dtype(q)
+        if (
+            q.dtype != rec_dtype
+            or k_cache.dtype != rec_dtype
+            or v_cache.dtype != rec_dtype
+        ):
+            arch = get_arch()
+            warnings.warn(
+                f"Use {rec_dtype} data type on {arch}. Got q: {q.dtype}, k: {k_cache.dtype}, v: {v_cache.dtype}",
+                UserWarning,
+            )
         if (q_descale is None) or (k_descale is None) or (v_descale is None):
-            import warnings
-
             warnings.warn(
                 "FP8 tensors detected but descale factors not provided. Using default scale of 1.0",
                 UserWarning,
@@ -1140,6 +1170,23 @@ def attention_forward_decode_triton_impl(
                 v_descale = torch.ones(
                     batch_size, nheads_vc, dtype=torch.float32, device=q.device
                 )
+        else:
+            # Enforce exact expected shapes; no reshaping or normalization.
+            assert (
+                q_descale.dim() == 2
+                and q_descale.shape[0] == batch_size
+                and q_descale.shape[1] == nheads_kc
+            ), f"q_descale expected shape ({batch_size}, {nheads_kc}) got {tuple(q_descale.shape)}"
+            assert (
+                k_descale.dim() == 2
+                and k_descale.shape[0] == batch_size
+                and k_descale.shape[1] == nheads_kc
+            ), f"k_descale expected shape ({batch_size}, {nheads_kc}) got {tuple(k_descale.shape)}"
+            assert (
+                v_descale.dim() == 2
+                and v_descale.shape[0] == batch_size
+                and v_descale.shape[1] == nheads_kc
+            ), f"v_descale expected shape ({batch_size}, {nheads_kc}) got {tuple(v_descale.shape)}"
         stride_q_descale_z, stride_q_descale_h = q_descale.stride()
         stride_k_descale_z, stride_k_descale_h = k_descale.stride()
         stride_v_descale_z, stride_v_descale_h = v_descale.stride()
@@ -1355,5 +1402,3 @@ def attention_forward_decode_triton_impl(
         PADDED_HEAD=is_padded_head,
         num_warps=num_warps_reduce,
     )
-
-    return lse.view(batch_size, n_group_q * heads_per_group_q, seqlen_q)
