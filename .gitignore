@@ -1,7 +1,6 @@
 *.ncu-rep
 .DS_store
 .vscode
-flash_attn_config.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -32,3 +31,6 @@ var/
 
 # Dev
 venv
+
+# compile-time generated file
+flash_attn_config.py

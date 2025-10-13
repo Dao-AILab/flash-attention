@@ -1828,11 +1828,11 @@ void boxed_mha_bwd(
     auto deterministic = to<bool>(stack[20]);
     auto sm_margin = to<int64_t>(stack[21]);
 
-    auto [dq_, dk_, dv_, softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum] = mha_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, window_size_left, window_size_right, softcap, deterministic, sm_margin);
+    auto [softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum] = mha_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, window_size_left, window_size_right, softcap, deterministic, sm_margin);
 
-    stack[0] = from(dq_);
-    stack[1] = from(dk_);
-    stack[2] = from(dv_);
+    stack[0] = from(dq);
+    stack[1] = from(dk);
+    stack[2] = from(dv);
     stack[3] = from(softmax_d);
     stack[4] = from(softmax_lse_log2);
     stack[5] = from(dq_accum);
