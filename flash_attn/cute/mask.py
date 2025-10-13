@@ -94,7 +94,7 @@ class AttentionMask:
                     col_limit_right = row_idx + causal_row_offset
                     if cutlass.const_expr(mask_seqlen):
                         col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
-                    if cutlass.const_expr(False):
+                    if cutlass.const_expr(True):
                         # traverse column index.
                         for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                             acc_S_mn[r, c] = -cutlass.Float32.inf if t0ScS_mn[0, c][1] >= col_limit_right else acc_S_mn[r, c]
