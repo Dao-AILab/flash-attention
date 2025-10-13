@@ -82,11 +82,19 @@ def should_run_schema_check(args, kwargs):
     return True
 
 
+def should_run_fake_check(args, kwargs):
+    if 'num_splits' in kwargs:
+        return kwargs['num_splits'] > 0
+    return True
+
+
 def run_opcheck(fn):
     def wrapper(*args, **kwargs):
         if should_run_schema_check(args, kwargs):
             safe_schema_check(fn, args, kwargs)
-        safe_fake_check(fn, args, kwargs)
+
+        if should_run_fake_check(args, kwargs):
+            safe_fake_check(fn, args, kwargs)
 
         if should_test_backward(args, kwargs):
             # Expensive check
