@@ -152,8 +152,7 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    # TODO (timmy) accumulate split kv in fp32
-    out_torch_dtype = q.dtype # if not is_split_kv else torch.float32
+    out_torch_dtype = q.dtype if not is_split_kv else torch.float32
     device = q.device
     split_kv_prefix = (num_splits,) if is_split_kv else ()
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)

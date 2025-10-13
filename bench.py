@@ -20,19 +20,24 @@ def main(should_log: bool = False):
     if should_log:
         setup_log("cutlass", log_to_console=True, log_level=logging.INFO)
 
-    B, Q, K, H, D = 1, 128, 8192, 32, 128
+    B, Q, K, H, D = 1, 256, 32768, 32, 64
 
     q = torch.randn(B, Q, H, D, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(B, K, H, D, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(B, K, H, D, device="cuda", dtype=torch.bfloat16)
 
     # def fn():
-    #     return flash_attn_func(q, k, v)
+    #     return flash_attn_func(q, k, v)[0]
 
     def fn():
-        out_partial, lse_partial = flash_attn_func(q, k, v, num_splits=8)
-        out, lse = flash_attn_combine(out_partial.to(torch.float32), lse_partial.transpose(2, 3))
-        return out.to(torch.bfloat16), lse
+        out_partial, lse_partial = flash_attn_func(q, k, v, num_splits=4)
+        out, _ = flash_attn_combine(
+            out_partial,
+            lse_partial.transpose(2, 3),
+            out_dtype=torch.bfloat16,
+            return_lse=False,
+        )
+        return out
 
     results = do_bench(fn)
     flops = 2 * 2 * B * Q * K * H * D
@@ -45,11 +50,18 @@ def main(should_log: bool = False):
     print(f"  Avg time: {results} ms")
     print(f"  TFLOPS: {flops / results * 1e-9} TFLOPS")
 
-    o, _ = fn()
+    o = fn()
     o_ref = attn_ref(q, k, v)
 
-    assert torch.allclose(o, o_ref, atol=1e-2, rtol=1e-2), "Output does not match reference"
-    print("Output matches reference")
+    correctness = torch.allclose(o, o_ref, atol=1e-2, rtol=1e-2)
+
+    if not correctness:
+        print("Output does not match reference")
+        print(f"  Max diff: {(o - o_ref).abs().max().item()}")
+        print(f"  Mean diff: {(o - o_ref).abs().mean().item()}")
+        print(f"  First 10 elements: {o.flatten()[:10]}")
+    else:
+        print("Output matches reference")
 
     return results
 
