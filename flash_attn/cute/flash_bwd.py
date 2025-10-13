@@ -405,7 +405,7 @@ class FlashAttentionBackwardSm80:
         mdO: cute.Tensor,
         mLSE: cute.Tensor,
         mdPsum: cute.Tensor,
-        mdQaccu: cute.Tensor,
+        mdQaccum: cute.Tensor,
         mdK: cute.Tensor,
         mdV: cute.Tensor,
         softmax_scale: cutlass.Float32,
@@ -459,7 +459,7 @@ class FlashAttentionBackwardSm80:
         gdO = cute.local_tile(mdO[batch_idx, None, head_idx, None], blkdO_shape, (None, 0))
         gLSE = cute.local_tile(mLSE[batch_idx, head_idx, None], (self.m_block_size,), (None,))
         gdPsum = cute.local_tile(mdPsum[batch_idx, head_idx, None], (self.m_block_size,), (None,))
-        gdQaccum = cute.local_tile(mdQaccu[batch_idx, head_idx, None], (self.m_block_size * self.head_dim_padded,), (None,))
+        gdQaccum = cute.local_tile(mdQaccum[batch_idx, head_idx, None], (self.m_block_size * self.head_dim_padded,), (None,))
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
