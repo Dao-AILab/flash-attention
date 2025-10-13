@@ -2,7 +2,7 @@
 from typing import Type, Union, Optional
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, const_expr
+from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.cute.nvgpu import warpgroup
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Numeric, dsl_user_op
@@ -35,6 +35,37 @@ def gemm(
         warpgroup.commit_group()
         if const_expr(wg_wait >= 0):
             warpgroup.wait_group(wg_wait)
+
+
+def gemm_zero_init(
+    tiled_mma: cute.TiledMma,
+    shape: cute.Shape,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    A_idx: Optional[Int32] = None,
+    B_idx: Optional[Int32] = None,
+    wg_wait: int = -1,
+) -> cute.Tensor:
+    acc = cute.make_fragment(tiled_mma.partition_shape_C(shape), Float32)
+    rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
+    rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]
+    gemm(tiled_mma, acc, rA, rB, zero_init=True, wg_wait=wg_wait)
+    return acc
+
+
+def gemm_w_idx(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    zero_init: Boolean,
+    A_idx: Optional[Int32] = None,
+    B_idx: Optional[Int32] = None,
+    wg_wait: int = -1,
+) -> None:
+    rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
+    rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]
+    gemm(tiled_mma, acc, rA, rB, zero_init=zero_init, wg_wait=wg_wait)
 
 
 @dsl_user_op

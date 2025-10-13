@@ -21,37 +21,6 @@ from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileSch
 from flash_attn.cute.named_barrier import NamedBarrierFwd, NamedBarrierBwd
 
 
-def mma_zero_init(
-    tiled_mma: cute.TiledMma,
-    shape: cute.Shape,
-    tCrA: cute.Tensor,
-    tCrB: cute.Tensor,
-    A_idx: Optional[Int32] = None,
-    B_idx: Optional[Int32] = None,
-    wg_wait: int = -1,
-) -> cute.Tensor:
-    acc = cute.make_fragment(tiled_mma.partition_shape_C(shape), Float32)
-    rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
-    rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]
-    sm90_utils.gemm(tiled_mma, acc, rA, rB, zero_init=True, wg_wait=wg_wait)
-    return acc
-
-
-def mma_sm90(
-    tiled_mma: cute.TiledMma,
-    acc: cute.Tensor,
-    tCrA: cute.Tensor,
-    tCrB: cute.Tensor,
-    zero_init: Boolean,
-    A_idx: Optional[Int32] = None,
-    B_idx: Optional[Int32] = None,
-    wg_wait: int = -1,
-) -> None:
-    rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
-    rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]
-    sm90_utils.gemm(tiled_mma, acc, rA, rB, zero_init=zero_init, wg_wait=wg_wait)
-
-
 class FlashAttentionBackwardSm90:
     arch = 90
 
@@ -153,7 +122,6 @@ class FlashAttentionBackwardSm90:
                 ((self.tile_m, self.tile_n), self.dS_stage),
             ]
         ]
-
         self.sdQaccum_layout = cute.make_layout(self.tile_m * self.tile_hdim)
         # dQaccum R->S
         self.r2s_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
@@ -792,14 +760,16 @@ class FlashAttentionBackwardSm90:
             Float32,
         )
 
-        mma_qk_fn = partial(mma_zero_init, tiled_mma_SdP, (self.tile_m, self.tile_n), tSrQ, tSrK)
-        mma_dov_fn = partial(
-            mma_zero_init, tiled_mma_SdP, (self.tile_m, self.tile_n), tdPrdO, tdPrV
+        mma_qk_fn = partial(
+            sm90_utils.gemm_zero_init, tiled_mma_SdP, (self.tile_m, self.tile_n), tSrQ, tSrK
         )
-        mma_pdo_fn = partial(mma_sm90, tiled_mma_dV, acc_dV, tdVrPt, tdVrdOt)
-        mma_dsq_fn = partial(mma_sm90, tiled_mma_dK, acc_dK, tdKrdSt, tdKrQt)
+        mma_dov_fn = partial(
+            sm90_utils.gemm_zero_init, tiled_mma_SdP, (self.tile_m, self.tile_n), tdPrdO, tdPrV
+        )
+        mma_pdo_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_dV, acc_dV, tdVrPt, tdVrdOt)
+        mma_dsq_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_dK, acc_dK, tdKrdSt, tdKrQt)
         mma_dsk_fn = partial(
-            mma_zero_init, tiled_mma_dQ, (self.tile_m, self.tile_hdim), tdQrdS, tdQrKt
+            sm90_utils.gemm_zero_init, tiled_mma_dQ, (self.tile_m, self.tile_hdim), tdQrdS, tdQrKt
         )
 
         mma_one_m_block_all = partial(
