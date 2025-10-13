@@ -809,6 +809,7 @@ class FlashAttentionBackwardSm90:
 
         mma_one_m_block_all = partial(
             self.mma_one_m_block,
+            warp_group_idx=warp_group_idx,
             mma_qk_fn=mma_qk_fn,
             mma_dov_fn=mma_dov_fn,
             mma_pdo_fn=mma_pdo_fn,
@@ -824,12 +825,9 @@ class FlashAttentionBackwardSm90:
             smem_thr_copy_PdS=smem_thr_copy_PdS,
             smem_thr_copy_dQaccum=smem_thr_copy_dQaccum,
             softmax_scale_log2=softmax_scale_log2,
-            acc_dV=acc_dV,
-            acc_dK=acc_dK,
+            # acc_dV=acc_dV,
+            # acc_dK=acc_dK,
         )
-
-        acc_dV.fill(0.0)
-        acc_dK.fill(0.0)
 
         kv_consumer_phase = Int32(0)
         consumer_state = pipeline.make_pipeline_state(
@@ -847,9 +845,13 @@ class FlashAttentionBackwardSm90:
             cute.arch.mbarrier_wait(mbar_ptr_KV, phase=kv_consumer_phase)
             kv_consumer_phase ^= 1
 
+            dKV_should_accumulate = False
             for m_tile in cutlass.range(m_block_max - m_block_min, unroll=1):
                 m_block = m_block_max - 1 - m_tile
-                consumer_state = mma_one_m_block_all(warp_group_idx, m_block, consumer_state)
+                consumer_state = mma_one_m_block_all(
+                    m_block, consumer_state, dKV_should_accumulate=dKV_should_accumulate
+                )
+                dKV_should_accumulate = True
 
             # scale dK
             acc_dK.store(acc_dK.load() * softmax_scale)
@@ -877,9 +879,9 @@ class FlashAttentionBackwardSm90:
     @cute.jit
     def mma_one_m_block(
         self,
-        warp_group_idx,
         m_block: Int32,
         smem_pipe_read: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
+        warp_group_idx: Int32,
         mma_qk_fn: Callable,
         mma_dov_fn: Callable,
         mma_pdo_fn: Callable,
@@ -895,8 +897,9 @@ class FlashAttentionBackwardSm90:
         smem_thr_copy_PdS: cute.TiledCopy,
         smem_thr_copy_dQaccum: cute.TiledCopy,
         softmax_scale_log2: Float32,
-        acc_dV,
-        acc_dK,
+        # acc_dV,
+        # acc_dK,
+        dKV_should_accumulate: Boolean = True,
     ):
         smem_idx = smem_pipe_read.index
         # (1) [GEMM 1] S = Q @ K^T
@@ -968,7 +971,7 @@ class FlashAttentionBackwardSm90:
         cute.copy(smem_thr_copy_PdS, tdSrdS, tdSsdS[None, None, None, PdS_smem_idx])
 
         # (4) [GEMM 3] dV += P.T @ dO
-        mma_pdo_fn(A_idx=PdS_smem_idx, B_idx=smem_idx, zero_init=False, wg_wait=-1)
+        mma_pdo_fn(A_idx=PdS_smem_idx, B_idx=smem_idx, zero_init=not dKV_should_accumulate, wg_wait=-1)
 
         # smem fence to make sure sdS is written before it's read by WGMMA
         cute.arch.fence_proxy(
@@ -983,7 +986,7 @@ class FlashAttentionBackwardSm90:
         pipeline_do.consumer_release(smem_pipe_read)  # release dO as dV mma is done
 
         # (7) [GEMM 5] dK += dS.T @ Q
-        mma_dsq_fn(A_idx=PdS_smem_idx, B_idx=smem_idx, zero_init=False, wg_wait=1)
+        mma_dsq_fn(A_idx=PdS_smem_idx, B_idx=smem_idx, zero_init=not dKV_should_accumulate, wg_wait=1)
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_dQ)
 
         cute.arch.barrier(
