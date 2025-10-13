@@ -938,7 +938,7 @@ struct CollectiveMainloopBwdSm90 {
                 Tensor tdQrdQ = partition_fragment_C(tiled_mma_dQ, select<!dQ_swapAB ? 0 : 2, !dQ_swapAB ? 2 : 0>(TileShape_MNK{}));
                 Tensor tdQrdS_cur = tdQrdS(_, _, _, cute::conditional_return<kStages_dS==1>(_0{}, smem_pipe_read.index()));
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/1, /*SwapAB=*/dQ_swapAB>(tiled_mma_dQ, tdQrdS_cur, tdQrK, tdQrdQ);
-                pipeline_do.consumer_release(smem_pipe_read_do_cur);  // release dQ
+                pipeline_do.consumer_release(smem_pipe_read_do_cur);  // release dO
 
                 if constexpr (Mma_dKV_is_RS) {
                     Tensor tdKrdS = make_tensor(rdS.data(), convert_layout_acc_Aregs<TiledMmadKV>(tdPrdP.layout()));

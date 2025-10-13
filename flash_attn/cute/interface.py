@@ -35,7 +35,9 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionF
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
+from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess_sm90
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
 
@@ -240,8 +242,8 @@ def _flash_attn_fwd(
                 is_causal=causal,
                 is_local=local,
                 pack_gqa=pack_gqa,
-                m_block_size=m_block_size,
-                n_block_size=n_block_size,
+                tile_m=m_block_size,
+                tile_n=n_block_size,
                 # num_stages=1,
                 num_stages=2,
                 num_threads=num_threads,
@@ -382,6 +384,8 @@ def _flash_attn_bwd(
         n_block_size, num_threads, num_stages_Q, num_stages_dO, SdP_swapAB, dKV_swapAB, dQ_swapAB,
         AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs
     )
+    m_block_size = 64
+    n_block_size = 128
     if compile_key not in _flash_attn_bwd.compile_cache:
         fa_bwd_sm80 = FlashAttentionBackwardSm80(
             dtype,
@@ -402,9 +406,30 @@ def _flash_attn_bwd(
             AtomLayoutMdQ,
             V_in_regs=V_in_regs,
         )
+        fa_bwd_sm90 = FlashAttentionBackwardSm90(
+            dtype,
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead,
+            m_block_size,
+            n_block_size,
+            # num_stages_Q,
+            # num_stages_dO,
+            # num_threads,
+            # causal,
+            # SdP_swapAB,
+            # dKV_swapAB,
+            # dQ_swapAB,
+            # AtomLayoutMSdP,
+            # AtomLayoutNdKV,
+            # AtomLayoutMdQ,
+            # V_in_regs=V_in_regs,
+        )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
-            fa_bwd_sm80, q_tensor, k_tensor, v_tensor, do_tensor, lse_log2_tensor, dpsum_tensor,
+            # fa_bwd_sm80,
+            fa_bwd_sm90,
+            q_tensor, k_tensor, v_tensor, do_tensor, lse_log2_tensor, dpsum_tensor,
             dq_accum_tensor,
             dk_tensor if qhead_per_kvhead == 1 else dk_accum_tensor,
             dv_tensor if qhead_per_kvhead == 1 else dv_accum_tensor,
@@ -421,7 +446,8 @@ def _flash_attn_bwd(
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
     compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
-        fa_bwd_post = FlashAttentionBackwardPostprocess(
+        # fa_bwd_post = FlashAttentionBackwardPostprocess(
+        fa_bwd_post = FlashAttentionBackwardPostprocess_sm90(
             dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB
         )
         # TODO: check @can_implement
@@ -515,7 +541,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.softcap,
         )
-        return dq, dk, dv, *((None,) * 5)
+        return dq, dk, dv, *((None,) * 10)  # Extra Nones is fine
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
