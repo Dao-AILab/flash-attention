@@ -449,8 +449,8 @@ def _flash_attn_bwd(
     m_block_size = 64
     n_block_size = 128
     num_stages_Q = 2
-    num_stages_dO = 2
-    num_stages_PdS = 2
+    num_stages_dO = 1
+    num_stages_PdS = 1
     AtomLayoutMSdP = 1
     AtomLayoutNdKV = 2
     AtomLayoutMdQ = 1
