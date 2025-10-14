@@ -450,8 +450,8 @@ def _flash_attn_bwd(
     n_block_size = 128
     num_stages_Q = 2
     num_stages_dO = 1
-    num_stages_PdS = 1
-    SdP_swapAB = False
+    num_stages_PdS = 2
+    SdP_swapAB = True
     dKV_swapAB = False
     dQ_swapAB = False
     AtomLayoutMSdP = 1

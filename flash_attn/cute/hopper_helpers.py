@@ -68,10 +68,14 @@ def gemm_w_idx(
     A_idx: Optional[Int32] = None,
     B_idx: Optional[Int32] = None,
     wg_wait: int = -1,
+    swap_AB: bool = False,
 ) -> None:
-    rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
-    rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]
-    gemm(tiled_mma, acc, rA, rB, zero_init=zero_init, wg_wait=wg_wait)
+    if const_expr(swap_AB):
+        gemm_w_idx(tiled_mma, acc, tCrB, tCrA, zero_init, B_idx, A_idx, wg_wait, swap_AB=False)
+    else:
+        rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
+        rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]
+        gemm(tiled_mma, acc, rA, rB, zero_init=zero_init, wg_wait=wg_wait)
 
 
 @dsl_user_op
