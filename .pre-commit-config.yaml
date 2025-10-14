@@ -1,0 +1,9 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.13
+    hooks:
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix]
+        files: ^flash_attn/cute/(flash_bwd_sm90|flash_bwd_preprocess|flash_bwd_postprocess|softmax)\.py$
+      - id: ruff-format
+        files: ^flash_attn/cute/(flash_bwd_sm90|flash_bwd_preprocess|flash_bwd_postprocess|softmax)\.py$

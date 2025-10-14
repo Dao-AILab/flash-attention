@@ -6,7 +6,8 @@ from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import Boolean, Int32, if_generate
+from cutlass import Boolean, Int32, const_expr
+from cutlass.cutlass_dsl import if_generate
 from cutlass.pipeline import PipelineAsync, PipelineState, CooperativeGroup, pipeline_init_wait
 from cutlass.pipeline import PipelineUserType, PipelineOp
 
@@ -134,7 +135,7 @@ class PipelineTmaAsyncNoCluster(PipelineAsync):
         )
         dst_rank = None
         producer_mask = None
-        if cutlass.const_expr(init_wait):
+        if const_expr(init_wait):
             pipeline_init_wait()
         return PipelineTmaAsyncNoCluster(
             sync_object_full,
@@ -144,7 +145,12 @@ class PipelineTmaAsyncNoCluster(PipelineAsync):
             dst_rank,
         )
 
-    def producer_acquire(self, state: PipelineState, try_acquire_token: Optional[Boolean] = None):
+    def producer_acquire(
+        self,
+        state: PipelineState,
+        try_acquire_token: Optional[Boolean] = None,
+        extra_tx_count: int = 0,
+    ):
         """
         TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
         """
@@ -152,7 +158,11 @@ class PipelineTmaAsyncNoCluster(PipelineAsync):
             try_acquire_token is None or try_acquire_token == 0,
             lambda: self.sync_object_empty.wait(state.index, state.phase),
         )
-        self.sync_object_full.arrive(state.index, self.producer_mask)
+        if const_expr(extra_tx_count == 0):
+            self.sync_object_full.arrive(state.index, self.producer_mask)
+        else:
+            tx_count = self.sync_object_full.tx_count + extra_tx_count
+            self.sync_object_full.arrive_and_expect_tx(state.index, tx_count)
 
     def producer_commit(self, state: PipelineState):
         """

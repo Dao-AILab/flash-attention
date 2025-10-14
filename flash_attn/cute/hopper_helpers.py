@@ -2,7 +2,7 @@
 from typing import Type, Union, Optional
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, const_expr
+from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.cute.nvgpu import warpgroup
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Numeric, dsl_user_op
@@ -37,6 +37,43 @@ def gemm(
             warpgroup.wait_group(wg_wait)
 
 
+def gemm_zero_init(
+    tiled_mma: cute.TiledMma,
+    shape: cute.Shape,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    A_idx: Optional[Int32] = None,
+    B_idx: Optional[Int32] = None,
+    wg_wait: int = -1,
+    swap_AB: bool = False,
+) -> cute.Tensor:
+    if const_expr(swap_AB):
+        return gemm_zero_init(
+            tiled_mma, shape[::-1], tCrB, tCrA, B_idx, A_idx, wg_wait, swap_AB=False
+        )
+    else:
+        acc = cute.make_fragment(tiled_mma.partition_shape_C(shape), Float32)
+        rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
+        rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]
+        gemm(tiled_mma, acc, rA, rB, zero_init=True, wg_wait=wg_wait)
+        return acc
+
+
+def gemm_w_idx(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    zero_init: Boolean,
+    A_idx: Optional[Int32] = None,
+    B_idx: Optional[Int32] = None,
+    wg_wait: int = -1,
+) -> None:
+    rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
+    rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]
+    gemm(tiled_mma, acc, rA, rB, zero_init=zero_init, wg_wait=wg_wait)
+
+
 @dsl_user_op
 def make_smem_layout(
     dtype: Type[Numeric],
@@ -61,22 +98,3 @@ def make_smem_layout(
     return smem_layout_staged
 
 
-@dsl_user_op
-def tma_reduce_add_bulk_f32(
-    smem_ptr: cute.Pointer,
-    gmem_ptr: cute.Pointer,
-    store_bytes: Int32,
-    *,
-    loc=None,
-    ip=None,
-):
-    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
-    llvm.inline_asm(
-        None,
-        [gmem_ptr.llvm_ptr, smem_ptr_i32, store_bytes.ir_value()],
-        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;",
-        "l,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )

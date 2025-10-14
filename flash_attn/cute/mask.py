@@ -30,6 +30,7 @@ class AttentionMask:
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
     ) -> None:
+        # TODO: implement swap_AB
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
         cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
@@ -41,7 +42,7 @@ class AttentionMask:
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
         if cutlass.const_expr(not mask_causal and not mask_local):
             if cutlass.const_expr(mask_seqlen):
-                if cutlass.const_expr(False):
+                if cutlass.const_expr(True):
                     # traverse column index.
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                         oob = t0ScS_mn[0, c][1] >= seqlenk_col_limit
@@ -94,7 +95,7 @@ class AttentionMask:
                     col_limit_right = row_idx + causal_row_offset
                     if cutlass.const_expr(mask_seqlen):
                         col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
-                    if cutlass.const_expr(False):
+                    if cutlass.const_expr(True):
                         # traverse column index.
                         for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                             acc_S_mn[r, c] = -cutlass.Float32.inf if t0ScS_mn[0, c][1] >= col_limit_right else acc_S_mn[r, c]
