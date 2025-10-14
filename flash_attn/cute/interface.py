@@ -312,8 +312,19 @@ def _flash_attn_bwd(
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m_block_size = 80 if not causal else 64
+    n_block_size = 128
+    num_stages_Q = 2
+    num_stages_dO = 2
+    num_stages_PdS = 2
+    SdP_swapAB = True
+    dKV_swapAB = False
+    dQ_swapAB = not causal
+    AtomLayoutMSdP = 1
+    AtomLayoutNdKV = 2
+    AtomLayoutMdQ = 1
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
-        maybe_contiguous(t) 
+        maybe_contiguous(t)
         for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
     ]
     num_head, head_dim = q.shape[-2:]
@@ -344,7 +355,7 @@ def _flash_attn_bwd(
         assert v.shape == (total_k, num_head_kv, head_dim_v)
         assert cu_seqlens_k.shape == (batch_size + 1,), "cu_seqlens_k must have shape (batch_size + 1,)"
 
-    if cu_seqlens_q is not None: 
+    if cu_seqlens_q is not None:
         assert cu_seqlens_q.shape == (batch_size + 1,), "cu_seqlens_q must have shape (batch_size + 1,)"
 
         assert out.shape == (total_q, num_head, head_dim_v)
@@ -436,7 +447,7 @@ def _flash_attn_bwd(
             dq_accum_tensor, cu_seqlens_q_tensor, seqused_q_tensor, current_stream
         )
     _flash_attn_bwd.compile_cache_pre[compile_key_pre](
-        o_tensor, do_tensor, dpsum_tensor, lse_tensor, lse_log2_tensor, dq_accum_tensor, 
+        o_tensor, do_tensor, dpsum_tensor, lse_tensor, lse_log2_tensor, dq_accum_tensor,
         cu_seqlens_q_tensor, seqused_q_tensor, current_stream
     )
 
@@ -446,17 +457,6 @@ def _flash_attn_bwd(
         n_block_size, num_threads, pack_gqa, num_stages_Q, num_stages_dO, SdP_swapAB, dKV_swapAB, dQ_swapAB,
         AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs
     )
-    m_block_size = 64
-    n_block_size = 128
-    num_stages_Q = 2
-    num_stages_dO = 1
-    num_stages_PdS = 2
-    SdP_swapAB = True
-    dKV_swapAB = False
-    dQ_swapAB = False
-    AtomLayoutMSdP = 1
-    AtomLayoutNdKV = 2
-    AtomLayoutMdQ = 1
     num_threads = 384
     if compile_key not in _flash_attn_bwd.compile_cache:
         fa_bwd_sm80 = FlashAttentionBackwardSm80(

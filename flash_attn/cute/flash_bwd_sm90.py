@@ -97,6 +97,14 @@ class FlashAttentionBackwardSm90:
             and not dKV_swapAB
         )
         self.V_in_regs = V_in_regs
+        # These are tuned for speed
+        # Do we keep the LSE and dPsum in each thread, or split them across 8 threads that share
+        # them and then shuffle to get the value whenever we need? This can reduce register
+        # pressure when SdP_swapAB, where each thread needs to keep statistics for (kBlockM / 4)
+        # rows. If !SdP_swapAB, each thread only needs to keep statistics for 2 rows.
+        # TODO: impl these for hdim 64
+        self.shuffle_LSE = self.SdP_swapAB and self.tile_hdim <= 64
+        self.shuffle_dPsum = self.SdP_swapAB and self.tile_hdim <= 64
 
     @staticmethod
     def can_implement(
