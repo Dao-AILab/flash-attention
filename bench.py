@@ -8,10 +8,12 @@ import argparse
 
 
 def attn_ref(q, k, v):
-    s = torch.einsum("bqhd,bkhd->bhqk", q, k)
+    # expand GQA dim for q
+    q_expanded = q.reshape(q.shape[0], q.shape[1], k.shape[2], q.shape[2] // k.shape[2], q.shape[3])
+    s = torch.einsum("bqghd,bkgd->bghqk", q_expanded, k)
     s *= q.shape[-1] ** -0.5
     s = torch.softmax(s, dim=-1)
-    return torch.einsum("bhqk,bkhd->bqhd", s, v)
+    return torch.einsum("bghqk,bkgd->bqghd", s, v).reshape(q.shape)
 
 
 def attn_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k):
@@ -21,22 +23,21 @@ def attn_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k):
         q_b = q[cu_seqlens_q[b]:cu_seqlens_q[b+1]]
         k_b = k[cu_seqlens_k[b]:cu_seqlens_k[b+1]]
         v_b = v[cu_seqlens_k[b]:cu_seqlens_k[b+1]]
-        s = torch.einsum("qhd,khd->hqk", q_b, k_b)
-        s *= q_b.shape[-1] ** -0.5
-        s = torch.softmax(s, dim=-1)
-        out[cu_seqlens_q[b]:cu_seqlens_q[b+1]] = torch.einsum("hqk,khd->qhd", s, v_b)
+        out[cu_seqlens_q[b]:cu_seqlens_q[b+1]] = attn_ref(q_b[None, :], k_b[None, :], v_b[None, :])
     return out
 
 
 def benchmark_standard(num_splits: int = 4):
     B, Q, K, H, D = 1, 256, 16384, 32, 128
+    kvheads_per_group = 8
+    pack_gqa = kvheads_per_group > 1
 
     q = torch.randn(B, Q, H, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, K, H, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(B, K, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, K, H // kvheads_per_group, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, K, H // kvheads_per_group, D, device="cuda", dtype=torch.bfloat16)
 
     def fn():
-        return flash_attn_func(q, k, v, num_splits=num_splits)[0]
+        return flash_attn_func(q, k, v, num_splits=num_splits, pack_gqa=pack_gqa)[0]
 
     results = do_bench(fn)
     flops = 2 * 2 * B * Q * K * H * D
@@ -46,6 +47,8 @@ def benchmark_standard(num_splits: int = 4):
     print(f"  K: {K}")
     print(f"  H: {H}")
     print(f"  D: {D}")
+    print(f"  kvheads_per_group: {kvheads_per_group}")
+    print(f"  pack_gqa: {pack_gqa}")
     print(f"  num_splits: {num_splits}")
     print(f"  Avg time: {results} ms")
     print(f"  TFLOPS: {flops / results * 1e-9} TFLOPS")
@@ -66,6 +69,8 @@ def benchmark_standard(num_splits: int = 4):
 
 def benchmark_varlen(num_splits: int = 4):
     B, Q, K, H, D = 2, 256, 16384, 32, 128
+    kvheads_per_group = 8
+    pack_gqa = kvheads_per_group > 1
 
     cu_seqlens_q = torch.arange(0, B + 1, device="cuda", dtype=torch.int32) * Q
     cu_seqlens_k = torch.arange(0, B + 1, device="cuda", dtype=torch.int32) * K
@@ -74,11 +79,11 @@ def benchmark_varlen(num_splits: int = 4):
     num_keys = cu_seqlens_k[-1].item()
 
     q = torch.randn(num_queries, H, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(num_keys, H, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(num_keys, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(num_keys, H // kvheads_per_group, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(num_keys, H // kvheads_per_group, D, device="cuda", dtype=torch.bfloat16)
 
     def fn():
-        return flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, num_splits=num_splits)[0]
+        return flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, num_splits=num_splits, pack_gqa=pack_gqa)[0]
 
     results = do_bench(fn)
 
@@ -93,6 +98,8 @@ def benchmark_varlen(num_splits: int = 4):
     print(f"  cu_seqlens_k: {cu_seqlens_k.tolist()}")
     print(f"  H: {H}")
     print(f"  D: {D}")
+    print(f"  kvheads_per_group: {kvheads_per_group}")
+    print(f"  pack_gqa: {pack_gqa}")
     print(f"  num_splits: {num_splits}")
     print(f"  Avg time: {results} ms")
     print(f"  TFLOPS: {flops / results * 1e-9} TFLOPS")

@@ -333,16 +333,19 @@ class FlashAttentionForwardSm100:
             sV_layout = cute.make_composed_layout(sV_layout.inner, 0, cute.make_layout((*sV_layout.outer.shape[:-1], self.kv_stage), stride=(*sV_layout.outer.stride[:-1], stage_stride)))
 
         if const_expr(self.pack_gqa):
-            # TODO(timmy): ordering will be wrong if split kv is enabled
             shape_Q_packed = ((self.qhead_per_kvhead, mQ.shape[0]), mQ.shape[1], mK.shape[2], *mQ.shape[3:])
             stride_Q_packed = ((mQ.stride[2], mQ.stride[0]), mQ.stride[1], mQ.stride[2] * self.qhead_per_kvhead, *mQ.stride[3:])
             mQ = cute.make_tensor(mQ.iterator, cute.make_layout(shape_Q_packed, stride=stride_Q_packed))
-            shape_O_packed = ((self.qhead_per_kvhead, mO.shape[0]), mK.shape[1], mK.shape[2], *mO.shape[3:])
-            stride_O_packed = ((mO.stride[2], mO.stride[0]), mO.stride[1], mO.stride[2] * self.qhead_per_kvhead, *mO.stride[3:])
+
+            o_head_axis = 3 if const_expr(self.is_split_kv) else 2
+            shape_O_packed = ((self.qhead_per_kvhead, mO.shape[0]), *mO.shape[1:o_head_axis], mK.shape[2], *mO.shape[o_head_axis + 1:])
+            stride_O_packed = ((mO.stride[o_head_axis], mO.stride[0]), *mO.stride[1:o_head_axis], mO.stride[o_head_axis] * self.qhead_per_kvhead, *mO.stride[o_head_axis + 1:])
             mO = cute.make_tensor(mO.iterator, cute.make_layout(shape_O_packed, stride=stride_O_packed))
+
             if const_expr(mLSE is not None):
-                shape_LSE_packed = ((self.qhead_per_kvhead, mLSE.shape[0]), mK.shape[2], *mLSE.shape[2:])
-                stride_LSE_packed = ((mLSE.stride[1], mLSE.stride[0]), mLSE.stride[1] * self.qhead_per_kvhead, *mLSE.stride[2:])
+                lse_head_axis = 2 if const_expr(self.is_split_kv) else 1
+                shape_LSE_packed = ((self.qhead_per_kvhead, mLSE.shape[0]), *mLSE.shape[1:lse_head_axis], mK.shape[2], *mLSE.shape[lse_head_axis + 1:])
+                stride_LSE_packed = ((mLSE.stride[lse_head_axis], mLSE.stride[0]), *mLSE.stride[1:lse_head_axis], mLSE.stride[lse_head_axis] * self.qhead_per_kvhead, *mLSE.stride[lse_head_axis + 1:])
                 mLSE = cute.make_tensor(mLSE.iterator, cute.make_layout(shape_LSE_packed, stride=stride_LSE_packed))
 
         # TMA load for Q
