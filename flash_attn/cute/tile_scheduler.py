@@ -236,12 +236,14 @@ class SingleTileLPTScheduler:
     @dataclass
     class Params(ParamsBase):
         total_blocks: Int32
+        num_splits: Int32
         num_block_divmod: FastDivmod
         num_head_divmod: FastDivmod
         l2_minor_divmod: FastDivmod
         l2_major_divmod: FastDivmod
         l2_minor_residual_divmod: FastDivmod
         num_hb_quotient: Int32
+        is_split_kv: cutlass.Constexpr[bool] = False
 
         @staticmethod
         @cute.jit
@@ -274,11 +276,14 @@ class SingleTileLPTScheduler:
                     max(num_hb_remainder, 1)
                 ),  # don't divide by 0
                 num_hb_quotient=Int32(num_hb_quotient),
+                num_splits=args.num_splits if const_expr(args.is_split_kv) else 1,
+                is_split_kv=args.is_split_kv,
             )
 
-    def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
+    def __init__(self, params: Params, tile_idx: Int32, split_idx: Int32, *, loc=None, ip=None):
         self.params = params
         self._tile_idx = tile_idx
+        self._split_idx = split_idx
         self._loc = loc
         self._ip = ip
 
@@ -289,8 +294,8 @@ class SingleTileLPTScheduler:
     @staticmethod
     @cute.jit
     def create(params: Params, *, loc=None, ip=None) -> "SingleTileLPTScheduler":
-        tile_idx = cute.arch.block_idx()[0]
-        return SingleTileLPTScheduler(params, tile_idx, loc=loc, ip=ip)
+        tile_idx, split_idx, _ = cute.arch.block_idx()
+        return SingleTileLPTScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
 
     # called by host
     @staticmethod
@@ -300,7 +305,7 @@ class SingleTileLPTScheduler:
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
-        return (params.total_blocks, Int32(1), Int32(1))
+        return (params.total_blocks, params.num_splits, Int32(1))
 
     @cute.jit
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
@@ -320,7 +325,7 @@ class SingleTileLPTScheduler:
         block = params.num_block_divmod.divisor - 1 - block
         is_valid = self._tile_idx < params.total_blocks
         return WorkTileInfo(
-            (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid
+            (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(self._split_idx)), is_valid
         )
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
@@ -335,7 +340,7 @@ class SingleTileLPTScheduler:
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
-        for obj in [self.params, self._tile_idx]:
+        for obj in [self.params, self._tile_idx, self._split_idx]:
             obj_values = cutlass.extract_mlir_values(obj)
             values += obj_values
             self._values_pos.append(len(obj_values))
@@ -343,7 +348,7 @@ class SingleTileLPTScheduler:
 
     def __new_from_mlir_values__(self, values):
         obj_list = []
-        for obj, n_items in zip([self.params, self._tile_idx], self._values_pos):
+        for obj, n_items in zip([self.params, self._tile_idx, self._split_idx], self._values_pos):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return SingleTileLPTScheduler(*(tuple(obj_list)), loc=self._loc)
