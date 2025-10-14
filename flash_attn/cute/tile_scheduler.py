@@ -76,7 +76,7 @@ class SingleTileScheduler:
         num_batch: Int32
         num_splits: Int32
         num_splits_divmod: FastDivmod
-        is_split_kv: cutlass.Constexpr[bool]
+        is_split_kv: cutlass.Constexpr[bool] = False
 
         @staticmethod
         def create(
@@ -355,12 +355,14 @@ class SingleTileVarlenScheduler:
         num_head: Int32
         num_batch: Int32
         total_q: Int32
+        num_splits: Int32
         max_kvblock_in_l2: Int32
         tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
         mCuSeqlensQ: Optional[cute.Tensor] = None
         mSeqUsedQ: Optional[cute.Tensor] = None
         qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
         lpt: cutlass.Constexpr[bool] = False
+        is_split_kv: cutlass.Constexpr[bool] = False
 
         @staticmethod
         @cute.jit
@@ -376,17 +378,20 @@ class SingleTileVarlenScheduler:
                 num_head=args.num_head,
                 num_batch=args.num_batch,
                 total_q=args.total_q,
+                num_splits=args.num_splits if const_expr(args.is_split_kv) else 1,
                 max_kvblock_in_l2=max_kvblock_in_l2,
                 tile_shape_mn=args.tile_shape_mn,
                 mCuSeqlensQ=args.mCuSeqlensQ,
                 mSeqUsedQ=args.mSeqUsedQ,
                 qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
                 lpt=args.lpt,
+                is_split_kv=args.is_split_kv,
             )
 
-    def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
+    def __init__(self, params: Params, tile_idx: Int32, split_idx: Int32, *, loc=None, ip=None):
         self.params = params
         self._tile_idx = tile_idx
+        self._split_idx = split_idx
         self._is_first_block = True
         self._loc = loc
         self._ip = ip
@@ -397,8 +402,8 @@ class SingleTileVarlenScheduler:
 
     @staticmethod
     def create(params: Params, *, loc=None, ip=None) -> "SingleTileVarlenScheduler":
-        tile_idx = cute.arch.block_idx()[0]
-        return SingleTileVarlenScheduler(params, tile_idx, loc=loc, ip=ip)
+        tile_idx, split_idx, _ = cute.arch.block_idx()
+        return SingleTileVarlenScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
 
     # called by host
     @staticmethod
@@ -411,7 +416,7 @@ class SingleTileVarlenScheduler:
         total_blocks_max = (
             params.total_q + params.num_batch * (params.tile_shape_mn[0] - 1)
         ) // params.tile_shape_mn[0]
-        return (total_blocks_max * params.num_head, Int32(1), Int32(1))
+        return (total_blocks_max * params.num_head, params.num_splits, Int32(1))
 
     @cute.jit
     def _get_num_m_blocks(self, lane: Int32, bidb_start: Int32) -> Int32:
@@ -506,8 +511,9 @@ class SingleTileVarlenScheduler:
                 block = mh_block - head_idx * num_m_blocks
             is_valid = self._is_first_block and batch_idx < params.num_batch
         # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d", self._tile_idx, batch_idx, head_idx, block, is_valid)
+        split_idx = self._split_idx if const_expr(params.is_split_kv) else Int32(0)
         return WorkTileInfo(
-            (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid
+            (Int32(block), Int32(head_idx), Int32(batch_idx), split_idx), is_valid
         )
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
@@ -522,7 +528,7 @@ class SingleTileVarlenScheduler:
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
-        for obj in [self.params, self._tile_idx]:
+        for obj in [self.params, self._tile_idx, self._split_idx]:
             obj_values = cutlass.extract_mlir_values(obj)
             values += obj_values
             self._values_pos.append(len(obj_values))
@@ -530,7 +536,7 @@ class SingleTileVarlenScheduler:
 
     def __new_from_mlir_values__(self, values):
         obj_list = []
-        for obj, n_items in zip([self.params, self._tile_idx], self._values_pos,
+        for obj, n_items in zip([self.params, self._tile_idx, self._split_idx], self._values_pos,
         ):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]

@@ -656,6 +656,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
+        num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
     ):
         out, lse = _flash_attn_fwd(
@@ -673,6 +674,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             learnable_sink=learnable_sink,
             softcap=softcap,
+            num_splits=num_splits,
             pack_gqa=pack_gqa,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -746,6 +748,7 @@ def flash_attn_varlen_func(
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
+    num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
 ):
     return FlashAttnVarlenFunc.apply(
@@ -762,6 +765,7 @@ def flash_attn_varlen_func(
         window_size,
         learnable_sink,
         softcap,
+        num_splits,
         pack_gqa,
     )
 
@@ -839,9 +843,9 @@ def _flash_attn_fwd_combine(
         log_max_splits = max(log_max_splits, 5)
 
     # Convert to cute tensors (using kernel-formatted tensors)
-    out_partial_tensor = from_dlpack(out_partial.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=4)
+    out_partial_tensor = from_dlpack(out_partial.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=4 if not is_varlen else 3)
     lse_partial_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse_partial.ndim - 2)
-    out_tensor = from_dlpack(out.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=3)
+    out_tensor = from_dlpack(out.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=3 if not is_varlen else 2)
     lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 2) if lse is not None else None
 
     optional_tensors = [
@@ -912,6 +916,8 @@ def flash_attn_combine(
     lse_partial: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
     return_lse: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Flash Attention combine function for split attention computation.
@@ -929,6 +935,8 @@ def flash_attn_combine(
             - (num_splits, total_q, num_heads) for variable length input
         out: Optional output tensor. If None, will be created automatically.
         out_dtype: Optional output dtype. If None, will use fp16/bf16 based on input.
+        cu_seqlens: Cumulative sequence lengths for variable length sequences
+        seqused: Used sequence lengths for each batch
         return_lse: Whether to return the combined LSE tensor. Default is True.
 
     Returns:
@@ -984,5 +992,12 @@ def flash_attn_combine(
     else:
         lse = None
 
-    _flash_attn_fwd_combine(out_partial, lse_partial, out, lse)
+    _flash_attn_fwd_combine(
+        out_partial,
+        lse_partial,
+        out,
+        lse,
+        cu_seqlens,
+        seqused,
+    )
     return out, lse
