@@ -106,9 +106,11 @@ class FlashAttentionForwardSm100:
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         self.s0_s1_barrier = False
-        self.overlap_sO_sQ = self.head_dim_padded == 192 and self.head_dim_v_padded >= 64
+        self.overlap_sO_sQ = (
+            (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
+            (self.head_dim_padded >= 128 and self.is_split_kv)
+        )
         if self.overlap_sO_sQ:
-            assert self.head_dim_padded >= self.head_dim_v_padded  # We assume sQ is larger than sO
             self.is_persistent = False
 
         self.softmax0_warp_ids = (0, 1, 2, 3)
@@ -456,6 +458,10 @@ class FlashAttentionForwardSm100:
         self.mbar_total = self.mbar_P_full_2_offset + 2
 
         sO_size = cute.cosize(sO_layout) if const_expr(not self.overlap_sO_sQ) else 0
+        sQ_size = (
+            cute.cosize(sQ_layout) if const_expr(not self.overlap_sO_sQ) else
+            cutlass.max(cute.cosize(sQ_layout), cute.cosize(sO_layout))
+        )
 
         @cute.struct
         class SharedStorage:
@@ -471,7 +477,7 @@ class FlashAttentionForwardSm100:
                 self.buffer_align_bytes,
             ]
             sQ: cute.struct.Align[
-                cute.struct.MemRange[self.q_dtype, cute.cosize(sQ_layout)],
+                cute.struct.MemRange[self.q_dtype, sQ_size],
                 self.buffer_align_bytes,
             ]
             sK: cute.struct.Align[
@@ -667,7 +673,7 @@ class FlashAttentionForwardSm100:
         if const_expr(not self.overlap_sO_sQ):
             sO = storage.sO.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
         else:
-            sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, sO_layout.inner), sO_layout.outer)
+            sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, sO_layout.inner, self.o_dtype), sO_layout.outer)
 
         sScale = storage.sScale.get_tensor(cute.make_layout(self.q_stage * self.m_block_size * 2))
 

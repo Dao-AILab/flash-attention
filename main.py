@@ -17,4 +17,4 @@ image = (
 )
 def run():
     import subprocess
-    subprocess.run(["python", "bench.py", "--benchmark_type", "varlen"])
+    subprocess.run(["python", "bench.py"])

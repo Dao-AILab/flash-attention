@@ -28,15 +28,26 @@ def attn_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k):
     return out
 
 
-def benchmark_standard():
-    B, Q, K, H, D = 1, 256, 16384, 32, 64
+def benchmark_standard(num_splits: int = 4):
+    B, Q, K, H, D = 1, 256, 16384, 32, 128
 
     q = torch.randn(B, Q, H, D, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(B, K, H, D, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(B, K, H, D, device="cuda", dtype=torch.bfloat16)
 
-    # def fn():
-    #     return flash_attn_func(q, k, v)[0]
+    if num_splits == 1:
+        def fn():
+            return flash_attn_func(q, k, v)[0]
+    else:
+        def fn():
+            out_partial, lse_partial = flash_attn_func(q, k, v, num_splits=num_splits)
+            out, _ = flash_attn_combine(
+                out_partial,
+                lse_partial.transpose(2, 3),
+                out_dtype=torch.bfloat16,
+                return_lse=False,
+            )
+            return out
 
     def fn():
         out_partial, lse_partial = flash_attn_func(q, k, v, num_splits=4)
@@ -56,6 +67,7 @@ def benchmark_standard():
     print(f"  K: {K}")
     print(f"  H: {H}")
     print(f"  D: {D}")
+    print(f"  num_splits: {num_splits}")
     print(f"  Avg time: {results} ms")
     print(f"  TFLOPS: {flops / results * 1e-9} TFLOPS")
 
@@ -73,8 +85,8 @@ def benchmark_standard():
         print("Output matches reference")
 
 
-def benchmark_varlen():
-    B, Q, K, H, D = 2, 256, 16384, 32, 64
+def benchmark_varlen(num_splits: int = 4):
+    B, Q, K, H, D = 2, 256, 16384, 32, 128
 
     cu_seqlens_q = torch.arange(0, B + 1, device="cuda", dtype=torch.int32) * Q
     cu_seqlens_k = torch.arange(0, B + 1, device="cuda", dtype=torch.int32) * K
@@ -86,19 +98,20 @@ def benchmark_varlen():
     k = torch.randn(num_keys, H, D, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(num_keys, H, D, device="cuda", dtype=torch.bfloat16)
 
-    # def fn():
-    #     return flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k)[0]
-
-    def fn():
-        out_partial, lse_partial = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, num_splits=2)
-        out, _ = flash_attn_combine(
-            out_partial,
-            lse_partial.transpose(1, 2),
-            cu_seqlens=cu_seqlens_q,
-            out_dtype=torch.bfloat16,
-            return_lse=False,
-        )
-        return out
+    if num_splits == 1:
+        def fn():
+            return flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k)[0]
+    else:
+        def fn():
+            out_partial, lse_partial = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, num_splits=num_splits)
+            out, _ = flash_attn_combine(
+                out_partial,
+                lse_partial.transpose(1, 2),
+                cu_seqlens=cu_seqlens_q,
+                out_dtype=torch.bfloat16,
+                return_lse=False,
+            )
+            return out
 
     results = do_bench(fn)
 
@@ -113,6 +126,7 @@ def benchmark_varlen():
     print(f"  cu_seqlens_k: {cu_seqlens_k.tolist()}")
     print(f"  H: {H}")
     print(f"  D: {D}")
+    print(f"  num_splits: {num_splits}")
     print(f"  Avg time: {results} ms")
     print(f"  TFLOPS: {flops / results * 1e-9} TFLOPS")
 
@@ -132,7 +146,8 @@ def benchmark_varlen():
 def main():
     args = argparse.ArgumentParser()
     args.add_argument("--should_log", action="store_true")
-    args.add_argument("--benchmark_type", type=str, choices=["standard", "varlen"])
+    args.add_argument("--num_splits", type=int, default=4)
+    args.add_argument("--benchmark_type", type=str, choices=["standard", "varlen"], default="standard")
     args = args.parse_args()
 
     faulthandler.enable()
@@ -140,9 +155,9 @@ def main():
         setup_log("cutlass", log_to_console=True, log_level=logging.INFO)
 
     if args.benchmark_type == "standard":
-        benchmark_standard()
+        benchmark_standard(args.num_splits)
     elif args.benchmark_type == "varlen":
-        benchmark_varlen()
+        benchmark_varlen(args.num_splits)
 
 if __name__ == "__main__":
     main()
