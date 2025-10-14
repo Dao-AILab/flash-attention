@@ -248,7 +248,7 @@ def create_tensors(
     return q, k, v
 
 
-def run_cute_flash(q, k, v, cute_score_mod, buffers=None) -> torch.Tensor:
+def run_cute_flash(q, k, v, cute_score_mod, buffers=None, pack_gqa=False) -> torch.Tensor:
     q_transposed, k_transposed, v_transposed = map(
         lambda x: x.transpose(1, 2), (q, k, v)
     )
@@ -262,6 +262,7 @@ def run_cute_flash(q, k, v, cute_score_mod, buffers=None) -> torch.Tensor:
         out=out,
         lse=None,
         buffers=buffers,
+        pack_gqa=pack_gqa,
     )
     return out.transpose(1, 2)
 
@@ -297,21 +298,26 @@ def run_flex_reference(q, k, v, eager_score_mod, dtype=None) -> torch.Tensor:
         (4224, 4224),
     ],
 )
-@pytest.mark.parametrize("num_heads", [1, 4])
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 2), (4, 2)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
-def test_cute_vs_flex_attention(seqlen_q, seqlen_kv, num_heads, dtype, score_mod_pair):
+def test_cute_vs_flex_attention(seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads, dtype, score_mod_pair):
     torch.random.manual_seed(42)
     cute_score_mod, eager_score_mod = score_mod_pair
 
+    num_q_heads = num_kv_heads * qhead_per_kvhead
+    pack_gqa = qhead_per_kvhead > 1
     q, k, v = create_tensors(
-        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=num_heads, dtype=dtype
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=num_q_heads, dtype=dtype
     )
+    if pack_gqa:
+        k = k[:, :num_kv_heads, :, :].clone()
+        v = v[:, :num_kv_heads, :, :].clone()
 
     out_ref_fp32 = run_flex_reference(q, k, v, eager_score_mod, dtype=torch.float32)
 
     out_pt = run_flex_reference(q, k, v, eager_score_mod)
-    out_cute = run_cute_flash(q, k, v, cute_score_mod)
+    out_cute = run_cute_flash(q, k, v, cute_score_mod, pack_gqa=pack_gqa)
 
     # Basic shape and NaN checks
     assert out_cute.shape == out_ref_fp32.shape == out_pt.shape
@@ -367,23 +373,28 @@ def test_cute_vs_flex_attention(seqlen_q, seqlen_kv, num_heads, dtype, score_mod
         (4224, 4224),
     ],
 )
-@pytest.mark.parametrize("num_heads", [1, 4])
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_WITH_BUFFERS)
 def test_cute_vs_flex_attention_with_buffers(
-    seqlen_q, seqlen_kv, num_heads, dtype, score_mod_pair
+    seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads, dtype, score_mod_pair
 ):
     torch.random.manual_seed(42)
     cute_score_mod, eager_score_mod_factory = score_mod_pair
 
     batch_size = 2
+    num_q_heads = num_kv_heads * qhead_per_kvhead
+    pack_gqa = qhead_per_kvhead > 1
     q, k, v = create_tensors(
         batch_size=batch_size,
         seqlen_q=seqlen_q,
         seqlen_kv=seqlen_kv,
-        num_heads=num_heads,
+        num_heads=num_q_heads,
         dtype=dtype,
     )
+    if pack_gqa:
+        k = k[:, :num_kv_heads, :, :].clone()
+        v = v[:, :num_kv_heads, :, :].clone()
 
     if cute_score_mod == score_mod_10:
         buffer = torch.randn(batch_size, device="cuda", dtype=dtype) * 0.1
@@ -391,17 +402,17 @@ def test_cute_vs_flex_attention_with_buffers(
         eager_score_mod = eager_score_mod_factory(buffer)
         assert buffer.shape == (batch_size,)
     elif cute_score_mod == score_mod_11:
-        head_bias = torch.randn(num_heads, device="cuda", dtype=dtype) * 0.2
+        head_bias = torch.randn(num_q_heads, device="cuda", dtype=dtype) * 0.2
         pos_scale = torch.arange(seqlen_q, device="cuda", dtype=dtype) * 0.01
         buffers = [head_bias, pos_scale]
         eager_score_mod = eager_score_mod_factory(head_bias, pos_scale)
-        assert head_bias.shape == (num_heads,)
+        assert head_bias.shape == (num_q_heads,)
         assert pos_scale.shape == (seqlen_q,)
 
     out_ref_fp32 = run_flex_reference(q, k, v, eager_score_mod, dtype=torch.float32)
 
     out_pt = run_flex_reference(q, k, v, eager_score_mod)
-    out_cute = run_cute_flash(q, k, v, cute_score_mod, buffers=buffers)
+    out_cute = run_cute_flash(q, k, v, cute_score_mod, buffers=buffers, pack_gqa=pack_gqa)
 
     # Basic shape and NaN checks
     assert out_cute.shape == out_ref_fp32.shape == out_pt.shape
@@ -429,57 +440,6 @@ def test_cute_vs_flex_attention_with_buffers(
     # Assert that CuTE's error is at most rtol times PyTorch's error + fwd_atol
     assert cute_error <= rtol * pt_error + fwd_atol, (
         f"CuTE error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
-    )
-
-
-@pytest.mark.xfail(raises=NotImplementedError, reason="PackGQA with score_mod not yet supported")
-def test_packgqa_with_score_mod():
-    """Test that PackGQA works correctly with score_mod index wrapping.
-
-    Without proper index wrapping, q_idx will be in packed space
-    (0 to qhead_per_kvhead * seqlen_q - 1) instead of logical space (0 to seqlen_q - 1).
-    This causes causal masking to be incorrect.
-    """
-    torch.random.manual_seed(42)
-
-    batch_size = 2
-    seqlen_q = 128
-    seqlen_kv = 128
-    qhead_per_kvhead = 4
-    num_heads_kv = 2
-    num_heads = num_heads_kv * qhead_per_kvhead
-    dtype = torch.bfloat16
-
-    q = torch.randn(batch_size, num_heads, seqlen_q, 128, device="cuda", dtype=dtype)
-    k = torch.randn(batch_size, num_heads_kv, seqlen_kv, 128, device="cuda", dtype=dtype)
-    v = torch.randn(batch_size, num_heads_kv, seqlen_kv, 128, device="cuda", dtype=dtype)
-
-    q_transposed, k_transposed, v_transposed = map(
-        lambda x: x.transpose(1, 2), (q, k, v)
-    )
-    out_cute = torch.empty_like(q_transposed)
-
-    _flash_attn_fwd(
-        q_transposed,
-        k_transposed,
-        v_transposed,
-        return_lse=True,
-        score_mod=score_mod_2,
-        out=out_cute,
-        lse=None,
-        pack_gqa=True,
-    )
-    out_cute = out_cute.transpose(1, 2)
-
-    out_ref_fp32 = run_flex_reference(q, k, v, causal_mask_eager, dtype=torch.float32)
-
-    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
-    cute_error = (out_cute - out_ref_fp32).abs().max().item()
-
-    assert not torch.isnan(out_cute).any(), "Output contains NaN values"
-    assert torch.isfinite(out_cute).all(), "Output contains infinite values"
-    assert cute_error <= fwd_atol * 10, (
-        f"CuTE error {cute_error:.2e} exceeds tolerance {fwd_atol * 10:.2e}"
     )
 
 
