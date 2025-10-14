@@ -14,6 +14,7 @@ from cutlass.utils import LayoutEnum
 from flash_attn.cute import hopper_helpers as sm90_utils
 from flash_attn.cute import utils
 from flash_attn.cute import copy_utils
+from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute import pipeline
@@ -57,6 +58,7 @@ class FlashAttentionBackwardSm90:
         self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_causal = is_causal
+        self.is_local = False
         self.tile_m = tile_m
         self.tile_n = tile_n
         self.num_threads = num_threads
@@ -509,8 +511,8 @@ class FlashAttentionBackwardSm90:
         block_info = BlockInfo(
             self.tile_m,
             self.tile_n,
-            False,
-            False,
+            self.is_causal,
+            self.is_local,
             None,
             None,
             qhead_per_kvhead_packgqa=1,
@@ -524,7 +526,13 @@ class FlashAttentionBackwardSm90:
             mSeqUsedQ=None,
             mSeqUsedK=None,
         )
-
+        AttentionMaskCls = partial(
+            AttentionMask,
+            self.tile_m,
+            self.tile_n,
+            window_size_left=None,
+            window_size_right=None,
+        )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
         if warp_idx < 4:
@@ -590,6 +598,7 @@ class FlashAttentionBackwardSm90:
                 softmax_scale,
                 block_info,
                 SeqlenInfoCls,
+                AttentionMaskCls,
                 TileSchedulerCls,
             )
 
@@ -695,6 +704,8 @@ class FlashAttentionBackwardSm90:
                     # cp.async.bulk is using ptx, so we need to elect one thread to do it
                     with cute.arch.elect_one():
                         load_LSE(m_block, producer_state=producer_state_Q)
+                    if const_expr(self.Q_stage == self.dO_stage):
+                        producer_state_dO = producer_state_Q
                     pipeline_dO.producer_acquire(producer_state_dO)
                     load_dO(m_block, producer_state=producer_state_dO)
                     with cute.arch.elect_one():
@@ -736,6 +747,7 @@ class FlashAttentionBackwardSm90:
         softmax_scale: Float32,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
+        AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -857,6 +869,15 @@ class FlashAttentionBackwardSm90:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
+            mask_fn = partial(
+                mask.apply_mask,
+                n_block=n_block,
+                thr_mma=thr_mma_SdP,
+                mask_seqlen=True,
+                mask_causal=self.is_causal,
+                mask_local=self.is_local,
+            )
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
             # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("tidx = {}, m_block_min = {}, m_block_max = {}", cute.arch.thread_idx()[0], m_block_min, m_block_max)
             dKV_should_accumulate = False
@@ -865,6 +886,7 @@ class FlashAttentionBackwardSm90:
                     m_block,
                     consumer_state_Q,
                     consumer_state_dO,
+                    mask_fn=mask_fn,
                     dKV_should_accumulate=dKV_should_accumulate,
                 )
                 dKV_should_accumulate = True
@@ -914,6 +936,7 @@ class FlashAttentionBackwardSm90:
         smem_thr_copy_PdS: cute.TiledCopy,
         smem_thr_copy_dQaccum: cute.TiledCopy,
         softmax_scale_log2: Float32,
+        mask_fn: Optional[Callable] = None,
         # acc_dV,
         # acc_dK,
         dKV_should_accumulate: Boolean = True,
@@ -933,6 +956,8 @@ class FlashAttentionBackwardSm90:
         )
         acc_dP = mma_dov_fn(A_idx=smem_idx_Q, wg_wait=1)
         # (3) [Pointwise 1] P = exp(S - LSE)
+        if cutlass.const_expr(mask_fn is not None):
+            mask_fn(acc_S, m_block=m_block)
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_S_mn)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
@@ -945,8 +970,8 @@ class FlashAttentionBackwardSm90:
         # Convert P from f32 -> f16
         tdVrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
         tdVrP = cute.make_fragment_like(tdVrP_acc, self.dtype)
-        # utils.cvt_f16(tdVrP_acc, tdVrP)
-        tdVrP.store(tdVrP_acc.load().to(self.dtype))
+        utils.cvt_f16(tdVrP_acc, tdVrP)
+        # tdVrP.store(tdVrP_acc.load().to(self.dtype))
         # S2R for dPsum
         tLSErdPsum = cute.make_fragment_like(tLSEsdPsum[None, 0])
         cute.autovec_copy(tLSEsdPsum[None, smem_idx_dO], tLSErdPsum)
@@ -973,8 +998,8 @@ class FlashAttentionBackwardSm90:
         # Convert dS from f32 -> f16
         tdKrdS_acc = cute.make_tensor(acc_dP.iterator, utils.convert_layout_acc_frgA(acc_dP.layout))
         tdKrdS = cute.make_fragment_like(tdKrdS_acc, self.dtype)
-        # utils.cvt_f16(tdKrdS_acc, tdKrdS)
-        tdKrdS.store(tdKrdS_acc.load().to(self.dtype))
+        utils.cvt_f16(tdKrdS_acc, tdKrdS)
+        # tdKrdS.store(tdKrdS_acc.load().to(self.dtype))
 
         # If there's double buffering on dS, we don't need to sync here.
         # Otherwise we might have WG1 writing to dS before WG2 is done reading from it during MmadQ.
@@ -1039,6 +1064,8 @@ class FlashAttentionBackwardSm90:
         smem_pipe_read_Q.advance()
         if const_expr(self.Q_stage != self.dO_stage):
             smem_pipe_read_dO.advance()
+        else:
+            smem_pipe_read_dO = smem_pipe_read_Q
         return smem_pipe_read_Q, smem_pipe_read_dO
 
     @cute.jit

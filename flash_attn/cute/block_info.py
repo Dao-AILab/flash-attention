@@ -50,7 +50,7 @@ class BlockInfo:
         m_block_max = cute.ceil_div(seqlen_info.seqlen_q, self.tile_m)
         m_block_min = 0
         if const_expr(self.is_causal):
-            m_block_min = max(m_block_min, cute.ceil_div(seqlen_info.seqlen_q - seqlen_info.seqlen_k + (n_block + 1) * self.tile_n, self.tile_m))
+            m_block_min = max(m_block_min, (n_block * self.tile_n + seqlen_info.seqlen_q - seqlen_info.seqlen_k) // self.tile_m)
         return m_block_min, m_block_max
 
     @cute.jit

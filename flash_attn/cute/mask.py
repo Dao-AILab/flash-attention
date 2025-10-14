@@ -41,7 +41,7 @@ class AttentionMask:
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
         if cutlass.const_expr(not mask_causal and not mask_local):
             if cutlass.const_expr(mask_seqlen):
-                if cutlass.const_expr(False):
+                if cutlass.const_expr(True):
                     # traverse column index.
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                         oob = t0ScS_mn[0, c][1] >= seqlenk_col_limit
