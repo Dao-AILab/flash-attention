@@ -95,6 +95,7 @@ class FlashAttentionBackwardSm90:
             and AtomLayoutNdKV == self.num_mma_warp_groups
             and SdP_swapAB
             and not dKV_swapAB
+            and False  # TODO
         )
         self.V_in_regs = V_in_regs
 
@@ -119,7 +120,6 @@ class FlashAttentionBackwardSm90:
             return False
         if num_threads % 32 != 0:
             return False
-
         if (tile_m * 2) % num_threads != 0:
             return False
         return True
@@ -796,14 +796,16 @@ class FlashAttentionBackwardSm90:
         tdQrdS, tdQrKt = mma_partition_fragment_AB(wg_mma_dQ, sdS, sKt, self.dQ_swapAB)
 
         # Smem copy atom tiling
-        smem_copy_atom_PdS = utils.get_smem_store_atom(self.arch, self.dtype)
+        smem_copy_atom_PdS = utils.get_smem_store_atom(
+            self.arch, self.dtype, transpose=self.SdP_swapAB
+        )
         smem_thr_copy_PdS = cute.make_tiled_copy_C(smem_copy_atom_PdS, tiled_mma_SdP).get_slice(
             tidx
         )
         tPsP = None
         if const_expr(sP is not None):
-            tPsP = smem_thr_copy_PdS.partition_D(sP)
-        tdSsdS = smem_thr_copy_PdS.partition_D(sdS)
+            tPsP = smem_thr_copy_PdS.partition_D(sP if const_expr(not self.SdP_swapAB) else sPt)
+        tdSsdS = smem_thr_copy_PdS.partition_D(sdS if const_expr(not self.SdP_swapAB) else sdSt)
 
         sLSE_mma = cute.make_tensor(
             sLSE.iterator,
@@ -819,19 +821,24 @@ class FlashAttentionBackwardSm90:
                 stride=(1, 0, cute.round_up(self.tile_m, 64)),
             ),
         )
-        LSEslice = (None, 0, None)
+        if const_expr(self.SdP_swapAB):
+            sLSE_mma = utils.transpose_view(sLSE_mma)
+            sdPsum_mma = utils.transpose_view(sdPsum_mma)
+        LSEslice = (None, 0, None) if const_expr(not self.SdP_swapAB) else (0, None, None)
         tLSEsLSE = utils.make_acc_tensor_mn_view(thr_mma_SdP.partition_C(sLSE_mma))[LSEslice]
         tLSEsdPsum = utils.make_acc_tensor_mn_view(thr_mma_SdP.partition_C(sdPsum_mma))[LSEslice]
 
         smem_thr_copy_dQaccum = r2s_tiled_copy_dQaccum.get_slice(tidx)
         tdQsdQaccum = smem_thr_copy_dQaccum.partition_D(sdQaccum)
 
+        dV_shape = (self.tile_n, self.tile_hdimv)
         acc_dV = cute.make_fragment(
-            tiled_mma_dV.partition_shape_C((self.tile_n, self.tile_hdimv)),
+            tiled_mma_dV.partition_shape_C(dV_shape if not self.dKV_swapAB else dV_shape[::-1]),
             Float32,
         )
+        dK_shape = (self.tile_n, self.tile_hdim)
         acc_dK = cute.make_fragment(
-            tiled_mma_dK.partition_shape_C((self.tile_n, self.tile_hdim)),
+            tiled_mma_dK.partition_shape_C(dK_shape if not self.dKV_swapAB else dK_shape[::-1]),
             Float32,
         )
 
@@ -984,9 +991,10 @@ class FlashAttentionBackwardSm90:
         )
         acc_dP = mma_dov_fn(A_idx=smem_idx_Q, wg_wait=1)
         # (3) [Pointwise 1] P = exp(S - LSE)
-        if cutlass.const_expr(mask_fn is not None):
+        # if cutlass.const_expr(mask_fn is not None):
+        if cutlass.const_expr(mask_fn is not None and not self.SdP_swapAB):  # TODO: impl mask
             mask_fn(acc_S, m_block=m_block)
-        acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
+        acc_S_mn = utils.make_acc_tensor_mn_view(acc_S, transpose=self.SdP_swapAB)
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_S_mn)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
             acc_S_mn[r, None].store(
@@ -1016,7 +1024,7 @@ class FlashAttentionBackwardSm90:
 
         # (4) [Pointwise 2] dS = P*(dP-dPsum)
         warpgroup.wait_group(0)
-        acc_dP_mn = utils.make_acc_tensor_mn_view(acc_dP)
+        acc_dP_mn = utils.make_acc_tensor_mn_view(acc_dP, transpose=self.SdP_swapAB)
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_dP_mn)
         for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
             acc_dP_mn[r, None].store(
