@@ -14,12 +14,28 @@ from cutlass.utils import LayoutEnum
 from flash_attn.cute import hopper_helpers as sm90_utils
 from flash_attn.cute import utils
 from flash_attn.cute import copy_utils
+from flash_attn.cute.hopper_helpers import gemm_zero_init, gemm_w_idx
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute import pipeline
 from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileScheduler, ParamsBase
 from flash_attn.cute.named_barrier import NamedBarrierFwd, NamedBarrierBwd
+
+
+def mma_partition_fragment_AB(
+    thr_mma: cute.core.ThrMma, sA: Optional[cute.Tensor], sB: Optional[cute.Tensor], swap_AB: bool
+):
+    if const_expr(not swap_AB):
+        return (
+            thr_mma.make_fragment_A(thr_mma.partition_A(sA)) if sA is not None else None,
+            thr_mma.make_fragment_B(thr_mma.partition_B(sB)) if sB is not None else None,
+        )
+    else:
+        return (
+            thr_mma.make_fragment_B(thr_mma.partition_B(sA)) if sA is not None else None,
+            thr_mma.make_fragment_A(thr_mma.partition_A(sB)) if sB is not None else None,
+        )
 
 
 class FlashAttentionBackwardSm90:
@@ -67,6 +83,9 @@ class FlashAttentionBackwardSm90:
         self.PdS_stage = PdS_stage
         assert self.dO_stage in [1, self.Q_stage]
         assert self.PdS_stage in [1, self.Q_stage]
+        self.SdP_swapAB = SdP_swapAB
+        self.dKV_swapAB = dKV_swapAB
+        self.dQ_swapAB = dQ_swapAB
         self.AtomLayoutMSdP = AtomLayoutMSdP
         self.AtomLayoutNdKV = AtomLayoutNdKV
         self.AtomLayoutMdQ = AtomLayoutMdQ
@@ -163,8 +182,9 @@ class FlashAttentionBackwardSm90:
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.K,
             Float32,
-            atom_layout_mnk=atom_layout_SdP + (1,),
-            tiler_mn=tiler_mn_SdP,
+            atom_layout_mnk=(atom_layout_SdP if not self.SdP_swapAB else atom_layout_SdP[::-1])
+            + (1,),
+            tiler_mn=tiler_mn_SdP if not self.SdP_swapAB else tiler_mn_SdP[::-1],
         )
         # dV = P.T @ dO, dK = dS.T @ Q
         atom_layout_dKV = (self.AtomLayoutNdKV, self.num_mma_warp_groups // self.AtomLayoutNdKV)
@@ -177,8 +197,9 @@ class FlashAttentionBackwardSm90:
                 warpgroup.OperandMajorMode.MN,
                 warpgroup.OperandMajorMode.MN,
                 Float32,
-                atom_layout_mnk=atom_layout_dKV + (1,),
-                tiler_mn=tiler_mn_d,
+                atom_layout_mnk=(atom_layout_dKV if not self.dKV_swapAB else atom_layout_dKV[::-1])
+                + (1,),
+                tiler_mn=tiler_mn_d if not self.dKV_swapAB else tiler_mn_d[::-1],
                 a_source=warpgroup.OperandSource.RMEM
                 if self.Mma_dKV_is_RS
                 else warpgroup.OperandSource.SMEM,
@@ -191,11 +212,11 @@ class FlashAttentionBackwardSm90:
         tiled_mma_dQ = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.MN,
+            warpgroup.OperandMajorMode.K if not self.dQ_swapAB else warpgroup.OperandMajorMode.MN,
+            warpgroup.OperandMajorMode.MN if not self.dQ_swapAB else warpgroup.OperandMajorMode.K,
             Float32,
-            atom_layout_mnk=atom_layout_dQ + (1,),
-            tiler_mn=tiler_mn_dQ,
+            atom_layout_mnk=(atom_layout_dQ if not self.dQ_swapAB else atom_layout_dQ[::-1]) + (1,),
+            tiler_mn=tiler_mn_dQ if not self.dQ_swapAB else tiler_mn_dQ[::-1],
         )
         return tiled_mma_SdP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ
 
@@ -493,7 +514,6 @@ class FlashAttentionBackwardSm90:
         if const_expr(not self.Mma_dKV_is_RS):
             sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
         sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
-
         sLSE = storage.sLSE.get_tensor(
             cute.make_layout(
                 (self.tile_m, self.Q_stage),
@@ -760,27 +780,20 @@ class FlashAttentionBackwardSm90:
         wg_mma_dV = tiled_mma_dV.get_slice(warp_group_thread_layout(warp_group_idx))
         wg_mma_dQ = tiled_mma_dQ.get_slice(warp_group_thread_layout(warp_group_idx))
         # S = Q @ K.T
-        tSrQ = tiled_mma_SdP.make_fragment_A(wg_mma_SdP.partition_A(sQ))
-        tSrK = tiled_mma_SdP.make_fragment_B(wg_mma_SdP.partition_B(sK))
+        tSrQ, tSrK = mma_partition_fragment_AB(wg_mma_SdP, sQ, sK, self.SdP_swapAB)
         # dP = dO @ V.T
-        tdPrdO = tiled_mma_SdP.make_fragment_A(wg_mma_SdP.partition_A(sdO))
-        tdPrV = tiled_mma_SdP.make_fragment_B(wg_mma_SdP.partition_B(sV))
+        tdPrdO, tdPrV = mma_partition_fragment_AB(wg_mma_SdP, sdO, sV, self.SdP_swapAB)
         # dV += P.T @ dO
         sPt = utils.transpose_view(sP) if sP is not None else None
         sdOt = utils.transpose_view(sdO)
-        tdVrPt = None
-        if const_expr(sP is not None):
-            tdVrPt = tiled_mma_dV.make_fragment_A(wg_mma_dV.partition_A(sPt))
-        tdVrdOt = tiled_mma_dV.make_fragment_B(wg_mma_dV.partition_B(sdOt))
+        tdVrPt, tdVrdOt = mma_partition_fragment_AB(wg_mma_dV, sPt, sdOt, self.dKV_swapAB)
         # dK += dS.T @ Q
         sdSt = utils.transpose_view(sdS)
         sQt = utils.transpose_view(sQ)
-        tdKrdSt = tiled_mma_dK.make_fragment_A(wg_mma_dK.partition_A(sdSt))
-        tdKrQt = tiled_mma_dK.make_fragment_B(wg_mma_dK.partition_B(sQt))
+        tdKrdSt, tdKrQt = mma_partition_fragment_AB(wg_mma_dK, sdSt, sQt, self.dKV_swapAB)
         # dQ = dS @ K
         sKt = utils.transpose_view(sK)
-        tdQrdS = tiled_mma_dQ.make_fragment_A(wg_mma_dQ.partition_A(sdS))
-        tdQrKt = tiled_mma_dQ.make_fragment_B(wg_mma_dQ.partition_B(sKt))
+        tdQrdS, tdQrKt = mma_partition_fragment_AB(wg_mma_dQ, sdS, sKt, self.dQ_swapAB)
 
         # Smem copy atom tiling
         smem_copy_atom_PdS = utils.get_smem_store_atom(self.arch, self.dtype)
@@ -823,15 +836,30 @@ class FlashAttentionBackwardSm90:
         )
 
         mma_qk_fn = partial(
-            sm90_utils.gemm_zero_init, tiled_mma_SdP, (self.tile_m, self.tile_n), tSrQ, tSrK
+            gemm_zero_init,
+            tiled_mma_SdP,
+            (self.tile_m, self.tile_n),
+            tSrQ,
+            tSrK,
+            swap_AB=self.SdP_swapAB,
         )
         mma_dov_fn = partial(
-            sm90_utils.gemm_zero_init, tiled_mma_SdP, (self.tile_m, self.tile_n), tdPrdO, tdPrV
+            gemm_zero_init,
+            tiled_mma_SdP,
+            (self.tile_m, self.tile_n),
+            tdPrdO,
+            tdPrV,
+            swap_AB=self.SdP_swapAB,
         )
-        mma_pdo_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_dV, acc_dV, tdVrPt, tdVrdOt)
-        mma_dsq_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_dK, acc_dK, tdKrdSt, tdKrQt)
+        mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, acc_dV, tdVrPt, tdVrdOt)
+        mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, acc_dK, tdKrdSt, tdKrQt)
         mma_dsk_fn = partial(
-            sm90_utils.gemm_zero_init, tiled_mma_dQ, (self.tile_m, self.tile_hdim), tdQrdS, tdQrKt
+            gemm_zero_init,
+            tiled_mma_dQ,
+            (self.tile_m, self.tile_hdim),
+            tdQrdS,
+            tdQrKt,
+            swap_AB=self.dQ_swapAB,
         )
 
         mma_one_m_block_all = partial(
@@ -1046,8 +1074,8 @@ class FlashAttentionBackwardSm90:
             barrier_id=int(NamedBarrierBwd.dQEmpty),
             number_of_threads=self.num_mma_threads + cute.arch.WARP_SIZE,
         )
-        tdQrdQaccum_tmp = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQaccum.shape))
-        cute.copy(smem_thr_copy_dQaccum, tdQrdQaccum_tmp, tdQsdQaccum)
+        tdQrdQaccum_flat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQaccum.shape))
+        cute.copy(smem_thr_copy_dQaccum, tdQrdQaccum_flat, tdQsdQaccum)
         cute.arch.fence_proxy(
             cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
         )
