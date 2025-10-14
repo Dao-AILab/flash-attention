@@ -152,36 +152,44 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    out_torch_dtype = q.dtype if not is_split_kv else torch.float32
+    out_torch_dtype = q.dtype
     device = q.device
-    split_kv_prefix = (num_splits,) if is_split_kv else ()
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
-    lse_shape = split_kv_prefix + ((batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q))
+    lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
 
     if out is None:
-        out = torch.empty(*split_kv_prefix, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
+        out = torch.empty(*q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
     else:
-        expected_out_shape = (*split_kv_prefix, *q_batch_seqlen_shape, num_head, head_dim_v)
+        expected_out_shape = (*q_batch_seqlen_shape, num_head, head_dim_v)
         assert out.shape == expected_out_shape, f"out tensor shape {out.shape} does not match expected shape {expected_out_shape}"
         assert out.dtype == out_torch_dtype, f"out tensor dtype {out.dtype} does not match expected dtype {out_torch_dtype}"
         assert out.device == device, f"out tensor device {out.device} does not match input device {device}"
         assert out.is_cuda, "out tensor must be on CUDA device"
 
     if lse is None:
-        lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad or return_lse or is_split_kv else None
+        lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad or return_lse else None
     elif lse is not None:
         assert lse.shape == lse_shape, f"lse tensor shape {lse.shape} does not match expected shape {lse_shape}"
         assert lse.dtype == torch.float32, f"lse tensor dtype {lse.dtype} does not match expected dtype torch.float32"
         assert lse.device == device, f"lse tensor device {lse.device} does not match input device {device}"
         assert lse.is_cuda, "lse tensor must be on CUDA device"
 
+    if is_split_kv:
+        out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
+        lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
+
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
-        for t in (q, k, v, out)
+        for t in (q, k, v, out if not is_split_kv else out_partial)
     ]
-    lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1) if lse is not None else None
+    if is_split_kv:
+        lse_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse_partial.ndim - 1)
+    elif lse is not None:
+        lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
+    else:
+        lse_tensor = None
     cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor, learnable_sink_tensor = [
         from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None
         for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
@@ -285,6 +293,15 @@ def _flash_attn_fwd(
         page_table_tensor,
         window_size_left, window_size_right, learnable_sink_tensor, cute_buffers
     )
+    if is_split_kv:
+        _flash_attn_fwd_combine(
+            out_partial,
+            lse_partial.transpose(-1, -2),
+            out,
+            lse,
+            cu_seqlens_q,
+            seqused_q,
+        )
     return out, lse
 
 

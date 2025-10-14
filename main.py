@@ -15,6 +15,6 @@ image = (
     gpu="B200",
     image=image,
 )
-def run():
+def run(num_splits: int = 4, benchmark_type: str = "standard"):
     import subprocess
-    subprocess.run(["python", "bench.py"])
+    subprocess.run(["python", "bench.py", "--num_splits", str(num_splits), "--benchmark_type", benchmark_type])

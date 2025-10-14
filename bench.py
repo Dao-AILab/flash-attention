@@ -35,29 +35,8 @@ def benchmark_standard(num_splits: int = 4):
     k = torch.randn(B, K, H, D, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(B, K, H, D, device="cuda", dtype=torch.bfloat16)
 
-    if num_splits == 1:
-        def fn():
-            return flash_attn_func(q, k, v)[0]
-    else:
-        def fn():
-            out_partial, lse_partial = flash_attn_func(q, k, v, num_splits=num_splits)
-            out, _ = flash_attn_combine(
-                out_partial,
-                lse_partial.transpose(2, 3),
-                out_dtype=torch.bfloat16,
-                return_lse=False,
-            )
-            return out
-
     def fn():
-        out_partial, lse_partial = flash_attn_func(q, k, v, num_splits=4)
-        out, _ = flash_attn_combine(
-            out_partial,
-            lse_partial.transpose(2, 3),
-            out_dtype=torch.bfloat16,
-            return_lse=False,
-        )
-        return out
+        return flash_attn_func(q, k, v, num_splits=num_splits)[0]
 
     results = do_bench(fn)
     flops = 2 * 2 * B * Q * K * H * D
@@ -98,20 +77,8 @@ def benchmark_varlen(num_splits: int = 4):
     k = torch.randn(num_keys, H, D, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(num_keys, H, D, device="cuda", dtype=torch.bfloat16)
 
-    if num_splits == 1:
-        def fn():
-            return flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k)[0]
-    else:
-        def fn():
-            out_partial, lse_partial = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, num_splits=num_splits)
-            out, _ = flash_attn_combine(
-                out_partial,
-                lse_partial.transpose(1, 2),
-                cu_seqlens=cu_seqlens_q,
-                out_dtype=torch.bfloat16,
-                return_lse=False,
-            )
-            return out
+    def fn():
+        return flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, num_splits=num_splits)[0]
 
     results = do_bench(fn)
 
