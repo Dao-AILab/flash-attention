@@ -1552,7 +1552,7 @@ class FlashAttentionForwardSm100:
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
             # Default LSE to -inf for invalid split_idx tiles
-            stats = [(0.0, -Float32.inf, True)] * self.q_stage
+            stats = [(0.0, -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None, True)] * self.q_stage
 
             if n_block_min < n_block_max:
                 # Ignore first signal from softmax as no correction is required
@@ -1612,7 +1612,14 @@ class FlashAttentionForwardSm100:
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + stage)
                     if const_expr(learnable_sink is not None):
                         LOG2_E = math.log2(math.e)
-                        row_sum += utils.exp2f(learnable_sink_val[stage] * LOG2_E - row_max * softmax_scale_log2)
+                        sink_val = learnable_sink_val[stage]
+                        if const_expr(not self.is_split_kv) or split_idx == 0:
+                            if row_max == -Float32.inf:
+                                # It's possible to have an empty row with splitKV.
+                                row_max = sink_val * (LOG2_E / softmax_scale_log2)
+                                row_sum = Float32(1.0)
+                            else:
+                                row_sum += utils.exp2f(sink_val * LOG2_E - row_max * softmax_scale_log2)
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
