@@ -8,7 +8,6 @@ repos:
         exclude: &cute_exclude |
           (?x)^flash_attn/cute/(
             __init__|
-            ampere_helpers|
             blackwell_helpers|
             block_info|
             copy_utils|
