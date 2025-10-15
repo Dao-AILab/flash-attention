@@ -4,6 +4,32 @@ repos:
     hooks:
       - id: ruff-check
         args: [--fix, --exit-non-zero-on-fix]
-        files: ^flash_attn/cute/(flash_bwd_sm90|flash_bwd_preprocess|flash_bwd_postprocess|softmax)\.py$
+        files: ^flash_attn/cute/.*\.py$
+        exclude: &cute_exclude |
+          (?x)^flash_attn/cute/(
+            __init__|
+            ampere_helpers|
+            blackwell_helpers|
+            block_info|
+            copy_utils|
+            cute_dsl_utils|
+            fast_math|
+            flash_bwd|
+            flash_fwd|
+            flash_fwd_combine|
+            flash_fwd_sm100|
+            hopper_helpers|
+            interface|
+            mask|
+            mma_sm100_desc|
+            named_barrier|
+            pack_gqa|
+            pipeline|
+            seqlen_info|
+            testing|
+            tile_scheduler|
+            utils
+          )\.py$
       - id: ruff-format
-        files: ^flash_attn/cute/(flash_bwd_sm90|flash_bwd_preprocess|flash_bwd_postprocess|softmax)\.py$
+        files: ^flash_attn/cute/.*\.py$
+        exclude: *cute_exclude
