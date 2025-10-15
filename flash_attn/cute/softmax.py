@@ -317,6 +317,17 @@ class SoftmaxSm100(Softmax):
 
 
 @cute.jit
+def floor_if_packed(
+    q_idx,
+    qhead_per_kvhead: cutlass.Constexpr[int],
+) -> cute.Tensor:
+    """Convert q_idx to packed format for Pack-GQA."""
+    if cutlass.const_expr(qhead_per_kvhead == 1):
+        return q_idx
+    return q_idx // qhead_per_kvhead
+
+
+@cute.jit
 def apply_score_mod_inner(
     score_tensor,
     index_tensor,
@@ -329,6 +340,7 @@ def apply_score_mod_inner(
     buffers,
     fastdiv_mods,
     constant_q_idx: cutlass.Constexpr,
+    qhead_per_kvhead: cutlass.Constexpr[int] = 1,
 ):
     """Shared implementation for applying score modification.
 
@@ -345,26 +357,42 @@ def apply_score_mod_inner(
         fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
         constant_q_idx: If provided, use this constant for all q_idx values
                        If None, compute q_idx per-element
+        qhead_per_kvhead_packgqa: Pack-GQA replication factor. Divide q_idx by this
+                                  when greater than 1 so score mods see logical heads.
     """
     n_vals = cutlass.const_expr(cute.size(score_tensor.shape))
     score_vec = cute.make_fragment(vec_size, qk_acc_dtype)
     kv_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
 
-    # SSA values for batch and head (constant across all elements)
+    # SSA values for batch (constant across all elements)
     batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32).broadcast_to((vec_size,))
-    head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32).broadcast_to((vec_size,))
 
     # Handle q_idx based on whether it's constant
     q_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+
+    # For Pack-GQA with non-constant q_idx, we need per-element head indices
+    # since a thread my process multiple query head indices
+    if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
+        head_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+
     for i in cutlass.range(0, n_vals, vec_size, unroll_full=True):
         for j in cutlass.range(vec_size, unroll_full=True):
             score_vec[j] = score_tensor[i + j] * softmax_scale
+
+            # Extract head offset from packed q_idx for Pack-GQA
+            if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
+                q_idx_packed = index_tensor[i + j][0]
+                # Building up the logical q_head idx: final_q_head = kv_head * qhead_per_kvhead + (q_physical % qhead_per_kvhead)
+                q_idx_logical = q_idx_packed // qhead_per_kvhead
+                head_offset = q_idx_packed - q_idx_logical * qhead_per_kvhead
+                head_idx_vec[j] = head_idx * qhead_per_kvhead + head_offset
 
             # If we will do loads we mod, in order to not read OOB
             if cutlass.const_expr(buffers is not None and fastdiv_mods is not None):
                 if cutlass.const_expr(constant_q_idx is None):
                     seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
-                    _, q_idx_wrapped = seqlen_q_divmod.divmod(index_tensor[i + j][0])
+                    q_idx_floored = floor_if_packed(index_tensor[i + j][0], qhead_per_kvhead)
+                    _, q_idx_wrapped = seqlen_q_divmod.divmod(q_idx_floored)
                     q_idx_vec[j] = q_idx_wrapped
                 else:
                     _, seqlen_k_divmod = fastdiv_mods
@@ -374,7 +402,7 @@ def apply_score_mod_inner(
             else:
                 # No bounds checking - direct indexing
                 if constant_q_idx is None:
-                    q_idx_vec[j] = index_tensor[i + j][0]
+                    q_idx_vec[j] = floor_if_packed(index_tensor[i + j][0], qhead_per_kvhead)
                 kv_idx_vec[j] = index_tensor[i + j][1]
 
         # Convert to SSA for score_mod call
@@ -383,7 +411,15 @@ def apply_score_mod_inner(
         if cutlass.const_expr(constant_q_idx is None):
             q_idx_ssa = q_idx_vec.load()
         else:
-            q_idx_ssa = utils.scalar_to_ssa(constant_q_idx, cutlass.Int32).broadcast_to((vec_size,))
+            # NB we do not apply Pack-GQA division here, as constant_q_idx is assumed to already be logical
+            q_idx_const = constant_q_idx
+            q_idx_ssa = utils.scalar_to_ssa(q_idx_const, cutlass.Int32).broadcast_to((vec_size,))
+
+        # Compute head_idx_ssa: per-element for Pack-GQA with non-constant q_idx, constant otherwise
+        if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
+            head_idx_ssa = head_idx_vec.load()
+        else:
+            head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32).broadcast_to((vec_size,))
 
         buffer_args = []
         if cutlass.const_expr(buffers is not None):

@@ -211,8 +211,6 @@ def _flash_attn_fwd(
         is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None or seqused_q is not None or seqused_k is not None
         if is_varlen:
             raise NotImplementedError("score_mod with buffers is not yet supported for varlen sequences. This will be fixed in a future PR.")
-        if pack_gqa:
-            raise NotImplementedError("score_mod with buffers is not yet supported with pack_gqa=True. This will be fixed in a future PR.")
 
     cute_buffers = None
     if buffers is not None:

@@ -490,7 +490,7 @@ class FlashAttentionForwardSm100:
 
         fastdiv_mods = None
         if cutlass.const_expr(buffers is not None):
-            seqlen_q = cute.size(mQ.shape[0])
+            seqlen_q = cute.size(mQ.shape[0]) // (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
             seqlen_k = cute.size(mK.shape[0])
             seqlen_q_divmod = FastDivmod.create(seqlen_q)
             seqlen_k_divmod = FastDivmod.create(seqlen_k)
@@ -1987,10 +1987,19 @@ class FlashAttentionForwardSm100:
         tScS_t2r = thr_tmem_load.partition_D(tScS)
 
         # Shared q_idx for all scores
-        q_idx_wrapped = tScS_t2r[0][0]
+        q_idx_logical = tScS_t2r[0][0]
+
+        # For Pack-GQA, compute the logical head index for this tile
+        if cutlass.const_expr(self.pack_gqa):
+            # Building up the logical q_head idx: final_q_head = kv_head * qhead_per_kvhead + (q_physical % qhead_per_kvhead)
+            q_physical = q_idx_logical
+            q_idx_logical = q_physical // self.qhead_per_kvhead
+            head_offset = q_physical - q_idx_logical * self.qhead_per_kvhead
+            head_idx = head_idx * self.qhead_per_kvhead + head_offset
+
         if cutlass.const_expr(buffers is not None):
             seqlen_q_divmod, _ = fastdiv_mods
-            _, q_idx_wrapped = seqlen_q_divmod.divmod(tScS_t2r[0][0])
+            _, q_idx_logical = seqlen_q_divmod.divmod(q_idx_logical)
 
         apply_score_mod_inner(
             tSrS_t2r,
@@ -2003,5 +2012,6 @@ class FlashAttentionForwardSm100:
             self.qk_acc_dtype,
             buffers,
             fastdiv_mods,
-            constant_q_idx=q_idx_wrapped
+            constant_q_idx=q_idx_logical,
+            qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
         )

@@ -601,7 +601,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
 
         fastdiv_mods = None
         if cutlass.const_expr(buffers is not None):
-            seqlen_q = cute.size(mQ.shape[0])
+            seqlen_q = cute.size(mQ.shape[0]) // (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
             seqlen_k = cute.size(mK.shape[0])
             seqlen_q_divmod = FastDivmod.create(seqlen_q)
             seqlen_k_divmod = FastDivmod.create(seqlen_k)
@@ -1250,7 +1250,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         fastdiv_mods = None
         if cutlass.const_expr(buffers is not None):
-            seqlen_q = cute.size(mQ.shape[0])
+            seqlen_q = cute.size(mQ.shape[0]) // (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
             seqlen_k = cute.size(mK.shape[0])
             seqlen_q_divmod = FastDivmod.create(seqlen_q)
             seqlen_k_divmod = FastDivmod.create(seqlen_k)
@@ -1939,7 +1939,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.qk_acc_dtype,
             buffers,
             fastdiv_mods,
-            constant_q_idx=None
+            constant_q_idx=None,
+            qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
 
     def warp_scheduler_barrier_sync(self):
