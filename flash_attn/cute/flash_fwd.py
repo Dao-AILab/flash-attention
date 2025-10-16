@@ -5,16 +5,17 @@
 # from Cutlass C++ to Cute-DSL.
 # Built on Cute-DSL example: https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/ampere/flash_attention_v2.py
 
+from ast import Call
 import math
 from types import SimpleNamespace
-from typing import Type, Callable, Optional
+from typing import Type, Callable, Optional, List
 from functools import partial
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Boolean, const_expr
+from cutlass import Constexpr, Float32, Int32, const_expr, Boolean
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils as utils_basic
 from cutlass.utils import LayoutEnum
@@ -35,6 +36,22 @@ from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileSch
 from flash_attn.cute.fast_math import FastDivmod
 
 
+def mma_qk(tiled_mma_qk: cute.TiledMma, shape: cute.Shape, tSrQ: cute.Tensor, tSrK: cute.Tensor, smem_idx: Int32, wg_wait: int = -1) -> cute.Tensor:
+    acc_S = cute.make_fragment(tiled_mma_qk.partition_shape_C(shape), Float32)
+    sm90_utils.gemm(
+        tiled_mma_qk, acc_S, tSrQ, tSrK[None, None, None, smem_idx], zero_init=True, wg_wait=wg_wait
+    )
+    return acc_S
+
+
+def mma_pv(tiled_mma_pv: cute.TiledMma, acc_O: cute.Tensor, tOrP: cute.Tensor, tOrVt: cute.Tensor, smem_idx: Int32, zero_init: Boolean, wg_wait: int = -1) -> None:
+    sm90_utils.gemm(
+        tiled_mma_pv, acc_O, tOrP,
+        tOrVt[None, None, None, smem_idx],
+        zero_init=zero_init, wg_wait=wg_wait
+    )
+
+
 class FlashAttentionForwardBase:
 
     arch: int = 80
@@ -53,7 +70,8 @@ class FlashAttentionForwardBase:
         num_stages: int = 1,
         num_threads: int = 128,
         Q_in_regs: bool = False,
-        score_mod: cutlass.Constexpr | None = None,
+        score_mod: Optional[cutlass.Constexpr] = None,
+        mask_mod: Optional[cutlass.Constexpr] = None,
         has_buffers: bool = False,
     ):
         """Initializes the configuration for a flash attention kernel.
@@ -72,6 +90,8 @@ class FlashAttentionForwardBase:
         :param is_causal: is causal
         :param score_mod: A callable that takes the attention scores and applies a modification.
             Callable signature: ``score_mod(scores, batch_idx, head_idx, q_idx, kv_idx, buffers) -> Any``
+        :param mask_mod: A callable that takes the attention scores and returns a boolean representing whether that score should be masked.
+            Callable signature: ``mask_mod(batch_idx, head_idx, q_idx, kv_idx, buffers) -> Boolean``
         """
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -93,6 +113,7 @@ class FlashAttentionForwardBase:
         self.num_stages = num_stages
         self.Q_in_regs = Q_in_regs
         self.score_mod = score_mod
+        self.mask_mod = mask_mod
         self.qk_acc_dtype = Float32
         if cutlass.const_expr(has_buffers):
             self.vec_size: cutlass.Constexpr = 1
@@ -983,10 +1004,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
     arch = 90
 
-    def __init__(self, *args, intra_wg_overlap: bool = True, mma_pv_is_rs: bool = True, **kwargs):
+    def __init__(
+        self,
+        *args,
+        intra_wg_overlap: bool = True,
+        mma_pv_is_rs: bool = True,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.intra_wg_overlap = intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
+        
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
@@ -1106,19 +1134,26 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
-        buffers=None,
+        full_block_cnt: Optional[cute.Tensor] = None,  # (b, h, m_block)
+        full_block_idx: Optional[cute.Tensor] = None,  # (b, h, m_block, n_block)
+        mask_block_cnt: Optional[cute.Tensor] = None,  # (b, h, m_block)
+        mask_block_idx: Optional[cute.Tensor] = None,  # (b, h, m_block, n_block)
+        buffers: Optional[list] = None,
     ):
         """Configures and launches the flash attention kernel.
 
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
+
         self._check_type(
             *(t.element_type if t is not None else None
               for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
         )
+
         # Assume all strides are divisible by 128 bits except the last stride
         new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
+
         mQ, mK, mV, mO = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mQ, mK, mV, mO)]
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ, mO = [utils.select(t, QO_layout_transpose) for t in (mQ, mO)]
@@ -1275,6 +1310,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             window_size_left,
             window_size_right,
             learnable_sink,
+            full_block_cnt,
+            full_block_idx,
+            mask_block_cnt,
+            mask_block_idx,
             self.sQ_layout,
             self.sK_layout,
             self.sV_layout,
@@ -1321,6 +1360,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
+        full_block_cnt: Optional[cute.Tensor],
+        full_block_idx: Optional[cute.Tensor],
+        mask_block_cnt: Optional[cute.Tensor],
+        mask_block_idx: Optional[cute.Tensor],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
@@ -1429,6 +1472,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 pipeline_k,
                 pipeline_v,
                 mbar_ptr_Q,
+                full_block_cnt,
+                full_block_idx,
+                mask_block_cnt,
+                mask_block_idx,
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
@@ -1467,6 +1514,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 SeqlenInfoCls,
                 AttentionMaskCls,
                 TileSchedulerCls,
+                full_block_cnt,
+                full_block_idx,
+                mask_block_cnt,
+                mask_block_idx,
                 buffers,
                 fastdiv_mods,
             )
@@ -1486,6 +1537,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_k: cutlass.pipeline.PipelineAsync,
         pipeline_v: cutlass.pipeline.PipelineAsync,
         mbar_ptr_Q: cutlass.Pointer,
+        full_block_cnt: Optional[cute.Tensor],
+        full_block_idx: Optional[cute.Tensor],
+        mask_block_cnt: Optional[cute.Tensor],
+        mask_block_idx: Optional[cute.Tensor],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
@@ -1526,16 +1581,44 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr_Q, self.tma_copy_q_bytes)
                     load_Q(tma_bar_ptr=mbar_ptr_Q)
-                n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-                # if cute.arch.thread_idx()[0] == 0:
-                #     cute.printf("m_block = %d, n_block_min: %d, n_block_max: %d", m_block, n_block_min, n_block_max)
-                for i in cutlass.range(n_block_max - n_block_min, unroll=2):
-                    n_block = n_block_max - i - 1
-                    pipeline_k.producer_acquire(kv_producer_state)
-                    load_K(src_idx=n_block, producer_state=kv_producer_state)
-                    pipeline_v.producer_acquire(kv_producer_state)
-                    load_V(src_idx=n_block, producer_state=kv_producer_state)
-                    kv_producer_state.advance()
+
+                if const_expr(mask_block_cnt is not None and full_block_cnt is not None):
+                    # ==========================================
+                    # Flex Attention blocksparsity
+                    # ==========================================
+                    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
+                    if curr_mask_block_cnt > 0:
+                        for i in cutlass.range(curr_mask_block_cnt):
+                            n_block_mask = mask_block_idx[
+                                batch_idx, head_idx, m_block, curr_mask_block_cnt - 1 - i
+                            ]
+                            pipeline_k.producer_acquire(kv_producer_state)
+                            load_K(src_idx=n_block_mask, producer_state=kv_producer_state)
+                            pipeline_v.producer_acquire(kv_producer_state)
+                            load_V(src_idx=n_block_mask, producer_state=kv_producer_state)
+                            kv_producer_state.advance()
+                    curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
+                    if curr_full_block_cnt > 0:
+                        for j in cutlass.range(curr_full_block_cnt):
+                            n_block_full = full_block_idx[
+                                batch_idx, head_idx, m_block, curr_full_block_cnt - 1 - j
+                            ]
+                            pipeline_k.producer_acquire(kv_producer_state)
+                            load_K(n_block_full, producer_state=kv_producer_state)
+                            pipeline_v.producer_acquire(kv_producer_state)
+                            load_V(n_block_full, producer_state=kv_producer_state)
+                            kv_producer_state.advance()
+                
+                else: # no block sparsity
+                    n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+                    for i in cutlass.range(n_block_max - n_block_min, unroll=2):
+                        n_block = n_block_max - i - 1
+                        pipeline_k.producer_acquire(kv_producer_state)
+                        load_K(src_idx=n_block, producer_state=kv_producer_state)
+                        pipeline_v.producer_acquire(kv_producer_state)
+                        load_V(src_idx=n_block, producer_state=kv_producer_state)
+                        kv_producer_state.advance()
+                        
                 tile_scheduler.prefetch_next_work()
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
@@ -1571,7 +1654,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
-        buffers=None,
+        full_block_cnt: Optional[cute.Tensor],
+        full_block_idx: Optional[cute.Tensor],
+        mask_block_cnt: Optional[cute.Tensor],
+        mask_block_idx: Optional[cute.Tensor],
+        buffers: Optional[list],
         fastdiv_mods=None,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -1641,18 +1728,31 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             seqlen = SeqlenInfoCls(batch_idx)
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
-                mask.apply_mask, m_block=m_block, thr_mma=thr_mma_qk,
-                mask_causal=self.is_causal, mask_local=self.is_local,
+                mask.apply_mask,
+                batch_idx=batch_idx,
+                head_idx=head_idx,
+                m_block=m_block,
+                thr_mma=thr_mma_qk,
+                mask_causal=self.is_causal,
+                mask_local=self.is_local,
+                buffers=buffers,
             )
             score_mod_fn = None
             if const_expr(self.score_mod is not None):
                 score_mod_fn = partial(
                     self.apply_score_mod,
-                    thr_mma_qk, batch_idx, head_idx, m_block,
-                    softmax_scale=softmax_scale, buffers=buffers, fastdiv_mods=fastdiv_mods,
+                    thr_mma_qk=thr_mma_qk,
+                    batch_idx=batch_idx,
+                    head_idx=head_idx,
+                    m_block=m_block,
+                    softmax_scale=softmax_scale,
+                    buffers=buffers,
+                    fastdiv_mods=fastdiv_mods,
                 )
             mma_one_n_block = partial(
-                mma_one_n_block_all, softmax=softmax, score_mod_fn=score_mod_fn
+                mma_one_n_block_all,
+                softmax=softmax,
+                score_mod_fn=score_mod_fn,
             )
             # Load Q if not TMA_Q
             if const_expr(not self.use_tma_Q):
@@ -1674,89 +1774,277 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # We also need masking on S if it's causal, for the last several blocks.
             # softmax.reset()  # Don't need reset as we explicitly call softmax w is_first=True
             O_should_accumulate = False
-            # First iteration with seqlen masking
-            if const_expr(self.intra_wg_overlap):
-                pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
-                acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
-                pipeline_k.consumer_release(kv_consumer_state)
-                # Use vectorized score modification
-                if cutlass.const_expr(score_mod_fn is not None):
-                    score_mod_fn(acc_S, n_block=n_block_max - 1)
-                # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
-                mask_fn(acc_S, n_block=n_block_max - 1, mask_seqlen=True)
-                # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
-                softmax.online_softmax(acc_S, is_first=True)
-                tOrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
-                tOrP_cur = tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
-                tOrP_cur.store(tOrP_acc.load().to(self.dtype))
-                if const_expr(not self.mma_pv_is_rs):
-                    tPrP = smem_thr_copy_P.retile(tOrP_cur)
-                    cute.copy(smem_thr_copy_P, tPrP, tPsP)
-                    # Fence and barrier to make sure smem store is visible to WGMMA
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            
+            
+            # ==========================================
+            # MAINLOOP 
+            # ==========================================
+            if const_expr(mask_block_cnt is not None and full_block_cnt is not None):
+                # ==========================================
+                # Flex Attention blocksparsity
+                # ==========================================
+                curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
+                curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
+                if curr_mask_block_cnt > 0:
+                    # ==========================================
+                    # Masked blocks processing
+                    # ==========================================
+                    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
+                    mask_n_block = 0
+                    if const_expr(self.intra_wg_overlap):
+                        mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
+
+                        kv_consumer_state = self.first_half_block_overlap(
+                            mask_n_block,
+                            mma_qk_fn,
+                            kv_consumer_state,
+                            pipeline_k,
+                            tOrP,
+                            smem_copy_params,
+                            softmax,
+                            mask_fn=partial(mask_fn, mask_mod=self.mask_mod),
+                            score_mod_fn=score_mod_fn,
+                            is_first_block=True,
+                            mask_seqlen=True,
+                        )
+
+                        # Process remaining blocks
+                        for i in cutlass.range(1, curr_mask_block_cnt):
+                            mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+                            kv_consumer_state = mma_one_n_block(
+                                kv_consumer_state,
+                                n_block=mask_n_block,
+                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
+                            )
+                            O_should_accumulate = True
+
+                        # Final PV gemm if no full blocks to be processed
+                        if curr_full_block_cnt == 0:
+                            kv_consumer_state = self.last_half_block_overlap(
+                                kv_consumer_state,
+                                pipeline_v,
+                                mma_pv_fn,
+                                zero_init=not O_should_accumulate,
+                            )
+                            O_should_accumulate = True
+
+                    else:
+                        # Non-overlap
+                        self.warp_scheduler_barrier_sync()
+                        mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
+                        kv_consumer_state = mma_one_n_block(
+                            kv_consumer_state,
+                            n_block=mask_n_block,
+                            mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                            mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
+                            is_first_n_block=True,
+                        )
+                        O_should_accumulate = True
+                        for i in cutlass.range(1, curr_mask_block_cnt):
+                            mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+                            kv_consumer_state = mma_one_n_block(
+                                kv_consumer_state,
+                                n_block=mask_n_block,
+                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
+                                is_first_n_block=False,
+                            )
+                        if curr_full_block_cnt == 0:
+                            self.warp_scheduler_barrier_arrive()
+
+                if curr_full_block_cnt > 0:
+                    # ==========================================
+                    # Full blocks processing
+                    # ==========================================
+                    curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
+                    full_n_block = 0
+                    if const_expr(self.intra_wg_overlap):
+                        # Handle first full block if it's the overall first
+                        if curr_mask_block_cnt == 0:
+                            full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
+                            kv_consumer_state = self.first_half_block_overlap(
+                                full_n_block,
+                                mma_qk_fn,
+                                kv_consumer_state,
+                                pipeline_k,
+                                tOrP,
+                                smem_copy_params,
+                                softmax,
+                                mask_fn=partial(mask_fn, mask_mod=None),
+                                score_mod_fn=score_mod_fn,
+                                is_first_block=True,
+                                mask_seqlen=True,
+                            )
+
+                            # Remaining full blocks (start at 1)
+                            for i in cutlass.range(1, curr_full_block_cnt):
+                                full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
+                                kv_consumer_state = mma_one_n_block(
+                                    kv_consumer_state,
+                                    n_block=full_n_block,
+                                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                                    mask_fn=partial(mask_fn, mask_seqlen=False),
+                                )
+                                O_should_accumulate = True
+                        else:
+                            # All full blocks use mma_one_n_block
+                            # first full block needs mask_seqlen
+                            full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
+                            kv_consumer_state = mma_one_n_block(
+                                kv_consumer_state,
+                                n_block=full_n_block,
+                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                                mask_fn=partial(mask_fn, mask_seqlen=True),
+                            )
+                            O_should_accumulate = True
+
+                            for i in cutlass.range(1, curr_full_block_cnt):
+                                full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
+                                kv_consumer_state = mma_one_n_block(
+                                    kv_consumer_state,
+                                    n_block=full_n_block,
+                                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                                    mask_fn=partial(mask_fn, mask_seqlen=False),
+                                )
+                                O_should_accumulate = True
+
+                        kv_consumer_state = self.last_half_block_overlap(
+                            kv_consumer_state,
+                            pipeline_v,
+                            mma_pv_fn,
+                            zero_init=not O_should_accumulate,
+                        )
+                        O_should_accumulate = True
+
+                    else:
+                        # non-overlap case
+                        if curr_mask_block_cnt == 0:
+                            self.warp_scheduler_barrier_sync()
+
+                        full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
+
+                        if curr_mask_block_cnt == 0:  # if no partially-masked blocks were computed
+                            kv_consumer_state = mma_one_n_block(
+                                kv_consumer_state,
+                                n_block=full_n_block,
+                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                                mask_fn=partial(mask_fn, mask_seqlen=True),
+                                is_first_n_block=True,
+                            )
+                            O_should_accumulate = True
+                        else:
+                            kv_consumer_state = mma_one_n_block(
+                                kv_consumer_state,
+                                n_block=full_n_block,
+                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                                mask_fn=partial(mask_fn, mask_seqlen=True),
+                                is_first_n_block=False,
+                            )
+                            O_should_accumulate = True
+                        for i in cutlass.range(1, curr_full_block_cnt):
+                            full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
+                            kv_consumer_state = mma_one_n_block(
+                                kv_consumer_state,
+                                n_block=full_n_block,
+                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                                mask_fn=partial(mask_fn, mask_seqlen=False),
+                                is_first_n_block=False,
+                            )
+                        self.warp_scheduler_barrier_arrive()
+
+                if curr_mask_block_cnt + curr_full_block_cnt == 0: # zero initialize if no blocks processed
+                    acc_O.fill(0.0)
+                    O_should_accumulate = True
+                    
+            else:            
+                # ==========================================
+                # No block-sparsity (original path)
+                # ==========================================
+                # First iteration with seqlen masking
+                if const_expr(self.intra_wg_overlap):
+                    pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
+                    acc_S = mma_qk_fn(kv_consumer_state.index, wg_wait=0)
+                    pipeline_k.consumer_release(kv_consumer_state)
+                    # Use vectorized score modification
+                    if cutlass.const_expr(score_mod_fn is not None):
+                        score_mod_fn(acc_S, n_block=n_block_max - 1)
+                    # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
+                    mask_fn(acc_S, n_block=n_block_max - 1, mask_seqlen=True)
+                    # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
+                    softmax.online_softmax(acc_S, is_first=True)
+                    tOrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
+                    tOrP_cur = tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
+                    tOrP_cur.store(tOrP_acc.load().to(self.dtype))
+                    if const_expr(not self.mma_pv_is_rs):
+                        tPrP = smem_thr_copy_P.retile(tOrP_cur)
+                        cute.copy(smem_thr_copy_P, tPrP, tPsP)
+                        # Fence and barrier to make sure smem store is visible to WGMMA
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                        )
+                        cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
+                    # Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
+                    # acc_O.fill(0.0)
+                else:
+                    self.warp_scheduler_barrier_sync()
+                    kv_consumer_state = mma_one_n_block(
+                        kv_consumer_state,
+                        n_block=n_block_max - 1,
+                        mma_pv_fn=partial(mma_pv_fn, zero_init=True),
+                        is_first_n_block=True,
+                        mask_fn=partial(mask_fn, mask_seqlen=True),
                     )
-                    cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
-                # Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
-                # acc_O.fill(0.0)
-            else:
-                self.warp_scheduler_barrier_sync()
-                kv_consumer_state = mma_one_n_block(
-                    kv_consumer_state,
-                    n_block=n_block_max - 1,
-                    mma_pv_fn=partial(mma_pv_fn, zero_init=True),
-                    is_first_n_block=True,
-                    mask_fn=partial(mask_fn, mask_seqlen=True),
-                )
-                O_should_accumulate = True
-            # if cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block_max = {}, n_block_min = {}", m_block, n_block_max, n_block_min)
-            n_block_max -= 1
-            # Next couple of iterations with causal masking
-            if const_expr(self.is_causal or self.is_local):
-                n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
+                    O_should_accumulate = True
+                # if cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block_max = {}, n_block_min = {}", m_block, n_block_max, n_block_min)
+                n_block_max -= 1
+                # Next couple of iterations with causal masking
+                if const_expr(self.is_causal or self.is_local):
+                    n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
+                        seqlen, m_block, n_block_min
+                    )
+                    # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block_min_causal_local_mask = {}", n_block_min_causal_local_mask)
+                    for n_tile in cutlass.range(n_block_max - n_block_min_causal_local_mask, unroll=1):
+                        kv_consumer_state = mma_one_n_block(
+                            kv_consumer_state,
+                            n_block=n_block_max - 1 - n_tile,
+                            mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                            mask_fn=partial(mask_fn, mask_seqlen=False),
+                        )
+                        O_should_accumulate = True
+                    n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
+                # The remaining iterations have no masking
+                n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
                     seqlen, m_block, n_block_min
                 )
-                # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block_min_causal_local_mask = {}", n_block_min_causal_local_mask)
-                for n_tile in cutlass.range(n_block_max - n_block_min_causal_local_mask, unroll=1):
+                # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block_min_before_local_mask = {}, n_block_min = {}", n_block_min_before_local_mask, n_block_min)
+                for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
                     kv_consumer_state = mma_one_n_block(
                         kv_consumer_state,
                         n_block=n_block_max - 1 - n_tile,
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                        mask_fn=partial(mask_fn, mask_seqlen=False),
                     )
                     O_should_accumulate = True
-                n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
-            # The remaining iterations have no masking
-            n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
-                seqlen, m_block, n_block_min
-            )
-            # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block_min_before_local_mask = {}, n_block_min = {}", n_block_min_before_local_mask, n_block_min)
-            for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
-                kv_consumer_state = mma_one_n_block(
-                    kv_consumer_state,
-                    n_block=n_block_max - 1 - n_tile,
-                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                )
-                O_should_accumulate = True
-            # Separate iterations with local masking on the left
-            if const_expr(self.is_local and block_info.window_size_left is not None):
-                n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
-                for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
-                    kv_consumer_state = mma_one_n_block(
-                        kv_consumer_state,
-                        n_block=n_block_max - 1 - n_tile,
-                        mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                        mask_fn=partial(mask_fn, mask_seqlen=False),
-                    )
-                    O_should_accumulate = True
-            # Last "half" iteration
-            if const_expr(self.intra_wg_overlap):
-                pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
-                mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=not O_should_accumulate, wg_wait=0)
-                pipeline_v.consumer_release(kv_consumer_state)
-                kv_consumer_state.advance()
-            else:
-                self.warp_scheduler_barrier_arrive()
+                # Separate iterations with local masking on the left
+                if const_expr(self.is_local and block_info.window_size_left is not None):
+                    n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
+                    for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
+                        kv_consumer_state = mma_one_n_block(
+                            kv_consumer_state,
+                            n_block=n_block_max - 1 - n_tile,
+                            mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                            mask_fn=partial(mask_fn, mask_seqlen=False),
+                        )
+                        O_should_accumulate = True
+                # Last "half" iteration
+                if const_expr(self.intra_wg_overlap):
+                    pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
+                    mma_pv_fn(kv_consumer_state.index, zero_init=not O_should_accumulate, wg_wait=0)
+                    pipeline_v.consumer_release(kv_consumer_state)
+                    kv_consumer_state.advance()
+                    O_should_accumulate=True
+                else:
+                    self.warp_scheduler_barrier_arrive()
 
             sink_val = None
             if const_expr(learnable_sink is not None):
@@ -1786,6 +2074,72 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
+    @cute.jit 
+    def first_half_block_overlap(
+        self,
+        n_block: Int32,
+        mma_qk_fn: Callable,
+        kv_consumer_state,
+        pipeline_k,
+        tOrP: cute.Tensor,
+        smem_copy_params: SimpleNamespace,
+        softmax: Softmax,
+        mask_fn: Optional[Callable] = None,
+        score_mod_fn: Optional[Callable] = None,
+        is_first_block: bool = False,
+        mask_seqlen: bool = False,
+    ):
+        """Processes the first half block when using intra-warpgroup-overlap"""
+        
+        pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
+        acc_S = mma_qk_fn(kv_consumer_state.index, wg_wait=0)
+        pipeline_k.consumer_release(kv_consumer_state)
+        
+        # Apply score modification if present
+        if const_expr(score_mod_fn is not None):
+            score_mod_fn(acc_S=acc_S, n_block=n_block)
+        
+        # Apply mask if present
+        if const_expr(mask_fn is not None):
+            mask_fn(acc_S, n_block=n_block, mask_seqlen=mask_seqlen)
+        
+        softmax.online_softmax(acc_S, is_first=is_first_block)
+        
+        tOrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
+        tOrP_cur = tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
+        utils.cvt_f16(tOrP_acc, tOrP_cur)
+        
+        # if pv gemm not rs
+        if const_expr(not self.mma_pv_is_rs):
+            tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
+            cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
+            # Fence and barrier to make smem store visible to WGMMA
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            )
+            cute.arch.sync_warp()
+        
+        return kv_consumer_state
+        
+    @cute.jit
+    def last_half_block_overlap(
+        self,
+        kv_consumer_state,
+        pipeline_v,
+        mma_pv_fn: Callable,
+        zero_init: bool,
+    ):
+        """Processes the final PV GEMM when using intra-warpgroup-overlap"""
+        
+        pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
+        mma_pv_fn(kv_consumer_state.index, zero_init=zero_init, wg_wait=0)
+        pipeline_v.consumer_release(kv_consumer_state)
+        
+        # Advance state for next iteration
+        kv_consumer_state.advance()
+        
+        return kv_consumer_state
+
     @cute.jit
     def mma_one_n_block(
         self,
@@ -1806,15 +2160,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         check_inf: cutlass.Constexpr = True,
     ):
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
-        # S = Q @ K.T
-        acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+        acc_S = mma_qk_fn(smem_pipe_read.index, wg_wait=-1)
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(0)
         pipeline_k.consumer_release(smem_pipe_read)
+        
+        # handle score mods and masking
         if const_expr(score_mod_fn is not None):
             score_mod_fn(acc_S, n_block=n_block)
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
+            
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
         # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
         tOrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
@@ -1864,20 +2220,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         smem_pipe_read.advance()
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
-        # S = Q @ K.T
-        acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+        acc_S = mma_qk_fn(smem_pipe_read.index, wg_wait=-1)
         pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v))
-        # O += P @ V
-        mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
+        mma_pv_fn(smem_pipe_read_v.index, wg_wait=-1)
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(1)
         pipeline_k.consumer_release(smem_pipe_read)
+        
+        # handle score mods and masking
         if const_expr(score_mod_fn is not None):
             score_mod_fn(acc_S, n_block=n_block)
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
+
         row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
         warpgroup.wait_group(0)
         pipeline_v.consumer_release(smem_pipe_read_v)

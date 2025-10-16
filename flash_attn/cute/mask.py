@@ -1,12 +1,13 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Optional
+from typing import Optional, Callable
 from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
 
 import flash_attn.cute.utils as utils
+
 
 
 @dataclass(frozen=True)
@@ -23,14 +24,17 @@ class AttentionMask:
     def apply_mask(
         self,
         acc_S: cute.Tensor,
+        batch_idx: cutlass.Int32,
+        head_idx: cutlass.Int32,
         m_block: cutlass.Int32,
         n_block: cutlass.Int32,
         thr_mma: cute.TiledMma,
         mask_seqlen: cutlass.Constexpr[bool],
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
+        mask_mod: Optional[Callable] = None,
+        buffers: Optional[list[cute.Tensor]] = None,
     ) -> None:
-        # TODO: implement swap_AB
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
         cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
@@ -40,9 +44,9 @@ class AttentionMask:
         t0ScS_mn = utils.make_acc_tensor_mn_view(thr_mma.get_slice(0).partition_C(cS))
         thr_col_offset = tScS_mn[0][1]
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
-        if cutlass.const_expr(not mask_causal and not mask_local):
+        if cutlass.const_expr(not mask_causal and not mask_local and mask_mod is None):
             if cutlass.const_expr(mask_seqlen):
-                if cutlass.const_expr(True):
+                if cutlass.const_expr(False):
                     # traverse column index.
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                         oob = t0ScS_mn[0, c][1] >= seqlenk_col_limit
@@ -62,6 +66,43 @@ class AttentionMask:
                             c = s * 24 + i
                             for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                                 acc_S_mn[r, c] = acc_S_mn[r, c] if in_bound else -cutlass.Float32.inf
+                                
+        elif cutlass.const_expr(not mask_causal and not mask_local and mask_mod is not None): # FlexAttention mask mod
+            nrow = cutlass.const_expr(cute.size(tScS_mn.shape[0]))
+            ncol = cutlass.const_expr(cute.size(tScS_mn.shape[1]))
+            thr_col_offset = tScS_mn[0, 0][1]
+            
+            for r in cutlass.range_constexpr(nrow):
+                global_row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
+                
+                for col in cutlass.range_constexpr(ncol):
+                    col_idx_local = t0ScS_mn[0, col][1]
+                    # Convert to absolute column index
+                    global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
+                    
+                    cond = cutlass.Boolean(
+                        mask_mod(
+                            batch_idx,
+                            head_idx,
+                            tScS_mn[r, 0][0] + m_block * self.tile_m,
+                            thr_col_offset + t0ScS_mn[0, col][1] + n_block * self.tile_n,
+                            self.seqlen_q,
+                            self.seqlen_k,
+                            buffers,
+                        )
+                    )
+                    if cutlass.const_expr(mask_seqlen):
+                        out_of_bounds = (global_row_idx >= self.seqlen_q) or (
+                            global_col_idx >= self.seqlen_k
+                        )
+                        if out_of_bounds:
+                            acc_S_mn[r, col] = -cutlass.Float32.inf
+                        else:
+                            acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
+                    else:
+                        acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
+
+
         else:  # Causal or local
             # If PackGQA, we split the work of compute divmod among threads in the same row
             threads_per_row = thr_mma.tv_layout_C.shape[0][0]
@@ -95,7 +136,7 @@ class AttentionMask:
                     col_limit_right = row_idx + causal_row_offset
                     if cutlass.const_expr(mask_seqlen):
                         col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
-                    if cutlass.const_expr(True):
+                    if cutlass.const_expr(False):
                         # traverse column index.
                         for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                             acc_S_mn[r, c] = -cutlass.Float32.inf if t0ScS_mn[0, c][1] >= col_limit_right else acc_S_mn[r, c]
