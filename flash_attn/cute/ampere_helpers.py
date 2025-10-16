@@ -8,11 +8,14 @@ import cutlass.cute as cute
 def get_smem_layout_atom(dtype: Type[cutlass.Numeric], k_dim: int) -> cute.ComposedLayout:
     dtype_byte = cutlass.const_expr(dtype.width // 8)
     bytes_per_row = cutlass.const_expr(k_dim * dtype_byte)
-    smem_k_block_size = cutlass.const_expr(
-        128
-        if bytes_per_row % 128 == 0
-        else (64 if bytes_per_row % 64 == 0 else (32 if bytes_per_row % 32 == 0 else 16))
-    ) // dtype_byte
+    smem_k_block_size = (
+        cutlass.const_expr(
+            128
+            if bytes_per_row % 128 == 0
+            else (64 if bytes_per_row % 64 == 0 else (32 if bytes_per_row % 32 == 0 else 16))
+        )
+        // dtype_byte
+    )
     swizzle_bits = (
         4
         if smem_k_block_size == 128
@@ -22,7 +25,9 @@ def get_smem_layout_atom(dtype: Type[cutlass.Numeric], k_dim: int) -> cute.Compo
     return cute.make_composed_layout(
         cute.make_swizzle(swizzle_bits, swizzle_base, swizzle_base),
         0,
-        cute.make_ordered_layout((8 if cutlass.const_expr(k_dim % 32 == 0) else 16, smem_k_block_size), order=(1, 0)),
+        cute.make_ordered_layout(
+            (8 if cutlass.const_expr(k_dim % 32 == 0) else 16, smem_k_block_size), order=(1, 0)
+        ),
     )
 
 
