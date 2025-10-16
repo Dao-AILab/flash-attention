@@ -5,8 +5,9 @@
 # - hdim 64, 96, 128, (192, 128).
 # - varlen
 # - sliding window
+# - split-kv
 # Unsupported features that will be added later:
-# - split-kv (optimizing for inference)
+# - page size != 128
 # - more hdim (192, 256)
 # Based on the cutlass example and cute-dsl example:
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha

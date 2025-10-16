@@ -298,7 +298,7 @@ def _flash_attn_fwd(
             out_partial,
             lse_partial.transpose(-1, -2),
             out,
-            lse,
+            lse.transpose(-1, -2) if lse is not None else None,
             cu_seqlens_q,
             seqused_q,
         )
