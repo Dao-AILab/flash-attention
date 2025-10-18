@@ -40,11 +40,12 @@ struct BlockMN {
             // If local, blocking (m_idx_max - m_idx_min + window_size_right + window_size_left)  
             // when cp is not enabled, tot_seqlen_k is equal to seqlen_k, and cp_world_size is 1.
             // cp_world_size is guaranteed to be greater than 0
-            n_block_max = std::min(n_block_max,
-                                    cute::ceil_div(
-                                    cute::ceil_div(m_idx_max + seqlen_info.tot_seqlen_k - seqlen_q + window_size_right - seqlen_info.cp_rank,
-                                                  seqlen_info.cp_world_size),
-                                    kBlockN));
+            int tot_seqlen_k = (Is_local) ? seqlen_k : seqlen_info.tot_seqlen_k;
+            int n_token_max = m_idx_max + tot_seqlen_k - seqlen_q + window_size_right;
+            if (seqlen_info.cp_world_size > 1 && !Is_local) {
+                n_token_max = cute::ceil_div(n_token_max - seqlen_info.cp_rank, seqlen_info.cp_world_size);
+            }
+            n_block_max = std::min(n_block_max, cute::ceil_div(n_token_max, kBlockN));
         }
         // Now, only adjust n_block_min if split
         int n_block_min = 0;
