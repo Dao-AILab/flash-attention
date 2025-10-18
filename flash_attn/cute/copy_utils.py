@@ -26,10 +26,17 @@ def cvt_copy(
 ) -> None:
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
     if const_expr(src.element_type != dst.element_type):
-        src_cvt = cute.make_fragment_like(src, dst.element_type)
+        src_cvt = cute.make_fragment_like(src, dst.element_type, loc=loc, ip=ip)
         src_cvt.store(src.load().to(dst.element_type))
         src = src_cvt
     cute.copy(atom, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
+
+
+@dsl_user_op
+def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    dst = cute.make_fragment_like(src, src.element_type, loc=loc, ip=ip)
+    cute.autovec_copy(src, dst, loc=loc, ip=ip)
+    return dst
 
 
 @dsl_user_op

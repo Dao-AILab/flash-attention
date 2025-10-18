@@ -18,8 +18,7 @@ class NamedBarrierBwd(enum.IntEnum):
     WarpSchedulerWG2 = enum.auto()
     WarpSchedulerWG3 = enum.auto()
     PdS = enum.auto()
-    #dQEmpty = 9
-    #dQEmpty = 9
-
-    dQFull = enum.auto()
-    dQEmpty = enum.auto()
+    dQFullWG0 = enum.auto()
+    dQFullWG1 = enum.auto()
+    dQEmptyWG0 = enum.auto()
+    dQEmptyWG1 = enum.auto()

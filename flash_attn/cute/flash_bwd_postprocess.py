@@ -127,9 +127,18 @@ class FlashAttentionBackwardPostprocess:
             cute.make_layout(async_copy_elems_accum),
         )
         num_s2r_copy_elems = 1 if const_expr(self.arch == 80) else 4
-        self.s2r_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
-            Float32, self.num_threads, num_s2r_copy_elems
-        )
+        if const_expr(self.arch == 80):
+            self.s2r_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
+                Float32, self.num_threads, num_s2r_copy_elems
+            )
+        else:
+            num_threads_per_warp_group = 128
+            num_mma_warp_groups = self.num_threads // 128
+            self.s2r_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
+                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128),
+                cute.make_layout((num_threads_per_warp_group, num_mma_warp_groups)),  # thr_layout
+                cute.make_layout(128 // Float32.width),  # val_layout
+            )
 
         self.gmem_tiled_copy_dQ = copy_utils.tiled_copy_2d(
             self.dtype, self.tile_hdim, self.num_threads
@@ -137,7 +146,13 @@ class FlashAttentionBackwardPostprocess:
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: dQaccum / dQ
         # ///////////////////////////////////////////////////////////////////////////////
-        self.sdQaccum_layout = cute.make_layout(self.tile_m * self.tile_hdim)
+        if const_expr(self.arch == 80):
+            self.sdQaccum_layout = cute.make_layout(self.tile_m * self.tile_hdim)
+        else:
+            num_mma_warp_groups = self.num_threads // 128
+            self.sdQaccum_layout = cute.make_layout(
+                (self.tile_m * self.tile_hdim // num_mma_warp_groups, num_mma_warp_groups)
+            )
         # We can't just use kHeadDim here. E.g. if MMA shape is 64 x 96 but split across 2 WGs,
         # then setting kBlockKSmem to 32 will cause "Static shape_div failure".
         # We want to treat it as 64 x 48, so kBlockKSmem should be 16.
@@ -253,6 +268,15 @@ class FlashAttentionBackwardPostprocess:
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
     ):
+        # ///////////////////////////////////////////////////////////////////////////////
+        # Get shared memory buffer
+        # ///////////////////////////////////////////////////////////////////////////////
+        smem = cutlass.utils.SmemAllocator()
+        sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
+        sdQaccum_flat = cute.make_tensor(sdQaccum.iterator, cute.make_layout(cute.size(sdQaccum)))
+        sdQ = cute.make_tensor(cute.recast_ptr(sdQaccum.iterator, dtype=self.dtype), sdQ_layout)
+        sdQt = utils.transpose_view(sdQ)
+
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
 
@@ -299,17 +323,8 @@ class FlashAttentionBackwardPostprocess:
                 )
                 mdQaccum_cur = cute.make_tensor(mdQaccum_cur_ptr, mdQaccum_cur.layout)
 
-            dQaccum_shape = (self.tile_m * self.tile_hdim,)
-            gdQaccum = cute.local_tile(mdQaccum_cur, dQaccum_shape, (m_block,))
+            gdQaccum = cute.local_tile(mdQaccum_cur, (self.tile_m * self.tile_hdim,), (m_block,))
             gdQ = cute.local_tile(mdQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
-
-            # ///////////////////////////////////////////////////////////////////////////////
-            # Get shared memory buffer
-            # ///////////////////////////////////////////////////////////////////////////////
-            smem = cutlass.utils.SmemAllocator()
-            sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
-            sdQ = cute.make_tensor(cute.recast_ptr(sdQaccum.iterator, dtype=self.dtype), sdQ_layout)
-            sdQt = utils.transpose_view(sdQ)
 
             seqlen_q = seqlen.seqlen_q
             seqlen_q_rounded = cute.round_up(seqlen_q, self.tile_m)
@@ -317,9 +332,7 @@ class FlashAttentionBackwardPostprocess:
             # Step 1: load dQaccum from gmem to smem
             g2s_thr_copy_dQaccum = g2s_tiled_copy_dQaccum.get_slice(tidx)
             tdQgdQaccum = g2s_thr_copy_dQaccum.partition_S(gdQaccum)
-            tdQsdQaccumg2s = g2s_thr_copy_dQaccum.partition_D(sdQaccum)
-            # print(tdQgdQaccum)
-            # print(tdQsdQaccum)
+            tdQsdQaccumg2s = g2s_thr_copy_dQaccum.partition_D(sdQaccum_flat)
             cute.copy(g2s_tiled_copy_dQaccum, tdQgdQaccum, tdQsdQaccumg2s)
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
@@ -328,25 +341,14 @@ class FlashAttentionBackwardPostprocess:
             # Step 2: load dQ from smem to rmem
             s2r_thr_copy_dQaccum = s2r_tiled_copy_dQaccum.get_slice(tidx)
             tdQsdQaccum = s2r_thr_copy_dQaccum.partition_S(sdQaccum)
-            # print(s2r_tiled_copy_dQaccum)
-            # print(sdQaccum)
-            # thr_mma = tiled_mma.get_slice(tidx)
-            # print(tiled_mma)
             tile_shape = (self.tile_m, self.tile_hdim)
             acc_shape = tiled_mma.partition_shape_C(
                 tile_shape if const_expr(not dQ_swapAB) else tile_shape[::-1]
             )
             acc = cute.make_fragment(acc_shape, cutlass.Float32)
             assert cute.size(acc) == cute.size(tdQsdQaccum)
-            tdQrdQaccum = s2r_thr_copy_dQaccum.retile(acc)
-            # Somehow even after retiling the layouts of tdQsdQaccum and tdQrdQaccum are different.
-            # So we have to do a for loop to copy
-            # cute.copy(s2r_tiled_copy_dQaccum, tdQsdQaccum, tdQrdQaccum)
-            # print(acc)
-            # print(tdQsdQaccum)  # ((1, 1), 64)
-            # print(tdQrdQaccum)  # ((1, 4), 4, 4)
-            for i in cutlass.range(cute.size(tdQsdQaccum), unroll_full=True):
-                tdQrdQaccum[i] = tdQsdQaccum[i]
+            tdQrdQaccum = cute.make_tensor(acc.iterator, cute.make_layout(tdQsdQaccum.shape))
+            cute.autovec_copy(tdQsdQaccum, tdQrdQaccum)
             # Convert tdQrdQaccum from fp32 to fp16/bf16
             rdQ = cute.make_fragment_like(acc, self.dtype)
             rdQ.store((acc.load() * scale).to(self.dtype))
@@ -362,8 +364,6 @@ class FlashAttentionBackwardPostprocess:
                 sdQ if const_expr(not self.dQ_swapAB) else sdQt
             )
             cute.copy(smem_copy_atom_dQ, taccdQrdQ, taccdQsdQ)
-            # print(taccdQrdQ)
-            # print(taccdQsdQ)
 
             # Step 4: Copy dQ from smem to register to prepare for coalesced write to gmem
             gmem_thr_copy_dQ = gmem_tiled_copy_dQ.get_slice(tidx)
