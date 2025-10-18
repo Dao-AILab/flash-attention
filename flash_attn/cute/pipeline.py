@@ -8,8 +8,41 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
 from cutlass.cutlass_dsl import if_generate
-from cutlass.pipeline import PipelineAsync, PipelineState, CooperativeGroup, pipeline_init_wait
+from cutlass.pipeline import PipelineAsync, PipelineState, Agent, CooperativeGroup
 from cutlass.pipeline import PipelineUserType, PipelineOp
+from cutlass.pipeline import PipelineTmaAsync as PipelineTmaAsyncOg
+
+
+# We deviate from cute-dsl implementation to use cute.arch.cluster_arrive_relaxed
+def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
+    """
+    Fences the mbarrier init and syncs the threadblock or cluster
+    """
+    cute.arch.mbarrier_init_fence()
+
+    if cta_layout_vmnk is None or cute.size(cta_layout_vmnk) == 1:
+        # If not using clusters, sync the threadblock
+        _sync(Agent.ThreadBlock)
+    else:
+        # If using clusters, sync the cluster
+        _sync(Agent.ThreadBlockCluster)
+
+
+def _sync(group: Agent):
+    """
+    Syncs all threads within an agent.
+    """
+    if group is Agent.Thread:
+        raise NotImplementedError("Error: Not supported.")
+    elif group is Agent.ThreadBlock:
+        cute.arch.sync_threads()
+    elif group is Agent.ThreadBlockCluster:
+        cute.arch.cluster_arrive_relaxed()
+        cute.arch.cluster_wait()
+    else:
+        assert (
+            False
+        ), "Error: No explicit sync instruction exists. Please use barriers (named / mbarrier) instead."
 
 
 class PipelineStateSimple:
@@ -89,7 +122,7 @@ def make_pipeline_state(type: PipelineUserType, stages: int):
 
 
 @dataclass(frozen=True)
-class PipelineTmaAsyncNoCluster(PipelineAsync):
+class PipelineTmaAsync(PipelineTmaAsyncOg):
     """
     If size(ClusterShape) == 1, PipelineTmaAsync has all threads
     signaling the barrier during consumer_release. This causes a perf regression in FA3
@@ -103,12 +136,15 @@ class PipelineTmaAsyncNoCluster(PipelineAsync):
 
     @staticmethod
     def create(
-        barrier_storage: cute.Pointer,
-        num_stages: Int32,
+        *,
+        num_stages: int,
         producer_group: CooperativeGroup,
         consumer_group: CooperativeGroup,
         tx_count: int,
-        init_wait: cutlass.Constexpr[bool] = True,
+        barrier_storage: cute.Pointer = None,
+        cta_layout_vmnk: Optional[cute.Layout] = None,
+        tidx: Optional[Int32] = None,
+        init_wait: cutlass.Constexpr[bool] = True
     ):
         """
         This helper function computes any necessary attributes and returns an instance of PipelineTmaAsync.
@@ -116,33 +152,59 @@ class PipelineTmaAsyncNoCluster(PipelineAsync):
         :type barrier_storage: cute.Pointer
         :param num_stages: Number of buffer stages for this pipeline
         :type num_stages: Int32
-        :param producer_group: CooperativeGroup for the producer agent
+        :param producer_group: `CooperativeGroup` for the producer agent
         :type producer_group: CooperativeGroup
-        :param consumer_group: CooperativeGroup for the consumer agent
+        :param consumer_group: `CooperativeGroup` for the consumer agent
         :type consumer_group: CooperativeGroup
         :param tx_count: Number of bytes expected to be written to the transaction barrier for one stage
         :type tx_count: int
+        :param cta_layout_vmnk: Layout of the cluster shape
+        :type cta_layout_vmnk: cute.Layout | None
+        :param tidx: thread index to consumer async threads
+        :type tidx: Int32 | None
         """
+        if not isinstance(barrier_storage, cute.Pointer):
+            raise ValueError(
+                f"Expected barrier_storage to be a cute.Pointer, but got {type(barrier_storage)}"
+            )
+
         producer_type = PipelineOp.TmaLoad
         consumer_type = PipelineOp.AsyncThread
+
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
+
         sync_object_full = PipelineAsync._make_sync_object(
             barrier_storage.align(min_align=8), num_stages, producer, tx_count
         )
         sync_object_empty = PipelineAsync._make_sync_object(
             barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
         )
-        dst_rank = None
+        if tidx is None:
+            tidx, _, _ = cute.arch.thread_idx()
+        if cta_layout_vmnk is None:
+            cta_layout_vmnk = cute.make_layout((1, 1, 1, 1))
+        if const_expr(cta_layout_vmnk is None or cute.size(cta_layout_vmnk) == 1):
+            dst_rank = None
+            is_signalling_thread = tidx % 128 == 0
+        else:
+            (
+                dst_rank,
+                is_signalling_thread,
+            ) = PipelineTmaAsync.init_empty_barrier_arrive_signal(cta_layout_vmnk, tidx)
+
         producer_mask = None
+
         if const_expr(init_wait):
             pipeline_init_wait()
-        return PipelineTmaAsyncNoCluster(
+
+        return PipelineTmaAsync(
             sync_object_full,
             sync_object_empty,
             num_stages,
             producer_mask,
             dst_rank,
+            is_signalling_thread,
         )
 
     def producer_acquire(
@@ -163,12 +225,6 @@ class PipelineTmaAsyncNoCluster(PipelineAsync):
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
             self.sync_object_full.arrive_and_expect_tx(state.index, tx_count)
-
-    def producer_commit(self, state: PipelineState):
-        """
-        TMA producer commit is a NOP. The transaction barrier signals the commit upon completion of the TMA.
-        """
-        pass
 
     def consumer_release(self, state: PipelineState):
         """

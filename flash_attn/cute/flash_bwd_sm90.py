@@ -498,7 +498,7 @@ class FlashAttentionBackwardSm90:
         pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread, self.num_mma_threads // self.num_threads_per_warp_group
         )
-        pipeline_Q = pipeline.PipelineTmaAsyncNoCluster.create(
+        pipeline_Q = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_ptr_Q.data_ptr(),
             num_stages=self.Q_stage,
             producer_group=pipeline_producer_group,
@@ -506,7 +506,7 @@ class FlashAttentionBackwardSm90:
             tx_count=self.tma_copy_bytes["Q"] + self.tma_copy_bytes["LSE"],
             init_wait=False,
         )
-        pipeline_dO = pipeline.PipelineTmaAsyncNoCluster.create(
+        pipeline_dO = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_ptr_dO.data_ptr(),
             num_stages=self.dO_stage,
             producer_group=pipeline_producer_group,
