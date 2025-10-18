@@ -119,9 +119,13 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
+                         nullptr, // cu_seqlen_q_ptr
+                         nullptr, // cu_seqlen_kv_ptr
                          seqlens_q.data_ptr(), // seqstart_q
                          seqlens_k.data_ptr(), // seqstart_k
                          nullptr,              // seqlen_kpads
+                         nullptr,              // seqstart_padded_q_ptr
+                         nullptr,              // seqstart_padded_k_ptr
                          total_q,
                          total_k,
                          b,

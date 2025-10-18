@@ -141,6 +141,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          dq_acc.data_ptr(), // dq_acc
                          seqlens_q.data_ptr(), // seqstart_q
                          seqlens_k.data_ptr(), // seqstart_k
+                         nullptr, // seqlen_q_ptr
                          nullptr, // seqlen_k_ptr
                          total_q,
                          total_k,
