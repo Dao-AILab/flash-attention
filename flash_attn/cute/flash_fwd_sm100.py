@@ -757,9 +757,6 @@ class FlashAttentionForwardSm100:
                 sQ,
                 sK,
                 sV,
-                sQ_layout.inner,
-                sK_layout.inner,
-                sV_layout.inner,
                 tStSs,
                 tOtOs,
                 tOrPs,
@@ -984,9 +981,6 @@ class FlashAttentionForwardSm100:
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
-        sQ_swizzle: cute.Swizzle,
-        sK_swizzle: cute.Swizzle,
-        sV_swizzle: cute.Swizzle,
         tStSs: Tuple[cute.Tensor, cute.Tensor],
         tOtOs: tuple[cute.Tensor],
         tOrPs: Tuple[cute.Tensor, cute.Tensor],
@@ -1012,7 +1006,7 @@ class FlashAttentionForwardSm100:
             partial(
                 sm100_utils.gemm_ptx_partial,
                 qk_mma_op, self.tmem_s_offset[stage], tSrQs[stage], sA=sQ[None, None, None, stage],
-                sA_swizzle=sQ_swizzle, sB_swizzle=sK_swizzle, zero_init=True
+                zero_init=True
             )
             for stage in range(2)
         ]
@@ -1020,7 +1014,7 @@ class FlashAttentionForwardSm100:
             partial(
                 sm100_utils.gemm_ptx_partial,
                 pv_mma_op, self.tmem_o_offset[stage if self.q_stage == 2 else 0], tOrPs[stage],
-                sA=None, sA_swizzle=None, sB_swizzle=sV_swizzle
+                sA=None
             )
             for stage in range(2)
         ]

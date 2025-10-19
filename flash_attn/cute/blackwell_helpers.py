@@ -7,6 +7,7 @@ from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import llvm
 
 import flash_attn.cute.mma_sm100_desc as sm100_desc
+from flash_attn.cute.utils import parse_swizzle_from_pointer
 
 
 @cute.jit
@@ -36,18 +37,16 @@ def gemm_ptx(
     tCrB: cute.Tensor,
     sA: Optional[cute.Tensor],
     sB: cute.Tensor,
-    sA_swizzle: Optional[cute.Swizzle],
-    sB_swizzle: cute.Swizzle,
     zero_init: bool | cutlass.Boolean = False,
 ) -> None:
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
     if cutlass.const_expr(not is_ts):
         assert sA is not None, "sA must be provided when a_src is not TMEM"
-        assert sA_swizzle is not None, "sA_swizzle must be provided when a_src is not TMEM"
     sA_layout = sA.layout if sA is not None else None
     sB_layout = sB.layout
     idesc: int = cutlass.const_expr(sm100_desc.mma_op_to_idesc(op))
     if cutlass.const_expr(not is_ts):
+        sA_swizzle = parse_swizzle_from_pointer(sA.iterator)
         smem_desc_base_a: int = cutlass.const_expr(sm100_desc.make_smem_desc_base(
             cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
             sA_swizzle,
@@ -59,6 +58,7 @@ def gemm_ptx(
     else:
         smem_desc_base_a = None
         smem_desc_base_a_lo, smem_desc_a_hi = None, None
+    sB_swizzle = parse_swizzle_from_pointer(sB.iterator)
     smem_desc_base_b: int = cutlass.const_expr(sm100_desc.make_smem_desc_base(
         cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
         sB_swizzle,
@@ -135,18 +135,16 @@ def gemm_ptx_loop(
     tCrB: cute.Tensor,
     sA: Optional[cute.Tensor],
     sB: cute.Tensor,
-    sA_swizzle: Optional[cute.Swizzle],
-    sB_swizzle: cute.Swizzle,
     zero_init: bool | cutlass.Boolean = False,
 ) -> None:
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
     if cutlass.const_expr(not is_ts):
         assert sA is not None, "sA must be provided when a_src is not TMEM"
-        assert sA_swizzle is not None, "sA_swizzle must be provided when a_src is not TMEM"
     sA_layout = sA.layout if sA is not None else tCrA.layout
     sB_layout = sB.layout
     idesc: int = cutlass.const_expr(sm100_desc.mma_op_to_idesc(op))
     if cutlass.const_expr(not is_ts):
+        sA_swizzle = parse_swizzle_from_pointer(sA.iterator)
         smem_desc_base_a: int = cutlass.const_expr(sm100_desc.make_smem_desc_base(
             cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
             sA_swizzle,
@@ -158,6 +156,7 @@ def gemm_ptx_loop(
     else:
         smem_desc_base_a = None
         smem_desc_base_a_lo, smem_desc_a_hi = None, None
+    sB_swizzle = parse_swizzle_from_pointer(sB.iterator)
     smem_desc_base_b: int = cutlass.const_expr(sm100_desc.make_smem_desc_base(
         cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
         sB_swizzle,
@@ -277,8 +276,6 @@ def gemm_ptx_partial(
     tCrB: cute.Tensor,
     sA: Optional[cute.Tensor],
     sB: cute.Tensor,
-    sA_swizzle: Optional[cute.Swizzle],
-    sB_swizzle: cute.Swizzle,
     mbar_ptr: Optional[cutlass.Pointer] = None,
     mbar_phase: Optional[cutlass.Int32] = None,
     zero_init: bool | cutlass.Boolean = False,
@@ -286,11 +283,11 @@ def gemm_ptx_partial(
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
     if cutlass.const_expr(not is_ts):
         assert sA is not None, "sA must be provided when a_src is not TMEM"
-        assert sA_swizzle is not None, "sA_swizzle must be provided when a_src is not TMEM"
     sA_layout = sA.layout if sA is not None else tCrA.layout
     sB_layout = sB.layout
     idesc: int = cutlass.const_expr(sm100_desc.mma_op_to_idesc(op))
     if cutlass.const_expr(not is_ts):
+        sA_swizzle = parse_swizzle_from_pointer(sA.iterator)
         smem_desc_base_a: int = cutlass.const_expr(sm100_desc.make_smem_desc_base(
             cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
             sA_swizzle,
@@ -302,6 +299,7 @@ def gemm_ptx_partial(
     else:
         smem_desc_base_a = None
         smem_desc_base_a_lo, smem_desc_a_hi = None, None
+    sB_swizzle = parse_swizzle_from_pointer(sB.iterator)
     smem_desc_base_b: int = cutlass.const_expr(sm100_desc.make_smem_desc_base(
         cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
         sB_swizzle,
@@ -329,8 +327,8 @@ def gemm_ptx_partial(
             None,
             [
                 # acc.iterator.toint().ir_value(),
-                cutlass.Int32(smem_desc_start_a_lo).ir_value(),
-                cutlass.Int32(smem_desc_start_b_lo).ir_value(),
+                cutlass.Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
+                cutlass.Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
                 cutlass.Int32(not zero_init).ir_value(),
             ],
             "{\n\t"
@@ -370,8 +368,8 @@ def gemm_ptx_partial(
         )
     else:
         input_args = [
-            cutlass.Int32(tCrA[None, None, 0].iterator.toint()).ir_value(),
-            cutlass.Int32(smem_desc_start_b_lo).ir_value(),
+            cutlass.Int32(cute.arch.make_warp_uniform(tCrA[None, None, 0].iterator.toint())).ir_value(),
+            cutlass.Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
             cutlass.Int32(not zero_init).ir_value(),
         ]
         if cutlass.const_expr(mbar_ptr is not None):
