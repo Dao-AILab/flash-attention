@@ -142,7 +142,7 @@ class FlashAttentionBackwardSm100:
         self.dS_stage = 1
         self.dQaccum_mma_stage = 1
         self.sdQaccum_stage = 2
-        self.psum_stage = 1
+        self.dpsum_stage = 1
         self.p_tmem_stage = 1
         self.sdKdVaccum_stage = 2
 
@@ -253,8 +253,8 @@ class FlashAttentionBackwardSm100:
             shape=(self.tile_m, self.lse_stage),
             stride=(1, cute.round_up(self.tile_m, 64)),
         )
-        self.sPsum_layout = cute.make_layout(
-            shape=(self.tile_m, self.psum_stage),
+        self.sdPsum_layout = cute.make_layout(
+            shape=(self.tile_m, self.dpsum_stage),
             stride=(1, cute.round_up(self.tile_m, 64)),
         )
 
@@ -266,7 +266,7 @@ class FlashAttentionBackwardSm100:
         mV: cute.Tensor,
         mdO: cute.Tensor,
         mLSE: cute.Tensor,
-        mPsum: cute.Tensor,
+        mdPsum: cute.Tensor,
         mdQaccum: cute.Tensor,
         mdK: cute.Tensor,
         mdV: cute.Tensor,
@@ -281,7 +281,7 @@ class FlashAttentionBackwardSm100:
         self.v_dtype = mV.element_type
         self.do_dtype = mdO.element_type
         self.lse_dtype = mLSE.element_type
-        self.psum_dtype = mPsum.element_type
+        self.dpsum_dtype = mdPsum.element_type
         self.dqaccum_dtype = mdQaccum.element_type
         self.dk_dtype = mdK.element_type
         self.dv_dtype = mdV.element_type
@@ -295,9 +295,9 @@ class FlashAttentionBackwardSm100:
         mQ, mK, mV, mdO, mdK, mdV = [
             utils.select(t, mode=layout_transpose) for t in (mQ, mK, mV, mdO, mdK, mdV)
         ]
-        LSE_Psum_dQaccum_transpose = [2, 1, 0]  # (b, n, s) --> (s, n, b)
-        mLSE, mPsum, mdQaccum = [
-            utils.select(t, mode=LSE_Psum_dQaccum_transpose) for t in (mLSE, mPsum, mdQaccum)
+        LSE_dPsum_dQaccum_transpose = [2, 1, 0]  # (b, n, s) --> (s, n, b)
+        mLSE, mdPsum, mdQaccum = [
+            utils.select(t, mode=LSE_dPsum_dQaccum_transpose) for t in (mLSE, mdPsum, mdQaccum)
         ]
         dO_transpose = [1, 0, 2, 3]
         mdO = utils.select(mdO, mode=dO_transpose)
@@ -405,7 +405,6 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_SdP,
             self.cluster_layout_vmnk.shape,
         )
-
         tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_B(
             tma_load_op,
             mQ,
@@ -414,7 +413,6 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_SdP,
             self.cluster_layout_vmnk.shape,
         )
-
         # dV += P @ dO
         tma_atom_dO, tma_tensor_dO = cute.nvgpu.make_tiled_tma_atom_B(
             tma_load_op,
@@ -424,13 +422,6 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_dV,
             self.cluster_layout_vmnk.shape,
         )
-        tma_atom_Psum, tma_tensor_Psum = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            tma_load_op,
-            mPsum,
-            cute.make_layout((self.tile_m)),
-            (self.tile_m,),
-        )
-
         # dP = V @ dO.T
         tma_atom_V, tma_tensor_V = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
@@ -486,8 +477,8 @@ class FlashAttentionBackwardSm100:
             do_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.do_stage]
             lse_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.k_stage]
             lse_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.k_stage]
-            psum_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.psum_stage]
-            psum_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.psum_stage]
+            dpsum_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.dpsum_stage]
+            dpsum_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.dpsum_stage]
             s_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.s_stage]
             dP_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dP_stage]
             p_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.s_stage]
@@ -526,8 +517,8 @@ class FlashAttentionBackwardSm100:
                 cute.struct.MemRange[self.lse_dtype, cute.cosize(self.sLSE_layout)],
                 128,
             ]
-            sPsum: cute.struct.Align[
-                cute.struct.MemRange[self.psum_dtype, cute.cosize(self.sPsum_layout)],
+            sdPsum: cute.struct.Align[
+                cute.struct.MemRange[self.dpsum_dtype, cute.cosize(self.sdPsum_layout)],
                 128,
             ]
             sdQaccum: cute.struct.Align[
@@ -544,7 +535,7 @@ class FlashAttentionBackwardSm100:
             tma_tensor_K,
             tma_tensor_V,
             mLSE,
-            tma_tensor_Psum,
+            mdPsum,
             tma_tensor_dO,
             mdV,
             mdK,
@@ -557,7 +548,7 @@ class FlashAttentionBackwardSm100:
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
-            tma_atom_Psum,
+            # tma_atom_Psum,
             tma_atom_dO,
             tma_atom_dV,
             tma_atom_dK,
@@ -566,7 +557,7 @@ class FlashAttentionBackwardSm100:
             self.sK_layout,
             self.sV_layout,
             self.sLSE_layout,
-            self.sPsum_layout,
+            self.sdPsum_layout,
             self.sdO_layout,
             self.sdOt_layout,
             self.sdSt_layout,
@@ -598,7 +589,7 @@ class FlashAttentionBackwardSm100:
         mK: cute.Tensor,
         mV: cute.Tensor,
         mLSE: cute.Tensor,
-        mPsum: cute.Tensor,
+        mdPsum: cute.Tensor,
         mdO: cute.Tensor,
         mdV: cute.Tensor,
         mdK: cute.Tensor,
@@ -611,7 +602,6 @@ class FlashAttentionBackwardSm100:
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
-        tma_atom_Psum: cute.CopyAtom,
         tma_atom_dO: cute.CopyAtom,
         tma_atom_dV: Optional[cute.CopyAtom],
         tma_atom_dK: Optional[cute.CopyAtom],
@@ -620,7 +610,7 @@ class FlashAttentionBackwardSm100:
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
         sLSE_layout: cute.Layout,
-        sPsum_layout: cute.Layout,
+        sdPsum_layout: cute.Layout,
         sdO_layout: cute.ComposedLayout,
         sdOt_layout: cute.ComposedLayout,
         sdSt_layout: cute.ComposedLayout,
@@ -645,7 +635,6 @@ class FlashAttentionBackwardSm100:
                 cpasync.prefetch_descriptor(tma_atom_Q)
                 cpasync.prefetch_descriptor(tma_atom_K)
                 cpasync.prefetch_descriptor(tma_atom_V)
-                cpasync.prefetch_descriptor(tma_atom_Psum)
                 cpasync.prefetch_descriptor(tma_atom_dO)
                 if const_expr(tma_atom_dV is not None):
                     cpasync.prefetch_descriptor(tma_atom_dV)
@@ -661,8 +650,8 @@ class FlashAttentionBackwardSm100:
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
         lse_full_mbar_ptr = storage.lse_full_mbar_ptr.data_ptr()
         lse_empty_mbar_ptr = storage.lse_empty_mbar_ptr.data_ptr()
-        psum_full_mbar_ptr = storage.psum_full_mbar_ptr.data_ptr()
-        psum_empty_mbar_ptr = storage.psum_empty_mbar_ptr.data_ptr()
+        dpsum_full_mbar_ptr = storage.dpsum_full_mbar_ptr.data_ptr()
+        dpsum_empty_mbar_ptr = storage.dpsum_empty_mbar_ptr.data_ptr()
         dQaccum_reduce_mbar_ptr = storage.dQaccum_reduce_mbar_ptr.data_ptr()
 
         if warp_idx == self.load_warp_id:
@@ -673,8 +662,8 @@ class FlashAttentionBackwardSm100:
             )
             cute.arch.mbarrier_init(lse_full_mbar_ptr, len([self.compute_warp_ids]))
             cute.arch.mbarrier_init(lse_empty_mbar_ptr, len([self.compute_warp_ids]))
-            cute.arch.mbarrier_init(psum_full_mbar_ptr, len([self.compute_warp_ids]))
-            cute.arch.mbarrier_init(psum_empty_mbar_ptr, len([self.compute_warp_ids]))
+            cute.arch.mbarrier_init(dpsum_full_mbar_ptr, len([self.compute_warp_ids]))
+            cute.arch.mbarrier_init(dpsum_empty_mbar_ptr, len([self.compute_warp_ids]))
             cute.arch.mbarrier_init(dQaccum_reduce_mbar_ptr, 1)
 
         pipeline_producer_group = cutlass.pipeline.CooperativeGroup(
@@ -795,9 +784,9 @@ class FlashAttentionBackwardSm100:
             cute.make_layout(shape=(self.tile_m, self.tile_n, self.lse_stage), stride=(0, 1, 0))
         )
 
-        sPsum_load = storage.sPsum.get_tensor(sPsum_layout)
-        sPsum_mma = storage.sPsum.get_tensor(
-            cute.make_layout(shape=(self.tile_m, self.tile_n, self.psum_stage), stride=(0, 1, 0))
+        sdPsum_load = storage.sdPsum.get_tensor(sdPsum_layout)
+        sdPsum_mma = storage.sdPsum.get_tensor(
+            cute.make_layout(shape=(self.tile_m, self.tile_n, self.dpsum_stage), stride=(0, 1, 0))
         )
 
         sdV = storage.sdO.get_tensor(
@@ -900,24 +889,23 @@ class FlashAttentionBackwardSm100:
                 mK,
                 mV,
                 mLSE,
-                mPsum,
+                mdPsum,
                 mdO,
                 sQ,
                 sK,
                 sV,
                 sLSE_load,
-                sPsum_load,
+                sdPsum_load,
                 sdO,
                 tma_atom_Q,
                 tma_atom_K,
                 tma_atom_V,
-                tma_atom_Psum,
                 tma_atom_dO,
                 pipeline_q,
                 lse_full_mbar_ptr,
                 lse_empty_mbar_ptr,
-                psum_full_mbar_ptr,
-                psum_empty_mbar_ptr,
+                dpsum_full_mbar_ptr,
+                dpsum_empty_mbar_ptr,
                 pipeline_do,
                 k_full_mbar_ptr,
                 v_full_mbar_ptr,
@@ -997,7 +985,7 @@ class FlashAttentionBackwardSm100:
                 thr_mma_dsq,
                 tStS,
                 sLSE_mma,
-                sPsum_mma,
+                sdPsum_mma,
                 tdVtdV,
                 tdKtdK,
                 mdV,
@@ -1007,8 +995,8 @@ class FlashAttentionBackwardSm100:
                 tdPtdP,
                 lse_full_mbar_ptr,
                 lse_empty_mbar_ptr,
-                psum_full_mbar_ptr,
-                psum_empty_mbar_ptr,
+                dpsum_full_mbar_ptr,
+                dpsum_empty_mbar_ptr,
                 pipeline_s,
                 pipeline_p,
                 pipeline_dS,
@@ -1063,24 +1051,23 @@ class FlashAttentionBackwardSm100:
         mK: cute.Tensor,
         mV: cute.Tensor,
         mLSE: cute.Tensor,
-        mPsum: cute.Tensor,
+        mdPsum: cute.Tensor,
         mdO: cute.Tensor,
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
         sLSE: cute.Tensor,
-        sPsum: cute.Tensor,
+        sdPsum: cute.Tensor,
         sdO: cute.Tensor,
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
-        tma_atom_Psum: cute.CopyAtom,
         tma_atom_dO: cute.CopyAtom,
         pipeline_q: PipelineAsync,
         lse_full_mbar_ptr: cute.Pointer,
         lse_empty_mbar_ptr: cute.Pointer,
-        psum_full_mbar_ptr: cute.Pointer,
-        psum_empty_mbar_ptr: cute.Pointer,
+        dpsum_full_mbar_ptr: cute.Pointer,
+        dpsum_empty_mbar_ptr: cute.Pointer,
         pipeline_do: PipelineAsync,
         k_full_mbar_ptr: cute.Pointer,
         v_full_mbar_ptr: cute.Pointer,
@@ -1111,7 +1098,7 @@ class FlashAttentionBackwardSm100:
             mV_cur = mV[None, None, head_idx_kv, batch_idx]
             mdO_cur = mdO[None, None, head_idx, batch_idx]
             mLSE_cur = mLSE[None, head_idx, batch_idx]
-            mPsum_cur = mPsum[None, head_idx, batch_idx]
+            mPsum_cur = mdPsum[None, head_idx, batch_idx]
 
             gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_kq, mode=[0, 2]), (n_block, 0))
             tSgK = thr_mma_kq.partition_A(gK)
@@ -1123,7 +1110,7 @@ class FlashAttentionBackwardSm100:
             tSgQ = thr_mma_kq.partition_B(gQ)
 
             gLSE = cute.local_tile(mLSE_cur, (self.tile_n,), (None,))
-            gPsum = cute.local_tile(mPsum_cur, (self.tile_n,), (None,))
+            gdPsum = cute.local_tile(mPsum_cur, (self.tile_n,), (None,))
 
             gdO = cute.local_tile(mdO_cur, cute.select(self.mma_tiler_pdo, mode=[1, 2]), (0, None))
             tdVgdO = thr_mma_pdo.partition_B(gdO)
@@ -1157,13 +1144,8 @@ class FlashAttentionBackwardSm100:
                 cute.group_modes(tdVgdO, 0, 3),
             )
             load_LSE = copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE)
-            tPsumsPsum, tPsumgPsum = cpasync.tma_partition(
-                tma_atom_Psum,
-                0,
-                cute.make_layout(1),
-                sPsum,
-                gPsum,
-            )
+            load_dPsum = copy_utils.cpasync_bulk_get_copy_fn(gdPsum, sdPsum)
+
             # K
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(k_full_mbar_ptr, self.tma_copy_bytes["K"])
@@ -1204,20 +1186,15 @@ class FlashAttentionBackwardSm100:
             pipeline_do.producer_commit(do_producer_state)
             do_producer_state.advance()
 
-            # Psum
+            # dPsum
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(
-                    psum_full_mbar_ptr, self.tma_copy_bytes["dPsum"]
+                    dpsum_full_mbar_ptr, self.tma_copy_bytes["dPsum"]
                 )
+                load_dPsum(src_idx=m_block_max - 1, dst_idx=0, tma_bar_ptr=dpsum_full_mbar_ptr)
 
-            cute.copy(
-                tma_atom_Psum,
-                tPsumgPsum[None, m_block_max - 1],
-                tPsumsPsum[None, 0],
-                tma_bar_ptr=psum_full_mbar_ptr,
-            )
             lse_empty_consumer_phase = cute.Int32(0)
-            psum_empty_consumer_phase = cute.Int32(0)
+            dpsum_empty_consumer_phase = cute.Int32(0)
 
             for i in cutlass.range(m_block_max - m_block_min - 1, unroll=1):
                 m_block = m_block_max - 2 - i
@@ -1232,7 +1209,6 @@ class FlashAttentionBackwardSm100:
                 # LSE
                 cute.arch.mbarrier_wait(lse_empty_mbar_ptr, lse_empty_consumer_phase)
                 lse_empty_consumer_phase ^= 1
-
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         lse_full_mbar_ptr, self.tma_copy_bytes["LSE"]
@@ -1251,21 +1227,14 @@ class FlashAttentionBackwardSm100:
                 pipeline_do.producer_commit(do_producer_state)
                 do_producer_state.advance()
 
-                # Psum
-                cute.arch.mbarrier_wait(psum_empty_mbar_ptr, psum_empty_consumer_phase)
-                psum_empty_consumer_phase ^= 1
-
+                # dPsum
+                cute.arch.mbarrier_wait(dpsum_empty_mbar_ptr, dpsum_empty_consumer_phase)
+                dpsum_empty_consumer_phase ^= 1
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
-                        psum_full_mbar_ptr, self.tma_copy_bytes["dPsum"]
+                        dpsum_full_mbar_ptr, self.tma_copy_bytes["dPsum"]
                     )
-
-                cute.copy(
-                    tma_atom_Psum,
-                    tPsumgPsum[None, m_block],
-                    tPsumsPsum[None, 0],
-                    tma_bar_ptr=psum_full_mbar_ptr,
-                )
+                    load_dPsum(src_idx=m_block, dst_idx=0, tma_bar_ptr=dpsum_full_mbar_ptr)
 
             pipeline_q.producer_tail(q_producer_state)
             pipeline_do.producer_tail(do_producer_state)
@@ -1669,8 +1638,8 @@ class FlashAttentionBackwardSm100:
         tdPtdP: cute.Tensor,
         lse_full_mbar_ptr: cute.Pointer,
         lse_empty_mbar_ptr: cute.Pointer,
-        psum_full_mbar_ptr: cute.Pointer,
-        psum_empty_mbar_ptr: cute.Pointer,
+        dpsum_full_mbar_ptr: cute.Pointer,
+        dpsum_empty_mbar_ptr: cute.Pointer,
         pipeline_s: PipelineAsync,
         pipeline_p: PipelineAsync,
         pipeline_dS: PipelineAsync,
@@ -1890,7 +1859,7 @@ class FlashAttentionBackwardSm100:
                 # dS.T = P.T * (dP.T - D)
                 # ---------------------------------------------
                 if warp_idx == self.compute_warp_ids[0]:
-                    cute.arch.mbarrier_wait(psum_full_mbar_ptr, psum_consumer_phase)
+                    cute.arch.mbarrier_wait(dpsum_full_mbar_ptr, psum_consumer_phase)
                 psum_consumer_phase ^= 1
 
                 pipeline_dP.consumer_wait(dP_consumer_state)
@@ -1989,7 +1958,7 @@ class FlashAttentionBackwardSm100:
 
                 if warp_idx == self.compute_warp_ids[0]:
                     with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(psum_empty_mbar_ptr)
+                        cute.arch.mbarrier_arrive(dpsum_empty_mbar_ptr)
 
             if const_expr(not self.use_tma_store):
                 self.epilogue_dKV(
