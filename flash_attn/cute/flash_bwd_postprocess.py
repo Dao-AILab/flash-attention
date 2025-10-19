@@ -395,7 +395,7 @@ class FlashAttentionBackwardPostprocess_sm100(FlashAttentionBackwardPostprocess)
         self,
         dtype: Type[cutlass.Numeric],
         head_dim: int,
-        m_block_size: int = 128,
+        tile_m: int = 128,
         num_threads: int = 256,
         AtomLayoutMdQ: int = 1,
         dQ_swapAB: bool = False,
@@ -404,7 +404,7 @@ class FlashAttentionBackwardPostprocess_sm100(FlashAttentionBackwardPostprocess)
             dtype=dtype,
             head_dim=head_dim,
             arch=90,  # tmp dummy placement for now
-            tile_m=m_block_size,
+            tile_m=tile_m,
             num_threads=num_threads,
             AtomLayoutMdQ=AtomLayoutMdQ,
             dQ_swapAB=dQ_swapAB,
