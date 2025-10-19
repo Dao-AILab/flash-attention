@@ -673,7 +673,7 @@ class FlashAttentionBackwardSm100:
             cutlass.pipeline.Agent.Thread, len([self.mma_warp_id])
         )
 
-        pipeline_q = cutlass.pipeline.PipelineTmaUmma.create(
+        pipeline_Q = cutlass.pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.q_mbar_ptr.data_ptr(),
             num_stages=self.q_stage,
             producer_group=pipeline_producer_group,
@@ -681,7 +681,7 @@ class FlashAttentionBackwardSm100:
             tx_count=self.tma_copy_bytes["Q"],
         )
 
-        pipeline_do = cutlass.pipeline.PipelineTmaUmma.create(
+        pipeline_dO = cutlass.pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.do_mbar_ptr.data_ptr(),
             num_stages=self.do_stage,
             producer_group=pipeline_producer_group,
@@ -901,12 +901,12 @@ class FlashAttentionBackwardSm100:
                 tma_atom_K,
                 tma_atom_V,
                 tma_atom_dO,
-                pipeline_q,
+                pipeline_Q,
                 lse_full_mbar_ptr,
                 lse_empty_mbar_ptr,
                 dpsum_full_mbar_ptr,
                 dpsum_empty_mbar_ptr,
-                pipeline_do,
+                pipeline_dO,
                 k_full_mbar_ptr,
                 v_full_mbar_ptr,
                 block_info,
@@ -950,8 +950,8 @@ class FlashAttentionBackwardSm100:
                 tdKtdK,
                 tdPtdP,
                 tdQtdQ,
-                pipeline_q,
-                pipeline_do,
+                pipeline_Q,
+                pipeline_dO,
                 pipeline_s,
                 pipeline_p,
                 pipeline_dS,
@@ -1063,25 +1063,22 @@ class FlashAttentionBackwardSm100:
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
         tma_atom_dO: cute.CopyAtom,
-        pipeline_q: PipelineAsync,
+        pipeline_Q: PipelineAsync,
         lse_full_mbar_ptr: cute.Pointer,
         lse_empty_mbar_ptr: cute.Pointer,
         dpsum_full_mbar_ptr: cute.Pointer,
         dpsum_empty_mbar_ptr: cute.Pointer,
-        pipeline_do: PipelineAsync,
+        pipeline_dO: PipelineAsync,
         k_full_mbar_ptr: cute.Pointer,
         v_full_mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
-        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        tidx = cute.arch.thread_idx()[0]
-
-        q_producer_state = cutlass.pipeline.make_pipeline_state(
+        producer_state_Q = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.q_stage
         )
-        do_producer_state = cutlass.pipeline.make_pipeline_state(
+        producer_state_dO = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.do_stage
         )
 
@@ -1089,7 +1086,6 @@ class FlashAttentionBackwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx = work_tile.tile_idx
-
             seqlen = SeqlenInfoCls(batch_idx)
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
             head_idx_kv = head_idx // self.qhead_per_kvhead
@@ -1129,20 +1125,12 @@ class FlashAttentionBackwardSm100:
                 cute.group_modes(sV, 0, 3),
                 cute.group_modes(tdPgV, 0, 3),
             )
-            tQsQ, tQgQ = cpasync.tma_partition(
-                tma_atom_Q,
-                0,  # no multicast
-                cute.make_layout(1),
-                cute.group_modes(sQ, 0, 3),
-                cute.group_modes(tSgQ, 0, 3),
+            load_Q, _, _ = copy_utils.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ)
+            load_Q = copy_utils.tma_producer_copy_fn(load_Q, pipeline_Q)
+            load_dO, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_dO, 0, cute.make_layout(1), tdVgdO, sdO
             )
-            tdOsdO, tdOgdO = cpasync.tma_partition(
-                tma_atom_dO,
-                0,  # no multicast
-                cute.make_layout(1),
-                cute.group_modes(sdO, 0, 3),
-                cute.group_modes(tdVgdO, 0, 3),
-            )
+            load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_dO)
             load_LSE = copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE)
             load_dPsum = copy_utils.cpasync_bulk_get_copy_fn(gdPsum, sdPsum)
 
@@ -1153,15 +1141,10 @@ class FlashAttentionBackwardSm100:
 
             ###### Prologue
             # Q0
-            pipeline_q.producer_acquire(q_producer_state)
-            cute.copy(
-                tma_atom_Q,
-                tQgQ[None, m_block_max - 1],
-                tQsQ[None, q_producer_state.index],
-                tma_bar_ptr=pipeline_q.producer_get_barrier(q_producer_state),
-            )
-            pipeline_q.producer_commit(q_producer_state)
-            q_producer_state.advance()
+            pipeline_Q.producer_acquire(producer_state_Q)
+            load_Q(m_block_max - 1, producer_state=producer_state_Q)
+            pipeline_Q.producer_commit(producer_state_Q)
+            producer_state_Q.advance()
 
             # LSE
             with cute.arch.elect_one():
@@ -1176,15 +1159,10 @@ class FlashAttentionBackwardSm100:
             cute.copy(tma_atom_V, tVgV, tVsV[None, 0], tma_bar_ptr=v_full_mbar_ptr)
 
             # dO
-            pipeline_do.producer_acquire(do_producer_state)
-            cute.copy(
-                tma_atom_dO,
-                tdOgdO[None, m_block_max - 1],
-                tdOsdO[None, do_producer_state.index],
-                tma_bar_ptr=pipeline_do.producer_get_barrier(do_producer_state),
-            )
-            pipeline_do.producer_commit(do_producer_state)
-            do_producer_state.advance()
+            pipeline_dO.producer_acquire(producer_state_dO)
+            load_dO(m_block_max - 1, producer_state=producer_state_dO)
+            pipeline_dO.producer_commit(producer_state_dO)
+            producer_state_dO.advance()
 
             # dPsum
             with cute.arch.elect_one():
@@ -1198,14 +1176,11 @@ class FlashAttentionBackwardSm100:
 
             for i in cutlass.range(m_block_max - m_block_min - 1, unroll=1):
                 m_block = m_block_max - 2 - i
-
                 # Q
-                self.load_M_tile(
-                    tma_atom_Q, tQgQ, tQsQ, pipeline_q, m_block, producer_state=q_producer_state
-                )
-                pipeline_q.producer_commit(q_producer_state)
-                q_producer_state.advance()
-
+                pipeline_Q.producer_acquire(producer_state_Q)
+                load_Q(m_block, producer_state=producer_state_Q)
+                pipeline_Q.producer_commit(producer_state_Q)
+                producer_state_Q.advance()
                 # LSE
                 cute.arch.mbarrier_wait(lse_empty_mbar_ptr, lse_empty_consumer_phase)
                 lse_empty_consumer_phase ^= 1
@@ -1214,19 +1189,11 @@ class FlashAttentionBackwardSm100:
                         lse_full_mbar_ptr, self.tma_copy_bytes["LSE"]
                     )
                     load_LSE(src_idx=m_block, dst_idx=0, tma_bar_ptr=lse_full_mbar_ptr)
-
                 # dO
-                self.load_M_tile(
-                    tma_atom_dO,
-                    tdOgdO,
-                    tdOsdO,
-                    pipeline_do,
-                    m_block,
-                    producer_state=do_producer_state,
-                )
-                pipeline_do.producer_commit(do_producer_state)
-                do_producer_state.advance()
-
+                pipeline_dO.producer_acquire(producer_state_dO)
+                load_dO(m_block, producer_state=producer_state_dO)
+                pipeline_dO.producer_commit(producer_state_dO)
+                producer_state_dO.advance()
                 # dPsum
                 cute.arch.mbarrier_wait(dpsum_empty_mbar_ptr, dpsum_empty_consumer_phase)
                 dpsum_empty_consumer_phase ^= 1
@@ -1236,8 +1203,8 @@ class FlashAttentionBackwardSm100:
                     )
                     load_dPsum(src_idx=m_block, dst_idx=0, tma_bar_ptr=dpsum_full_mbar_ptr)
 
-            pipeline_q.producer_tail(q_producer_state)
-            pipeline_do.producer_tail(do_producer_state)
+            pipeline_Q.producer_tail(producer_state_Q)
+            pipeline_dO.producer_tail(producer_state_dO)
 
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
@@ -1271,8 +1238,8 @@ class FlashAttentionBackwardSm100:
         tdKtdK: cute.Tensor,
         tdPtdP: cute.Tensor,
         tdQacctdQacc: cute.Tensor,
-        pipeline_q: PipelineAsync,
-        pipeline_do: PipelineAsync,
+        pipeline_Q: PipelineAsync,
+        pipeline_dO: PipelineAsync,
         pipeline_s: PipelineAsync,
         pipeline_p: PipelineAsync,
         pipeline_dS: PipelineAsync,
@@ -1371,7 +1338,7 @@ class FlashAttentionBackwardSm100:
             # 3. dV = P @ dO
 
             # 1) S  = Q0 @ K.T
-            pipeline_q.consumer_wait(q_consumer_state)
+            pipeline_Q.consumer_wait(q_consumer_state)
             pipeline_s.producer_acquire(s_producer_state)
 
             num_k_phases = cute.size(tSrK, mode=[2])
@@ -1390,7 +1357,7 @@ class FlashAttentionBackwardSm100:
             s_producer_state.advance()
 
             # 2) dP = V @ dO.T
-            pipeline_do.consumer_wait(do_consumer_state)
+            pipeline_dO.consumer_wait(do_consumer_state)
             pipeline_dP.producer_acquire(dP_producer_state)
 
             pipeline_dQaccum.producer_acquire(dQaccum_producer_state)
@@ -1422,7 +1389,7 @@ class FlashAttentionBackwardSm100:
                 )
             pipeline_p.consumer_release(p_consumer_state)
             p_consumer_state.advance()
-            pipeline_do.consumer_release(do_consumer_state)
+            pipeline_dO.consumer_release(do_consumer_state)
             do_consumer_state.advance()
             # -----------------------------------------------------------
             ###### MAIN LOOP
@@ -1435,7 +1402,7 @@ class FlashAttentionBackwardSm100:
 
             for i in cutlass.range(m_block_max - m_block_min - 1, unroll=1):
                 # 1) S = K @ Q_i
-                pipeline_q.consumer_wait(q_consumer_state)
+                pipeline_Q.consumer_wait(q_consumer_state)
                 pipeline_s.producer_acquire(s_producer_state)
                 #'''
                 for kphase_idx in cutlass.range_constexpr(num_k_phases, unroll=1):
@@ -1482,13 +1449,13 @@ class FlashAttentionBackwardSm100:
                     )
                     accumulate_dK = True
 
-                pipeline_q.consumer_release(q_dk_consumer_state)
+                pipeline_Q.consumer_release(q_dk_consumer_state)
                 q_dk_consumer_state.advance()
                 pipeline_dS.consumer_release(dS_consumer_state)
                 dS_consumer_state.advance()
 
                 # 4) dP = V @ dO.T
-                pipeline_do.consumer_wait(do_consumer_state)
+                pipeline_dO.consumer_wait(do_consumer_state)
 
                 pipeline_dQaccum.producer_acquire(dQaccum_producer_state)
 
@@ -1520,7 +1487,7 @@ class FlashAttentionBackwardSm100:
 
                 pipeline_p.consumer_release(p_consumer_state)
                 p_consumer_state.advance()
-                pipeline_do.consumer_release(do_consumer_state)
+                pipeline_dO.consumer_release(do_consumer_state)
                 do_consumer_state.advance()
 
             pipeline_dV.producer_acquire(dV_producer_state)
@@ -1566,7 +1533,7 @@ class FlashAttentionBackwardSm100:
                 )
             pipeline_dQaccum.producer_commit(dQaccum_producer_state)
             dQaccum_producer_state.advance()
-            pipeline_q.consumer_release(q_dk_consumer_state)
+            pipeline_Q.consumer_release(q_dk_consumer_state)
             q_dk_consumer_state.advance()
             pipeline_dS.consumer_release(dS_consumer_state)
             dS_consumer_state.advance()
