@@ -1,3 +1,4 @@
+# Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
 import math
 from typing import Callable, Optional
 from functools import partial
@@ -7,45 +8,25 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
-from cutlass.cute.nvgpu import cpasync
-import cutlass.cute.nvgpu.tcgen05 as tcgen05
-
+from cutlass.utils import LayoutEnum
+from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
+from cutlass.pipeline import PipelineAsync
+
+from flash_attn.cute import utils
+from flash_attn.cute import copy_utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
-
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     ParamsBase,
 )
-from cutlass.pipeline import PipelineAsync
 
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import dsl_user_op
-
-from cutlass._mlir.dialects import nvvm
-
-from flash_attn.cute import barrier
+# from flash_attn.cute import barrier
+from flash_attn.cute import named_barrier as barrier  # TODO: temp, to make linter pass
 from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
-
-
-@dsl_user_op
-def tma_reduce_add_bulk_f32(
-    smem_ptr: cute.Pointer, gmem_ptr: cute.Pointer, store_bytes: cutlass.Int32, *, loc=None, ip=None
-):
-    cute.make_mma_atom
-    smem_u32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
-    llvm.inline_asm(
-        None,
-        [gmem_ptr.llvm_ptr, smem_u32, store_bytes.ir_value()],
-        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;",
-        "l,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
 
 
 class FlashAttentionBackwardSm100:
@@ -241,10 +222,10 @@ class FlashAttentionBackwardSm100:
             mdK_semaphore = None
             mdV_semaphore = None
 
-        self.q_major_mode = cutlass.utils.LayoutEnum.from_tensor(mQ).mma_major_mode()
-        self.k_major_mode = cutlass.utils.LayoutEnum.from_tensor(mK).mma_major_mode()
-        self.v_major_mode = cutlass.utils.LayoutEnum.from_tensor(mV).mma_major_mode()
-        self.do_major_mode = cutlass.utils.LayoutEnum.from_tensor(mdO).mma_major_mode()
+        self.q_major_mode = LayoutEnum.from_tensor(mQ).mma_major_mode()
+        self.k_major_mode = LayoutEnum.from_tensor(mK).mma_major_mode()
+        self.v_major_mode = LayoutEnum.from_tensor(mV).mma_major_mode()
+        self.do_major_mode = LayoutEnum.from_tensor(mdO).mma_major_mode()
 
         self._setup_attributes()
         cta_group = tcgen05.CtaGroup.ONE
@@ -390,8 +371,8 @@ class FlashAttentionBackwardSm100:
             stride=(1, cute.round_up(self.tile_m, 64)),
         )
 
-        self.mdK_layout_enum = cutlass.utils.LayoutEnum.from_tensor(mdK)
-        self.mdV_layout_enum = cutlass.utils.LayoutEnum.from_tensor(mdV)
+        self.mdK_layout_enum = LayoutEnum.from_tensor(mdK)
+        self.mdV_layout_enum = LayoutEnum.from_tensor(mdV)
         self.dK_major_mode = self.mdK_layout_enum.mma_major_mode()
         self.dV_major_mode = self.mdV_layout_enum.mma_major_mode()
         if const_expr(self.dK_major_mode != tcgen05.OperandMajorMode.K):
@@ -1825,13 +1806,6 @@ class FlashAttentionBackwardSm100:
 
         lse_consumer_phase = psum_consumer_phase = cute.Int32(0)
 
-        sub_packed_f32x2 = partial(
-            cute.arch.calc_packed_f32x2_op,
-            src_c=None,
-            calc_func=nvvm.sub_packed_f32x2,
-            rnd=nvvm.RoundingModeKind.RN,
-        )
-
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -2062,7 +2036,7 @@ class FlashAttentionBackwardSm100:
                             own1, offset=j, mask=FULL, mask_and_clamp=MAC
                         )
 
-                        tdPrdP_t2r[j, 0, 0], tdPrdP_t2r[j + 1, 0, 0] = sub_packed_f32x2(
+                        tdPrdP_t2r[j, 0, 0], tdPrdP_t2r[j + 1, 0, 0] = utils.sub_packed_f32x2(
                             (tdPrdP_t2r[j, 0, 0], tdPrdP_t2r[j + 1, 0, 0]), (psum_j, psum_j1)
                         )
 
@@ -2287,7 +2261,7 @@ class FlashAttentionBackwardSm100:
                             (g_stage_index_elems,), mdQaccum_cur
                         ).iterator
 
-                        tma_reduce_add_bulk_f32(smem_ptr, gmem_row_ptr, store_bytes)
+                        copy_utils.cpasync_reduce_bulk_add_f32(smem_ptr, gmem_row_ptr, store_bytes)
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(1, read=read_flag)
 
