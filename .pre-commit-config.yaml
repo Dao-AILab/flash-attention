@@ -17,9 +17,7 @@ repos:
             flash_fwd_sm100|
             hopper_helpers|
             interface|
-            mma_sm100_desc|
             pack_gqa|
-            seqlen_info|
             testing|
             tile_scheduler|
             utils
