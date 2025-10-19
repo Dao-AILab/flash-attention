@@ -11,6 +11,7 @@ from cutlass.cutlass_dsl import if_generate
 from cutlass.pipeline import PipelineAsync, PipelineState, Agent, CooperativeGroup
 from cutlass.pipeline import PipelineUserType, PipelineOp
 from cutlass.pipeline import PipelineTmaAsync as PipelineTmaAsyncOg
+from cutlass.pipeline import PipelineTmaUmma as PipelineTmaUmmaOg
 
 
 # We deviate from cute-dsl implementation to use cute.arch.cluster_arrive_relaxed
@@ -231,7 +232,115 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
         TMA consumer release conditionally signals the empty buffer to the producer.
         """
         # Only 1 thread per warp group signals the empty buffer.
-        if_generate(
-            cute.arch.thread_idx()[0] % 128 == 0,
-            lambda: self.sync_object_empty.arrive(state.index, self.consumer_mask),
+        if self.consumer_mask is None:  # No cluster, 1 thread per warp group to signal
+            if_generate(
+                cute.arch.thread_idx()[0] % 128 == 0,
+                lambda: self.sync_object_empty.arrive(state.index, self.consumer_mask),
+            )
+        else:
+            if_generate(
+                self.is_signalling_thread,
+                lambda: self.sync_object_empty.arrive(state.index, self.consumer_mask),
+            )
+
+
+@dataclass(frozen=True)
+class PipelineTmaUmma(PipelineTmaUmmaOg):
+    @staticmethod
+    def create(
+        *,
+        num_stages: int,
+        producer_group: CooperativeGroup,
+        consumer_group: CooperativeGroup,
+        tx_count: int,
+        barrier_storage: cute.Pointer = None,
+        cta_layout_vmnk: Optional[cute.Layout] = None,
+        init_wait: cutlass.Constexpr[bool] = True,
+    ):
+        """
+        This helper function computes any necessary attributes and returns an instance of PipelineTmaUmma.
+        :param barrier_storage: Pointer to the smem address for this pipeline's mbarriers
+        :type barrier_storage: cute.Pointer
+        :param num_stages: Number of buffer stages for this pipeline
+        :type num_stages: Int32
+        :param producer_group: `CooperativeGroup` for the producer agent
+        :type producer_group: CooperativeGroup
+        :param consumer_group: `CooperativeGroup` for the consumer agent
+        :type consumer_group: CooperativeGroup
+        :param tx_count: Number of bytes expected to be written to the transaction barrier for one stage
+        :type tx_count: int
+        :param cta_layout_vmnk: Layout of the cluster shape
+        :type cta_layout_vmnk: cute.Layout | None
+        """
+        if not isinstance(barrier_storage, cute.Pointer):
+            raise ValueError(
+                f"Expected barrier_storage to be a cute.Pointer, but got {type(barrier_storage)}"
+            )
+
+        producer_type = PipelineOp.TmaLoad
+        consumer_type = PipelineOp.TCGen05Mma
+
+        producer = (producer_type, producer_group)
+        consumer = (consumer_type, consumer_group)
+
+        sync_object_full = PipelineAsync._make_sync_object(
+            barrier_storage.align(min_align=8), num_stages, producer, tx_count
         )
+        sync_object_empty = PipelineAsync._make_sync_object(
+            barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
+        )
+
+        if cta_layout_vmnk is None or cute.size(cta_layout_vmnk) == 1:
+            # No mcast mask if not using clusters
+            producer_mask = None
+            # All threadblocks are leaders if not using clusters
+            is_leader_cta = True
+        else:
+            producer_mask = PipelineTmaUmma._compute_mcast_arrival_mask(cta_layout_vmnk)
+            is_leader_cta = PipelineTmaUmma._compute_is_leader_cta(cta_layout_vmnk)
+
+        cta_group = (
+            cute.nvgpu.tcgen05.CtaGroup.ONE
+            if cta_layout_vmnk is None or cute.size(cta_layout_vmnk, mode=[0]) == 1
+            else cute.nvgpu.tcgen05.CtaGroup.TWO
+        )
+
+        consumer_mask = producer_mask
+
+        if const_expr(init_wait):
+            pipeline_init_wait(cta_layout_vmnk)
+
+        return PipelineTmaUmma(
+            sync_object_full,
+            sync_object_empty,
+            num_stages,
+            producer_mask,
+            consumer_mask,
+            is_leader_cta,
+            cta_group,
+        )
+
+    def producer_acquire(
+        self,
+        state: PipelineState,
+        try_acquire_token: Optional[Boolean] = None,
+        extra_tx_count: int = 0,
+    ):
+        """
+        TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
+        """
+        if_generate(
+            try_acquire_token is None or try_acquire_token == 0,
+            lambda: self.sync_object_empty.wait(state.index, state.phase),
+        )
+        if const_expr(extra_tx_count == 0):
+            if_generate(
+                self.is_leader_cta,
+                lambda: self.sync_object_full.arrive(state.index, self.producer_mask),
+            )
+        else:
+            tx_count = self.sync_object_full.tx_count + extra_tx_count
+            if_generate(
+                self.is_leader_cta,
+                lambda: self.sync_object_full.arrive_and_expect_tx(state.index, tx_count),
+            )
