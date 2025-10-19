@@ -352,10 +352,6 @@ class FlashAttentionBackwardSm100:
             self.sdKdVaccum_stage,
         )
 
-        self.tma_copy_dKdV_bytes = cute.size_in_bytes(
-            self.dk_dtype, cute.select(sdKdV_layout, mode=[0, 1])
-        )
-
         if const_expr(self.use_tma_store):
             if const_expr(self.dk_dtype.width == 32):
                 tma_copy_op_dKdV = cpasync.CopyReduceBulkTensorTileS2GOp()
@@ -428,12 +424,6 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_dV,
             self.cluster_layout_vmnk.shape,
         )
-        tma_atom_LSE, tma_tensor_LSE = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            tma_load_op,
-            mLSE,
-            cute.make_layout((self.tile_m)),
-            (self.tile_m,),
-        )
         tma_atom_Psum, tma_tensor_Psum = cute.nvgpu.cpasync.make_tiled_tma_atom(
             tma_load_op,
             mPsum,
@@ -451,20 +441,17 @@ class FlashAttentionBackwardSm100:
             self.cluster_layout_vmnk.shape,
         )
 
-        self.tma_copy_q_bytes = cute.size_in_bytes(
-            self.q_dtype, cute.select(self.sQ_layout, mode=[0, 1, 2])
-        )
-        self.tma_copy_k_bytes = cute.size_in_bytes(
-            self.k_dtype, cute.select(self.sK_layout, mode=[0, 1, 2])
-        )
-        self.tma_copy_v_bytes = cute.size_in_bytes(
-            self.v_dtype, cute.select(self.sV_layout, mode=[0, 1, 2])
-        )
-        self.tma_copy_do_bytes = cute.size_in_bytes(
-            self.do_dtype, cute.select(self.sdO_layout, mode=[0, 1, 2])
-        )
-        self.tma_copy_lse_bytes = self.tile_m * 4
-        self.tma_copy_psum_bytes = self.tile_m * 4
+        self.tma_copy_bytes = {
+            name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1, 2]))
+            for name, mX, layout in [
+                ("Q", mQ, self.sQ_layout),
+                ("K", mK, self.sK_layout),
+                ("V", mV, self.sV_layout),
+                ("dO", mdO, self.sdO_layout),
+            ]
+        }
+        self.tma_copy_bytes["LSE"] = self.tile_m * Float32.width // 8
+        self.tma_copy_bytes["dPsum"] = self.tile_m * Float32.width // 8
 
         TileScheduler = SingleTileScheduler
         # TODO -- optimizer scheduler for causal
@@ -556,7 +543,7 @@ class FlashAttentionBackwardSm100:
             tma_tensor_Q,
             tma_tensor_K,
             tma_tensor_V,
-            tma_tensor_LSE,
+            mLSE,
             tma_tensor_Psum,
             tma_tensor_dO,
             mdV,
@@ -570,7 +557,6 @@ class FlashAttentionBackwardSm100:
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
-            tma_atom_LSE,
             tma_atom_Psum,
             tma_atom_dO,
             tma_atom_dV,
@@ -625,7 +611,6 @@ class FlashAttentionBackwardSm100:
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
-        tma_atom_LSE: cute.CopyAtom,
         tma_atom_Psum: cute.CopyAtom,
         tma_atom_dO: cute.CopyAtom,
         tma_atom_dV: Optional[cute.CopyAtom],
@@ -660,7 +645,6 @@ class FlashAttentionBackwardSm100:
                 cpasync.prefetch_descriptor(tma_atom_Q)
                 cpasync.prefetch_descriptor(tma_atom_K)
                 cpasync.prefetch_descriptor(tma_atom_V)
-                cpasync.prefetch_descriptor(tma_atom_LSE)
                 cpasync.prefetch_descriptor(tma_atom_Psum)
                 cpasync.prefetch_descriptor(tma_atom_dO)
                 if const_expr(tma_atom_dV is not None):
@@ -705,7 +689,7 @@ class FlashAttentionBackwardSm100:
             num_stages=self.q_stage,
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
-            tx_count=self.tma_copy_q_bytes,
+            tx_count=self.tma_copy_bytes["Q"],
         )
 
         pipeline_do = cutlass.pipeline.PipelineTmaUmma.create(
@@ -713,7 +697,7 @@ class FlashAttentionBackwardSm100:
             num_stages=self.do_stage,
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
-            tx_count=self.tma_copy_do_bytes,
+            tx_count=self.tma_copy_bytes["dO"],
         )
 
         # UMMA producers and AsyncThread consumers
@@ -927,7 +911,6 @@ class FlashAttentionBackwardSm100:
                 tma_atom_Q,
                 tma_atom_K,
                 tma_atom_V,
-                tma_atom_LSE,
                 tma_atom_Psum,
                 tma_atom_dO,
                 pipeline_q,
@@ -1091,7 +1074,6 @@ class FlashAttentionBackwardSm100:
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
-        tma_atom_LSE: cute.CopyAtom,
         tma_atom_Psum: cute.CopyAtom,
         tma_atom_dO: cute.CopyAtom,
         pipeline_q: PipelineAsync,
@@ -1174,13 +1156,7 @@ class FlashAttentionBackwardSm100:
                 cute.group_modes(sdO, 0, 3),
                 cute.group_modes(tdVgdO, 0, 3),
             )
-            tLSEsLSE, tLSEgLSE = cpasync.tma_partition(
-                tma_atom_LSE,
-                0,
-                cute.make_layout(1),
-                sLSE,
-                gLSE,
-            )
+            load_LSE = copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE)
             tPsumsPsum, tPsumgPsum = cpasync.tma_partition(
                 tma_atom_Psum,
                 0,
@@ -1190,7 +1166,7 @@ class FlashAttentionBackwardSm100:
             )
             # K
             with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(k_full_mbar_ptr, self.tma_copy_k_bytes)
+                cute.arch.mbarrier_arrive_and_expect_tx(k_full_mbar_ptr, self.tma_copy_bytes["K"])
             cute.copy(tma_atom_K, tKgK, tKsK[None, 0], tma_bar_ptr=k_full_mbar_ptr)
 
             ###### Prologue
@@ -1207,18 +1183,14 @@ class FlashAttentionBackwardSm100:
 
             # LSE
             with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(lse_full_mbar_ptr, self.tma_copy_lse_bytes)
-
-            cute.copy(
-                tma_atom_LSE,
-                tLSEgLSE[None, m_block_max - 1],
-                tLSEsLSE[None, 0],
-                tma_bar_ptr=lse_full_mbar_ptr,
-            )
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    lse_full_mbar_ptr, self.tma_copy_bytes["LSE"]
+                )
+                load_LSE(src_idx=m_block_max - 1, dst_idx=0, tma_bar_ptr=lse_full_mbar_ptr)
 
             # V
             with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(v_full_mbar_ptr, self.tma_copy_v_bytes)
+                cute.arch.mbarrier_arrive_and_expect_tx(v_full_mbar_ptr, self.tma_copy_bytes["V"])
             cute.copy(tma_atom_V, tVgV, tVsV[None, 0], tma_bar_ptr=v_full_mbar_ptr)
 
             # dO
@@ -1235,7 +1207,7 @@ class FlashAttentionBackwardSm100:
             # Psum
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(
-                    psum_full_mbar_ptr, self.tma_copy_psum_bytes
+                    psum_full_mbar_ptr, self.tma_copy_bytes["dPsum"]
                 )
 
             cute.copy(
@@ -1263,15 +1235,9 @@ class FlashAttentionBackwardSm100:
 
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
-                        lse_full_mbar_ptr, self.tma_copy_lse_bytes
+                        lse_full_mbar_ptr, self.tma_copy_bytes["LSE"]
                     )
-
-                cute.copy(
-                    tma_atom_LSE,
-                    tLSEgLSE[None, m_block],
-                    tLSEsLSE[None, 0],
-                    tma_bar_ptr=lse_full_mbar_ptr,
-                )
+                    load_LSE(src_idx=m_block, dst_idx=0, tma_bar_ptr=lse_full_mbar_ptr)
 
                 # dO
                 self.load_M_tile(
@@ -1291,7 +1257,7 @@ class FlashAttentionBackwardSm100:
 
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
-                        psum_full_mbar_ptr, self.tma_copy_psum_bytes
+                        psum_full_mbar_ptr, self.tma_copy_bytes["dPsum"]
                     )
 
                 cute.copy(
