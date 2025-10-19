@@ -133,8 +133,8 @@ class FlashAttentionBackwardSm100:
     def _setup_attributes(self):
         self.q_stage = 2
         self.k_stage = self.v_stage = 1
-        self.do_stage = 1
-        self.ds_stage = 1
+        self.dO_stage = 1
+        self.dS_stage = 1
         self.lse_stage = 1
         self.acc_stage = 1
         self.s_stage = 1
@@ -208,7 +208,7 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_dV,
             self.mma_tiler_pdo,
             self.do_dtype,
-            self.do_stage,
+            self.dO_stage,
         )
         # dP = V @ dO.T
         self.sV_layout = sm100_utils_basic.make_smem_layout_a(
@@ -221,14 +221,14 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_SdP,
             self.mma_tiler_vdo,
             self.do_dtype,
-            self.do_stage,
+            self.dO_stage,
         )
         # dK += dS.T @ Q
         self.sdSt_layout = sm100_utils_basic.make_smem_layout_a(
             self.tiled_mma_dK,
             self.mma_tiler_dsq,
             self.ds_dtype,
-            self.ds_stage,
+            self.dS_stage,
         )
         self.sQt_layout = sm100_utils_basic.make_smem_layout_b(
             self.tiled_mma_dK,
@@ -241,7 +241,7 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_dQ,
             self.mma_tiler_dsk,
             self.q_dtype,
-            self.ds_stage,
+            self.dS_stage,
         )
         self.sKt_layout = sm100_utils_basic.make_smem_layout_b(
             self.tiled_mma_dQ,
@@ -474,7 +474,7 @@ class FlashAttentionBackwardSm100:
         class SharedStorage:
             q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.q_stage]
             lse_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.lse_stage]
-            do_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.do_stage]
+            do_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dO_stage]
             lse_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.k_stage]
             lse_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.k_stage]
             dpsum_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.dpsum_stage]
@@ -482,7 +482,7 @@ class FlashAttentionBackwardSm100:
             s_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.s_stage]
             dP_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dP_stage]
             p_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.s_stage]
-            dS_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.ds_stage]
+            dS_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dS_stage]
             dV_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dV_stage]
             dK_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dK_stage]
             dQaccum_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dQaccum_mma_stage]
@@ -680,7 +680,7 @@ class FlashAttentionBackwardSm100:
 
         pipeline_dO = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.do_mbar_ptr.data_ptr(),
-            num_stages=self.do_stage,
+            num_stages=self.dO_stage,
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
             tx_count=self.tma_copy_bytes["dO"],
@@ -1056,7 +1056,7 @@ class FlashAttentionBackwardSm100:
             cutlass.pipeline.PipelineUserType.Producer, self.q_stage
         )
         producer_state_dO = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Producer, self.do_stage
+            cutlass.pipeline.PipelineUserType.Producer, self.dO_stage
         )
 
         tile_scheduler = TileSchedulerCls()
@@ -1245,11 +1245,9 @@ class FlashAttentionBackwardSm100:
         consumer_state_Q = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.q_stage
         )
-        q_dk_consumer_state = consumer_state_Q
         consumer_state_dO = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, self.do_stage
+            cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
         )
-
         producer_state_S = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.s_stage
         )
@@ -1293,7 +1291,6 @@ class FlashAttentionBackwardSm100:
             pipeline_S.producer_acquire(producer_state_S)
             mma_qk_fn(B_idx=consumer_state_Q.index)
             # Don't release Q yet
-            consumer_state_Q.advance()
             pipeline_S.producer_commit(producer_state_S)
             producer_state_S.advance()
 
@@ -1324,12 +1321,13 @@ class FlashAttentionBackwardSm100:
 
             for i in cutlass.range(m_block_max - m_block_min - 1, unroll=1):
                 # 1) S = K @ Q_i
+                consumer_state_Q_prev = consumer_state_Q.clone()
+                consumer_state_Q.advance()
                 pipeline_Q.consumer_wait(consumer_state_Q)
                 pipeline_S.producer_acquire(producer_state_S)
                 mma_qk_fn(B_idx=consumer_state_Q.index)
                 pipeline_S.producer_commit(producer_state_S)
                 producer_state_S.advance()
-                consumer_state_Q.advance()
 
                 # 2) dQ = dS @ K
                 pipeline_dS.consumer_wait(consumer_state_dS)
@@ -1339,10 +1337,9 @@ class FlashAttentionBackwardSm100:
                 producer_state_dQ.advance()
 
                 # 3) dK = dS.T @ Q
-                mma_dsq_fn(B_idx=q_dk_consumer_state.index, zero_init=not accumulate_dK)
+                mma_dsq_fn(B_idx=consumer_state_Q_prev.index, zero_init=not accumulate_dK)
                 accumulate_dK = True
-                pipeline_Q.consumer_release(q_dk_consumer_state)
-                q_dk_consumer_state.advance()
+                pipeline_Q.consumer_release(consumer_state_Q_prev)
                 pipeline_dS.consumer_release(consumer_state_dS)
                 consumer_state_dS.advance()
 
@@ -1374,7 +1371,7 @@ class FlashAttentionBackwardSm100:
             # -----------------------------------------------------------
             # 1) dK += dS.T @ Q
             pipeline_dS.consumer_wait(consumer_state_dS)
-            mma_dsq_fn(B_idx=q_dk_consumer_state.index, zero_init=not accumulate_dK)
+            mma_dsq_fn(B_idx=consumer_state_Q.index, zero_init=not accumulate_dK)
             pipeline_dK.producer_acquire(dK_producer_state)
             pipeline_dK.producer_commit(dK_producer_state)
             dK_producer_state.advance()
@@ -1383,8 +1380,8 @@ class FlashAttentionBackwardSm100:
             mma_dsk_fn(A_idx=consumer_state_dS.index)
             pipeline_dQ.producer_commit(producer_state_dQ)
             producer_state_dQ.advance()
-            pipeline_Q.consumer_release(q_dk_consumer_state)
-            q_dk_consumer_state.advance()
+            pipeline_Q.consumer_release(consumer_state_Q)
+            consumer_state_Q.advance()
             pipeline_dS.consumer_release(consumer_state_dS)
             consumer_state_dS.advance()
 
@@ -1505,7 +1502,7 @@ class FlashAttentionBackwardSm100:
             cutlass.pipeline.PipelineUserType.Producer, self.s_stage
         )
         dS_producer_state = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Producer, self.ds_stage
+            cutlass.pipeline.PipelineUserType.Producer, self.dS_stage
         )
 
         dP_consumer_state = cutlass.pipeline.make_pipeline_state(
