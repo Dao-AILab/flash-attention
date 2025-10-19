@@ -20,13 +20,9 @@ class BlockInfo:
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
 
     @cute.jit
-    def get_n_block_min_max(
-        self, seqlen_info: SeqlenInfoQK, m_block: Int32
-    ) -> Tuple[Int32, Int32]:
+    def get_n_block_min_max(self, seqlen_info: SeqlenInfoQK, m_block: Int32) -> Tuple[Int32, Int32]:
         n_block_max = cute.ceil_div(seqlen_info.seqlen_k, self.tile_n)
-        if const_expr(
-            self.is_causal or (self.is_local and self.window_size_right is not None)
-        ):
+        if const_expr(self.is_causal or (self.is_local and self.window_size_right is not None)):
             m_idx_max = (m_block + 1) * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa > 1):
                 m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
@@ -44,13 +40,15 @@ class BlockInfo:
         return n_block_min, n_block_max
 
     @cute.jit
-    def get_m_block_min_max(
-        self, seqlen_info: SeqlenInfoQK, n_block: Int32
-    ) -> Tuple[Int32, Int32]:
+    def get_m_block_min_max(self, seqlen_info: SeqlenInfoQK, n_block: Int32) -> Tuple[Int32, Int32]:
         m_block_max = cute.ceil_div(seqlen_info.seqlen_q, self.tile_m)
         m_block_min = 0
         if const_expr(self.is_causal):
-            m_block_min = max(m_block_min, (n_block * self.tile_n + seqlen_info.seqlen_q - seqlen_info.seqlen_k) // self.tile_m)
+            m_block_min = max(
+                m_block_min,
+                (n_block * self.tile_n + seqlen_info.seqlen_q - seqlen_info.seqlen_k)
+                // self.tile_m,
+            )
         return m_block_min, m_block_max
 
     @cute.jit

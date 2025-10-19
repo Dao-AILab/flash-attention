@@ -212,9 +212,9 @@ class AttentionMask:
         n_block: Int32,
         thr_mma: cute.TiledMma,
         thr_tmem_load: cute.TiledCopy,
-        mask_seqlen: cutlass.Constexpr,
-        mask_causal: cutlass.Constexpr,
-        mask_local: cutlass.Constexpr,
+        mask_seqlen: cutlass.Constexpr[bool],
+        mask_causal: cutlass.Constexpr[bool],
+        mask_local: cutlass.Constexpr[bool] = False,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
