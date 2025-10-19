@@ -23,8 +23,9 @@ class NamedBarrierBwd(enum.IntEnum):
     dQEmptyWG0 = enum.auto()
     dQEmptyWG1 = enum.auto()
 
+
 class NamedBarrierBwdSm100(enum.IntEnum):
     EpilogueWG1 = enum.auto()
     EpilogueWG2 = enum.auto()
-    Compute     = enum.auto()
+    Compute = enum.auto()
     dQaccReduce = enum.auto()
