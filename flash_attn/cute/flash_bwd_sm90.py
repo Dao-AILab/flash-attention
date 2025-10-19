@@ -1023,11 +1023,10 @@ class FlashAttentionBackwardSm90:
         )
         acc_dP = mma_dov_fn(A_idx=smem_idx_Q, wg_wait=1)
         # (3) [Pointwise 1] P = exp(S - LSE)
-        # if cutlass.const_expr(mask_fn is not None):
-        if cutlass.const_expr(mask_fn is not None and not self.SdP_swapAB):  # TODO: impl mask
+        if cutlass.const_expr(mask_fn is not None):
             mask_fn(acc_S, m_block=m_block)
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S, transpose=self.SdP_swapAB)
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_S_mn)
+        # if cute.arch.thread_idx()[0] == 256: cute.print_tensor(acc_S_mn)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
             for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
                 acc_S_mn[r, c] = cute.math.exp2(
@@ -1228,12 +1227,11 @@ class FlashAttentionBackwardSm90:
                             gdQaccum[None, warp_group_idx, m_block].iterator,
                             self.tma_copy_bytes["dQ"],
                         )
-                        cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_commit_group()
                 for warp_group_idx in cutlass.range_constexpr(self.num_mma_warp_groups):
-                    with cute.arch.elect_one():
-                        cute.arch.cp_async_bulk_wait_group(
-                            self.num_mma_warp_groups - 1 - warp_group_idx, read=True
-                        )
+                    cute.arch.cp_async_bulk_wait_group(
+                        self.num_mma_warp_groups - 1 - warp_group_idx, read=True
+                    )
                     cute.arch.barrier_arrive(
                         barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
                         number_of_threads=self.num_threads_per_warp_group + cute.arch.WARP_SIZE,

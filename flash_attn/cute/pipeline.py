@@ -40,9 +40,9 @@ def _sync(group: Agent):
         cute.arch.cluster_arrive_relaxed()
         cute.arch.cluster_wait()
     else:
-        assert (
-            False
-        ), "Error: No explicit sync instruction exists. Please use barriers (named / mbarrier) instead."
+        assert False, (
+            "Error: No explicit sync instruction exists. Please use barriers (named / mbarrier) instead."
+        )
 
 
 class PipelineStateSimple:
@@ -144,7 +144,7 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
         barrier_storage: cute.Pointer = None,
         cta_layout_vmnk: Optional[cute.Layout] = None,
         tidx: Optional[Int32] = None,
-        init_wait: cutlass.Constexpr[bool] = True
+        init_wait: cutlass.Constexpr[bool] = True,
     ):
         """
         This helper function computes any necessary attributes and returns an instance of PipelineTmaAsync.
