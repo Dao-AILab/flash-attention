@@ -280,3 +280,49 @@ class AttentionMask:
                         if col_idx >= col_limit_right or col_idx < col_limit_left
                         else acc_S[i]
                     )
+
+
+    @cute.jit
+    def apply_mask_sm100_transposed(
+        self,
+        acc_S: cute.Tensor,
+        tScS_t2r : cute.Tensor,
+        m_block: cutlass.Int32,
+        n_block: cutlass.Int32,
+        wg_idx: cutlass.Int32,
+        num_wg: cutlass.Constexpr[cutlass.Int32],
+        mask_seqlen: cutlass.Constexpr,
+        mask_causal: cutlass.Constexpr,
+        mask_local: cutlass.Constexpr,
+    ) -> None:
+        '''
+        Backward pass: mask S = K @ Q.T where n_block tiles seqlen_k and m_block tiles seqlen_q.
+        '''
+        assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
+
+        tidx = cute.arch.thread_idx()[0] % 128
+
+        seqlenk_row_limit = self.seqlen_k - n_block * self.tile_n
+        if cutlass.const_expr(not mask_causal and not mask_local):
+            if cutlass.const_expr(mask_seqlen):
+                ncol = cutlass.const_expr(cute.size(tScS_t2r.shape))
+                if tScS_t2r[0][0] >= seqlenk_row_limit:
+                    for i in cutlass.range(ncol, unroll_full=True):
+                        acc_S[i] = -cutlass.Float32.inf
+        else:  # Causal or local
+            causal_row_offset = (self.seqlen_q - self.seqlen_k - 1) - m_block * self.tile_m
+            row_idx = tScS_t2r[0][0] + n_block * self.tile_n
+            
+            if cutlass.const_expr(mask_causal):
+                col_limit_left = row_idx + causal_row_offset
+                ncol = cutlass.const_expr(cute.size(tScS_t2r.shape))
+                # if tidx == 32 and wg_idx == 1:
+                #     cute.printf("row idx = {}, causal_row_offset = {}, col_limit_left = {}, first column = {}, last column = {} ", row_idx, causal_row_offset, col_limit_left, tScS_t2r[0][1], tScS_t2r[ncol - 1][1])
+                if cutlass.const_expr(mask_seqlen):
+                    if tScS_t2r[0][0] >= seqlenk_row_limit:
+                        col_limit_left = self.tile_m
+                for i in cutlass.range(ncol, unroll_full=True):
+                    acc_S[i] = (
+                        -cutlass.Float32.inf if tScS_t2r[i][1] <= col_limit_left else acc_S[i]
+                    )
+            # TODO: local
