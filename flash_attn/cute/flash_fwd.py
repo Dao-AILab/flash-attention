@@ -1138,7 +1138,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         full_block_idx: Optional[cute.Tensor] = None,  # (b, h, m_block, n_block)
         mask_block_cnt: Optional[cute.Tensor] = None,  # (b, h, m_block)
         mask_block_idx: Optional[cute.Tensor] = None,  # (b, h, m_block, n_block)
-        buffers: Optional[list] = None,
+        buffers: Optional[list[cute.Tensor]] = None,
     ):
         """Configures and launches the flash attention kernel.
 
@@ -1380,7 +1380,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
         SharedStorage: cutlass.Constexpr[Callable],
-        buffers=None,
+        buffers=Optional[list[cute.Tensor]],
         fastdiv_mods=None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1658,7 +1658,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         full_block_idx: Optional[cute.Tensor],
         mask_block_cnt: Optional[cute.Tensor],
         mask_block_idx: Optional[cute.Tensor],
-        buffers: Optional[list],
+        buffers: Optional[list[cute.Tensor]],
         fastdiv_mods=None,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -2251,7 +2251,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         acc_S,
         n_block,
         softmax_scale,
-        buffers=None,
+        buffers=Optional[list[cute.Tensor]],
         fastdiv_mods=None,
     ):
         # Prepare index tensor
