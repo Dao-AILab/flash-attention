@@ -120,7 +120,8 @@ class FlashAttentionBackwardSm100:
 
         self.num_regs_reduce = 144
         self.num_regs_compute = 128
-        self.num_regs_load = 96
+        # self.num_regs_load = 96
+        self.num_regs_load = 112
         self.num_regs_mma = 112
         self.num_regs_empty = 24
 
@@ -1629,7 +1630,7 @@ class FlashAttentionBackwardSm100:
                             own1, offset=j, mask=FULL, mask_and_clamp=MAC
                         )
 
-                        tSrS_t2r[j, i, 0, 0], tSrS_t2r[j + 1, i, 0, 0] = cute.arch.fma_packed_f32x2(
+                        tSrS_t2r[j, i, 0, 0], tSrS_t2r[j + 1, i, 0, 0] = utils.fma_packed_f32x2(
                             ((tSrS_t2r[j, i, 0, 0], tSrS_t2r[j + 1, i, 0, 0])),
                             (softmax_scale_log2, softmax_scale_log2),
                             (-lse_j, -lse_j1),
@@ -1736,7 +1737,7 @@ class FlashAttentionBackwardSm100:
                             (tdPrdP_t2r[j, 0, 0], tdPrdP_t2r[j + 1, 0, 0]), (psum_j, psum_j1)
                         )
 
-                        tSrS_t2r[j, i, 0, 0], tSrS_t2r[j + 1, i, 0, 0] = cute.arch.mul_packed_f32x2(
+                        tSrS_t2r[j, i, 0, 0], tSrS_t2r[j + 1, i, 0, 0] = utils.mul_packed_f32x2(
                             (tSrS_t2r[j, i, 0, 0], tSrS_t2r[j + 1, i, 0, 0]),
                             (tdPrdP_t2r[j, 0, 0], tdPrdP_t2r[j + 1, 0, 0]),
                         )
@@ -1796,8 +1797,7 @@ class FlashAttentionBackwardSm100:
                     tma_atom_dV,
                     thr_copy_r2s_dKdV,
                     pipeline_dV,
-                    softmax_scale,
-                    False,  # apply scale
+                    None,  # Don't scale
                     int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
                     mdV_semaphore,
                 )
@@ -1815,7 +1815,6 @@ class FlashAttentionBackwardSm100:
                     thr_copy_r2s_dKdV,
                     pipeline_dK,
                     softmax_scale,
-                    True,  # apply scale
                     int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
                     mdK_semaphore,
                 )
@@ -1922,6 +1921,17 @@ class FlashAttentionBackwardSm100:
                         cute.arch.cp_async_bulk_wait_group(1, read=read_flag)
                     dQacc_reduce_barrier.arrive_and_wait()
                     reduce_phase ^= 1
+                    # Directly add to gmem, much slower
+                    # tdQgdQ = thr_copy_dQaccum_r2s.partition_D(gdQaccum[None, stage, m_block])
+                    # assert cute.size(tdQrdQ_r2s) == cute.size(tdQgdQ)
+                    # for i in cutlass.range(cute.size(tdQrdQ_r2s) // 4, unroll_full=True):
+                    #     copy_utils.atomic_add_fp32x4(
+                    #         tdQrdQ_r2s[4 * i],
+                    #         tdQrdQ_r2s[4 * i + 1],
+                    #         tdQrdQ_r2s[4 * i + 2],
+                    #         tdQrdQ_r2s[4 * i + 3],
+                    #         utils.elem_pointer(tdQgdQ, 4 * i),
+                    #     )
 
                 # semaphore release
                 # NOTE: arrive_inc calls red_release which issues membar
@@ -2089,8 +2099,7 @@ class FlashAttentionBackwardSm100:
         tma_atom_dKV: cute.CopyAtom,
         thr_copy_r2s_dKdV: cute.TiledCopy,
         pipeline: PipelineAsync,
-        softmax_scale: Float32,
-        do_scale: cutlass.Constexpr[cutlass.Boolean],
+        scale: Optional[Float32],
         barrier_id: Int32,
         mdKV_semaphore: Optional[cute.Tensor],
     ):
@@ -2178,14 +2187,13 @@ class FlashAttentionBackwardSm100:
             cute.arch.fence_view_async_tmem_load()
 
             # RMEM -- scale and convert
+            if const_expr(scale is not None):
+                for i in cutlass.range(cute.size(tdKVrdKV_t2r.shape) // 2, unroll_full=True):
+                    tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1] = utils.mul_packed_f32x2(
+                        (tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1]), (scale, scale)
+                    )
             tdKVrdKV = cute.make_fragment(tdKVrdKV_t2r.shape, self.dv_dtype)
-            if const_expr(do_scale):
-                scale = softmax_scale
-            else:
-                scale = Float32(1)
-
-            dKV_vec = tdKVrdKV_t2r.load() * scale
-            tdKVrdKV.store(dKV_vec.to(self.dv_dtype))
+            tdKVrdKV.store(tdKVrdKV_t2r.load().to(self.dv_dtype))
 
             # RMEM -> SMEM -- setup
             tdKVcdKV_r2s_p = thr_copy_r2s_dKdV.partition_S(cdKV)
