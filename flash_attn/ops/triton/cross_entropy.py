@@ -57,10 +57,9 @@ def cross_entropy_fwd_kernel(
             if HAS_SMOOTHING:
                 sum_logits += tl.sum(tl.where(cols < n_cols, logits, 0.0))
             m_i_new = tl.maximum(m_i, tl.max(logits))
-            if m_i_new == -float("inf"):
-                continue
-            l_i = tl.exp(m_i - m_i_new) * l_i + tl.sum(tl.exp(logits - m_i_new))
-            m_i = m_i_new
+            if m_i_new > -float("inf"):
+                l_i = tl.exp(m_i - m_i_new) * l_i + tl.sum(tl.exp(logits - m_i_new))
+                m_i = m_i_new
         lse = tl.log(l_i) + m_i
         tl.store(lse_ptr + row_idx, lse)
     else:
