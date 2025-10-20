@@ -36,6 +36,29 @@ def gemm_w_idx(
 
 
 @cute.jit
+def gemm_ptx_w_idx(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    sA: Optional[cute.Tensor],
+    sB: cute.Tensor,
+    A_idx: Optional[Int32] = None,
+    B_idx: Optional[Int32] = None,
+    zero_init: bool | Boolean = False,
+) -> None:
+    rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
+    rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]
+    sA_cur = None
+    if const_expr(sA is not None):
+        sA_cur = sA if const_expr(A_idx is None) else sA[None, None, None, A_idx]
+    sB_cur = sB if const_expr(B_idx is None) else sB[None, None, None, B_idx]
+    mma_atom = cute.make_mma_atom(tiled_mma.op)
+    acc_tmem_addr = acc.iterator.toint()
+    gemm_ptx_partial(mma_atom.op, acc_tmem_addr, rA, rB, sA_cur, sB_cur, zero_init=zero_init)
+
+
+@cute.jit
 def gemm(
     tiled_mma: cute.TiledMma,
     acc: cute.Tensor,
