@@ -61,8 +61,6 @@ class FlashAttentionBackwardSm100:
 
         self.tile_m = tile_m
         self.tile_n = tile_n
-        # number of tma reduce adds per dQacc mma
-        self.dQaccum_reduce_stage = self.tile_hdim // 32
 
         # CTA tiler
         self.cta_tiler = (tile_m, tile_n, self.tile_hdim)
@@ -147,6 +145,8 @@ class FlashAttentionBackwardSm100:
         self.dpsum_stage = 1
         self.p_tmem_stage = 1
         self.sdKdVaccum_stage = 2
+        # number of tma reduce adds per dQacc mma
+        self.dQaccum_reduce_stage = self.tile_hdim // 32
 
     def _get_tiled_mma(self):
         cta_group = tcgen05.CtaGroup.ONE
@@ -445,6 +445,7 @@ class FlashAttentionBackwardSm100:
         }
         self.tma_copy_bytes["LSE"] = self.tile_m * Float32.width // 8
         self.tma_copy_bytes["dPsum"] = self.tile_m * Float32.width // 8
+        self.tma_copy_bytes["dQ"] = self.tile_m * 32 * Float32.width // 8
 
         TileScheduler = SingleTileScheduler
         # TODO -- optimizer scheduler for causal
@@ -486,7 +487,6 @@ class FlashAttentionBackwardSm100:
             dV_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dV_stage]
             dK_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dK_stage]
             dQaccum_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dQaccum_mma_stage]
-            dQaccum_reduce_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dQaccum_mma_stage]
 
             # TMEM
             tmem_holding_buf: Int32
@@ -650,7 +650,6 @@ class FlashAttentionBackwardSm100:
         lse_empty_mbar_ptr = storage.lse_empty_mbar_ptr.data_ptr()
         dpsum_full_mbar_ptr = storage.dpsum_full_mbar_ptr.data_ptr()
         dpsum_empty_mbar_ptr = storage.dpsum_empty_mbar_ptr.data_ptr()
-        dQaccum_reduce_mbar_ptr = storage.dQaccum_reduce_mbar_ptr.data_ptr()
 
         if warp_idx == self.load_warp_id:
             cute.arch.mbarrier_init(
@@ -660,7 +659,6 @@ class FlashAttentionBackwardSm100:
             cute.arch.mbarrier_init(lse_empty_mbar_ptr, len([self.compute_warp_ids]))
             cute.arch.mbarrier_init(dpsum_full_mbar_ptr, len([self.compute_warp_ids]))
             cute.arch.mbarrier_init(dpsum_empty_mbar_ptr, len([self.compute_warp_ids]))
-            cute.arch.mbarrier_init(dQaccum_reduce_mbar_ptr, 1)
 
         pipeline_producer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread, len([self.load_warp_id])
@@ -1012,7 +1010,6 @@ class FlashAttentionBackwardSm100:
                 thr_mma_dQ,
                 tdQtdQ,
                 pipeline_dQ,
-                dQaccum_reduce_mbar_ptr,
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
@@ -1541,7 +1538,7 @@ class FlashAttentionBackwardSm100:
                     lse_consumer_phase ^= 1
 
                 tiled_tmem_ld = tcgen05.make_tmem_copy(tmem_load_atom, tStS)
-                thr_tmem_ld = tiled_tmem_ld.get_slice(tidx)
+                thr_tmem_load = tiled_tmem_ld.get_slice(tidx)
 
                 tileP_f32_like = self.mma_tiler_kq[0] // 32 * self.v_dtype.width  # (128, 64)
                 tStP = cute.make_tensor(
@@ -1553,13 +1550,13 @@ class FlashAttentionBackwardSm100:
                 thr_tmem_st = tiled_tmem_st.get_slice(tidx)
 
                 #### TMEM
-                tStS_t2r_p = thr_tmem_ld.partition_S(tStS)
+                tStS_t2r_p = thr_tmem_load.partition_S(tStS)
                 tStS_t2r = self.split_wg(tStS_t2r_p, wg_idx, num_wg)
 
                 #### RMEM
                 tScS = thr_mma_SdP.partition_C(cute.make_identity_tensor(self.mma_tiler_kq[:2]))
                 tScS_tensor = cute.make_tensor(tScS.iterator, tScS.layout)
-                tScS_t2r_p = thr_tmem_ld.partition_D(tScS_tensor)
+                tScS_t2r_p = thr_tmem_load.partition_D(tScS_tensor)
                 tScS_t2r = self.split_wg(tScS_t2r_p, wg_idx, num_wg)
 
                 tSrS_t2r = cute.make_fragment(tScS_t2r.shape, Float32)  # 64
@@ -1599,7 +1596,7 @@ class FlashAttentionBackwardSm100:
                 tStP_r2t = self.split_wg(tStP_r2t_p, wg_idx, num_wg)
 
                 #### Compute P = exp(S * scale - LSE)
-                tLSE = thr_tmem_ld.partition_D(sLSE_2D)
+                tLSE = thr_tmem_load.partition_D(sLSE_2D)
                 # split to  wg0 & wg1
                 tLSErLSE_p = cute.make_tensor(
                     cute.recast_ptr(tLSE.iterator),
@@ -1713,7 +1710,7 @@ class FlashAttentionBackwardSm100:
                     cute.recast_ptr(tSrS_t2r.iterator, dtype=self.ds_dtype), tSrS_t2r.shape
                 )
 
-                tPsum = thr_tmem_ld.partition_D(sPsum_2D)
+                tPsum = thr_tmem_load.partition_D(sPsum_2D)
                 tPsumrPsum_p = cute.make_tensor(
                     cute.recast_ptr(tPsum.iterator),
                     cute.make_layout(
@@ -1838,163 +1835,107 @@ class FlashAttentionBackwardSm100:
         thr_mma_dQ: cute.core.ThrMma,
         tdQtdQ: cute.Tensor,
         pipeline_dQ: PipelineAsync,
-        dQaccum_reduce_mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         mdQ_semaphore: Optional[cute.Tensor],
     ):
-        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * 4)
+        num_reduce_threads = cute.arch.WARP_SIZE * len(self.reduce_warp_ids)
+        tidx = cute.arch.thread_idx()[0] % num_reduce_threads
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx() % len(self.reduce_warp_ids))
+        # TMEM -> RMEM
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+        )
+        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ).get_slice(tidx)
+        tdQtdQ_t2r = thr_tmem_load.partition_S(tdQtdQ)
+        tdQcdQ = thr_mma_dQ.partition_C(cute.make_identity_tensor(self.mma_tiler_dsk[:2]))
+        tdQrdQ_t2r_shape = thr_tmem_load.partition_D(tdQcdQ).shape
+        assert cute.size(tdQrdQ_t2r_shape, mode=[1]) == self.dQaccum_reduce_stage, (
+            "dQaccum reduce stage mismatch"
+        )
 
-        dQ_consumer_state = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, self.dQaccum_mma_stage
+        thr_copy_dQaccum_r2s = copy_utils.tiled_copy_1d(
+            self.dqaccum_dtype, num_reduce_threads, num_copy_elems=128 // self.dqaccum_dtype.width
+        ).get_slice(tidx)
+        tdQsdQ = thr_copy_dQaccum_r2s.partition_D(sdQaccum)
+
+        read_flag = const_expr(not self.deterministic)
+
+        reduce_phase = cutlass.Int32(0)
+
+        dQacc_reduce_barrier = cutlass.pipeline.NamedBarrier(
+            barrier_id=int(NamedBarrierBwdSm100.dQaccReduce),
+            num_threads=num_reduce_threads,
         )
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
-
-        # TMEM -> RMEM
-        tmem_ld_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+        dQ_consumer_state = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.dQaccum_mma_stage
         )
-        tiled_tmem_ld = tcgen05.make_tmem_copy(tmem_ld_atom, tdQtdQ)
-        thr_tmem_ld = tiled_tmem_ld.get_slice(tidx)
-
-        tdQtdQ_t2r = thr_tmem_ld.partition_S(tdQtdQ)
-
-        cdQ = cute.make_identity_tensor((self.mma_tiler_dsk[0], self.mma_tiler_dsk[1]))
-        tdQcdQ = thr_mma_dQ.partition_C(cdQ)
-        tdQcdQ_tensor = cute.make_tensor(tdQcdQ.iterator, tdQcdQ.layout)
-        tdQrdQ = thr_tmem_ld.partition_D(tdQcdQ_tensor)
-
-        num_reduce_threads = cute.arch.WARP_SIZE * len(self.reduce_warp_ids)
-
-        atom_universal_copy = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), self.dqaccum_dtype, num_bits_per_copy=128
-        )
-        thr_layout = cute.make_layout(shape=128, stride=1)
-        val_layout = cute.make_layout(shape=4, stride=1)
-
-        tiler_mn, layout_tv = cute.make_layout_tv(thr_layout=thr_layout, val_layout=val_layout)
-        tiled_smem_store = cute.make_tiled_copy(
-            atom_universal_copy, layout_tv=layout_tv, tiler_mn=tiler_mn
-        )
-
-        smem_thr_copy_dQaccum = tiled_smem_store.get_slice(tidx)
-        tdQsdQ = smem_thr_copy_dQaccum.partition_D(sdQaccum)
-        store_bytes = cutlass.Int32(self.tile_m * 32 * 4)
-
-        if const_expr(self.deterministic):
-            read_flag = False
-        else:
-            read_flag = True
-
-        reduce_phase = cutlass.Int32(0)
-        if cute.arch.thread_idx()[0] == 0:
-            cute.arch.mbarrier_arrive(dQaccum_reduce_mbar_ptr)
-
-        cute.arch.barrier(
-            barrier_id=int(NamedBarrierBwdSm100.dQaccReduce), number_of_threads=num_reduce_threads
-        )
-
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
-
             mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
-
+            gdQaccum_ = cute.local_tile(mdQaccum_cur, (self.tile_m * self.tile_hdim,), (None,))
+            # (M * K / STAGE, STAGE, _)
+            gdQaccum = cute.flat_divide(
+                gdQaccum_, (self.tile_m * self.tile_hdim // self.dQaccum_reduce_stage,)
+            )
+            mdQ_semaphore_cur = None
             if const_expr(self.deterministic):
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
             for i in cutlass.range(m_block_max - m_block_min, unroll=1):
                 m_block = m_block_max - 1 - i
-
                 pipeline_dQ.consumer_wait(dQ_consumer_state)
-
                 # TMEM -> RMEM
-                tdQrdQ_t2r = cute.make_fragment(tdQrdQ.shape, Float32)
-                assert self.dQaccum_reduce_stage == cute.size(tdQrdQ_t2r, mode=[1]), (
-                    "dQaccum reduce stage mismatch"
-                )
-
-                cute.copy(thr_tmem_ld, tdQtdQ_t2r, tdQrdQ_t2r)
+                tdQrdQ_t2r = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
+                cute.copy(thr_tmem_load, tdQtdQ_t2r, tdQrdQ_t2r)
                 cute.arch.fence_view_async_tmem_load()
-
                 pipeline_dQ.consumer_release(dQ_consumer_state)
                 dQ_consumer_state.advance()
 
                 # semaphore acquire
                 if const_expr(self.deterministic):
                     barrier.wait_eq(mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, n_block)
-                    cute.arch.barrier(
-                        barrier_id=int(NamedBarrierBwdSm100.dQaccReduce),
-                        number_of_threads=num_reduce_threads,
-                    )
+                    dQacc_reduce_barrier.arrive_and_wait()
 
                 for stage in cutlass.range_constexpr(cute.size(tdQrdQ_t2r, mode=[1])):  # 4
-                    if stage >= 2 and cute.arch.thread_idx()[0] == 0:
-                        cute.arch.cp_async_bulk_wait_group(1, read=read_flag)
-
-                    cute.arch.mbarrier_wait(dQaccum_reduce_mbar_ptr, reduce_phase)
-
-                    tdQrdQ_r2s = tdQrdQ_t2r[None, stage, None, None]
                     tdQsdQ_r2s = tdQsdQ[None, None, reduce_phase]
                     tdQrdQ_r2s = cute.make_tensor(
-                        tdQrdQ_r2s.iterator, cute.make_layout(tdQsdQ_r2s.shape)
+                        tdQrdQ_t2r[None, stage, None, None].iterator, tdQsdQ_r2s.shape
                     )
-
-                    cute.copy(smem_thr_copy_dQaccum, tdQrdQ_r2s, tdQsdQ_r2s)
-
+                    cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
                     cute.arch.fence_proxy(
                         cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
                     )
-                    cute.arch.barrier(
-                        barrier_id=int(NamedBarrierBwdSm100.dQaccReduce),
-                        number_of_threads=num_reduce_threads,
-                    )
-
-                    if cute.arch.thread_idx()[0] == 0:
-                        smem_ptr = sdQaccum[None, reduce_phase].iterator
-                        g_stage_index_elems = m_block * (self.tile_m * self.tile_hdimv) + stage * (
-                            self.tile_m * 32
-                        )
-                        gmem_row_ptr = cute.domain_offset(
-                            (g_stage_index_elems,), mdQaccum_cur
-                        ).iterator
-
-                        copy_utils.cpasync_reduce_bulk_add_f32(smem_ptr, gmem_row_ptr, store_bytes)
+                    dQacc_reduce_barrier.arrive_and_wait()
+                    if warp_idx == 0:
+                        with cute.arch.elect_one():
+                            copy_utils.cpasync_reduce_bulk_add_f32(
+                                sdQaccum[None, reduce_phase].iterator,
+                                gdQaccum[None, stage, m_block].iterator,
+                                self.tma_copy_bytes["dQ"],
+                            )
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(1, read=read_flag)
-
-                        cute.arch.mbarrier_arrive(dQaccum_reduce_mbar_ptr)
-
+                    dQacc_reduce_barrier.arrive_and_wait()
                     reduce_phase ^= 1
-
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-                    )
-                    cute.arch.barrier(
-                        barrier_id=int(NamedBarrierBwdSm100.dQaccReduce),
-                        number_of_threads=num_reduce_threads,
-                    )
 
                 # semaphore release
                 # NOTE: arrive_inc calls red_release which issues membar
                 if const_expr(self.deterministic):
-                    if cute.arch.thread_idx()[0] == 0:
+                    if tidx == 0:
                         cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-                    cute.arch.barrier(
-                        barrier_id=int(NamedBarrierBwdSm100.dQaccReduce),
-                        number_of_threads=num_reduce_threads,
-                    )
+                    dQacc_reduce_barrier.arrive_and_wait()
                     barrier.arrive_inc(mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, 1)
 
-            if cute.arch.thread_idx()[0] == 0:
+            if warp_idx == 0:
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
 
-            tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
@@ -2189,7 +2130,7 @@ class FlashAttentionBackwardSm100:
         num_epi_stages = cute.size(tdKVgdKV.shape[1])
         assert num_epi_stages == 1 or num_epi_stages == 2, "Wrong number of epi stages"
 
-        tmem_ld_atom = cute.make_copy_atom(
+        tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
         )
 
@@ -2213,17 +2154,17 @@ class FlashAttentionBackwardSm100:
 
         for s in cutlass.range_constexpr(num_epi_stages):
             # TMEM -> RMEM -- setup
-            tiled_tmem_ld = tcgen05.make_tmem_copy(tmem_ld_atom, tdKVtdKV)
-            thr_tmem_ld = tiled_tmem_ld.get_slice(tidx)
+            tiled_tmem_ld = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV)
+            thr_tmem_load = tiled_tmem_ld.get_slice(tidx)
 
-            tdKVtdKV_t2r_p = thr_tmem_ld.partition_S(tdKVtdKV)
+            tdKVtdKV_t2r_p = thr_tmem_load.partition_S(tdKVtdKV)
             tdKVtdKV_t2r = self.split_wg(tdKVtdKV_t2r_p, wg_idx, num_wg)[None, None, 0, 0]
             if const_expr(num_epi_stages > 1):
                 tdKVtdKV_t2r = tdKVtdKV_t2r[None, s]
 
             cdKV = cute.make_identity_tensor((self.tile_n, self.tile_hdim))
             tdKVcdKV = thr_mma.partition_C(cdKV)
-            tdKVcdKV_t2r_p = thr_tmem_ld.partition_D(tdKVcdKV)
+            tdKVcdKV_t2r_p = thr_tmem_load.partition_D(tdKVcdKV)
             tdKVcdKV_t2r = self.split_wg(tdKVcdKV_t2r_p, wg_idx, num_wg)[None, None, 0, 0]
             if const_expr(num_epi_stages > 1):
                 tdKVcdKV_t2r = tdKVcdKV_t2r[None, s]
@@ -2235,7 +2176,7 @@ class FlashAttentionBackwardSm100:
             )
 
             # TMEM -> RMEM -- copy and fence
-            cute.copy(thr_tmem_ld, tdKVtdKV_t2r, tdKVrdKV_t2r)
+            cute.copy(thr_tmem_load, tdKVtdKV_t2r, tdKVrdKV_t2r)
             cute.arch.fence_view_async_tmem_load()
 
             # RMEM -- scale and convert
