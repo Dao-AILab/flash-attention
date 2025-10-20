@@ -110,11 +110,11 @@ class FlashAttentionBackwardSm100:
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
-        self.tmem_s_offset = 0
-        self.tmem_p_offset = 0  # overlap with S
-        self.tmem_dV_offset = self.tmem_s_offset + self.tile_n
+        self.tmem_S_offset = 0
+        self.tmem_P_offset = 0  # overlap with S
+        self.tmem_dV_offset = self.tmem_S_offset + self.tile_n
         self.tmem_dP_offset = self.tmem_dV_offset + self.tile_hdimv
-        self.tmem_dQaccum_offset = self.tmem_dP_offset  # overlap with dP
+        self.tmem_dQ_offset = self.tmem_dP_offset  # overlap with dP
         self.tmem_dK_offset = self.tmem_dP_offset + self.tile_m
 
         self.num_regs_reduce = 144
@@ -783,8 +783,7 @@ class FlashAttentionBackwardSm100:
             "Not enough space for sdK"
         )
 
-        swz128 = cute.make_swizzle(3, 4, 3)
-        sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout, swizzle=swz128)
+        sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
 
         # TMEM
         # S
@@ -806,7 +805,7 @@ class FlashAttentionBackwardSm100:
         thr_mma_dQ = tiled_mma_dQ.get_slice(0)
         dQacc_shape = thr_mma_dQ.partition_shape_C(self.mma_tiler_dsk[:2])
         tdQtdQ = thr_mma_dQ.make_fragment_C(dQacc_shape)
-        tdQtdQ = cute.make_tensor(tdQtdQ.iterator + self.tmem_dQaccum_offset, tdQtdQ.layout)
+        tdQtdQ = cute.make_tensor(tdQtdQ.iterator + self.tmem_dQ_offset, tdQtdQ.layout)
         # dP
         dPacc_shape = thr_mma_SdP.partition_shape_C(self.mma_tiler_vdo[:2])
         tdPtdP = thr_mma_SdP.make_fragment_C(dPacc_shape)
